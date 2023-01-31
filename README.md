@@ -10,7 +10,7 @@
 
 ``LD_PRELOAD=liblibperf.so  ./a.out`` 
 
-**To Use with MPI:** 
+**To Use with MPI:** Attached the tool to one MPI rank.
 
 *intel mpirun:* 
 
