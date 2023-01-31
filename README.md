@@ -44,26 +44,34 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 **Example Output:**
 
 ```
--------------------------------------
-     Using BLAS Perf Library
--------------------------------------
-
------------------- BLAS PERF ENV -------------------
-BLASPERF_MKL_FAKE = -1 
-BLASPERF_DEBUG = 0 
----------- BLAS Perf: function statistics ----------
-function:   zscal_, count:       4, time:     0.0007
-function:   daxpy_, count:    6626, time:     0.0013
-function:   dcopy_, count: 1046756, time:     4.0465
-function:    ddot_, count:  402064, time:     1.6348
-function:  idamax_, count:    3744, time:     0.0019
-function:   dscal_, count:    9453, time:     0.8196
-function:   dnrm2_, count:   22779, time:     0.0035
-function:   dtrsm_, count:     576, time:     1.1204
-function:   dsymv_, count:    3312, time:     0.0030
-function:   dgemv_, count:   22608, time:     0.0048
-function:   dgemm_, count:   15408, time:    50.5629
-function:    dger_, count:    3456, time:     0.0020
 ----------------------------------------------------
+            Using BLAS/LAPACK Perf Library
+----------------------------------------------------
+
+-------------------- BLAS/LAPACK Perf ---------------------
+Total runtime: 1125.264
+------------------ BLAS/LAPACK Perf ENV -------------------
+LIBPERF_MKL_FAKE = -1 
+LIBPERF_DEBUG = 0 
+---------- BLAS/LAPACK Perf: function statistics ----------
+function:   dgesv_, count:       1, time:      0.002
+function:  dsteqr_, count:      50, time:      0.003
+function:   dcopy_, count:  313141, time:      1.965
+function:   dtrmv_, count:   49245, time:      0.703
+function:    ddot_, count:   63833, time:      1.357
+function:   dtrmm_, count:      45, time:      0.004
+function:  idamax_, count:    1490, time:      0.001
+function:   dsyrk_, count:     960, time:      0.006
+function:   dscal_, count:    3300, time:      0.388
+function:   dsyev_, count:       4, time:      0.010
+function:   dnrm2_, count:   22939, time:      0.037
+function:   dtrsm_, count:     110, time:      1.748
+function:   dgemv_, count:   98925, time:      0.132
+function:   dgemm_, count:   18255, time:    609.383
+function:  dpotrf_, count:      15, time:      0.001
+function:    dger_, count:     160, time:      0.021
+----------------------------------------------------
+
+
 ```
 
