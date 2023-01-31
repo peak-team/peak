@@ -13,8 +13,8 @@ FLAG="$FLAG0 $LIB"
 COMPILER=""
 EXE=""
 
-#export BLASPERF_MKL_FAKE=1 # disabled for now
-#export BLASPERF_DEBUG=1    # will print stats after every BLAS call
+#export LIBPERF_MKL_FAKE=1 # disabled for now
+#export LIBPERF_DEBUG=1    # will print stats after every BLAS call
 
 f_type(){
   file=$1
@@ -38,11 +38,12 @@ f_type(){
   esac
 }
 
-for t in test_dgemm.F  test_symv.f90  test_ysr.f90 test_cblas_dgemm.c
+for t in test_dgemm.F  test_symv.f90  test_ysr.f90 test_cblas_dgemm.c test_lapacke_dgesv.c test_lapack_dgesv.F
 do
   f_type $t
   cmd="$COMPILER $FLAG -o $EXE $t"
+  echo $cmd
   $cmd
-  LD_PRELOAD=../libblasperf.so  $EXE 
+  LD_PRELOAD=../liblibperf.so  $EXE 
   rm $EXE
 done

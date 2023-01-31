@@ -3,6 +3,8 @@
 typedef struct STAT{
    int count; 
    double time;
+   char type[20]; 
+   char comment[20];
 } STAT;
 
 struct item {
