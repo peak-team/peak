@@ -1,4 +1,4 @@
-# profiler_lite 
+# library perf 
 
 ## A simple tool to report timing of BLAS/LAPACK library.  
 
