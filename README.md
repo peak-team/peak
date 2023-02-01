@@ -1,6 +1,6 @@
 # library perf 
 
-## A simple tool to report timing of BLAS/LAPACK library.  
+## A simple tool to report timing of BLAS/LAPACK/ScaLAPACK library.  
 
 **To Compile:** 
 
@@ -44,12 +44,12 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 **Example Output:**
 
 ```
--------------------- BLAS/LAPACK/SCALAPACK Perf ---------------------
+-------------------- BLAS/LAPACK/ScaLAPACK Perf ---------------------
 Total runtime: 239.246
------------------- BLAS/LAPACK/SCALAPACK Perf ENV -------------------
+------------------ BLAS/LAPACK/ScaLAPACK Perf ENV -------------------
 LIBPERF_MKL_FAKE = -1 
 LIBPERF_DEBUG = 1 
----------- BLAS/LAPACK/SCALAPACK Perf: function statistics ----------
+---------- BLAS/LAPACK/ScaLAPACK Perf: function statistics ----------
 function:   zscal_, count:       4, time:      0.001    
 function: pdormqr_, count:      49, time:      2.041    
 function:   dgesv_, count:      39, time:      0.025    
