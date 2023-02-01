@@ -44,33 +44,35 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 **Example Output:**
 
 ```
-----------------------------------------------------
-            Using BLAS/LAPACK Perf Library
+-------------------- BLAS/LAPACK/SCALAPACK Perf ---------------------
+Total runtime: 239.246
+------------------ BLAS/LAPACK/SCALAPACK Perf ENV -------------------
+LIBPERF_MKL_FAKE = -1 
+LIBPERF_DEBUG = 1 
+---------- BLAS/LAPACK/SCALAPACK Perf: function statistics ----------
+function:   zscal_, count:       4, time:      0.001    
+function: pdormqr_, count:      49, time:      2.041    
+function:   dgesv_, count:      39, time:      0.025    
+function: pdsyevd_, count:      98, time:     14.162   
+function:  dsteqr_, count:      49, time:      0.003    
+function:   daxpy_, count:    2256, time:      0.001    
+function:   dcopy_, count:  350337, time:      1.632    
+function:    ddot_, count:  124920, time:      0.569    
+function:  idamax_, count:    1274, time:      0.000    
+function:   dscal_, count:    3215, time:      0.249    
+function:   dsyev_, count:      84, time:      0.635    
+function:   dnrm2_, count:    7705, time:      0.002    
+function:   dtrsm_, count:     196, time:      0.686    
+function:   dsymv_, count:    1127, time:      0.001    
+function: pdstedc_, count:      49, time:      0.971    
+function: pdormtr_, count:      49, time:      2.042    
+function:   dgemv_, count:    7693, time:      0.002    
+function:   dgemm_, count:    5243, time:     14.730   
+function:  dpotrf_, count:      49, time:      0.018    
+function:    dger_, count:    1176, time:      0.001    
+function: pdpotrf_, count:      49, time:      8.283    
 ----------------------------------------------------
 
--------------------- BLAS/LAPACK Perf ---------------------
-Total runtime: 1125.264
------------------- BLAS/LAPACK Perf ENV -------------------
-LIBPERF_MKL_FAKE = -1 
-LIBPERF_DEBUG = 0 
----------- BLAS/LAPACK Perf: function statistics ----------
-function:   dgesv_, count:       1, time:      0.002
-function:  dsteqr_, count:      50, time:      0.003
-function:   dcopy_, count:  313141, time:      1.965
-function:   dtrmv_, count:   49245, time:      0.703
-function:    ddot_, count:   63833, time:      1.357
-function:   dtrmm_, count:      45, time:      0.004
-function:  idamax_, count:    1490, time:      0.001
-function:   dsyrk_, count:     960, time:      0.006
-function:   dscal_, count:    3300, time:      0.388
-function:   dsyev_, count:       4, time:      0.010
-function:   dnrm2_, count:   22939, time:      0.037
-function:   dtrsm_, count:     110, time:      1.748
-function:   dgemv_, count:   98925, time:      0.132
-function:   dgemm_, count:   18255, time:    609.383
-function:  dpotrf_, count:      15, time:      0.001
-function:    dger_, count:     160, time:      0.021
-----------------------------------------------------
 
 
 ```
