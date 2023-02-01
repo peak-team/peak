@@ -25,9 +25,8 @@ LAPACKE (C), FFTW in progress.
   
   mpmd.txt: 
   ```
-  -n 1 ./parsec.sh
+  -n 1 ./parsec.sh  #use a wrapper to setup LD_PRELOAD
   -n 3 ./parsec.exe
-
   ```
   parsec.sh:
   ```
