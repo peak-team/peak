@@ -26,7 +26,7 @@ LAPACKE (C), FFTW in progress.
   mpmd.txt: 
   ```
   -n 1 LD_PRELOAD=liblibperf.so ./parsec.exe 
-  -n 4 ./parsec.exe
+  -n 3 ./parsec.exe
 
   ```
 
