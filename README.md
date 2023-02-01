@@ -5,7 +5,7 @@
 **Supported libraries:**
 1. BLAS/CBLAS
 2. LAPACK (Fortran)
-3. ScaLAPACK (Fortran)
+3. ScaLAPACK/PBLAS (Fortran)
 
 LAPACKE (C), FFTW in progress.
 
