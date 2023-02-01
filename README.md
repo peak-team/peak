@@ -40,11 +40,16 @@ LAPACKE (C), FFTW in progress.
   
   mpmd.txt:
   ```
-   0 LD_PRELOAD=liblibperf.so ./parsec.exe 
+   0 ./parsec.sh  #use a wrapper to setup LD_PRELOAD
    1 ./parsec.exe
    2 ./parsec.exe
    3 ./parsec.exe
    ```
+  parsec.sh:
+  ```
+  LD_PRELOAD=liblibperf.so 
+  ./parsec.exe 
+  ```
 
 **Settings**
 ```
