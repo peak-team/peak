@@ -1,6 +1,13 @@
 # library perf 
 
-## A simple tool to report timing of BLAS/LAPACK/ScaLAPACK library.  
+## A simple tool to report timing of common math libraries. 
+
+**Supported libraries:**
+1. BLAS/CBLAS
+2. LAPACK (Fortran)
+3. ScaLAPACK (Fortran)
+
+LAPACKE (C), FFTW in progress.
 
 **To Compile:** 
 
