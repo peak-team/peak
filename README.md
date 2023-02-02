@@ -2,24 +2,24 @@
 
 ## A simple tool to report timing of common math libraries. 
 
-**Supported libraries:**
+##Supported libraries:##
 1. BLAS/CBLAS
 2. LAPACK (Fortran)
 3. ScaLAPACK/PBLAS (Fortran)
 
 LAPACKE (C), FFTW on to-do list.
 
-**To Compile:** 
+##To Compile:## 
 
 ``make`` 
 
-**To Use without MPI:**  
+##To Use without MPI:##  
 
 ``LD_PRELOAD=liblibperf.so  ./a.out`` 
 
-**To Use with MPI:** Attached the tool to one MPI rank.
+##To Use with MPI:## Attached the tool to one MPI rank.
 
-*intel mpirun:* 
+**intel mpirun:** 
 
   run: ``mpirun -configfile ./mpmd.txt``  
   
@@ -34,7 +34,7 @@ LAPACKE (C), FFTW on to-do list.
   ./parsec.exe 
   ```
 
-*srun:*  
+**srun:**  
 
   run: ``srun -n 4 --multi-prog mpmd.txt``
   
@@ -51,13 +51,13 @@ LAPACKE (C), FFTW on to-do list.
   ./parsec.exe 
   ```
 
-**Settings**
+##Settings##
 ```
 export LIBPERF_MKL_FAKE=1  #not in use right now
 export LIBPERF_DEBUG=1    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
 ```
 
-**Example Output:**
+##Example Output:##
 
    **Please note: timing is inclusive at this point.**
 
