@@ -61,7 +61,7 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 
 ## Example Output:
 
-   **Please note: timing is inclusive at this point.**
+   **Please note: timing is inclusive at this point,** meaning if function A calls B, the timing of B is not deducted from the timing of A.
 
 ```
 ----------------------------------------------------
