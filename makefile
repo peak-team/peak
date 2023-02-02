@@ -6,7 +6,9 @@ LIBS =
 
 OBJ = libperf.o mysecond.o hash.o \
       blas.o cblas.o\
-      lapack.o
+      lapack.o  \
+      scalapack.o\
+      pblas.o
 DEPS0 = makefile
 DEPS = $(DEPS0) libperf.h hash.h 
 TARGET = liblibperf.so

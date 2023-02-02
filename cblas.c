@@ -1,6 +1,7 @@
 #include "libperf.h"
 #include "hash.h"
 
+#define func_group "CBLAS"
 
 #define CBLAS_INT int32_t
 #define CBLAS_INDEX size_t /* this may vary between platforms */

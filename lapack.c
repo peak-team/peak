@@ -2,6 +2,8 @@
 #include "libperf.h"
 #include "hash.h"
 
+#define func_group "LAPACK"
+
 
 
 

@@ -19,12 +19,12 @@ unsigned long hash(char* str) {
     return hash % HASH_SIZE;
 }
 
-struct item* hash_insert(char* key, int count, double time) {
+struct item* hash_insert(char* key) {
     unsigned long index = hash(key);
     struct item* new_item = (struct item*) malloc(sizeof(struct item));
     new_item->key = strdup(key);
-    new_item->value.time = time;
-    new_item->value.count = count;
+    new_item->value.time =  0.0; 
+    new_item->value.count = 0;
     new_item->next = hashtable[index];
     hashtable[index] = new_item;
     return new_item;
@@ -42,11 +42,11 @@ struct item* hash_get(char* key) {
 }
 
 void hash_show() {
-    printf("---------- BLAS/LAPACK Perf: function statistics ----------\n");
+    printf("---------- Library Perf: function statistics ----------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
-            printf("function: %8s, count: %7d, time: %10.3f\n", item->key, item->value.count, item->value.time);
+            printf("group: %10s, function: %8s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time);
             item = item->next;
         }   
     }   

@@ -3,6 +3,7 @@
 #include "hash.h"
 #include "complex.h"
 
+#define func_group "BLAS"
 
 // 
 //BLAS level 1 functions 
