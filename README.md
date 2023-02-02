@@ -1,4 +1,4 @@
-# library perf 
+# library perf  (need a better name)
 
 ## A simple tool to report timing of common math libraries. 
 
