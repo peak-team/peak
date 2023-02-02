@@ -56,7 +56,7 @@ LAPACKE (C), FFTW on to-do list.
 ## Settings
 ```
 export SIMPLEPERF_MKL_FAKE=1  #not in use right now
-export SIMPLEPERF_DEBUG=1    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
+export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
 ```
 
 ## Example Output:
