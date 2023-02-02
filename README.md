@@ -65,43 +65,42 @@ export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library ca
 
 ```
 ----------------------------------------------------
-            Using BLAS/LAPACK Perf Library
+            Using Simple Perf Library
 ----------------------------------------------------
 
--------------------- BLAS/LAPACK Perf ---------------------
-Total runtime: 1149.856
------------------- BLAS/LAPACK Perf ENV -------------------
+-------------------- Simple Perf ---------------------
+Total runtime: 1155.030
+------------------ Simple Perf ENV -------------------
 SIMPLEPERF_MKL_FAKE = -1 
 SIMPLEPERF_DEBUG = 0 
----------- Library Perf: function statistics ----------
-group:      PBLAS, function:   pddot_, count:   24000, time:      0.024
-group:  ScaLAPACK, function: pdormqr_, count:       5, time:     19.083
-group:     LAPACK, function:   dgesv_, count:       1, time:      0.095
-group:       BLAS, function:   dtrmv_, count:   49245, time:      0.670
+---------- Simple Perf: function statistics ----------
+group:      PBLAS, function:   pddot_, count:   24000, time:      0.044
+group:  ScaLAPACK, function: pdormqr_, count:       5, time:     17.441
+group:     LAPACK, function:   dgesv_, count:       1, time:      0.054
+group:       BLAS, function:   dtrmv_, count:   49245, time:      0.720
 group:       BLAS, function:  idamax_, count:    1490, time:      0.001
-group:      PBLAS, function:  pdtrsm_, count:     750, time:     31.166
-group:       BLAS, function:   dscal_, count:    3312, time:      0.382
-group:       BLAS, function:   dnrm2_, count:   22936, time:      0.037
-group:       BLAS, function:   dtrsm_, count:     110, time:      1.814
-group:  ScaLAPACK, function: pdstedc_, count:       5, time:      5.290
-group:  ScaLAPACK, function: pdormtr_, count:       5, time:     19.271
-group:       BLAS, function:   dgemv_, count:   98925, time:      0.126
-group:     LAPACK, function:  dpotrf_, count:      15, time:      0.051
-group:  ScaLAPACK, function: pdpotrf_, count:       5, time:      5.205
-group:  ScaLAPACK, function: pdsyevd_, count:      10, time:     27.914
+group:      PBLAS, function:  pdtrsm_, count:     750, time:     31.103
+group:       BLAS, function:   dscal_, count:    3308, time:      0.387
+group:       BLAS, function:   dnrm2_, count:   22935, time:      0.037
+group:       BLAS, function:   dtrsm_, count:     110, time:      1.788
+group:  ScaLAPACK, function: pdstedc_, count:       5, time:      4.674
+group:  ScaLAPACK, function: pdormtr_, count:       5, time:     17.640
+group:       BLAS, function:   dgemv_, count:   98925, time:      0.137
+group:     LAPACK, function:  dpotrf_, count:      15, time:      0.024
+group:  ScaLAPACK, function: pdpotrf_, count:       5, time:      4.262
+group:  ScaLAPACK, function: pdsyevd_, count:      10, time:     25.652
 group:     LAPACK, function:  dsteqr_, count:      50, time:      0.004
-group:      PBLAS, function:  pdsyrk_, count:     745, time:      3.804
-group:       BLAS, function:   dcopy_, count:  313087, time:      3.364
-group:       BLAS, function:    ddot_, count:   63849, time:      1.935
+group:      PBLAS, function:  pdsyrk_, count:     745, time:      2.875
+group:       BLAS, function:   dcopy_, count:  313617, time:      2.901
+group:       BLAS, function:    ddot_, count:   63833, time:      1.342
 group:       BLAS, function:   dtrmm_, count:      45, time:      0.004
 group:       BLAS, function:   dsyrk_, count:     960, time:      0.006
-group:      PBLAS, function:  pdgemm_, count:    1505, time:    649.565
-group:     LAPACK, function:   dsyev_, count:       4, time:      0.201
-group:       BLAS, function:   dgemm_, count:   18257, time:    596.370
-group:      PBLAS, function: pilaenv_, count:    2172, time:      0.061
-group:       BLAS, function:    dger_, count:     160, time:      0.018
+group:      PBLAS, function:  pdgemm_, count:    1505, time:    654.216
+group:     LAPACK, function:   dsyev_, count:       4, time:      0.578
+group:       BLAS, function:   dgemm_, count:   18264, time:    603.309
+group:      PBLAS, function: pilaenv_, count:    2173, time:      0.001
+group:       BLAS, function:    dger_, count:     160, time:      0.017
 ----------------------------------------------------
-
 
 ```
 
