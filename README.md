@@ -7,7 +7,7 @@
 2. LAPACK (Fortran)
 3. ScaLAPACK/PBLAS (Fortran)
 
-LAPACKE (C), FFTW in progress.
+LAPACKE (C), FFTW on to-do list.
 
 **To Compile:** 
 
