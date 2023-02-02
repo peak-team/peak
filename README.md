@@ -5,7 +5,7 @@
 **Supported libraries:**
 1. BLAS/CBLAS
 2. LAPACK (Fortran)
-3. ScaLAPACK (Fortran)
+3. ScaLAPACK/PBLAS (Fortran)
 
 LAPACKE (C), FFTW in progress.
 
@@ -25,9 +25,13 @@ LAPACKE (C), FFTW in progress.
   
   mpmd.txt: 
   ```
-  -n 1 LD_PRELOAD=liblibperf.so ./parsec.exe 
+  -n 1 ./parsec.sh  #use a wrapper to setup LD_PRELOAD
   -n 3 ./parsec.exe
-
+  ```
+  parsec.sh:
+  ```
+  LD_PRELOAD=liblibperf.so 
+  ./parsec.exe 
   ```
 
 *srun:*  
@@ -36,11 +40,16 @@ LAPACKE (C), FFTW in progress.
   
   mpmd.txt:
   ```
-   0 LD_PRELOAD=liblibperf.so ./parsec.exe 
+   0 ./parsec.sh  #use a wrapper to setup LD_PRELOAD
    1 ./parsec.exe
    2 ./parsec.exe
    3 ./parsec.exe
    ```
+  parsec.sh:
+  ```
+  LD_PRELOAD=liblibperf.so 
+  ./parsec.exe 
+  ```
 
 **Settings**
 ```
