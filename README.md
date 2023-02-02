@@ -65,36 +65,43 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 ----------------------------------------------------
 
 -------------------- BLAS/LAPACK Perf ---------------------
-Total runtime: 168.995
+Total runtime: 47.686
 ------------------ BLAS/LAPACK Perf ENV -------------------
 LIBPERF_MKL_FAKE = -1 
 LIBPERF_DEBUG = 0 
----------- BLAS/LAPACK Perf: function statistics ----------
-function:   zscal_, count:       4, time:      0.001
-function: pdormqr_, count:      52, time:      0.382
-function:   dgesv_, count:      42, time:      0.017
-function: pdsyevd_, count:     104, time:      1.719
-function:  dsteqr_, count:     156, time:      0.010
-function:   daxpy_, count:    9882, time:      0.001
-function:   dcopy_, count:  270754, time:      4.167
-function:   dtrmv_, count:    3224, time:      0.001
-function:    ddot_, count:  141748, time:      1.043
-function:   dtrmm_, count:     104, time:      0.001
-function:  idamax_, count:     936, time:      0.001
-function:   dsyrk_, count:    2496, time:      0.007
-function:   dscal_, count:   10543, time:      0.237
-function:   dsyev_, count:      90, time:      0.215
-function:   dnrm2_, count:   18003, time:      0.006
-function:  dsyr2k_, count:     624, time:      0.007
-function:   dtrsm_, count:     312, time:      4.978
-function:   dsymv_, count:   24804, time:      0.008
-function: pdstedc_, count:      52, time:      0.228
-function: pdormtr_, count:      52, time:      0.383
-function:   dgemv_, count:   53404, time:      0.019
-function:   dgemm_, count:    7123, time:     10.191
-function:  dpotrf_, count:     156, time:      0.023
-function:    dger_, count:    1664, time:      0.005
-function: pdpotrf_, count:      52, time:      4.288
+---------- Library Perf: function statistics ----------
+group:       BLAS, function:   zscal_, count:       2, time:      0.000
+group:      PBLAS, function:   pddot_, count:    5688, time:      0.014
+group:  ScaLAPACK, function: pdormqr_, count:       9, time:      2.390
+group:     LAPACK, function:   dgesv_, count:       1, time:      0.004
+group:  ScaLAPACK, function: pdsyevd_, count:      18, time:      2.878
+group:     LAPACK, function:  dsteqr_, count:       9, time:      0.000
+group:       BLAS, function:   daxpy_, count:     415, time:      0.000
+group:      PBLAS, function:  pdsyrk_, count:     351, time:      4.386
+group:       BLAS, function:   dcopy_, count:   61121, time:      0.100
+group:      PBLAS, function:  pdscal_, count:    3240, time:      0.000
+group:       BLAS, function:    ddot_, count:   16438, time:      0.033
+group:      PBLAS, function:  pdnrm2_, count:     432, time:      0.005
+group:       BLAS, function:  idamax_, count:     234, time:      0.000
+group:      PBLAS, function:  pdtrsm_, count:     360, time:      3.730
+group:      PBLAS, function:  pdsymv_, count:    2808, time:      0.182
+group:      PBLAS, function:  pdgemv_, count:   16848, time:      0.019
+group:      PBLAS, function:  pdgemm_, count:     261, time:      2.148
+group:       BLAS, function:   dscal_, count:     586, time:      0.004
+group:     LAPACK, function:   dsyev_, count:       4, time:      0.017
+group:       BLAS, function:   dnrm2_, count:    1436, time:      0.000
+group:       BLAS, function:   dtrsm_, count:      36, time:      0.056
+group:       BLAS, function:   dsymv_, count:     207, time:      0.000
+group:  ScaLAPACK, function: pdstedc_, count:       9, time:      0.039
+group:      PBLAS, function: pdsyr2k_, count:     117, time:      0.057
+group:  ScaLAPACK, function: pdormtr_, count:       9, time:      2.391
+group:       BLAS, function:   dgemv_, count:    1413, time:      0.000
+group:       BLAS, function:   dgemm_, count:     963, time:      0.959
+group:     LAPACK, function:  dpotrf_, count:       9, time:      0.001
+group:      PBLAS, function: pilaenv_, count:     802, time:      0.000
+group:       BLAS, function:    dger_, count:     216, time:      0.000
+group:  ScaLAPACK, function: pdpotrf_, count:       9, time:      5.692
+group:      PBLAS, function:  pdaxpy_, count:    2808, time:      0.000
 ----------------------------------------------------
 
 
