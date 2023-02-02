@@ -4,16 +4,16 @@ INCLUDE = ./
 CFLAGS = -O2 -g -I$(INCLUDE) -shared -fPIC -qopenmp
 LIBS = 
 
-OBJ = libperf.o mysecond.o hash.o \
+OBJ = simpleperf.o mysecond.o hash.o \
       blas.o cblas.o\
       lapack.o  \
       scalapack.o\
       pblas.o
 DEPS0 = makefile
-DEPS = $(DEPS0) libperf.h hash.h 
-TARGET = liblibperf.so
+DEPS = $(DEPS0) simpleperf.h hash.h 
+TARGET = libsimpleperf.so
 
-ALL : liblibperf.so #a.out
+ALL : libsimpleperf.so #a.out
 
 #a.out: test_symv.f90
 #	$(FC) -qmkl test.F

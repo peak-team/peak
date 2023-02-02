@@ -1,5 +1,5 @@
 
-#include "libperf.h"
+#include "simpleperf.h"
 #include "hash.h"
 
 #define func_group "LAPACK"

@@ -3,9 +3,9 @@
 
 
 
-  if(!libperf_init_flag) blas_init(); 
+  if(!simpleperf_init_flag) blas_init(); 
 
-  if (libperf_debug>0) printf("LIBPERF: calling %s\n",__func__);
+  if (simpleperf_debug>0) printf("SIMPLEPERF: calling %s\n",__func__);
 
   strcpy(str,__func__);
   item = hash_get(str); 

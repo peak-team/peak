@@ -1,4 +1,4 @@
-# library perf  (need a better name)
+# Simple Perf  (needs a better name)
 
 ## A simple tool to report timing of common math libraries. 
 
@@ -15,7 +15,7 @@ LAPACKE (C), FFTW on to-do list.
 
 ## To Use without MPI: 
 
-``LD_PRELOAD=liblibperf.so  ./a.out`` 
+``LD_PRELOAD=libsimpleperf.so  ./a.out`` 
 
 ## To Use with MPI: Attached the tool to one MPI rank.
 
@@ -31,7 +31,7 @@ LAPACKE (C), FFTW on to-do list.
   parsec.sh:
   ```
   #!/bin/bash
-  LD_PRELOAD=liblibperf.so 
+  LD_PRELOAD=libsimpleperf.so 
   ./parsec.exe 
   ```
 
@@ -49,14 +49,14 @@ LAPACKE (C), FFTW on to-do list.
   parsec.sh:
   ```
   #!/bin/bash
-  LD_PRELOAD=liblibperf.so 
+  LD_PRELOAD=libsimpleperf.so 
   ./parsec.exe 
   ```
 
 ## Settings
 ```
-export LIBPERF_MKL_FAKE=1  #not in use right now
-export LIBPERF_DEBUG=1    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
+export SIMPLEPERF_MKL_FAKE=1  #not in use right now
+export SIMPLEPERF_DEBUG=1    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
 ```
 
 ## Example Output:
@@ -71,8 +71,8 @@ export LIBPERF_DEBUG=1    # turn this on to report timing at every library call,
 -------------------- BLAS/LAPACK Perf ---------------------
 Total runtime: 1149.856
 ------------------ BLAS/LAPACK Perf ENV -------------------
-LIBPERF_MKL_FAKE = -1 
-LIBPERF_DEBUG = 0 
+SIMPLEPERF_MKL_FAKE = -1 
+SIMPLEPERF_DEBUG = 0 
 ---------- Library Perf: function statistics ----------
 group:      PBLAS, function:   pddot_, count:   24000, time:      0.024
 group:  ScaLAPACK, function: pdormqr_, count:       5, time:     19.083

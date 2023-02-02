@@ -5,11 +5,10 @@
 
 #include "hash.h"
 
-#define HASH_SIZE 100
+#define HASH_SIZE 200
 
 
 struct item* hashtable[HASH_SIZE];
-
 
 unsigned long hash(char* str) {
     unsigned long hash = 5381;
@@ -42,7 +41,7 @@ struct item* hash_get(char* key) {
 }
 
 void hash_show() {
-    printf("---------- Library Perf: function statistics ----------\n");
+    printf("---------- Simple Perf: function statistics ----------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
