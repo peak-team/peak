@@ -66,7 +66,7 @@ export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library ca
 
 ## Example Output:
 
-  
+For PARSEC:   
 ```
 ----------------------------------------------------
             Using Simple Perf Library
@@ -108,3 +108,17 @@ group:       BLAS, function:    dger_, count:     160, time:      0.017
 
 ```
 
+
+For MuST: 
+```
+---------- BLAS Perf: function statistics ----------
+function:   zscal_, count:    1224, time:     0.0012
+function:   zgemm_, count: 4618911, time:  1045.7964
+function:   dcopy_, count:      38, time:     0.0003
+function:   zgeru_, count:     144, time:     0.0000
+function:   dscal_, count:       4, time:     0.0069
+function:   zaxpy_, count:   40800, time:     0.0052
+function:   zcopy_, count:   12036, time:     0.0577
+function:  izamax_, count:     360, time:     0.0008
+----------------------------------------------------
+```
