@@ -111,6 +111,15 @@ group:       BLAS, function:    dger_, count:     160, time:      0.017
 
 For MuST: 
 ```
+----------------------------------------------------
+            Using Simple Perf Library
+----------------------------------------------------
+
+-------------------- Simple Perf ---------------------
+Total runtime: 1366.075
+------------------ Simple Perf ENV -------------------
+SIMPLEPERF_MKL_FAKE = -1 
+SIMPLEPERF_DEBUG = 0 
 ---------- Simple Perf: function statistics ----------
 group:       BLAS, function:   zgemm_, count: 4618917, time:    833.068
 group:     LAPACK, function:  dgetri_, count:       2, time:      0.000
@@ -124,5 +133,6 @@ group:       BLAS, function:   zgeru_, count:     138, time:      0.000
 group:       BLAS, function:   zaxpy_, count:   40800, time:      0.004
 group:       BLAS, function:   zcopy_, count:   12036, time:      0.075
 ----------------------------------------------------
+
 
 ```
