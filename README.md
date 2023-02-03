@@ -59,10 +59,14 @@ export SIMPLEPERF_MKL_FAKE=1  #not in use right now
 export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
 ```
 
+## Limitations
+1. It is not able to intercept internal blas functions, e.g.  mkl_blas_dgemm() used inside some of the MKL routines. 
+2. timing is inclusive at this point, meaning if function A calls B, the timing of B is not deducted from the timing of A.
+
+
 ## Example Output:
 
-   **Please note: timing is inclusive at this point,** meaning if function A calls B, the timing of B is not deducted from the timing of A.
-
+  
 ```
 ----------------------------------------------------
             Using Simple Perf Library
