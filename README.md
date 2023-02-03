@@ -60,8 +60,8 @@ export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library ca
 ```
 
 ## Limitations
-1. It is not able to intercept internal blas functions, e.g.  mkl_blas_dgemm() used inside some of the MKL routines. 
-2. timing is inclusive at this point, meaning if function A calls B, the timing of B is not deducted from the timing of A.
+1. It is not able to intercept internal blas functions, e.g.  MKL's cblas_dgemm calls mkl_blas_dgemm() instead of dgemm(), and mkl_blas_dgemm is not intercepted. 
+3. timing is inclusive at this point, meaning if function A calls B, the timing of B is not deducted from the timing of A.
 
 
 ## Example Output:
