@@ -45,7 +45,7 @@ void hash_show() {
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
-            printf("group: %10s, function: %8s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time);
+            printf("group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time);
             item = item->next;
         }   
     }   
