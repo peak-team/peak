@@ -3,7 +3,7 @@
 typedef struct STAT{
    int count; 
    double time;
-   char fgroup[20]; 
+   char* fgroup; 
    char comment[20];
 } STAT;
 

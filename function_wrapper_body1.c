@@ -1,6 +1,7 @@
   struct item* item; 
   char str[10];
 
+  double time=0.0;
 
 
   if(!simpleperf_init_flag) blas_init(); 
@@ -14,7 +15,8 @@
 #endif
   if (item == NULL ) {
     item = hash_insert(str);
-    strcpy(item->value.fgroup,func_group);
+//    strcpy(item->value.fgroup,func_group);
+    item->value.fgroup=func_group;
   }
 #ifdef _OPENMP
   omp_unset_lock(&lock);
@@ -22,9 +24,12 @@
 
   orig_f = dlsym(RTLD_NEXT, __func__);
 
+/*
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
-  item->value.time -= mysecond(); 
+*/
+//  item->value.time -= mysecond(); 
+  time=mysecond();
 
 // BLAS is called here

@@ -23,7 +23,7 @@ struct item* hash_insert(char* key) {
     struct item* new_item = (struct item*) malloc(sizeof(struct item));
     new_item->key = strdup(key);
     new_item->value.time =  0.0; 
-    new_item->value.count = 0;
+    new_item->value.count = 1;
     new_item->next = hashtable[index];
     hashtable[index] = new_item;
     return new_item;

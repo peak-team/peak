@@ -1,8 +1,9 @@
 // BLAS is called here
 //
 
+  time=mysecond()-time;
 #pragma omp atomic
-  item->value.time += mysecond();
+  item->value.time += time;
 
 #pragma omp atomic
   item->value.count ++;
