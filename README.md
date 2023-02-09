@@ -2,13 +2,13 @@
 
 PEAK is a lightweight and easy-to-use performance evaluation tool designed with HPC systems in mind. With its user-friendly interface, PEAK provides detailed performance reports on programs, allowing users to quickly identify and resolve performance bottlenecks. Whether you're optimizing code for maximum performance or conducting regular performance evaluations, PEAK is the ideal solution for anyone looking to improve the performance of their programs. 
 
+## Supported counters:
+1. single and double precision floating point operations as scalar, 128-bit vector, 256-bit vector, 512-bit vector.
+2. memory read and write bandwidth.
 ## Supported libraries:
 1. BLAS/CBLAS
 2. LAPACK (Fortran)
 3. ScaLAPACK/PBLAS (Fortran) 
-## Supported counters:
-1. single and double precision floating point operations as scalar, 128-bit vector, 256-bit vector, 512-bit vector.
-2. memory read and write bandwidth.
 
 LAPACKE (C), FFTW on to-do list.
 
@@ -18,7 +18,7 @@ LAPACKE (C), FFTW on to-do list.
 
 ## To Use without MPI: 
 
-``LD_PRELOAD=libsimpleperf.so  ./a.out`` 
+``LD_PRELOAD=peak_prof.so  ./a.out`` 
 
 ## To Use with MPI: Attached the tool to one MPI rank.
 
@@ -52,13 +52,13 @@ LAPACKE (C), FFTW on to-do list.
   parsec.sh:
   ```
   #!/bin/bash
-  LD_PRELOAD=libsimpleperf.so 
+  LD_PRELOAD=peak_prof.so 
   ./parsec.exe 
   ```
 
 ## Settings
 ```
-export SIMPLEPERF_DEBUG=2    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
+export PEAKPROF_DEBUG=2    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
 ```
 
 ## Limitations
