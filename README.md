@@ -5,7 +5,10 @@ PEAK is a lightweight and easy-to-use performance evaluation tool designed with 
 ## Supported libraries:
 1. BLAS/CBLAS
 2. LAPACK (Fortran)
-3. ScaLAPACK/PBLAS (Fortran)
+3. ScaLAPACK/PBLAS (Fortran) 
+## Supported counters:
+1. single and double precision floating point operations as scalar, 128-bit vector, 256-bit vector, 512-bit vector.
+2. memory read and write bandwidth.
 
 LAPACKE (C), FFTW on to-do list.
 
