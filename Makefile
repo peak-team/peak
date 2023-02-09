@@ -11,7 +11,7 @@ OBJ1 = $(DIR1)/lib_prof.o $(DIR1)/mysecond.o $(DIR1)/hash.o  \
        $(DIR1)/lib_wrappers/scalapack.o\
        $(DIR1)/lib_wrappers/pblas.o  
 OBJ2 = perf_counter/perf_counter.o
-DEPS0 = makefile
+DEPS0 = Makefile
 DEPS = $(DEPS0) $(DIR1)/lib_prof.h $(DIR1)/hash.h 
 TARGET = peak_libprof.so
 TARGET2 = peak_counter.so
@@ -31,7 +31,8 @@ $(TARGET2) : $(OBJ2)
 	$(CC) $(CFLAGS) -c -o $@ $< 
 
 .PHONY: clean
+.PHONY: veryclean
 clean :
 	rm -f $(OBJ1) $(OBJ2)
 veryclean: 
-	rm -f *.o $(TARGET) $(TARGET2)
+	rm -f *.o $(TARGET) $(TARGET2) $(OBJ1) $(OBJ2)
