@@ -33,4 +33,4 @@ $(TARGET2) : $(OBJ2)
 clean :
 	rm -f *.o $(OBJ2)
 veryclean: 
-	rm -f *.o $(TARGET)
+	rm -f *.o $(TARGET) $(TARGET2)
