@@ -31,6 +31,6 @@ $(TARGET2) : $(OBJ2)
 
 .PHONY: clean
 clean :
-	rm -f *.o 
+	rm -f *.o $(OBJ2)
 veryclean: 
 	rm -f *.o $(TARGET)
