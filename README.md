@@ -44,7 +44,7 @@ LAPACKE (C), FFTW on to-do list.
   parsec.sh:
   ```
   #!/bin/bash
-  LD_PRELOAD=libsimpleperf.so 
+  LD_PRELOAD=peak_prof.so 
   ./parsec.exe 
   ```
 
