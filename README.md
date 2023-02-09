@@ -90,7 +90,6 @@ group:  ScaLAPACK, function:   pdsyevx_, count:      10, time:      4.310
                                            total library time:     46.459
 -------------------------------------------------------------------------
 
-
 -------------------  function statistics (exclusive) --------------------
     exclusive time (in seconds) and counts
 -------------------------------------------------------------------------
