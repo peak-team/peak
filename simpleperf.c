@@ -8,10 +8,13 @@
 #include <stdlib.h>     /* atexit */
 
 // global 
-bool simpleperf_init_flag=false;
-int simpleperf_mkl_fake=-1;
-int simpleperf_debug=0;
-double apptime;
+ bool simpleperf_init_flag=false;
+ int simpleperf_mkl_fake=-1;
+ int simpleperf_debug=0;
+ double apptime=0.0;
+ double libtime=0.0;
+ double layer_time[MAX_LAYER];
+ int layer_count;
 
 #ifdef _OPENMP
   omp_lock_t lock;
@@ -46,9 +49,9 @@ void env_get()
 
 void env_show()
 {
-   fprintf(stdout, "------------------ Simple Perf ENV -------------------\n");
-   fprintf(stdout, "SIMPLEPERF_MKL_FAKE = %d \n",simpleperf_mkl_fake); 
-   fprintf(stdout, "SIMPLEPERF_DEBUG = %d \n",simpleperf_debug);
+   fprintf(stdout, "environmental variables:\n");
+//   fprintf(stdout, "SIMPLEPERF_MKL_FAKE = %d \n",simpleperf_mkl_fake); 
+   fprintf(stdout, "    SIMPLEPERF_DEBUG = %d \n",simpleperf_debug);
 
    //fprintf(stderr,"*******************************\n");
 
@@ -63,17 +66,19 @@ void env_show()
   {
     apptime = mysecond()-apptime;
     fprintf(stdout,"\n"); 
-    fprintf(stdout, "-------------------- Simple Perf ---------------------\n");
-    fprintf(stdout,"Total runtime: %.3f\n",apptime);
+    printf("----------------------------- Simple Perf -------------------------------\n");
+    fprintf(stdout,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n",apptime, libtime, libtime/apptime*100);
     env_show();
-    hash_show();
+    hash_show_final();
     fprintf(stdout,"\n"); 
   }
   //fclose(bpfile);
 }
 
-void blas_init(){
+void lib_init(){
   simpleperf_init_flag=true;
+  layer_count=0; 
+  memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
   env_get();
   atexit(simpleperf_finalize);
 #ifdef _OPENMP

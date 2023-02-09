@@ -1,6 +1,7 @@
 
 #include "simpleperf.h"
 #include "hash.h"
+#include "stack.h"
 #include "complex.h"
 
 #define func_group "BLAS"

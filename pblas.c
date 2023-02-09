@@ -1,5 +1,6 @@
 #include "simpleperf.h"
 #include "hash.h"
+#include "stack.h"
 
 #define func_group "PBLAS"
 

@@ -16,11 +16,15 @@
 extern omp_lock_t lock;
 #endif
 
-void blas_init();
+#define MAX_LAYER 20
+void lib_init();
 extern bool simpleperf_init_flag;
 extern int simpleperf_mkl_tune;
 extern int simpleperf_debug;
 extern double apptime;
+extern double libtime;
+extern double layer_time[MAX_LAYER];
+extern int layer_count;
 //extern FILE *bpfile;
 
 double mysecond();

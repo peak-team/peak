@@ -1,18 +1,28 @@
 // BLAS is called here
 //
 
-  time=mysecond()-time;
-#pragma omp atomic
-  item->value.time += time;
-
-#pragma omp atomic
+  local_time=mysecond()-local_time;
+//#pragma omp atomic
+  if ( layer_count == 1) { 
+     item->value.time_di += local_time;
+     libtime+=local_time; 
+     item->value.count_di++;
+  }
+  item->value.time_in += local_time;
+  item->value.time_ex += local_time - layer_time[layer_count];
+  layer_time[layer_count-1] += local_time;
   item->value.count ++;
 
-//  printf("\n------------ in %s wrapper -----------\n",__func__);
-//  printf ("%s time = %.6f seconds, count = %d\n",__func__,item->value.time, item->value.count);
-//  printf("------------------------------------------\n\n");
+//  printf("layer count %d\n", layer_count);
+//  printf("local time %.3f, layer time %.3f\n",local_time, layer_time[layer_count]);
+  layer_count--;
 
- if (simpleperf_debug>1) hash_show();
+  if (simpleperf_debug>1) hash_show();
+  if (simpleperf_debug>0) printf("SIMPLEPERF: done with %s\n",__func__);
+
+#ifdef _OPENMP
+}
+#endif
 
  
 
