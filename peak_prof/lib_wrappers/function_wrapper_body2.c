@@ -17,8 +17,8 @@
 //  printf("local time %.3f, layer time %.3f\n",local_time, layer_time[layer_count]);
   layer_count--;
 
-  if (simpleperf_debug>1) hash_show();
-  if (simpleperf_debug>0) printf("SIMPLEPERF: done with %s\n",__func__);
+  if (peakprof_debug>1) hash_show();
+  if (peakprof_debug>0) printf("PEAKPROF: done with %s\n",__func__);
 
 #ifdef _OPENMP
 }

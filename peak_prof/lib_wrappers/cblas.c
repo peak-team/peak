@@ -1,5 +1,4 @@
-#include "simpleperf.h"
-#include "hash.h"
+#include "lib_wrappers/lib_wrappers.h"
 
 #define func_group "CBLAS"
 

@@ -44,7 +44,7 @@ struct item* hash_get(char* key) {
 }
 
 void hash_show() {
-    printf("---------- Simple Perf: function statistics (inclusive) ----------\n");
+    printf("---------- PEAK Prof: function statistics (inclusive) ----------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
