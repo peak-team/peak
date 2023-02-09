@@ -54,10 +54,6 @@ void hash_show() {
     }   
     printf("----------------------------------------------------\n");
     fflush(stdout);
-<<<<<<< HEAD
-=======
-
->>>>>>> e3b32d1bafe1699be7844d3537d0df60a1320032
 }
 
 void hash_show_final() {
