@@ -10,7 +10,7 @@
 #endif
 
   if(!peakprof_init_flag) lib_init(); 
-  if (peakprof_debug>0) printf("PEAKPROF: calling %s\n",__func__);
+  if (peakprof_debug>0) fprintf(stdout,"PEAKPROF: calling %s\n",__func__);
 
 //  memset(layer_time, 0, (MAX_LAYER*sizeof(layer_time[0]));
   for (int i=layer_count+1;i<MAX_LAYER;i++) layer_time[i]=0.0;

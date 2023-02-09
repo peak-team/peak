@@ -1,4 +1,4 @@
-#include "peak_prof.h"
+#include "lib_prof.h"
 #include "hash.h"
 #include <stdlib.h>     /* atexit */
 

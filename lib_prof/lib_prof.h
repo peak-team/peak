@@ -16,7 +16,8 @@
 extern omp_lock_t lock;
 #endif
 
-#define MAX_LAYER 20
+#define MAX_LAYER 20   //max tracked nested calls
+
 void lib_init();
 extern bool peakprof_init_flag;
 extern int peakprof_mkl_tune;

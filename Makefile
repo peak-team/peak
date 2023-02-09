@@ -1,19 +1,19 @@
 CC = mpicc
 FC = mpiifort
-INCLUDE = -I./  -I./peak_prof/ -I./peak_prof/lib_wrappers/
+INCLUDE = -I./  -I./lib_prof/ -I./lib_prof/lib_wrappers/
 CFLAGS = -O2 -g $(INCLUDE) -shared -fPIC -qopenmp
 LIBS = 
 
-DIR1 = peak_prof
-OBJ1 = $(DIR1)/peak_prof.o $(DIR1)/mysecond.o $(DIR1)/hash.o  \
+DIR1 = lib_prof
+OBJ1 = $(DIR1)/lib_prof.o $(DIR1)/mysecond.o $(DIR1)/hash.o  \
        $(DIR1)/lib_wrappers/blas.o $(DIR1)/lib_wrappers/cblas.o\
        $(DIR1)/lib_wrappers/lapack.o  \
        $(DIR1)/lib_wrappers/scalapack.o\
        $(DIR1)/lib_wrappers/pblas.o  
 OBJ2 = perf_counter/perf_counter.o
 DEPS0 = makefile
-DEPS = $(DEPS0) $(DIR1)/peak_prof.h $(DIR1)/hash.h 
-TARGET = peak_prof.so
+DEPS = $(DEPS0) $(DIR1)/lib_prof.h $(DIR1)/hash.h 
+TARGET = peak_libprof.so
 TARGET2 = peak_counter.so
 
 ALL : $(TARGET) $(TARGET2) #a.out
