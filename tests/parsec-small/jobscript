@@ -1,0 +1,8 @@
+#!/bin/bash
+#SBATCH -J Si23049H3220
+#SBATCH -p development
+#SBATCH -N 32
+#SBATCH --tasks-per-node 56
+#SBATCH -t 0:30:00
+
+./run.sh

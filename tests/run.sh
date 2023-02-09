@@ -44,6 +44,6 @@ do
   cmd="$COMPILER $FLAG -o $EXE $t"
   echo $cmd
   $cmd
-  LD_PRELOAD=../liblibperf.so  $EXE 
+  LD_PRELOAD=../libsimpleperf.so  $EXE 
   rm $EXE
 done
