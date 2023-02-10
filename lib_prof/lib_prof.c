@@ -51,9 +51,9 @@ void env_get()
 
 void env_show()
 {
-   fprintf(stdout, "environmental variables:\n");
-//   fprintf(stdout, "PEAKPROF_MKL_FAKE = %d \n",peakprof_mkl_fake); 
-   fprintf(stdout, "    PEAKPROF_DEBUG = %d \n",peakprof_debug);
+   fprintf(OUTFILE, "environmental variables:\n");
+//   fprintf(OUTFILE, "PEAKPROF_MKL_FAKE = %d \n",peakprof_mkl_fake); 
+   fprintf(OUTFILE, "    PEAKPROF_DEBUG = %d \n",peakprof_debug);
 
 
    return ;
@@ -66,12 +66,16 @@ void env_show()
 #endif
   {
     apptime = mysecond()-apptime;
-    fprintf(stdout,"\n"); 
-    printf("----------------------------- PEAK Prof -------------------------------\n");
-    fprintf(stdout,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n",apptime, libtime, libtime/apptime*100);
+    fprintf(OUTFILE,"\n"); 
+
+    fprintf(OUTFILE, "        ----------------------------------------------------\n");
+    fprintf(OUTFILE, "                         PEAK Prof Library\n");
+    fprintf(OUTFILE, "        ----------------------------------------------------\n");
+    fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
+    fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n",apptime, libtime, libtime/apptime*100);
     env_show();
     hash_show_final();
-    fprintf(stdout,"\n"); 
+    fprintf(OUTFILE,"\n"); 
   }
   //fclose(bpfile);
 }
@@ -80,9 +84,9 @@ void libprof_init(){
 
 
    apptime = mysecond();
-   fprintf(stdout, "        ----------------------------------------------------\n");
-   fprintf(stdout, "                    Using PEAK Prof Library\n");
-   fprintf(stdout, "        ----------------------------------------------------\n");
+   fprintf(OUTFILE, "        ----------------------------------------------------\n");
+   fprintf(OUTFILE, "                    Starting PEAK Prof Library\n");
+   fprintf(OUTFILE, "        ----------------------------------------------------\n");
 
    peakprof_init_flag=true;
    layer_count=0; 

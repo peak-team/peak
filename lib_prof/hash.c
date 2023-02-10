@@ -7,6 +7,8 @@
 
 #define HASH_SIZE 200
 
+#define OUTFILE stdout
+
 
 struct item* hashtable[HASH_SIZE];
 int hash_size=0;
@@ -46,16 +48,16 @@ struct item* hash_get(char* key) {
 }
 
 void hash_show() {
-    fprintf(stdout,"---------- PEAK Prof: function statistics (inclusive) ----------\n");
+    fprintf(OUTFILE,"---------- PEAK Prof: function statistics (inclusive) ----------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
-            fprintf(stdout,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_in);
+            fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_in);
             item = item->next;
         }   
     }   
-    fprintf(stdout,"----------------------------------------------------\n");
-    fflush(stdout);
+    fprintf(OUTFILE,"----------------------------------------------------\n");
+    fflush(OUTFILE);
 }
 
 void hash_show_final() {
@@ -64,56 +66,56 @@ void hash_show_final() {
 
 
     time_sum=0.0;
-    fprintf(stdout,"\n----------------------  function statistics (direct) --------------------\n");
-    fprintf(stdout,"    time (in seconds) and counts of direct calls\n");
-    fprintf(stdout,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"\n----------------------  function statistics (direct) --------------------\n");
+    fprintf(OUTFILE,"    time (in seconds) and counts of direct calls\n");
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
             if(item->value.count_di>0) 
             { 
-              fprintf(stdout,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count_di, item->value.time_di);
+              fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count_di, item->value.time_di);
               time_sum+=item->value.time_di;
             }
             item = item->next;
         }   
     }   
-    fprintf(stdout,"%62s %10.3f\n","total library time:", time_sum);
-    fprintf(stdout,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%62s %10.3f\n","total library time:", time_sum);
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
 
 
 
     time_sum=0.0;
-    fprintf(stdout,"\n-------------------  function statistics (exclusive) --------------------\n");
-    fprintf(stdout,"    exclusive time (in seconds) and counts\n");
-    fprintf(stdout,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"\n-------------------  function statistics (exclusive) --------------------\n");
+    fprintf(OUTFILE,"    exclusive time (in seconds) and counts\n");
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
-            fprintf(stdout,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_ex);
+            fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_ex);
             time_sum+=item->value.time_ex;
             item = item->next;
         }   
     }   
-    fprintf(stdout,"%62s %10.3f\n","total library time:", time_sum);
-    fprintf(stdout,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%62s %10.3f\n","total library time:", time_sum);
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
 
 
     time_sum=0.0;
-    fprintf(stdout,"\n-------------------  function statistics (inclusive) --------------------\n");
-    fprintf(stdout,"    inclusive time (in seconds) and counts\n");
-    fprintf(stdout,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"\n-------------------  function statistics (inclusive) --------------------\n");
+    fprintf(OUTFILE,"    inclusive time (in seconds) and counts\n");
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
         while (item != NULL) {
-            fprintf(stdout,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_in);
+            fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", item->value.fgroup, item->key, item->value.count, item->value.time_in);
             item = item->next;
         }   
     }   
-    fprintf(stdout,"-------------------------------------------------------------------------\n\n");
+    fprintf(OUTFILE,"-------------------------------------------------------------------------\n\n");
 
 
-    fflush(stdout);
+    fflush(OUTFILE);
 }
 
 
@@ -124,9 +126,9 @@ int main() {
     hash_insert("key2", 2,0.3);
     hash_insert("key3", 5,0.9);
     struct item* item = hash_get("key1");
-    fprintf(stdout,"%d %.3f\n", item->value.count,item->value.time);
+    fprintf(OUTFILE,"%d %.3f\n", item->value.count,item->value.time);
     item = hash_get("key2");
-    fprintf(stdout,"%d %.3f\n", item->value.count,item->value.time);
+    fprintf(OUTFILE,"%d %.3f\n", item->value.count,item->value.time);
     hash_show();
 
     return 0;

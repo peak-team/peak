@@ -46,8 +46,8 @@ do
   cmd="$COMPILER $FLAG -o $EXE $t"
   echo $cmd
   $cmd
-#  LD_PRELOAD=../peak_libprof.so  $EXE 
-  LD_PRELOAD=../peak_counter.so  $EXE 
+   LD_PRELOAD=../peak_libprof.so  $EXE 
+# LD_PRELOAD=../peak_counter.so  $EXE 
   printf "\n\n"
- # rm $EXE
+   rm $EXE
 done

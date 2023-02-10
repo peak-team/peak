@@ -18,7 +18,7 @@
   layer_count--;
 
   if (peakprof_debug>1) hash_show();
-  if (peakprof_debug>0) fprintf(stdout,"PEAKPROF: done with %s\n",__func__);
+  if (peakprof_debug>0) fprintf(OUTFILE,"PEAKPROF: done with %s\n",__func__);
 
 #ifdef _OPENMP
 }
