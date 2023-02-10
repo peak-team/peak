@@ -7,7 +7,7 @@
 CC=icc
 FC=ifort 
 FLAG0="-O2 -g"
-LIB=-qmkl 
+LIB=-mkl 
 FLAG="$FLAG0 $LIB"
 
 COMPILER=""
@@ -19,7 +19,7 @@ EXE=""
 f_type(){
   file=$1
   ext=`echo $file|awk -F. '{print $NF}'`
-  EXE=`echo $file|sed "s/.$ext//g"`
+  EXE=`echo $file|sed "s/\.$ext//g"`
   case $ext in 
       c)
       COMPILER=$CC ;;
@@ -40,10 +40,14 @@ f_type(){
 
 for t in test_dgemm.F  test_symv.f90  test_ysr.f90 test_cblas_dgemm.c test_lapacke_dgesv.c test_lapack_dgesv.F
 do
+  printf "\n\n"
+  echo "*********************** running $t ***************************"
   f_type $t
   cmd="$COMPILER $FLAG -o $EXE $t"
   echo $cmd
   $cmd
-  LD_PRELOAD=../libsimpleperf.so  $EXE 
-  rm $EXE
+#  LD_PRELOAD=../peak_libprof.so  $EXE 
+  LD_PRELOAD=../peak_counter.so  $EXE 
+  printf "\n\n"
+ # rm $EXE
 done

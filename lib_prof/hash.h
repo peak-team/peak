@@ -22,3 +22,4 @@ struct item* hash_insert(char* key);
 struct item* hash_get(char* key);
 void hash_show();
 void hash_show_final();
+int hash_size;

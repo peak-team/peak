@@ -30,4 +30,7 @@ extern int layer_count;
 
 double mysecond();
 
+extern int my_rank_id;
+extern int my_rank_size; 
+
 

@@ -9,6 +9,7 @@
 
 
 struct item* hashtable[HASH_SIZE];
+int hash_size=0;
 
 unsigned long hash(char* str) {
     unsigned long hash = 5381;
@@ -29,6 +30,7 @@ struct item* hash_insert(char* key) {
     new_item->value.count_di = 0;
     new_item->next = hashtable[index];
     hashtable[index] = new_item;
+    hash_size++;
     return new_item;
 }
 

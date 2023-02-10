@@ -8,6 +8,8 @@
  double libtime=0.0;
  double layer_time[MAX_LAYER];
  int layer_count;
+ int my_rank_id;
+ int my_rank_size; 
 
 // environmental variables
  int peakprof_debug=0;
@@ -57,9 +59,9 @@ void env_show()
    return ;
 }
 
- void peakprof_finalize(){
+ void libprof_finalize(){
 #ifdef _OPENMP
-  omp_destroy_lock(&lock);
+//  omp_destroy_lock(&lock);
 #pragma omp master
 #endif
   {
@@ -74,24 +76,27 @@ void env_show()
   //fclose(bpfile);
 }
 
-void lib_init(){
-  peakprof_init_flag=true;
-  layer_count=0; 
-  memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
-  env_get();
-  atexit(peakprof_finalize);
-#ifdef _OPENMP
-  omp_init_lock(&lock);
-#endif
-// bpfile = fopen("peakprof.log");
-  return;
-}
+void libprof_init(){
 
-void __attribute__ ((constructor)) premain()
-{
 
    apptime = mysecond();
    fprintf(stdout, "        ----------------------------------------------------\n");
    fprintf(stdout, "                    Using PEAK Prof Library\n");
    fprintf(stdout, "        ----------------------------------------------------\n");
+
+   peakprof_init_flag=true;
+   layer_count=0; 
+   memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
+   env_get();
+  //atexit(peakprof_finalize);
+#ifdef _OPENMP
+//  omp_init_lock(&lock);
+#endif
+// bpfile = fopen("peakprof.log");
+  return;
 }
+
+
+void libprof_init()     __attribute__((constructor));
+void libprof_finalize() __attribute__((destructor));
+
