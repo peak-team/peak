@@ -87,6 +87,7 @@ char *counter_names[NUM_COUNTERS] = {
     "FP_ARITH_INST_RETIRED.512B_PACKED_SINGLE"
 };
 double scaling_factors[NUM_COUNTERS] = {1, 1, 2, 4, 4, 8, 8, 16};
+double counter_64bits[NUM_COUNTERS] = {1, 0, 1, 0, 1, 0, 1, 0};
 
 long long configs_uc[NUM_COUNTERS_UC] = {
     CAS_COUNT_RD,
@@ -279,15 +280,33 @@ int get_MPI_local_rank() {
 }
 
 int MPI_Finalize(void) {
+    //printf("--- My Final ---\n");
     return 0;
 }
 
-void print_result(char *argv, double* values, double* values_uc, double elapsed_time, int node_count) {
-    double flops = 0;
-    for (int i = 0; i < NUM_COUNTERS; i++) {
-        flops += values[i] * scaling_factors[i]; 
+int (*original_pmpi_finalize)(void);
+int peak_counter_done = 0;
+int PMPI_Finalize(void) {
+    //printf("--- My PFinal ---\n");
+    if (!original_pmpi_finalize) {
+        original_pmpi_finalize = dlsym(RTLD_NEXT, "PMPI_Finalize");
     }
-    if (flops > 1e3) {
+    if(peak_counter_done)
+        return original_pmpi_finalize();
+    else
+        return 0;
+}
+
+void print_result(char *argv, double* values, double* values_uc, double elapsed_time, int node_count) {
+    double flops_32 = 0;
+    double flops_64 = 0;
+    for (int i = 0; i < NUM_COUNTERS; i++) {
+        if (counter_64bits[i])
+            flops_64 += values[i] * scaling_factors[i]; 
+        else
+            flops_32 += values[i] * scaling_factors[i];
+    }
+    if (flops_64 + flops_32 > 1e3) {
         double mem_v[NUM_COUNTERS_UC] = {0.0};
         fprintf(stderr, "argv[%d]: %s\n", 0, argv);
         for (int i = 0; i < NUM_COUNTERS_UC; i++) {
@@ -305,9 +324,12 @@ void print_result(char *argv, double* values, double* values_uc, double elapsed_
         fprintf(stderr, "Memory Write [GB]:       %f\n", mem_v[1]/1e9);
         fprintf(stderr, "Memory BW [GB/s]:        %f\n", (mem_v[0]+mem_v[1])/1e9/elapsed_time);
         fprintf(stderr, "Memory BW/node [GB/s]:   %f\n", (mem_v[0]+mem_v[1])/1e9/elapsed_time/node_count);
-        fprintf(stderr, "TFLOP:                   %f\n", flops/1e12);
-        fprintf(stderr, "TFLOPS:                  %f\n", flops/elapsed_time/1e12);
-        fprintf(stderr, "TFLOPS/node:             %f\n", flops/elapsed_time/1e12/node_count);
+        fprintf(stderr, "32bit TFLOP:             %f\n", flops_32/1e12);
+        fprintf(stderr, "64bit TFLOP:             %f\n", flops_64/1e12);
+        fprintf(stderr, "32bit TFLOPS:            %f\n", flops_32/elapsed_time/1e12);
+        fprintf(stderr, "64bit TFLOPS:            %f\n", flops_64/elapsed_time/1e12);
+        fprintf(stderr, "32bit TFLOPS/node:       %f\n", flops_32/elapsed_time/1e12/node_count);
+        fprintf(stderr, "64bit TFLOPS/node:       %f\n", flops_64/elapsed_time/1e12/node_count);
     }
 }
 
@@ -337,6 +359,7 @@ void reduce_result(char *argv, double* values, double* values_uc, double elapsed
     if (rank == 0) {
         print_result(argv, sum_values, sum_values_uc, elapsed_time, total_node_count);
     }
+    peak_counter_done =1;
     PMPI_Finalize();
 }
 
