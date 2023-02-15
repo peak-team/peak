@@ -78,5 +78,5 @@ export PEAKPROF_DEBUG=2    # turn this on to report timing at every library call
 2. only measures the master thread in OpenMP
 
 ## Example Output:
-[PEAK Prof output for PARSEC](peak_prof/output.md)
+[PEAK Prof output for PARSEC](lib_prof/output.md)
 
