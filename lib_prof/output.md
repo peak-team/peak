@@ -1,7 +1,7 @@
 
 For PARSEC:  
 
-** small problem Single node:**  
+**small problem Single node:**  
 
 ```
 ----------------------------------------------------
