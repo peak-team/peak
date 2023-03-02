@@ -1,23 +1,26 @@
-CC = mpicc
-FC = mpiifort
 
-INCLUDE = -I./
-CFLAGS = -O2 -g $(INCLUDE) -shared -fPIC -qopenmp
-LIBS = 
+
+include ../Make.inc
 
 OBJ = perf_counter.o
+TARGET = peak_counter.so
+
+INCLUDE = -I./
+LOCAL_CFLAGS = $(CFLAGS) $(INCLUDE)
+LIBS = 
+
 DEPS0 = Makefile
 DEPS = $(DEPS0) 
-TARGET = peak_counter.so
 
 ALL : $(TARGET) link
 
 
 $(TARGET) : $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ 
+	$(CC) $(LOCAL_CFLAGS) -o $@ $^ 
 
 %.o: %.c $(DEPS)
-	$(CC) $(CFLAGS) -c -o $@ $< 
+	$(CC) $(LOCAL_CFLAGS) -c -o $@ $< 
+
 
 .PHONY: link
 link :

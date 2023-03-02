@@ -1,18 +1,20 @@
-CC = mpicc
-FC = mpiifort
 
-INCLUDE = -I./ -I./lib_wrappers/
-CFLAGS = -O2 -g $(INCLUDE) -shared -fPIC -qopenmp
-LIBS = 
 
+include ../Make.inc
+
+TARGET = peak_libprof.so
 OBJ = lib_prof.o util.o hash.o  \
        lib_wrappers/blas.o lib_wrappers/cblas.o\
        lib_wrappers/lapack.o  \
        lib_wrappers/scalapack.o\
        lib_wrappers/pblas.o  
+
+INCLUDE = -I./ -I./lib_wrappers/
+LOCAL_CFLAGS = $(CFLAGS) $(INCLUDE)
+LIBS = 
+
 DEPS0 = Makefile
 DEPS = $(DEPS0) lib_prof.h hash.h util.h
-TARGET = peak_libprof.so
 
 ALL : $(TARGET) link
 
@@ -20,10 +22,11 @@ ALL : $(TARGET) link
 #	$(FC) -qmkl test.F
 
 $(TARGET) : $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ 
+	$(CC) $(LOCAL_CFLAGS) -o $@ $^ 
 
 %.o: %.c $(DEPS)
-	$(CC) $(CFLAGS) -c -o $@ $< 
+	$(CC) $(LOCAL_CFLAGS) -c -o $@ $< 
+
 
 .PHONY: link
 link :
