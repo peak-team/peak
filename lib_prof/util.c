@@ -1,3 +1,23 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+
+
+
+
+int check_MPI() {
+    char* pmi_rank = getenv("PMI_RANK");
+    char* mvapich_rank = getenv("MV2_COMM_WORLD_RANK");
+    char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
+    if (pmi_rank != NULL || ompi_rank != NULL || mvapich_rank != NULL)
+        return 1;
+    else
+        return 0;
+}
+
+
+
+
 /* A gettimeofday routine to give access to the wall
    clock timer on most UNIX-like systems.
 

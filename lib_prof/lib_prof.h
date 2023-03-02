@@ -30,7 +30,7 @@ extern double layer_time[MAX_LAYER];
 extern int layer_count;
 //extern FILE *bpfile;
 
-double mysecond();
+#include "util.h"
 
 extern int my_rank_id;
 extern int my_rank_size; 
