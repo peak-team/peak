@@ -11,7 +11,7 @@
 
 
 struct item* hashtable[HASH_SIZE];
-int hash_size=0;
+static int hash_count=0;
 
 unsigned long hash(char* str) {
     unsigned long hash = 5381;
@@ -24,7 +24,8 @@ unsigned long hash(char* str) {
 struct item* hash_insert(char* key) {
     unsigned long index = hash(key);
     struct item* new_item = (struct item*) malloc(sizeof(struct item));
-    new_item->key = strdup(key);
+//    new_item->key = strdup(key);
+    strcpy(new_item->key, key);
     new_item->value.time_di =  0.0; 
     new_item->value.time_in =  0.0; 
     new_item->value.time_ex =  0.0; 
@@ -32,7 +33,7 @@ struct item* hash_insert(char* key) {
     new_item->value.count_di = 0;
     new_item->next = hashtable[index];
     hashtable[index] = new_item;
-    hash_size++;
+    hash_count++;
     return new_item;
 }
 
@@ -46,6 +47,8 @@ struct item* hash_get(char* key) {
     }   
     return NULL;
 }
+
+int hash_get_size(){ return hash_count;}
 
 void hash_show() {
     fprintf(OUTFILE,"---------- PEAK Prof: function statistics (inclusive) ----------\n");
@@ -64,10 +67,9 @@ void hash_show_final() {
     
     double time_sum;
 
-
     time_sum=0.0;
     fprintf(OUTFILE,"\n----------------------  function statistics (direct) --------------------\n");
-    fprintf(OUTFILE,"    time (in seconds) and counts of direct calls\n");
+    fprintf(OUTFILE,"    direct call time (in seconds) and counts\n");
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
@@ -87,7 +89,8 @@ void hash_show_final() {
 
     time_sum=0.0;
     fprintf(OUTFILE,"\n-------------------  function statistics (exclusive) --------------------\n");
-    fprintf(OUTFILE,"    exclusive time (in seconds) and counts\n");
+    fprintf(OUTFILE,"    exclusive call time (in seconds) and counts\n");
+//  fprintf(OUTFILE,"    (call time and counts spent in a function exclusing its children functions)\n");
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
@@ -103,7 +106,7 @@ void hash_show_final() {
 
     time_sum=0.0;
     fprintf(OUTFILE,"\n-------------------  function statistics (inclusive) --------------------\n");
-    fprintf(OUTFILE,"    inclusive time (in seconds) and counts\n");
+    fprintf(OUTFILE,"    inclusive call time (in seconds) and counts\n");
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i = 0; i < HASH_SIZE; i++) {
         struct item* item = hashtable[i];
@@ -118,6 +121,31 @@ void hash_show_final() {
     fflush(OUTFILE);
 }
 
+
+struct item* hash_to_array(){
+    int fn=hash_get_size();
+    struct item* harray=malloc(fn*sizeof(struct item));
+
+    int fi=0;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        struct item* item = hashtable[i];
+        while (item != NULL) {
+            strcpy(harray[fi].key,item->key);
+            harray[fi].value.count_di=item->value.count_di;
+            harray[fi].value.count=item->value.count;
+            harray[fi].value.time_di=item->value.time_di;
+            harray[fi].value.time_in=item->value.time_in;
+            harray[fi].value.time_ex=item->value.time_ex;
+            strcpy(harray[fi].value.fgroup,item->value.fgroup);
+            strcpy(harray[fi].value.comment,item->value.comment);
+            harray[fi].next=NULL;
+            fi++;
+            item = item->next;
+        }   
+    }   
+
+    return harray;
+}
 
 
 /*

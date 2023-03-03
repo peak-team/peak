@@ -18,15 +18,15 @@ extern omp_lock_t lock;
 
 
 #define MAX_LAYER 20   //max tracked nested calls
+extern double layer_time[MAX_LAYER];
+
 #define OUTFILE stdout
 
-void lib_init();
 extern bool peakprof_init_flag;
 extern int peakprof_mkl_tune;
 extern int peakprof_debug;
 extern double apptime;
 extern double libtime;
-extern double layer_time[MAX_LAYER];
 extern int layer_count;
 //extern FILE *bpfile;
 

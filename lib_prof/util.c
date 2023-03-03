@@ -1,23 +1,4 @@
 
-#include <stdio.h>
-#include <stdlib.h>
-
-
-
-
-int check_MPI() {
-    char* pmi_rank = getenv("PMI_RANK");
-    char* mvapich_rank = getenv("MV2_COMM_WORLD_RANK");
-    char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
-    if (pmi_rank != NULL || ompi_rank != NULL || mvapich_rank != NULL)
-        return 1;
-    else
-        return 0;
-}
-
-
-
-
 /* A gettimeofday routine to give access to the wall
    clock timer on most UNIX-like systems.
 
@@ -44,4 +25,31 @@ struct timezone { int   tz_minuteswest;
 }
 
 double mysecond_() {return mysecond();}
+
+
+
+
+#include <stdio.h>
+#include <stdlib.h>
+
+int check_MPI() {
+    char* pmi_rank = getenv("PMI_RANK");
+    char* pmix_rank = getenv("PMIX_RANK");
+    char* mvapich_rank = getenv("MV2_COMM_WORLD_RANK");
+    char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
+//    char* slurm_rank = getenv("SLURM_PROCID");
+    if (pmi_rank != NULL || pmix_rank != NULL || ompi_rank != NULL || mvapich_rank != NULL ) //|| slurm_rank != NULL)
+        return 1;
+    else
+        return 0;
+}
+/* local ranks
+    OMPI_COMM_WORLD_LOCAL_RANK
+    MPI_LOCALRANKID
+    MV2_COMM_WORLD_LOCAL_RANK
+    SLURM_LOCALID
+ */
+
+
+
 

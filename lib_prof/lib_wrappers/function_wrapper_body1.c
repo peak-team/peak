@@ -20,12 +20,12 @@
   item = hash_get(str); 
   if (item == NULL ) {
     item = hash_insert(str);
-//    strcpy(item->value.fgroup,func_group);
-    item->value.fgroup=func_group;
+    strcpy(item->value.fgroup,func_group);
+  //  item->value.fgroup=func_group;
   }
 #ifdef _OPENMP
 //  omp_unset_lock(&lock);
- }
+}
 #endif
 
   orig_f = dlsym(RTLD_NEXT, __func__);
