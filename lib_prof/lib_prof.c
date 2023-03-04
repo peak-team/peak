@@ -105,10 +105,10 @@ void print_result() {
     fprintf(OUTFILE, "        ----------------------------------------------------\n");
     fprintf(OUTFILE, "                         PEAK Prof Library\n");
     fprintf(OUTFILE, "        ----------------------------------------------------\n");
-    fprintf(OUTFILE, "for application: %s\n",argv0);
-    fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
-    fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n",apptime, libtime, libtime/apptime*100);
-    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE, "for application: %s\n\n",argv0);
+//   fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
+    fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n\n",apptime, libtime, libtime/apptime*100);
+//   fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     env_show();
      // hash_show_final();
 
