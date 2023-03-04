@@ -24,4 +24,8 @@ int hash_get_size();
 void hash_show();
 void hash_show_final();
 int hash_size;
+
 struct item* hash_to_array();
+int compare_time_di(const void *a, const void *b);
+int compare_time_ex(const void *a, const void *b);
+int compare_time_in(const void *a, const void *b);

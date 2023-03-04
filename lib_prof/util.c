@@ -34,11 +34,11 @@ double mysecond_() {return mysecond();}
 
 int check_MPI() {
     char* pmi_rank = getenv("PMI_RANK");
-    char* pmix_rank = getenv("PMIX_RANK");
+    //char* pmix_rank = getenv("PMIX_RANK");
     char* mvapich_rank = getenv("MV2_COMM_WORLD_RANK");
-    char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
-//    char* slurm_rank = getenv("SLURM_PROCID");
-    if (pmi_rank != NULL || pmix_rank != NULL || ompi_rank != NULL || mvapich_rank != NULL ) //|| slurm_rank != NULL)
+   // char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
+    //char* slurm_rank = getenv("SLURM_PROCID");
+    if (pmi_rank != NULL  || mvapich_rank != NULL ) // || slurm_rank != NULL)
         return 1;
     else
         return 0;
@@ -51,5 +51,24 @@ int check_MPI() {
  */
 
 
+#include <string.h>
+void get_argv0(char **argv0) {
+    char* buffer = (char *)malloc(sizeof(char) * (1024));
+    strcpy(buffer, "null\0");
+    FILE *fp = fopen("/proc/self/cmdline", "r");
+    if (!fp) {
+        perror("fopen");
+        *argv0 = buffer;
+        return;
+    }
 
+    int n = fread(buffer, 1, 1024, fp);
+    if (n == 0) {
+        perror("fread");
+        *argv0 = buffer;
+        return;
+    }
+    buffer[n-1] = '\0';
+    *argv0 = buffer;
+}
 

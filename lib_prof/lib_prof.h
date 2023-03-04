@@ -11,28 +11,21 @@
 #include <stdbool.h>
 #include <string.h>
 
-#ifdef _OPENMP
-#include <omp.h>
-extern omp_lock_t lock;
-#endif
-
-
 #define MAX_LAYER 20   //max tracked nested calls
 extern double layer_time[MAX_LAYER];
 
 #define OUTFILE stdout
 
 extern bool peakprof_init_flag;
-extern int peakprof_mkl_tune;
 extern int peakprof_debug;
+extern int peakprof_mkl_fake;
+extern int peakprof_record_rank;
+extern double peakprof_record_threshold;
 extern double apptime;
 extern double libtime;
 extern int layer_count;
 //extern FILE *bpfile;
 
 #include "util.h"
-
-extern int my_rank_id;
-extern int my_rank_size; 
 
 

@@ -148,6 +148,26 @@ struct item* hash_to_array(){
 }
 
 
+int compare_time_di(const void *a, const void *b) {
+    double va = ((struct item*)a)->value.time_di;
+    double vb = ((struct item*)b)->value.time_di;
+    return (va > vb) ? -1 : (va < vb) ? 1 : 0;
+}
+
+int compare_time_ex(const void *a, const void *b) {
+    double va = ((struct item*)a)->value.time_ex;
+    double vb = ((struct item*)b)->value.time_ex;
+    return (va > vb) ? -1 : (va < vb) ? 1 : 0;
+}
+
+int compare_time_in(const void *a, const void *b) {
+    double va = ((struct item*)a)->value.time_in;
+    double vb = ((struct item*)b)->value.time_in;
+    return (va > vb) ? -1 : (va < vb) ? 1 : 0;
+}
+
+
+
 /*
 int main() {
     hash_insert("key1", 1,0.1);
