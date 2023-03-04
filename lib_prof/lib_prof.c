@@ -14,7 +14,7 @@
  int peakprof_debug=0;
  int peakprof_mkl_fake=-1;
  int peakprof_record_rank=0;
- double peakprof_record_threshold=0.000;
+ double peakprof_record_threshold=-0.001;
 
 //local
  char *argv0;
@@ -48,7 +48,7 @@ void env_get()
    peakprof_record_rank = myenv? atoi(myenv) : 0 ;        
 
    myenv = getenv("PEAKPROF_RECORD_THRESHOLD");
-   peakprof_record_threshold = myenv? atof(myenv) : 0.0 ;        
+   peakprof_record_threshold = myenv? atof(myenv) : -0.001 ;        
 
    return ;
 }
@@ -59,7 +59,7 @@ void env_show()
 //   fprintf(OUTFILE, "PEAKPROF_MKL_FAKE = %d \n",peakprof_mkl_fake); 
    fprintf(OUTFILE, "    PEAKPROF_DEBUG=%d \n",peakprof_debug);
    fprintf(OUTFILE, "    PEAKPROF_RECORD_RANK=%d \n",peakprof_record_rank);
-   fprintf(OUTFILE, "    PEAKPROF_RECORD_THRESHOLD=%d \n",peakprof_record_threshold);
+   fprintf(OUTFILE, "    PEAKPROF_RECORD_THRESHOLD=%.3f \n",peakprof_record_threshold);
 
    return ;
 }
@@ -118,8 +118,9 @@ void print_result() {
     fprintf(OUTFILE,"    direct call time (in seconds) and counts\n");
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i=0; i<fn; i++) {
+       if(farray[i].value.count_di>0)
          if(farray[i].value.time_di > peakprof_record_threshold)
-             fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_di);
+             fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", farray[i].value.fgroup, farray[i].key, farray[i].value.count_di, farray[i].value.time_di);
     }
     fprintf(OUTFILE,"%62s %10.3f\n","------------------------------------------ total library time:", libtime);
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
@@ -130,7 +131,7 @@ void print_result() {
     fprintf(OUTFILE,"    exclusive call time (in seconds) and counts\n");
     fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     for (int i=0; i<fn; i++) {
-         if(farray[i].value.time_di > peakprof_record_threshold)
+         if(farray[i].value.time_ex > peakprof_record_threshold)
              fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_ex);
     }
     fprintf(OUTFILE,"%62s %10.3f\n","------------------------------------------ total library time:", libtime);
