@@ -145,15 +145,24 @@ void print_result() {
 
 void reduce_result() {
     int my_rank_id, my_rank_size;
+
     if (!original_pmpi_finalize) PMPI_Finalize(); //register original_pmpi_finalize
 
-      int init_flag;
-      MPI_Initialized(&init_flag);
-      if(!init_flag) 
-              MPI_Init(NULL, NULL);
+    int init_flag;
+    MPI_Initialized(&init_flag);
+    if(!init_flag) MPI_Init(NULL, NULL);
 
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank_id);
     MPI_Comm_size(MPI_COMM_WORLD, &my_rank_size);
+
+    struct item* farray=NULL;
+    int fn = hash_get_size();
+    
+    farray=hash_to_array();
+    int* fnarray=(int*)malloc(sizeof(int) * my_rank_size);
+    MPI_Gather(&fn, 1, MPI_INT, fnarray, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (my_rank_id==0) 
+       for(int i=0;i<my_rank_size;i++) printf("fn[%d]=%d\n",i,fnarray[i]);
 
 //  MPI_Reduce(values, &sum_values, NUM_COUNTERS, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 //  MPI_Reduce(values_uc, &sum_values_uc, NUM_COUNTERS_UC*SOCKETS, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -163,6 +172,13 @@ void reduce_result() {
     if (my_rank_id == peakprof_record_rank) {
         print_result();
     }
+/*
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (my_rank_id == 63) {
+        print_result();
+    }
+*/
+    free(farray); free(fnarray);
     original_pmpi_finalize();
     return;
 }
