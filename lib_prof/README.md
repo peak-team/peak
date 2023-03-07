@@ -2,54 +2,21 @@
 
 ``make`` 
 
-## To Use without MPI: 
+## To Use: 
 
 ``LD_PRELOAD=peak_prof.so  ./a.out`` 
 
-## To Use with MPI: Attached the tool to one MPI rank.
-
-**intel mpirun:** 
-
-  run: ``mpirun -configfile ./mpmd.txt``  
-  
-  mpmd.txt: 
-  ```
-  -n 1 ./parsec.sh >stats.log  #use a wrapper to setup LD_PRELOAD
-  -n 3 ./parsec.exe
-  ```
-  parsec.sh:
-  ```
-  #!/bin/bash
-  LD_PRELOAD=peak_prof.so 
-  ./parsec.exe 
-  ```
-
-**srun:**  
-
-  run: ``srun -n 4 --multi-prog mpmd.txt``
-  
-  mpmd.txt:
-  ```
-   0 ./parsec.sh >stats.log  #use a wrapper to setup LD_PRELOAD
-   1 ./parsec.exe
-   2 ./parsec.exe
-   3 ./parsec.exe
-   ```
-  parsec.sh:
-  ```
-  #!/bin/bash
-  LD_PRELOAD=peak_prof.so 
-  ./parsec.exe 
-  ```
 
 ## Settings
 ```
-export PEAKPROF_DEBUG=2    # turn this on to report timing at every library call, otherwise timing is only reported in the end. 
+ PEAKPROF_RECORD_RANK=0               # the rank for which result will be printed out. 
+ PEAKPROF_RECORD_THRESHOLD=-0.001     # threshold for printing out timing.
 ```
 
 ## Limitations
 1. It is not able to intercept internal blas functions, e.g.  MKL's cblas_dgemm calls mkl_blas_dgemm() instead of dgemm(), and mkl_blas_dgemm is not intercepted. 
-2. only measures the master thread in OpenMP
+2. Cannot intercept static libraries. Work in progress.
+3. Only measures the master thread in OpenMP
 
 ## Example Output:
 [PEAK Prof output for PARSEC](lib_prof/output.md)
