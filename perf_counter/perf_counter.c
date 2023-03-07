@@ -12,6 +12,8 @@
 #include <signal.h>
 #include <mpi.h>
 
+#include "utils.h"
+
 #define LOCK_FILE_PREFIX "/tmp/lock_flops_count_"
 #define MAX_TIME_DIFF_ENV "FLOPS_MAX_DELAY"
 #define MAX_TIME_DIFF 60
@@ -148,8 +150,8 @@ int check_string(const char *str) {
         "/bin/sh",
         "/bin/bash", 
         "lscpu",
-        "hostname",
         "bin/ssh",
+        "hostname",
         //"awk", "sed", "grep", "lscpu", "mktemp", "rm", "mv",
         "ibrun",
         "mpirun",
@@ -235,49 +237,6 @@ int check_lock(char* file_name, char** lock_file) {
     return fd;
 }
 
-void get_argv0(char **argv0) {
-    char* buffer = (char *)malloc(sizeof(char) * (1024));
-    strcpy(buffer, "null\0");
-    FILE *fp = fopen("/proc/self/cmdline", "r");
-    if (!fp) {
-        perror("fopen");
-        *argv0 = buffer;
-        return;
-    }
-
-    int n = fread(buffer, 1, 1024, fp);
-    if (n == 0) {
-        perror("fread");
-        *argv0 = buffer;
-        return;
-    }
-    buffer[n-1] = '\0';
-    *argv0 = buffer;
-}
-
-int check_MPI() {
-    char* pmi_rank = getenv("PMI_RANK");
-    char* mvapich_rank = getenv("MV2_COMM_WORLD_RANK");
-    char* ompi_rank = getenv("OMPI_COMM_WORLD_RANK");
-    if (pmi_rank != NULL || ompi_rank != NULL || mvapich_rank != NULL)
-        return 1;
-    else
-        return 0;
-}
-
-int get_MPI_local_rank() {
-    char* pmi_rank = getenv("MPI_LOCALRANKID");
-    char* mvapich_rank = getenv("MV2_COMM_WORLD_LOCAL_RANK");
-    char* ompi_rank = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
-    if (pmi_rank != NULL)
-        return atoi(pmi_rank);
-    else if (mvapich_rank != NULL)
-        return atoi(mvapich_rank);
-    else if (ompi_rank != NULL)
-        return atoi(ompi_rank);
-    else
-        return -1;
-}
 
 int MPI_Finalize(void) {
     //printf("--- My Final ---\n");
@@ -287,7 +246,7 @@ int MPI_Finalize(void) {
 int (*original_pmpi_finalize)(void);
 int peak_counter_done = 0;
 int PMPI_Finalize(void) {
-    //printf("--- My PFinal ---\n");
+//   printf("--- My PFinal ---\n");
     if (!original_pmpi_finalize) {
         original_pmpi_finalize = dlsym(RTLD_NEXT, "PMPI_Finalize");
     }

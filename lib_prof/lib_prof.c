@@ -57,7 +57,7 @@ void env_show()
 {
    fprintf(OUTFILE, "environmental variables:\n");
 //   fprintf(OUTFILE, "PEAKPROF_MKL_FAKE = %d \n",peakprof_mkl_fake); 
-   fprintf(OUTFILE, "    PEAKPROF_DEBUG=%d \n",peakprof_debug);
+//   fprintf(OUTFILE, "    PEAKPROF_DEBUG=%d \n",peakprof_debug);
    fprintf(OUTFILE, "    PEAKPROF_RECORD_RANK=%d \n",peakprof_record_rank);
    fprintf(OUTFILE, "    PEAKPROF_RECORD_THRESHOLD=%.3f \n",peakprof_record_threshold);
 
@@ -65,12 +65,12 @@ void env_show()
 }
 
 int MPI_Finalize(void) {
-    printf("--- My Final ---\n");
+//    printf("--- My Final ---\n");
     return 0;
 }
 
 void  MPI_Finalize_(int *ierr) {
-    printf("--- My Final_ ---\n");
+//    printf("--- My Final_ ---\n");
     ierr=0;
     return ;
 }
@@ -161,8 +161,8 @@ void reduce_result() {
     farray=hash_to_array();
     int* fnarray=(int*)malloc(sizeof(int) * my_rank_size);
     MPI_Gather(&fn, 1, MPI_INT, fnarray, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (my_rank_id==0) 
-       for(int i=0;i<my_rank_size;i++) printf("fn[%d]=%d\n",i,fnarray[i]);
+ //   if (my_rank_id==0) 
+//       for(int i=0;i<my_rank_size;i++) printf("fn[%d]=%d\n",i,fnarray[i]);
 
 //  MPI_Reduce(values, &sum_values, NUM_COUNTERS, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 //  MPI_Reduce(values_uc, &sum_values_uc, NUM_COUNTERS_UC*SOCKETS, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);

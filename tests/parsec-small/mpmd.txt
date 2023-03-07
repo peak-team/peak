@@ -1,2 +1,0 @@
--n 1 ./parsec.sh 
--n 255 /scratch1/07893/junjieli/lccf/evaluation/parsec-debug/parsec.x

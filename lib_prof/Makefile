@@ -3,18 +3,20 @@
 include ../Make.inc
 
 TARGET = peak_libprof.so
-OBJ = lib_prof.o util.o hash.o  \
+
+OBJU = ../utils/utils.o
+OBJ =  $(OBJU)  lib_prof.o hash.o  \
        lib_wrappers/blas.o lib_wrappers/cblas.o\
        lib_wrappers/lapack.o  \
        lib_wrappers/scalapack.o\
        lib_wrappers/pblas.o  
 
-INCLUDE = -I./ -I./lib_wrappers/
-LOCAL_CFLAGS = $(CFLAGS) $(INCLUDE)
+INCLUDE = -I./ -I./lib_wrappers/ -I../utils/
+CFLAGS += $(INCLUDE)
 LIBS = 
 
-DEPS0 = Makefile
-DEPS = $(DEPS0) lib_prof.h hash.h util.h
+DEPS0 = ../utils/utils.h Makefile
+DEPS += $(DEPS0) lib_prof.h hash.h 
 
 ALL : $(TARGET) link
 
@@ -22,14 +24,14 @@ ALL : $(TARGET) link
 #	$(FC) -qmkl test.F
 
 $(TARGET) : $(OBJ)
-	$(CC) $(LOCAL_CFLAGS) -o $@ $^ 
+	$(CC) $(CFLAGS) -o $@ $^ 
 
 %.o: %.c $(DEPS)
-	$(CC) $(LOCAL_CFLAGS) -c -o $@ $< 
+	$(CC) $(CFLAGS) -c -o $@ $< 
 
 
-.PHONY: link
-link :
+#.PHONY: link
+link : $(TARGET)
 	ln -fs `pwd`/$(TARGET) ../
 
 .PHONY: clean
