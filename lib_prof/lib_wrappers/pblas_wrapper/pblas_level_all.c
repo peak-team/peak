@@ -807,6 +807,7 @@ void psgemm_( const char *transa, const char *transb, const int *m, const int *n
 
 void pdgemm_( const char *transa, const char *transb, const int *m, const int *n, const int *k, const double *alpha, const double *a, const int *ia, const int *ja, const int *desca, const double *b, const int *ib, const int *jb, const int *descb, const double *beta, double *c, const int *ic, const int *jc, const int *descc )
 {
+  //  printf ("pdgemm -- matrix size A:%dx%d  B:%dx%d:   C:%dx%d\n", *m, *k,*k,*n,*m,*n);
   void (*orig_f)()=NULL;
 #include "function_wrapper_body1.c" 
   orig_f( transa, transb, m, n, k, alpha, a, ia, ja, desca, b, ib, jb, descb, beta, c, ic, jc, descc );

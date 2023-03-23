@@ -93,6 +93,7 @@ double dsdot_(const int *n, const float *scale, const double *x, const int *incx
    return result;
 }
 
+/* //complex Fortran functions will be crash by the following override.
 complex cdotc_(const int* n, const complex *x, const int *incx, const complex *y, const int *incy)
 {
    complex (*orig_f)()=NULL;
@@ -132,6 +133,7 @@ double complex zdotu_(const int* n, const double complex *x, const int *incx, co
 #include "function_wrapper_body2.c" 
    return result;
 }
+*/
 
 //?nrm2
 //

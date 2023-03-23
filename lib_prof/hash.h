@@ -1,8 +1,8 @@
 #include <string.h>
 
 typedef struct STAT{
-   int count_di; 
-   int count;
+   int unsigned long count_di; 
+   int unsigned long count;
    double time_di; //direct call time without counting children calls
    double time_in; //inclusive time
    double time_ex; //exclusive time
@@ -12,6 +12,7 @@ typedef struct STAT{
 
 struct item {
     char key[40];
+    char caller[40];
     STAT value;
     struct item* next;
 };

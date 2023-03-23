@@ -5,18 +5,19 @@ include ../Make.inc
 TARGET = peak_libprof.so
 
 OBJU = ../utils/utils.o
-OBJ =  $(OBJU)  lib_prof.o hash.o  \
-       lib_wrappers/blas.o lib_wrappers/cblas.o\
-       lib_wrappers/lapack.o  \
-       lib_wrappers/scalapack.o\
-       lib_wrappers/pblas.o  
+OBJ =  $(OBJU)  lib_prof.o hash.o  hash2.o cstr-utils.o \
+	lib_wrappers/blas.o \
+ lib_wrappers/cblas.o  \
+ lib_wrappers/lapack.o  \
+ lib_wrappers/scalapack.o\
+ lib_wrappers/pblas.o  
 
 INCLUDE = -I./ -I./lib_wrappers/ -I../utils/
 CFLAGS += $(INCLUDE)
 LIBS = 
 
 DEPS0 = ../utils/utils.h Makefile
-DEPS += $(DEPS0) lib_prof.h hash.h 
+DEPS += $(DEPS0) lib_prof.h hash.h  hash2.h cstr-utils.h
 
 ALL : $(TARGET) link
 

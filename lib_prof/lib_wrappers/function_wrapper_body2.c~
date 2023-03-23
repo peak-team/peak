@@ -2,6 +2,7 @@
 //
 
   local_time=mysecond()-local_time;
+//#pragma omp atomic
   if ( layer_count == 1) { 
      item->value.time_di += local_time;
      libtime+=local_time; 
@@ -20,7 +21,9 @@
   if (peakprof_debug>1) hash_show();
   if (peakprof_debug>0) fprintf(OUTFILE,"PEAKPROF: done with %s\n",__func__);
 
+#ifdef _OPENMP
 }
+#endif
 
  
 

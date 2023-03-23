@@ -1,23 +1,30 @@
 #include "lib_prof.h"
 #include "hash.h"
+#include "hash2.h"
 #include <stdlib.h>     /* atexit */
 #include <mpi.h>
+#include <string.h>
+#include "cstr-utils.h"
 
 // global 
  bool peakprof_init_flag=false;
  double apptime=0.0;
  double libtime=0.0;
  double layer_time[MAX_LAYER];
+ char layer_caller[MAX_LAYER][40];
  int layer_count;
+ char **record_f=NULL;
 
 // environmental variables
  int peakprof_debug=0;
  int peakprof_mkl_fake=-1;
  int peakprof_record_rank=0;
- double peakprof_record_threshold=-0.001;
+ double peakprof_record_threshold=0.000;
+ char peakprof_record_function[1000];
 
 //local
  char *argv0;
+ int ifmpi;
 
 
 
@@ -48,7 +55,11 @@ void env_get()
    peakprof_record_rank = myenv? atoi(myenv) : 0 ;        
 
    myenv = getenv("PEAKPROF_RECORD_THRESHOLD");
-   peakprof_record_threshold = myenv? atof(myenv) : -0.001 ;        
+   peakprof_record_threshold = myenv? atof(myenv) : 0.00 ;        
+
+   myenv = getenv("PEAKPROF_RECORD_FUNCTION");
+   if(myenv) strcpy(peakprof_record_function , myenv) ;        
+   record_f=myenv? str_split(peakprof_record_function, ',') : NULL;
 
    return ;
 }
@@ -59,6 +70,7 @@ void env_show()
 //   fprintf(OUTFILE, "PEAKPROF_MKL_FAKE = %d \n",peakprof_mkl_fake); 
 //   fprintf(OUTFILE, "    PEAKPROF_DEBUG=%d \n",peakprof_debug);
    fprintf(OUTFILE, "    PEAKPROF_RECORD_RANK=%d \n",peakprof_record_rank);
+   fprintf(OUTFILE, "    PEAKPROF_RECORD_FUNCTION=%s \n",peakprof_record_function);
    fprintf(OUTFILE, "    PEAKPROF_RECORD_THRESHOLD=%.3f \n",peakprof_record_threshold);
 
    return ;
@@ -98,6 +110,7 @@ void print_result() {
 
     struct item* farray=NULL;
     int fn = hash_get_size();
+    int k;
     if (fn == 0) return;   //nothing profiled
     farray=hash_to_array();
 
@@ -106,37 +119,43 @@ void print_result() {
     fprintf(OUTFILE, "                         PEAK Prof Library\n");
     fprintf(OUTFILE, "        ----------------------------------------------------\n");
     fprintf(OUTFILE, "for application: %s\n\n",argv0);
+    if(ifmpi)  fprintf(OUTFILE, "recorded MPI rank: %d\n",peakprof_record_rank);
 //   fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
     fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n\n",apptime, libtime, libtime/apptime*100);
+    printf("layer_time=%.3fs\n",layer_time[0]);
 //   fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     env_show();
      // hash_show_final();
 
 // direct call 
     qsort(farray, fn, sizeof(struct item), compare_time_di);
-    fprintf(OUTFILE,"\n----------------------  function statistics (direct) --------------------\n");
+    fprintf(OUTFILE,"\n--------------------------  function statistics (direct) ------------------------\n");
     fprintf(OUTFILE,"    direct call time (in seconds) and counts\n");
-    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    k=0;
     for (int i=0; i<fn; i++) {
        if(farray[i].value.count_di>0)
          if(farray[i].value.time_di > peakprof_record_threshold)
-             fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", farray[i].value.fgroup, farray[i].key, farray[i].value.count_di, farray[i].value.time_di);
+             fprintf(OUTFILE,"%3d  group: %10s, function: %10s, count: %10lu, time: %10.3f\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count_di, farray[i].value.time_di);
     }
-    fprintf(OUTFILE,"%62s %10.3f\n","------------------------------------------ total library time:", libtime);
-    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%67s %10.3f\n","-------------------------------------------------- total library time:", libtime);
+    //fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
 
 // exlusive time
     qsort(farray, fn, sizeof(struct item), compare_time_ex);
-    fprintf(OUTFILE,"\n-------------------  function statistics (exclusive) --------------------\n");
+    fprintf(OUTFILE,"\n-------------------------  function statistics (exclusive) -----------------------\n");
     fprintf(OUTFILE,"    exclusive call time (in seconds) and counts\n");
-    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    k=0;
     for (int i=0; i<fn; i++) {
          if(farray[i].value.time_ex > peakprof_record_threshold)
-             fprintf(OUTFILE,"group: %10s, function: %10s, count: %7d, time: %10.3f\n", farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_ex);
+             fprintf(OUTFILE,"%3d  group: %10s, function: %10s, count: %10lu, time: %10.3f\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_ex);
     }
-    fprintf(OUTFILE,"%62s %10.3f\n","------------------------------------------ total library time:", libtime);
-    fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%67s %10.3f\n","-------------------------------------------------- total library time:", libtime);
+    //fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
     fprintf(OUTFILE,"\n"); 
+
+    hash2_show_sorted();
    
     fflush(OUTFILE); 
     free(farray);
@@ -185,11 +204,12 @@ void reduce_result() {
 
 void libprof_fini(){
    apptime = mysecond()-apptime;
-   if (check_MPI())  {
+   ifmpi=check_MPI();
+   if (ifmpi)  {
       reduce_result(); 
    }
    else 
-       print_result();
+      print_result();
 }
 
 void libprof_init(){
@@ -201,10 +221,10 @@ void libprof_init(){
 */
    peakprof_init_flag=true;
    layer_count=0; 
+   strcpy(layer_caller[0],"user");
    memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
    env_get();
    get_argv0(&argv0);
-
    apptime = mysecond();
   return;
 }

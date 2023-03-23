@@ -7,5 +7,6 @@
 #include "scalapack_wrapper/v1/scalapack_driver_d.c"
 #include "scalapack_wrapper/v1/scalapack_driver_c.c"
 #include "scalapack_wrapper/v1/scalapack_driver_z.c"
+#include "scalapack_wrapper/v1/scalapack_tools.c"
 
 //  #include "scalapack_wrapper/v2/scalapack_all.c"
