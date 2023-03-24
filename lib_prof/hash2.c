@@ -5,7 +5,7 @@
 #include <math.h> 
 
 #include "hash2.h"
-#include "lib_prof.h"
+#include "global.h"
 #include "cstr-utils.h"
 
 #define HASH_SIZE 100

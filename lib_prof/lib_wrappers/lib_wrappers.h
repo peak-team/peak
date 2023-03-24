@@ -1,4 +1,4 @@
-#include "lib_prof.h"
+#include "global.h"
 #include "hash.h"
 #include "hash2.h"
 //#include "stack.h"

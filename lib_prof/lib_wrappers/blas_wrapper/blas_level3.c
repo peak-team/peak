@@ -4,6 +4,9 @@
 // 30 subroutines in total
 //
 
+#define GET_AVG_MATRIX_SIZE3 int isize=(int)( cbrt(*m)*cbrt(*n)*cbrt(*k) )
+#define GET_AVG_MATRIX_SIZE2 int isize=(int)( sqrt(*m)*sqrt(*n) )
+
 //?gemm
 //
 
@@ -15,6 +18,9 @@ void sgemm_(const char *transa, const char *transb, const int *m, const int *n, 
 #include "function_wrapper_body1.c" 
     orig_f(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 #include "function_wrapper_body2.c" 
+    //int isize=(int)( cbrt(*m)*cbrt(*n)*cbrt(*k) );
+    GET_AVG_MATRIX_SIZE3;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -27,30 +33,8 @@ void dgemm_(const char *transa, const char *transb, const int *m, const int *n, 
     if(peakprof_debug && ifrecord) printf ("dgemm -- matrix size A:%dx%d  B:%dx%d:   C:%dx%d\n", *m, *k,*k,*n,*m,*n);
     orig_f(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 #include "function_wrapper_body2.c" 
-
-    if(ifrecord){
-      int isize=(int)( cbrt(*m)*cbrt(*n)*cbrt(*k) );
-      if(isize==0) isize=1;
-      int log10_isize=(int)log10(isize);
-      char callpath[400]="";
-      struct item2* item2;
-      strcat(callpath,layer_caller[0]);
-      for(int j=1;j<=layer_count+1;j++) { 
-         strcat(callpath,"->");
-         strcat(callpath,layer_caller[j]);
-      }
-      item2 = hash2_get(callpath); 
-      if (item2 == NULL )  item2 = hash2_insert(callpath);
-      
-      item2->value.time_in += local_time;
-      item2->value.distribution_time[log10_isize] += local_time;
-      item2->value.count ++;
-      item2->value.distribution_count[log10_isize] ++;
-      item2->value.distribution_sizesum[log10_isize] += (float)isize;
-      item2->value.distribution_sizesumsq[log10_isize] += (float)isize*(float)isize;
-      
-    }
-
+    GET_AVG_MATRIX_SIZE3;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -62,6 +46,8 @@ void cgemm_(const char *transa, const char *transb, const int *m, const int *n, 
 #include "function_wrapper_body1.c" 
     orig_f(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -73,6 +59,8 @@ void zgemm_(const char *transa, const char *transb, const int *m, const int *n, 
 #include "function_wrapper_body1.c" 
     orig_f(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 

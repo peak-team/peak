@@ -1,4 +1,4 @@
-#include "lib_prof.h"
+#include "global.h"
 #include "hash.h"
 #include "hash2.h"
 #include <stdlib.h>     /* atexit */
@@ -166,6 +166,21 @@ void print_result() {
     }
     fprintf(OUTFILE,"--------------------------------------------------------------\n");
     fprintf(OUTFILE,"%48s %10.3f\n","total library time:", libtime);
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"\n"); 
+
+// inclusive time
+    qsort(farray, fn, sizeof(struct item), compare_time_in);
+    fprintf(OUTFILE,"\n--------------  function statistics (inclusive) --------------\n");
+    fprintf(OUTFILE,"    inclusive call time (in seconds) and counts\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"    |   group    |    function    |    count   |    time    |\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    k=0;
+    for (int i=0; i<fn; i++) {
+         if(farray[i].value.time_in > peakprof_record_threshold)
+             fprintf(OUTFILE,"%3d | %10s | %14s | %10lu | %10.3f |\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_in);
+    }
     fprintf(OUTFILE,"--------------------------------------------------------------\n");
     fprintf(OUTFILE,"\n"); 
 

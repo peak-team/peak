@@ -17,7 +17,7 @@ CFLAGS += $(INCLUDE)
 LIBS = 
 
 DEPS0 = ../utils/utils.h Makefile
-DEPS += $(DEPS0) lib_prof.h hash.h  hash2.h cstr-utils.h
+DEPS += $(DEPS0) global.h hash.h  hash2.h cstr-utils.h
 
 ALL : $(TARGET) link
 

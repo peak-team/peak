@@ -3,6 +3,9 @@
 //BLAS level 2
 //
 
+#define GET_AVG_MATRIX_SIZE3 int isize=(int)( cbrt(*m)*cbrt(*n)*cbrt(*k) )
+#define GET_AVG_MATRIX_SIZE2 int isize=(int)( sqrt(*m)*sqrt(*n) )
+
 //?gbmv 
 //
 
@@ -62,6 +65,8 @@ void sgemv_(const char *trans, const int *m, const int *n, const float *alpha,
 #include "function_wrapper_body1.c" 
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -73,30 +78,8 @@ void dgemv_(const char *trans, const int *m, const int *n, const double *alpha,
 #include "function_wrapper_body1.c" 
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
-
-    if(ifrecord){
-      int isize=(int)( sqrt(*m)*sqrt(*n) );
-      if(isize==0) isize=1;
-      int log10_isize=(int)log10(isize);
-      char callpath[400]="";
-      struct item2* item2;
-      strcat(callpath,layer_caller[0]);
-      for(int j=1;j<=layer_count+1;j++) { 
-         strcat(callpath,"->");
-         strcat(callpath,layer_caller[j]);
-      }
-      item2 = hash2_get(callpath); 
-      if (item2 == NULL )  item2 = hash2_insert(callpath);
-      
-      item2->value.time_in += local_time;
-      item2->value.distribution_time[log10_isize] += local_time;
-      item2->value.count ++;
-      item2->value.distribution_count[log10_isize] ++;
-      item2->value.distribution_sizesum[log10_isize] += (float)isize;
-      item2->value.distribution_sizesumsq[log10_isize] += (float)isize*(float)isize;
-      
-    }
-
+    GET_AVG_MATRIX_SIZE2;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -108,6 +91,8 @@ void cgemv_(const char *trans, const int *m, const int *n, const void *alpha,
 #include "function_wrapper_body1.c" 
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
@@ -119,6 +104,8 @@ void zgemv_(const char *trans, const int *m, const int *n, const void *alpha,
 #include "function_wrapper_body1.c" 
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "blas_wrapper/function_wrapper_stats.c"
     return;
 }
 
