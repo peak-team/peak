@@ -19,5 +19,6 @@
 3. Only measures the master thread in OpenMP
 
 ## Example Output:
-[PEAK Prof output for PARSEC](lib_prof/output.md)
+[PEAK Prof output for PARSEC](outputs/output-parsec.md) 
+[PEAK Prof output for VASP](outputs/output-vasp.md)
 
