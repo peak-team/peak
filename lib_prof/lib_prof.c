@@ -122,37 +122,43 @@ void print_result() {
     if(ifmpi)  fprintf(OUTFILE, "recorded MPI rank: %d\n",peakprof_record_rank);
 //   fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
     fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n\n",apptime, libtime, libtime/apptime*100);
-    printf("layer_time=%.3fs\n",layer_time[0]);
+//    printf("layer_time=%.3fs\n",layer_time[0]);
 //   fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     env_show();
      // hash_show_final();
 
 // direct call 
     qsort(farray, fn, sizeof(struct item), compare_time_di);
-    fprintf(OUTFILE,"\n--------------------------  function statistics (direct) ------------------------\n");
+    fprintf(OUTFILE,"\n----------------  function statistics (direct) ---------------\n");
     fprintf(OUTFILE,"    direct call time (in seconds) and counts\n");
-    fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"    |   group    |    function    |    count   |    time    |\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
     k=0;
     for (int i=0; i<fn; i++) {
        if(farray[i].value.count_di>0)
          if(farray[i].value.time_di > peakprof_record_threshold)
-             fprintf(OUTFILE,"%3d  group: %10s, function: %10s, count: %10lu, time: %10.3f\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count_di, farray[i].value.time_di);
+             fprintf(OUTFILE,"%3d | %10s | %14s | %10lu | %10.3f |\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count_di, farray[i].value.time_di);
     }
-    fprintf(OUTFILE,"%67s %10.3f\n","-------------------------------------------------- total library time:", libtime);
-    //fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%48s %10.3f\n","total library time:", libtime);
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
 
 // exlusive time
     qsort(farray, fn, sizeof(struct item), compare_time_ex);
-    fprintf(OUTFILE,"\n-------------------------  function statistics (exclusive) -----------------------\n");
+    fprintf(OUTFILE,"\n--------------  function statistics (exclusive) --------------\n");
     fprintf(OUTFILE,"    exclusive call time (in seconds) and counts\n");
-    fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"    |   group    |    function    |    count   |    time    |\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
     k=0;
     for (int i=0; i<fn; i++) {
          if(farray[i].value.time_ex > peakprof_record_threshold)
-             fprintf(OUTFILE,"%3d  group: %10s, function: %10s, count: %10lu, time: %10.3f\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_ex);
+             fprintf(OUTFILE,"%3d | %10s | %14s | %10lu | %10.3f |\n", ++k, farray[i].value.fgroup, farray[i].key, farray[i].value.count, farray[i].value.time_ex);
     }
-    fprintf(OUTFILE,"%67s %10.3f\n","-------------------------------------------------- total library time:", libtime);
-    //fprintf(OUTFILE,"---------------------------------------------------------------------------------\n");
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
+    fprintf(OUTFILE,"%48s %10.3f\n","total library time:", libtime);
+    fprintf(OUTFILE,"--------------------------------------------------------------\n");
     fprintf(OUTFILE,"\n"); 
 
     hash2_show_sorted();
