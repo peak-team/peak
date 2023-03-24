@@ -15,7 +15,7 @@ total runtime: 228.507s, library time: 71.790s, percentage of lib: 31.4%
 
 environmental variables:
     PEAKPROF_RECORD_RANK=0 
-    PEAKPROF_RECORD_FUNCTION=dgemm_ 
+    PEAKPROF_RECORD_FUNCTION=dgemv_
     PEAKPROF_RECORD_THRESHOLD=0.000 
 
 ----------------  function statistics (direct) ---------------

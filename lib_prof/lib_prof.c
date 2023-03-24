@@ -58,8 +58,16 @@ void env_get()
    peakprof_record_threshold = myenv? atof(myenv) : 0.00 ;        
 
    myenv = getenv("PEAKPROF_RECORD_FUNCTION");
-   if(myenv) strcpy(peakprof_record_function , myenv) ;        
-   record_f=myenv? str_split(peakprof_record_function, ',') : NULL;
+//  if(myenv) strcpy(peakprof_record_function , myenv) ;        
+//  record_f=myenv? str_split(peakprof_record_function, ',') : NULL;
+   if(myenv) { 
+        strcpy(peakprof_record_function , myenv) ;        
+        record_f=str_split(peakprof_record_function,',');
+   // below is neccessary as str_split will chop the original string.
+        strcpy(peakprof_record_function , myenv) ; 
+   }  
+   else  record_f=NULL; 
+
 
    return ;
 }

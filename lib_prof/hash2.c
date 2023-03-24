@@ -125,10 +125,10 @@ void hash2_show_sorted() {
                    fprintf(OUTFILE,"\n                %10s call path statistics               \n",record_f[f]);
                    fprintf(OUTFILE,"--------------------------------------------------------------\n");
              }
-             fprintf(OUTFILE,"%d) %-50s\n",itmp, item2->key);
-             fprintf(OUTFILE,"   -------------------------------------------------------\n");
-             fprintf(OUTFILE, "   log10(N) |  avg(N)  | stdev(N) |   count   |    time     \n"); 
-             fprintf(OUTFILE,"   -------------------------------------------------------\n");
+             fprintf(OUTFILE,"%d)  %-50s\n",itmp, item2->key);
+             fprintf(OUTFILE,"    -------------------------------------------------------\n");
+             fprintf(OUTFILE, "    log10(N) |  avg(N)  | stdev(N) |   count   |    time     \n"); 
+             fprintf(OUTFILE,"    -------------------------------------------------------\n");
              for (int j=0;j<20;j++) {
                 if(item2->value.distribution_count[j]>0) {
                   count=item2->value.distribution_count[j];
@@ -137,13 +137,13 @@ void hash2_show_sorted() {
                   avg=sum/(float)count;
                   stdev=sqrt(abs(sumsq/(float)count-avg*avg));
                 //  printf("---debug: count=%d  sum=%8.3f  sumsq=%8.3f   avg=%8.3f  stdev=%8.2f\n", count, sum, sumsq, avg,stdev);
-                  fprintf(OUTFILE, "      %2d~%-2d | %8.1f | %8.1f | %9d | %10.3f  \n", \
+                  fprintf(OUTFILE, "       %2d~%-2d | %8.1f | %8.1f | %9d | %10.3f  \n", \
                      j,j+1,avg,stdev,count,item2->value.distribution_time[j]);
                 }
              }
-             fprintf(OUTFILE,"   -------------------------------------------------------\n");
-             fprintf(OUTFILE,"   %31s  %9d   %10.3f\n", "total:", item2->value.count, item2->value.time_in);
-             fprintf(OUTFILE,"   -------------------------------------------------------\n");
+             fprintf(OUTFILE,"    -------------------------------------------------------\n");
+             fprintf(OUTFILE,"    %31s  %9d   %10.3f\n", "total:", item2->value.count, item2->value.time_in);
+             fprintf(OUTFILE,"    -------------------------------------------------------\n");
            }
         }   
       }   
