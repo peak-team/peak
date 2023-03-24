@@ -22,5 +22,6 @@
 
 ## Example Output:
 [PEAK Prof output for PARSEC](outputs/output-parsec.md) 
+
 [PEAK Prof output for VASP](outputs/output-vasp.md)
 
