@@ -9,8 +9,10 @@
 
 ## Settings
 ```
- PEAKPROF_RECORD_RANK=0               # the rank for which result will be printed out. 
- PEAKPROF_RECORD_THRESHOLD=-0.001     # threshold for printing out timing.
+ PEAKPROF_RECORD_RANK=0                  # the rank for which result will be printed out. 
+ PEAKPROF_RECORD_THRESHOLD=0.001        # threshold for printing out timing. 
+ PEAKPROF_RECORD_FUNCTION=dgemm_,dgemv_  # functions that will be tracked for more details
+
 ```
 
 ## Limitations
@@ -20,5 +22,6 @@
 
 ## Example Output:
 [PEAK Prof output for PARSEC](outputs/output-parsec.md) 
+
 [PEAK Prof output for VASP](outputs/output-vasp.md)
 
