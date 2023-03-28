@@ -1,3 +1,5 @@
+#define GET_AVG_MATRIX_SIZE3 int isize=(int)( cbrt(*m)*cbrt(*n)*cbrt(*k) )
+#define GET_AVG_MATRIX_SIZE2 int isize=(int)( sqrt(*m)*sqrt(*n) )
 
 /* PBLAS Level 1 Routines */
 
@@ -379,6 +381,8 @@ void psgemv_( const char *trans, const int *m, const int *n, const float *alpha,
 #include "function_wrapper_body1.c" 
   orig_f( trans, m, n, alpha, a, ia, ja, desca, x, ix, jx, descx, incx, beta, y, iy, jy, descy, incy );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -389,6 +393,8 @@ void pdgemv_( const char *trans, const int *m, const int *n, const double *alpha
 #include "function_wrapper_body1.c" 
   orig_f( trans, m, n, alpha, a, ia, ja, desca, x, ix, jx, descx, incx, beta, y, iy, jy, descy, incy );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -399,6 +405,8 @@ void pcgemv_( const char *trans, const int *m, const int *n, const void *alpha, 
 #include "function_wrapper_body1.c" 
   orig_f( trans, m, n, alpha, a, ia, ja, desca, x, ix, jx, descx, incx, beta, y, iy, jy, descy, incy );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -409,6 +417,8 @@ void pzgemv_( const char *trans, const int *m, const int *n, const void *alpha, 
 #include "function_wrapper_body1.c" 
   orig_f( trans, m, n, alpha, a, ia, ja, desca, x, ix, jx, descx, incx, beta, y, iy, jy, descy, incy );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE2;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -801,6 +811,8 @@ void psgemm_( const char *transa, const char *transb, const int *m, const int *n
 #include "function_wrapper_body1.c" 
   orig_f( transa, transb, m, n, k, alpha, a, ia, ja, desca, b, ib, jb, descb, beta, c, ic, jc, descc );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -812,6 +824,8 @@ void pdgemm_( const char *transa, const char *transb, const int *m, const int *n
 #include "function_wrapper_body1.c" 
   orig_f( transa, transb, m, n, k, alpha, a, ia, ja, desca, b, ib, jb, descb, beta, c, ic, jc, descc );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -822,6 +836,8 @@ void pcgemm_( const char *transa, const char *transb, const int *m, const int *n
 #include "function_wrapper_body1.c" 
   orig_f( transa, transb, m, n, k, alpha, a, ia, ja, desca, b, ib, jb, descb, beta, c, ic, jc, descc );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "function_wrapper_stats.c"
   return;
 }
 
@@ -832,6 +848,8 @@ void pzgemm_( const char *transa, const char *transb, const int *m, const int *n
 #include "function_wrapper_body1.c" 
   orig_f( transa, transb, m, n, k, alpha, a, ia, ja, desca, b, ib, jb, descb, beta, c, ic, jc, descc );
 #include "function_wrapper_body2.c" 
+    GET_AVG_MATRIX_SIZE3;
+#include "function_wrapper_stats.c"
   return;
 }
 

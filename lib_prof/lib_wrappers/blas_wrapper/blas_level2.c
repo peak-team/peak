@@ -66,7 +66,7 @@ void sgemv_(const char *trans, const int *m, const int *n, const float *alpha,
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
     GET_AVG_MATRIX_SIZE2;
-#include "blas_wrapper/function_wrapper_stats.c"
+#include "function_wrapper_stats.c"
     return;
 }
 
@@ -79,7 +79,7 @@ void dgemv_(const char *trans, const int *m, const int *n, const double *alpha,
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
     GET_AVG_MATRIX_SIZE2;
-#include "blas_wrapper/function_wrapper_stats.c"
+#include "function_wrapper_stats.c"
     return;
 }
 
@@ -92,7 +92,7 @@ void cgemv_(const char *trans, const int *m, const int *n, const void *alpha,
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
     GET_AVG_MATRIX_SIZE2;
-#include "blas_wrapper/function_wrapper_stats.c"
+#include "function_wrapper_stats.c"
     return;
 }
 
@@ -105,7 +105,7 @@ void zgemv_(const char *trans, const int *m, const int *n, const void *alpha,
     orig_f(trans, m, n, alpha, a, lda, x, incx, beta, y, incy);
 #include "function_wrapper_body2.c" 
     GET_AVG_MATRIX_SIZE2;
-#include "blas_wrapper/function_wrapper_stats.c"
+#include "function_wrapper_stats.c"
     return;
 }
 

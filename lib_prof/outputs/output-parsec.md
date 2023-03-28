@@ -4,71 +4,243 @@ For PARSEC:
 
 **Si23k 512-node:** 
 ```
-running with node= 512,  rank= 4096, thread_per_node= 7, total_cpu_core= 0
+running with node= 512,  rank= 1024, thread_per_node= 7, total_cpu_core= 0
+
         ----------------------------------------------------
                          PEAK Prof Library
         ----------------------------------------------------
 for application: /scratch1/07893/junjieli/lccf/evaluation/parsec-debug/parsec.x
 
-total runtime: 1415.943s, library time: 788.537s, percentage of lib: 55.7%
+recorded MPI rank: 0
+total runtime: 2648.838s, library time: 1754.498s, percentage of lib: 66.2%
 
 environmental variables:
     PEAKPROF_RECORD_RANK=0 
-    PEAKPROF_RECORD_THRESHOLD=0.000
+    PEAKPROF_RECORD_FUNCTION=dgemm_,dgemv_,pdgemm_ 
+    PEAKPROF_RECORD_THRESHOLD=0.000 
 
-----------------------  function statistics (direct) --------------------
+----------------  function statistics (direct) ---------------
     direct call time (in seconds) and counts
--------------------------------------------------------------------------
-group:      PBLAS, function:    pdgemm_, count:       6, time:    605.060
-group:      PBLAS, function:    pdtrsm_, count:       2, time:    108.924
-group:  ScaLAPACK, function:   pdsyevx_, count:       4, time:     63.725
-group:  ScaLAPACK, function:   pdpotrf_, count:       2, time:     10.269
-group:       BLAS, function:     dcopy_, count:    2443, time:      0.236
-group:       BLAS, function:      ddot_, count:   20246, time:      0.177
-group:     LAPACK, function:     dsyev_, count:       2, time:      0.077
-group:       BLAS, function:     dscal_, count:       1, time:      0.069
------------------------------------------- total library time:    788.537
--------------------------------------------------------------------------
+--------------------------------------------------------------
+    |   group    |    function    |    count   |    time    |
+--------------------------------------------------------------
+  1 |      PBLAS |        pdgemm_ |          6 |   1303.005 |
+  2 |      PBLAS |        pdtrsm_ |          2 |    365.747 |
+  3 |  ScaLAPACK |       pdsyevx_ |          4 |     78.469 |
+  4 |  ScaLAPACK |       pdpotrf_ |          2 |      6.082 |
+  5 |       BLAS |         dcopy_ |       3161 |      0.487 |
+  6 |       BLAS |          ddot_ |      21682 |      0.485 |
+  7 |       BLAS |         dscal_ |          1 |      0.148 |
+  8 |     LAPACK |         dsyev_ |          2 |      0.075 |
+  9 |  ScaLAPACK |      descinit_ |          4 |      0.000 |
+--------------------------------------------------------------
+                             total library time:   1754.498
+--------------------------------------------------------------
 
--------------------  function statistics (exclusive) --------------------
+--------------  function statistics (exclusive) --------------
     exclusive call time (in seconds) and counts
--------------------------------------------------------------------------
-group:       BLAS, function:     dgemm_, count:  106708, time:    387.783
-group:      PBLAS, function:    pdgemm_, count:    5118, time:    223.398
-group:      PBLAS, function:    pdtrsm_, count:    3840, time:    104.061
-group:  ScaLAPACK, function:   pdsyevx_, count:       4, time:     44.869
-group:      PBLAS, function:    pdsyrk_, count:    3838, time:      9.597
-group:      PBLAS, function:   pdsyr2k_, count:    2556, time:      4.956
-group:      PBLAS, function:    pdsymm_, count:    2556, time:      4.803
-group:  ScaLAPACK, function:   pdgeqrf_, count:    2564, time:      4.217
-group:  ScaLAPACK, function:   pdstebz_, count:       2, time:      1.011
-group:       BLAS, function:     dcopy_, count:  734213, time:      0.669
-group:  ScaLAPACK, function:   pdstein_, count:       2, time:      0.657
-group:  ScaLAPACK, function:   pdlaebz_, count:       4, time:      0.514
-group:  ScaLAPACK, function:  pdlapdct_, count:    1228, time:      0.416
-group:       BLAS, function:    dsyr2k_, count:   24282, time:      0.287
-group:  ScaLAPACK, function:   pdpotrf_, count:       2, time:      0.269
-group:      PBLAS, function:    pdnrm2_, count:    1920, time:      0.221
-group:       BLAS, function:     dsymm_, count:   24282, time:      0.205
-group:       BLAS, function:     dtrsm_, count:     128, time:      0.190
-group:       BLAS, function:      ddot_, count:   20246, time:      0.177
-group:     LAPACK, function:     dsyev_, count:       2, time:      0.077
-group:       BLAS, function:     dscal_, count:    1945, time:      0.070
-group:       BLAS, function:     dsyrk_, count:    6144, time:      0.036
-group:      PBLAS, function:    pdtrmm_, count:    2556, time:      0.017
-group:       BLAS, function:     dgemv_, count:    3572, time:      0.013
-group:       BLAS, function:      dger_, count:    1880, time:      0.012
-group:     LAPACK, function:    dpotrf_, count:       8, time:      0.005
-group:       BLAS, function:     daxpy_, count:    1824, time:      0.002
-group:      PBLAS, function:   pilaenv_, count:   23056, time:      0.001
-group:       BLAS, function:    idamax_, count:     120, time:      0.001
-group:      PBLAS, function:    pdscal_, count:    1920, time:      0.001
-group:       BLAS, function:     dasum_, count:      90, time:      0.000
-group:       BLAS, function:     dnrm2_, count:      30, time:      0.000
-group:       BLAS, function:     dtrmm_, count:      38, time:      0.000
-group:  ScaLAPACK, function:   pdlaecv_, count:      91, time:      0.000
------------------------------------------- total library time:    788.537
--------------------------------------------------------------------------
+--------------------------------------------------------------
+    |   group    |    function    |    count   |    time    |
+--------------------------------------------------------------
+  1 |      PBLAS |        pdgemm_ |       5118 |    768.519 |
+  2 |       BLAS |         dgemm_ |     225366 |    538.532 |
+  3 |      PBLAS |        pdtrsm_ |       1920 |    354.734 |
+  4 |  ScaLAPACK |       pdsyevx_ |          4 |     60.048 |
+  5 |       BLAS |         dcopy_ |    1265121 |     10.076 |
+  6 |      PBLAS |       pdsyr2k_ |       2556 |      6.367 |
+  7 |  ScaLAPACK |       pdpotrf_ |          2 |      3.710 |
+  8 |      PBLAS |        pdsymm_ |       2556 |      3.204 |
+  9 |  ScaLAPACK |       pdgeqrf_ |       2564 |      1.984 |
+ 10 |      PBLAS |        pdsyrk_ |       1918 |      1.651 |
+ 11 |  ScaLAPACK |      pdlapdct_ |       4769 |      1.609 |
+ 12 |  ScaLAPACK |       pdstein_ |          2 |      0.829 |
+ 13 |       BLAS |         dtrsm_ |        178 |      0.580 |
+ 14 |       BLAS |        dsyr2k_ |      49878 |      0.517 |
+ 15 |       BLAS |          ddot_ |      21682 |      0.485 |
+ 16 |  ScaLAPACK |       pdstebz_ |          2 |      0.414 |
+ 17 |       BLAS |         dsymm_ |      49878 |      0.398 |
+ 18 |       BLAS |         dsyrk_ |      27840 |      0.250 |
+ 19 |       BLAS |         dscal_ |       4225 |      0.151 |
+ 20 |      PBLAS |        pdnrm2_ |       3840 |      0.130 |
+ 21 |     LAPACK |         dsyev_ |          2 |      0.075 |
+ 22 |  ScaLAPACK |       pdlaebz_ |          4 |      0.074 |
+ 23 |       BLAS |         dgemv_ |       7332 |      0.056 |
+ 24 |       BLAS |          dger_ |       3760 |      0.050 |
+ 25 |      PBLAS |        pdtrmm_ |       2556 |      0.032 |
+ 26 |     LAPACK |        dpotrf_ |         60 |      0.007 |
+ 27 |       BLAS |         daxpy_ |       3744 |      0.006 |
+ 28 |       BLAS |        idamax_ |        480 |      0.005 |
+ 29 |       BLAS |         dasum_ |        360 |      0.002 |
+ 30 |      PBLAS |        pdscal_ |       3840 |      0.002 |
+ 31 |      PBLAS |       pilaenv_ |      23096 |      0.001 |
+ 32 |  ScaLAPACK |      descinit_ |       5118 |      0.001 |
+ 33 |       BLAS |         dnrm2_ |        120 |      0.001 |
+ 34 |       BLAS |         dtrmm_ |         78 |      0.000 |
+ 35 |  ScaLAPACK |       pdlaecv_ |         93 |      0.000 |
+--------------------------------------------------------------
+                             total library time:   1754.498
+--------------------------------------------------------------
 
 
+--------------  function statistics (inclusive) --------------
+    inclusive call time (in seconds) and counts
+--------------------------------------------------------------
+    |   group    |    function    |    count   |    time    |
+--------------------------------------------------------------
+  1 |      PBLAS |        pdgemm_ |       5118 |   1303.044 |
+  2 |       BLAS |         dgemm_ |     225366 |    538.532 |
+  3 |      PBLAS |        pdtrsm_ |       1920 |    365.768 |
+  4 |  ScaLAPACK |       pdsyevx_ |          4 |     78.469 |
+  5 |       BLAS |         dcopy_ |    1265121 |     10.076 |
+  6 |      PBLAS |       pdsyr2k_ |       2556 |      8.357 |
+  7 |  ScaLAPACK |       pdpotrf_ |          2 |      6.082 |
+  8 |      PBLAS |        pdsymm_ |       2556 |      4.815 |
+  9 |      PBLAS |        pdsyrk_ |       1918 |      2.344 |
+ 10 |  ScaLAPACK |       pdgeqrf_ |       2564 |      2.206 |
+ 11 |  ScaLAPACK |       pdstebz_ |          2 |      2.098 |
+ 12 |  ScaLAPACK |       pdlaebz_ |          4 |      1.684 |
+ 13 |  ScaLAPACK |      pdlapdct_ |       4769 |      1.609 |
+ 14 |  ScaLAPACK |       pdstein_ |          2 |      0.845 |
+ 15 |       BLAS |         dtrsm_ |        178 |      0.580 |
+ 16 |       BLAS |        dsyr2k_ |      49878 |      0.517 |
+ 17 |       BLAS |          ddot_ |      21682 |      0.485 |
+ 18 |       BLAS |         dsymm_ |      49878 |      0.398 |
+ 19 |       BLAS |         dsyrk_ |      27840 |      0.250 |
+ 20 |       BLAS |         dscal_ |       4225 |      0.151 |
+ 21 |      PBLAS |        pdnrm2_ |       3840 |      0.130 |
+ 22 |     LAPACK |         dsyev_ |          2 |      0.075 |
+ 23 |       BLAS |         dgemv_ |       7332 |      0.056 |
+ 24 |       BLAS |          dger_ |       3760 |      0.050 |
+ 25 |      PBLAS |        pdtrmm_ |       2556 |      0.040 |
+ 26 |     LAPACK |        dpotrf_ |         60 |      0.007 |
+ 27 |       BLAS |         daxpy_ |       3744 |      0.006 |
+ 28 |       BLAS |        idamax_ |        480 |      0.005 |
+ 29 |      PBLAS |        pdscal_ |       3840 |      0.003 |
+ 30 |       BLAS |         dasum_ |        360 |      0.002 |
+ 31 |      PBLAS |       pilaenv_ |      23096 |      0.001 |
+ 32 |  ScaLAPACK |      descinit_ |       5118 |      0.001 |
+ 33 |       BLAS |         dnrm2_ |        120 |      0.001 |
+ 34 |       BLAS |         dtrmm_ |         78 |      0.000 |
+ 35 |  ScaLAPACK |       pdlaecv_ |         93 |      0.000 |
+--------------------------------------------------------------
 
+
+                    dgemm_ call path statistics               
+--------------------------------------------------------------
+1)  user->pdgemm_->dgemm_                             
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        3~4  |   3998.2 |    945.5 |      4336 |    525.778  
+    -------------------------------------------------------
+                             total:       4336      525.778
+    -------------------------------------------------------
+2)  user->pdtrsm_->dgemm_                             
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        3~4  |   3679.4 |    907.1 |       118 |     10.454  
+    -------------------------------------------------------
+                             total:        118       10.454
+    -------------------------------------------------------
+3)  user->pdsyevx_->pdsyr2k_->dgemm_                  
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     76.9 |     16.3 |     53748 |      0.389  
+        2~3  |    124.0 |     38.3 |     41020 |      0.646  
+    -------------------------------------------------------
+                             total:      94768        1.035
+    -------------------------------------------------------
+4)  user->pdsyevx_->pdsymm_->dgemm_                   
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     76.9 |     16.3 |     53748 |      0.360  
+        2~3  |    124.0 |     38.3 |     41020 |      0.609  
+    -------------------------------------------------------
+                             total:      94768        0.969
+    -------------------------------------------------------
+5)  user->pdpotrf_->pdsyrk_->dgemm_                   
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     78.0 |     11.4 |     20160 |      0.134  
+        2~3  |    206.0 |     42.8 |      5824 |      0.147  
+    -------------------------------------------------------
+                             total:      25984        0.281
+    -------------------------------------------------------
+6)  user->pdsyevx_->pdgemm_->dgemm_                   
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     76.1 |     17.1 |        86 |      0.001  
+        2~3  |    115.6 |     18.1 |       178 |      0.006  
+    -------------------------------------------------------
+                             total:        264        0.007
+    -------------------------------------------------------
+7)  user->pdsyevx_->dgemm_                            
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        0~1  |      1.0 |      0.0 |      4898 |      0.001  
+        1~2  |     78.7 |     16.1 |        36 |      0.000  
+        2~3  |    135.9 |     17.0 |       116 |      0.003  
+    -------------------------------------------------------
+                             total:       5050        0.004
+    -------------------------------------------------------
+8)  user->pdsyevx_->pdtrmm_->dgemm_                   
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     78.7 |     16.1 |        18 |      0.000  
+        2~3  |    136.8 |     17.3 |        60 |      0.004  
+    -------------------------------------------------------
+                             total:         78        0.004
+    -------------------------------------------------------
+
+                    dgemv_ call path statistics               
+--------------------------------------------------------------
+1)  user->pdsyevx_->pdgeqrf_->dgemv_                  
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        0~1  |      8.0 |      1.4 |         6 |      0.000  
+        1~2  |     62.5 |     22.8 |      1238 |      0.001  
+        2~3  |    173.2 |     48.3 |      2422 |      0.037  
+    -------------------------------------------------------
+                             total:       3666        0.038
+    -------------------------------------------------------
+2)  user->pdsyevx_->dgemv_                            
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        0~1  |      8.0 |      1.4 |         6 |      0.000  
+        1~2  |     62.5 |     22.8 |      1238 |      0.001  
+        2~3  |    173.2 |     48.3 |      2422 |      0.016  
+    -------------------------------------------------------
+                             total:       3666        0.018
+    -------------------------------------------------------
+
+                   pdgemm_ call path statistics               
+--------------------------------------------------------------
+1)  user->pdgemm_                                     
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        5~6  | 385649.0 |     50.9 |         6 |   1303.005  
+    -------------------------------------------------------
+                             total:          6     1303.005
+    -------------------------------------------------------
+2)  user->pdsyevx_->pdgemm_                           
+    -------------------------------------------------------
+    log10(N) |  avg(N)  | stdev(N) |   count   |    time     
+    -------------------------------------------------------
+        1~2  |     78.7 |     16.1 |        36 |      0.000  
+        2~3  |    392.6 |     97.5 |      5076 |      0.039  
+    -------------------------------------------------------
+                             total:       5112        0.039
+    -------------------------------------------------------
+--------------------------------------------------------------
+
+```

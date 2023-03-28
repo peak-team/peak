@@ -5,7 +5,7 @@ include ../Make.inc
 TARGET = peak_libprof.so
 
 OBJU = ../utils/utils.o
-OBJ =  $(OBJU)  lib_prof.o hash.o  hash2.o cstr-utils.o \
+OBJ =  $(OBJU)  libprof.o hash.o  hash2.o cstr-utils.o \
 	lib_wrappers/blas.o \
  lib_wrappers/cblas.o  \
  lib_wrappers/lapack.o  \
