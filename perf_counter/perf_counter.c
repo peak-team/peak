@@ -289,7 +289,7 @@ int check_parent_process(int *need_to_clean) {
 
     sem_post(file_semaphore); // Release the lock
     sem_close(file_semaphore); // Close the semaphore
-    sem_unlink("/file_semaphore"); // Unlink the semaphore
+    sem_unlink("/fppid_semaphore"); // Unlink the semaphore
 
     free(lock_file);
     fclose(file); 
