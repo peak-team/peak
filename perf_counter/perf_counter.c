@@ -6,7 +6,6 @@
 #include <dlfcn.h>
 #include <linux/perf_event.h>
 #include <unistd.h>
-#include <semaphore.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -14,8 +13,10 @@
 #include <mpi.h>
 
 #include "utils.h"
+#include "ppid_check.h"
 
 #define LOCK_FILE_PREFIX "/tmp/lock_flops_count_"
+#define PPID_FILE_NAME "/tmp/lock_flops_count_ppid_list"
 #define MAX_TIME_DIFF_ENV "FLOPS_MAX_DELAY"
 #define MAX_TIME_DIFF 60
 #define NUM_COUNTERS 8
@@ -239,73 +240,6 @@ int check_lock(char* file_name, char** lock_file) {
 }
 
 
-int check_parent_process(int *need_to_clean) {
-    const char *tmp_file_name = "my_ppid_list";
-    char *lock_file = (char *)malloc(sizeof(char) * (strlen(LOCK_FILE_PREFIX) + strlen(tmp_file_name) + 1));
-    sprintf(lock_file, "%s%s", LOCK_FILE_PREFIX, tmp_file_name);
-    *need_to_clean = 0;
-    int fd = open(lock_file, O_CREAT | O_EXCL | O_RDWR, 0644);
-    if (fd < 0) {
-        // PPID file already exists
-        fd = open(lock_file, O_RDWR);
-        if (fd < 0) {
-            //perror("Failed to open PPID file");
-            free(lock_file);
-            return -1;
-        }
-    } else {
-        *need_to_clean = 1;
-    }
-    // Write current PPID to lock file
-    pid_t mypid = getpid();
-    pid_t parentpid = getppid();
-
-    FILE* file = fdopen(fd, "r+");  // open the file in read mode using fdopen()
-    if (file == NULL) {
-        perror("fdopen");
-        free(lock_file);
-        close(fd);
-        return -1;
-    }
-
-    sem_t *file_semaphore = sem_open("/fppid_semaphore", O_CREAT, 0644, 1);
-    sem_wait(file_semaphore); // Obtain an exclusive lock on the file
-
-    int found_parent = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), file) != NULL) {  // read each line of the file
-        int num;
-        if (sscanf(line, "%d", &num) == 1) {  // extract the integer from the line
-            if (num == parentpid) {  // compare the integer with the desired PPID
-                found_parent = 1; 
-                // fprintf(stderr, "Found PPID %d in file\n", parentpid);
-                break;  // stop searching if a match is found
-            }
-        }
-    }
-    fprintf(file, "%d\n", mypid); 
-    //fprintf(stderr, "wrote %d with flag %d\n", mypid, flg);
-    fflush(file); // Flush the output buffer
-
-    sem_post(file_semaphore); // Release the lock
-    sem_close(file_semaphore); // Close the semaphore
-    sem_unlink("/fppid_semaphore"); // Unlink the semaphore
-
-    free(lock_file);
-    fclose(file); 
-    close(fd);
-    return found_parent;
-}
-
-
-void remove_ppid_file() {
-    const char *tmp_file_name = "my_ppid_list";
-    char *lock_file = (char *)malloc(sizeof(char) * (strlen(LOCK_FILE_PREFIX) + strlen(tmp_file_name) + 1));
-    sprintf(lock_file, "%s%s", LOCK_FILE_PREFIX, tmp_file_name);
-    unlink(lock_file);
-    free(lock_file);
-}
-
 int MPI_Finalize(void) {
     //printf("--- My Final ---\n");
     return 0;
@@ -411,7 +345,7 @@ void setup_counters_main() {
     is_MPI = check_MPI();
     // fprintf(stderr, "open %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
     if (is_MPI){
-        is_parent_MPI = check_parent_process(&flag_clean_fppid);
+        is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
         // fprintf(stderr, "open %s \t MPI %d \t FLAG %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, flag_clean_fppid, getpid(), getppid());
         if(is_parent_MPI > 0) {
             is_MPI = 0;
@@ -516,7 +450,7 @@ void collect_counters_main() {
     }
     if(flag_clean_fppid) {
         // fprintf(stderr, "remove %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
-        remove_ppid_file();
+        remove_ppid_file(PPID_FILE_NAME);
     }
     if(is_parent_MPI > 0) {
         return;
