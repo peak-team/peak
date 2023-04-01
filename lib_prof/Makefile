@@ -6,10 +6,10 @@ TARGET = peak_libprof.so
 
 OBJU = ../utils/utils.o
 OBJ =  $(OBJU)  libprof.o hash.o  hash2.o cstr-utils.o \
-	lib_wrappers/blas.o \
- lib_wrappers/cblas.o  \
- lib_wrappers/lapack.o  \
- lib_wrappers/scalapack.o\
+ 	lib_wrappers/blas.o \
+  lib_wrappers/cblas.o  \
+  lib_wrappers/lapack.o  \
+  lib_wrappers/scalapack.o\
  lib_wrappers/pblas.o  
 
 INCLUDE = -I./ -I./lib_wrappers/ -I../utils/

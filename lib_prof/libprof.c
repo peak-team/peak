@@ -129,7 +129,8 @@ void print_result() {
     fprintf(OUTFILE, "for application: %s\n\n",argv0);
     if(ifmpi)  fprintf(OUTFILE, "recorded MPI rank: %d\n",peakprof_record_rank);
 //   fprintf(OUTFILE,"----------------------------- PEAK Prof -------------------------------\n");
-    fprintf(OUTFILE,"total runtime: %.3fs, library time: %.3fs, percentage of lib: %.1f%\n\n",apptime, libtime, libtime/apptime*100);
+    fprintf(OUTFILE,"total runtime: %.3fs\nlibrary time: %.3fs\npercentage of lib: %.1f%\n\n", \
+                     apptime, libtime, libtime/apptime*100);
 //    printf("layer_time=%.3fs\n",layer_time[0]);
 //   fprintf(OUTFILE,"-------------------------------------------------------------------------\n");
     env_show();
@@ -258,9 +259,9 @@ void libprof_init(){
   return;
 }
 
-//__attribute__((section(".init_array"))) void *__init = libprof_init;
-//__attribute__((section(".fini_array"))) void *__fini = libprof_fini;
+  __attribute__((section(".init_array"))) void *__init = libprof_init;
+  __attribute__((section(".fini_array"))) void *__fini = libprof_fini;
 
-  void libprof_init() __attribute__((constructor));
-  void libprof_fini() __attribute__((destructor));
+//  void libprof_init() __attribute__((constructor));
+//  void libprof_fini() __attribute__((destructor));
 
