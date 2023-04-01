@@ -5,6 +5,7 @@
 #include <mpi.h>
 #include <string.h>
 #include "cstr-utils.h"
+#include "ppid_check.h"
 
 // global 
  bool peakprof_init_flag=false;
@@ -25,6 +26,7 @@
 //local
  char *argv0;
  int ifmpi;
+ int flag_clean_fppid = 0;
 
 
 
@@ -233,13 +235,15 @@ void reduce_result() {
 }
 
 void libprof_fini(){
-   apptime = mysecond()-apptime;
-   ifmpi=check_MPI();
-   if (ifmpi)  {
-      reduce_result(); 
-   }
-   else 
-      print_result();
+    apptime = mysecond()-apptime;
+    if (ifmpi)  {
+        reduce_result(); 
+    }
+    else 
+        print_result();
+    if(flag_clean_fppid) {
+        remove_ppid_file(PPID_FILE_NAME);
+    }
 }
 
 void libprof_init(){
@@ -249,14 +253,21 @@ void libprof_init(){
    fprintf(OUTFILE, "                    Starting PEAK Prof Library\n");
    fprintf(OUTFILE, "        ----------------------------------------------------\n");
 */
-   peakprof_init_flag=true;
-   layer_count=0; 
-   strcpy(layer_caller[0],"user");
-   memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
-   env_get();
-   get_argv0(&argv0);
-   apptime = mysecond();
-  return;
+    peakprof_init_flag=true;
+    layer_count=0; 
+    strcpy(layer_caller[0],"user");
+    memset(layer_time, 0, MAX_LAYER*sizeof(layer_time[0]));
+    env_get();
+    get_argv0(&argv0);
+    ifmpi=check_MPI();
+    if (ifmpi){
+        int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
+        if(is_parent_MPI > 0) {
+            ifmpi = 0;
+        }
+    }
+    apptime = mysecond();
+    return;
 }
 
   __attribute__((section(".init_array"))) void *__init = libprof_init;

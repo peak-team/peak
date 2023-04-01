@@ -31,4 +31,6 @@ extern char **record_f;
 
 #include "utils.h"
 
+#define PPID_FILE_NAME "/tmp/lock_libprof_ppid_list"
+
 

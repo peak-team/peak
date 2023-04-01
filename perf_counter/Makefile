@@ -4,7 +4,7 @@ include ../Make.inc
 
 TARGET = peak_counter.so
 
-OBJU = ../utils/utils.o
+OBJU = ../utils/utils.o ../utils/ppid_check.o
 OBJ = $(OBJU) perf_counter.o
 
 

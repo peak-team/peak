@@ -13,8 +13,10 @@
 #include <mpi.h>
 
 #include "utils.h"
+#include "ppid_check.h"
 
 #define LOCK_FILE_PREFIX "/tmp/lock_flops_count_"
+#define PPID_FILE_NAME "/tmp/lock_flops_count_ppid_list"
 #define MAX_TIME_DIFF_ENV "FLOPS_MAX_DELAY"
 #define MAX_TIME_DIFF 60
 #define NUM_COUNTERS 8
@@ -331,11 +333,26 @@ int *fds;
 int *fds_uc;
 char *argv_o;
 int clean_up_done = 0;
+int is_MPI = 0;
+int is_parent_MPI = 0;
+int flag_clean_fppid = 0;
 void setup_counters_main() {
     get_argv0(&argv_o);
     skip_flag = check_string(argv_o);
     if(skip_flag) {
         return;
+    }
+    is_MPI = check_MPI();
+    // fprintf(stderr, "open %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
+    if (is_MPI){
+        is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
+        // fprintf(stderr, "open %s \t MPI %d \t FLAG %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, flag_clean_fppid, getpid(), getppid());
+        if(is_parent_MPI > 0) {
+            is_MPI = 0;
+            return;
+        }
+        // if(is_parent_MPI < 0)
+        //     fprintf(stderr, "err open %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
     }
     fd = check_lock(argv_o, &lock_file_name); 
     //fprintf(stderr, "open %d %s\n", fd, argv[0]);
@@ -417,6 +434,10 @@ void setup_counters_main() {
     //only redirect signals here to ensure setups are done
     redirect_signals();
     //printf("--- Before main ---\n");
+    // fprintf(stderr, "open %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
+    // system("unset LD_PRELOAD");
+    // system("unset MV2_COMM_WORLD_RANK");
+    // system("unset OMPI_COMM_WORLD_RANK");
     clock_gettime(CLOCK_MONOTONIC, &start);
 }
 void collect_counters_main() {
@@ -427,9 +448,16 @@ void collect_counters_main() {
     if(skip_flag) {
         return;
     }
+    if(flag_clean_fppid) {
+        // fprintf(stderr, "remove %s \t MPI %d \t PID=%d \t PPID=%d \n", argv_o, is_MPI, getpid(), getppid());
+        remove_ppid_file(PPID_FILE_NAME);
+    }
+    if(is_parent_MPI > 0) {
+        return;
+    }
     if(fd < 0) {
         clock_gettime(CLOCK_MONOTONIC, &end);
-        if (check_MPI() && !signal_received) {
+        if (is_MPI && !signal_received) {
             double values[NUM_COUNTERS] = {0.0};
             double values_uc[NUM_COUNTERS_UC] = {0.0};
             double elapsed_time = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -480,7 +508,7 @@ void collect_counters_main() {
     unlink(lock_file_name);
     free(lock_file_name);
 
-    if (check_MPI() && !signal_received) {
+    if (is_MPI && !signal_received) {
         reduce_result(argv_o, values, values_uc, elapsed_time);
     } else {
         print_result(argv_o, values, values_uc, elapsed_time, 1);
