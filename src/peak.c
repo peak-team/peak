@@ -46,12 +46,12 @@ example_listener_on_enter (GumInvocationListener * listener,
 {
   ExampleListener * self = EXAMPLE_LISTENER (listener);
   ExampleHookId hook_id = GUM_IC_GET_FUNC_DATA (ic, ExampleHookId);
-  if(self->num_calls == 1)
-    g_print ("[*] dgemm_(M = %d, N = %d, K = %d) %d\n", 
-      *((int*) (gum_invocation_context_get_nth_argument (ic, 2))),
-      *((int*) (gum_invocation_context_get_nth_argument (ic, 3))),
-      *((int*) (gum_invocation_context_get_nth_argument (ic, 4))), self->num_calls
-    );
+  // if(self->num_calls == 1)
+    // g_print ("[*] dgemm_(M = %d, N = %d, K = %d) %d\n", 
+    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 2))),
+    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 3))),
+    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 4))), self->num_calls
+    // );
 
   // switch (hook_id)
   // {
@@ -110,7 +110,11 @@ void libprof_init(){
   
   char **strings;
   int count = parse_env_w_comma("PEAK_TARGET", &strings);
-  hook_address = GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, "dgemm_"));
+  if(count>0) {
+    hook_address = GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, strings[0]));
+  }
+  else
+    hook_address = NULL;
   if (hook_address) {
     g_print ("dgemm address = %p\n", hook_address);
     
