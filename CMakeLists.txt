@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(peak C CXX)
+project(peak C CXX Fortran)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")
@@ -36,24 +36,11 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_INCLUDE_DIRS)
     message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
 endif()
 
+add_subdirectory(src)
 
-############################################################
-# Create a library
-############################################################
-
-# Generate the shared library from the library sources
-add_library(peak SHARED 
-    src/peak.c
-)
-
-target_include_directories(peak
-    PUBLIC 
-        ${PROJECT_SOURCE_DIR}/include
-        ${FRIDA_GUM_INCLUDE_DIRS}
-)
-
-target_link_libraries(peak
-    PRIVATE
-        ${FRIDA_GUM_LIBRARIES}
-)
-
+# Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests
+option(BUILD_TESTS "Build tests" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()
