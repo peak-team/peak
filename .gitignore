@@ -96,3 +96,6 @@ dkms.conf
 
 # Built Visual Studio Code Extensions
 *.vsix
+
+# build directory 
+build/
