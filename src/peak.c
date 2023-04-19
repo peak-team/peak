@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "utils/env_parser.h"
+
 typedef struct _ExampleListener ExampleListener;
 typedef enum _ExampleHookId ExampleHookId;
 
@@ -106,6 +108,8 @@ void libprof_init(){
   interceptor = gum_interceptor_obtain ();
   listener = g_object_new (EXAMPLE_TYPE_LISTENER, NULL);
   
+  char **strings;
+  int count = parse_env_w_comma("PEAK_TARGET", &strings);
   hook_address = GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, "dgemm_"));
   if (hook_address) {
     g_print ("dgemm address = %p\n", hook_address);
@@ -117,6 +121,17 @@ void libprof_init(){
         GSIZE_TO_POINTER (EXAMPLE_HOOK_DGEMM));
     gum_interceptor_end_transaction (interceptor);
   }
+
+  // if (count == 0) {
+  //     printf("No strings found in PEAK_TARGET\n");
+  // } else {
+  //     printf("Parsed %d strings from PEAK_TARGET:\n", count);
+  //     for (int i = 0; i < count; i++) {
+  //         printf("  %s\n", strings[i]);
+  //         free(strings[i]);
+  //     }
+  //     free(strings);
+  // }
 }
 
 void libprof_fini(){
