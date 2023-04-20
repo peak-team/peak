@@ -127,7 +127,6 @@ void libprof_init(){
 }
 
 void libprof_fini(){
-  gboolean hook_flag = 0;
   for(size_t i=0; i<hook_address_count; i++) {
     if (hook_address[i]) {
       for(size_t j=1; j<num_cores; j++) {
@@ -139,14 +138,11 @@ void libprof_fini(){
         PEAKGENERAL_LISTENER (listener)->num_calls[i * num_cores], 
         PEAKGENERAL_LISTENER (listener)->total_time[i * num_cores]
         );
-      hook_flag = 1;
     }
   }
-  if (hook_flag) {
-    gum_interceptor_detach (interceptor, listener);
-    g_object_unref (listener);
-    g_object_unref (interceptor);
-  }
+  gum_interceptor_detach (interceptor, listener);
+  g_object_unref (listener);
+  g_object_unref (interceptor);
   gum_deinit_embedded ();
 }
 
