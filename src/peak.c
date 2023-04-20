@@ -12,138 +12,119 @@
 #include <unistd.h>
 
 #include "utils/env_parser.h"
+#include "utils/utils.h"
 
-typedef struct _ExampleListener ExampleListener;
-typedef enum _ExampleHookId ExampleHookId;
+#define PEAK_TARGET_ENV "PEAK_TARGET"
+#define PEAK_TARGET_DELIM ','
 
-struct _ExampleListener
+typedef struct _PeakGeneralListener PeakGeneralListener;
+
+struct _PeakGeneralListener
 {
   GObject parent;
 
-  guint num_calls;
+  guint* num_calls;
+  gdouble* total_time;
+  gdouble* current_time;
 };
 
-enum _ExampleHookId
-{
-  EXAMPLE_HOOK_DGEMM,
-  EXAMPLE_HOOK_CLOSE
-};
+static void peak_general_listener_iface_init (gpointer g_iface, gpointer iface_data);
 
-static void example_listener_iface_init (gpointer g_iface, gpointer iface_data);
-
-#define EXAMPLE_TYPE_LISTENER (example_listener_get_type ())
-G_DECLARE_FINAL_TYPE (ExampleListener, example_listener, EXAMPLE, LISTENER, GObject)
-G_DEFINE_TYPE_EXTENDED (ExampleListener,
-                        example_listener,
+#define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type ())
+G_DECLARE_FINAL_TYPE (PeakGeneralListener, peak_general_listener, PEAKGENERAL, LISTENER, GObject)
+G_DEFINE_TYPE_EXTENDED (PeakGeneralListener,
+                        peak_general_listener,
                         G_TYPE_OBJECT,
                         0,
                         G_IMPLEMENT_INTERFACE (GUM_TYPE_INVOCATION_LISTENER,
-                            example_listener_iface_init))
+                            peak_general_listener_iface_init))
 
 static void
-example_listener_on_enter (GumInvocationListener * listener,
+peak_general_listener_on_enter (GumInvocationListener * listener,
                            GumInvocationContext * ic)
 {
-  ExampleListener * self = EXAMPLE_LISTENER (listener);
-  ExampleHookId hook_id = GUM_IC_GET_FUNC_DATA (ic, ExampleHookId);
-  // if(self->num_calls == 1)
-    // g_print ("[*] dgemm_(M = %d, N = %d, K = %d) %d\n", 
-    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 2))),
-    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 3))),
-    //   *((int*) (gum_invocation_context_get_nth_argument (ic, 4))), self->num_calls
-    // );
-
-  // switch (hook_id)
-  // {
-  //   case EXAMPLE_HOOK_DGEMM:
-  //     g_print ("[*] dgemm_(M = %d, N = %d, K = %d)\n", 
-  //       GPOINTER_TO_INT (gum_invocation_context_get_nth_argument (ic, 2)),
-  //       GPOINTER_TO_INT (gum_invocation_context_get_nth_argument (ic, 3)),
-  //       GPOINTER_TO_INT (gum_invocation_context_get_nth_argument (ic, 4))
-  //     );
-  //     break;
-  //   case EXAMPLE_HOOK_CLOSE:
-  //     g_print ("Error\n");
-  //     break;
-  // }
-
-  self->num_calls++;
+  PeakGeneralListener * self = PEAKGENERAL_LISTENER (listener);
+  size_t hook_id = GUM_IC_GET_FUNC_DATA (ic, size_t);
+  self->num_calls[hook_id]++;
+  self->current_time[hook_id] = peak_second();
 }
 
 static void
-example_listener_on_leave (GumInvocationListener * listener,
+peak_general_listener_on_leave (GumInvocationListener * listener,
                            GumInvocationContext * ic)
 {
+  PeakGeneralListener * self = PEAKGENERAL_LISTENER (listener);
+  size_t hook_id = GUM_IC_GET_FUNC_DATA (ic, size_t);
+  self->total_time[hook_id] += peak_second() - self->current_time[hook_id];
 }
 
 static void
-example_listener_class_init (ExampleListenerClass * klass)
+peak_general_listener_class_init (PeakGeneralListenerClass * klass)
 {
-  (void) EXAMPLE_IS_LISTENER;
-  (void) glib_autoptr_cleanup_ExampleListener;
+  (void) PEAKGENERAL_IS_LISTENER;
+  (void) glib_autoptr_cleanup_PeakGeneralListener;
 }
 
 static void
-example_listener_iface_init (gpointer g_iface,
+peak_general_listener_iface_init (gpointer g_iface,
                              gpointer iface_data)
 {
   GumInvocationListenerInterface * iface = g_iface;
 
-  iface->on_enter = example_listener_on_enter;
-  iface->on_leave = example_listener_on_leave;
-}
-
-static void
-example_listener_init (ExampleListener * self)
-{
+  iface->on_enter = peak_general_listener_on_enter;
+  iface->on_leave = peak_general_listener_on_leave;
 }
 
 GumInterceptor * interceptor;
 GumInvocationListener * listener;
-gpointer hook_address;
+size_t hook_address_count;
+gpointer* hook_address = NULL;
+char **hook_strings;
+
+static void
+peak_general_listener_init (PeakGeneralListener * self)
+{
+  self->num_calls = malloc(sizeof(size_t) * hook_address_count);
+  memset(self->num_calls, 0, sizeof(size_t) * hook_address_count);
+  self->total_time = malloc(sizeof(double) * hook_address_count);
+  memset(self->total_time, 0, sizeof(double) * hook_address_count);
+  self->current_time = malloc(sizeof(double) * hook_address_count);
+  memset(self->current_time, 0, sizeof(double) * hook_address_count);
+}
+
 void libprof_init(){
 
   gum_init_embedded ();
 
   interceptor = gum_interceptor_obtain ();
-  listener = g_object_new (EXAMPLE_TYPE_LISTENER, NULL);
+  listener = g_object_new (PEAKGENERAL_TYPE_LISTENER, NULL);
   
-  char **strings;
-  int count = parse_env_w_comma("PEAK_TARGET", &strings);
-  if(count>0) {
-    hook_address = GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, strings[0]));
+  hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &hook_strings);
+  hook_address = malloc(sizeof(gpointer) * hook_address_count);
+  gum_interceptor_begin_transaction (interceptor);
+  for(size_t i=0; i<hook_address_count; i++) {
+    hook_address[i] = GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, hook_strings[i]));
+    if (hook_address[i]) {
+      // g_print ("%s address = %p\n", hook_strings[i], hook_address[i]);
+      gum_interceptor_attach (interceptor,
+          hook_address[i],
+          listener,
+          GSIZE_TO_POINTER (i));
+    }
   }
-  else
-    hook_address = NULL;
-  if (hook_address) {
-    g_print ("dgemm address = %p\n", hook_address);
-    
-    gum_interceptor_begin_transaction (interceptor);
-    gum_interceptor_attach (interceptor,
-        hook_address,
-        listener,
-        GSIZE_TO_POINTER (EXAMPLE_HOOK_DGEMM));
-    gum_interceptor_end_transaction (interceptor);
-  }
-
-  // if (count == 0) {
-  //     printf("No strings found in PEAK_TARGET\n");
-  // } else {
-  //     printf("Parsed %d strings from PEAK_TARGET:\n", count);
-  //     for (int i = 0; i < count; i++) {
-  //         printf("  %s\n", strings[i]);
-  //         free(strings[i]);
-  //     }
-  //     free(strings);
-  // }
+  gum_interceptor_end_transaction (interceptor);
 }
 
 void libprof_fini(){
-  if (hook_address) {
+  gboolean hook_flag = 0;
+  for(size_t i=0; i<hook_address_count; i++) {
+    if (hook_address[i]) {
+      g_print ("%s is called %u times and costs %f s\n", hook_strings[i], PEAKGENERAL_LISTENER (listener)->num_calls[i], PEAKGENERAL_LISTENER (listener)->total_time[i]);
+      hook_flag = 1;
+    }
+  }
+  if (hook_flag) {
     gum_interceptor_detach (interceptor, listener);
-
-    g_print ("[*] listener has %u calls\n", EXAMPLE_LISTENER (listener)->num_calls);
-
     g_object_unref (listener);
     g_object_unref (interceptor);
   }

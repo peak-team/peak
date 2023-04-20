@@ -30,6 +30,12 @@ if(BUILD_TESTING)
     # Add test of dgemm
     add_subdirectory(dgemm)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
-    set_tests_properties(test_dgemm PROPERTIES ENVIRONMENT "PEAK_TARGET=dgemm_;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so")
-    set_tests_properties(test_dgemm PROPERTIES PASS_REGULAR_EXPRESSION "has 100000 calls")
+    set_tests_properties(test_dgemm 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=dgemm_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+    )
+    set_tests_properties(test_dgemm 
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "dgemm_ is called 100000 times[\r\n\t ]*__libc_start_main is called 1 times"
+    )
 endif()

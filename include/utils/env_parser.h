@@ -7,21 +7,22 @@
  */
 
 #include <stdio.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
 /**
- * @brief Parses a comma-separated environment variable into an array of strings.
+ * @brief Splits a string into an array of substrings based on a given delimiter.
  *
- * This function takes a comma-separated environment variable as input and returns an array
- * of strings that correspond to the comma-separated values in the input. The array is
- * dynamically allocated and must be freed by the caller when it is no longer needed.
+ * This function splits a given string into an array of substrings based on the specified delimiter character.
+ * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
+ * If the string does not contain the delimiter, the resulting array will have a single element containing the entire string.
  *
  * @param env_var The environment variable to parse.
+ * @param a_delim A pointer to a char to be used as the delimiter.
  * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @param size A pointer to an integer that will be set to the number of strings in the array.
  * @return 0 if the env does not exist, or the number of strings in the array.
  */
-int parse_env_w_comma(const char *env_var, char ***result);
+size_t parse_env_w_delim(const char *env_var, const char a_delim, char ***result);
 
 #endif /* ENV_PARSER_H */
