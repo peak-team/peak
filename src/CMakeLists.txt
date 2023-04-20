@@ -21,6 +21,7 @@ target_include_directories(peak
 target_link_libraries(peak
     PRIVATE
         ${FRIDA_GUM_LIBRARIES}
+        Threads::Threads
 )
 
 install (TARGETS peak DESTINATION lib)

@@ -16,14 +16,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(CMAKE_BUILD_TYPE MATCHES "Release")
     add_compile_options("SHELL: -Wall -O3 -ffunction-sections -fdata-sections")
-    add_link_options("SHELL: -static-libgcc -Wl,-z,noexecstack,--gc-sections")
+    add_link_options("SHELL: -ldl -lrt -lresolv -lm -static-libgcc -Wl,-z,noexecstack,--gc-sections")
 elseif(CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_options("SHELL: -Wall -O0 -g")
+    add_link_options("SHELL: -ldl -lrt -lresolv -lm")
 endif()
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
+
+find_package(Threads REQUIRED)
 
 # Find or download frida-gum
 if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_INCLUDE_DIRS)
