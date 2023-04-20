@@ -22,6 +22,10 @@ target_link_libraries(peak
     PRIVATE
         ${FRIDA_GUM_LIBRARIES}
         Threads::Threads
+        ${DL_LIBRARY}
+        ${RT_LIBRARY}
+        ${RESOLV_LIBRARY}
+        ${M_LIBRARY}
 )
 
 install (TARGETS peak DESTINATION lib)
