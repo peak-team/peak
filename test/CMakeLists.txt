@@ -27,6 +27,8 @@ if(BUILD_TESTING)
         set(LAPACK_LIBRARIES ${PROJECT_BINARY_DIR}/openblas/lib/libopenblas.a)
     endif()
 
+    find_package(OpenMP)
+
     include (FortranCInterface)
     list (APPEND FORTRAN_FUNCTIONS sdot)
     FortranCInterface_HEADER (include/FC.h 
@@ -49,12 +51,19 @@ if(BUILD_TESTING)
     # Add test of sdot
     add_subdirectory(sdot)
     add_test(NAME test_sdot COMMAND ${PROJECT_BINARY_DIR}/test/sdot/test_sdot)
+    if(OpenMP_FOUND)
+        set_tests_properties(test_sdot
+            PROPERTIES 
+                ENVIRONMENT "OMP_NUM_THREADS=56;PEAK_TARGET=sdot_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+        )
+    else()
+        set_tests_properties(test_sdot
+            PROPERTIES 
+                ENVIRONMENT "PEAK_TARGET=sdot_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+        )
+    endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=sdot_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
-    )
-    set_tests_properties(test_sdot
-        PROPERTIES 
-            PASS_REGULAR_EXPRESSION "sdot_ is called 10000 times .*[\r\n\t ]*__libc_start_main is called 1 times"
+            PASS_REGULAR_EXPRESSION "sdot_ is called 1000000 times .*[\r\n\t ]*__libc_start_main is called 1 times"
     )
 endif()

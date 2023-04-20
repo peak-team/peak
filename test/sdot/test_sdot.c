@@ -11,7 +11,8 @@ int main() {
         y[i] = i + 1;
     }
     float dot_product;
-    for (int i = 0; i < 10000; i++) {
+    #pragma omp parallel for
+    for (int i = 0; i < 1000000; i++) {
         dot_product = cblas_sdot(N, x, 1, y, 1);
     }
     printf("Dot product: %f\n", dot_product);
