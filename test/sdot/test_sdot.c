@@ -4,14 +4,15 @@
 
 #define N 80
 
-int main() {
+int main()
+{
     float x[N], y[N];
     for (int i = 0; i < N; i++) {
         x[i] = i;
         y[i] = i + 1;
     }
     float dot_product;
-    #pragma omp parallel for
+#pragma omp parallel for
     for (int i = 0; i < 1000000; i++) {
         dot_product = cblas_sdot(N, x, 1, y, 1);
     }

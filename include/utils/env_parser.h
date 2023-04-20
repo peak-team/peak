@@ -23,6 +23,6 @@
  * @param result A pointer to an array of strings to be allocated and filled by this function.
  * @return 0 if the env does not exist, or the number of strings in the array.
  */
-size_t parse_env_w_delim(const char *env_var, const char a_delim, char ***result);
+size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
 
 #endif /* ENV_PARSER_H */
