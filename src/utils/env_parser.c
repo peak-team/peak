@@ -39,7 +39,6 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
             *(*result + idx++) = strdup(token);
             token = strtok(0, delim);
         }
-        assert(idx == count - 1);
     }
 
     return count;

@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#include "pthread_listener.h"
 #include "utils/env_parser.h"
 #include "utils/utils.h"
 
@@ -33,7 +34,7 @@ GumInvocationListener* listener;
 size_t hook_address_count;
 gpointer* hook_address = NULL;
 char** hook_strings;
-long num_cores;
+long max_num_threads;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -52,10 +53,12 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     size_t hook_id = GUM_IC_GET_FUNC_DATA(ic, size_t);
-    pid_t tid = syscall(SYS_gettid) % num_cores;
+    pthread_t tid = pthread_self();
     // g_print ("hook_id %lu tid %lu tid_orig %lu\n", hook_id, tid, syscall(SYS_gettid));
-    self->num_calls[hook_id * num_cores + tid]++;
-    self->current_time[hook_id * num_cores + tid] = peak_second();
+    pthread_t mapped_tid = (pthread_t) (gum_metal_hash_table_lookup(tid_mapping, GUINT_TO_POINTER(tid)));
+    // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
+    self->num_calls[hook_id * max_num_threads + mapped_tid]++;
+    self->current_time[hook_id * max_num_threads + mapped_tid] = peak_second();
 }
 
 static void
@@ -65,8 +68,9 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     size_t hook_id = GUM_IC_GET_FUNC_DATA(ic, size_t);
-    pid_t tid = syscall(SYS_gettid) % num_cores;
-    self->total_time[hook_id * num_cores + tid] += end_time - self->current_time[hook_id * num_cores + tid];
+    pthread_t tid = pthread_self();
+    pthread_t mapped_tid = (pthread_t) (gum_metal_hash_table_lookup(tid_mapping, GUINT_TO_POINTER(tid)));
+    self->total_time[hook_id * max_num_threads + mapped_tid] += end_time - self->current_time[hook_id * max_num_threads + mapped_tid];
 }
 
 static void
@@ -89,7 +93,7 @@ peak_general_listener_iface_init(gpointer g_iface,
 static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
-    size_t total_count = hook_address_count * num_cores;
+    size_t total_count = hook_address_count * max_num_threads;
     // g_print ("total count %lu hook_address_count %lu num_cores %lu\n", total_count, hook_address_count, num_cores);
     self->num_calls = malloc(sizeof(size_t) * total_count);
     memset(self->num_calls, 0, sizeof(size_t) * total_count);
@@ -102,10 +106,12 @@ peak_general_listener_init(PeakGeneralListener* self)
 void libprof_init()
 {
 
-    num_cores = sysconf(_SC_NPROCESSORS_ONLN) * 2;
+    max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
     hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &hook_strings);
 
     gum_init_embedded();
+
+    pthread_listener_attach();
 
     interceptor = gum_interceptor_obtain();
     listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
@@ -130,19 +136,20 @@ void libprof_fini()
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
-            for (size_t j = 1; j < num_cores; j++) {
-                PEAKGENERAL_LISTENER(listener)->num_calls[i * num_cores] += PEAKGENERAL_LISTENER(listener)->num_calls[i * num_cores + j];
-                PEAKGENERAL_LISTENER(listener)->total_time[i * num_cores] += PEAKGENERAL_LISTENER(listener)->total_time[i * num_cores + j];
+            for (size_t j = 1; j < max_num_threads; j++) {
+                PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j];
+                PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads + j];
             }
             g_print("%s is called %u times and costs %f s\n",
                     hook_strings[i],
-                    PEAKGENERAL_LISTENER(listener)->num_calls[i * num_cores],
-                    PEAKGENERAL_LISTENER(listener)->total_time[i * num_cores]);
+                    PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
+                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]);
         }
     }
     gum_interceptor_detach(interceptor, listener);
     g_object_unref(listener);
     g_object_unref(interceptor);
+    pthread_listener_dettach();
     gum_deinit_embedded();
 }
 
