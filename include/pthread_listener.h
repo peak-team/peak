@@ -27,6 +27,22 @@ struct _PthreadListener {
 };
 
 /**
+ * @struct _PthreadState
+ * @brief Structure for PthreadState
+ *
+ * This structure represents a PthreadState.
+ */
+typedef struct _PthreadState PthreadState;
+
+/**
+ * @brief PthreadState class
+ */
+struct _PthreadState {
+    pthread_t* child_tid;
+    gboolean is_original;
+};
+
+/**
  * @brief Attach the pthread listener
  */
 void pthread_listener_attach();

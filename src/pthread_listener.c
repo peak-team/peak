@@ -2,10 +2,9 @@
 
 GumInterceptor* pthread_create_interceptor;
 GumInvocationListener* pthread_create_listener;
+PthreadState state;
 GumMetalHashTable* tid_mapping;
 GMutex tid_mapping_mutex;
-GumMetalHashTable* tid_store;
-GMutex tid_store_mutex;
 pthread_t current_tid = 0;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
@@ -23,35 +22,34 @@ static void
 pthread_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
+    PthreadState* thread_state = (PthreadState*) (gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
     pthread_t* tid = (pthread_t *) (gum_invocation_context_get_nth_argument(ic, 0));
-    guint my_tid = pthread_self();
     //g_print ("%lu pthread_listener_on_enter %lu\n", my_tid, *tid);
     if (tid == NULL) {
-        pthread_t* replaced_tid = malloc(sizeof(pthread_t));
-        g_mutex_lock(&tid_store_mutex);
-        gum_metal_hash_table_insert(tid_store, GUINT_TO_POINTER(my_tid), replaced_tid);
-        g_mutex_unlock(&tid_store_mutex);
+        pthread_t* replaced_tid = g_new0(pthread_t, 1);
         gum_invocation_context_replace_nth_argument(ic, 0, replaced_tid);
+        thread_state->child_tid = replaced_tid;
+        thread_state->is_original = FALSE;
+    } else {
+        thread_state->child_tid = tid;
+        thread_state->is_original = TRUE;
     }
-    g_mutex_lock(&tid_store_mutex);
-    gum_metal_hash_table_insert(tid_store, GUINT_TO_POINTER(my_tid), tid);
-    g_mutex_unlock(&tid_store_mutex);
 }
 
 static void
 pthread_listener_on_leave(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
-    guint my_tid = pthread_self();
-    g_mutex_lock(&tid_store_mutex);
-    pthread_t tid = *((pthread_t *) (gum_metal_hash_table_lookup(tid_store, GUINT_TO_POINTER(my_tid))));
-    g_mutex_unlock(&tid_store_mutex);
+    PthreadState* thread_state = (PthreadState*) (gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
+    pthread_t tid = *(thread_state->child_tid);
 
     //g_print ("%lu pthread_listener_on_leave %lu\n", my_tid, tid);
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_insert(tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
     g_mutex_unlock(&tid_mapping_mutex);
+    if (!thread_state->is_original)
+        g_free(thread_state->child_tid);
 }
 
 static void
@@ -80,9 +78,7 @@ void pthread_listener_attach()
 {
     // g_print ("hook_address_count %lu num_cores %lu\n",  hook_address_count, num_cores);
     tid_mapping = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
-    tid_store = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
     g_mutex_init(&tid_mapping_mutex);
-    g_mutex_init(&tid_store_mutex);
     gum_metal_hash_table_insert(tid_mapping, GUINT_TO_POINTER(pthread_self()), GUINT_TO_POINTER(current_tid));
     current_tid++;
     
@@ -96,7 +92,7 @@ void pthread_listener_attach()
         gum_interceptor_attach(pthread_create_interceptor,
                                hook_address,
                                pthread_create_listener,
-                               NULL);
+                               &state);
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }
@@ -111,6 +107,8 @@ void pthread_listener_dettach()
     // gum_metal_hash_table_foreach(tid_mapping, (GHFunc)print_key_value_pair, NULL);
 
     gum_interceptor_detach(pthread_create_interceptor, pthread_create_listener);
+    gum_metal_hash_table_unref(tid_mapping);
+    g_mutex_clear(&tid_mapping_mutex);
     g_object_unref(pthread_create_listener);
     g_object_unref(pthread_create_interceptor);
 }
