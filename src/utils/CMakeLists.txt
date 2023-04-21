@@ -1,6 +1,7 @@
 # Add all source files
 FILE(GLOB sources_utils
     env_parser.c
+    mpi_utils.c
     utils.c
 )
 

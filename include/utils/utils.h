@@ -1,6 +1,12 @@
 #ifndef __UTILS_H
 #define __UTILS_H
 
+/**
+ * @file utils.h
+ * @brief Provides functions of utilities to be used in the project.
+ */
+
+
 #include <stddef.h>
 #include <sys/time.h>
 

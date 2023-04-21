@@ -47,6 +47,11 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_INCLUDE_DIRS)
     message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
 endif()
 
+find_package(MPI)
+if(MPI_FOUND)
+    add_definitions(-DHAVE_MPI)
+endif()
+
 add_subdirectory(src)
 
 # Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests

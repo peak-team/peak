@@ -3,7 +3,7 @@
 
 /**
  * @file env_parser.h
- * @brief Header file for the env_parser functions.
+ * @brief Header file for PEAK's environment variables related functions.
  */
 
 #include <stdio.h>
