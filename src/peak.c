@@ -24,7 +24,7 @@ typedef struct _PeakGeneralListener PeakGeneralListener;
 struct _PeakGeneralListener {
     GObject parent;
 
-    guint* num_calls;
+    gulong* num_calls;
     gdouble* total_time;
     gdouble* current_time;
 };
@@ -95,12 +95,17 @@ peak_general_listener_init(PeakGeneralListener* self)
 {
     size_t total_count = hook_address_count * max_num_threads;
     // g_print ("total count %lu hook_address_count %lu num_cores %lu\n", total_count, hook_address_count, num_cores);
-    self->num_calls = malloc(sizeof(size_t) * total_count);
-    memset(self->num_calls, 0, sizeof(size_t) * total_count);
-    self->total_time = malloc(sizeof(double) * total_count);
-    memset(self->total_time, 0, sizeof(double) * total_count);
-    self->current_time = malloc(sizeof(double) * total_count);
-    memset(self->current_time, 0, sizeof(double) * total_count);
+    self->num_calls = g_new0(gulong, total_count);
+    self->total_time = g_new0(double, total_count);
+    self->current_time = g_new0(double, total_count);
+}
+
+static void
+peak_general_listener_free(PeakGeneralListener* self)
+{
+    g_free(self->num_calls);
+    g_free(self->total_time);
+    g_free(self->current_time);
 }
 
 void libprof_init()
@@ -116,7 +121,7 @@ void libprof_init()
     interceptor = gum_interceptor_obtain();
     listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
 
-    hook_address = malloc(sizeof(gpointer) * hook_address_count);
+    hook_address = g_new0(gpointer, hook_address_count);
     // g_print ("hook_address_count %lu num_cores %lu\n",  hook_address_count, num_cores);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < hook_address_count; i++) {
@@ -140,16 +145,18 @@ void libprof_fini()
                 PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j];
                 PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads + j];
             }
-            g_print("%s is called %u times and costs %f s\n",
+            g_print("%s is called %lu times and costs %f s\n",
                     hook_strings[i],
                     PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]);
         }
     }
     gum_interceptor_detach(interceptor, listener);
+    peak_general_listener_free(PEAKGENERAL_LISTENER(listener));
     g_object_unref(listener);
     g_object_unref(interceptor);
     pthread_listener_dettach();
+    g_free(hook_address);
     gum_deinit_embedded();
 }
 
