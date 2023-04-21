@@ -54,16 +54,16 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=56;PEAK_TARGET=sdot_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "OMP_NUM_THREADS=56;PEAK_TARGET=sdot_,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     else()
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=sdot_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "PEAK_TARGET=sdot_,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "sdot_ is called 1000000 times .*[\r\n\t ]*__libc_start_main is called 1 times"
+            PASS_REGULAR_EXPRESSION "sdot_ is called 1000000 times .*[\r\n\t ]*__libc_start_main is called 1 times .*[\r\n\t ]*my_sleep_func is called 56 times and costs 56"
     )
 endif()

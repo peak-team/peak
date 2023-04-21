@@ -114,7 +114,7 @@ void libprof_init()
     // g_print ("hook_address_count %lu num_cores %lu\n",  hook_address_count, num_cores);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < hook_address_count; i++) {
-        hook_address[i] = GSIZE_TO_POINTER(gum_module_find_export_by_name(NULL, hook_strings[i]));
+        hook_address[i] = gum_find_function (hook_strings[i]);
         if (hook_address[i]) {
             // g_print ("%s address = %p\n", hook_strings[i], hook_address[i]);
             gum_interceptor_attach(interceptor,
