@@ -22,7 +22,7 @@ static void
 pthread_listener_on_enter(GumInvocationListener* listener,
                           GumInvocationContext* ic)
 {
-    PthreadState* thread_state = (PthreadState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
+    PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t* tid = (pthread_t*)(gum_invocation_context_get_nth_argument(ic, 0));
     //g_print ("%lu pthread_listener_on_enter %lu\n", my_tid, *tid);
     if (tid == NULL) {
@@ -40,7 +40,7 @@ static void
 pthread_listener_on_leave(GumInvocationListener* listener,
                           GumInvocationContext* ic)
 {
-    PthreadState* thread_state = (PthreadState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
+    PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t tid = *(thread_state->child_tid);
 
     //g_print ("%lu pthread_listener_on_leave %lu\n", my_tid, tid);
