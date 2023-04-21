@@ -20,10 +20,10 @@ G_DEFINE_TYPE_EXTENDED(PthreadListener,
 
 static void
 pthread_listener_on_enter(GumInvocationListener* listener,
-                               GumInvocationContext* ic)
+                          GumInvocationContext* ic)
 {
-    PthreadState* thread_state = (PthreadState*) (gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
-    pthread_t* tid = (pthread_t *) (gum_invocation_context_get_nth_argument(ic, 0));
+    PthreadState* thread_state = (PthreadState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
+    pthread_t* tid = (pthread_t*)(gum_invocation_context_get_nth_argument(ic, 0));
     //g_print ("%lu pthread_listener_on_enter %lu\n", my_tid, *tid);
     if (tid == NULL) {
         pthread_t* replaced_tid = g_new0(pthread_t, 1);
@@ -38,9 +38,9 @@ pthread_listener_on_enter(GumInvocationListener* listener,
 
 static void
 pthread_listener_on_leave(GumInvocationListener* listener,
-                               GumInvocationContext* ic)
+                          GumInvocationContext* ic)
 {
-    PthreadState* thread_state = (PthreadState*) (gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
+    PthreadState* thread_state = (PthreadState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PthreadState)));
     pthread_t tid = *(thread_state->child_tid);
 
     //g_print ("%lu pthread_listener_on_leave %lu\n", my_tid, tid);
@@ -61,7 +61,7 @@ pthread_listener_class_init(PthreadListenerClass* klass)
 
 static void
 pthread_listener_iface_init(gpointer g_iface,
-                                 gpointer iface_data)
+                            gpointer iface_data)
 {
     GumInvocationListenerInterface* iface = g_iface;
     iface->on_enter = pthread_listener_on_enter;
@@ -71,7 +71,6 @@ pthread_listener_iface_init(gpointer g_iface,
 static void
 pthread_listener_init(PthreadListener* self)
 {
-
 }
 
 void pthread_listener_attach()
@@ -81,12 +80,12 @@ void pthread_listener_attach()
     g_mutex_init(&tid_mapping_mutex);
     gum_metal_hash_table_insert(tid_mapping, GUINT_TO_POINTER(pthread_self()), GUINT_TO_POINTER(current_tid));
     current_tid++;
-    
+
     pthread_create_interceptor = gum_interceptor_obtain();
     pthread_create_listener = g_object_new(PTHREAD_TYPE_LISTENER, NULL);
 
     gum_interceptor_begin_transaction(pthread_create_interceptor);
-    gpointer* hook_address = gum_find_function ("pthread_create");
+    gpointer* hook_address = gum_find_function("pthread_create");
     if (hook_address) {
         // g_print ("pthread_create found at %p\n",  hook_address);
         gum_interceptor_attach(pthread_create_interceptor,

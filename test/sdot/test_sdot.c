@@ -15,7 +15,7 @@ float my_sleep_func()
     }
     // printf("y[N]: %f\n", y[N-1]);
     sleep(1);
-    return x[N-1] + y[N-1];
+    return x[N - 1] + y[N - 1];
 }
 
 int main()

@@ -23,7 +23,7 @@ typedef struct _PthreadListener PthreadListener;
  * @brief PthreadListener class
  */
 struct _PthreadListener {
-    GObject parent; 
+    GObject parent;
 };
 
 /**
