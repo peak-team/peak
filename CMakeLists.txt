@@ -36,7 +36,7 @@ message(STATUS "M_LIBRARY    = ${M_LIBRARY}")
 message(STATUS "RESOLV_LIBRARY   = ${RESOLV_LIBRARY}")
 
 # Find or download frida-gum
-if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_INCLUDE_DIRS)
+if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
     message(STATUS "Fetching frida-gum")
     include(cmake/frida-gum.cmake)
     fetch_frida_gum(
