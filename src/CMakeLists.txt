@@ -32,7 +32,7 @@ target_link_libraries(peak
 
 if(MPI_FOUND)
     target_link_libraries(peak 
-        PUBLIC 
+        PRIVATE 
             MPI::MPI_C
     )
 endif()

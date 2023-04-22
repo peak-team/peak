@@ -30,7 +30,7 @@ if(BUILD_TESTING)
     find_package(OpenMP)
 
     include (FortranCInterface)
-    list (APPEND FORTRAN_FUNCTIONS sdot)
+    list (APPEND FORTRAN_FUNCTIONS sdot dgemm)
     FortranCInterface_HEADER (include/FC.h 
         MACRO_NAMESPACE "FC_"
         SYMBOLS ${FORTRAN_FUNCTIONS}
@@ -66,5 +66,22 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+5.6"
     )
+    
+    if(MPI_FOUND)
+        add_subdirectory(dgemm_mpi)
+        add_test(NAME test_dgemm_mpi COMMAND ${MPIEXEC} -ppn 2 ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_dgemm_mpi)
+        math(EXPR N_CPU_DIV2 "${N_CPU}/2")
+        if(OpenMP_FOUND)
+            set_tests_properties(test_dgemm_mpi
+                PROPERTIES 
+                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+            )
+        else()
+            set_tests_properties(test_dgemm_mpi
+                PROPERTIES 
+                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+            )
+        endif()
+    endif()
 endif()
 
