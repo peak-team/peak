@@ -64,7 +64,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+56"
+            PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+5.6"
     )
 endif()
 

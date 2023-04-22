@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <time.h>
 
 #include "test_cblas.h"
 
@@ -14,7 +14,8 @@ float my_sleep_func()
         y[i] = i + 1;
     }
     // printf("y[N]: %f\n", y[N-1]);
-    sleep(1);
+    struct timespec ts = { 0, 100000000 }; // Sleep for 0.1 seconds (100,000,000 nanoseconds)
+    nanosleep(&ts, NULL);
     return x[N - 1] + y[N - 1];
 }
 
