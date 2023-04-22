@@ -115,16 +115,16 @@ void peak_general_listener_attach()
     gum_interceptor_end_transaction(interceptor);
 }
 
-void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count, const int rank_count) 
+void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count, const int rank_count)
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
             g_printerr("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
-                        hook_strings[i],
-                        sum_num_calls[i],
-                        sum_total_time[i],
-                        sum_total_time[i] / thread_count[i],
-                        sum_total_time[i] / rank_count);
+                       hook_strings[i],
+                       sum_num_calls[i],
+                       sum_total_time[i],
+                       sum_total_time[i] / thread_count[i],
+                       sum_total_time[i] / rank_count);
         }
     }
 }
@@ -133,7 +133,7 @@ void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_tot
     int rank, size;
     int init_flag;
     MPI_Initialized(&init_flag);
-    if(!init_flag)
+    if (!init_flag)
         MPI_Init(NULL, NULL);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -172,7 +172,7 @@ void peak_general_listener_print(int is_MPI)
     }
     if (is_MPI) {
         peak_general_listener_reduce_result(sum_num_calls, sum_total_time, thread_count);
-    } else{
+    } else {
         peak_general_listener_print_result(sum_num_calls, sum_total_time, thread_count, 1);
     }
     g_free(sum_num_calls);

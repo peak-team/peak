@@ -7,10 +7,19 @@ static gpointer* hook_address;
 
 int (*original_pmpi_finalize)(void);
 
-int peak_pmpi_finalize(void) 
+/**
+ * @brief Custom implementation of `PMPI_Finalize` function
+ *
+ * This function is a custom implementation of the `PMPI_Finalize` function that can be used to perform additional
+ * actions before calling the original function. It checks the value of `peak_is_done` to determine whether to call
+ * the original function or return immediately.
+ *
+ * @return the return value of the original `PMPI_Finalize` function if `peak_is_done` is true, otherwise 0.
+ */
+int peak_pmpi_finalize(void)
 {
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
-    if(peak_is_done)
+    if (peak_is_done)
         return original_pmpi_finalize();
     else
         return 0;
@@ -26,8 +35,8 @@ int mpi_interceptor_attach()
     // g_printerr ("PMPI_Finalize found at %p\n",  hook_address);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
-                    hook_address, &peak_pmpi_finalize,
-                    (gpointer*)(&original_pmpi_finalize));
+                                                     hook_address, &peak_pmpi_finalize,
+                                                     (gpointer*)(&original_pmpi_finalize));
     }
     gum_interceptor_end_transaction(mpi_interceptor);
     return replace_check;
