@@ -25,4 +25,17 @@
  */
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
 
-#endif /* ENV_PARSER_H */
+/**
+ * @brief Frees the memory allocated by parse_env_w_delim function.
+ *
+ * This function frees the memory allocated by the parse_env_w_delim function
+ * for the result variable. The function should be called when the result variable
+ * is no longer needed to avoid memory leaks.
+ *
+ * @param result A pointer to the result variable.
+ * @param count The number of elements in the result variable.
+ * @return void
+ */
+void free_parsed_result(char** result, size_t count);
+
+#endif /* __ENV_PARSER_H */

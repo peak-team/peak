@@ -43,3 +43,11 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
 
     return count;
 }
+
+void free_parsed_result(char** result, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        free(result[i]);
+    }
+    free(result);
+}

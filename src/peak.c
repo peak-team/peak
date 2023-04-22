@@ -4,7 +4,7 @@
 
 size_t hook_address_count;
 char** hook_strings;
-long max_num_threads;
+gulong max_num_threads;
 
 void libprof_init()
 {
@@ -25,6 +25,7 @@ void libprof_fini()
     peak_general_listener_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();
+    free_parsed_result(hook_strings, hook_address_count);
 }
 
 __attribute__((section(".init_array"))) void* __init = libprof_init;
