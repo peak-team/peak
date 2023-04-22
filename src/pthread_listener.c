@@ -2,7 +2,7 @@
 
 GumInterceptor* pthread_create_interceptor;
 GumInvocationListener* pthread_create_listener;
-PthreadState state;
+PthreadState pthread_create_state;
 GumMetalHashTable* tid_mapping;
 GMutex tid_mapping_mutex;
 pthread_t current_tid = 0;
@@ -91,7 +91,7 @@ void pthread_listener_attach()
         gum_interceptor_attach(pthread_create_interceptor,
                                hook_address,
                                pthread_create_listener,
-                               &state);
+                               &pthread_create_state);
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }
