@@ -168,7 +168,7 @@ void libprof_fini()
                     thread_count++;
             }
             if(thread_count == 0) thread_count = 1;
-            g_print("%30s \t %10lu times \t %10.3f s total \t %10.3f s per thread\n",
+            g_print("%30s  %10lu times  %10.3f s total  %10.3f s per thread\n",
                     hook_strings[i],
                     PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads],
