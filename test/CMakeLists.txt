@@ -45,7 +45,7 @@ if(BUILD_TESTING)
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "dgemm_ is called 100000 times .*[\r\n\t ]*__libc_start_main is called 1 times"
+            PASS_REGULAR_EXPRESSION "dgemm_[ \t]+100000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times"
     )
 
     # Add test of sdot
@@ -64,6 +64,6 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "sdot_ is called 1000000 times .*[\r\n\t ]*__libc_start_main is called 1 times .*[\r\n\t ]*my_sleep_func is called 56 times and costs 56"
+            PASS_REGULAR_EXPRESSION "sdot_[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+56"
     )
 endif()

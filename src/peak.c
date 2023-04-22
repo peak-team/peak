@@ -160,14 +160,19 @@ void libprof_fini()
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
+            size_t thread_count = 0;
             for (size_t j = 1; j < max_num_threads; j++) {
                 PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j];
                 PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads + j];
+                if (PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j] != 0)
+                    thread_count++;
             }
-            g_print("%s is called %lu times and costs %f s\n",
+            if(thread_count == 0) thread_count = 1;
+            g_print("%30s \t %10lu times \t %10.3f s total \t %10.3f s per thread\n",
                     hook_strings[i],
                     PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
-                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]);
+                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads],
+                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]/thread_count);
         }
     }
     gum_interceptor_detach(interceptor, listener);
