@@ -118,7 +118,7 @@ void peak_general_listener_attach()
 void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count, const int rank_count)
 {
     for (size_t i = 0; i < hook_address_count; i++) {
-        if (hook_address[i]) {
+        if (hook_address[i] && sum_num_calls[i] != 0) {
             g_printerr("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
                        hook_strings[i],
                        sum_num_calls[i],
