@@ -27,12 +27,13 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
 
     /* Add space for trailing token. */
     count += last_comma < (a_str + strlen(a_str) - 1);
+    char* a_str_dup = strdup(a_str);
 
     *result = malloc(sizeof(char*) * count);
 
     if (*result) {
         size_t idx = 0;
-        char* token = strtok(a_str, delim);
+        char* token = strtok(a_str_dup, delim);
 
         while (token) {
             assert(idx < count);
@@ -40,6 +41,7 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
             token = strtok(0, delim);
         }
     }
+    free(a_str_dup);
 
     return count;
 }
