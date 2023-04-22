@@ -1,10 +1,39 @@
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <mpi.h>
+
 #include "general_listener.h"
 #include "pthread_listener.h"
 #include "utils/env_parser.h"
+#include "utils/mpi_utils.h"
 
 size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;
+
+int MPI_Finalize(void) 
+{
+    return 0;
+}
+
+void  MPI_Finalize_(int *ierr) 
+{
+    ierr=0;
+    return ;
+}
+
+int (*original_pmpi_finalize)(void);
+int peak_is_done = 0;
+int PMPI_Finalize(void) 
+{
+    if (!original_pmpi_finalize) {
+        original_pmpi_finalize = dlsym(RTLD_NEXT, "PMPI_Finalize");
+    }
+    if(peak_is_done)
+        return original_pmpi_finalize();
+    else
+        return 0;
+}
 
 void libprof_init()
 {
@@ -20,7 +49,8 @@ void libprof_init()
 
 void libprof_fini()
 {
-    peak_general_listener_print();
+    int is_MPI = check_MPI();
+    peak_general_listener_print(is_MPI);
 
     peak_general_listener_dettach();
     pthread_listener_dettach();

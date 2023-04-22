@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#include <mpi.h>
+
 #include "utils/utils.h"
 
 #define PEAK_TARGET_ENV "PEAK_TARGET"
@@ -68,7 +70,7 @@ void peak_general_listener_attach();
  *
  * @return void
  */
-void peak_general_listener_print();
+void peak_general_listener_print(int is_MPI);
 
 /**
  * @brief Detaches the Peak General Listener.

@@ -30,4 +30,12 @@ target_link_libraries(peak
         ${M_LIBRARY}
 )
 
+if(MPI_FOUND)
+    target_link_libraries(peak 
+        PUBLIC 
+            MPI::MPI_C
+    )
+endif()
+
+
 install (TARGETS peak DESTINATION lib)

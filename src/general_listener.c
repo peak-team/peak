@@ -8,6 +8,7 @@ static gpointer* hook_address = NULL;
 extern size_t hook_address_count;
 extern char** hook_strings;
 extern long max_num_threads;
+extern int peak_is_done;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -114,7 +115,7 @@ void peak_general_listener_attach()
     gum_interceptor_end_transaction(interceptor);
 }
 
-void peak_general_listener_print()
+void peak_general_listener_print_result() 
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
@@ -133,6 +134,36 @@ void peak_general_listener_print()
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads],
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] / thread_count);
         }
+    }
+
+}
+void peak_general_listener_reduce_result()
+{
+    int rank, size;
+    int init_flag;
+    MPI_Initialized(&init_flag);
+    if(!init_flag)
+        MPI_Init(NULL, NULL);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    gulong* sum_num_calls = g_new0(gulong, hook_address_count * max_num_threads);
+    gdouble* sum_total_time = g_new0(gdouble, hook_address_count * max_num_threads);
+    MPI_Reduce(PEAKGENERAL_LISTENER(listener)->num_calls, &sum_num_calls, hook_address_count * max_num_threads, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(PEAKGENERAL_LISTENER(listener)->total_time, &sum_total_time, hook_address_count * max_num_threads, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        peak_general_listener_print_result();
+    }
+    peak_is_done =1;
+    PMPI_Finalize();
+}
+
+void peak_general_listener_print(int is_MPI)
+{
+    if (is_MPI) {
+        peak_general_listener_reduce_result();
+    } else{
+        peak_general_listener_print_result();
     }
 }
 

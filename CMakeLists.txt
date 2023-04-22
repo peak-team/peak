@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.9)
 
 project(peak C CXX Fortran)
 
@@ -50,8 +50,10 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
     message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
 endif()
 
+# reference: https://cliutils.gitlab.io/modern-cmake/chapters/packages/MPI.html
 find_package(MPI)
 if(MPI_FOUND)
+    message(STATUS "Run: ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} ${MPIEXEC_MAX_NUMPROCS} ${MPIEXEC_PREFLAGS} EXECUTABLE ${MPIEXEC_POSTFLAGS} ARGS")
     add_definitions(-DHAVE_MPI)
 endif()
 
