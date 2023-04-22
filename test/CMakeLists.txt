@@ -4,7 +4,7 @@ if(BUILD_TESTING)
     find_package(BLAS)
     if(NOT BLAS_FOUND)
         message(STATUS "Building OpenBLAS")
-        include(cmake/openblas.cmake)
+        include(${PROJECT_SOURCE_DIR}/cmake/openblas.cmake)
         fetch_openblas(
             ${PROJECT_SOURCE_DIR}/cmake
             ${PROJECT_BINARY_DIR}/openblas
@@ -19,7 +19,7 @@ if(BUILD_TESTING)
         set(LAPACK_LIBRARIES ${PROJECT_BINARY_DIR}/openblas/lib/libopenblas.a)
     elseif(NOT LAPACK_FOUND)
         message(STATUS "Building OpenBLAS for LAPACK")
-        include(cmake/openblas.cmake)
+        include(${PROJECT_SOURCE_DIR}/cmake/openblas.cmake)
         fetch_openblas(
             ${PROJECT_SOURCE_DIR}/cmake
             ${PROJECT_BINARY_DIR}/openblas
@@ -67,3 +67,4 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "sdot_[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+56"
     )
 endif()
+
