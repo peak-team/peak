@@ -115,29 +115,20 @@ void peak_general_listener_attach()
     gum_interceptor_end_transaction(interceptor);
 }
 
-void peak_general_listener_print_result() 
+void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count, const int rank_count) 
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
-            size_t thread_count = 0;
-            for (size_t j = 1; j < max_num_threads; j++) {
-                PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j];
-                PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] += PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads + j];
-                if (PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j] != 0)
-                    thread_count++;
-            }
-            if (thread_count == 0)
-                thread_count = 1;
-            g_print("%30s  %10lu times  %10.3f s total  %10.3f s per thread\n",
+            g_print("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
                     hook_strings[i],
-                    PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
-                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads],
-                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] / thread_count);
+                    sum_num_calls[i],
+                    sum_total_time[i],
+                    sum_total_time[i] / thread_count[i],
+                    sum_total_time[i] / rank_count);
         }
     }
-
 }
-void peak_general_listener_reduce_result()
+void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count)
 {
     int rank, size;
     int init_flag;
@@ -146,25 +137,47 @@ void peak_general_listener_reduce_result()
         MPI_Init(NULL, NULL);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    gulong* sum_num_calls = g_new0(gulong, hook_address_count * max_num_threads);
-    gdouble* sum_total_time = g_new0(gdouble, hook_address_count * max_num_threads);
-    MPI_Reduce(PEAKGENERAL_LISTENER(listener)->num_calls, &sum_num_calls, hook_address_count * max_num_threads, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(PEAKGENERAL_LISTENER(listener)->total_time, &sum_total_time, hook_address_count * max_num_threads, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    
+    gulong* mpi_sum_num_calls = g_new0(gulong, hook_address_count);
+    gdouble* mpi_sum_total_time = g_new0(gdouble, hook_address_count);
+    gulong* mpi_thread_count = g_new0(gulong, hook_address_count);
+    MPI_Reduce(sum_num_calls, mpi_sum_num_calls, hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(sum_total_time, mpi_sum_total_time, hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(thread_count, mpi_thread_count, hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        peak_general_listener_print_result();
+        peak_general_listener_print_result(mpi_sum_num_calls, mpi_sum_total_time, mpi_thread_count, size);
     }
-    peak_is_done =1;
+    peak_is_done = 1;
     PMPI_Finalize();
+    g_free(mpi_sum_num_calls);
+    g_free(mpi_sum_total_time);
+    g_free(mpi_thread_count);
 }
 
 void peak_general_listener_print(int is_MPI)
 {
-    if (is_MPI) {
-        peak_general_listener_reduce_result();
-    } else{
-        peak_general_listener_print_result();
+    gulong* sum_num_calls = g_new0(gulong, hook_address_count);
+    gdouble* sum_total_time = g_new0(gdouble, hook_address_count);
+    gulong* thread_count = g_new0(gulong, hook_address_count);
+    for (size_t i = 0; i < hook_address_count; i++) {
+        if (hook_address[i]) {
+            for (size_t j = 0; j < max_num_threads; j++) {
+                sum_num_calls[i] += PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j];
+                sum_total_time[i] += PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads + j];
+                if (PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j] != 0)
+                    thread_count[i]++;
+            }
+            if (thread_count[i] == 0)
+                thread_count[i] = 1;
+        }
     }
+    if (is_MPI) {
+        peak_general_listener_reduce_result(sum_num_calls, sum_total_time, thread_count);
+    } else{
+        peak_general_listener_print_result(sum_num_calls, sum_total_time, thread_count, 1);
+    }
+    g_free(sum_num_calls);
+    g_free(sum_total_time);
+    g_free(thread_count);
 }
 
 void peak_general_listener_dettach()
