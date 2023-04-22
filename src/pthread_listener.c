@@ -1,11 +1,11 @@
 #include "pthread_listener.h"
 
-GumInterceptor* pthread_create_interceptor;
-GumInvocationListener* pthread_create_listener;
-PthreadState pthread_create_state;
-GumMetalHashTable* tid_mapping;
-GMutex tid_mapping_mutex;
-pthread_t current_tid = 0;
+static GumInterceptor* pthread_create_interceptor;
+static GumInvocationListener* pthread_create_listener;
+static PthreadState pthread_create_state;
+extern GumMetalHashTable* tid_mapping;
+static GMutex tid_mapping_mutex;
+static pthread_t current_tid = 0;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 

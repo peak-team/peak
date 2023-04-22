@@ -3,6 +3,7 @@ add_subdirectory(utils)
 # Add all source files
 FILE(GLOB sources_peak
     peak.c
+    general_listener.c
     pthread_listener.c
 )
 
