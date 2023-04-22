@@ -41,11 +41,11 @@ if(BUILD_TESTING)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=dgemm_,__libc_start_main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "dgemm_[ \t]+100000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times"
+            PASS_REGULAR_EXPRESSION "dgemm_[ \t]+100000 times .*[\r\n\t ]*main[ \t]+1 times"
     )
 
     # Add test of sdot
@@ -54,17 +54,17 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     else()
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=cblas_sdot,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "PEAK_TARGET=cblas_sdot,main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+5.6"
+            PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+5.6"
     )
 endif()
 
