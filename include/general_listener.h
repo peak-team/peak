@@ -50,6 +50,7 @@ struct _PeakGeneralState {
 };
 
 void peak_general_listener_attach();
+void peak_general_listener_print();
 void peak_general_listener_dettach();
 
 #endif /* __GENERAL_LISTENER_H */

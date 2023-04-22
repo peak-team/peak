@@ -115,7 +115,7 @@ void peak_general_listener_attach()
     gum_interceptor_end_transaction(interceptor);
 }
 
-void peak_general_listener_dettach()
+void peak_general_listener_print()
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
@@ -134,6 +134,10 @@ void peak_general_listener_dettach()
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]/thread_count);
         }
     }
+}
+
+void peak_general_listener_dettach()
+{
     gum_interceptor_detach(interceptor, listener);
     peak_general_listener_free(PEAKGENERAL_LISTENER(listener));
     g_object_unref(listener);
