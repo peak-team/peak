@@ -54,17 +54,17 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=56;PEAK_TARGET=sdot_,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     else()
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=sdot_,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "PEAK_TARGET=cblas_sdot,__libc_start_main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
         )
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "sdot_[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+56"
+            PASS_REGULAR_EXPRESSION "cblas_sdot[ \t]+1000000 times .*[\r\n\t ]*__libc_start_main[ \t]+1 times .*[\r\n\t ]*my_sleep_func[ \t]+56 times[ \t]+56"
     )
 endif()
 
