@@ -69,19 +69,23 @@ if(BUILD_TESTING)
     
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
-        add_test(NAME test_dgemm_mpi COMMAND ${MPIEXEC} -ppn 2 ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_dgemm_mpi)
+        add_test(NAME test_dgemm_mpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_dgemm_mpi)
         math(EXPR N_CPU_DIV2 "${N_CPU}/2")
         if(OpenMP_FOUND)
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
             )
         else()
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
             )
         endif()
+        set_tests_properties(test_dgemm_mpi
+            PROPERTIES 
+                PASS_REGULAR_EXPRESSION "cblas_dgemm[ \t]+200 times"
+        )
     endif()
 endif()
 

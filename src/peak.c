@@ -4,6 +4,7 @@
 
 #include "general_listener.h"
 #include "pthread_listener.h"
+#include "mpi_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
@@ -13,30 +14,7 @@
 size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;
-
-int MPI_Finalize(void) 
-{
-    return 0;
-}
-
-void  MPI_Finalize_(int *ierr) 
-{
-    ierr=0;
-    return ;
-}
-
-int (*original_pmpi_finalize)(void);
-int peak_is_done = 0;
-int PMPI_Finalize(void) 
-{
-    if (!original_pmpi_finalize) {
-        original_pmpi_finalize = dlsym(RTLD_NEXT, "PMPI_Finalize");
-    }
-    if(peak_is_done)
-        return original_pmpi_finalize();
-    else
-        return 0;
-}
+static int found_MPI;
 
 void libprof_init()
 {
@@ -48,13 +26,17 @@ void libprof_init()
 
     pthread_listener_attach();
     peak_general_listener_attach();
+    found_MPI = check_MPI();
+    if (mpi_interceptor_attach() != 0) {
+        found_MPI = 0;
+    }
 }
 
 void libprof_fini()
 {
-    int is_MPI = check_MPI();
-    peak_general_listener_print(is_MPI);
-
+    peak_general_listener_print(found_MPI);
+    if (found_MPI)
+        mpi_interceptor_dettach();
     peak_general_listener_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();

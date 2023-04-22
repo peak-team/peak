@@ -5,6 +5,7 @@ FILE(GLOB sources_peak
     peak.c
     general_listener.c
     pthread_listener.c
+    mpi_interceptor.c
 )
 
 # Generate the shared library from the library sources
