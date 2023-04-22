@@ -21,7 +21,7 @@ void libprof_init()
 void libprof_fini()
 {
     peak_general_listener_print();
-    
+
     peak_general_listener_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();

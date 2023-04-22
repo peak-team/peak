@@ -49,8 +49,34 @@ struct _PeakGeneralState {
     gdouble current_time;
 };
 
+/**
+ * @brief Attaches the Peak General Listener.
+ *
+ * This function attaches the Peak General Listener to the function hooks specified
+ * in `hook_strings`. It will record the number of times each function is called as
+ * well as its total execution time in seconds. The time spent in multiple threads 
+ * will be summed up.
+ *
+ * @return void
+ */
 void peak_general_listener_attach();
+
+/**
+ * @brief Prints the results of the Peak General Listener.
+ *
+ * This function prints the results of the Peak General Listener for each function hook.
+ *
+ * @return void
+ */
 void peak_general_listener_print();
+
+/**
+ * @brief Detaches the Peak General Listener.
+ *
+ * This function detaches the Peak General Listener and frees the memory allocated for it.
+ *
+ * @return void
+ */
 void peak_general_listener_dettach();
 
 #endif /* __GENERAL_LISTENER_H */

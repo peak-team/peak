@@ -19,7 +19,7 @@ G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
                        0,
                        G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
                                              peak_general_listener_iface_init))
-                                             
+
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
@@ -89,7 +89,6 @@ peak_general_listener_free(PeakGeneralListener* self)
     g_free(self->total_time);
 }
 
-
 void peak_general_listener_attach()
 {
     interceptor = gum_interceptor_obtain();
@@ -126,12 +125,13 @@ void peak_general_listener_print()
                 if (PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads + j] != 0)
                     thread_count++;
             }
-            if(thread_count == 0) thread_count = 1;
+            if (thread_count == 0)
+                thread_count = 1;
             g_print("%30s  %10lu times  %10.3f s total  %10.3f s per thread\n",
                     hook_strings[i],
                     PEAKGENERAL_LISTENER(listener)->num_calls[i * max_num_threads],
                     PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads],
-                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads]/thread_count);
+                    PEAKGENERAL_LISTENER(listener)->total_time[i * max_num_threads] / thread_count);
         }
     }
 }
