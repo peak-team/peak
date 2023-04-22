@@ -7,6 +7,9 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
+#define PEAK_TARGET_ENV "PEAK_TARGET"
+#define PEAK_TARGET_DELIM ','
+
 size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;

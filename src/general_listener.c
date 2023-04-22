@@ -97,12 +97,12 @@ void peak_general_listener_attach()
 
     hook_address = g_new0(gpointer, hook_address_count);
     state = g_new0(PeakGeneralState, hook_address_count);
-    // g_print ("hook_address_count %lu num_cores %lu\n",  hook_address_count, num_cores);
+    // g_printerr ("hook_address_count %lu max_num_threads %lu\n",  hook_address_count, max_num_threads);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < hook_address_count; i++) {
         hook_address[i] = gum_find_function(hook_strings[i]);
         if (hook_address[i]) {
-            // g_print ("%s address = %p\n", hook_strings[i], hook_address[i]);
+            // g_printerr ("%s address = %p\n", hook_strings[i], hook_address[i]);
 
             state[i].hook_id = i;
             state[i].current_time = 0.0;
@@ -119,12 +119,12 @@ void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_tota
 {
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i]) {
-            g_print("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
-                    hook_strings[i],
-                    sum_num_calls[i],
-                    sum_total_time[i],
-                    sum_total_time[i] / thread_count[i],
-                    sum_total_time[i] / rank_count);
+            g_printerr("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
+                        hook_strings[i],
+                        sum_num_calls[i],
+                        sum_total_time[i],
+                        sum_total_time[i] / thread_count[i],
+                        sum_total_time[i] / rank_count);
         }
     }
 }

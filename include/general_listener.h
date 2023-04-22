@@ -19,9 +19,6 @@
 
 #include "utils/utils.h"
 
-#define PEAK_TARGET_ENV "PEAK_TARGET"
-#define PEAK_TARGET_DELIM ','
-
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
 /**
