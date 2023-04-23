@@ -56,7 +56,7 @@ struct _PeakGeneralState {
  * @brief Attaches the Peak General Listener.
  *
  * This function attaches the Peak General Listener to the function hooks specified
- * in `hook_strings`. It will record the number of times each function is called as
+ * in `peak_hook_strings`. It will record the number of times each function is called as
  * well as its total execution time in seconds. The time spent in multiple threads 
  * will be summed up.
  *

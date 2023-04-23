@@ -3,7 +3,7 @@
 static GumInterceptor* pthread_create_interceptor;
 static GumInvocationListener* pthread_create_listener;
 static PthreadState pthread_create_state;
-GumMetalHashTable* tid_mapping;
+GumMetalHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static pthread_t current_tid = 0;
 
@@ -45,7 +45,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
 
     //g_print ("%lu pthread_listener_on_leave %lu\n", my_tid, tid);
     g_mutex_lock(&tid_mapping_mutex);
-    gum_metal_hash_table_insert(tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
+    gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
     g_mutex_unlock(&tid_mapping_mutex);
     if (!thread_state->is_original)
@@ -75,10 +75,10 @@ pthread_listener_init(PthreadListener* self)
 
 void pthread_listener_attach()
 {
-    // g_print ("hook_address_count %lu num_cores %lu\n",  hook_address_count, num_cores);
-    tid_mapping = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
+    // g_print ("peak_hook_address_count %lu num_cores %lu\n",  peak_hook_address_count, num_cores);
+    peak_tid_mapping = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
     g_mutex_init(&tid_mapping_mutex);
-    gum_metal_hash_table_insert(tid_mapping, GUINT_TO_POINTER(pthread_self()), GUINT_TO_POINTER(current_tid));
+    gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(pthread_self()), GUINT_TO_POINTER(current_tid));
     current_tid++;
 
     pthread_create_interceptor = gum_interceptor_obtain();
@@ -102,11 +102,11 @@ void pthread_listener_attach()
 // }
 void pthread_listener_dettach()
 {
-    // g_print("Hash table contents %p:\n", tid_mapping);
-    // gum_metal_hash_table_foreach(tid_mapping, (GHFunc)print_key_value_pair, NULL);
+    // g_print("Hash table contents %p:\n", peak_tid_mapping);
+    // gum_metal_hash_table_foreach(peak_tid_mapping, (GHFunc)print_key_value_pair, NULL);
 
     gum_interceptor_detach(pthread_create_interceptor, pthread_create_listener);
-    gum_metal_hash_table_unref(tid_mapping);
+    gum_metal_hash_table_unref(peak_tid_mapping);
     g_mutex_clear(&tid_mapping_mutex);
     g_object_unref(pthread_create_listener);
     g_object_unref(pthread_create_interceptor);

@@ -14,9 +14,9 @@
 #define PEAK_TARGET_DELIM ','
 #define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
 
-size_t hook_address_count;
-char** hook_strings;
-gulong max_num_threads;
+size_t peak_hook_address_count;
+char** peak_hook_strings;
+gulong peak_max_num_threads;
 #ifdef HAVE_MPI
 static int found_MPI;
 static int flag_clean_fppid = 0;
@@ -25,8 +25,8 @@ static int flag_clean_fppid = 0;
 void libprof_init()
 {
 
-    max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
-    hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &hook_strings);
+    peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
+    peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
 
     gum_init_embedded();
 
@@ -60,7 +60,7 @@ void libprof_fini()
     peak_general_listener_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();
-    free_parsed_result(hook_strings, hook_address_count);
+    free_parsed_result(peak_hook_strings, peak_hook_address_count);
 }
 
 __attribute__((section(".init_array"))) void* __init = libprof_init;
