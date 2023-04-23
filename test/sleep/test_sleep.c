@@ -8,7 +8,7 @@
 
 __attribute__((noinline)) float my_sleep_func()
 {
-    struct timespec ts = { 0, 10000000 }; // Sleep for 0.01 seconds (1,000,000 nanoseconds)
+    struct timespec ts = { 0, 10000000 }; // Sleep for 0.01 seconds (10,000,000 nanoseconds)
     nanosleep(&ts, NULL);
     return 0.01;
 }
