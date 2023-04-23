@@ -10,7 +10,7 @@
 
 #define PEAK_TARGET_ENV "PEAK_TARGET"
 #define PEAK_TARGET_DELIM ','
-#define PPID_FILE_NAME "/tmp/lock_flops_count_ppid_list"
+#define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
 
 size_t hook_address_count;
 char** hook_strings;
