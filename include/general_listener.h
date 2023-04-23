@@ -33,6 +33,8 @@ struct _PeakGeneralListener {
 
     gulong* num_calls;
     gdouble* total_time;
+    gfloat* max_time;
+    gfloat* min_time;
 };
 
 typedef struct _PeakGeneralState PeakGeneralState;
