@@ -8,7 +8,9 @@
 
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
@@ -51,5 +53,16 @@ int check_parent_process(char* lock_file, int* need_to_clean);
  * @return void
  */
 void remove_ppid_file(char* lock_file);
+
+/**
+ * @brief Get the path to the current running binary.
+ *
+ * This function obtains the path to the current running binary by reading the
+ * command line from the /proc/self/cmdline file. If an error occurs while
+ * reading the file, the function returns the string "null".
+ *
+ * @param[out] argv0 A pointer to a char pointer where the path to the current running binary will be stored.
+ */
+void get_argv0(char** argv0);
 
 #endif /* __UTILS_H */

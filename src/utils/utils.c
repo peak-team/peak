@@ -61,3 +61,24 @@ void remove_ppid_file(char* lock_file)
 {
     unlink(lock_file);
 }
+
+void get_argv0(char** argv0)
+{
+    char* buffer = (char*)malloc(sizeof(char) * (1024));
+    strcpy(buffer, "null\0");
+    FILE* fp = fopen("/proc/self/cmdline", "r");
+    if (!fp) {
+        perror("fopen");
+        *argv0 = buffer;
+        return;
+    }
+
+    int n = fread(buffer, 1, 1024, fp);
+    if (n == 0) {
+        perror("fread");
+        *argv0 = buffer;
+        return;
+    }
+    buffer[n - 1] = '\0';
+    *argv0 = buffer;
+}

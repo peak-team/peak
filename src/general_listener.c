@@ -117,6 +117,9 @@ void peak_general_listener_attach()
 
 void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count, const int rank_count)
 {
+    char* argv_o;
+    get_argv0(&argv_o);
+    gboolean have_output = FALSE;
     for (size_t i = 0; i < hook_address_count; i++) {
         if (hook_address[i] && sum_num_calls[i] != 0) {
             g_printerr("%30s  %10lu times  %10.3f s total  %10.3f s per thread  %10.3f s per rank\n",
@@ -125,8 +128,12 @@ void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_tota
                        sum_total_time[i],
                        sum_total_time[i] / thread_count[i],
                        sum_total_time[i] / rank_count);
+            have_output = TRUE;
         }
     }
+    if (have_output)
+        g_printerr("PEAK done with: %s\n", argv_o);
+    free(argv_o);
 }
 void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_total_time, gulong* thread_count)
 {
