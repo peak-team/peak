@@ -200,7 +200,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
     gboolean have_output = FALSE;
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i] && sum_num_calls[i] != 0) {
-            g_printerr("%30s  %10lu times  %10.4f /thread  %10lu /rank  %10.3f s total  %10.3e s max  %10.3e s min %10.3e s overhead\n",
+            g_printerr("%30s  %10lu times  %10.4f /thread  %10lu /rank  %10.3f s total  %10.3e s max  %10.3e s min  %10.3e s overhead\n",
                        peak_hook_strings[i],
                        sum_num_calls[i],
                        sum_num_calls[i] / (double)thread_count[i],
