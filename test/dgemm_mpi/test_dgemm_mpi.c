@@ -28,8 +28,8 @@ int main(int argc, char **argv) {
         //C[i][j] += A[i][k] * B[k][j];
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, N, N, 1.0, &A[0][0], N, &B[0][0], N, 0.0, &C[0][0], N);
     }
-    // if(rank==0)
-    //     system("echo hello!");
+    if(rank==0)
+        system("echo hello!");
 
     // Perform all-reduce operation to sum the C matrix across all processes
     MPI_Allreduce(C, D, N*N, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);

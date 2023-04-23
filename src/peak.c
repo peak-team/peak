@@ -10,11 +10,13 @@
 
 #define PEAK_TARGET_ENV "PEAK_TARGET"
 #define PEAK_TARGET_DELIM ','
+#define PPID_FILE_NAME "/tmp/lock_flops_count_ppid_list"
 
 size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;
 static int found_MPI;
+static int flag_clean_fppid = 0;
 
 void libprof_init()
 {
@@ -27,13 +29,21 @@ void libprof_init()
     pthread_listener_attach();
     peak_general_listener_attach();
     found_MPI = check_MPI();
-    if (mpi_interceptor_attach() != 0) {
-        found_MPI = 0;
+    if (found_MPI){
+        int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
+        if(is_parent_MPI > 0) {
+            found_MPI = 0;
+        } else if (mpi_interceptor_attach() != 0) {
+            found_MPI = 0;
+        }
     }
 }
 
 void libprof_fini()
 {
+    if(flag_clean_fppid) {
+        remove_ppid_file(PPID_FILE_NAME);
+    }
     peak_general_listener_print(found_MPI);
     if (found_MPI)
         mpi_interceptor_dettach();
