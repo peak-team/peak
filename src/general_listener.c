@@ -7,7 +7,7 @@ static PeakGeneralState* state;
 static gpointer* hook_address = NULL;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
-extern long peak_max_num_threads;
+extern gulong peak_max_num_threads;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -30,9 +30,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
-    pthread_t tid = pthread_self();
     // g_print ("hook_id %lu tid %lu tid_orig %lu\n", hook_id, tid, syscall(SYS_gettid));
-    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid)));
+    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
     thread_state->current_time = peak_second();
@@ -50,14 +49,14 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
-    pthread_t tid = pthread_self();
-    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid)));
+    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     end_time = end_time - thread_state->current_time;
-    if (end_time > self->max_time[hook_id * peak_max_num_threads + mapped_tid])
-        self->max_time[hook_id * peak_max_num_threads + mapped_tid] = end_time;
-    if (end_time < self->min_time[hook_id * peak_max_num_threads + mapped_tid] || self->num_calls[hook_id * peak_max_num_threads + mapped_tid] == 1)
-        self->min_time[hook_id * peak_max_num_threads + mapped_tid] = end_time;
-    self->total_time[hook_id * peak_max_num_threads + mapped_tid] += end_time;
+    size_t index = hook_id * peak_max_num_threads + mapped_tid;
+    if (end_time > self->max_time[index])
+        self->max_time[index] = end_time;
+    if (end_time < self->min_time[index] || self->num_calls[index] == 1)
+        self->min_time[index] = end_time;
+    self->total_time[index] += end_time;
     // g_print ("hook_id %lu time %f\n", hook_id, thread_state->current_time);
 }
 
