@@ -2,10 +2,6 @@
 #include <stdlib.h>
 #include <time.h>
 
-#include "test_cblas.h"
-
-#define N 80
-
 __attribute__((noinline)) float my_sleep_func()
 {
     struct timespec ts = { 0, 10000000 }; // Sleep for 0.01 seconds (10,000,000 nanoseconds)

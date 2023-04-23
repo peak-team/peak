@@ -8,7 +8,5 @@ target_include_directories(test_sleep
 )
 if(OpenMP_FOUND)
     target_compile_options(test_sleep PUBLIC ${OpenMP_C_FLAGS})
-    target_link_libraries(test_sleep PRIVATE ${BLAS_LIBRARIES} PUBLIC ${OpenMP_C_LIBRARIES})
-else()
-    target_link_libraries(test_sleep PRIVATE ${BLAS_LIBRARIES})
+    target_link_libraries(test_sleep PUBLIC ${OpenMP_C_LIBRARIES})
 endif()
