@@ -69,6 +69,6 @@ void pthread_listener_attach();
  */
 void pthread_listener_dettach();
 
-GumMetalHashTable* tid_mapping;
+extern GumMetalHashTable* tid_mapping;
 
 #endif /* __PTHREAD_LISTENER_H */

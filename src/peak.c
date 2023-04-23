@@ -2,11 +2,11 @@
 #include <dlfcn.h>
 #ifdef HAVE_MPI
 #include <mpi.h>
+#include "mpi_interceptor.h"
 #endif
 
 #include "general_listener.h"
 #include "pthread_listener.h"
-#include "mpi_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
@@ -17,8 +17,8 @@
 size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;
-static int found_MPI;
 #ifdef HAVE_MPI
+static int found_MPI;
 static int flag_clean_fppid = 0;
 #endif
 

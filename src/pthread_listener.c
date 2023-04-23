@@ -3,7 +3,7 @@
 static GumInterceptor* pthread_create_interceptor;
 static GumInvocationListener* pthread_create_listener;
 static PthreadState pthread_create_state;
-extern GumMetalHashTable* tid_mapping;
+GumMetalHashTable* tid_mapping;
 static GMutex tid_mapping_mutex;
 static pthread_t current_tid = 0;
 
