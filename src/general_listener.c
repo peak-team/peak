@@ -31,9 +31,9 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
-    // g_print ("hook_id %lu tid %lu tid_orig %lu\n", hook_id, tid, syscall(SYS_gettid));
     pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
+    // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
     thread_state->current_time = peak_second();
     // g_print ("hook_id %lu time %f\n", hook_id, thread_state->current_time);
@@ -104,6 +104,27 @@ __attribute__((noinline)) static void peak_general_overhead_dummy_func()
     nanosleep(&ts, NULL);
 }
 
+static int cmpfunc(const void* a, const void* b)
+{
+    if (*(double*)a < *(double*)b) {
+        return -1;
+    } else if (*(double*)a > *(double*)b) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+static double median(double* arr, size_t n)
+{
+    qsort(arr, n, sizeof(double), cmpfunc);
+    if (n % 2 == 0) {
+        return (double)(arr[n / 2 - 1] + arr[n / 2]) / 2.0;
+    } else {
+        return (double)arr[n / 2];
+    }
+}
+
 static void
 peak_general_overhead_bootstrapping()
 {
@@ -116,10 +137,13 @@ peak_general_overhead_bootstrapping()
                            &state_bootstrapping);
     gum_interceptor_end_transaction(interceptor);
 
-    double time = peak_second();
-    for (int i = 0; i < 1000; i++)
+    guint n_tests = 2000;
+    double* time = g_new(double, n_tests * 2);
+    for (guint i = 0; i < n_tests; i++) {
+        time[n_tests + i] = peak_second();
         peak_general_overhead_dummy_func();
-    time = peak_second() - time;
+        time[n_tests + i] = peak_second() - time[n_tests + i];
+    }
 
     // g_printerr("%10lu times  %10.3f s total  %10.3e s max  %10.3e s min \n",
     //             PEAKGENERAL_LISTENER(listener_bootstrapping)->num_calls[0],
@@ -130,21 +154,21 @@ peak_general_overhead_bootstrapping()
     peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
     g_object_unref(listener_bootstrapping);
 
-    double orig_time = peak_second();
-    for (int i = 0; i < 1000; i++)
+    for (guint i = 0; i < n_tests; i++) {
+        time[i] = peak_second();
         peak_general_overhead_dummy_func();
-    orig_time = peak_second() - orig_time;
+        time[i] = peak_second() - time[i];
+    }
 
     // g_printerr("orig %.6e time %.6e\n", orig_time, time);
-    peak_general_overhead = (time - orig_time) * 1e-3;
+    peak_general_overhead = (median(&time[n_tests], n_tests) - median(&time[0], n_tests));
+    g_free(time);
 }
 
 void peak_general_listener_attach()
 {
     interceptor = gum_interceptor_obtain();
     listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-
-    peak_general_overhead_bootstrapping();
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     state = g_new0(PeakGeneralState, peak_hook_address_count);
@@ -164,6 +188,8 @@ void peak_general_listener_attach()
         }
     }
     gum_interceptor_end_transaction(interceptor);
+    if (peak_hook_address_count)
+        peak_general_overhead_bootstrapping();
 }
 
 static void
@@ -174,14 +200,15 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
     gboolean have_output = FALSE;
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i] && sum_num_calls[i] != 0) {
-            g_printerr("%30s  %10lu times  %10lu /thread  %10lu /rank  %10.3f s total  %10.3f s max  %10.3f s min \n",
+            g_printerr("%30s  %10lu times  %10.4f /thread  %10lu /rank  %10.3f s total  %10.3e s max  %10.3e s min %10.3e s overhead\n",
                        peak_hook_strings[i],
                        sum_num_calls[i],
-                       sum_num_calls[i] / thread_count[i],
+                       sum_num_calls[i] / (double)thread_count[i],
                        sum_num_calls[i] / rank_count,
                        sum_total_time[i],
                        sum_max_time[i],
-                       sum_min_time[i]);
+                       sum_min_time[i],
+                       sum_num_calls[i] / (double)thread_count[i] * peak_general_overhead);
             have_output = TRUE;
         }
     }
