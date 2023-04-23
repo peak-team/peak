@@ -2,9 +2,13 @@
 
 double peak_second()
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1.e-6;
+    struct timespec measure;
+
+    // Get the current time as the start time
+    clock_gettime(CLOCK_MONOTONIC, &measure);
+
+    // Return the elapsed time in seconds
+    return (double)measure.tv_sec + (double)measure.tv_nsec * 1e-9;
 }
 
 int check_parent_process(char* lock_file, int* need_to_clean)

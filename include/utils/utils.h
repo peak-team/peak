@@ -14,6 +14,7 @@
 #include <sys/file.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 /**
