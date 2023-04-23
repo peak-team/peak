@@ -2,10 +2,10 @@
 
 static GumInterceptor* mpi_interceptor;
 
-int peak_is_done = 0;
+static int peak_is_done = 0;
 static gpointer* hook_address;
 
-int (*original_pmpi_finalize)(void);
+static int (*original_pmpi_finalize)(void);
 
 /**
  * @brief Custom implementation of `PMPI_Finalize` function
@@ -44,6 +44,8 @@ int mpi_interceptor_attach()
 
 void mpi_interceptor_dettach()
 {
+    peak_is_done = 1;
+    PMPI_Finalize();
     gum_interceptor_revert(mpi_interceptor, hook_address);
     g_object_unref(mpi_interceptor);
 }

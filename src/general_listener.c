@@ -8,7 +8,6 @@ static gpointer* hook_address = NULL;
 extern size_t hook_address_count;
 extern char** hook_strings;
 extern long max_num_threads;
-extern int peak_is_done;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -168,7 +167,6 @@ void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_tot
     if (rank == 0) {
         peak_general_listener_print_result(mpi_sum_num_calls, mpi_sum_total_time, mpi_sum_max_time, mpi_sum_min_time, mpi_thread_count, size);
     }
-    peak_is_done = 1;
     PMPI_Finalize();
     g_free(mpi_sum_num_calls);
     g_free(mpi_sum_total_time);
