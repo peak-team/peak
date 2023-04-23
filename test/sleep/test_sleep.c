@@ -12,9 +12,9 @@ __attribute__((noinline)) float my_sleep_func()
 int main()
 {
     float total = 0.0;
-#pragma omp parallel for reduction(+:total)
+#pragma omp parallel for reduction(+ : total)
     for (int i = 0; i < 1000; i++) {
-        total+=my_sleep_func();
+        total += my_sleep_func();
     }
     printf("Sleep is done: %f\n", total);
     return 0;

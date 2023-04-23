@@ -16,7 +16,8 @@ static int (*original_pmpi_finalize)(void);
  *
  * @return the return value of the original `PMPI_Finalize` function if `peak_is_done` is true, otherwise 0.
  */
-int peak_pmpi_finalize(void)
+static int
+peak_pmpi_finalize(void)
 {
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     if (peak_is_done)
@@ -27,7 +28,7 @@ int peak_pmpi_finalize(void)
 
 int mpi_interceptor_attach()
 {
-    GumReplaceReturn replace_check;
+    GumReplaceReturn replace_check = -1;
     mpi_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(mpi_interceptor);
@@ -45,7 +46,7 @@ int mpi_interceptor_attach()
 void mpi_interceptor_dettach()
 {
     peak_is_done = 1;
-    PMPI_Finalize();
+    peak_pmpi_finalize();
     gum_interceptor_revert(mpi_interceptor, hook_address);
     g_object_unref(mpi_interceptor);
 }

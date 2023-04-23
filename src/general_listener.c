@@ -98,21 +98,22 @@ peak_general_listener_free(PeakGeneralListener* self)
     g_free(self->min_time);
 }
 
-__attribute__((noinline)) void peak_general_overhead_dummy_func()
+__attribute__((noinline)) static void peak_general_overhead_dummy_func()
 {
     struct timespec ts = { 0, 1 }; // Sleep for 1,000 nanoseconds
     nanosleep(&ts, NULL);
 }
 
-void peak_general_overhead_bootstrapping()
+static void
+peak_general_overhead_bootstrapping()
 {
     GumInvocationListener* listener_bootstrapping = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-    PeakGeneralState state_bootstrapping = {0, 0.0};
+    PeakGeneralState state_bootstrapping = { 0, 0.0 };
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_attach(interceptor,
-                            &peak_general_overhead_dummy_func,
-                            listener_bootstrapping,
-                            &state_bootstrapping);
+                           &peak_general_overhead_dummy_func,
+                           listener_bootstrapping,
+                           &state_bootstrapping);
     gum_interceptor_end_transaction(interceptor);
 
     double time = peak_second();
@@ -165,7 +166,8 @@ void peak_general_listener_attach()
     gum_interceptor_end_transaction(interceptor);
 }
 
-void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count, const int rank_count)
+static void
+peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count, const int rank_count)
 {
     char* argv_o;
     get_argv0(&argv_o);
@@ -183,14 +185,16 @@ void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_tota
             have_output = TRUE;
         }
     }
-    if (have_output)
+    if (have_output) {
         g_printerr("Estimated overhead: %.6e s per call\n", peak_general_overhead);
         g_printerr("PEAK done with: %s\n", argv_o);
+    }
     free(argv_o);
 }
 
 #ifdef HAVE_MPI
-void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count)
+static void
+peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count)
 {
     int rank, size;
     int init_flag;
@@ -212,7 +216,6 @@ void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_tot
     if (rank == 0) {
         peak_general_listener_print_result(mpi_sum_num_calls, mpi_sum_total_time, mpi_sum_max_time, mpi_sum_min_time, mpi_thread_count, size);
     }
-    PMPI_Finalize();
     g_free(mpi_sum_num_calls);
     g_free(mpi_sum_total_time);
     g_free(mpi_thread_count);
