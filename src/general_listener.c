@@ -145,6 +145,8 @@ void peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_tota
         g_printerr("PEAK done with: %s\n", argv_o);
     free(argv_o);
 }
+
+#ifdef HAVE_MPI
 void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count)
 {
     int rank, size;
@@ -172,6 +174,7 @@ void peak_general_listener_reduce_result(gulong* sum_num_calls, gdouble* sum_tot
     g_free(mpi_sum_total_time);
     g_free(mpi_thread_count);
 }
+#endif
 
 void peak_general_listener_print(int is_MPI)
 {
@@ -198,11 +201,15 @@ void peak_general_listener_print(int is_MPI)
                 thread_count[i] = 1;
         }
     }
+#ifdef HAVE_MPI
     if (is_MPI) {
         peak_general_listener_reduce_result(sum_num_calls, sum_total_time, sum_max_time, sum_min_time, thread_count);
     } else {
         peak_general_listener_print_result(sum_num_calls, sum_total_time, sum_max_time, sum_min_time, thread_count, 1);
     }
+#else
+    peak_general_listener_print_result(sum_num_calls, sum_total_time, sum_max_time, sum_min_time, thread_count, 1);
+#endif
     g_free(sum_num_calls);
     g_free(sum_total_time);
     g_free(thread_count);

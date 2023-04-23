@@ -5,15 +5,26 @@ FILE(GLOB sources_peak
     peak.c
     general_listener.c
     pthread_listener.c
+)
+FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
 )
 
 # Generate the shared library from the library sources
-add_library(peak 
-    SHARED 
-        ${sources_peak}
-        $<TARGET_OBJECTS:utils>  
-)
+if(MPI_FOUND)
+    add_library(peak 
+        SHARED 
+            ${sources_peak}
+            ${sources_peak_mpi}
+            $<TARGET_OBJECTS:utils>  
+    )
+else()
+    add_library(peak 
+        SHARED 
+            ${sources_peak}
+            $<TARGET_OBJECTS:utils>  
+    )
+endif()
 
 target_include_directories(peak
     PUBLIC 

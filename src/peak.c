@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#ifdef HAVE_MPI
 #include <mpi.h>
+#endif
 
 #include "general_listener.h"
 #include "pthread_listener.h"
@@ -16,7 +18,9 @@ size_t hook_address_count;
 char** hook_strings;
 gulong max_num_threads;
 static int found_MPI;
+#ifdef HAVE_MPI
 static int flag_clean_fppid = 0;
+#endif
 
 void libprof_init()
 {
@@ -28,6 +32,7 @@ void libprof_init()
 
     pthread_listener_attach();
     peak_general_listener_attach();
+#ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
         int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
@@ -37,16 +42,21 @@ void libprof_init()
             found_MPI = 0;
         }
     }
+#endif
 }
 
 void libprof_fini()
 {
+#ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
     }
     peak_general_listener_print(found_MPI);
     if (found_MPI)
         mpi_interceptor_dettach();
+#else
+    peak_general_listener_print(0);
+#endif
     peak_general_listener_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();

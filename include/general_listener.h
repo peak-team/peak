@@ -15,7 +15,9 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#ifdef HAVE_MPI
 #include <mpi.h>
+#endif
 
 #include "utils/utils.h"
 
