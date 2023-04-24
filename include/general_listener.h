@@ -49,7 +49,6 @@ typedef struct _PeakGeneralState PeakGeneralState;
  */
 struct _PeakGeneralState {
     size_t hook_id;
-    gdouble current_time;
 };
 
 /**

@@ -134,7 +134,7 @@ static void
 peak_general_overhead_bootstrapping()
 {
     GumInvocationListener* listener_bootstrapping = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-    PeakGeneralState state_bootstrapping = { 0, 0.0 };
+    PeakGeneralState state_bootstrapping = { 0 };
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_attach(interceptor,
                            &peak_general_overhead_dummy_func,
@@ -193,7 +193,6 @@ void peak_general_listener_attach()
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
 
             state[i].hook_id = i;
-            state[i].current_time = 0.0;
             gum_interceptor_attach(interceptor,
                                    hook_address[i],
                                    listener,
@@ -273,14 +272,15 @@ void peak_general_listener_print(int is_MPI)
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
             for (size_t j = 0; j < peak_max_num_threads; j++) {
-                sum_num_calls[i] += pg_listener->num_calls[i * peak_max_num_threads + j];
-                sum_total_time[i] += pg_listener->total_time[i * peak_max_num_threads + j];
-                if (pg_listener->num_calls[i * peak_max_num_threads + j] != 0) {
+                size_t index = i * peak_max_num_threads + j;
+                sum_num_calls[i] += pg_listener->num_calls[index];
+                sum_total_time[i] += pg_listener->total_time[index];
+                if (pg_listener->num_calls[index] != 0) {
                     thread_count[i]++;
-                    if (pg_listener->max_time[i * peak_max_num_threads + j] > sum_max_time[i])
-                        sum_max_time[i] = pg_listener->max_time[i * peak_max_num_threads + j];
-                    if (pg_listener->min_time[i * peak_max_num_threads + j] < sum_min_time[i] || thread_count[i] == 1)
-                        sum_min_time[i] = pg_listener->min_time[i * peak_max_num_threads + j];
+                    if (pg_listener->max_time[index] > sum_max_time[i])
+                        sum_max_time[i] = pg_listener->max_time[index];
+                    if (pg_listener->min_time[index] < sum_min_time[i] || thread_count[i] == 1)
+                        sum_min_time[i] = pg_listener->min_time[index];
                 }
             }
             if (thread_count[i] == 0)
