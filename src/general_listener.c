@@ -9,7 +9,7 @@ static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern gulong peak_max_num_threads;
-static pthread_key_t key;
+static pthread_key_t thread_local_key;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -28,10 +28,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* current_time = (double *) pthread_getspecific (key);
+    double* current_time = (double *) pthread_getspecific (thread_local_key);
     if (current_time == NULL) {
         current_time = g_new0 (double, 1);
-        pthread_setspecific(key, current_time);
+        pthread_setspecific(thread_local_key, current_time);
     }
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
@@ -51,7 +51,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* current_time = (double *) pthread_getspecific (key);
+    double* current_time = (double *) pthread_getspecific (thread_local_key);
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
@@ -105,7 +105,7 @@ peak_general_listener_free(PeakGeneralListener* self)
 
 __attribute__((noinline)) static void peak_general_overhead_dummy_func()
 {
-    struct timespec ts = { 0, 1 }; // Sleep for 1,000 nanoseconds
+    struct timespec ts = { 0, 1 }; // Sleep for 1 nanosecond
     nanosleep(&ts, NULL);
 }
 
@@ -181,7 +181,7 @@ void peak_general_listener_attach()
     interceptor = gum_interceptor_obtain();
     listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
 
-    pthread_key_create(&key, destr_fn);
+    pthread_key_create(&thread_local_key, destr_fn);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     state = g_new0(PeakGeneralState, peak_hook_address_count);
@@ -303,7 +303,7 @@ void peak_general_listener_print(int is_MPI)
 
 void peak_general_listener_dettach()
 {
-    // pthread_key_delete(key);
+    pthread_key_delete(thread_local_key);
     gum_interceptor_detach(interceptor, listener);
     peak_general_listener_free(PEAKGENERAL_LISTENER(listener));
     g_object_unref(listener);

@@ -24,7 +24,7 @@ pthread_listener_on_enter(GumInvocationListener* listener,
 {
     PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t* tid = (pthread_t*)(gum_invocation_context_get_nth_argument(ic, 0));
-    //g_print ("%lu pthread_listener_on_enter %lu\n", my_tid, *tid);
+    // g_print ("pthread_listener_on_enter %lu\n", *tid);
     if (tid == NULL) {
         pthread_t* replaced_tid = g_new0(pthread_t, 1);
         gum_invocation_context_replace_nth_argument(ic, 0, replaced_tid);
@@ -43,7 +43,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t tid = *(thread_state->child_tid);
 
-    //g_print ("%lu pthread_listener_on_leave %lu\n", my_tid, tid);
+    // g_print ("pthread_listener_on_leave %lu\n", tid);
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
