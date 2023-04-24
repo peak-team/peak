@@ -9,6 +9,7 @@ static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern gulong peak_max_num_threads;
+static pthread_key_t key;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -27,7 +28,11 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    PeakGeneralState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PeakGeneralState);
+    double* current_time = (double *) pthread_getspecific (key);
+    if (current_time == NULL) {
+        current_time = g_new0 (double, 1);
+        pthread_setspecific(key, current_time);
+    }
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
@@ -35,8 +40,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
-    thread_state->current_time = peak_second();
-    // g_print ("hook_id %lu time %f\n", hook_id, thread_state->current_time);
+    *current_time = peak_second();
+    // g_printerr ("hook_id %lu time %f\n", hook_id, *current_time);
 }
 
 static void
@@ -46,19 +51,19 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    PeakGeneralState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PeakGeneralState);
+    double* current_time = (double *) pthread_getspecific (key);
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
     pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
-    end_time = end_time - thread_state->current_time;
+    end_time = end_time - *current_time;
     size_t index = hook_id * peak_max_num_threads + mapped_tid;
     if (end_time > self->max_time[index])
         self->max_time[index] = end_time;
     if (end_time < self->min_time[index] || self->num_calls[index] == 1)
         self->min_time[index] = end_time;
     self->total_time[index] += end_time;
-    // g_print ("hook_id %lu time %f\n", hook_id, thread_state->current_time);
+    // g_printerr ("hook_id %lu time %f\n", hook_id, *current_time);
 }
 
 static void
@@ -165,10 +170,18 @@ peak_general_overhead_bootstrapping()
     g_free(time);
 }
 
+static void destr_fn(void *parm)
+{
+    printf("Destructor function invoked %f %p\n", *((double*)parm), parm);
+    g_free(parm);
+}
+
 void peak_general_listener_attach()
 {
     interceptor = gum_interceptor_obtain();
     listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+
+    pthread_key_create(&key, destr_fn);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     state = g_new0(PeakGeneralState, peak_hook_address_count);
@@ -290,6 +303,7 @@ void peak_general_listener_print(int is_MPI)
 
 void peak_general_listener_dettach()
 {
+    // pthread_key_delete(key);
     gum_interceptor_detach(interceptor, listener);
     peak_general_listener_free(PEAKGENERAL_LISTENER(listener));
     g_object_unref(listener);
