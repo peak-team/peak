@@ -21,6 +21,10 @@ G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
                        0,
                        G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
                                              peak_general_listener_iface_init))
+typedef struct _PeakGeneralThreadState {
+    glong hook_id;
+    double child_time;
+} PeakGeneralThreadState;
 
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
@@ -47,6 +51,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
+    PeakGeneralThreadState* thread_data = GUM_IC_GET_THREAD_DATA(ic, PeakGeneralThreadState);
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
@@ -59,6 +64,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     if (end_time < self->min_time[index] || self->num_calls[index] == 1)
         self->min_time[index] = end_time;
     self->total_time[index] += end_time;
+    self->exclusive_time[index] += end_time - thread_data->child_time;
+    thread_data->child_time = end_time;
     // g_printerr ("hook_id %lu time %f endtime %f\n", hook_id, *current_time, end_time);
 }
 
@@ -86,6 +93,7 @@ peak_general_listener_init(PeakGeneralListener* self)
     // g_print ("total count %lu peak_hook_address_count %lu num_cores %lu\n", total_count, peak_hook_address_count, peak_max_num_threads);
     self->num_calls = g_new0(gulong, total_count);
     self->total_time = g_new0(gdouble, total_count);
+    self->exclusive_time = g_new0(gdouble, total_count);
     self->max_time = g_new0(gfloat, total_count);
     self->min_time = g_new0(gfloat, total_count);
 }
@@ -95,6 +103,7 @@ peak_general_listener_free(PeakGeneralListener* self)
 {
     g_free(self->num_calls);
     g_free(self->total_time);
+    g_free(self->exclusive_time);
     g_free(self->max_time);
     g_free(self->min_time);
 }
@@ -183,6 +192,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                    gdouble* sum_total_time,
                                    gdouble* max_total_time,
                                    gdouble* min_total_time,
+                                   gdouble* sum_exclusive_time,
                                    gfloat* sum_max_time,
                                    gfloat* sum_min_time,
                                    gulong* thread_count,
@@ -241,20 +251,22 @@ peak_general_listener_print_result(gulong* sum_num_calls,
         g_printerr("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
         g_printerr(" thread aggregated time (in seconds)\n");
         g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
-                   max_col_width + 4, "total",
-                   max_col_width + 4, "max",
-                   max_col_width + 3, "min",
+                   max_col_width, "total",
+                   max_col_width, "exclusive",
+                   max_col_width, "max",
+                   max_col_width, "min",
                    max_col_width, "overhead");
         g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%*s|%*.5f|%*.5f|%*.5f|%*.3e|\n",
+                g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                            max_function_width, peak_hook_strings[i],
-                           max_col_width + 4, sum_total_time[i],
-                           max_col_width + 4, max_total_time[i],
-                           max_col_width + 3, min_total_time[i],
+                           max_col_width, sum_total_time[i],
+                           max_col_width, sum_exclusive_time[i],
+                           max_col_width, max_total_time[i],
+                           max_col_width, min_total_time[i],
                            max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
                                           * peak_general_overhead);
             }
@@ -271,6 +283,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                     gdouble* sum_total_time,
                                     gdouble* max_total_time,
                                     gdouble* min_total_time,
+                                    gdouble* sum_exclusive_time,
                                     gfloat* sum_max_time,
                                     gfloat* sum_min_time,
                                     gulong* thread_count)
@@ -286,6 +299,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_max_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_min_total_time = g_new0(gdouble, peak_hook_address_count);
+    gdouble* mpi_sum_exclusive_time = g_new0(gdouble, peak_hook_address_count);
     gfloat* mpi_sum_max_time = g_new0(gfloat, peak_hook_address_count);
     gfloat* mpi_sum_min_time = g_new0(gfloat, peak_hook_address_count);
     gulong* mpi_thread_count = g_new0(gulong, peak_hook_address_count);
@@ -293,6 +307,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     MPI_Reduce(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(min_total_time, mpi_min_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(sum_exclusive_time, mpi_sum_exclusive_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(sum_max_time, mpi_sum_max_time, peak_hook_address_count, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -301,12 +316,18 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                            mpi_sum_total_time,
                                            mpi_max_total_time,
                                            mpi_min_total_time,
+                                           mpi_sum_exclusive_time,
                                            mpi_sum_max_time,
                                            mpi_sum_min_time,
                                            mpi_thread_count, size);
     }
     g_free(mpi_sum_num_calls);
     g_free(mpi_sum_total_time);
+    g_free(mpi_max_total_time);
+    g_free(mpi_min_total_time);
+    g_free(mpi_sum_exclusive_time);
+    g_free(mpi_sum_max_time);
+    g_free(mpi_sum_min_time);
     g_free(mpi_thread_count);
 }
 #endif
@@ -317,6 +338,7 @@ void peak_general_listener_print(int is_MPI)
     gdouble* sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* max_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* min_total_time = g_new0(gdouble, peak_hook_address_count);
+    gdouble* sum_exclusive_time = g_new0(gdouble, peak_hook_address_count);
     gfloat* sum_max_time = g_new0(gfloat, peak_hook_address_count);
     gfloat* sum_min_time = g_new0(gfloat, peak_hook_address_count);
     gulong* thread_count = g_new0(gulong, peak_hook_address_count);
@@ -327,6 +349,7 @@ void peak_general_listener_print(int is_MPI)
                 size_t index = i * peak_max_num_threads + j;
                 sum_num_calls[i] += pg_listener->num_calls[index];
                 sum_total_time[i] += pg_listener->total_time[index];
+                sum_exclusive_time[i] += pg_listener->exclusive_time[index];
                 if (pg_listener->num_calls[index] != 0) {
                     thread_count[i]++;
                     if (pg_listener->total_time[index] > max_total_time[i])
@@ -349,6 +372,7 @@ void peak_general_listener_print(int is_MPI)
                                             sum_total_time,
                                             max_total_time,
                                             min_total_time,
+                                            sum_exclusive_time,
                                             sum_max_time,
                                             sum_min_time,
                                             thread_count);
@@ -357,6 +381,7 @@ void peak_general_listener_print(int is_MPI)
                                            sum_total_time,
                                            max_total_time,
                                            min_total_time,
+                                           sum_exclusive_time,
                                            sum_max_time,
                                            sum_min_time,
                                            thread_count, 1);
@@ -366,12 +391,18 @@ void peak_general_listener_print(int is_MPI)
                                        sum_total_time,
                                        max_total_time,
                                        min_total_time,
+                                       sum_exclusive_time,
                                        sum_max_time,
                                        sum_min_time,
                                        thread_count, 1);
 #endif
     g_free(sum_num_calls);
     g_free(sum_total_time);
+    g_free(max_total_time);
+    g_free(min_total_time);
+    g_free(sum_exclusive_time);
+    g_free(sum_max_time);
+    g_free(sum_min_time);
     g_free(thread_count);
 }
 

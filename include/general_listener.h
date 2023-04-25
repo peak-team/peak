@@ -35,6 +35,7 @@ struct _PeakGeneralListener {
 
     gulong* num_calls;
     gdouble* total_time;
+    gdouble* exclusive_time;
     gfloat* max_time;
     gfloat* min_time;
 };
