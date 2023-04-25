@@ -37,7 +37,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
-    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
+    size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
@@ -56,7 +56,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
-    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
+    size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     end_time = end_time - *current_time;
     size_t index = hook_id * peak_max_num_threads + mapped_tid;
     if (end_time > self->max_time[index])

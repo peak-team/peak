@@ -36,12 +36,18 @@ if(BUILD_TESTING)
         SYMBOLS ${FORTRAN_FUNCTIONS}
     )
 
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        set(PRELOAD_VAR "LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so")
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+        set(PRELOAD_VAR "DYLD_INSERT_LIBRARIES=${PROJECT_BINARY_DIR}/src/libpeak.dylib")
+    endif()
+
     # Add test of dgemm
     add_subdirectory(dgemm)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${PRELOAD_VAR}"
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
@@ -54,12 +60,12 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main;${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=cblas_sdot,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "PEAK_TARGET=cblas_sdot,main;${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sdot
@@ -73,12 +79,12 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sleep
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sleep
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sleep
@@ -93,12 +99,12 @@ if(BUILD_TESTING)
         if(OpenMP_FOUND)
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
             )
         else()
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so"
+                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
             )
         endif()
         set_tests_properties(test_dgemm_mpi

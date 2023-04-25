@@ -66,6 +66,12 @@ void libprof_fini()
     gum_deinit_embedded();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
 }
-
-__attribute__((section(".init_array"))) void* __init = libprof_init;
-__attribute__((section(".fini_array"))) void* __fini = libprof_fini;
+#if defined(__APPLE__)
+__attribute__((used, section("__DATA,__mod_init_func"))) static void* __init = libprof_init;
+__attribute__((used, section("__DATA,__mod_fini_func"))) static void* __fini = libprof_fini;
+#elif defined(__ELF__)
+__attribute__((section(".init_array"))) static void* __init = libprof_init;
+__attribute__((section(".fini_array"))) static void* __fini = libprof_fini;
+#else
+#error Unsupported platform
+#endif

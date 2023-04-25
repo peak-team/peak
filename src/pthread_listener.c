@@ -5,7 +5,7 @@ static GumInvocationListener* pthread_create_listener;
 static PthreadState pthread_create_state;
 GumMetalHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
-static pthread_t current_tid = 0;
+static size_t current_tid = 0;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
