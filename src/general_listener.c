@@ -28,9 +28,9 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* current_time = (double *) pthread_getspecific (thread_local_key);
+    double* current_time = (double*)pthread_getspecific(thread_local_key);
     if (current_time == NULL) {
-        current_time = g_new0 (double, 1);
+        current_time = g_new0(double, 1);
         pthread_setspecific(thread_local_key, current_time);
     }
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
@@ -51,7 +51,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* current_time = (double *) pthread_getspecific (thread_local_key);
+    double* current_time = (double*)pthread_getspecific(thread_local_key);
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
@@ -170,9 +170,9 @@ peak_general_overhead_bootstrapping()
     g_free(time);
 }
 
-static void destr_fn(void *parm)
+static void destr_fn(void* parm)
 {
-    printf("Destructor function invoked %f %p\n", *((double*)parm), parm);
+    // printf("Destructor function invoked %f %p\n", *((double*)parm), parm);
     g_free(parm);
 }
 
@@ -221,9 +221,9 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("----------------------------------------------------------------------------------\n");
         g_printerr("                                  PEAK Library\n");
         g_printerr("----------------------------------------------------------------------------------\n");
-        g_printerr("PEAK done with: %s\n",argv_o);
+        g_printerr("PEAK done with: %s\n", argv_o);
         g_printerr("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
-        
+
         g_printerr("\n--------------------------- function statistics (call) ---------------------------\n");
         g_printerr("    individual call counts and time (in seconds)\n");
         g_printerr("----------------------------------------------------------------------------------\n");
@@ -232,16 +232,16 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 g_printerr("|%20s| %10lu| %10.1f| %10lu| %10.3e| %10.3e|\n",
-                        peak_hook_strings[i],
-                        sum_num_calls[i],
-                        sum_num_calls[i] / (double)thread_count[i],
-                        sum_num_calls[i] / rank_count,
-                        sum_max_time[i],
-                        sum_min_time[i]);
+                           peak_hook_strings[i],
+                           sum_num_calls[i],
+                           sum_num_calls[i] / (double)thread_count[i],
+                           sum_num_calls[i] / rank_count,
+                           sum_max_time[i],
+                           sum_min_time[i]);
             }
         }
         g_printerr("----------------------------------------------------------------------------------\n");
-        
+
         g_printerr("\n-------------------------- function statistics (thread) --------------------------\n");
         g_printerr("    per thread aggregated time (in seconds)\n");
         g_printerr("----------------------------------------------------------------------------------\n");
@@ -250,11 +250,11 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 g_printerr("|%20s| %14.5f| %14.5f| %14.5f| %10.3e|\n",
-                        peak_hook_strings[i],
-                        sum_total_time[i],
-                        max_total_time[i],
-                        min_total_time[i],
-                        sum_num_calls[i] / (double)thread_count[i] * peak_general_overhead);
+                           peak_hook_strings[i],
+                           sum_total_time[i],
+                           max_total_time[i],
+                           min_total_time[i],
+                           sum_num_calls[i] / (double)thread_count[i] * peak_general_overhead);
             }
         }
         g_printerr("----------------------------------------------------------------------------------\n");
