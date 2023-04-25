@@ -32,6 +32,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
+    PeakGeneralThreadState* thread_data = GUM_IC_GET_THREAD_DATA(ic, PeakGeneralThreadState);
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
     // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
     // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
@@ -40,6 +41,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
+    thread_data->child_time = 0.0;
     *current_time = peak_second();
     // g_printerr ("hook_id %lu time %f\n", hook_id, *current_time);
 }
