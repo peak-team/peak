@@ -221,7 +221,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
 
         g_printerr("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
-        g_printerr("    individual call counts and time (in seconds)\n");
+        g_printerr(" individual call counts and time (in seconds)\n");
         g_printerr("%.*s\n", row_width, row_separator);
         g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
@@ -245,7 +245,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("%.*s\n", row_width, row_separator);
 
         g_printerr("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
-        g_printerr("    per thread aggregated time (in seconds)\n");
+        g_printerr(" thread aggregated time (in seconds)\n");
         g_printerr("%.*s\n", row_width, row_separator);
         g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
