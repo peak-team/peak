@@ -196,8 +196,8 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
 {
     guint max_function_width = 20;
     guint max_col_width = 10;
-    guint row_width = max_function_width + max_col_width * 5 + 7 ;
-    char *row_separator = malloc(row_width + 1);
+    guint row_width = max_function_width + max_col_width * 5 + 7;
+    char* row_separator = malloc(row_width + 1);
     memset(row_separator, '-', row_width);
     row_separator[row_width] = '\0';
 
@@ -223,13 +223,13 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
         g_printerr("    individual call counts and time (in seconds)\n");
         g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n", 
-                    max_function_width, "function", 
-                    max_col_width, "count", 
-                    max_col_width, "per thread", 
-                    max_col_width, "per rank", 
-                    max_col_width, "max", 
-                    max_col_width, "min");
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
+                   max_function_width, "function",
+                   max_col_width, "count",
+                   max_col_width, "per thread",
+                   max_col_width, "per rank",
+                   max_col_width, "max",
+                   max_col_width, "min");
         g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
@@ -247,12 +247,12 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
         g_printerr("    per thread aggregated time (in seconds)\n");
         g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n", 
-                    max_function_width, "function", 
-                    max_col_width + 4, "total", 
-                    max_col_width + 4, "max", 
-                    max_col_width + 3, "min", 
-                    max_col_width, "overhead");
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
+                   max_function_width, "function",
+                   max_col_width + 4, "total",
+                   max_col_width + 4, "max",
+                   max_col_width + 3, "min",
+                   max_col_width, "overhead");
         g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
@@ -262,7 +262,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
                            max_col_width + 4, max_total_time[i],
                            max_col_width + 3, min_total_time[i],
                            max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                           * peak_general_overhead);
+                                          * peak_general_overhead);
             }
         }
         g_printerr("%.*s\n", row_width, row_separator);
