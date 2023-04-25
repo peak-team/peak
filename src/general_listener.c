@@ -104,6 +104,13 @@ peak_general_listener_free(PeakGeneralListener* self)
     g_free(self->min_time);
 }
 
+static void (*original_peak_general_overhead_dummy_func)(void);
+
+static void peak_general_overhead_dummy_func_2() 
+{
+    original_peak_general_overhead_dummy_func();
+}
+
 __attribute__((noinline)) static void peak_general_overhead_dummy_func()
 {
     struct timespec ts = { 0, 1 }; // Sleep for 1 nanosecond
@@ -113,17 +120,26 @@ __attribute__((noinline)) static void peak_general_overhead_dummy_func()
 static void
 peak_general_overhead_bootstrapping()
 {
+    guint n_tests = 2000;
+    double* time = g_new(double, n_tests * 2);
+
+    for (guint i = 0; i < n_tests; i++) {
+        time[i] = peak_second();
+        peak_general_overhead_dummy_func();
+        time[i] = peak_second() - time[i];
+    }
     GumInvocationListener* listener_bootstrapping = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
     PeakGeneralState state_bootstrapping = { 0 };
     gum_interceptor_begin_transaction(interceptor);
-    gum_interceptor_attach(interceptor,
-                           &peak_general_overhead_dummy_func,
-                           listener_bootstrapping,
-                           &state_bootstrapping);
+    // gum_interceptor_attach(interceptor,
+    //                        &peak_general_overhead_dummy_func,
+    //                        listener_bootstrapping,
+    //                        &state_bootstrapping);
+    gum_interceptor_replace_fast(interceptor,
+                                &peak_general_overhead_dummy_func, &peak_general_overhead_dummy_func_2,
+                                (gpointer*)(&original_peak_general_overhead_dummy_func));
     gum_interceptor_end_transaction(interceptor);
 
-    guint n_tests = 2000;
-    double* time = g_new(double, n_tests * 2);
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
         peak_general_overhead_dummy_func();
@@ -135,15 +151,10 @@ peak_general_overhead_bootstrapping()
     //             PEAKGENERAL_LISTENER(listener_bootstrapping)->total_time[0],
     //             PEAKGENERAL_LISTENER(listener_bootstrapping)->max_time[0],
     //             PEAKGENERAL_LISTENER(listener_bootstrapping)->min_time[0]);
-    gum_interceptor_detach(interceptor, listener_bootstrapping);
+    // gum_interceptor_detach(interceptor, listener_bootstrapping);
+    gum_interceptor_revert(interceptor, &peak_general_overhead_dummy_func);
     peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
     g_object_unref(listener_bootstrapping);
-
-    for (guint i = 0; i < n_tests; i++) {
-        time[i] = peak_second();
-        peak_general_overhead_dummy_func();
-        time[i] = peak_second() - time[i];
-    }
 
     // g_printerr("orig %.6e time %.6e\n", orig_time, time);
     peak_general_overhead = (median_double(&time[n_tests], n_tests) - median_double(&time[0], n_tests));
