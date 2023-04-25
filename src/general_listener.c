@@ -200,7 +200,8 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
     gboolean have_output = FALSE;
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i] && sum_num_calls[i] != 0) {
-            total_overhead += sum_num_calls[i] / (double)thread_count[i] * peak_general_overhead;
+            total_overhead += (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
+                              * peak_general_overhead;
             have_output = TRUE;
         }
     }
@@ -242,7 +243,8 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
                            sum_total_time[i],
                            max_total_time[i],
                            min_total_time[i],
-                           (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0)) * peak_general_overhead);
+                           (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
+                           * peak_general_overhead);
             }
         }
         g_printerr("----------------------------------------------------------------------------------\n");
