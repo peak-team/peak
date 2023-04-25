@@ -45,7 +45,7 @@ if(BUILD_TESTING)
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "dgemm_\|[ \t]+100000\|"
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
 
     # Add test of sdot
@@ -64,7 +64,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "cblas_sdot\|[ \t]+1000000\|"
+            PASS_REGULAR_EXPRESSION "cblas_sdot\\|[ \t]+1000000\\|"
     )
 
     # Add test of sleep
@@ -83,7 +83,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sleep
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "my_sleep_func\|[ \t]+1000\|.*my_sleep_func\|[ \t]+10\."
+            PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
     )
     
     if(MPI_FOUND)
@@ -103,7 +103,7 @@ if(BUILD_TESTING)
         endif()
         set_tests_properties(test_dgemm_mpi
             PROPERTIES 
-                PASS_REGULAR_EXPRESSION "cblas_dgemm\|[ \t]+200\|"
+                PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+200\\|"
         )
     endif()
 endif()
