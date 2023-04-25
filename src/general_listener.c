@@ -6,10 +6,11 @@ extern GumMetalHashTable* peak_tid_mapping;
 static PeakGeneralState* state;
 static gpointer* hook_address = NULL;
 static double peak_general_overhead;
+static pthread_key_t thread_local_key;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern gulong peak_max_num_threads;
-static pthread_key_t thread_local_key;
+extern double peak_main_time;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -167,7 +168,14 @@ void peak_general_listener_attach()
     // g_printerr ("peak_hook_address_count %lu peak_max_num_threads %lu\n",  peak_hook_address_count, peak_max_num_threads);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        hook_address[i] = gum_find_function(peak_hook_strings[i]);
+        // replace certain function we are capturing already.
+        if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0) {
+            hook_address[i] = gum_find_function("peak_pmpi_finalize");
+        } else if (strcmp(peak_hook_strings[i], "main") == 0) {
+            hook_address[i] = NULL;
+        } else {
+            hook_address[i] = gum_find_function(peak_hook_strings[i]);
+        }
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
 
@@ -200,6 +208,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("----------------------------------------------------------------------------------\n");
         g_printerr("                                  PEAK Library\n");
         g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("Time: %f\n", peak_main_time);
         g_printerr("PEAK done with: %s\n", argv_o);
         g_printerr("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
 
@@ -210,10 +219,10 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("----------------------------------------------------------------------------------\n");
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%20s| %10lu| %10.1f| %10lu| %10.3e| %10.3e|\n",
+                g_printerr("|%20s| %10lu| %10lu| %10lu| %10.3e| %10.3e|\n",
                            peak_hook_strings[i],
                            sum_num_calls[i],
-                           sum_num_calls[i] / (double)thread_count[i],
+                           sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                            sum_num_calls[i] / rank_count,
                            sum_max_time[i],
                            sum_min_time[i]);
@@ -224,7 +233,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         g_printerr("\n-------------------------- function statistics (thread) --------------------------\n");
         g_printerr("    per thread aggregated time (in seconds)\n");
         g_printerr("----------------------------------------------------------------------------------\n");
-        g_printerr("|      function      |      time     |      max      |      min      |  overhead |\n");
+        g_printerr("|      function      |     total     |      max      |      min      |  overhead |\n");
         g_printerr("----------------------------------------------------------------------------------\n");
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
@@ -233,7 +242,7 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
                            sum_total_time[i],
                            max_total_time[i],
                            min_total_time[i],
-                           sum_num_calls[i] / (double)thread_count[i] * peak_general_overhead);
+                           (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0)) * peak_general_overhead);
             }
         }
         g_printerr("----------------------------------------------------------------------------------\n");

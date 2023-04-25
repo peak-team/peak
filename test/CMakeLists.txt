@@ -45,7 +45,7 @@ if(BUILD_TESTING)
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "dgemm_\|[ \t]+100000\| .*[\r\n\t ]*main\|[ \t]+1\|"
+            PASS_REGULAR_EXPRESSION "dgemm_\|[ \t]+100000\|"
     )
 
     # Add test of sdot
@@ -64,7 +64,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "cblas_sdot\|[ \t]+1000000\| .*[\r\n\t ]*main\|[ \t]+1\|"
+            PASS_REGULAR_EXPRESSION "cblas_sdot\|[ \t]+1000000\|"
     )
 
     # Add test of sleep

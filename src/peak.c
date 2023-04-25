@@ -17,6 +17,7 @@
 size_t peak_hook_address_count;
 char** peak_hook_strings;
 gulong peak_max_num_threads;
+double peak_main_time;
 #ifdef HAVE_MPI
 static int found_MPI;
 static int flag_clean_fppid = 0;
@@ -31,7 +32,6 @@ void libprof_init()
     gum_init_embedded();
 
     pthread_listener_attach();
-    peak_general_listener_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -43,10 +43,14 @@ void libprof_init()
         }
     }
 #endif
+    // general listener needs to be after pthread and mpi ones
+    peak_general_listener_attach();
+    peak_main_time = peak_second();
 }
 
 void libprof_fini()
 {
+    peak_main_time = peak_second() - peak_main_time;
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
