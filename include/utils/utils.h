@@ -66,4 +66,14 @@ void remove_ppid_file(char* lock_file);
  */
 void get_argv0(char** argv0);
 
+/**
+ * @brief Calculates the median value of an array of doubles.
+ *
+ * @param arr Pointer to the array of doubles.
+ * @param n Number of elements in the array.
+ *
+ * @return The median value of the array.
+ */
+double median_double(double* arr, size_t n);
+
 #endif /* __UTILS_H */

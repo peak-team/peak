@@ -109,27 +109,6 @@ __attribute__((noinline)) static void peak_general_overhead_dummy_func()
     nanosleep(&ts, NULL);
 }
 
-static int cmpfunc(const void* a, const void* b)
-{
-    if (*(double*)a < *(double*)b) {
-        return -1;
-    } else if (*(double*)a > *(double*)b) {
-        return 1;
-    } else {
-        return 0;
-    }
-}
-
-static double median(double* arr, size_t n)
-{
-    qsort(arr, n, sizeof(double), cmpfunc);
-    if (n % 2 == 0) {
-        return (double)(arr[n / 2 - 1] + arr[n / 2]) / 2.0;
-    } else {
-        return (double)arr[n / 2];
-    }
-}
-
 static void
 peak_general_overhead_bootstrapping()
 {
@@ -166,7 +145,7 @@ peak_general_overhead_bootstrapping()
     }
 
     // g_printerr("orig %.6e time %.6e\n", orig_time, time);
-    peak_general_overhead = (median(&time[n_tests], n_tests) - median(&time[0], n_tests));
+    peak_general_overhead = (median_double(&time[n_tests], n_tests) - median_double(&time[0], n_tests));
     g_free(time);
 }
 
