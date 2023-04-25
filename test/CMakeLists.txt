@@ -91,6 +91,14 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
     )
+
+    # Add test of recursive
+    add_subdirectory(recursive)
+    add_test(NAME test_recursive COMMAND ${PROJECT_BINARY_DIR}/test/recursive/test_recursive)
+    set_tests_properties(test_recursive
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=functionA,functionB;${PRELOAD_VAR}"
+    )
     
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
