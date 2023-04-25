@@ -194,6 +194,13 @@ void peak_general_listener_attach()
 static void
 peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_time, gdouble* max_total_time, gdouble* min_total_time, gfloat* sum_max_time, gfloat* sum_min_time, gulong* thread_count, const int rank_count)
 {
+    guint max_function_width = 20;
+    guint max_col_width = 10;
+    guint row_width = max_function_width + max_col_width * 5 + 7 ;
+    char *row_separator = malloc(row_width + 1);
+    memset(row_separator, '-', row_width);
+    row_separator[row_width] = '\0';
+
     char* argv_o;
     get_argv0(&argv_o);
     double total_overhead = 0.0;
@@ -206,50 +213,62 @@ peak_general_listener_print_result(gulong* sum_num_calls, gdouble* sum_total_tim
         }
     }
     if (have_output) {
-        g_printerr("----------------------------------------------------------------------------------\n");
-        g_printerr("                                  PEAK Library\n");
-        g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("%*s PEAK Library\n", (row_width - 12) / 2, "");
+        g_printerr("%.*s\n", row_width, row_separator);
         g_printerr("Time: %f\n", peak_main_time);
         g_printerr("PEAK done with: %s\n", argv_o);
         g_printerr("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
 
-        g_printerr("\n--------------------------- function statistics (call) ---------------------------\n");
+        g_printerr("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
         g_printerr("    individual call counts and time (in seconds)\n");
-        g_printerr("----------------------------------------------------------------------------------\n");
-        g_printerr("|      function      |   count   | per thread|  per rank |    max    |    min    |\n");
-        g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n", 
+                    max_function_width, "function", 
+                    max_col_width, "count", 
+                    max_col_width, "per thread", 
+                    max_col_width, "per rank", 
+                    max_col_width, "max", 
+                    max_col_width, "min");
+        g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%20s| %10lu| %10lu| %10lu| %10.3e| %10.3e|\n",
-                           peak_hook_strings[i],
-                           sum_num_calls[i],
-                           sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                           sum_num_calls[i] / rank_count,
-                           sum_max_time[i],
-                           sum_min_time[i]);
+                g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                           max_function_width, peak_hook_strings[i],
+                           max_col_width, sum_num_calls[i],
+                           max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                           max_col_width, sum_num_calls[i] / rank_count,
+                           max_col_width, sum_max_time[i],
+                           max_col_width, sum_min_time[i]);
             }
         }
-        g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("%.*s\n", row_width, row_separator);
 
-        g_printerr("\n-------------------------- function statistics (thread) --------------------------\n");
+        g_printerr("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
         g_printerr("    per thread aggregated time (in seconds)\n");
-        g_printerr("----------------------------------------------------------------------------------\n");
-        g_printerr("|      function      |     total     |      max      |      min      |  overhead |\n");
-        g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n", 
+                    max_function_width, "function", 
+                    max_col_width + 4, "total", 
+                    max_col_width + 4, "max", 
+                    max_col_width + 3, "min", 
+                    max_col_width, "overhead");
+        g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%20s| %14.5f| %14.5f| %14.5f| %10.3e|\n",
-                           peak_hook_strings[i],
-                           sum_total_time[i],
-                           max_total_time[i],
-                           min_total_time[i],
-                           (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
+                g_printerr("|%*s|%*.5f|%*.5f|%*.5f|%*.3e|\n",
+                           max_function_width, peak_hook_strings[i],
+                           max_col_width + 4, sum_total_time[i],
+                           max_col_width + 4, max_total_time[i],
+                           max_col_width + 3, min_total_time[i],
+                           max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
                            * peak_general_overhead);
             }
         }
-        g_printerr("----------------------------------------------------------------------------------\n");
+        g_printerr("%.*s\n", row_width, row_separator);
     }
     free(argv_o);
+    free(row_separator);
 }
 
 #ifdef HAVE_MPI
