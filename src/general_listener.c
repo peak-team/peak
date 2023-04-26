@@ -106,9 +106,17 @@ peak_general_listener_free(PeakGeneralListener* self)
 
 static void (*original_peak_general_overhead_dummy_func)(void);
 
+static size_t* bsp_num_calls;
+static gdouble* bsp_total_time;
+
 static void peak_general_overhead_dummy_func_2() 
 {
+    pthread_t mapped_tid = (pthread_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
+    double current_time = peak_second();
     original_peak_general_overhead_dummy_func();
+    current_time = peak_second() - current_time;
+    bsp_num_calls[mapped_tid]++;
+    bsp_total_time[mapped_tid] += current_time;
 }
 
 __attribute__((noinline)) static void peak_general_overhead_dummy_func()
@@ -122,6 +130,8 @@ peak_general_overhead_bootstrapping()
 {
     guint n_tests = 2000;
     double* time = g_new(double, n_tests * 2);
+    bsp_num_calls = g_new0(gulong, peak_max_num_threads);
+    bsp_total_time = g_new0(gdouble, peak_max_num_threads);
 
     for (guint i = 0; i < n_tests; i++) {
         time[i] = peak_second();
@@ -158,7 +168,10 @@ peak_general_overhead_bootstrapping()
 
     // g_printerr("orig %.6e time %.6e\n", orig_time, time);
     peak_general_overhead = (median_double(&time[n_tests], n_tests) - median_double(&time[0], n_tests));
+    g_printerr("BSP called %lu %f\n", bsp_num_calls[0], bsp_total_time[0]);
     g_free(time);
+    g_free(bsp_num_calls);
+    g_free(bsp_total_time);
 }
 
 static void destr_fn(void* parm)
