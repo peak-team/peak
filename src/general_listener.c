@@ -2,6 +2,7 @@
 
 static GumInterceptor* interceptor;
 static GumInvocationListener** array_listener;
+static gboolean* array_listener_detached;
 extern GumMetalHashTable* peak_tid_mapping;
 static PeakGeneralState* state;
 static gpointer* hook_address = NULL;
@@ -49,14 +50,22 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     size_t index = mapped_tid;
     self->num_calls[index]++;
     *child_time = 0.0;
-    if (self->num_calls[index] > 30000000) {
+    if (mapped_tid == 0 && self->num_calls[index] > 3000) {
         pthread_mutex_lock(&lock);
-        gum_interceptor_begin_transaction(interceptor);
-        gum_interceptor_detach(interceptor, listener);
-        gum_interceptor_end_transaction(interceptor);
+        if(!array_listener_detached[hook_id]) {
+            array_listener_detached[hook_id] = TRUE;
+            // gum_interceptor_ignore_other_threads(interceptor);
+            gum_interceptor_begin_transaction(interceptor);
+            gum_interceptor_detach(interceptor, listener);
+            gum_interceptor_end_transaction(interceptor);
+        }
         pthread_mutex_unlock(&lock);
         // gum_interceptor_revert(interceptor, hook_address[hook_id]);
         // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
+    }
+    if(array_listener_detached[hook_id]) {
+        pthread_mutex_lock(&lock);
+        pthread_mutex_unlock(&lock);
     }
     *current_time = peak_second();
     // g_printerr ("hook_id %lu time %f count %lu\n", hook_id, *current_time, self->num_calls[mapped_tid]);
@@ -85,8 +94,6 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     self->exclusive_time[index] += end_time - *child_time;
     // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
     *child_time = end_time;
-    pthread_mutex_lock(&lock);
-    pthread_mutex_unlock(&lock);
 }
 
 static void
@@ -184,6 +191,7 @@ void peak_general_listener_attach()
 {
     interceptor = gum_interceptor_obtain();
     array_listener = (GumInvocationListener**)g_new0(gpointer, peak_hook_address_count);
+    array_listener_detached = g_new0(gboolean, peak_hook_address_count);
 
     pthread_key_create(&thread_local_key, destr_fn);
 
