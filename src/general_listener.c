@@ -22,8 +22,9 @@ G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
                        G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
                                              peak_general_listener_iface_init))
 typedef struct _PeakGeneralThreadState {
-    glong hook_id;
-    double child_time;
+    gulong level;
+    gulong capacity;
+    gdouble* child_time;
 } PeakGeneralThreadState;
 
 static void
@@ -41,7 +42,17 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     self->num_calls[hook_id * peak_max_num_threads + mapped_tid]++;
-    thread_data->child_time = 0.0;
+    if (thread_data->child_time == NULL) {
+        thread_data->level = 0;
+        thread_data->capacity = 16;
+        thread_data->child_time = g_new(gdouble, 16);
+    }
+    thread_data->child_time[thread_data->level] = 0.0;
+    thread_data->level++;
+    if (thread_data->level == thread_data->capacity) {
+        thread_data->capacity *= 2;
+        thread_data->child_time = g_renew(double, thread_data->child_time, thread_data->capacity);
+    }
     *current_time = peak_second();
     // g_printerr ("hook_id %lu time %f\n", hook_id, *current_time);
 }
@@ -66,8 +77,15 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     if (end_time < self->min_time[index] || self->num_calls[index] == 1)
         self->min_time[index] = end_time;
     self->total_time[index] += end_time;
-    self->exclusive_time[index] += end_time - thread_data->child_time;
-    thread_data->child_time = end_time;
+    thread_data->level--;
+    if (thread_data->level > 0)
+        thread_data->child_time[thread_data->level - 1] += end_time;
+    self->exclusive_time[index] += end_time - thread_data->child_time[thread_data->level];
+    if (thread_data->level == 0) {
+        void* tmp_ptr = thread_data->child_time;
+        thread_data->child_time = NULL;
+        g_free(tmp_ptr);
+    }
     // g_printerr ("hook_id %lu time %f endtime %f\n", hook_id, *current_time, end_time);
 }
 
