@@ -25,6 +25,7 @@ typedef struct _PeakGeneralThreadState {
     gulong level;
     gulong capacity;
     gdouble* child_time;
+    gboolean at_max;
 } PeakGeneralThreadState;
 
 static void
@@ -46,12 +47,20 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         thread_data->level = 0;
         thread_data->capacity = 16;
         thread_data->child_time = g_new(gdouble, 16);
+        thread_data->at_max = FALSE;
+        // g_printerr ("hook_id %lu alloc %lu\n", hook_id, 16);
     }
-    thread_data->child_time[thread_data->level] = 0.0;
+    if (thread_data->at_max == FALSE)
+        thread_data->child_time[thread_data->level] = 0.0;
+    else
+        thread_data->child_time[MAX_FUNC_DEPTH - 1] = 0.0;
     thread_data->level++;
-    if (thread_data->level == thread_data->capacity) {
+    if (thread_data->level == thread_data->capacity && thread_data->level < MAX_FUNC_DEPTH) {
         thread_data->capacity *= 2;
         thread_data->child_time = g_renew(double, thread_data->child_time, thread_data->capacity);
+        // g_printerr ("hook_id %lu realloc %lu\n", hook_id, thread_data->capacity);
+    } else if (thread_data->level >= MAX_FUNC_DEPTH) {
+        thread_data->at_max = TRUE;
     }
     *current_time = peak_second();
     // g_printerr ("hook_id %lu time %f\n", hook_id, *current_time);
@@ -78,13 +87,20 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         self->min_time[index] = end_time;
     self->total_time[index] += end_time;
     thread_data->level--;
-    if (thread_data->level > 0)
-        thread_data->child_time[thread_data->level - 1] += end_time;
-    self->exclusive_time[index] += end_time - thread_data->child_time[thread_data->level];
+    if (!thread_data->at_max || thread_data->level < MAX_FUNC_DEPTH) {
+        thread_data->at_max = FALSE;
+        if (thread_data->level > 0)
+            thread_data->child_time[thread_data->level - 1] += end_time;
+        self->exclusive_time[index] += end_time - thread_data->child_time[thread_data->level];
+    } else {
+        self->exclusive_time[index] += end_time - thread_data->child_time[MAX_FUNC_DEPTH - 1];
+        thread_data->child_time[MAX_FUNC_DEPTH - 1] = end_time;
+    }
     if (thread_data->level == 0) {
         void* tmp_ptr = thread_data->child_time;
         thread_data->child_time = NULL;
         g_free(tmp_ptr);
+        // g_printerr ("hook_id %lu free %lu\n", hook_id, thread_data->capacity);
     }
     // g_printerr ("hook_id %lu time %f endtime %f\n", hook_id, *current_time, end_time);
 }

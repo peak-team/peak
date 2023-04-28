@@ -21,6 +21,8 @@
 
 #include "utils/utils.h"
 
+#define MAX_FUNC_DEPTH 1024
+
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
 /**
