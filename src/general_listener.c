@@ -27,8 +27,9 @@ G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
                        G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
                                              peak_general_listener_iface_init))
 typedef struct _PeakGeneralThreadState {
-    glong hook_id;
-    double child_time;
+    gulong level;
+    gulong capacity;
+    gdouble* child_time;
 } PeakGeneralThreadState;
 
 sem_t pthread_pause_sem;
@@ -120,21 +121,29 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     if (!self)
         return;
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* child_time = (double*)pthread_getspecific(thread_local_key);
-    if (child_time == NULL) {
-        child_time = g_new0(double, 1);
-        pthread_setspecific(thread_local_key, child_time);
+    PeakGeneralThreadState* thread_data = (PeakGeneralThreadState*)pthread_getspecific(thread_local_key);
+    if (thread_data == NULL) {
+        thread_data = g_new0(PeakGeneralThreadState, 1);
+        pthread_setspecific(thread_local_key, thread_data);
     }
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
-    // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
-    // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
     size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
     // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
     size_t index = mapped_tid;
     self->num_calls[index]++;
-    *child_time = 0.0;
+    if (thread_data->child_time == NULL) {
+        thread_data->level = 0;
+        thread_data->capacity = 16;
+        thread_data->child_time = g_new(gdouble, 16);
+    }
+    thread_data->child_time[thread_data->level] = 0.0;
+    thread_data->level++;
+    if (thread_data->level == thread_data->capacity) {
+        thread_data->capacity *= 2;
+        thread_data->child_time = g_renew(double, thread_data->child_time, thread_data->capacity);
+    }
     if (mapped_tid == 0 && self->num_calls[index] > 3000) {
         if(!array_listener_detached[hook_id]) {
             array_listener_detached[hook_id] = TRUE;
@@ -171,10 +180,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     if (!self)
         return;
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-    double* child_time = (double*)pthread_getspecific(thread_local_key);
+    PeakGeneralThreadState* thread_data = (PeakGeneralThreadState*)pthread_getspecific(thread_local_key);
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
-    // PeakGeneralState* state = (PeakGeneralState*)(gum_invocation_context_get_listener_function_data(ic));
-    // PeakGeneralState* thread_state = (PeakGeneralState*)(gum_invocation_context_get_listener_thread_data(ic, sizeof(PeakGeneralState)));
     size_t hook_id = state->hook_id;
     size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
     end_time = end_time - *current_time;
@@ -184,9 +191,16 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     if (end_time < self->min_time[index] || self->num_calls[index] == 1)
         self->min_time[index] = end_time;
     self->total_time[index] += end_time;
-    self->exclusive_time[index] += end_time - *child_time;
     // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
-    *child_time = end_time;
+    thread_data->level--;
+    if (thread_data->level > 0)
+        thread_data->child_time[thread_data->level - 1] += end_time;
+    self->exclusive_time[index] += end_time - thread_data->child_time[thread_data->level];
+    if (thread_data->level == 0) {
+        void* tmp_ptr = thread_data->child_time;
+        thread_data->child_time = NULL;
+        g_free(tmp_ptr);
+    }
 }
 
 static void
