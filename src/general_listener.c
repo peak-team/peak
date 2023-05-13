@@ -1,5 +1,8 @@
 #include "general_listener.h"
 
+#define PEAK_SIG_STOP (SIGRTMIN+0)
+#define PEAK_SIG_CONT (SIGRTMIN+1)
+
 static GumInterceptor* interceptor;
 static GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
@@ -12,7 +15,6 @@ extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern gulong peak_max_num_threads;
 extern double peak_main_time;
-static pthread_mutex_t lock;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -29,11 +31,94 @@ typedef struct _PeakGeneralThreadState {
     double child_time;
 } PeakGeneralThreadState;
 
+sem_t pthread_pause_sem;
+pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
+
+void pthread_pause_once(void) {
+    sem_init(&pthread_pause_sem, 0, 1);
+}
+
+#define pthread_pause_init() (pthread_once(&pthread_pause_once_ctrl, &pthread_pause_once))
+
+void pthread_pause_handler(int signal) {
+    //Post semaphore to confirm that signal is handled
+    sem_post(&pthread_pause_sem);
+    //Suspend if needed
+    if(signal == PEAK_SIG_STOP) {
+        sigset_t sigset;
+        sigfillset(&sigset);
+        sigdelset(&sigset, PEAK_SIG_STOP);
+        sigdelset(&sigset, PEAK_SIG_CONT);
+        sigsuspend(&sigset); //Wait for next signal
+    } else return;
+}
+
+void pthread_pause_enable() {
+    pthread_pause_init();
+    //Prepare sigset
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, PEAK_SIG_STOP);
+    sigaddset(&sigset, PEAK_SIG_CONT);
+
+    //Register signal handlers
+    //We now use sigaction() instead of signal(), because it supports SA_RESTART
+    const struct sigaction pause_sa = {
+        .sa_handler = pthread_pause_handler,
+        .sa_mask = sigset,
+        .sa_flags = SA_RESTART,
+        .sa_restorer = NULL
+    };
+    sigaction(PEAK_SIG_STOP, &pause_sa, NULL);
+    sigaction(PEAK_SIG_CONT, &pause_sa, NULL);
+
+    //UnBlock signals
+    pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+}
+
+void pthread_pause_disable() {
+    //This is important for when you want to do some signal unsafe stuff
+    //Eg.: locking mutex, calling printf() which has internal mutex, etc...
+    //After unlocking mutex, you can enable pause again.
+
+    pthread_pause_init();
+
+    //Make sure all signals are dispatched before we block them
+    sem_wait(&pthread_pause_sem);
+
+    //Block signals
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, PEAK_SIG_STOP);
+    sigaddset(&sigset, PEAK_SIG_CONT);
+    pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+
+    sem_post(&pthread_pause_sem);
+}
+
+int pthread_pause(pthread_t thread) {
+    sem_wait(&pthread_pause_sem);
+    //If signal queue is full, we keep retrying
+    while(pthread_kill(thread, PEAK_SIG_STOP) == EAGAIN) usleep(1000);
+    //pthread_pause_yield();
+    return 0;
+}
+
+int pthread_unpause(pthread_t thread) {
+    sem_wait(&pthread_pause_sem);
+    //If signal queue is full, we keep retrying
+    while(pthread_kill(thread, PEAK_SIG_CONT) == EAGAIN) usleep(1000);
+    //pthread_pause_yield();
+    return 0;
+}
+
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+    if (!self)
+        return;
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
     double* child_time = (double*)pthread_getspecific(thread_local_key);
     if (child_time == NULL) {
@@ -51,21 +136,27 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     self->num_calls[index]++;
     *child_time = 0.0;
     if (mapped_tid == 0 && self->num_calls[index] > 3000) {
-        pthread_mutex_lock(&lock);
         if(!array_listener_detached[hook_id]) {
             array_listener_detached[hook_id] = TRUE;
-            // gum_interceptor_ignore_other_threads(interceptor);
+            GumMetalHashTableIter peak_tid_iter;
+            pthread_t peak_tid_key;
+            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
+            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void **)&peak_tid_key, NULL)) {
+                // g_print ("peak_tid_key %lu my_tid %lu\n", peak_tid_key, pthread_self());
+                if (peak_tid_key != pthread_self())
+                    pthread_pause(peak_tid_key);
+            }
             gum_interceptor_begin_transaction(interceptor);
             gum_interceptor_detach(interceptor, listener);
             gum_interceptor_end_transaction(interceptor);
+            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
+            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void **)&peak_tid_key, NULL)) {
+                if (peak_tid_key != pthread_self())
+                    pthread_unpause(peak_tid_key);
+            }
         }
-        pthread_mutex_unlock(&lock);
         // gum_interceptor_revert(interceptor, hook_address[hook_id]);
         // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
-    }
-    if(array_listener_detached[hook_id]) {
-        pthread_mutex_lock(&lock);
-        pthread_mutex_unlock(&lock);
     }
     *current_time = peak_second();
     // g_printerr ("hook_id %lu time %f count %lu\n", hook_id, *current_time, self->num_calls[mapped_tid]);
@@ -77,6 +168,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+    if (!self)
+        return;
     PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
     double* child_time = (double*)pthread_getspecific(thread_local_key);
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
@@ -189,6 +282,7 @@ static void destr_fn(void* parm)
 
 void peak_general_listener_attach()
 {
+    pthread_pause_enable();
     interceptor = gum_interceptor_obtain();
     array_listener = (GumInvocationListener**)g_new0(gpointer, peak_hook_address_count);
     array_listener_detached = g_new0(gboolean, peak_hook_address_count);

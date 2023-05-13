@@ -14,6 +14,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <pthread.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
