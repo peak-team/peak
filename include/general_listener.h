@@ -44,18 +44,6 @@ struct _PeakGeneralListener {
     gfloat* min_time;
 };
 
-typedef struct _PeakGeneralState PeakGeneralState;
-
-/**
- * @struct _PeakGeneralState
- * @brief Struct representing the Peak General State
- *
- * This struct represents the Peak General State, which keeps track of the hook ID and current time for each hooked function.
- */
-struct _PeakGeneralState {
-    size_t hook_id;
-};
-
 /**
  * @brief Attaches the Peak General Listener.
  *

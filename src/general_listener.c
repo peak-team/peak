@@ -7,7 +7,6 @@ static GumInterceptor* interceptor;
 static GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
 extern GumMetalHashTable* peak_tid_mapping;
-static PeakGeneralState* state;
 static gpointer* hook_address = NULL;
 static double peak_general_overhead;
 static pthread_key_t thread_local_key;
@@ -275,12 +274,12 @@ static void
 peak_general_overhead_bootstrapping()
 {
     GumInvocationListener* listener_bootstrapping = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-    PeakGeneralState state_bootstrapping = { 0 };
+    PEAKGENERAL_LISTENER(listener_bootstrapping)->hook_id = 0;
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_attach(interceptor,
                            &peak_general_overhead_dummy_func,
                            listener_bootstrapping,
-                           &state_bootstrapping);
+                           NULL);
     gum_interceptor_end_transaction(interceptor);
 
     guint n_tests = 2000;
@@ -329,7 +328,6 @@ void peak_general_listener_attach()
     pthread_key_create(&thread_local_key, destr_fn);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
-    state = g_new0(PeakGeneralState, peak_hook_address_count);
     // g_printerr ("peak_hook_address_count %lu peak_max_num_threads %lu\n",  peak_hook_address_count, peak_max_num_threads);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -345,11 +343,10 @@ void peak_general_listener_attach()
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
             array_listener[i] = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
             PEAKGENERAL_LISTENER(array_listener[i])->hook_id = i;
-            state[i].hook_id = i;
             gum_interceptor_attach(interceptor,
                                    hook_address[i],
                                    array_listener[i],
-                                   &state[i]);
+                                   NULL);
         }
     }
     gum_interceptor_end_transaction(interceptor);
@@ -587,6 +584,5 @@ void peak_general_listener_dettach()
     }
     g_object_unref(interceptor);
     g_free(hook_address);
-    g_free(state);
     g_free(array_listener);
 }
