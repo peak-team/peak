@@ -36,6 +36,7 @@ typedef struct _PeakGeneralListener PeakGeneralListener;
 struct _PeakGeneralListener {
     GObject parent;
 
+    size_t hook_id;
     gulong* num_calls;
     gdouble* total_time;
     gdouble* exclusive_time;
