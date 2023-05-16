@@ -1,7 +1,7 @@
 #include "general_listener.h"
 
-#define PEAK_SIG_STOP (SIGRTMIN+0)
-#define PEAK_SIG_CONT (SIGRTMIN+1)
+#define PEAK_SIG_STOP (SIGRTMIN + 0)
+#define PEAK_SIG_CONT (SIGRTMIN + 1)
 
 static GumInterceptor* interceptor;
 static GumInvocationListener** array_listener;
@@ -13,6 +13,8 @@ extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern gulong peak_max_num_threads;
 extern double peak_main_time;
+extern float peak_detach_cost;
+static gulong peak_detach_count = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
@@ -36,26 +38,30 @@ static __thread PeakGeneralThreadState thread_data;
 sem_t pthread_pause_sem;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 
-void pthread_pause_once(void) {
+void pthread_pause_once(void)
+{
     sem_init(&pthread_pause_sem, 0, 1);
 }
 
 #define pthread_pause_init() (pthread_once(&pthread_pause_once_ctrl, &pthread_pause_once))
 
-void pthread_pause_handler(int signal) {
+void pthread_pause_handler(int signal)
+{
     //Post semaphore to confirm that signal is handled
     sem_post(&pthread_pause_sem);
     //Suspend if needed
-    if(signal == PEAK_SIG_STOP) {
+    if (signal == PEAK_SIG_STOP) {
         sigset_t sigset;
         sigfillset(&sigset);
         sigdelset(&sigset, PEAK_SIG_STOP);
         sigdelset(&sigset, PEAK_SIG_CONT);
         sigsuspend(&sigset); //Wait for next signal
-    } else return;
+    } else
+        return;
 }
 
-void pthread_pause_enable() {
+void pthread_pause_enable()
+{
     pthread_pause_init();
     //Prepare sigset
     sigset_t sigset;
@@ -78,7 +84,8 @@ void pthread_pause_enable() {
     pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
 }
 
-void pthread_pause_disable() {
+void pthread_pause_disable()
+{
     //This is important for when you want to do some signal unsafe stuff
     //Eg.: locking mutex, calling printf() which has internal mutex, etc...
     //After unlocking mutex, you can enable pause again.
@@ -98,18 +105,22 @@ void pthread_pause_disable() {
     sem_post(&pthread_pause_sem);
 }
 
-int pthread_pause(pthread_t thread) {
+int pthread_pause(pthread_t thread)
+{
     sem_wait(&pthread_pause_sem);
     //If signal queue is full, we keep retrying
-    while(pthread_kill(thread, PEAK_SIG_STOP) == EAGAIN) usleep(1000);
+    while (pthread_kill(thread, PEAK_SIG_STOP) == EAGAIN)
+        usleep(1000);
     //pthread_pause_yield();
     return 0;
 }
 
-int pthread_unpause(pthread_t thread) {
+int pthread_unpause(pthread_t thread)
+{
     sem_wait(&pthread_pause_sem);
     //If signal queue is full, we keep retrying
-    while(pthread_kill(thread, PEAK_SIG_CONT) == EAGAIN) usleep(1000);
+    while (pthread_kill(thread, PEAK_SIG_CONT) == EAGAIN)
+        usleep(1000);
     //pthread_pause_yield();
     return 0;
 }
@@ -143,15 +154,15 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         pthread_pause_enable();
     }
     self->num_calls[index]++;
-    if (self->num_calls[index] > 3000) {
+    if (peak_detach_count && self->num_calls[index] >= peak_detach_count) {
         pthread_mutex_lock(&lock);
         size_t hook_id = self->hook_id;
-        if(!array_listener_detached[hook_id]) {
+        if (!array_listener_detached[hook_id]) {
             array_listener_detached[hook_id] = TRUE;
             GumMetalHashTableIter peak_tid_iter;
             pthread_t peak_tid_key;
             gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void **)&peak_tid_key, NULL)) {
+            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
                 // g_print ("peak_tid_key %lu my_tid %lu\n", peak_tid_key, my_tid);
                 if (peak_tid_key != my_tid)
                     pthread_pause(peak_tid_key);
@@ -160,7 +171,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             gum_interceptor_detach(interceptor, listener);
             gum_interceptor_end_transaction(interceptor);
             gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void **)&peak_tid_key, NULL)) {
+            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
                 if (peak_tid_key != my_tid)
                     pthread_unpause(peak_tid_key);
             }
@@ -333,8 +344,11 @@ void peak_general_listener_attach()
         }
     }
     gum_interceptor_end_transaction(interceptor);
-    if (peak_hook_address_count)
+    if (peak_hook_address_count) {
         peak_general_overhead_bootstrapping();
+        if (peak_detach_cost > 0)
+            peak_detach_count = (peak_detach_cost > peak_general_overhead) ? peak_detach_cost / peak_general_overhead : 1;
+    }
 }
 
 static void
@@ -387,13 +401,22 @@ peak_general_listener_print_result(gulong* sum_num_calls,
         g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                           max_function_width, peak_hook_strings[i],
-                           max_col_width, sum_num_calls[i],
-                           max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                           max_col_width, sum_num_calls[i] / rank_count,
-                           max_col_width, sum_max_time[i],
-                           max_col_width, sum_min_time[i]);
+                if (!array_listener_detached[i])
+                    g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                               max_function_width, peak_hook_strings[i],
+                               max_col_width, sum_num_calls[i],
+                               max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                               max_col_width, sum_num_calls[i] / rank_count,
+                               max_col_width, sum_max_time[i],
+                               max_col_width, sum_min_time[i]);
+                else
+                    g_printerr("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                               max_function_width - 1, peak_hook_strings[i],
+                               max_col_width, sum_num_calls[i],
+                               max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                               max_col_width, sum_num_calls[i] / rank_count,
+                               max_col_width, sum_max_time[i],
+                               max_col_width, sum_min_time[i]);
             }
         }
         g_printerr("%.*s\n", row_width, row_separator);
@@ -411,14 +434,24 @@ peak_general_listener_print_result(gulong* sum_num_calls,
         g_printerr("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                           max_function_width, peak_hook_strings[i],
-                           max_col_width, sum_total_time[i],
-                           max_col_width, sum_exclusive_time[i],
-                           max_col_width, max_total_time[i],
-                           max_col_width, min_total_time[i],
-                           max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                          * peak_general_overhead);
+                if (!array_listener_detached[i])
+                    g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                               max_function_width, peak_hook_strings[i],
+                               max_col_width, sum_total_time[i],
+                               max_col_width, sum_exclusive_time[i],
+                               max_col_width, max_total_time[i],
+                               max_col_width, min_total_time[i],
+                               max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
+                                              * peak_general_overhead);
+                else
+                    g_printerr("|%*s*|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                               max_function_width - 1, peak_hook_strings[i],
+                               max_col_width, sum_total_time[i],
+                               max_col_width, sum_exclusive_time[i],
+                               max_col_width, max_total_time[i],
+                               max_col_width, min_total_time[i],
+                               max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
+                                              * peak_general_overhead);
             }
         }
         g_printerr("%.*s\n", row_width, row_separator);
@@ -453,6 +486,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gfloat* mpi_sum_max_time = g_new0(gfloat, peak_hook_address_count);
     gfloat* mpi_sum_min_time = g_new0(gfloat, peak_hook_address_count);
     gulong* mpi_thread_count = g_new0(gulong, peak_hook_address_count);
+    gboolean* mpi_array_listener_detached = g_new0(gboolean, peak_hook_address_count);
     MPI_Reduce(sum_num_calls, mpi_sum_num_calls, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -461,7 +495,9 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     MPI_Reduce(sum_max_time, mpi_sum_max_time, peak_hook_address_count, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
+        memcpy(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count * sizeof(gboolean));
         peak_general_listener_print_result(mpi_sum_num_calls,
                                            mpi_sum_total_time,
                                            mpi_max_total_time,
@@ -479,6 +515,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     g_free(mpi_sum_max_time);
     g_free(mpi_sum_min_time);
     g_free(mpi_thread_count);
+    g_free(mpi_array_listener_detached);
 }
 #endif
 

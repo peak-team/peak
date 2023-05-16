@@ -26,6 +26,19 @@
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
 
 /**
+ * @brief Parses a floating point number from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a floating point number using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed floating point value, or 0.0 if the environment
+ *         variable is not set, is empty, or contains invalid characters.
+ */
+float parse_env_to_float(const char* env_var);
+
+/**
  * @brief Frees the memory allocated by parse_env_w_delim function.
  *
  * This function frees the memory allocated by the parse_env_w_delim function

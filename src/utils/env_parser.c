@@ -46,6 +46,27 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
     return count;
 }
 
+float parse_env_to_float(const char* env_var)
+{
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        // Environment variable is not set or is empty
+        return 0.0f;
+    }
+
+    // Parse the string as a floating point number
+    char* endptr;
+    float result = strtof(varvalue, &endptr);
+
+    // Check for errors during parsing
+    if (*endptr != '\0') {
+        // The string contains invalid characters
+        return 0.0f;
+    }
+
+    return result;
+}
+
 void free_parsed_result(char** result, size_t count)
 {
     for (size_t i = 0; i < count; i++) {

@@ -12,12 +12,14 @@
 
 #define PEAK_TARGET_ENV "PEAK_TARGET"
 #define PEAK_TARGET_DELIM ','
+#define PEAK_COST_ENV "PEAK_COST"
 #define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
 
 size_t peak_hook_address_count;
 char** peak_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
+float peak_detach_cost;
 #ifdef HAVE_MPI
 static int found_MPI;
 static int flag_clean_fppid = 0;
@@ -28,6 +30,7 @@ void libprof_init()
 
     peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
+    peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
 
     gum_init_embedded();
 

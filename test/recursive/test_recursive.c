@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "test_cblas.h"
+
+#define N 80
+
 int functionA(int num);
 
 __attribute__((noinline)) int functionC(int num)
@@ -42,5 +46,15 @@ int main(int argc, char* argv[])
     printf("input=%d\n", input);
     int a = functionA(input);
     printf("a=%d\n", a);
+    float x[N], y[N];
+    for (int i = 0; i < N; i++) {
+        x[i] = i;
+        y[i] = i + 1;
+    }
+    float dot_product;
+    for (int i = 0; i < 1000; i++) {
+        dot_product = cblas_sdot(N, x, 1, y, 1);
+    }
+    printf("Dot product: %f\n", dot_product);
     return 0;
 }
