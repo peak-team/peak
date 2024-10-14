@@ -26,6 +26,33 @@
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
 
 /**
+ * @brief Read lines from a outside configuration file.
+ *
+ * This function reads lines from a outside configuration file by lines and add them to the resulting array.
+ * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
+ *
+ * @param config_file The environment variable to parse.
+ * @param result A pointer to an array of strings to be allocated and filled by this function.
+ * @param existing_count The current size of the resulting array.
+ * @return 0 if the env does not exist, or the number of lines read from the configuration file.
+ */
+size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count);
+
+/**
+ * @brief Read strings from a array.
+ *
+ * This function reads strings from a array and add them to the resulting array.
+ * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
+ *
+ * @param source_array The array to read from.
+ * @param source_array The count of the strings in the array.
+ * @param result A pointer to an array of strings to be allocated and filled by this function.
+ * @param existing_count The current size of the resulting array.
+ * @return 0 if the env does not exist, or the number of strings read from the array.
+ */
+size_t load_symbols_from_array(char** source_array, size_t source_count, char*** result, size_t existing_count);
+
+/**
  * @brief Parses a floating point number from an environment variable.
  *
  * This function retrieves the value of an environment variable as a string
