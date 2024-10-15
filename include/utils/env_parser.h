@@ -50,8 +50,7 @@ size_t load_profiling_symbols(const char* config_file, char*** result, size_t ex
  * @param existing_count The current size of the resulting array.
  * @return 0 if the env does not exist, or the number of strings read from the array.
  */
-size_t load_symbols_from_array(char** source_array, size_t source_count, char*** result, size_t existing_count);
-
+size_t load_symbols_from_array(const char* env_var, char*** result, size_t existing_count);
 /**
  * @brief Parses a floating point number from an environment variable.
  *
