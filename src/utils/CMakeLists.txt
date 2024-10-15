@@ -3,6 +3,7 @@ FILE(GLOB sources_utils
     env_parser.c
     mpi_utils.c
     utils.c
+    source_target.c
 )
 
 # Generate the shared library from the library sources
