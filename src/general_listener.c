@@ -129,13 +129,13 @@ static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
-    if (peak_detach_count == 0) {
-        if (!listener || g_object_is_floating(listener)) {
+    if (!listener || g_object_is_floating(listener)) {
             return;
         }
         PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
         pthread_t my_tid = pthread_self();
         size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
+    if (peak_detach_count == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -151,42 +151,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             thread_data.child_time = g_renew(double, thread_data.child_time, thread_data.capacity);
         }
         self->num_calls[index]++;
-        if (peak_detach_count && self->num_calls[index] >= peak_detach_count) {
-            pthread_mutex_lock(&lock);
-            size_t hook_id = self->hook_id;
-            if (!array_listener_detached[hook_id]) {
-                array_listener_detached[hook_id] = TRUE;
-                GumMetalHashTableIter peak_tid_iter;
-                pthread_t peak_tid_key;
-                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                    // g_print ("peak_tid_key %lu my_tid %lu\n", peak_tid_key, my_tid);
-                    if (peak_tid_key != my_tid)
-                        pthread_pause(peak_tid_key);
-                }
-                gum_interceptor_begin_transaction(interceptor);
-                gum_interceptor_detach(interceptor, listener);
-                gum_interceptor_end_transaction(interceptor);
-                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                    if (peak_tid_key != my_tid)
-                        pthread_unpause(peak_tid_key);
-                }
-            }
-            pthread_mutex_unlock(&lock);
-            // gum_interceptor_revert(interceptor, hook_address[hook_id]);
-            // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
-        }
-        double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
-        *current_time = peak_second();
         // g_printerr ("hook_id %lu time %f count %lu\n", hook_id, *current_time, self->num_calls[mapped_tid]);
     } else {
-        if (!listener || g_object_is_floating(listener)) {
-            return;
-        }
-        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-        pthread_t my_tid = pthread_self();
-        size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -232,19 +198,19 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             // gum_interceptor_revert(interceptor, hook_address[hook_id]);
             // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
         }
-        double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
         pthread_pause_disable();
-        *current_time = peak_second();
         // g_printerr ("hook_id %lu time %f count %lu\n", hook_id, *current_time, self->num_calls[mapped_tid]);
     }
+    double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
+    *current_time = peak_second();
 }
 
 static void
 peak_general_listener_on_leave(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
+    double end_time = peak_second();
     if (peak_detach_count == 0) {
-        double end_time = peak_second();
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
@@ -277,7 +243,6 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
             g_free(tmp_ptr);
         }
     } else {
-        double end_time = peak_second();
         pthread_pause_enable();
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
