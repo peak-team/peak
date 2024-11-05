@@ -66,7 +66,6 @@ size_t count_lines_in_file(FILE* file) {
 size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count) {
     char* a_str = getenv(config_file);
     if (a_str == NULL) {
-        *result = NULL;
         return 0;
     }
     FILE* file = fopen(a_str, "r");
@@ -94,7 +93,6 @@ size_t load_profiling_symbols(const char* config_file, char*** result, size_t ex
 size_t load_symbols_from_array(const char* env_var, char*** result, size_t existing_count) {
     char* a_str = getenv(env_var);
     if (a_str == NULL) {
-        *result = NULL;
         return 0;
     }
 

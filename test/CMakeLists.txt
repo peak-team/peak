@@ -120,5 +120,17 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+200\\|"
         )
     endif()
+
+    # Add test of config_file
+    add_subdirectory(config_file)
+    add_test(NAME test_config_file COMMAND ${PROJECT_BINARY_DIR}/test/config_file/test_config_file)
+    set_tests_properties(test_config_file 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=dgemm_;${PRELOAD_VAR}"
+    )
+    set_tests_properties(test_config_file 
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
+    )
 endif()
 
