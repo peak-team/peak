@@ -50,13 +50,15 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
 size_t count_lines_in_file(FILE* file) {
     size_t lines = 0;
     char ch;
+    char prev_ch = '\0';
     while ((ch = fgetc(file)) != EOF) {
-        if (ch == '\n') {
+        if (ch == '\n' && prev_ch != '\n') {
             lines++;
         }
+        prev_ch = ch;
     }
 
-    if (lines > 0 && ch != '\n') {
+    if (prev_ch != '\n') {
         lines++;
     }
     rewind(file);
@@ -76,7 +78,6 @@ size_t load_profiling_symbols(const char* config_file, char*** result, size_t ex
     char line[256];
     size_t count = 0;
     size_t capacity = count_lines_in_file(file);
-    
     *result = realloc(*result, sizeof(char*) * (existing_count + capacity));
     if (*result) {
         while (fgets(line, sizeof(line), file)) {
