@@ -19,7 +19,9 @@ make
 ```
  PEAK_TARGET=dgemm_,dgemv_        # functions that will be profiled
  PEAK_COST=10                     # upperlimit of profiling cost. Detach when exceeding the limit.
-
+ PEAK_TARGET_CONFIG=BLAS, LAPACK  # options include PBLAS, ScaLAPACK, LAPACK, and BLAS for specifying target libraries for profiling
+ PEAK_TARGET_CONFIG_ENV=/path/to/the/configuration/file
+                                  # list function names for profiling in the configuration file, one function name per line
 ```
 
 

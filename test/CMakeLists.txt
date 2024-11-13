@@ -42,6 +42,9 @@ if(BUILD_TESTING)
         set(PRELOAD_VAR "DYLD_INSERT_LIBRARIES=${PROJECT_BINARY_DIR}/src/libpeak.dylib")
     endif()
 
+    configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)
+    set(PEAK_TARGET_CONFIG_PATH ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf)
+
     # Add test of dgemm
     add_subdirectory(dgemm)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
@@ -50,6 +53,28 @@ if(BUILD_TESTING)
             ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${PRELOAD_VAR}"
     )
     set_tests_properties(test_dgemm 
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
+    )
+
+    # Add test of TARGET_CONFIG
+    add_test(NAME test_target_config COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
+    set_tests_properties(test_target_config 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET_CONFIG=BLAS;${PRELOAD_VAR}"
+    )
+    set_tests_properties(test_target_config 
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
+    )
+
+    # Add test of config_file
+    add_test(NAME test_config_file COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
+    set_tests_properties(test_config_file 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET_CONFIG_ENV=${PEAK_TARGET_CONFIG_PATH};${PRELOAD_VAR}"
+    )
+    set_tests_properties(test_config_file 
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
@@ -120,5 +145,7 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+200\\|"
         )
     endif()
+
+   
 endif()
 

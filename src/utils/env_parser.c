@@ -1,4 +1,5 @@
 #include "env_parser.h"
+#include "../../include/utils/source_target.h"
 
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
 {
@@ -44,6 +45,112 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
     free(a_str_dup);
 
     return count;
+}
+
+size_t count_lines_in_file(FILE* file) {
+    size_t lines = 0;
+    char ch;
+    char prev_ch = '\0';
+    while ((ch = fgetc(file)) != EOF) {
+        if (ch == '\n' && prev_ch != '\n') {
+            lines++;
+        }
+        prev_ch = ch;
+    }
+
+    if (prev_ch != '\n') {
+        lines++;
+    }
+    rewind(file);
+    return lines;
+}
+
+size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count) {
+    char* a_str = getenv(config_file);
+    if (a_str == NULL) {
+        return 0;
+    }
+    FILE* file = fopen(a_str, "r");
+    if (!file) {
+        printf("Can't find the configuration file!\n");
+        return 0;
+    }
+    char line[256];
+    size_t count = 0;
+    size_t capacity = count_lines_in_file(file);
+    *result = realloc(*result, sizeof(char*) * (existing_count + capacity));
+    if (*result) {
+        while (fgets(line, sizeof(line), file)) {
+            line[strcspn(line, "\n")] = 0;
+            (*result)[count + existing_count] = strdup(line);
+            count ++;
+        }
+        fclose(file);
+        return capacity;
+    }
+    return 0;
+}
+
+size_t load_symbols_from_array(const char* env_var, char*** result, size_t existing_count) {
+    char* a_str = getenv(env_var);
+    if (a_str == NULL) {
+        return 0;
+    }
+
+    size_t source_count = 0;
+    if (strstr(a_str, "BLAS")) {
+        *result = realloc(*result, sizeof(char*) * (existing_count + source_count_BLAS));
+        for (size_t i = 0; i < source_count_BLAS; i++) {
+            (*result)[i + existing_count] = strdup(source_target_array_BLAS[i]);
+            if ((*result)[existing_count + i] == NULL) {
+                printf("Failed to duplicate string!\n");
+                return i + source_count;
+            }
+        }
+        source_count += source_count_BLAS;
+        existing_count += source_count_BLAS;
+    }
+
+    if (strstr(a_str, "LAPACK")) {
+        *result = realloc(*result, sizeof(char*) * (existing_count + source_count_LAPACK));
+        for (size_t i = 0; i < source_count_LAPACK; i++) {
+            (*result)[i + existing_count] = strdup(source_target_array_LAPACK[i]);
+            if ((*result)[existing_count + i] == NULL) {
+                printf("Failed to duplicate string!\n");
+                return i + source_count;
+            }
+        }
+        source_count += source_count_LAPACK;
+        existing_count += source_count_LAPACK;
+    }
+
+    if (strstr(a_str, "PBLAS")) {
+        *result = realloc(*result, sizeof(char*) * (existing_count + source_count_PBLAS));
+        for (size_t i = 0; i < source_count_PBLAS; i++) {
+            (*result)[i + existing_count] = strdup(source_target_array_PBLAS[i]);
+            if ((*result)[existing_count + i] == NULL) {
+                printf("Failed to duplicate string!\n");
+                return i + source_count;
+            }
+        }
+        source_count += source_count_PBLAS;
+        existing_count += source_count_PBLAS;
+    }
+
+    if (strstr(a_str, "ScaLAPACK")) {
+        *result = realloc(*result, sizeof(char*) * (existing_count + source_count_ScaLAPACK));
+        for (size_t i = 0; i < source_count_ScaLAPACK; i++) {
+            (*result)[i + existing_count] = strdup(source_target_array_ScaLAPACK[i]);
+            if ((*result)[existing_count + i] == NULL) {
+                printf("Failed to duplicate string!\n");
+                return i + source_count;
+            }
+        }
+        source_count += source_count_ScaLAPACK;
+        existing_count += source_count_ScaLAPACK;
+    }
+
+    return source_count;
 }
 
 float parse_env_to_float(const char* env_var)
