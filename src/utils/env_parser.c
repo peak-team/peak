@@ -49,8 +49,8 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
 
 size_t count_lines_in_file(FILE* file) {
     size_t lines = 0;
-    char ch;
-    char prev_ch = '\0';
+    int ch;
+    int prev_ch = '\0';
     while ((ch = fgetc(file)) != EOF) {
         if (ch == '\n' && prev_ch != '\n') {
             lines++;
@@ -58,12 +58,14 @@ size_t count_lines_in_file(FILE* file) {
         prev_ch = ch;
     }
 
-    if (prev_ch != '\n') {
+    // If the last character read wasn't a newline, then we have one last line
+    if (prev_ch != '\n' && prev_ch != EOF) {
         lines++;
     }
     rewind(file);
     return lines;
 }
+
 
 size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count) {
     char* a_str = getenv(config_file);
