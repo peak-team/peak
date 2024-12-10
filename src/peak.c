@@ -77,8 +77,50 @@ void libprof_fini()
 __attribute__((used, section("__DATA,__mod_init_func"))) void* __init = libprof_init;
 __attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = libprof_fini;
 #elif defined(__ELF__)
-__attribute__((section(".init_array"))) void* __init = libprof_init;
-__attribute__((section(".fini_array"))) void* __fini = libprof_fini;
+//__attribute__((section(".init_array"))) void* __init = libprof_init;
+//__attribute__((section(".fini_array"))) void* __fini = libprof_fini;
+typedef int (*main_fn)(int, char**, char**);
+typedef int (*libc_start_main_fn)(main_fn, int, char**, 
+                                  int (*)(int, char**, char**),
+                                  void (*)(void), void (*)(void), void*);
+
+static main_fn real_main = NULL;
+static libc_start_main_fn real___libc_start_main = NULL;
+
+static int main_wrapper(int argc, char** argv, char** envp) {
+    // Call libprof_init before main
+    // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
+    libprof_init();
+
+    int ret = real_main(argc, argv, envp);
+
+    // Call libprof_fini after main returns
+    libprof_fini();
+
+    // fprintf(stderr, "[LD_PRELOAD] main has finished. Running my code now.\n");
+    return ret;
+}
+
+__attribute__((visibility("default")))
+int __libc_start_main(main_fn main, int argc, char** argv,
+                      int (*init)(int, char**, char**),
+                      void (*fini)(void), void (*rtld_fini)(void), void* stack_end) {
+    // fprintf(stderr, "Running my code now.\n");
+    if (!real___libc_start_main) {
+        real___libc_start_main = (libc_start_main_fn)dlsym(RTLD_NEXT, "__libc_start_main");
+        if (!real___libc_start_main) {
+            fprintf(stderr, "Error: dlsym failed to find __libc_start_main\n");
+            _exit(1);
+        }
+    }
+
+    // Store the original main function pointer
+    real_main = main;
+
+    // Pass our main_wrapper instead of the original main
+    return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
+}
 #else
 #error Unsupported platform
 #endif
+
