@@ -40,7 +40,7 @@ ExternalProject_Add(
   frida-gum
   SOURCE_DIR "@FRIDA_GUM_DOWNLOAD_ROOT@/frida-gum-src"
   URL
-    https://github.com/frida/frida/releases/download/16.0.14/frida-gum-devkit-16.0.14-${FRIDA_ARCH_VAR}.tar.xz
+    https://github.com/frida/frida/releases/download/16.5.9/frida-gum-devkit-16.5.9-${FRIDA_ARCH_VAR}.tar.xz
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ""
   BUILD_IN_SOURCE 1
