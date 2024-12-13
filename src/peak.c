@@ -120,8 +120,12 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     // Store the original main function pointer
     real_main = main;
 
-    // Pass our main_wrapper instead of the original main
-    return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
+    // Decide whether to use the main wrapper based on argv[0]
+    if (argv[0] && !check_command(argv[0])) {
+        return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
+    } else {
+        return real___libc_start_main(main, argc, argv, init, fini, rtld_fini, stack_end);
+    }
 }
 #else
 #error Unsupported platform
