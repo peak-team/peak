@@ -29,7 +29,7 @@ static int found_MPI;
 static int flag_clean_fppid = 0;
 #endif
 
-void libprof_init()
+void peak_init()
 {
 
     peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
@@ -58,7 +58,7 @@ void libprof_init()
     peak_main_time = peak_second();
 }
 
-void libprof_fini()
+void peak_fini()
 {
     peak_main_time = peak_second() - peak_main_time;
 #ifdef HAVE_MPI
@@ -78,11 +78,11 @@ void libprof_fini()
 }
 
 #if defined(__APPLE__)
-__attribute__((used, section("__DATA,__mod_init_func"))) void* __init = libprof_init;
-__attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = libprof_fini;
+__attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_init;
+__attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
 #elif defined(__ELF__)
-//__attribute__((section(".init_array"))) void* __init = libprof_init;
-//__attribute__((section(".fini_array"))) void* __fini = libprof_fini;
+//__attribute__((section(".init_array"))) void* __init = peak_init;
+//__attribute__((section(".fini_array"))) void* __fini = peak_fini;
 typedef int (*main_fn)(int, char**, char**);
 typedef int (*libc_start_main_fn)(main_fn, int, char**, 
                                   int (*)(int, char**, char**),
@@ -101,7 +101,7 @@ static void
 peak_exit(int status) {
     //g_printerr("Custom exit called with status: %d\n", status);
 
-    libprof_fini();
+    peak_fini();
     atexit(exit_interceptor_detach);
 
     // Call the original `exit` function to terminate the process
@@ -145,10 +145,10 @@ void exit_interceptor_detach() {
 }
 
 static int main_wrapper(int argc, char** argv, char** envp) {
-    // Call libprof_init before main
+    // Call peak_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
     if (!exit_interceptor_attach())
-        libprof_init();
+        peak_init();
 
     int ret = real_main(argc, argv, envp);
 
