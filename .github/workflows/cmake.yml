@@ -18,28 +18,17 @@ jobs:
         os: [ubuntu-latest]
         build_type: [Release]
         c_compiler: [gcc, clang]
-        mpi: [ 'mpich', 'openmpi', 'intelmpi']
         include:
           - os: ubuntu-latest
             c_compiler: gcc
             cpp_compiler: g++
-            mpi: openmpi
           - os: ubuntu-latest
             c_compiler: gcc
             cpp_compiler: g++
-            mpi: intelmpi
-          - os: ubuntu-latest
-            c_compiler: clang
-            cpp_compiler: clang++
-            mpi: mpich
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4      
-    - name: Setup MPI
-      uses: mpi4py/setup-mpi@v1
-      with:
-        mpi: ${{ matrix.mpi }}
 
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
