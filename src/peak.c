@@ -7,6 +7,7 @@
 
 #include "general_listener.h"
 #include "pthread_listener.h"
+#include "syscall_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
@@ -39,6 +40,7 @@ void libprof_init()
     gum_init_embedded();
 
     pthread_listener_attach();
+    syscall_interceptor_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -69,6 +71,7 @@ void libprof_fini()
     peak_general_listener_print(0);
 #endif
     peak_general_listener_dettach();
+    syscall_interceptor_dettach();
     pthread_listener_dettach();
     gum_deinit_embedded();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
@@ -91,11 +94,11 @@ static int main_wrapper(int argc, char** argv, char** envp) {
     // Call libprof_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
     libprof_init();
-
+    atexit(libprof_fini);
     int ret = real_main(argc, argv, envp);
 
     // Call libprof_fini after main returns
-    libprof_fini();
+    //libprof_fini();
 
     // fprintf(stderr, "[LD_PRELOAD] main has finished. Running my code now.\n");
     return ret;
