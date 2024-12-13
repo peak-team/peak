@@ -1,5 +1,5 @@
 #include "env_parser.h"
-#include "../../include/utils/source_target.h"
+#include "source_target.h"
 
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
 {
