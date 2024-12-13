@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+
 #ifdef HAVE_MPI
 #include <mpi.h>
 #include "mpi_interceptor.h"
@@ -11,12 +12,12 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV "PEAK_TARGET"
-#define PEAK_TARGET_CONFIG_ENV "PEAK_TARGET_CONFIG_ENV"
-#define PEAK_TARGET_CONFIG "PEAK_TARGET_CONFIG"
-#define PEAK_TARGET_DELIM ','
-#define PEAK_COST_ENV "PEAK_COST"
-#define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_ENV            "PEAK_TARGET"
+#define PEAK_TARGET_CONFIG_ENV     "PEAK_TARGET_CONFIG_ENV"
+#define PEAK_TARGET_CONFIG         "PEAK_TARGET_CONFIG"
+#define PEAK_TARGET_DELIM          ','
+#define PEAK_COST_ENV              "PEAK_COST"
+#define PPID_FILE_NAME             "/tmp/lock_peak_ppid_list"
 
 size_t peak_hook_address_count;
 char** peak_hook_strings;
@@ -37,7 +38,7 @@ void libprof_init()
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_CONFIG, &peak_hook_strings, peak_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
 
-    gum_init_embedded();
+    //gum_init_embedded();
 
     pthread_listener_attach();
     syscall_interceptor_attach();
@@ -73,9 +74,9 @@ void libprof_fini()
     peak_general_listener_dettach();
     syscall_interceptor_dettach();
     pthread_listener_dettach();
-    gum_deinit_embedded();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
 }
+
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA,__mod_init_func"))) void* __init = libprof_init;
 __attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = libprof_fini;
@@ -90,17 +91,67 @@ typedef int (*libc_start_main_fn)(main_fn, int, char**,
 static main_fn real_main = NULL;
 static libc_start_main_fn real___libc_start_main = NULL;
 
+// Original function pointer for `exit`
+static void (*original_exit)(int) = NULL;
+static GumInterceptor* exit_interceptor = NULL;
+static gpointer* exit_address = NULL;
+void exit_interceptor_detach();
+
+static void
+peak_exit(int status) {
+    //g_printerr("Custom exit called with status: %d\n", status);
+
+    libprof_fini();
+    atexit(exit_interceptor_detach);
+
+    // Call the original `exit` function to terminate the process
+    original_exit(status);
+}
+
+/**
+ * @brief Attaches the interceptor to the `exit` function.
+ *
+ * This function uses the Gum API to intercept calls to the `exit` function, 
+ * replacing it with a custom implementation (`peak_exit`).
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int exit_interceptor_attach() {
+    gum_init_embedded();
+    GumReplaceReturn replace_check = -1;
+    exit_interceptor = gum_interceptor_obtain();
+
+    gum_interceptor_begin_transaction(exit_interceptor);
+    exit_address = gum_find_function("exit");
+    if (exit_address) {
+        replace_check = gum_interceptor_replace_fast(exit_interceptor,
+                                      exit_address, (gpointer*)&peak_exit,
+                                      (gpointer*)(&original_exit));
+    }
+    gum_interceptor_end_transaction(exit_interceptor);
+    return replace_check;
+}
+
+/**
+ * @brief Detaches the interceptor from the `exit` function.
+ *
+ * This function reverts the interception of the `exit` function, restoring its 
+ * original behavior.
+ */
+void exit_interceptor_detach() {
+    gum_interceptor_revert(exit_interceptor, exit_address);
+    g_object_unref(exit_interceptor);
+    gum_deinit_embedded();
+}
+
 static int main_wrapper(int argc, char** argv, char** envp) {
     // Call libprof_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
-    libprof_init();
-    atexit(libprof_fini);
+    if (!exit_interceptor_attach())
+        libprof_init();
+
     int ret = real_main(argc, argv, envp);
 
-    // Call libprof_fini after main returns
-    //libprof_fini();
-
-    // fprintf(stderr, "[LD_PRELOAD] main has finished. Running my code now.\n");
     return ret;
 }
 
