@@ -10,24 +10,19 @@ jobs:
       # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
       fail-fast: false
 
-      # Set up a matrix to run the following 2 configurations:
-      # 1. <Linux, Release, latest GCC compiler toolchain on the default runner image, default generator>
-      # 2. <Linux, Release, latest Clang compiler toolchain on the default runner image, default generator>
-      # To add more build types (Release, Debug, RelWithDebInfo, etc.) customize the build_type list.
       matrix:
         os: [ubuntu-latest]
         build_type: [Release]
-        c_compiler: [gcc, clang]
-        include:
-          - os: ubuntu-latest
-            c_compiler: gcc
-            cpp_compiler: g++
-          - os: ubuntu-latest
-            c_compiler: clang
-            cpp_compiler: clang++
+        c_compiler: [gcc]
+        mpi: [ 'mpich', 'openmpi', 'intelmpi']
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4      
+    - name: Setup MPI
+      uses: mpi4py/setup-mpi@v1
+      with:
+        mpi: ${{ matrix.mpi }}
 
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
@@ -41,8 +36,8 @@ jobs:
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
       run: >
         cmake -B ${{ steps.strings.outputs.build-output-dir }}
-        -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
-        -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+        -DCMAKE_CXX_COMPILER=mpicxx
+        -DCMAKE_C_COMPILER=mpicc
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         -DBUILD_TESTS=1
         -S ${{ github.workspace }}
