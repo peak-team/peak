@@ -137,6 +137,7 @@ static const char *check_list[] = {
     "lscpu",
     "hostname",
     "numactl",
+    "scontrol",
     // Common Linux commands
     "sh",
     "bash", 
@@ -156,6 +157,7 @@ static const char *check_list[] = {
     "whoami",
     "date",
     "mkdir",
+    "mktemp",
     "rmdir",
     "df",
     "du",
