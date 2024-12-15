@@ -124,21 +124,51 @@ static const char *check_list[] = {
     "mpiexec.hydra",        // MPICH Hydra process manager
     "mpirun_rsh",           // RSH-based MPI launcher
     "prterun",              // Open MPI (PRTE runtime launcher)
+    "prted",                // PRTE daemon used by Open MPI
     "orterun",              // Older Open MPI runtime launcher (deprecated)
+    "orted",                // Open MPI daemon for job launching
+    "prun",                 // Another launcher found in some Open MPI
     "srun",                 // Slurm job launcher with MPI support
     "jsrun",                // IBM Spectrum MPI launcher (LSF)
     "aprun",                // Cray MPI launcher
     "hydra_bstrap_proxy",   // MPICH Hydra bootstrap proxy
     "hydra_pmi_proxy",      // MPICH Hydra PMI proxy
+    "pmi_proxy",           // Generic PMI proxy
+    "pmi2_proxy",          // PMI2 proxy (if present in your environment)
+    "pmix_server",         // PMIx server daemon (if applicable)
+    "pmix_proxy",          // PMIx proxy (if applicable)
     "tau_exec",             // Performance profiling wrapper for MPI
     "mpiexec_mpt",          // SGI MPT MPI launcher
     //"yod",                  // IBM Blue Gene MPI launcher
     //"poe"                   // IBM Parallel Operating Environment (POE) launcher
+    // Additional MPI/OpenSHMEM related launchers/daemons
+    "oshrun",              // OpenSHMEM program launcher
+    "shmemrun",            // Another OpenSHMEM launcher
+    "mpd",                 // Old MPICH daemon
+    "mpdboot",             // Old MPICH daemon bootstrap
+    "mpdallexit",          // Old MPICH daemon shutdown
+    "mpdtrace",            // Old MPICH daemon trace tool
+    // HPC job schedulers and related commands (Slurm, LSF, PBS/Torque)
+    "salloc",
+    "sbatch",
+    "squeue",
+    "scancel",
+    "sinfo",
+    "scontrol",
+    "sreport",
+    "sacct",
+    "bsub",                // LSF job submission
+    "bjobs",               // LSF job listing
+    "bkill",               // LSF job termination
+    "qsub",                // PBS/Torque job submission
+    "qstat",               // PBS/Torque job status
+    "qdel",                // PBS/Torque job deletion
+    "qhold",               // PBS/Torque hold job
+    "qalter",              // PBS/Torque alter job attributes
+    // Common Linux commands
     "lscpu",
     "hostname",
     "numactl",
-    "scontrol",
-    // Common Linux commands
     "sh",
     "bash", 
     "awk",
