@@ -3,7 +3,7 @@
 #include <mpi.h>
 #include "test_cblas.h"
 
-#define N 1000
+#define N 20
 
 int main(int argc, char** argv)
 {

@@ -381,6 +381,10 @@ void peak_general_listener_attach()
         // replace certain function we are capturing already.
         if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0) {
             hook_address[i] = gum_find_function("peak_pmpi_finalize");
+        } else if (strcmp(peak_hook_strings[i], "close") == 0) {
+            hook_address[i] = gum_find_function("peak_close");
+        } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
+            hook_address[i] = gum_find_function("peak_exit");
         } else if (strcmp(peak_hook_strings[i], "main") == 0) {
             hook_address[i] = NULL;
         } else {

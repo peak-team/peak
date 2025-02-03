@@ -76,4 +76,22 @@ void get_argv0(char** argv0);
  */
 double median_double(double* arr, size_t n);
 
+/**
+ * @brief Checks if the given command is a basic command.
+ * 
+ * This function determines whether a given string represents a basic  
+ * command by comparing the base name of the input string against a predefined 
+ * list of command names. It supports both full paths (e.g., "/bin/awk") and 
+ * bare command names (e.g., "awk").
+ * 
+ * @param str The command to check. This can be a full path or a bare command name.
+ *            Example: "/bin/awk" or "awk".
+ * 
+ * @return 1 if the command matches a basic command, 0 otherwise.
+ * 
+ * @note The list of basic commands is hardcoded in the implementation.
+ *       Custom or user-defined commands will return 0.
+ */
+int check_command(const char *str);
+
 #endif /* __UTILS_H */

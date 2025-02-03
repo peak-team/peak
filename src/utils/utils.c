@@ -115,3 +115,142 @@ double median_double(double* arr, size_t n)
         return (double)arr[n / 2];
     }
 }
+
+// Hardcoded list of substrings, null-terminated
+static const char *check_list[] = {
+    "ibrun",                // TACC-specific launcher
+    "mpirun",               // Generic MPI launcher (Open MPI, MPICH, etc.)
+    "mpiexec",              // Alias for mpirun in many MPI distributions
+    "mpiexec.hydra",        // MPICH Hydra process manager
+    "mpirun_rsh",           // RSH-based MPI launcher
+    "prterun",              // Open MPI (PRTE runtime launcher)
+    "prted",                // PRTE daemon used by Open MPI
+    "orterun",              // Older Open MPI runtime launcher (deprecated)
+    "orted",                // Open MPI daemon for job launching
+    "prun",                 // Another launcher found in some Open MPI
+    "srun",                 // Slurm job launcher with MPI support
+    "jsrun",                // IBM Spectrum MPI launcher (LSF)
+    "aprun",                // Cray MPI launcher
+    "hydra_bstrap_proxy",   // MPICH Hydra bootstrap proxy
+    "hydra_pmi_proxy",      // MPICH Hydra PMI proxy
+    "pmi_proxy",           // Generic PMI proxy
+    "pmi2_proxy",          // PMI2 proxy (if present in your environment)
+    "pmix_server",         // PMIx server daemon (if applicable)
+    "pmix_proxy",          // PMIx proxy (if applicable)
+    "tau_exec",             // Performance profiling wrapper for MPI
+    "mpiexec_mpt",          // SGI MPT MPI launcher
+    //"yod",                  // IBM Blue Gene MPI launcher
+    //"poe"                   // IBM Parallel Operating Environment (POE) launcher
+    // Additional MPI/OpenSHMEM related launchers/daemons
+    "oshrun",              // OpenSHMEM program launcher
+    "shmemrun",            // Another OpenSHMEM launcher
+    "mpd",                 // Old MPICH daemon
+    "mpdboot",             // Old MPICH daemon bootstrap
+    "mpdallexit",          // Old MPICH daemon shutdown
+    "mpdtrace",            // Old MPICH daemon trace tool
+    // HPC job schedulers and related commands (Slurm, LSF, PBS/Torque)
+    "salloc",
+    "sbatch",
+    "squeue",
+    "scancel",
+    "sinfo",
+    "scontrol",
+    "sreport",
+    "sacct",
+    "bsub",                // LSF job submission
+    "bjobs",               // LSF job listing
+    "bkill",               // LSF job termination
+    "qsub",                // PBS/Torque job submission
+    "qstat",               // PBS/Torque job status
+    "qdel",                // PBS/Torque job deletion
+    "qhold",               // PBS/Torque hold job
+    "qalter",              // PBS/Torque alter job attributes
+    // Common Linux commands
+    "lscpu",
+    "hostname",
+    "numactl",
+    "sh",
+    "bash", 
+    "awk",
+    "sed",
+    "grep",
+    "ls",
+    "cat",
+    "rm",
+    "cp",
+    "mv",
+    "chmod",
+    "chown",
+    "find",
+    "pwd",
+    "echo",
+    "whoami",
+    "date",
+    "mkdir",
+    "mktemp",
+    "rmdir",
+    "df",
+    "du",
+    "top",
+    "ps",
+    "kill",
+    "uname",
+    "ifconfig",
+    "ping",
+    "curl",
+    "wget",
+    "scp",
+    "rsync",
+    "zip",
+    "unzip",
+    "tar",
+    "gzip",
+    "gunzip",
+    "sort",
+    "uniq",
+    "head",
+    "tail",
+    "cut",
+    "tr",
+    "wc",
+    "diff",
+    "patch",
+    "make",
+    "node",
+    "npm",
+    "git",
+    "ssh",
+    "scp",
+    "sftp",
+    NULL // Null terminator to mark the end of the list
+};
+
+/**
+ * @brief Extracts the base name of a command from a path.
+ * 
+ * For example, given "/bin/awk", it will return "awk".
+ * 
+ * @param path The full path of the command.
+ * @return Pointer to the base name within the input string.
+ */
+static const char *get_base_name(const char *path) {
+    const char *base = strrchr(path, '/');
+    return (base != NULL) ? base + 1 : path;
+}
+
+int check_command(const char *str) {
+    if (!str) {
+        return 0; // Invalid input
+    }
+
+    const char *base_name = get_base_name(str);
+
+    // Iterate through the check_list for a match
+    for (const char **entry = check_list; *entry != NULL; ++entry) {
+        if (strcmp(base_name, *entry) == 0) {
+            return 1; // Match found
+        }
+    }
+
+    return 0; // No match found
+}
