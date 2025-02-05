@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
 
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-22.04]
         build_type: [Release]
         c_compiler: [gcc]
         mpi: [ 'mpich', 'openmpi', 'intelmpi']
