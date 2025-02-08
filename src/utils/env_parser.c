@@ -66,7 +66,6 @@ size_t count_lines_in_file(FILE* file) {
     return lines;
 }
 
-
 size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count) {
     char* a_str = getenv(config_file);
     if (a_str == NULL) {
@@ -150,6 +149,19 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
         }
         source_count += source_count_ScaLAPACK;
         existing_count += source_count_ScaLAPACK;
+    }
+
+    if (strstr(a_str, "FFTW")) {
+        *result = realloc(*result, sizeof(char*) * (existing_count + source_count_FFTW));
+        for (size_t i = 0; i < source_count_FFTW; i++) {
+            (*result)[i + existing_count] = strdup(source_target_array_FFTW[i]);
+            if ((*result)[existing_count + i] == NULL) {
+                printf("Failed to duplicate string!\n");
+                return i + source_count;
+            }
+        }
+        source_count += source_count_FFTW;
+        existing_count += source_count_FFTW;
     }
 
     return source_count;
