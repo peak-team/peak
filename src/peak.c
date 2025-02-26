@@ -12,14 +12,27 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV            "PEAK_TARGET"
+#define PEAK_TARGET_ENV "PEAK_TARGET"
 #define PEAK_TARGET_CONFIG_ENV     "PEAK_TARGET_CONFIG_ENV"
-#define PEAK_TARGET_CONFIG         "PEAK_TARGET_CONFIG"
-#define PEAK_TARGET_DELIM          ','
-#define PEAK_COST_ENV              "PEAK_COST"
-#define PPID_FILE_NAME             "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_DELIM ','
+#define PEAK_COST_ENV "PEAK_COST"
+#define HEARTBEAT_TIME_ENV "HEARTBEAT_TIME"
+#define CHECK_INTERVAL_ENV "CHECK_INTERVAL"
+#define TARGET_PROFILE_RATIO_ENV "TARGET_PROFILE_RATIO"
+#define REATTACH_ENABLE_ENV "REATTACH_ENABLE"
+#define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
 
+
+gboolean* peak_need_detach;
+gdouble* heartbeat_overhead;
+PeakHeartbeatArgs* args;
+extern gboolean heartbeat_running;
+pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
+unsigned int heartbeat_time;
+unsigned int check_interval;
+float target_profile_ratio;
+gboolean reattach_enable;
 char** peak_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
@@ -37,6 +50,11 @@ void peak_init()
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_CONFIG_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_CONFIG, &peak_hook_strings, peak_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
+    heartbeat_time = parse_env_to_time(HEARTBEAT_TIME_ENV);
+    check_interval = parse_env_to_interval(CHECK_INTERVAL_ENV);
+    target_profile_ratio = parse_env_to_float(TARGET_PROFILE_RATIO_ENV);
+    reattach_enable = parse_env_to_bool(REATTACH_ENABLE_ENV);
+    // g_printerr ("reattach_enable hook_id %d\n", reattach_enable);
 
     //gum_init_embedded();
 
@@ -55,12 +73,29 @@ void peak_init()
 #endif
     // general listener needs to be after pthread and mpi ones
     peak_general_listener_attach();
+    // 
+    peak_need_detach = g_new0(gboolean, peak_hook_address_count);
+    heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
+    args = g_new0(PeakHeartbeatArgs, 1);
+    args->heartbeat_time = heartbeat_time;
+    args->check_interval = check_interval;
+    // create heartbeat thread
+    if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, NULL) != 0) {
+        perror("Failed to create heartbeat thread");
+        g_free(args);
+        exit(EXIT_FAILURE);
+    }
     peak_main_time = peak_second();
 }
 
 void peak_fini()
 {
+    heartbeat_running = false;
+    pthread_join(heartbeat_thread, NULL);
     peak_main_time = peak_second() - peak_main_time;
+    g_free(peak_need_detach);
+    g_free(args);
+
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);

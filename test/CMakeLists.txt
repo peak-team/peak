@@ -154,6 +154,16 @@ if(BUILD_TESTING)
         )
     endif()
 
-   
+    # Add test of dgemm_heartbeat
+    add_subdirectory(dgemm_heartbeat)
+    add_test(NAME test_dgemm_heartbeat COMMAND ${PROJECT_BINARY_DIR}/test/dgemm_heartbeat/test_dgemm_heartbeat)
+    set_tests_properties(test_dgemm_heartbeat 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${PRELOAD_VAR}"
+    )
+    set_tests_properties(test_dgemm_heartbeat 
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
+    )
 endif()
 

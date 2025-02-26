@@ -10,6 +10,9 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 
 /**
  * @brief Splits a string into an array of substrings based on a given delimiter.
@@ -63,6 +66,12 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
  *         variable is not set, is empty, or contains invalid characters.
  */
 float parse_env_to_float(const char* env_var);
+
+unsigned int parse_env_to_time(const char* env_var);
+
+unsigned int parse_env_to_interval(const char* env_var);
+
+bool parse_env_to_bool(const char* env_var);
 
 /**
  * @brief Frees the memory allocated by parse_env_w_delim function.

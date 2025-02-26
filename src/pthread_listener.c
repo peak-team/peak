@@ -6,6 +6,7 @@ static PthreadState pthread_create_state;
 GumMetalHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static size_t current_tid = 0;
+extern pthread_t heartbeat_thread;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -43,7 +44,9 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t tid = *(thread_state->child_tid);
 
-    // g_print ("pthread_listener_on_leave %lu\n", tid);
+    if (tid == heartbeat_thread) return;
+
+    g_print ("pthread_listener_on_leave %lu\n", tid);
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
@@ -78,6 +81,7 @@ void pthread_listener_attach()
     // g_print ("peak_hook_address_count %lu num_cores %lu\n",  peak_hook_address_count, num_cores);
     peak_tid_mapping = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
     g_mutex_init(&tid_mapping_mutex);
+    g_print ("pthread_listener_attach %lu\n", pthread_self());
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(pthread_self()), GUINT_TO_POINTER(current_tid));
     current_tid++;
 

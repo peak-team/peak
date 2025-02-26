@@ -44,6 +44,11 @@ struct _PeakGeneralListener {
     gfloat* min_time;
 };
 
+typedef struct {
+    unsigned int heartbeat_time;
+    unsigned int check_interval;
+} PeakHeartbeatArgs;
+
 /**
  * @brief Attaches the Peak General Listener.
  *
@@ -74,4 +79,5 @@ void peak_general_listener_print(int is_MPI);
  */
 void peak_general_listener_dettach();
 
+void* peak_heartbeat_monitor();
 #endif /* __GENERAL_LISTENER_H */
