@@ -124,6 +124,14 @@ if(BUILD_TESTING)
         PROPERTIES 
             ENVIRONMENT "PEAK_TARGET=functionA,functionB;${PRELOAD_VAR}"
     )
+
+    # Add test of fftw
+    add_subdirectory(fftw)
+    add_test(NAME test_fftw COMMAND ${PROJECT_BINARY_DIR}/test/fftw/test_fftw)
+    set_tests_properties(test_fftw
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET_CONFIG=FFTW;${PRELOAD_VAR}"
+    )
     
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
