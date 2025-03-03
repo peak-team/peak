@@ -115,7 +115,6 @@ void pthread_pause_disable()
 int pthread_pause(pthread_t thread)
 {
     sem_wait(&pthread_pause_sem);
-    g_printerr("pthread_pause\n");
     //If signal queue is full, we keep retrying
     while (pthread_kill(thread, PEAK_SIG_STOP) == EAGAIN)
         usleep(1000);
@@ -126,7 +125,6 @@ int pthread_pause(pthread_t thread)
 int pthread_unpause(pthread_t thread)
 {
     sem_wait(&pthread_pause_sem);
-    g_printerr("pthread_unpause\n");
     //If signal queue is full, we keep retrying
     while (pthread_kill(thread, PEAK_SIG_CONT) == EAGAIN)
         usleep(1000);
@@ -140,8 +138,6 @@ void* peak_heartbeat_monitor(void* arg) {
     unsigned int heartbeat_counter = 0;
     double total_execution_time = 0.0;
     pthread_t my_tid = pthread_self();
-    g_print ("my_tid %lu", my_tid);
-
     
     while (heartbeat_running) {
         total_execution_time = peak_second() - peak_main_time;
@@ -156,11 +152,11 @@ void* peak_heartbeat_monitor(void* arg) {
                 
                 double current_profile_ratio = (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
                 if ((++heartbeat_counter % check_interval) == 0) {
-                    g_printerr("total_num_calls: %d\n", total_num_calls);
-                    g_printerr("current_profile_ratio = %3e, target_profile_ratio = %3e, peak_need_detach = %d\n", current_profile_ratio, target_profile_ratio, peak_need_detach[i]);
-                    g_printerr("array_listener_detached: %d, array_listener_reattached: %d\n", array_listener_detached[i], array_listener_reattached[i]);
+                    // g_printerr("total_num_calls: %d\n", total_num_calls);
+                    // g_printerr("current_profile_ratio = %3e, target_profile_ratio = %3e, peak_need_detach = %d\n", current_profile_ratio, target_profile_ratio, peak_need_detach[i]);
+                    // g_printerr("array_listener_detached: %d, array_listener_reattached: %d\n", array_listener_detached[i], array_listener_reattached[i]);
                     if (current_profile_ratio > target_profile_ratio && !peak_need_detach[i]) {
-                        g_printerr("detach\n");
+                        // g_printerr("detach\n");
                         peak_need_detach[i] = TRUE;
                     }
                     if (reattach_enable) {
@@ -261,7 +257,6 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             pthread_t peak_tid_key;
             gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
             while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                g_print ("pthread_pause peak_tid_key %lu my_tid %lu\n", peak_tid_key, my_tid);
                 if (peak_tid_key != my_tid)
                     pthread_pause(peak_tid_key);
             }
@@ -270,7 +265,6 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             gum_interceptor_end_transaction(interceptor);
             gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
             while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                g_print ("pthread_unpause peak_tid_key %lu my_tid %lu\n", peak_tid_key, my_tid);
                 if (peak_tid_key != my_tid)
                     pthread_unpause(peak_tid_key);
             }
@@ -286,11 +280,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         //     g_print ("disable: my_tid %lu\n", my_tid);
         //     pthread_pause_disable();
         // }
-        // if (reattach_enable) pthread_pause_enable();
-        // else pthread_pause_disable();
-        pthread_pause_disable();
-        g_printerr("my_tid %lu disable\n", my_tid);
-        g_printerr ("hook_id %lu count %lu\n", hook_id, self->num_calls[mapped_tid]);
+        if (reattach_enable) pthread_pause_enable();
+        else pthread_pause_disable();
+        // g_printerr("my_tid %lu disable\n", my_tid);
+        // g_printerr ("hook_id %lu count %lu\n", hook_id, self->num_calls[mapped_tid]);
     }
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
     *current_time = peak_second();
@@ -335,7 +328,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
     } else {
         pthread_pause_enable();
-        g_printerr("pthread_pause_enable\n");
+        // g_printerr("pthread_pause_enable\n");
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {

@@ -67,10 +67,43 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
  */
 float parse_env_to_float(const char* env_var);
 
+/**
+ * @brief Parses an unsigned integer time value from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as an unsigned integer using the standard library
+ * function strtoul(). If the environment variable is not set, is empty, or 
+ * contains invalid characters, a default value of 1000000 is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed unsigned integer value, or 1000000 if parsing fails.
+ */
 unsigned int parse_env_to_time(const char* env_var);
 
+/**
+ * @brief Parses an unsigned integer interval value from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as an unsigned integer using the standard library
+ * function strtoul(). If the environment variable is not set, is empty, or 
+ * contains invalid characters, a default value of 5 is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed unsigned integer value, or 5 if parsing fails.
+ */
 unsigned int parse_env_to_interval(const char* env_var);
 
+/**
+ * @brief Parses a boolean value from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and interprets it as a boolean. The function returns true if the value 
+ * is "true" (case-insensitive) or "1", and false otherwise. If the environment 
+ * variable is not set, false is returned by default.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed boolean value, or false if parsing fails.
+ */
 bool parse_env_to_bool(const char* env_var);
 
 /**

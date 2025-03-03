@@ -79,5 +79,20 @@ void peak_general_listener_print(int is_MPI);
  */
 void peak_general_listener_dettach();
 
+/**
+ * @brief Monitors the heartbeat of the Peak profiling system.
+ *
+ * This function periodically checks the profiling overhead and dynamically 
+ * adjusts the attachment or detachment of hooks based on the profiling ratio. 
+ * If the profiling overhead exceeds a target threshold, the corresponding 
+ * listener is detached to reduce resource consumption. If reattachment is 
+ * enabled and the overhead falls below the threshold, the listener is reattached.
+ *
+ * The function runs in a separate thread and continuously monitors the profiling 
+ * activity, adjusting accordingly until the monitoring process is stopped.
+ *
+ * @param arg A pointer to the arguments structure containing heartbeat settings.
+ * @return NULL when the monitoring thread exits.
+ */
 void* peak_heartbeat_monitor();
 #endif /* __GENERAL_LISTENER_H */

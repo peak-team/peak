@@ -54,7 +54,6 @@ void peak_init()
     check_interval = parse_env_to_interval(CHECK_INTERVAL_ENV);
     target_profile_ratio = parse_env_to_float(TARGET_PROFILE_RATIO_ENV);
     reattach_enable = parse_env_to_bool(REATTACH_ENABLE_ENV);
-    // g_printerr ("reattach_enable hook_id %d\n", reattach_enable);
 
     //gum_init_embedded();
 
