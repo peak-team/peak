@@ -12,15 +12,16 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV "PEAK_TARGET"
-#define PEAK_TARGET_CONFIG_ENV     "PEAK_TARGET_CONFIG_ENV"
-#define PEAK_TARGET_DELIM ','
-#define PEAK_COST_ENV "PEAK_COST"
-#define HEARTBEAT_TIME_ENV "HEARTBEAT_TIME"
-#define CHECK_INTERVAL_ENV "CHECK_INTERVAL"
-#define TARGET_PROFILE_RATIO_ENV "TARGET_PROFILE_RATIO"
-#define REATTACH_ENABLE_ENV "REATTACH_ENABLE"
-#define PPID_FILE_NAME "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_ENV             "PEAK_TARGET"
+#define PEAK_TARGET_CONFIG_ENV      "PEAK_TARGET_CONFIG_ENV"
+#define PEAK_TARGET_CONFIG          "PEAK_TARGET_CONFIG"
+#define PEAK_TARGET_DELIM           ','
+#define PEAK_COST_ENV               "PEAK_COST"
+#define HEARTBEAT_TIME_ENV          "HEARTBEAT_TIME"
+#define CHECK_INTERVAL_ENV          "CHECK_INTERVAL"
+#define TARGET_PROFILE_RATIO_ENV    "TARGET_PROFILE_RATIO"
+#define REATTACH_ENABLE_ENV         "REATTACH_ENABLE"
+#define PPID_FILE_NAME              "/tmp/lock_peak_ppid_list"
 
 
 gboolean* peak_need_detach;

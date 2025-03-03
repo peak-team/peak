@@ -17,13 +17,26 @@ make
 
 ## Settings
 ```
- PEAK_TARGET=dgemm_,dgemv_        # functions that will be profiled
- PEAK_COST=10                     # Upper limit of profiling cost. The monitoring process will detach if the total profiling cost exceeds this value.  
+PEAK_TARGET=dgemm_,dgemv_        # functions that will be profiled
+PEAK_COST=10                     # Upper limit of profiling cost. The monitoring process will detach if the total profiling cost exceeds this value.  
                                   # The number of detachments is determined by dividing the total allowed cost by the cost of a single profiling operation.  
- PEAK_TARGET_CONFIG=BLAS,LAPACK,FFTW  
+PEAK_TARGET_CONFIG=BLAS,LAPACK,FFTW  
                                   # options include FFTW, PBLAS, ScaLAPACK, LAPACK, and BLAS for specifying target libraries for profiling
- PEAK_TARGET_CONFIG_ENV=/path/to/the/configuration/file
+PEAK_TARGET_CONFIG_ENV=/path/to/the/configuration/file
                                   # list function names for profiling in the configuration file, one function name per line
+HEARTBEAT_TIME=100000             # Interval (in microseconds) at which the heartbeat monitor runs.
+                                  # This determines how frequently the system assesses whether profiling should be adjusted.
+
+CHECK_INTERVAL=10                 # Number of heartbeat cycles between each check of profiling overhead.
+                                  # A lower value makes the system respond more quickly to overhead changes.
+
+TARGET_PROFILE_RATIO=0.05         # Target profiling overhead ratio. If the actual profiling overhead exceeds this ratio,
+                                  # the monitoring process will detach to reduce overhead.
+
+REATTACH_ENABLE=1                 # Whether to allow reattaching after detachment. If set to 1 (enabled), 
+                                  # the monitoring system will attempt to reattach profiling hooks when the overhead 
+                                  # drops below the target threshold.
+
 ```
 
 ## Important Notes
