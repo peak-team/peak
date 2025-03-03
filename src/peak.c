@@ -6,6 +6,10 @@
 #include "mpi_interceptor.h"
 #endif
 
+#ifdef HAVE_CUDA
+#include "cuda_interceptor.h"
+#endif
+
 #include "general_listener.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
@@ -78,6 +82,9 @@ void peak_init()
         }
     }
 #endif
+#ifdef HAVE_CUDA
+    cuda_interceptor_attach();
+#endif
     // general listener needs to be after pthread and mpi ones
     peak_general_listener_attach();
     peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
@@ -119,6 +126,10 @@ void peak_fini()
         mpi_interceptor_dettach();
 #else
     peak_general_listener_print(0);
+#endif
+#ifdef HAVE_CUDA
+    cuda_interceptor_print();
+    cuda_interceptor_dettach();
 #endif
     peak_general_listener_dettach();
     syscall_interceptor_dettach();

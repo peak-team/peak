@@ -10,14 +10,32 @@ FILE(GLOB sources_peak
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
 )
+FILE(GLOB sources_peak_cuda
+    cuda_interceptor.c
+)
 
 # Generate the shared library from the library sources
-if(MPI_FOUND)
+if(MPI_FOUND AND CUDA_FOUND)
     add_library(peak 
         SHARED 
             ${sources_peak}
             ${sources_peak_mpi}
+	    ${sources_peak_cuda}
             $<TARGET_OBJECTS:utils>  
+    )
+elseif (MPI_FOUND)
+    add_library(peak
+	SHARED
+	    ${sources_peak}
+	    ${sources_peak_mpi}
+	    $<TARGET_OBJECTS:utils>
+    )
+elseif (CUDA_FOUND)
+    add_library(peak
+	SHARED
+	    ${sources_peak}
+	    ${sources_peak_cuda}
+	    $<TARGET_OBJECTS:utils>
     )
 else()
     add_library(peak 
@@ -50,5 +68,11 @@ if(MPI_FOUND)
     )
 endif()
 
+if(CUDA_FOUND)
+    target_link_libraries(peak
+	PRIVATE
+	    ${CUDA_LIBRARIES}
+    )
+endif()
 
 install (TARGETS peak DESTINATION lib)
