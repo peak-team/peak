@@ -154,6 +154,26 @@ if(BUILD_TESTING)
         )
     endif()
 
-   
+    # Add test of dgemm_heartbeat
+    if(MPI_FOUND)
+        add_subdirectory(dgemm_heartbeat)
+        add_test(NAME test_dgemm_heartbeat COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/dgemm_heartbeat/test_dgemm_heartbeat)
+        math(EXPR N_CPU_DIV2 "${N_CPU}/2")
+        if(OpenMP_FOUND)
+            set_tests_properties(test_dgemm_heartbeat
+                PROPERTIES 
+                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
+            )
+        else()
+            set_tests_properties(test_dgemm_heartbeat
+                PROPERTIES 
+                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
+            )
+        endif()
+        set_tests_properties(test_dgemm_heartbeat
+            PROPERTIES 
+                PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+1000\\|"
+        )
+    endif()
 endif()
 
