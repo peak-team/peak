@@ -156,8 +156,8 @@ if(BUILD_TESTING)
 
     # Add test of dgemm_heartbeat
     if(MPI_FOUND)
-        add_subdirectory(dgemm_mpi)
-        add_test(NAME test_dgemm_mpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/dgemm_heartbeat/test_dgemm_heartbeat)
+        add_subdirectory(dgemm_heartbeat)
+        add_test(NAME test_dgemm_heartbeat COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/dgemm_heartbeat/test_dgemm_heartbeat)
         math(EXPR N_CPU_DIV2 "${N_CPU}/2")
         if(OpenMP_FOUND)
             set_tests_properties(test_dgemm_heartbeat
