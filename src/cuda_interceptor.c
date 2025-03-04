@@ -2,7 +2,8 @@
 
 static GHashTable* cuda_kernel_dim_mapping;
 static GumInterceptor* cuda_interceptor;
-static gpointer* hook_address;
+static gpointer* hook_cuda_launch;
+static gpointer* hook_cu_launch;
 static int device_count = 0;
 
 typedef struct {
@@ -13,6 +14,12 @@ typedef struct {
 static cudaError_t (*original_cuda_launch_kernel)(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream);
+
+static CUresult (*original_cu_launch_kernel)(
+    CUfunction func, 
+    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+    unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 
 static cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
@@ -30,6 +37,25 @@ static cudaError_t peak_cuda_launch_kernel(
     return original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
 
+static CUresult peak_cu_launch_kernel(
+    CUfunction func,
+    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+    unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra)
+{
+    KernelDimInfo* dim_info = g_new(KernelDimInfo, 1);
+    dim_info->gridDim = (dim3){gridDimX, gridDimY, gridDimZ};
+    dim_info->blockDim = (dim3){blockDimX, blockDimY, blockDimZ};
+    g_hash_table_insert(cuda_kernel_dim_mapping, (gpointer)func, dim_info);
+
+    // g_printerr("Intercepted cuLaunchKernel: func=%p, gridDim=(%d,%d,%d), blockDim=(%d,%d,%d), sharedMem=%u\n",
+    //            func, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes);
+
+    return original_cu_launch_kernel(func, gridDimX, gridDimY, gridDimZ,
+                                     blockDimX, blockDimY, blockDimZ,
+                                     sharedMemBytes, hStream, kernelParams, extra);
+}
+
 int cuda_interceptor_attach()
 {
     cudaGetDeviceCount(&device_count);
@@ -39,13 +65,19 @@ int cuda_interceptor_attach()
     cuda_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(cuda_interceptor);
-    hook_address = gum_find_function("cudaLaunchKernel");
-    // g_printerr("cudaLaunchKernel found at %p\n", hook_address);
-    if (hook_address) {
+    hook_cuda_launch = gum_find_function("cudaLaunchKernel");
+    hook_cu_launch = gum_find_function("cuLaunchKernel");
+    if (hook_cuda_launch) {
         replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_address,
+            cuda_interceptor, hook_cuda_launch,
             (gpointer*)&peak_cuda_launch_kernel,
             (gpointer*)&original_cuda_launch_kernel);
+    }
+    if (hook_cu_launch) {
+        replace_check = gum_interceptor_replace_fast(
+            cuda_interceptor, hook_cu_launch,
+            (gpointer*)&peak_cu_launch_kernel,
+            (gpointer*)&original_cu_launch_kernel);
     }
     gum_interceptor_end_transaction(cuda_interceptor);
 
@@ -54,10 +86,13 @@ int cuda_interceptor_attach()
 
 void cuda_interceptor_dettach()
 {
-    gum_interceptor_revert(cuda_interceptor, hook_address);
+    if (hook_cuda_launch) {
+        gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
+    }
+    if (hook_cu_launch) {
+        gum_interceptor_revert(cuda_interceptor, hook_cu_launch);
+    }
     g_object_unref(cuda_interceptor);
-
-    // Free hash table and stored data
     g_hash_table_destroy(cuda_kernel_dim_mapping);
 }
 
