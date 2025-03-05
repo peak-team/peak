@@ -3,13 +3,13 @@
 #include <mpi.h>
 #include "test_cblas.h"
 
-#define N 1000
+#define N 300
+static double A[N][N], B[N][N], C[N][N];
 
 int main(int argc, char** argv)
 {
     int rank, size;
     int i, j;
-    double A[N][N], B[N][N], C[N][N];
     double* D = (double*)malloc(N * N * sizeof(double));
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -25,7 +25,7 @@ int main(int argc, char** argv)
 
 // Perform matrix multiplication
 #pragma omp parallel for
-    for (i = 0; i < 500; i++) {
+    for (i = 0; i < 10000; i++) {
         //C[i][j] += A[i][k] * B[k][j];
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, N, N, 1.0, &A[0][0], N, &B[0][0], N, 0.0, &C[0][0], N);
     }
@@ -36,6 +36,7 @@ int main(int argc, char** argv)
     MPI_Allreduce(C, D, N * N, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     if (rank == 0)
         printf("Test is done, D[0][0] = %f\n", D[0]);
+    free(D);
     MPI_Finalize();
     return 0;
 }
