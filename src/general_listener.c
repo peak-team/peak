@@ -626,7 +626,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
 }
 
 #ifdef HAVE_MPI
-static void // !
+static void
 peak_general_listener_reduce_result(gulong* sum_num_calls,
                                     gdouble* sum_total_time,
                                     gdouble* max_total_time,
@@ -661,8 +661,9 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     MPI_Reduce(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    g_free(array_listener_detached);
+    array_listener_detached = mpi_array_listener_detached;
     if (rank == 0) {
-        memcpy(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count * sizeof(gboolean)); // !
         peak_general_listener_print_result(mpi_sum_num_calls,
                                            mpi_sum_total_time,
                                            mpi_max_total_time,
@@ -680,7 +681,6 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     g_free(mpi_sum_max_time);
     g_free(mpi_sum_min_time);
     g_free(mpi_thread_count);
-    g_free(mpi_array_listener_detached);
 }
 #endif
 
@@ -769,5 +769,7 @@ void peak_general_listener_dettach()
     }
     g_object_unref(interceptor);
     g_free(hook_address);
+    g_free(array_listener_detached);
+    g_free(array_listener_reattached);
     g_free(array_listener);
 }

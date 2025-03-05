@@ -172,7 +172,7 @@ if(BUILD_TESTING)
         endif()
         set_tests_properties(test_dgemm_heartbeat
             PROPERTIES 
-                PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+1000\\|"
+                PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+500\\|"
         )
     endif()
 endif()

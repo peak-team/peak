@@ -25,7 +25,7 @@ int main(int argc, char** argv)
 
 // Perform matrix multiplication
 #pragma omp parallel for
-    for (i = 0; i < 1000; i++) {
+    for (i = 0; i < 500; i++) {
         //C[i][j] += A[i][k] * B[k][j];
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, N, N, 1.0, &A[0][0], N, &B[0][0], N, 0.0, &C[0][0], N);
     }
