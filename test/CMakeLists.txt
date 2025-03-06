@@ -154,6 +154,23 @@ if(BUILD_TESTING)
         )
     endif()
 
-   
+    # Add test of heartbeat
+    add_subdirectory(heartbeat)
+    add_test(NAME test_heartbeat COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    if(OpenMP_FOUND)
+        set_tests_properties(test_heartbeat
+            PROPERTIES 
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
+        )
+    else()
+        set_tests_properties(test_heartbeat
+            PROPERTIES 
+                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
+        )
+    endif()
+    set_tests_properties(test_heartbeat
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+0\\.1"
+    )
 endif()
 
