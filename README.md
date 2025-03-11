@@ -36,6 +36,10 @@ TARGET_PROFILE_RATIO=0.05         # Target profiling overhead ratio. If the actu
 REATTACH_ENABLE=1                 # Whether to allow reattaching after detachment. If set to 1 (enabled), 
                                   # the monitoring system will attempt to reattach profiling hooks when the overhead 
                                   # drops below the target threshold.
+                                  
+POST_INTERVAL=1                   # Timeout (in seconds) for waiting on the semaphore before posting it.  
+                                  # If the semaphore wait exceeds this duration, the semaphore will be posted manually  
+                                  # to prevent indefinite blocking and allow the execution to proceed.
 
 ```
 

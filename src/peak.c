@@ -21,17 +21,20 @@
 #define CHECK_INTERVAL_ENV          "CHECK_INTERVAL"
 #define TARGET_PROFILE_RATIO_ENV    "TARGET_PROFILE_RATIO"
 #define REATTACH_ENABLE_ENV         "REATTACH_ENABLE"
+#define POST_INTERVAL_ENV         "POST_INTERVAL"
 #define PPID_FILE_NAME              "/tmp/lock_peak_ppid_list"
 
 
 gboolean* peak_need_detach;
 gdouble* heartbeat_overhead;
+gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
 extern gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
+unsigned int post_wait_interval;
 float target_profile_ratio;
 gboolean reattach_enable;
 char** peak_hook_strings;
@@ -55,6 +58,7 @@ void peak_init()
     check_interval = parse_env_to_interval(CHECK_INTERVAL_ENV);
     target_profile_ratio = parse_env_to_float(TARGET_PROFILE_RATIO_ENV);
     reattach_enable = parse_env_to_bool(REATTACH_ENABLE_ENV);
+    post_wait_interval = parse_env_to_post_interval(POST_INTERVAL_ENV);
 
     //gum_init_embedded();
 
@@ -73,7 +77,10 @@ void peak_init()
 #endif
     // general listener needs to be after pthread and mpi ones
     peak_general_listener_attach();
-    // 
+    peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
+    }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
     args = g_new0(PeakHeartbeatArgs, 1);
@@ -93,6 +100,10 @@ void peak_fini()
     heartbeat_running = false;
     pthread_join(heartbeat_thread, NULL);
     peak_main_time = peak_second() - peak_main_time;
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        g_free(peak_target_thread_called[i]);
+    }
+    g_free(peak_target_thread_called);
     g_free(peak_need_detach);
     g_free(args);
 

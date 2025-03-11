@@ -17,6 +17,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <pthread.h>
+#include <time.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
