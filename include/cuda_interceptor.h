@@ -7,9 +7,28 @@
  */
 
 #include "frida-gum.h"
-
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <pthread.h>
+#include <string.h>
+
+#ifdef HAVE_MPI
+#include <mpi.h>
+#endif
+
+#define max(a,b)             \
+({                           \
+    __typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a > _b ? _a : _b;       \
+})
+
+#define min(a,b)             \
+({                           \
+    __typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a < _b ? _a : _b;       \
+})
 
 /**
  * @brief Attach CUDA function interception

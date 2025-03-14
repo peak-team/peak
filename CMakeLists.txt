@@ -72,12 +72,9 @@ if(MPI_FOUND)
 endif()
 
 # Find CUDA
-if(CMAKE_VERSION VERSION_LESS "3.10")
-    find_package(CUDA QUIET)
-else()
-    find_package(CUDAToolkit QUIET)
-endif()
-if(CUDA_FOUND OR CUDAToolkit_FOUND)
+# FIXME: consider cmake version
+find_package(CUDA QUIET)
+if(CUDA_FOUND)
     message(STATUS "CUDA found: ${CUDA_VERSION}")
     add_definitions(-DHAVE_CUDA)
     include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})

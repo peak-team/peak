@@ -68,6 +68,10 @@ void peak_init()
 void peak_fini()
 {
     peak_main_time = peak_second() - peak_main_time;
+#ifdef HAVE_CUDA
+    cuda_interceptor_print();
+    cuda_interceptor_dettach();
+#endif
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
@@ -77,10 +81,6 @@ void peak_fini()
         mpi_interceptor_dettach();
 #else
     peak_general_listener_print(0);
-#endif
-#ifdef HAVE_CUDA
-    cuda_interceptor_print();
-    cuda_interceptor_dettach();
 #endif
     peak_general_listener_dettach();
     syscall_interceptor_dettach();
