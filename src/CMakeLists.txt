@@ -15,7 +15,7 @@ FILE(GLOB sources_peak_cuda
 )
 
 # Generate the shared library from the library sources
-if(MPI_FOUND AND CUDA_FOUND)
+if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
     add_library(peak 
         SHARED 
             ${sources_peak}
@@ -30,7 +30,7 @@ elseif (MPI_FOUND)
 	    ${sources_peak_mpi}
 	    $<TARGET_OBJECTS:utils>
     )
-elseif (CUDA_FOUND)
+elseif (CUDA_FOUND OR CUDAToolkit_FOUND)
     add_library(peak
 	SHARED
 	    ${sources_peak}
@@ -68,10 +68,11 @@ if(MPI_FOUND)
     )
 endif()
 
-if(CUDA_FOUND)
+if(CUDA_FOUND OR CUDAToolkit_FOUND)
     target_link_libraries(peak
-	PRIVATE
-	    ${CUDA_LIBRARIES}
+        PRIVATE
+            ${CUDA_LIBRARIES}
+            ${CUDAToolkit_LIBRARY_DIR}
     )
 endif()
 
