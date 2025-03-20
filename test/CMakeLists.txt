@@ -153,7 +153,14 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "cblas_dgemm\\|[ \t]+200\\|"
         )
     endif()
-
+    
+    # Add test of malloc
+    add_subdirectory(malloc)
+    add_test(NAME test_malloc COMMAND ${PROJECT_BINARY_DIR}/test/malloc/test_malloc)
+    set_tests_properties(test_malloc
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=malloc;${PRELOAD_VAR}"
+    )
    
 endif()
 
