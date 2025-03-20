@@ -156,7 +156,7 @@ if(BUILD_TESTING)
     
     # Add test of malloc
     add_subdirectory(malloc)
-    add_test(NAME test_malloc COMMAND ${PROJECT_BINARY_DIR}/test/malloc/test_malloc)
+    add_test(NAME test_malloc COMMAND ${PROJECT_BINARY_DIR}/test/malloc/test_malloc -t 102400 -n 2)
     set_tests_properties(test_malloc
         PROPERTIES 
             ENVIRONMENT "PEAK_TARGET=malloc;${PRELOAD_VAR}"
