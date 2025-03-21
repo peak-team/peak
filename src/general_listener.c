@@ -48,13 +48,6 @@ static __thread PeakGeneralThreadState thread_data;
 sem_t pthread_pause_sem;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 
-void pthread_pause_once(void)
-{
-    sem_init(&pthread_pause_sem, 0, 1);
-}
-
-#define pthread_pause_init() (pthread_once(&pthread_pause_once_ctrl, &pthread_pause_once))
-
 void pthread_pause_handler(int signal)
 {
     //Post semaphore to confirm that signal is handled
@@ -70,14 +63,15 @@ void pthread_pause_handler(int signal)
         return;
 }
 
-void pthread_pause_enable()
+void pthread_pause_once(void)
 {
-    pthread_pause_init();
-    //Prepare sigset
+    sem_init(&pthread_pause_sem, 0, 1);
+
+    // Prepare sigset
     sigset_t sigset;
     sigemptyset(&sigset);
     sigaddset(&sigset, PEAK_SIG_STOP);
-    sigaddset(&sigset, PEAK_SIG_CONT);
+    sigaddset(&sigset, PEAK_SIG_CONT);   
 
     //Register signal handlers
     //We now use sigaction() instead of signal(), because it supports SA_RESTART
@@ -88,8 +82,19 @@ void pthread_pause_enable()
         .sa_restorer = NULL
     };
     sigaction(PEAK_SIG_STOP, &pause_sa, NULL);
-    sigaction(PEAK_SIG_CONT, &pause_sa, NULL);
+    sigaction(PEAK_SIG_CONT, &pause_sa, NULL);  
+}
 
+#define pthread_pause_init() (pthread_once(&pthread_pause_once_ctrl, &pthread_pause_once))
+
+void pthread_pause_enable()
+{
+    pthread_pause_init();
+    //Prepare sigset
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, PEAK_SIG_STOP);
+    sigaddset(&sigset, PEAK_SIG_CONT);
     //UnBlock signals
     pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
 }
