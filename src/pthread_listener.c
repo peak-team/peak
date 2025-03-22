@@ -6,6 +6,7 @@ static PthreadState pthread_create_state;
 GumMetalHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static size_t current_tid = 0;
+static gpointer* hook_address;
 extern pthread_t heartbeat_thread;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
@@ -48,6 +49,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
     g_mutex_unlock(&tid_mapping_mutex);
+    // g_print ("pthread_listener_on_leave %lu\n", tid);
     if (!thread_state->is_original)
         g_free(thread_state->child_tid);
 }
@@ -73,6 +75,19 @@ pthread_listener_init(PthreadListener* self)
 {
 }
 
+static int (*original_pthread_join)(pthread_t thread, void **retval);
+
+static int
+peak_pthread_join(pthread_t thread, void **retval)
+{
+    // g_printerr ("peak_pthread_join called on thread %ld\n",  thread);
+    g_mutex_lock(&tid_mapping_mutex);
+    gum_metal_hash_table_remove(peak_tid_mapping, GUINT_TO_POINTER(thread));
+    current_tid--;
+    g_mutex_unlock(&tid_mapping_mutex);
+    return original_pthread_join(thread, retval);
+}
+
 void pthread_listener_attach()
 {
     // g_print ("peak_hook_address_count %lu num_cores %lu\n",  peak_hook_address_count, num_cores);
@@ -85,13 +100,19 @@ void pthread_listener_attach()
     pthread_create_listener = g_object_new(PTHREAD_TYPE_LISTENER, NULL);
 
     gum_interceptor_begin_transaction(pthread_create_interceptor);
-    gpointer* hook_address = gum_find_function("pthread_create");
+    hook_address = gum_find_function("pthread_create");
     if (hook_address) {
         // g_print ("pthread_create found at %p\n",  hook_address);
         gum_interceptor_attach(pthread_create_interceptor,
                                hook_address,
                                pthread_create_listener,
                                &pthread_create_state);
+    }
+    hook_address = gum_find_function("pthread_join");
+    if (hook_address) {
+        gum_interceptor_replace_fast(pthread_create_interceptor,
+                                    hook_address, &peak_pthread_join,
+                                    (gpointer*)(&original_pthread_join));
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }
@@ -106,6 +127,7 @@ void pthread_listener_dettach()
     // gum_metal_hash_table_foreach(peak_tid_mapping, (GHFunc)print_key_value_pair, NULL);
 
     gum_interceptor_detach(pthread_create_interceptor, pthread_create_listener);
+    gum_interceptor_revert(pthread_create_interceptor, hook_address);
     gum_metal_hash_table_unref(peak_tid_mapping);
     g_mutex_clear(&tid_mapping_mutex);
     g_object_unref(pthread_create_listener);
