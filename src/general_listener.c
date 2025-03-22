@@ -54,16 +54,40 @@ void pthread_pause_handler(int signal)
     sem_post(&pthread_pause_sem);
     //Suspend if needed
     if (signal == PEAK_SIG_STOP) {
-        sigset_t sigset;
+        sigset_t new_mask, original_mask, wait_set;
         struct timespec timeout;
-        sigfillset(&sigset);
-        sigdelset(&sigset, PEAK_SIG_STOP);
-        sigdelset(&sigset, PEAK_SIG_CONT);
-        /*TODO: need to make this a standalone parameter*/
-        // Set the timeout 
-        timeout.tv_sec += post_wait_interval;
-        sigtimedwait(&sigset, NULL, &timeout);
-        // sigsuspend(&sigset); //Wait for next signal
+
+        // Block all signals except PEAK_SIG_CONT
+        sigfillset(&new_mask);
+        sigdelset(&new_mask, PEAK_SIG_CONT);
+
+        // Apply the new signal mask
+        pthread_sigmask(SIG_SETMASK, &new_mask, &original_mask);
+
+        // Prepare to wait for PEAK_SIG_CONT
+        sigemptyset(&wait_set);
+        sigaddset(&wait_set, PEAK_SIG_CONT);
+
+        // Set the timeout (e.g., 5 seconds)
+        timeout.tv_sec = post_wait_interval;  // Adjust as needed
+        timeout.tv_nsec = 0;
+
+        // Wait for the signal with timeout
+        sigtimedwait(&wait_set, NULL, &timeout);
+
+        // Restore the original signal mask
+        pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
+
+        // sigset_t sigset;
+        // struct timespec timeout;
+        // sigfillset(&sigset);
+        // sigdelset(&sigset, PEAK_SIG_STOP);
+        // sigdelset(&sigset, PEAK_SIG_CONT);
+        // /*TODO: need to make this a standalone parameter*/
+        // // Set the timeout 
+        // timeout.tv_sec += post_wait_interval;
+        // sigtimedwait(&sigset, NULL, &timeout);
+        // // sigsuspend(&sigset); //Wait for next signal
     } else
         return;
 }
@@ -170,6 +194,7 @@ void* peak_heartbeat_monitor(void* arg) {
     unsigned int check_interval = args->check_interval;
     unsigned int heartbeat_counter = 0;
     double total_execution_time = 0.0;
+    gum_interceptor_ignore_current_thread(interceptor);
     pthread_t my_tid = pthread_self();
     
     while (heartbeat_running) {
@@ -234,7 +259,7 @@ void* peak_heartbeat_monitor(void* arg) {
         }
         usleep(heartbeat_time);
     }
-
+    gum_interceptor_unignore_current_thread(interceptor);
     return NULL;
 }
 
@@ -244,10 +269,11 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 {
     if (!listener || g_object_is_floating(listener)) {
             return;
-        }
-        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-        pthread_t my_tid = pthread_self();
-        size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
+    }
+    gum_interceptor_ignore_current_thread(interceptor);
+    PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+    pthread_t my_tid = pthread_self();
+    size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
     if (peak_detach_count == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
@@ -319,6 +345,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         else pthread_pause_disable();
     }
     double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
+    gum_interceptor_unignore_current_thread(interceptor);
     *current_time = peak_second();
 }
 
@@ -327,6 +354,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
     double end_time = peak_second();
+    gum_interceptor_ignore_current_thread(interceptor);
     if (peak_detach_count == 0) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
@@ -398,6 +426,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
             pthread_pause_enable();
         }
     }
+    gum_interceptor_unignore_current_thread(interceptor);
 }
 
 static void
