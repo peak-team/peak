@@ -55,10 +55,15 @@ void pthread_pause_handler(int signal)
     //Suspend if needed
     if (signal == PEAK_SIG_STOP) {
         sigset_t sigset;
+        struct timespec timeout;
         sigfillset(&sigset);
         sigdelset(&sigset, PEAK_SIG_STOP);
         sigdelset(&sigset, PEAK_SIG_CONT);
-        sigsuspend(&sigset); //Wait for next signal
+        /*TODO: need to make this a standalone parameter*/
+        // Set the timeout 
+        timeout.tv_sec += post_wait_interval;
+        sigtimedwait(&sigset, NULL, &timeout);
+        // sigsuspend(&sigset); //Wait for next signal
     } else
         return;
 }
@@ -107,7 +112,15 @@ void pthread_pause_disable()
     pthread_pause_init();
 
     //Make sure all signals are dispatched before we block them
-    sem_wait(&pthread_pause_sem);
+    //sem_wait(&pthread_pause_sem);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += post_wait_interval;
+
+    if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
+        sem_post(&pthread_pause_sem);
+    }
 
     //Block signals
     sigset_t sigset;
