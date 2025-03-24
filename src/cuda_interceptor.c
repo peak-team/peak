@@ -5,6 +5,8 @@ static GMutex cuda_kernel_local_dim_mapping_mutex;
 static GumInterceptor* cuda_interceptor;
 static gpointer* hook_cuda_launch;
 static gpointer* hook_cu_launch;
+extern size_t peak_hook_address_count;
+extern char** peak_hook_strings;
 
 static cudaError_t (*original_cuda_launch_kernel)(
     const void* func, dim3 gridDim, dim3 blockDim,
@@ -35,47 +37,57 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
+static void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size)
+{
+    g_mutex_lock(&cuda_kernel_local_dim_mapping_mutex);
+
+    KernelDimInfo* dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
+    if (!dim_info) {
+        dim_info = g_new(KernelDimInfo, 1);
+        dim_info->total_gpu_threads = total_threads;
+        dim_info->total_kernel_call_cnt = 1; 
+        dim_info->total_block_size = block_size;
+        dim_info->total_grid_size = grid_size;
+        dim_info->max_gpu_threads = total_threads;
+        dim_info->min_gpu_threads = total_threads;
+        dim_info->max_block_size = block_size;
+        dim_info->min_block_size = block_size;
+        dim_info->max_grid_size = grid_size;
+        dim_info->min_grid_size = grid_size;
+        g_hash_table_insert(cuda_kernel_local_dim_mapping, g_strdup(kernel_name), dim_info);
+    } else {
+        dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
+        dim_info->total_gpu_threads += total_threads;
+        dim_info->total_kernel_call_cnt++;
+        dim_info->total_block_size += block_size;
+        dim_info->total_grid_size += grid_size;
+        dim_info->max_gpu_threads = max(dim_info->max_gpu_threads, total_threads);
+        dim_info->min_gpu_threads = min(dim_info->min_gpu_threads, total_threads);
+        dim_info->max_block_size = max(dim_info->max_block_size, block_size);
+        dim_info->min_block_size = min(dim_info->min_block_size, block_size);
+        dim_info->max_grid_size = max(dim_info->max_grid_size, grid_size);
+        dim_info->min_grid_size = min(dim_info->min_grid_size, grid_size);
+    }
+
+    g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
+    g_free(kernel_name);
+}
+
 static cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    if (kernel_name != NULL) {
-        g_mutex_lock(&cuda_kernel_local_dim_mapping_mutex);
-        
-        gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
-        gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
-        gulong block_size = blockDim.x * blockDim.y * blockDim.z;
-        KernelDimInfo* dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
-        if (!dim_info) {
-            dim_info = g_new(KernelDimInfo, 1);
-            dim_info->total_gpu_threads = total_threads;
-            dim_info->total_kernel_call_cnt = 1; 
-            dim_info->total_block_size = block_size;
-            dim_info->total_grid_size = grid_size;
-            dim_info->max_gpu_threads = total_threads;
-            dim_info->min_gpu_threads = total_threads;
-            dim_info->max_block_size = block_size;
-            dim_info->min_block_size = block_size;
-            dim_info->max_grid_size = grid_size;
-            dim_info->min_grid_size = grid_size;
-            g_hash_table_insert(cuda_kernel_local_dim_mapping, g_strdup(kernel_name), dim_info);
-        } else {
-            dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
-            dim_info->total_gpu_threads += total_threads;
-            dim_info->total_kernel_call_cnt++;
-            dim_info->total_block_size += block_size;
-            dim_info->total_grid_size += grid_size;
-            dim_info->max_gpu_threads = max(dim_info->max_gpu_threads, total_threads);
-            dim_info->min_gpu_threads = min(dim_info->min_gpu_threads, total_threads);
-            dim_info->max_block_size = max(dim_info->max_block_size, block_size);
-            dim_info->min_block_size = min(dim_info->min_block_size, block_size);
-            dim_info->max_grid_size = max(dim_info->max_grid_size, grid_size);
-            dim_info->min_grid_size = min(dim_info->min_grid_size, grid_size);
-        }
 
-        g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
-        g_free(kernel_name);
+    // TODO: compare name
+    // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (g_strcmp0(peak_hook_strings[i], kernel_name) == 0) {
+            gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
+            gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
+            gulong block_size = blockDim.x * blockDim.y * blockDim.z;
+            insert_cuda_mapping_record(kernel_name, total_threads, grid_size, block_size);
+        }
     }
 
     return original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
@@ -90,53 +102,17 @@ static CUresult peak_cu_launch_kernel(
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    if (kernel_name != NULL) {
-        g_mutex_lock(&cuda_kernel_local_dim_mapping_mutex);
-        
-        gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
-        gulong grid_size = gridDimX * gridDimY * gridDimZ;
-        gulong block_size = blockDimX * blockDimY * blockDimZ;
-        KernelDimInfo* dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
-        if (!dim_info) {
-            dim_info = g_new(KernelDimInfo, 1);        
-            dim_info->total_gpu_threads = total_threads;
-            dim_info->total_kernel_call_cnt = 1; 
-            dim_info->total_block_size = block_size;
-            dim_info->total_grid_size = grid_size;
-
-            if (dim_info->total_kernel_call_cnt == 1) {
-                dim_info->max_gpu_threads = total_threads;
-                dim_info->min_gpu_threads = total_threads;
-                dim_info->max_block_size = block_size;
-                dim_info->min_block_size = block_size;
-                dim_info->max_grid_size = grid_size;
-                dim_info->min_grid_size = grid_size;
-            } else {
-                dim_info->max_gpu_threads = max(dim_info->max_gpu_threads, total_threads);
-                dim_info->min_gpu_threads = min(dim_info->min_gpu_threads, total_threads);
-                dim_info->max_block_size = max(dim_info->max_block_size, block_size);
-                dim_info->min_block_size = min(dim_info->min_block_size, block_size);
-                dim_info->max_grid_size = max(dim_info->max_grid_size, grid_size);
-                dim_info->min_grid_size = min(dim_info->min_grid_size, grid_size);
-            }
-
-            g_hash_table_insert(cuda_kernel_local_dim_mapping, g_strdup(kernel_name), dim_info);
-        } else {
-            dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, g_strdup(kernel_name));
-            dim_info->total_gpu_threads += total_threads;
-            dim_info->total_kernel_call_cnt++;
-            dim_info->total_block_size += block_size;
-            dim_info->total_grid_size += grid_size;
-            dim_info->max_gpu_threads = max(dim_info->max_gpu_threads, total_threads);
-            dim_info->min_gpu_threads = min(dim_info->min_gpu_threads, total_threads);
-            dim_info->max_block_size = max(dim_info->max_block_size, block_size);
-            dim_info->min_block_size = min(dim_info->min_block_size, block_size);
-            dim_info->max_grid_size = max(dim_info->max_grid_size, grid_size);
-            dim_info->min_grid_size = min(dim_info->min_grid_size, grid_size);
+    
+    // TODO: compare name
+    // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (g_strcmp0(peak_hook_strings[i], kernel_name) == 0) {
+            gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
+            gulong grid_size = gridDimX * gridDimY * gridDimZ;
+            gulong block_size = blockDimX * blockDimY * blockDimZ;
+            insert_cuda_mapping_record(kernel_name, total_threads, grid_size, block_size);
         }
-
-        g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
-    } 
+    }
 
     return original_cu_launch_kernel(func, gridDimX, gridDimY, gridDimZ,
                                      blockDimX, blockDimY, blockDimZ,
