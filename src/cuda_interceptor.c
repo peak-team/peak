@@ -73,6 +73,8 @@ static void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads,
     g_free(kernel_name);
 }
 
+// TODO: demangle function
+
 static cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
@@ -227,7 +229,6 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     free(row_separator);
 }
 
-// TODO:
 #ifdef HAVE_MPI
 static void
 cuda_interceptor_reduce_result()
@@ -288,70 +289,80 @@ cuda_interceptor_reduce_result()
     MPI_Gather(&local_keys_buffer_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     
-    gchar *global_keys_string = NULL;
-    gint *keys_offset_array = NULL;
-    gint *values_offset_array = NULL;
-    gchar **global_keys_array = NULL;
-    KernelDimInfo* global_values_array = NULL;
-    if (world_rank == 0) {
-        // Key
-        keys_offset_array = g_new(gint, world_size);
-        keys_offset_array[0] = 0;
-        for (guint i = 1; i < world_size; i++) {
-            keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
-        }
-        global_keys_string = g_new(gchar, global_keys_length_sum);
-        memset(global_keys_string, ' ', global_keys_length_sum - 1); // allocate string, pre-fill with spaces and null terminator
-        global_keys_string[global_keys_length_sum - 1] = '\0'; 
-
-        // Value
-        global_values_array = g_new(KernelDimInfo, global_kernel_count);
-        values_offset_array = g_new(gint, global_kernel_count);
-        values_offset_array[0] = 0;
-        for (guint i = 1; i < world_size; i++) {
-            values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
-        }
-    }
-    MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);  
-    MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
-
-
-    if (world_rank == 0) {
-        // Spilt global key strings into global key array
-        global_keys_array = g_new(gchar*, global_kernel_count);
-        guint index = 0;
-        for (guint i = 0; i < global_kernel_count; i++) {
-            guint len = strlen(global_keys_string + index);
-            global_keys_array[i] = g_new(gchar, len);
-            strcpy(global_keys_array[i], global_keys_string + index);
-            index += len + 1;
-        }
-
-        // aggregate value
-        for (guint i = 0; i < global_kernel_count; i++) {
-            KernelDimInfo* existing = (KernelDimInfo*) g_hash_table_lookup(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]));
-            if (existing) {
-                existing->total_kernel_call_cnt += global_values_array[i].total_kernel_call_cnt;
-                existing->total_gpu_threads += global_values_array[i].total_gpu_threads;
-                existing->max_gpu_threads = max(existing->max_gpu_threads, global_values_array[i].max_gpu_threads);
-                existing->min_gpu_threads = min(existing->min_gpu_threads, global_values_array[i].min_gpu_threads);
-                existing->total_block_size += global_values_array[i].total_block_size;
-                existing->max_block_size = max(existing->max_block_size, global_values_array[i].max_block_size);
-                existing->min_block_size = min(existing->min_block_size, global_values_array[i].min_block_size);
-                existing->total_grid_size += global_values_array[i].total_grid_size;
-                existing->max_block_size = max(existing->max_grid_size, global_values_array[i].max_grid_size);
-                existing->min_block_size = min(existing->min_grid_size, global_values_array[i].min_grid_size);
-            } else {
-                g_hash_table_insert(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]), g_memdup(&global_values_array[i], sizeof(KernelDimInfo)));
+    if (global_kernel_count > 0) {
+        gchar *global_keys_string = NULL;
+        gint *keys_offset_array = NULL;
+        gint *values_offset_array = NULL;
+        gchar **global_keys_array = NULL;
+        KernelDimInfo* global_values_array = NULL;
+        if (world_rank == 0) {
+            // Key
+            keys_offset_array = g_new(gint, world_size);
+            keys_offset_array[0] = 0;
+            for (guint i = 1; i < world_size; i++) {
+                keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
             }
+            global_keys_string = g_new(gchar, global_keys_length_sum);
+            memset(global_keys_string, ' ', global_keys_length_sum - 1); // allocate string, pre-fill with spaces and null terminator
+            global_keys_string[global_keys_length_sum - 1] = '\0'; 
+
+            // Value
+            global_values_array = g_new(KernelDimInfo, global_kernel_count);
+            values_offset_array = g_new(gint, global_kernel_count);
+            values_offset_array[0] = 0;
+            for (guint i = 1; i < world_size; i++) {
+                values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
+            }
+        }
+        MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);  
+        MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        if (world_rank == 0) {
+            // Spilt global key strings into global key array
+            global_keys_array = g_new(gchar*, global_kernel_count);
+            guint index = 0;
+            for (guint i = 0; i < global_kernel_count; i++) {
+                guint len = strlen(global_keys_string + index);
+                global_keys_array[i] = g_new(gchar, len);
+                strcpy(global_keys_array[i], global_keys_string + index);
+                index += len + 1;
+            }
+
+            // aggregate value
+            for (guint i = 0; i < global_kernel_count; i++) {
+                KernelDimInfo* existing = (KernelDimInfo*) g_hash_table_lookup(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]));
+                if (existing) {
+                    existing->total_kernel_call_cnt += global_values_array[i].total_kernel_call_cnt;
+                    existing->total_gpu_threads += global_values_array[i].total_gpu_threads;
+                    existing->max_gpu_threads = max(existing->max_gpu_threads, global_values_array[i].max_gpu_threads);
+                    existing->min_gpu_threads = min(existing->min_gpu_threads, global_values_array[i].min_gpu_threads);
+                    existing->total_block_size += global_values_array[i].total_block_size;
+                    existing->max_block_size = max(existing->max_block_size, global_values_array[i].max_block_size);
+                    existing->min_block_size = min(existing->min_block_size, global_values_array[i].min_block_size);
+                    existing->total_grid_size += global_values_array[i].total_grid_size;
+                    existing->max_block_size = max(existing->max_grid_size, global_values_array[i].max_grid_size);
+                    existing->min_block_size = min(existing->min_grid_size, global_values_array[i].min_grid_size);
+                } else {
+                    g_hash_table_insert(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]), g_memdup(&global_values_array[i], sizeof(KernelDimInfo)));
+                }
+            }
+        }
+        
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        if (world_rank == 0) {
+            cuda_interceptor_print_result(cuda_kernel_global_dim_mapping);
+            for (guint i = 0; i < global_kernel_count; i++) {
+                g_free(global_keys_array[i]);
+            }
+            g_free(global_keys_string);
+            g_free(keys_offset_array);
+            g_free(values_offset_array);
+            g_free(global_keys_array);
+            g_free(global_values_array);
         }
     }
     
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    if (world_rank == 0) {
-        cuda_interceptor_print_result(cuda_kernel_global_dim_mapping);
-    }
 
     for (guint i = 0; i < local_kernel_count; i++) {
         g_free(local_keys[i]);
@@ -364,14 +375,6 @@ cuda_interceptor_reduce_result()
         g_free(kernel_count_array);
         g_free(keys_buffer_array);
         g_free(values_buffer_array);
-        g_free(global_keys_string);
-        g_free(keys_offset_array);
-        g_free(values_offset_array);
-        for (guint i = 0; i < global_kernel_count; i++) {
-            g_free(global_keys_array);
-        }
-        g_free(global_keys_array);
-        g_free(global_values_array);
     }
 }
 #endif
