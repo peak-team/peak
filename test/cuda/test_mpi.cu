@@ -57,11 +57,9 @@ void print_line() {
 }
 
 void run_kernel(int rank, const std::vector<KernelConfig>& configs, bool enable_logging) {
-    cudaSetDevice(rank);
-    
     if (enable_logging) {
         print_line();
-        std::cout << "MPI Rank " << rank << " running on GPU " << (rank) << "\n";
+        std::cout << "MPI Rank " << rank << " running on GPU " << 0 << "\n";
         print_line();
     }
     
@@ -107,7 +105,7 @@ int main(int argc, char** argv) {
     int rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    
+
     bool enable_logging = false;
     bool randomize = false;
     int num_blocks = 1, num_threads = 32, num_calls = 1, kernel_number = 1;
