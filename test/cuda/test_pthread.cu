@@ -66,12 +66,11 @@ void print_line() {
 
 void* run_kernel(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
-    cudaSetDevice(args->gpu_id);
     pthread_t thread_id = pthread_self();
     
     if (args->enable_logging) {
         print_line();
-        std::cout << "Thread " << thread_id << " running on GPU " << args->gpu_id << "\n";
+        std::cout << "Thread " << thread_id << " running on GPU " << 0 << "\n";
         print_line();
         for (size_t i = 0; i < args->kernel_numbers.size(); ++i) {
             std::cout << "Kernel " << args->kernel_numbers[i] << " | Blocks: " << args->num_blocks[i]
@@ -120,7 +119,7 @@ int main(int argc, char** argv) {
     int num_blocks = 1;
     int num_threads = 32;
     int num_calls = 1;
-    int kernel_number = 1;
+    int kernel_number = 5;
     bool enable_logging = false;
     bool randomize = false;
     
@@ -146,11 +145,11 @@ int main(int argc, char** argv) {
     ThreadArgs thread_args[num_cpu_threads];
     
     for (int t = 0; t < num_cpu_threads; ++t) {
-        for (int i = 0; i < MAX_KERNELS; ++i) {
+        for (int i = 0; i < kernel_number; ++i) {
             thread_args[t].num_blocks.push_back(randomize ? dist_blocks(gen) : num_blocks);
             thread_args[t].num_threads.push_back(randomize ? dist_threads(gen) : num_threads);
             thread_args[t].num_calls.push_back(randomize ? dist_calls(gen) : num_calls);
-            thread_args[t].kernel_numbers.push_back(randomize ? dist_kernel(gen) : kernel_number);
+            thread_args[t].kernel_numbers.push_back(randomize ? dist_kernel(gen) : i+1);
         }
         thread_args[t].gpu_id = 0;
         thread_args[t].enable_logging = enable_logging;

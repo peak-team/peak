@@ -57,11 +57,9 @@ void print_line() {
 }
 
 void run_kernel(int rank, const std::vector<KernelConfig>& configs, bool enable_logging) {
-    cudaSetDevice(rank);
-    
     if (enable_logging) {
         print_line();
-        std::cout << "MPI Rank " << rank << " running on GPU " << (rank) << "\n";
+        std::cout << "MPI Rank " << rank << " running on GPU " << 0 << "\n";
         print_line();
     }
     

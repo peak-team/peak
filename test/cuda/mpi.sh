@@ -12,4 +12,4 @@ rm test_mpi mpi.log
 mpicxx -o test_mpi test_mpi.cu -L$CUDA_LIB_PATH -lcudart -I$CUDA_INCLUDE_PATH -fPIC --std=c++17
 
 # Run the MPI program with LD_PRELOAD
-LD_PRELOAD=$LD_PRELOAD_PATH mpirun -N 2 ./test_mpi --random --verbose > mpi.log
+LD_PRELOAD=$LD_PRELOAD_PATH mpirun -np 2 ./test_mpi --random --verbose > mpi.log
