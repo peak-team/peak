@@ -58,13 +58,13 @@ void print_line() {
 }
 
 void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& configs, bool enable_logging) {
-    cudaSetDevice(rank % 4); // Assuming up to 4 GPUs per node
+    cudaSetDevice(rank);
     
     if (enable_logging) {
         #pragma omp critical
         {
             print_line();
-            std::cout << "MPI Rank " << rank << " | OpenMP Thread " << thread_id << " running on GPU " << (rank % 4) << "\n";
+            std::cout << "MPI Rank " << rank << " | OpenMP Thread " << thread_id << " running on GPU " << (rank) << "\n";
             print_line();
         }
     }

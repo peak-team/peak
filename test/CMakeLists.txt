@@ -28,6 +28,15 @@ if(BUILD_TESTING)
     endif()
 
     find_package(OpenMP)
+    find_package(MPI)
+    if (CMAKE_VERSION VERSION_LESS 3.17)
+        find_package(CUDA)
+    else()
+        find_package(CUDAToolkit)
+    endif()
+    if (CUDA_FOUND OR CUDAToolkit_FOUND)
+        include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS}) 
+    endif()
 
     include (FortranCInterface)
     list (APPEND FORTRAN_FUNCTIONS sdot dgemm)
@@ -154,6 +163,19 @@ if(BUILD_TESTING)
         )
     endif()
 
-   
+    # Add Cuda Test cases
+    if(CUDA_FOUND OR CUDAToolkit_FOUND)
+        add_subdirectory(cuda)
+
+        # add_test(NAME test_ompmpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/parallel_tests/test_omp_mpi)
+        # set_tests_properties(test_omp_mpi PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=4;PEAK_TARGET=main;${PRELOAD_VAR}")
+
+        # add_test(NAME test_mpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/parallel_tests/test_mpi)
+        # set_tests_properties(test_mpi PROPERTIES ENVIRONMENT "PEAK_TARGET=main;${PRELOAD_VAR}")
+
+        # add_test(NAME test_pthread COMMAND ${PROJECT_BINARY_DIR}/test/parallel_tests/test_pthread)
+        # set_tests_properties(test_pthread PROPERTIES ENVIRONMENT "PEAK_TARGET=main;${PRELOAD_VAR}")
+    endif()
+    
 endif()
 
