@@ -221,14 +221,14 @@ unsigned int parse_env_to_interval(const char* env_var) {
 unsigned int parse_env_to_post_interval(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {
-        return 1;
+        return 10000000; // 0.01s
     }
 
     char* endptr;
     errno = 0; 
     unsigned int result = strtoul(varvalue, &endptr, 10);
     if (errno == ERANGE || result > UINT_MAX || *endptr != '\0') {
-        return 1;
+        return 10000000;
     }
     return (unsigned int)result;
 }

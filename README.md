@@ -17,29 +17,32 @@ make
 
 ## Settings
 ```
-PEAK_TARGET=dgemm_,dgemv_        # functions that will be profiled
-PEAK_COST=10                     # Upper limit of profiling cost. The monitoring process will detach if the total profiling cost exceeds this value.  
+PEAK_TARGET=dgemm_,dgemv_         # functions that will be profiled
+PEAK_COST=10                      # Upper limit of profiling cost in seconds. The monitoring process will detach if the total profiling cost exceeds this value.  
                                   # The number of detachments is determined by dividing the total allowed cost by the cost of a single profiling operation.  
-PEAK_TARGET_CONFIG=BLAS,LAPACK,FFTW  
+PEAK_TARGET_GROUP=BLAS,LAPACK,FFTW  
                                   # options include FFTW, PBLAS, ScaLAPACK, LAPACK, and BLAS for specifying target libraries for profiling
-PEAK_TARGET_CONFIG_ENV=/path/to/the/configuration/file
+PEAK_TARGET_FILE=/path/to/the/configuration/file
                                   # list function names for profiling in the configuration file, one function name per line
-HEARTBEAT_TIME=100000             # Interval (in microseconds) at which the heartbeat monitor runs.
+PEAK_HEARTBEAT_INTERVAL=100000    # Interval (in microseconds) at which the heartbeat monitor runs.
                                   # This determines how frequently the system assesses whether profiling should be adjusted.
 
-CHECK_INTERVAL=10                 # Number of heartbeat cycles between each check of profiling overhead.
+PEAK_HIBERNATION_CYCLE=10         # Determines how often the system checks whether it needs to detach and reattach, 
+                                  # based on the number of heartbeat cycles.
                                   # A lower value makes the system respond more quickly to overhead changes.
 
-TARGET_PROFILE_RATIO=0.05         # Target profiling overhead ratio. If the actual profiling overhead exceeds this ratio,
+PEAK_OVERHEAD_RATIO=0.05          # Target profiling overhead ratio. If the actual profiling overhead exceeds this ratio,
                                   # the monitoring process will detach to reduce overhead.
 
-REATTACH_ENABLE=1                 # Whether to allow reattaching after detachment. If set to 1 (enabled), 
+PEAK_ENABLE_REATTACH=1            # Whether to allow reattaching after detachment. If set to 1 (enabled), 
                                   # the monitoring system will attempt to reattach profiling hooks when the overhead 
                                   # drops below the target threshold.
                                   
-POST_INTERVAL=1                   # Timeout (in seconds) for waiting on the semaphore before posting it.  
-                                  # If the semaphore wait exceeds this duration, the semaphore will be posted manually  
-                                  # to prevent indefinite blocking and allow the execution to proceed.
+PEAK_PAUSE_TIMEOUT=10000000       # For a thread that does not call the target function or calls it infrequently, 
+                                  # this variable adjusts the maximum waiting time (in nanoseconds) for it to respond to the pause and unpause command.
+
+PEAK_SIG_CONT_TIMEOUT=10000000    # For a thread that does not call the target function or calls it infrequently, 
+                                  # this variable adjusts the maximum waiting time (in nanoseconds) for the continue signal.
 
 ```
 

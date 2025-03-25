@@ -22,6 +22,7 @@ extern float peak_detach_cost;
 extern float target_profile_ratio;
 extern gboolean reattach_enable;
 extern unsigned int post_wait_interval;
+extern unsigned int sig_cont_wait_interval;
 static gulong peak_detach_count = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -55,7 +56,6 @@ void pthread_pause_handler(int signal)
     //Suspend if needed
     if (signal == PEAK_SIG_STOP) {
         sigset_t new_mask, original_mask, wait_set;
-        struct timespec timeout;
 
         // Block all signals except PEAK_SIG_CONT
         sigfillset(&new_mask);
@@ -68,9 +68,17 @@ void pthread_pause_handler(int signal)
         sigemptyset(&wait_set);
         sigaddset(&wait_set, PEAK_SIG_CONT);
 
-        // Set the timeout (e.g., 5 seconds)
-        timeout.tv_sec = post_wait_interval;  // Adjust as needed
-        timeout.tv_nsec = 0;
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        // in nanoseconds
+        timeout.tv_sec += sig_cont_wait_interval / 1000000000;
+        timeout.tv_nsec += sig_cont_wait_interval % 1000000000;
+
+        // ts.tv_nsec overflow
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec += 1;
+            timeout.tv_nsec -= 1000000000;
+        }
 
         // Wait for the signal with timeout
         sigtimedwait(&wait_set, NULL, &timeout);
@@ -140,7 +148,15 @@ void pthread_pause_disable()
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += post_wait_interval;
+    // in nanoseconds
+    ts.tv_sec += post_wait_interval / 1000000000;
+    ts.tv_nsec += post_wait_interval % 1000000000;
+
+    // ts.tv_nsec overflow
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
 
     if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
         sem_post(&pthread_pause_sem);
@@ -160,7 +176,16 @@ int pthread_pause(pthread_t thread)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += post_wait_interval;
+
+    // in nanoseconds
+    ts.tv_sec += post_wait_interval / 1000000000;
+    ts.tv_nsec += post_wait_interval % 1000000000;
+
+    // ts.tv_nsec overflow
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
 
     if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
         sem_post(&pthread_pause_sem);
@@ -177,7 +202,16 @@ int pthread_unpause(pthread_t thread)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += post_wait_interval;
+
+    // in nanoseconds
+    ts.tv_sec += post_wait_interval / 1000000000;
+    ts.tv_nsec += post_wait_interval % 1000000000;
+
+    // ts.tv_nsec overflow
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
 
     if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
         sem_post(&pthread_pause_sem);

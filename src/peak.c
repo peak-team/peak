@@ -12,17 +12,18 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV             "PEAK_TARGET"
-#define PEAK_TARGET_CONFIG_ENV      "PEAK_TARGET_CONFIG_ENV"
-#define PEAK_TARGET_CONFIG          "PEAK_TARGET_CONFIG"
-#define PEAK_TARGET_DELIM           ','
-#define PEAK_COST_ENV               "PEAK_COST"
-#define HEARTBEAT_TIME_ENV          "HEARTBEAT_TIME"
-#define CHECK_INTERVAL_ENV          "CHECK_INTERVAL"
-#define TARGET_PROFILE_RATIO_ENV    "TARGET_PROFILE_RATIO"
-#define REATTACH_ENABLE_ENV         "REATTACH_ENABLE"
-#define POST_INTERVAL_ENV         "POST_INTERVAL"
-#define PPID_FILE_NAME              "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_ENV                 "PEAK_TARGET"
+#define PEAK_TARGET_FILE_ENV            "PEAK_TARGET_FILE"
+#define PEAK_TARGET_GROUP_ENV           "PEAK_TARGET_GROUP"
+#define PEAK_TARGET_DELIM               ','
+#define PEAK_COST_ENV                   "PEAK_COST"
+#define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
+#define PEAK_HIBERNATION_CYCLE_ENV      "PEAK_HIBERNATION_CYCLE"
+#define PEAK_OVERHEAD_RATIO_ENV         "PEAK_OVERHEAD_RATIO"
+#define PEAK_ENABLE_REATTACH_ENV        "PEAK_ENABLE_REATTACH"
+#define PEAK_PAUSE_TIMEOUT_ENV          "PEAK_PAUSE_TIMEOUT"
+#define PEAK_SIG_CONT_TIMEOUT_ENV       "PEAK_SIG_CONT_TIMEOUT"
+#define PPID_FILE_NAME                  "/tmp/lock_peak_ppid_list"
 
 
 gboolean* peak_need_detach;
@@ -35,6 +36,7 @@ size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
 unsigned int post_wait_interval;
+unsigned int sig_cont_wait_interval;
 float target_profile_ratio;
 gboolean reattach_enable;
 char** peak_hook_strings;
@@ -51,14 +53,15 @@ void peak_init()
 
     peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
-    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_CONFIG_ENV, &peak_hook_strings, peak_hook_address_count);
-    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_CONFIG, &peak_hook_strings, peak_hook_address_count);
+    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
+    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
-    heartbeat_time = parse_env_to_time(HEARTBEAT_TIME_ENV);
-    check_interval = parse_env_to_interval(CHECK_INTERVAL_ENV);
-    target_profile_ratio = parse_env_to_float(TARGET_PROFILE_RATIO_ENV);
-    reattach_enable = parse_env_to_bool(REATTACH_ENABLE_ENV);
-    post_wait_interval = parse_env_to_post_interval(POST_INTERVAL_ENV);
+    heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
+    check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
+    target_profile_ratio = parse_env_to_float(PEAK_OVERHEAD_RATIO_ENV);
+    reattach_enable = parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
+    post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
+    sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
 
     //gum_init_embedded();
 
