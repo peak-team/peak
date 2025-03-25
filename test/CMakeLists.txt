@@ -61,7 +61,7 @@ if(BUILD_TESTING)
     add_test(NAME test_target_config COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_target_config 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_CONFIG=BLAS;${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET_GROUP=BLAS;${PRELOAD_VAR}"
     )
     set_tests_properties(test_target_config 
         PROPERTIES 
@@ -72,7 +72,7 @@ if(BUILD_TESTING)
     add_test(NAME test_config_file COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_config_file 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_CONFIG_ENV=${PEAK_TARGET_CONFIG_PATH};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET_FILE=${PEAK_TARGET_CONFIG_PATH};${PRELOAD_VAR}"
     )
     set_tests_properties(test_config_file 
         PROPERTIES 
