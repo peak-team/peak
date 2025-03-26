@@ -19,6 +19,9 @@
 #define PEAK_TARGET_ENV                 "PEAK_TARGET"
 #define PEAK_TARGET_FILE_ENV            "PEAK_TARGET_FILE"
 #define PEAK_TARGET_GROUP_ENV           "PEAK_TARGET_GROUP"
+#define PEAK_GPU_TARGET_ENV             "PEAK_GPU_TARGET"
+#define PEAK_GPU_TARGET_FILE_ENV        "PEAK_GPU_TARGET_FILE"
+#define PEAK_GPU_TARGET_GROUP           "PEAK_GPU_TARGET_GROUP"
 #define PEAK_TARGET_DELIM               ','
 #define PEAK_COST_ENV                   "PEAK_COST"
 #define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
@@ -43,7 +46,9 @@ unsigned int post_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
 gboolean reattach_enable;
+size_t peak_gpu_hook_address_count;
 char** peak_hook_strings;
+char** peak_gpu_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
 float peak_detach_cost;
@@ -59,6 +64,9 @@ void peak_init()
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
+    peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
+    peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
+    peak_gpu_hook_address_count += load_symbols_from_array(PEAK_GPU_TARGET_GROUP, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
