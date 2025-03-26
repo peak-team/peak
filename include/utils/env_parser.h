@@ -68,15 +68,19 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
 float parse_env_to_float(const char* env_var);
 
 /**
- * @brief Parses an unsigned integer time value from an environment variable.
+ * @brief Parses a time value in seconds from an environment variable and converts it to microseconds.
  *
  * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as an unsigned integer using the standard library
- * function strtoul(). If the environment variable is not set, is empty, or 
- * contains invalid characters, a default value of 1000000 is returned.
+ * and attempts to parse it as a floating-point number using the standard 
+ * library function strtod(). The parsed value, representing seconds, is then
+ * converted to microseconds (µs) by multiplying by 1e6. 
+ *
+ * If the environment variable is not set, is empty, contains invalid characters, 
+ * or results in an out-of-range value, a default value of 100000 (0.1 seconds) 
+ * is returned.
  *
  * @param env_var The name of the environment variable to parse.
- * @return The parsed unsigned integer value, or 1000000 if parsing fails.
+ * @return The parsed time value in microseconds (µs), or 100000 (0.1 seconds) if parsing fails.
  */
 unsigned int parse_env_to_time(const char* env_var);
 
@@ -93,16 +97,20 @@ unsigned int parse_env_to_time(const char* env_var);
  */
 unsigned int parse_env_to_interval(const char* env_var);
 
-/**
- * @brief Parses an unsigned integer interval value (in nanoseconds) from an environment variable.
+ /**
+ * @brief Parses a time value in seconds from an environment variable and converts it to nanoseconds.
  *
  * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as an unsigned integer using the standard library
- * function strtoul(). If the environment variable is not set, is empty, or 
- * contains invalid characters, a default value of 10000000 is returned.
+ * and attempts to parse it as a floating-point number using the standard 
+ * library function strtod(). The parsed value, representing seconds, is then
+ * converted to nanoseconds (ns) by multiplying by 1e6. 
+ *
+ * If the environment variable is not set, is empty, contains invalid characters, 
+ * or results in an out-of-range value, a default value of 10000000 (0.01 seconds) 
+ * is returned.
  *
  * @param env_var The name of the environment variable to parse.
- * @return The parsed unsigned integer value, or 10000000 if parsing fails.
+ * @return The parsed time value in nanoseconds (ns), or 10000000 (0.01 seconds) if parsing fails.
  */
 unsigned int parse_env_to_post_interval(const char* env_var);
 

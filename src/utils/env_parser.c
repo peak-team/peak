@@ -191,16 +191,18 @@ float parse_env_to_float(const char* env_var)
 unsigned int parse_env_to_time(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {
-        return 1000000;
+        return 100000;
     }
 
     char* endptr;
-    errno = 0; 
-    unsigned int result = strtoul(varvalue, &endptr, 10);\
-    if (errno == ERANGE || result > UINT_MAX || *endptr != '\0') {
-        return 1000000;
+    errno = 0;
+    double seconds = strtod(varvalue, &endptr);
+
+    if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
+        return 100000;
     }
-    return (unsigned int)result;
+
+    return (unsigned int)(seconds * 1e6);
 }
 
 unsigned int parse_env_to_interval(const char* env_var) {
@@ -221,16 +223,18 @@ unsigned int parse_env_to_interval(const char* env_var) {
 unsigned int parse_env_to_post_interval(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {
-        return 10000000; // 0.01s
+        return 10000000;
     }
 
     char* endptr;
-    errno = 0; 
-    unsigned int result = strtoul(varvalue, &endptr, 10);
-    if (errno == ERANGE || result > UINT_MAX || *endptr != '\0') {
+    errno = 0;
+    double seconds = strtod(varvalue, &endptr);
+
+    if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
         return 10000000;
     }
-    return (unsigned int)result;
+
+    return (unsigned int)(seconds * 1e9);
 }
 
 bool parse_env_to_bool(const char* env_var) {
