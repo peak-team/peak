@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <pthread.h>
 #include <string.h>
+#include <demangle.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
