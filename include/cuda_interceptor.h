@@ -7,11 +7,11 @@
  */
 
 #include "frida-gum.h"
+#include "utils/demangle.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <pthread.h>
 #include <string.h>
-#include <demangle.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>

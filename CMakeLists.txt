@@ -91,29 +91,6 @@ else()
     message(WARNING "CUDA not found. Skipping CUDA-related features.")
 endif()
 
-# Find libiberty
-find_path(LIBIBERTY_INCLUDE_DIR
-    NAMES demangle.h
-    PATH_SUFFIXES include include/libiberty
-)
-
-find_library(LIBIBERTY_LIB
-    NAMES iberty libiberty.a
-    PATH_SUFFIXES lib lib64
-)
-
-include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(Libiberty
-    REQUIRED_VARS LIBIBERTY_LIB LIBIBERTY_INCLUDE_DIR
-    HANDLE_COMPONENTS
-)
-
-if (Libiberty_FOUND)
-    message(STATUS "Found libiberty: ${LIBIBERTY_LIB}")
-else()
-    message(FATAL_ERROR "libiberty not found.")
-endif()
-
 add_subdirectory(src)
 
 # Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests
