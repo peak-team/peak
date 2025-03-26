@@ -49,6 +49,7 @@ target_include_directories(peak
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
+        ${LIBIBERTY_INCLUDE_DIR}
 )
 
 target_link_libraries(peak
@@ -59,6 +60,7 @@ target_link_libraries(peak
         ${RT_LIBRARY}
         ${RESOLV_LIBRARY}
         ${M_LIBRARY}
+        ${LIBIBERTY_LIB}
 )
 
 if(MPI_FOUND)
