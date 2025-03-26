@@ -5,8 +5,8 @@ static GMutex cuda_kernel_local_dim_mapping_mutex;
 static GumInterceptor* cuda_interceptor;
 static gpointer* hook_cuda_launch;
 static gpointer* hook_cu_launch;
-extern size_t peak_hook_address_count;
-extern char** peak_hook_strings;
+extern size_t peak_gpu_hook_address_count;
+extern size_t peak_gpu_hook_strings;
 
 static cudaError_t (*original_cuda_launch_kernel)(
     const void* func, dim3 gridDim, dim3 blockDim,
@@ -83,8 +83,8 @@ static cudaError_t peak_cuda_launch_kernel(
 
     // TODO: compare name
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (g_strcmp0(peak_hook_strings[i], kernel_name) == 0) {
+    for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
+        if (g_strcmp0(peak_gpu_hook_strings[i], kernel_name) == 0) {
             gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
             gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
             gulong block_size = blockDim.x * blockDim.y * blockDim.z;
@@ -107,8 +107,8 @@ static CUresult peak_cu_launch_kernel(
     
     // TODO: compare name
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (g_strcmp0(peak_hook_strings[i], kernel_name) == 0) {
+    for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
+        if (g_strcmp0(peak_gpu_hook_strings[i], kernel_name) == 0) {
             gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
             gulong grid_size = gridDimX * gridDimY * gridDimZ;
             gulong block_size = blockDimX * blockDimY * blockDimZ;
