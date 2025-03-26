@@ -6,7 +6,7 @@ static GumInterceptor* cuda_interceptor;
 static gpointer* hook_cuda_launch;
 static gpointer* hook_cu_launch;
 extern size_t peak_gpu_hook_address_count;
-extern size_t peak_gpu_hook_strings;
+extern char** peak_gpu_hook_strings;
 
 static cudaError_t (*original_cuda_launch_kernel)(
     const void* func, dim3 gridDim, dim3 blockDim,
@@ -70,27 +70,26 @@ static void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads,
     }
 
     g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
-    g_free(kernel_name);
+    free(kernel_name);
 }
-
-// TODO: demangle function
 
 static cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
+    gchar* demangled_kernel_name = (gchar*)cplus_demangle(kernel_name, DMGL_AUTO);
 
-    // TODO: compare name
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
     for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
-        if (g_strcmp0(peak_gpu_hook_strings[i], kernel_name) == 0) {
+        if (g_strcmp0(peak_gpu_hook_strings[i], demangled_kernel_name) == 0) {
             gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
             gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
             gulong block_size = blockDim.x * blockDim.y * blockDim.z;
-            insert_cuda_mapping_record(kernel_name, total_threads, grid_size, block_size);
+            insert_cuda_mapping_record(demangled_kernel_name, total_threads, grid_size, block_size);
         }
     }
+    g_free(kernel_name);
 
     return original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
@@ -104,17 +103,18 @@ static CUresult peak_cu_launch_kernel(
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
+    gchar* demangled_kernel_name = cplus_demangle(kernel_name, DMGL_AUTO);
     
-    // TODO: compare name
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
     for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
-        if (g_strcmp0(peak_gpu_hook_strings[i], kernel_name) == 0) {
+        if (g_strcmp0(peak_gpu_hook_strings[i], demangled_kernel_name) == 0) {
             gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
             gulong grid_size = gridDimX * gridDimY * gridDimZ;
             gulong block_size = blockDimX * blockDimY * blockDimZ;
-            insert_cuda_mapping_record(kernel_name, total_threads, grid_size, block_size);
+            insert_cuda_mapping_record(demangled_kernel_name, total_threads, grid_size, block_size);
         }
     }
+    g_free(kernel_name);
 
     return original_cu_launch_kernel(func, gridDimX, gridDimY, gridDimZ,
                                      blockDimX, blockDimY, blockDimZ,
@@ -166,9 +166,9 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     GHashTableIter iter;
     gpointer key, value;
 
-    guint row_width = 88;
-    guint max_function_width = 20;
-    guint max_col_width = 10;
+    guint row_width = 80;
+    guint max_function_width = 15;
+    guint max_col_width = 7;
     char* space_separator = malloc(row_width + 1);
     char* row_separator = malloc(row_width + 1);
     memset(space_separator, ' ', row_width);

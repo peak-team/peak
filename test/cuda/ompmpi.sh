@@ -12,5 +12,6 @@ rm ompmpi.log test_ompmpi
 mpicxx -fopenmp -o test_ompmpi test_ompmpi.cu -L$CUDA_LIB_PATH -lcudart -I$CUDA_INCLUDE_PATH -fPIC --std=c++17
 
 # Run the OpenMP MPI program with LD_PRELOAD
-export PEAK_TARGET=_Z7kernel1mib,_Z7kernel2mib,_Z7kernel3mib,_Z7kernel4mib,_Z7kernel5mib
-LD_PRELOAD=$LD_PRELOAD_PATH mpirun -N 2 ./test_ompmpi --verbose --random > ompmpi.log
+export PEAK_TARGET=run_kernel
+export PEAK_GPU_TARGET=kernel1,kernel2,kernel3,kernel4,kernel5
+LD_PRELOAD=$LD_PRELOAD_PATH mpirun -np 2 ./test_ompmpi --verbose --random > ompmpi.log
