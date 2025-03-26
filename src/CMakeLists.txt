@@ -20,28 +20,32 @@ if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
         SHARED 
             ${sources_peak}
             ${sources_peak_mpi}
-	    ${sources_peak_cuda}
-            $<TARGET_OBJECTS:utils>  
+	        ${sources_peak_cuda}
+            $<TARGET_OBJECTS:utils_c>
+            $<TARGET_OBJECTS:utils_cxx>  
     )
 elseif (MPI_FOUND)
     add_library(peak
 	SHARED
 	    ${sources_peak}
 	    ${sources_peak_mpi}
-	    $<TARGET_OBJECTS:utils>
+	    $<TARGET_OBJECTS:utils_c>
+        $<TARGET_OBJECTS:utils_cxx>
     )
 elseif (CUDA_FOUND OR CUDAToolkit_FOUND)
     add_library(peak
 	SHARED
 	    ${sources_peak}
 	    ${sources_peak_cuda}
-	    $<TARGET_OBJECTS:utils>
+	    $<TARGET_OBJECTS:utils_c>
+        $<TARGET_OBJECTS:utils_cxx>
     )
 else()
     add_library(peak 
         SHARED 
             ${sources_peak}
-            $<TARGET_OBJECTS:utils>  
+            $<TARGET_OBJECTS:utils_c>  
+            $<TARGET_OBJECTS:utils_cxx>
     )
 endif()
 
