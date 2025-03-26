@@ -19,12 +19,17 @@
 #define PEAK_TARGET_ENV            "PEAK_TARGET"
 #define PEAK_TARGET_CONFIG_ENV     "PEAK_TARGET_CONFIG_ENV"
 #define PEAK_TARGET_CONFIG         "PEAK_TARGET_CONFIG"
+#define PEAK_GPU_TARGET_ENV        "PEAK_GPU_TARGET"
+#define PEAK_GPU_TARGET_CONFIG_ENV "PEAK_GPU_TARGET_CONFIG_ENV"
+#define PEAK_GPU_TARGET_CONFIG     "PEAK_GPU_TARGET_CONFIG"
 #define PEAK_TARGET_DELIM          ','
 #define PEAK_COST_ENV              "PEAK_COST"
 #define PPID_FILE_NAME             "/tmp/lock_peak_ppid_list"
 
 size_t peak_hook_address_count;
+size_t peak_gpu_hook_address_count;
 char** peak_hook_strings;
+char** peak_gpu_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
 float peak_detach_cost;
@@ -40,6 +45,9 @@ void peak_init()
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_CONFIG_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_CONFIG, &peak_hook_strings, peak_hook_address_count);
+    peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
+    peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_CONFIG_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
+    peak_gpu_hook_address_count += load_symbols_from_array(PEAK_GPU_TARGET_CONFIG, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
 
     //gum_init_embedded();
