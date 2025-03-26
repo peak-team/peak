@@ -78,7 +78,7 @@ static cudaError_t peak_cuda_launch_kernel(
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    gchar* demangled_kernel_name = (gchar*)cplus_demangle(kernel_name, DMGL_AUTO);
+    gchar* demangled_kernel_name = (gchar*)demangle(kernel_name);
 
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
     for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
@@ -103,7 +103,7 @@ static CUresult peak_cu_launch_kernel(
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    gchar* demangled_kernel_name = cplus_demangle(kernel_name, DMGL_AUTO);
+    gchar* demangled_kernel_name = (gchar*)demangle(kernel_name);
     
     // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
     for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
