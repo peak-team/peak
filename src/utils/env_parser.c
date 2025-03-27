@@ -220,10 +220,10 @@ unsigned int parse_env_to_interval(const char* env_var) {
     return (unsigned int)result;
 }
 
-unsigned int parse_env_to_post_interval(const char* env_var) {
+unsigned long long parse_env_to_post_interval(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {
-        return 10000000;
+        return 10000000ULL;
     }
 
     char* endptr;
@@ -231,10 +231,10 @@ unsigned int parse_env_to_post_interval(const char* env_var) {
     double seconds = strtod(varvalue, &endptr);
 
     if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
-        return 10000000;
+        return 10000000ULL;
     }
 
-    return (unsigned int)(seconds * 1e9);
+    return (unsigned long long)(seconds * 1e9);
 }
 
 bool parse_env_to_bool(const char* env_var) {

@@ -112,7 +112,7 @@ unsigned int parse_env_to_interval(const char* env_var);
  * @param env_var The name of the environment variable to parse.
  * @return The parsed time value in nanoseconds (ns), or 10000000 (0.01 seconds) if parsing fails.
  */
-unsigned int parse_env_to_post_interval(const char* env_var);
+unsigned long long parse_env_to_post_interval(const char* env_var);
 
 /**
  * @brief Parses a boolean value from an environment variable.

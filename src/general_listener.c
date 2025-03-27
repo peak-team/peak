@@ -22,7 +22,7 @@ extern float peak_detach_cost;
 extern float target_profile_ratio;
 extern gboolean reattach_enable;
 extern unsigned int post_wait_interval;
-extern unsigned int sig_cont_wait_interval;
+extern unsigned long long sig_cont_wait_interval;
 static gulong peak_detach_count = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 

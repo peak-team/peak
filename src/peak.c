@@ -36,7 +36,7 @@ size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
 unsigned int post_wait_interval;
-unsigned int sig_cont_wait_interval;
+unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
 gboolean reattach_enable;
 char** peak_hook_strings;
