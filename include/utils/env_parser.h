@@ -10,6 +10,9 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 
 /**
  * @brief Splits a string into an array of substrings based on a given delimiter.
@@ -63,6 +66,66 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
  *         variable is not set, is empty, or contains invalid characters.
  */
 float parse_env_to_float(const char* env_var);
+
+/**
+ * @brief Parses a time value in seconds from an environment variable and converts it to microseconds.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as a floating-point number using the standard 
+ * library function strtod(). The parsed value, representing seconds, is then
+ * converted to microseconds (µs) by multiplying by 1e6. 
+ *
+ * If the environment variable is not set, is empty, contains invalid characters, 
+ * or results in an out-of-range value, a default value of 100000 (0.1 seconds) 
+ * is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed time value in microseconds (µs), or 100000 (0.1 seconds) if parsing fails.
+ */
+unsigned int parse_env_to_time(const char* env_var);
+
+/**
+ * @brief Parses an unsigned integer interval value from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as an unsigned integer using the standard library
+ * function strtoul(). If the environment variable is not set, is empty, or 
+ * contains invalid characters, a default value of 5 is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed unsigned integer value, or 5 if parsing fails.
+ */
+unsigned int parse_env_to_interval(const char* env_var);
+
+ /**
+ * @brief Parses a time value in seconds from an environment variable and converts it to nanoseconds.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as a floating-point number using the standard 
+ * library function strtod(). The parsed value, representing seconds, is then
+ * converted to nanoseconds (ns) by multiplying by 1e6. 
+ *
+ * If the environment variable is not set, is empty, contains invalid characters, 
+ * or results in an out-of-range value, a default value of 10000000 (0.01 seconds) 
+ * is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed time value in nanoseconds (ns), or 10000000 (0.01 seconds) if parsing fails.
+ */
+unsigned long long parse_env_to_post_interval(const char* env_var);
+
+/**
+ * @brief Parses a boolean value from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and interprets it as a boolean. The function returns true if the value 
+ * is "true" (case-insensitive) or "1", and false otherwise. If the environment 
+ * variable is not set, false is returned by default.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed boolean value, or false if parsing fails.
+ */
+bool parse_env_to_bool(const char* env_var);
 
 /**
  * @brief Frees the memory allocated by parse_env_w_delim function.

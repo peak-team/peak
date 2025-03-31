@@ -12,14 +12,33 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV            "PEAK_TARGET"
-#define PEAK_TARGET_CONFIG_ENV     "PEAK_TARGET_CONFIG_ENV"
-#define PEAK_TARGET_CONFIG         "PEAK_TARGET_CONFIG"
-#define PEAK_TARGET_DELIM          ','
-#define PEAK_COST_ENV              "PEAK_COST"
-#define PPID_FILE_NAME             "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_ENV                 "PEAK_TARGET"
+#define PEAK_TARGET_FILE_ENV            "PEAK_TARGET_FILE"
+#define PEAK_TARGET_GROUP_ENV           "PEAK_TARGET_GROUP"
+#define PEAK_TARGET_DELIM               ','
+#define PEAK_COST_ENV                   "PEAK_COST"
+#define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
+#define PEAK_HIBERNATION_CYCLE_ENV      "PEAK_HIBERNATION_CYCLE"
+#define PEAK_OVERHEAD_RATIO_ENV         "PEAK_OVERHEAD_RATIO"
+#define PEAK_ENABLE_REATTACH_ENV        "PEAK_ENABLE_REATTACH"
+#define PEAK_PAUSE_TIMEOUT_ENV          "PEAK_PAUSE_TIMEOUT"
+#define PEAK_SIG_CONT_TIMEOUT_ENV       "PEAK_SIG_CONT_TIMEOUT"
+#define PPID_FILE_NAME                  "/tmp/lock_peak_ppid_list"
 
+
+gboolean* peak_need_detach;
+gdouble* heartbeat_overhead;
+gboolean** peak_target_thread_called;
+PeakHeartbeatArgs* args;
+extern gboolean heartbeat_running;
+pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
+unsigned int heartbeat_time;
+unsigned int check_interval;
+unsigned int post_wait_interval;
+unsigned long long sig_cont_wait_interval;
+float target_profile_ratio;
+gboolean reattach_enable;
 char** peak_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
@@ -34,9 +53,15 @@ void peak_init()
 
     peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
-    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_CONFIG_ENV, &peak_hook_strings, peak_hook_address_count);
-    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_CONFIG, &peak_hook_strings, peak_hook_address_count);
+    peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
+    peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
+    heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
+    check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
+    target_profile_ratio = parse_env_to_float(PEAK_OVERHEAD_RATIO_ENV);
+    reattach_enable = parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
+    post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
+    sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
 
     //gum_init_embedded();
 
@@ -55,12 +80,36 @@ void peak_init()
 #endif
     // general listener needs to be after pthread and mpi ones
     peak_general_listener_attach();
+    peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
+    }
+    peak_need_detach = g_new0(gboolean, peak_hook_address_count);
+    heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
+    args = g_new0(PeakHeartbeatArgs, 1);
+    args->heartbeat_time = heartbeat_time;
+    args->check_interval = check_interval;
+    // create heartbeat thread
+    if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, NULL) != 0) {
+        perror("Failed to create heartbeat thread");
+        g_free(args);
+        exit(EXIT_FAILURE);
+    }
     peak_main_time = peak_second();
 }
 
 void peak_fini()
 {
+    heartbeat_running = false;
+    pthread_join(heartbeat_thread, NULL);
     peak_main_time = peak_second() - peak_main_time;
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        g_free(peak_target_thread_called[i]);
+    }
+    g_free(peak_target_thread_called);
+    g_free(peak_need_detach);
+    g_free(args);
+
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);

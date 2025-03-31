@@ -36,6 +36,7 @@ int main(int argc, char** argv)
     MPI_Allreduce(C, D, N * N, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     if (rank == 0)
         printf("Test is done, D[0][0] = %f\n", D[0]);
+    free(D);
     MPI_Finalize();
     return 0;
 }

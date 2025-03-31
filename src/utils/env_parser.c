@@ -188,6 +188,67 @@ float parse_env_to_float(const char* env_var)
     return result;
 }
 
+unsigned int parse_env_to_time(const char* env_var) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return 100000;
+    }
+
+    char* endptr;
+    errno = 0;
+    double seconds = strtod(varvalue, &endptr);
+
+    if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
+        return 100000;
+    }
+
+    return (unsigned int)(seconds * 1e6);
+}
+
+unsigned int parse_env_to_interval(const char* env_var) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return 5;
+    }
+
+    char* endptr;
+    errno = 0; 
+    unsigned int result = strtoul(varvalue, &endptr, 10);
+    if (errno == ERANGE || result > UINT_MAX || *endptr != '\0') {
+        return 5;
+    }
+    return (unsigned int)result;
+}
+
+unsigned long long parse_env_to_post_interval(const char* env_var) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return 10000000ULL;
+    }
+
+    char* endptr;
+    errno = 0;
+    double seconds = strtod(varvalue, &endptr);
+
+    if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
+        return 10000000ULL;
+    }
+
+    return (unsigned long long)(seconds * 1e9);
+}
+
+bool parse_env_to_bool(const char* env_var) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return false;
+    }
+    
+    if (strcasecmp(varvalue, "true") == 0 || strcmp(varvalue, "1") == 0) {
+        return true;
+    }
+    return false;
+}
+
 void free_parsed_result(char** result, size_t count)
 {
     for (size_t i = 0; i < count; i++) {
