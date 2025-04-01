@@ -1,12 +1,9 @@
-#ifndef CUDA_UTILS_H
-#define CUDA_UTILS_H
+#ifndef CXX_UTILS_H
+#define CXX_UTILS_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <cuda.h>
-#include <cuda_runtime_api.h>
 
 /**
  * Demangles a C++ mangled symbol name.
@@ -21,4 +18,4 @@ char* demangle(const char* mangled_name);
 }
 #endif
 
-#endif // CUDA_UTILS_H
+#endif // CXX_UTILS_H
