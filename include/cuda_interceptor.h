@@ -7,9 +7,9 @@
  */
 
 #include "frida-gum.h"
-#include "utils/demangle.h"
+#include "utils/cuda_utils.h"
 #include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 #include <pthread.h>
 #include <string.h>
 
