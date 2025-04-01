@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
-project(peak C CXX CUDA Fortran)
+project(peak C CXX Fortran)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")
@@ -78,11 +78,13 @@ else()
     find_package(CUDAToolkit)
 endif()
 if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
     message(STATUS "CUDA ToolKit found: ${CUDAToolkit_VERSION}")
     add_definitions(-DHAVE_CUDA)
     include_directories(${CUDAToolkit_INCLUDE_DIRS})
     set_source_files_properties(src/cuda_interceptor.c PROPERTIES LANGUAGE CUDA)
 elseif(CUDA_FOUND)
+    enable_language(CUDA)
     message(STATUS "CUDA found: ${CUDA_VERSION}")
     add_definitions(-DHAVE_CUDA)
     include_directories(${CUDA_INCLUDE_DIRS})
