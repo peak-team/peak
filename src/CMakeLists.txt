@@ -74,12 +74,12 @@ if(MPI_FOUND)
     )
 endif()
 
-if(CUDA_FOUND OR CUDAToolkit_FOUND)
-    target_link_libraries(peak
-        PRIVATE
-            ${CUDA_LIBRARIES}
-            ${CUDAToolkit_LIBRARY_DIR}
-    )
+if(CUDA_FOUND)
+    target_link_libraries(peak PRIVATE ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.so)
+    target_link_options(peak PRIVATE -Wl,-rpath,${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+elseif(CUDAToolkit_FOUND)
+    target_link_libraries(peak PRIVATE CUDA::cudart)
+    target_link_options(peak PRIVATE -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR})
 endif()
 
 install (TARGETS peak DESTINATION lib)

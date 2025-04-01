@@ -14,4 +14,4 @@ mpicxx -fopenmp -o test_ompmpi test_ompmpi.cu -L$CUDA_LIB_PATH -lcudart -I$CUDA_
 # Run the OpenMP MPI program with LD_PRELOAD
 export PEAK_TARGET=run_kernel
 export PEAK_GPU_TARGET=kernel1,kernel2,kernel3,kernel4,kernel5
-LD_PRELOAD=$LD_PRELOAD_PATH mpirun -np 2 ./test_ompmpi --verbose --random > ompmpi.log
+LD_PRELOAD=$LD_PRELOAD_PATH mpirun -np 2 ./test_ompmpi --num_calls 100 > ompmpi.log
