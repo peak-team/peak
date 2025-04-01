@@ -44,6 +44,11 @@ PEAK_PAUSE_TIMEOUT=0.01           # For a thread that does not call the target f
 PEAK_SIG_CONT_TIMEOUT=0.01        # For a thread that does not call the target function or calls it infrequently, 
                                   # this variable adjusts the maximum waiting time (in seconds) for the continue signal.
 
+PEAK_GPU_TARGET=kernel1,kernel2   # GPU kernels that will be profiled PEAK_GPU_TARGET_FILE=/path/to/gpu/config/file  
+                                  # Path to a configuration file listing GPU kernel names for profiling (one per line).
+PEAK_GPU_MONITOR_ALL=TRUE         # If set to TRUE, all GPU kernels will be profiled, 
+                                  # regardless of whether they're listed in PEAK_GPU_TARGET or the config file.
+                                  # If set to FALSE or unset, only the listed kernel names will be monitored.
 ```
 
 ## Important Notes
@@ -53,6 +58,9 @@ Append an '\_' to lower case fortran procedure names. For example, Fortran_Proce
 
 2. **PEAK_TARGET_CONFIG and PEAK_TARGET Behavior:**
 These variables are merged, combining their items into a unified list. Duplicate entries should be avoided but will be handled automatically.
+
+3. **GPU Kernel Profiling:**
+GPU profiling includes the warm-up time of kernels and the CUDA initialization overhead associated with the first kernel launch.
 
 ## Reference
 If you use PEAK in your research, please cite the following paper:

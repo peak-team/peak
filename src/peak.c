@@ -21,7 +21,8 @@
 #define PEAK_TARGET_GROUP_ENV           "PEAK_TARGET_GROUP"
 #define PEAK_GPU_TARGET_ENV             "PEAK_GPU_TARGET"
 #define PEAK_GPU_TARGET_FILE_ENV        "PEAK_GPU_TARGET_FILE"
-#define PEAK_GPU_TARGET_GROUP           "PEAK_GPU_TARGET_GROUP"
+// #define PEAK_GPU_TARGET_GROUP_ENV    "PEAK_GPU_TARGET_GROUP"
+#define PEAK_GPU_MONITOR_ALL            "PEAK_GPU_MONITOR_ALL"
 #define PEAK_TARGET_DELIM               ','
 #define PEAK_COST_ENV                   "PEAK_COST"
 #define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
@@ -52,6 +53,7 @@ char** peak_gpu_hook_strings;
 gulong peak_max_num_threads;
 double peak_main_time;
 float peak_detach_cost;
+gboolean peak_gpu_monitor_all = false;
 #ifdef HAVE_MPI
 static int found_MPI;
 static int flag_clean_fppid = 0;
@@ -66,8 +68,10 @@ void peak_init()
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
     peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
-    peak_gpu_hook_address_count += load_symbols_from_array(PEAK_GPU_TARGET_GROUP, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
+    // TODO: add pre-defined kernels in the future: CUBLAS
+    // peak_gpu_hook_address_count += load_symbols_from_array(PEAK_GPU_TARGET_GROUP, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
+    peak_gpu_monitor_all = parse_env_to_bool(PEAK_GPU_MONITOR_ALL);
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
     target_profile_ratio = parse_env_to_float(PEAK_OVERHEAD_RATIO_ENV);
