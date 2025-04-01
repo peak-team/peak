@@ -188,6 +188,20 @@ float parse_env_to_float(const char* env_var)
     return result;
 }
 
+bool parse_env_to_boolean(const char* env_var)
+{
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return false;
+    }
+
+    if (strcasecmp(varvalue, "true") == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 void free_parsed_result(char** result, size_t count)
 {
     for (size_t i = 0; i < count; i++) {

@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /**
  * @brief Splits a string into an array of substrings based on a given delimiter.
@@ -63,6 +64,19 @@ size_t load_symbols_from_array(const char* env_var, char*** result, size_t exist
  *         variable is not set, is empty, or contains invalid characters.
  */
 float parse_env_to_float(const char* env_var);
+
+/**
+ * @brief Parses a boolean from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a boolean using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed boolean value, or false if the environment
+ *         variable is not set, is empty, or contains invalid characters.
+ */
+ bool parse_env_to_boolean(const char* env_var);
 
 /**
  * @brief Frees the memory allocated by parse_env_w_delim function.
