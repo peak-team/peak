@@ -228,75 +228,87 @@ void cuda_interceptor_dettach()
 
 static void cuda_interceptor_print_result(GHashTable* hashTable)
 {
+    gboolean have_output = FALSE;
     GHashTableIter iter;
     gpointer key, value;
 
-    guint row_width = 80;
-    guint max_function_width = 15;
-    guint max_col_width = 9;
-    char* space_separator = malloc(row_width + 1);
-    char* row_separator = malloc(row_width + 1);
-    memset(space_separator, ' ', row_width);
-    memset(row_separator, '-', row_width);
-    space_separator[row_width] = '\0';
-    row_separator[row_width] = '\0';
-
-    g_printerr("\n%.*s\n", row_width, row_separator);
-    g_printerr("%.*s GPU Statistics %.*s\n", (row_width - 16) / 2, space_separator, (row_width - 16) / 2, space_separator);
-    g_printerr("%.*s\n", row_width, row_separator);
-    g_printerr("\n%.*s kernel statistics (gpu) %.*s\n", (row_width - 25) / 2 + 1, row_separator, (row_width - 25) / 2, row_separator);
-    
-    g_printerr(" kernel call count & time\n");
-    g_printerr("%.*s\n", row_width, row_separator);
-    g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
-        max_function_width, "kernel",
-        max_col_width, "call",
-        max_col_width, "total",
-        max_col_width, "max",
-        max_col_width, "min");
-    g_printerr("%.*s\n", row_width, row_separator);
     g_hash_table_iter_init(&iter, hashTable);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         KernelDimInfo* dim_info = value;
-        g_printerr("|%*s|%*lu|%*.6f|%*.6f|%*.6f|\n",
-            max_function_width, key,
-            max_col_width, dim_info->total_kernel_call_cnt,
-            max_col_width, dim_info->total_time,
-            max_col_width, dim_info->max_time,
-            max_col_width, dim_info->min_time);
+        if (dim_info->total_kernel_call_cnt > 0) {
+            have_output = TRUE;
+            break;
+        }
     }
-    g_printerr("%.*s\n\n", row_width, row_separator);
 
-    g_printerr("%.*s\n", row_width, row_separator);
-    g_printerr(" kernel block & thread size\n");
-    g_printerr("%.*s\n", row_width, row_separator);
-    g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|%*s|\n",
-        max_function_width, "kernel",
-        max_col_width, "ave block",
-        max_col_width, "ave grid",
-        max_col_width, "max block",
-        max_col_width, "min block",
-        max_col_width, "max grid",
-        max_col_width, "min grid"
-    );
-    g_printerr("%.*s\n", row_width, row_separator);
-    g_hash_table_iter_init(&iter, hashTable);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        KernelDimInfo* dim_info = value;
-        g_printerr("|%*s|%*.2f|%*.2f|%*lu|%*lu|%*lu|%*lu|\n",
-            max_function_width, key,
-            max_col_width, (1.0 * dim_info->total_block_size / dim_info->total_kernel_call_cnt),
-            max_col_width, (1.0 * dim_info->total_grid_size / dim_info->total_kernel_call_cnt),
-            max_col_width, dim_info->max_block_size,
-            max_col_width, dim_info->min_block_size,
-            max_col_width, dim_info->max_grid_size,
-            max_col_width, dim_info->min_grid_size
+    if (have_output) {
+        guint row_width = 80;
+        guint max_function_width = 15;
+        guint max_col_width = 9;
+        char* space_separator = malloc(row_width + 1);
+        char* row_separator = malloc(row_width + 1);
+        memset(space_separator, ' ', row_width);
+        memset(row_separator, '-', row_width);
+        space_separator[row_width] = '\0';
+        row_separator[row_width] = '\0';
+
+        g_printerr("\n%.*s\n", row_width, row_separator);
+        g_printerr("%.*s GPU Statistics %.*s\n", (row_width - 16) / 2, space_separator, (row_width - 16) / 2, space_separator);
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("\n%.*s kernel statistics (gpu) %.*s\n", (row_width - 25) / 2 + 1, row_separator, (row_width - 25) / 2, row_separator);
+        
+        g_printerr(" kernel call count & time\n");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
+            max_function_width, "kernel",
+            max_col_width, "call",
+            max_col_width, "total",
+            max_col_width, "max",
+            max_col_width, "min");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_hash_table_iter_init(&iter, hashTable);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            KernelDimInfo* dim_info = value;
+            g_printerr("|%*s|%*lu|%*.6f|%*.6f|%*.6f|\n",
+                max_function_width, key,
+                max_col_width, dim_info->total_kernel_call_cnt,
+                max_col_width, dim_info->total_time,
+                max_col_width, dim_info->max_time,
+                max_col_width, dim_info->min_time);
+        }
+        g_printerr("%.*s\n\n", row_width, row_separator);
+
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr(" kernel block & thread size\n");
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|%*s|\n",
+            max_function_width, "kernel",
+            max_col_width, "ave block",
+            max_col_width, "ave grid",
+            max_col_width, "max block",
+            max_col_width, "min block",
+            max_col_width, "max grid",
+            max_col_width, "min grid"
         );
-    }
-    g_printerr("%.*s\n\n", row_width, row_separator);
+        g_printerr("%.*s\n", row_width, row_separator);
+        g_hash_table_iter_init(&iter, hashTable);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            KernelDimInfo* dim_info = value;
+            g_printerr("|%*s|%*.2f|%*.2f|%*lu|%*lu|%*lu|%*lu|\n",
+                max_function_width, key,
+                max_col_width, (1.0 * dim_info->total_block_size / dim_info->total_kernel_call_cnt),
+                max_col_width, (1.0 * dim_info->total_grid_size / dim_info->total_kernel_call_cnt),
+                max_col_width, dim_info->max_block_size,
+                max_col_width, dim_info->min_block_size,
+                max_col_width, dim_info->max_grid_size,
+                max_col_width, dim_info->min_grid_size
+            );
+        }
+        g_printerr("%.*s\n\n", row_width, row_separator);
 
-    free(space_separator);
-    free(row_separator);
+        free(space_separator);
+        free(row_separator);
+    }
 }
 
 #ifdef HAVE_MPI
