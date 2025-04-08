@@ -57,7 +57,7 @@ void cuda_interceptor_dettach();
  * This function prints the results of the CUDA Interceptor for each kernel launch hook.
  *
  */
-void cuda_interceptor_print();
+void cuda_interceptor_print(int is_MPI);
 
 #endif /* __CUDA_INTERCEPTOR_H */
 

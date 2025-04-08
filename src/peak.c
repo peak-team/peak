@@ -135,7 +135,7 @@ void peak_fini()
     }
     peak_general_listener_print(found_MPI);
     #ifdef HAVE_CUDA
-        cuda_interceptor_print();
+        cuda_interceptor_print(found_MPI);
         cuda_interceptor_dettach();
     #endif
     if (found_MPI)
@@ -143,7 +143,7 @@ void peak_fini()
 #else
     peak_general_listener_print(0);
     #ifdef HAVE_CUDA
-    cuda_interceptor_print();
+    cuda_interceptor_print(0);
     cuda_interceptor_dettach();
     #endif
 #endif
