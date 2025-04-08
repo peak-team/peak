@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     bool enable_logging = false;
     bool randomize = false;
     int num_threads_omp = 4;
-    int num_blocks = 1, num_threads = 32, num_calls = 1, kernel_number = 1;
+    int num_blocks = 1, num_threads = 32, num_calls = 1, kernel_number = 5;
     
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -132,12 +132,12 @@ int main(int argc, char** argv) {
     }
     
     std::vector<KernelConfig> configs;
-    for (int i = 0; i < MAX_KERNELS; ++i) {
+    for (int i = 0; i < kernel_number; ++i) {
         configs.push_back({
             randomize ? dist_blocks(gen) : num_blocks,
             randomize ? dist_threads(gen) : num_threads,
             randomize ? dist_calls(gen) : num_calls,
-            randomize ? dist_kernel(gen) : kernel_number
+            randomize ? dist_kernel(gen) : i+1
         });
     }
     
