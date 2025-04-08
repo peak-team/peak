@@ -410,8 +410,8 @@ cuda_interceptor_reduce_result()
                     existing->max_block_size = max(existing->max_block_size, global_values_array[i].max_block_size);
                     existing->min_block_size = min(existing->min_block_size, global_values_array[i].min_block_size);
                     existing->total_grid_size += global_values_array[i].total_grid_size;
-                    existing->max_block_size = max(existing->max_grid_size, global_values_array[i].max_grid_size);
-                    existing->min_block_size = min(existing->min_grid_size, global_values_array[i].min_grid_size);
+                    existing->max_grid_size = max(existing->max_grid_size, global_values_array[i].max_grid_size);
+                    existing->min_grid_size = min(existing->min_grid_size, global_values_array[i].min_grid_size);
                     existing->total_time += global_values_array[i].total_time;
                     existing->max_time = max(existing->max_time, global_values_array[i].max_time);
                     existing->min_time = min(existing->min_time, global_values_array[i].min_time);
