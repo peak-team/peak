@@ -452,9 +452,13 @@ cuda_interceptor_reduce_result()
 }
 #endif
 
-void cuda_interceptor_print() {
+void cuda_interceptor_print(int is_MPI) {
     #ifdef HAVE_MPI
-        cuda_interceptor_reduce_result();
+        if (is_MPI) {
+            cuda_interceptor_reduce_result();
+        } else {
+            cuda_interceptor_print_result(cuda_kernel_local_dim_mapping);
+        }
     #else
         cuda_interceptor_print_result(cuda_kernel_local_dim_mapping);
     #endif
