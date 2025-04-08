@@ -129,10 +129,6 @@ void peak_fini()
     g_free(peak_need_detach);
     g_free(args);
 
-#ifdef HAVE_CUDA
-    cuda_interceptor_print();
-    cuda_interceptor_dettach();
-#endif
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
