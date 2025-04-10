@@ -45,6 +45,12 @@ PEAK_SIG_CONT_TIMEOUT=0.01        # For a thread that does not call the target f
                                   # this variable adjusts the maximum waiting time (in seconds) for the continue signal.
 
 PEAK_GPU_TARGET=kernel1,kernel2   # GPU kernels that will be profiled
+                                  # Matching is done via string comparison on the demangled kernel name
+                                  # Only the base kernel names are matched
+                                  # Namespaces and template parameters are not included in the matching process
+                                  # e.g.: If your kernel is named void myspace::kernel1<int>(...), 
+                                  # it will still match kernel1 in PEAK_GPU_TARGET.
+
 PEAK_GPU_TARGET_FILE=/path/to/gpu/config/file  
                                   # Path to a configuration file listing GPU kernel names for profiling (one per line).
 PEAK_GPU_MONITOR_ALL=TRUE         # If set to TRUE, all GPU kernels will be profiled, 
