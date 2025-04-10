@@ -10,6 +10,7 @@
 #include "utils/cxx_utils.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <nv_decode.h>
 #include <pthread.h>
 #include <string.h>
 

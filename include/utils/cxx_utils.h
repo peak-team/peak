@@ -6,13 +6,21 @@ extern "C" {
 #endif
 
 /**
- * Demangles a C++ mangled symbol name.
+ * Demangles a C++ mangled symbol name (cxa).
  *
  * @param mangled_name The mangled symbol (e.g., "_Z3fooi").
  * @return A newly allocated string with the demangled name.
  *         Caller must free the returned string using free().
  */
-char* demangle(const char* mangled_name);
+char* cxa_demangle(const char* mangled_name);
+
+/**
+ * Extracts the function name only (without return type, namespace, templates, or parameters).
+ *
+ * @param demangled A demangled C++ function signature.
+ * @return The bare function name (e.g., "MyKernel").
+ */
+char* extract_function_name(const char* demangled);
 
 #ifdef __cplusplus
 }

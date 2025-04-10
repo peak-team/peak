@@ -49,6 +49,20 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
+char* cu_demangle(char* mangled_name) {
+    int status;
+    size_t size = sizeof(char) * 1000;
+    char* demangled_name = (char*)malloc(size);
+    
+    __cu_demangle(mangled_name, demangled_name, &size, &status);
+    if (status == 0) {
+        return demangled_name;
+    }
+
+    free(demangled_name);
+    return mangled_name;
+}
+
 static void update_kernel_map_info(const gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     gchar* key = g_strdup(kernel_name);
@@ -91,18 +105,26 @@ static void update_kernel_map_info(const gchar* kernel_name, gulong total_thread
 void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     if (peak_gpu_monitor_all) {
+        gchar* demangled = cu_demangle(kernel_name);
+        gchar* extract_kernel_name = extract_function_name(demangled);
         g_mutex_lock(&cuda_kernel_local_dim_mapping_mutex);
-        update_kernel_map_info(kernel_name, total_threads, grid_size, block_size, elapsed_sec);
+        update_kernel_map_info(demangled, total_threads, grid_size, block_size, elapsed_sec);
         g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
+        free(demangled);
+        free(extract_kernel_name);
     } else {
         // FIXME: should we use a hash table to do the compare rather than for loop look up each time?
         for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
-            if (g_strcmp0(peak_gpu_hook_strings[i], kernel_name) == 0) {
+            gchar* demangled = cu_demangle(kernel_name);
+            gchar* extract_kernel_name = extract_function_name(demangled);
+            if (g_strcmp0(peak_gpu_hook_strings[i], extract_kernel_name) == 0) {
                 g_mutex_lock(&cuda_kernel_local_dim_mapping_mutex);
-                update_kernel_map_info(kernel_name, total_threads, grid_size, block_size, elapsed_sec);
+                update_kernel_map_info(demangled, total_threads, grid_size, block_size, elapsed_sec);
                 g_mutex_unlock(&cuda_kernel_local_dim_mapping_mutex);
                 break;
             }
+            free(demangled);
+            free(extract_kernel_name);
         }
     }
 }
@@ -126,11 +148,9 @@ static cudaError_t peak_cuda_launch_kernel(
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    gchar* demangled_kernel_name = (gchar*)demangle(kernel_name);
     KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(demangled_kernel_name);
+    payload->kernel_name = g_strdup(kernel_name);
     g_free(kernel_name);
-    free(demangled_kernel_name);
 
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
@@ -160,10 +180,8 @@ static CUresult peak_cu_launch_kernel(
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    gchar* demangled_kernel_name = (gchar*)demangle(kernel_name);
     KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(demangled_kernel_name);
-    free(demangled_kernel_name);
+    payload->kernel_name = g_strdup(kernel_name);
     
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
@@ -226,6 +244,16 @@ void cuda_interceptor_dettach()
     g_object_unref(cuda_interceptor);
 }
 
+char* truncate(const char* s, size_t max_len) {
+    size_t len = strlen(s);
+    if (len <= max_len) return strdup(s);
+
+    char* result = (char*)malloc(max_len + 1);
+    strncpy(result, s, max_len - 3);
+    strcpy(result + max_len - 3, "...");
+    return result;
+}
+
 static void cuda_interceptor_print_result(GHashTable* hashTable)
 {
     gboolean have_output = FALSE;
@@ -242,70 +270,96 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     }
 
     if (have_output) {
-        guint row_width = 80;
-        guint max_function_width = 15;
-        guint max_col_width = 9;
+        const guint row_width = 100;
+        const guint max_function_width = 40;
+        const guint max_col_width = 9;
+    
         char* space_separator = malloc(row_width + 1);
         char* row_separator = malloc(row_width + 1);
         memset(space_separator, ' ', row_width);
         memset(row_separator, '-', row_width);
         space_separator[row_width] = '\0';
         row_separator[row_width] = '\0';
-
-        g_printerr("\n%.*s\n", row_width, row_separator);
-        g_printerr("%.*s GPU Statistics %.*s\n", (row_width - 16) / 2, space_separator, (row_width - 16) / 2, space_separator);
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("\n%.*s kernel statistics (gpu) %.*s\n", (row_width - 25) / 2 + 1, row_separator, (row_width - 25) / 2, row_separator);
-        
-        g_printerr(" kernel call count & time\n");
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|\n",
-            max_function_width, "kernel",
-            max_col_width, "call",
-            max_col_width, "total",
-            max_col_width, "max",
-            max_col_width, "min");
-        g_printerr("%.*s\n", row_width, row_separator);
+    
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sGPU STATISTICS%*s\n", 
+            (row_width - 15) / 2, "", 
+            (row_width - 15 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+    
+        // Section: Kernel call count & time
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sKERNEL STATISTICS (GPU)%*s\n", 
+            (row_width - 26) / 2, "", 
+            (row_width - 26 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+        g_printerr("| %-*s | %*s | %*s | %*s | %*s |\n",
+            max_function_width, "Kernel",
+            max_col_width, "Calls",
+            max_col_width, "Total(s)",
+            max_col_width, "Max(s)",
+            max_col_width, "Min(s)");
+        g_printerr("%s\n", row_separator);
+    
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = value;
-            g_printerr("|%*s|%*lu|%*.6f|%*.6f|%*.6f|\n",
-                max_function_width, key,
+            g_printerr("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
+                max_function_width, truncate(key, max_function_width),
                 max_col_width, dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->total_time,
                 max_col_width, dim_info->max_time,
                 max_col_width, dim_info->min_time);
         }
-        g_printerr("%.*s\n\n", row_width, row_separator);
-
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr(" kernel block & thread size\n");
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|%*s|\n",
-            max_function_width, "kernel",
-            max_col_width, "ave block",
-            max_col_width, "ave grid",
-            max_col_width, "max block",
-            max_col_width, "min block",
-            max_col_width, "max grid",
-            max_col_width, "min grid"
-        );
-        g_printerr("%.*s\n", row_width, row_separator);
+        g_printerr("%s\n", row_separator);
+    
+        // Section: Kernel block & thread size
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sKERNEL BLOCK SIZE%*s\n", 
+            (row_width - 20) / 2, "", 
+            (row_width - 20 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+        g_printerr("| %-*s | %*s | %*s | %*s |\n",
+            max_function_width, "Kernel",
+            max_col_width, "AvgBlk",
+            max_col_width, "MaxBlk",
+            max_col_width, "MinBlk");
+        g_printerr("%s\n", row_separator);
+    
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = value;
-            g_printerr("|%*s|%*.2f|%*.2f|%*lu|%*lu|%*lu|%*lu|\n",
-                max_function_width, key,
-                max_col_width, (1.0 * dim_info->total_block_size / dim_info->total_kernel_call_cnt),
-                max_col_width, (1.0 * dim_info->total_grid_size / dim_info->total_kernel_call_cnt),
+            g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
+                max_function_width, truncate(key, max_function_width),
+                max_col_width, (double)dim_info->total_block_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_block_size,
-                max_col_width, dim_info->min_block_size,
-                max_col_width, dim_info->max_grid_size,
-                max_col_width, dim_info->min_grid_size
-            );
+                max_col_width, dim_info->min_block_size);
         }
-        g_printerr("%.*s\n\n", row_width, row_separator);
+        g_printerr("%s\n", row_separator);
 
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sKERNEL THREAD SIZE%*s\n", 
+            (row_width - 21) / 2, "", 
+            (row_width - 21 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+        g_printerr("| %-*s | %*s | %*s | %*s |\n",
+            max_function_width, "Kernel",
+            max_col_width, "AvgGrid",
+            max_col_width, "MaxGrid",
+            max_col_width, "MinGrid");
+        g_printerr("%s\n", row_separator);
+    
+        g_hash_table_iter_init(&iter, hashTable);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            KernelDimInfo* dim_info = value;
+            g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
+                max_function_width, truncate(key, max_function_width),
+                max_col_width, (double)dim_info->total_grid_size / dim_info->total_kernel_call_cnt,
+                max_col_width, dim_info->max_grid_size,
+                max_col_width, dim_info->min_grid_size);
+        }
+        g_printerr("%s\n", row_separator);
+    
         free(space_separator);
         free(row_separator);
     }
@@ -428,7 +482,7 @@ cuda_interceptor_reduce_result()
                     existing->max_time = max(existing->max_time, global_values_array[i].max_time);
                     existing->min_time = min(existing->min_time, global_values_array[i].min_time);
                 } else {
-                    g_hash_table_insert(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]), g_memdup(&global_values_array[i], sizeof(KernelDimInfo)));
+                    g_hash_table_insert(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]), g_memdup2(&global_values_array[i], sizeof(KernelDimInfo)));
                 }
             }
         }

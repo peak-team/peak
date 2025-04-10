@@ -140,6 +140,10 @@ int main(int argc, char** argv) {
             randomize ? dist_kernel(gen) : i+1
         });
     }
+
+    if (enable_logging && rank == 0) {
+        std::cout << "OMP threads: " << num_threads_omp << "\n";
+    }
     
     #pragma omp parallel num_threads(num_threads_omp)
     {
