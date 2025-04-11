@@ -574,8 +574,8 @@ void peak_general_listener_attach()
         } else {
             gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
             GArray* addresses = gum_find_functions_matching(truncate_hook);
-            for (gsize i = 0; i < addresses->len; i++) {
-                gpointer addr = g_array_index(addresses, gpointer, i);
+            for (gsize j = 0; j < addresses->len; j++) {
+                gpointer addr = g_array_index(addresses, gpointer, j);
                 gchar* mangled = gum_symbol_name_from_address(addr);
                 if (!mangled) continue;
             
