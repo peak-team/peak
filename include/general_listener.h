@@ -24,6 +24,7 @@
 #endif
 
 #include "utils/utils.h"
+#include "utils/cxx_utils.h"
 
 typedef struct _PeakGeneralListener PeakGeneralListener;
 

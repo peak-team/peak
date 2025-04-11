@@ -75,10 +75,12 @@ if(MPI_FOUND)
 endif()
 
 if(CUDA_FOUND)
-    target_link_libraries(peak PRIVATE ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.so)
+    target_link_libraries(peak PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.a")
+    target_link_libraries(peak PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.so")
     target_link_options(peak PRIVATE -Wl,-rpath,${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 elseif(CUDAToolkit_FOUND)
     target_link_libraries(peak PRIVATE CUDA::cudart)
+    target_link_libraries(peak PRIVATE "${CUDAToolkit_LIBRARY_DIR}/libcufilt.a")
     target_link_options(peak PRIVATE -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR})
 endif()
 
