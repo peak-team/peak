@@ -16,6 +16,7 @@ static gpointer* hook_address = NULL;
 static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
+static char** peak_demangled_strings;
 extern gulong peak_max_num_threads;
 extern double peak_main_time;
 extern float peak_detach_cost;
@@ -557,6 +558,7 @@ void peak_general_listener_attach()
     array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
+    peak_demangled_strings = g_new0(char*, peak_hook_address_count);
     // g_printerr ("peak_hook_address_count %lu peak_max_num_threads %lu\n",  peak_hook_address_count, peak_max_num_threads);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -570,7 +572,28 @@ void peak_general_listener_attach()
         } else if (strcmp(peak_hook_strings[i], "main") == 0) {
             hook_address[i] = NULL;
         } else {
-            hook_address[i] = gum_find_function(peak_hook_strings[i]);
+            gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
+            GArray* addresses = gum_find_functions_matching(truncate_hook);
+            for (gsize i = 0; i < addresses->len; i++) {
+                gpointer addr = g_array_index(addresses, gpointer, i);
+                gchar* mangled = gum_symbol_name_from_address(addr);
+                if (!mangled) continue;
+            
+                char* demangled = cxa_demangle(mangled);
+                if (!demangled) continue;
+
+                gchar* extract_kernel_name = extract_function_name(demangled);
+                if (strcmp(peak_hook_strings[i], extract_kernel_name) == 0) {
+                    hook_address[i] = addr;
+                    peak_demangled_strings[i] = g_strdup(demangled);
+                }
+
+                g_free(mangled);
+                free(demangled);
+                free(extract_kernel_name);
+            }
+            g_array_free(addresses, TRUE);
+            g_free(truncate_hook);
         }
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
@@ -642,7 +665,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 if (!array_listener_detached[i])
                     g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                               max_function_width, peak_hook_strings[i],
+                               max_function_width, peak_demangled_strings[i],
                                max_col_width, sum_num_calls[i],
                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                max_col_width, sum_num_calls[i] / rank_count,
@@ -651,7 +674,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                 else {
                     if (!array_listener_reattached[i])
                         g_printerr("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width - 1, peak_hook_strings[i],
+                                max_function_width - 1, peak_demangled_strings[i],
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                 max_col_width, sum_num_calls[i] / rank_count,
@@ -659,7 +682,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                 max_col_width, sum_min_time[i]);
                     else
                         g_printerr("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width - 1, peak_hook_strings[i],
+                                max_function_width - 1, peak_demangled_strings[i],
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                 max_col_width, sum_num_calls[i] / rank_count,
@@ -686,7 +709,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 if (!array_listener_detached[i])
                     g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                               max_function_width, peak_hook_strings[i],
+                               max_function_width, peak_demangled_strings[i],
                                max_col_width, sum_total_time[i],
                                max_col_width, sum_exclusive_time[i],
                                max_col_width, max_total_time[i],
@@ -696,7 +719,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                 else {
                     if (!array_listener_reattached[i])
                         g_printerr("|%*s*|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                    max_function_width - 1, peak_hook_strings[i],
+                                    max_function_width - 1, peak_demangled_strings[i],
                                     max_col_width, sum_total_time[i],
                                     max_col_width, sum_exclusive_time[i],
                                     max_col_width, max_total_time[i],
@@ -705,7 +728,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                                     * peak_general_overhead);
                     else
                         g_printerr("|%*s**|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                max_function_width - 1, peak_hook_strings[i],
+                                max_function_width - 1, peak_demangled_strings[i],
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
                                 max_col_width, max_total_time[i],
@@ -717,6 +740,10 @@ peak_general_listener_print_result(gulong* sum_num_calls,
         }
         g_printerr("%.*s\n", row_width, row_separator);
     }
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        g_free(peak_demangled_strings[i]);
+    }
+    g_free(peak_demangled_strings);
     free(argv_o);
     free(row_separator);
 }
