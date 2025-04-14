@@ -84,6 +84,7 @@ extern "C" char* cxa_demangle(const char* name) {
 extern "C" int cxa_demangle_status(const char* mangled_name) {
     int status = 0;
     char* result = abi::__cxa_demangle(mangled_name, 0, 0, &status);
+    free(result);
     return status;
 }
 
