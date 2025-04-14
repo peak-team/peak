@@ -18,6 +18,11 @@ make
 ## Settings
 ```
 PEAK_TARGET=dgemm_,dgemv_         # functions that will be profiled
+                                  # - If using demangled names:
+                                  #     Only the first matching symbol per name will be selected.
+                                  # - If using mangled names:
+                                  #     The profiler will directly hook the symbol by exact match, 
+                                  #     without demangling or additional comparison.
 PEAK_COST=10                      # Upper limit of profiling cost in seconds. The monitoring process will detach if the total profiling cost exceeds this value.  
                                   # The number of detachments is determined by dividing the total allowed cost by the cost of a single profiling operation.  
 PEAK_TARGET_GROUP=BLAS,LAPACK,FFTW  
