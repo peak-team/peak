@@ -20,7 +20,7 @@ char* cxa_demangle(const char* name);
  * @param name
  * @return Status code for demangle operation on input string
  */
- char* cxa_demangle(const char* mangled_name);
+ int cxa_demangle_status(const char* mangled_name);
 
 /**
  * Extracts the function name only (without return type, namespace, templates, or parameters).
