@@ -75,10 +75,16 @@ char* extractFinalFunctionName(const char* s) {
     return lastColon ? strdup(lastColon + 1) : strdup(s);
 }
 
-extern "C" char* cxa_demangle(const char* mangled) {
+extern "C" char* cxa_demangle(const char* name) {
     int status = 0;
-    char* result = abi::__cxa_demangle(mangled, 0, 0, &status);
-    return (status == 0) ? result : strdup(mangled);
+    char* result = abi::__cxa_demangle(name, 0, 0, &status);
+    return (status == 0) ? result : strdup(name);
+}
+
+extern "C" int cxa_demangle_status(const char* mangled_name) {
+    int status = 0;
+    char* result = abi::__cxa_demangle(mangled_name, 0, 0, &status);
+    return status;
 }
 
 extern "C" char* extract_function_name(const char* demangled) {

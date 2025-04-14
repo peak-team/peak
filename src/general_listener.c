@@ -572,28 +572,41 @@ void peak_general_listener_attach()
         } else if (strcmp(peak_hook_strings[i], "main") == 0) {
             hook_address[i] = NULL;
         } else {
-            gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
-            GArray* addresses = gum_find_functions_matching(truncate_hook);
-            for (gsize j = 0; j < addresses->len; j++) {
-                gpointer addr = g_array_index(addresses, gpointer, j);
-                gchar* mangled = gum_symbol_name_from_address(addr);
-                if (!mangled) continue;
-            
-                char* demangled = cxa_demangle(mangled);
-                if (!demangled) continue;
+            if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
+                // peak_hook_strings is just function name
+                gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
+                GArray* addresses = gum_find_functions_matching(truncate_hook);
+                for (gsize j = 0; j < addresses->len; j++) {
+                    gpointer addr = g_array_index(addresses, gpointer, j);
+                    gchar* mangled = gum_symbol_name_from_address(addr);
+                    gboolean function_match = FALSE;
+                    if (!mangled) continue;
+                
+                    char* demangled = cxa_demangle(mangled);
+                    g_free(mangled);
+                    if (!demangled) continue;
+    
+                    gchar* function_name = extract_function_name(demangled);
+                    if (strcmp(peak_hook_strings[i], function_name) == 0) {
+                        hook_address[i] = addr;
+                        peak_demangled_strings[i] = g_strdup(demangled);
+                        function_match = TRUE;
+                    }
+                    free(demangled);
+                    free(function_name);
 
-                gchar* extract_kernel_name = extract_function_name(demangled);
-                if (strcmp(peak_hook_strings[i], extract_kernel_name) == 0) {
-                    hook_address[i] = addr;
-                    peak_demangled_strings[i] = g_strdup(demangled);
+                    if (function_match) {
+                        break;
+                    }
                 }
-
-                g_free(mangled);
+                g_array_free(addresses, TRUE);
+                g_free(truncate_hook);
+            } else {
+                hook_address[i] = gum_find_function(peak_hook_strings[i]);
+                char* demangled = cxa_demangle(peak_hook_strings[i]);
+                peak_demangled_strings[i] = g_strdup(demangled);
                 free(demangled);
-                free(extract_kernel_name);
             }
-            g_array_free(addresses, TRUE);
-            g_free(truncate_hook);
         }
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);

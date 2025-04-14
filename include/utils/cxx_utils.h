@@ -12,7 +12,15 @@ extern "C" {
  * @return A newly allocated string with the demangled name.
  *         Caller must free the returned string using free().
  */
-char* cxa_demangle(const char* mangled_name);
+char* cxa_demangle(const char* name);
+
+/**
+ * Return demangle status for input string (cxa).
+ *
+ * @param name
+ * @return Status code for demangle operation on input string
+ */
+ char* cxa_demangle(const char* mangled_name);
 
 /**
  * Extracts the function name only (without return type, namespace, templates, or parameters).
