@@ -565,12 +565,43 @@ void peak_general_listener_attach()
         // replace certain function we are capturing already.
         if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0) {
             hook_address[i] = gum_find_function("peak_pmpi_finalize");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "close") == 0) {
             hook_address[i] = gum_find_function("peak_close");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
             hook_address[i] = gum_find_function("peak_exit");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "main") == 0) {
             hook_address[i] = NULL;
+        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernel") == 0) {
+            hook_address[i] = gum_find_function("peak_cuda_launch_kernel");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernel") == 0) {
+            hook_address[i] = gum_find_function("peak_cuda_launch_cooperative_kernel");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernelMultiDevice") == 0) {
+            hook_address[i] = gum_find_function("peak_cuda_launch_cooperative_kernel_multiple_device");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelEx") == 0) {
+            // C++ API template versions, also use cudaLaunchKernelExC internal
+            hook_address[i] = gum_find_function("peak_cuda_launch_kernel_exc");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelExC") == 0) {
+            hook_address[i] = gum_find_function("peak_cuda_launch_kernel_exc");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernel") == 0) {
+            hook_address[i] = gum_find_function("peak_cu_launch_kernel");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernel") == 0) {
+            hook_address[i] = gum_find_function("peak_cu_launch_cooperative_kernel");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernelMultiDevice") == 0) {
+            hook_address[i] = gum_find_function("peak_cu_launch_cooperative_kernel_multiple_device");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernelEx") == 0) {
+            hook_address[i] = gum_find_function("peak_cu_launch_kernel_ex");
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
             if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
                 // peak_hook_strings is just function name
@@ -678,7 +709,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 if (!array_listener_detached[i])
                     g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                               max_function_width, peak_demangled_strings[i],
+                               max_function_width, truncate_string(peak_demangled_strings[i], max_function_width),
                                max_col_width, sum_num_calls[i],
                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                max_col_width, sum_num_calls[i] / rank_count,
@@ -687,7 +718,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                 else {
                     if (!array_listener_reattached[i])
                         g_printerr("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width - 1, peak_demangled_strings[i],
+                                max_function_width - 1, truncate_string(peak_demangled_strings[i], max_function_width-1),
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                 max_col_width, sum_num_calls[i] / rank_count,
@@ -695,7 +726,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                 max_col_width, sum_min_time[i]);
                     else
                         g_printerr("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width - 1, peak_demangled_strings[i],
+                                max_function_width - 1, truncate_string(peak_demangled_strings[i], max_function_width-1),
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
                                 max_col_width, sum_num_calls[i] / rank_count,
@@ -722,7 +753,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 if (!array_listener_detached[i])
                     g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                               max_function_width, peak_demangled_strings[i],
+                               max_function_width, truncate_string(peak_demangled_strings[i], max_function_width),
                                max_col_width, sum_total_time[i],
                                max_col_width, sum_exclusive_time[i],
                                max_col_width, max_total_time[i],
@@ -732,7 +763,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                 else {
                     if (!array_listener_reattached[i])
                         g_printerr("|%*s*|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                    max_function_width - 1, peak_demangled_strings[i],
+                                    max_function_width - 1, truncate_string(peak_demangled_strings[i], max_function_width-1),
                                     max_col_width, sum_total_time[i],
                                     max_col_width, sum_exclusive_time[i],
                                     max_col_width, max_total_time[i],
@@ -741,7 +772,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                                     * peak_general_overhead);
                     else
                         g_printerr("|%*s**|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                max_function_width - 1, peak_demangled_strings[i],
+                                max_function_width - 1, truncate_string(peak_demangled_strings[i], max_function_width-1),
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
                                 max_col_width, max_total_time[i],

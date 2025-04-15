@@ -254,3 +254,13 @@ int check_command(const char *str) {
 
     return 0; // No match found
 }
+
+char* truncate_string(const char* s, size_t max_len) {
+    size_t len = strlen(s);
+    if (len <= max_len) return strdup(s);
+
+    char* result = (char*)malloc(max_len + 1);
+    strncpy(result, s, max_len - 3);
+    strcpy(result + max_len - 3, "...");
+    return result;
+}
