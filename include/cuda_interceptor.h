@@ -7,6 +7,7 @@
  */
 
 #include "frida-gum.h"
+#include "utils/utils.h"
 #include "utils/cxx_utils.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
