@@ -110,7 +110,7 @@ void peak_init()
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
         // create heartbeat thread
-        if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, NULL) != 0) {
+        if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
             perror("Failed to create heartbeat thread");
             g_free(args);
             args = NULL;
