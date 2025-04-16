@@ -13,6 +13,7 @@ extern gboolean* peak_detached;
 extern PeakHeartbeatArgs* args;
 extern gdouble* heartbeat_overhead;
 extern gboolean** peak_target_thread_called;
+extern unsigned int check_interval;
 static gpointer* hook_address = NULL;
 static double peak_general_overhead;
 extern size_t peak_hook_address_count;
