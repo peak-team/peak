@@ -35,6 +35,7 @@
 
 
 gboolean* peak_need_detach;
+gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
@@ -46,7 +47,6 @@ unsigned int check_interval;
 unsigned int post_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
-gboolean reattach_enable;
 size_t peak_gpu_hook_address_count;
 char** peak_hook_strings;
 char** peak_gpu_hook_strings;
@@ -75,7 +75,6 @@ void peak_init()
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
     target_profile_ratio = parse_env_to_float(PEAK_OVERHEAD_RATIO_ENV);
-    reattach_enable = parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
     post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
 
@@ -104,30 +103,41 @@ void peak_init()
         peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
     }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
-    heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
-    args = g_new0(PeakHeartbeatArgs, 1);
-    args->heartbeat_time = heartbeat_time;
-    args->check_interval = check_interval;
-    // create heartbeat thread
-    if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, NULL) != 0) {
-        perror("Failed to create heartbeat thread");
-        g_free(args);
-        exit(EXIT_FAILURE);
+    peak_detached = g_new0(gboolean, peak_hook_address_count);
+    if (heartbeat_time != 0) {
+        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
+        args = g_new0(PeakHeartbeatArgs, 1);
+        args->heartbeat_time = heartbeat_time;
+        args->check_interval = check_interval;
+        // create heartbeat thread
+        if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, NULL) != 0) {
+            perror("Failed to create heartbeat thread");
+            g_free(args);
+            args = NULL;
+            g_free(heartbeat_overhead);
+            heartbeat_overhead = NULL;
+            exit(EXIT_FAILURE);
+        }
     }
+    
     peak_main_time = peak_second();
 }
 
 void peak_fini()
 {
-    heartbeat_running = false;
-    pthread_join(heartbeat_thread, NULL);
+    if (heartbeat_time != 0) {
+        heartbeat_running = false;
+        pthread_join(heartbeat_thread, NULL);
+        if (heartbeat_overhead) g_free(heartbeat_overhead);
+        if (args) g_free(args);
+    }
     peak_main_time = peak_second() - peak_main_time;
     for (gint i = 0; i < peak_hook_address_count; i++) {
         g_free(peak_target_thread_called[i]);
     }
     g_free(peak_target_thread_called);
     g_free(peak_need_detach);
-    g_free(args);
+    g_free(peak_detached);
 
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {

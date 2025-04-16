@@ -31,17 +31,16 @@ PEAK_TARGET_FILE=/path/to/the/configuration/file
                                   # list function names for profiling in the configuration file, one function name per line
 PEAK_HEARTBEAT_INTERVAL=1         # Interval (in seconds) at which the heartbeat monitor runs.
                                   # This determines how frequently the system assesses whether profiling should be adjusted.
+                                  # If set to 0, the heartbeat monitor is disabled.
 
 PEAK_HIBERNATION_CYCLE=10         # Determines how often the system checks whether it needs to detach and reattach, 
                                   # based on the number of heartbeat cycles.
                                   # A lower value makes the system respond more quickly to overhead changes.
+                                  # If set to 0, reattachment is disabled entirely. Once detached due to high overhead,
+                                  # the profiling system will not attempt to reattach.
 
 PEAK_OVERHEAD_RATIO=0.05          # Target profiling overhead ratio. If the actual profiling overhead exceeds this ratio,
                                   # the monitoring process will detach to reduce overhead.
-
-PEAK_ENABLE_REATTACH=1            # Whether to allow reattaching after detachment. If set to 1 (enabled), 
-                                  # the monitoring system will attempt to reattach profiling hooks when the overhead 
-                                  # drops below the target threshold.
                                   
 PEAK_PAUSE_TIMEOUT=0.01           # For a thread that does not call the target function or calls it infrequently, 
                                   # this variable adjusts the maximum waiting time (in seconds) for it to respond to the pause and unpause command.
