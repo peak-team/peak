@@ -2,79 +2,62 @@
 
 PEAK is a lightweight and easy-to-use performance evaluation tool designed with HPC systems in mind. With its user-friendly interface, PEAK provides detailed performance reports on programs, allowing users to quickly identify and resolve performance bottlenecks. Whether you're optimizing code for maximum performance or conducting regular performance evaluations, PEAK is the ideal solution for anyone looking to improve the performance of their programs. 
 
-## To Compile:
+## Compilation:
 
-```
+```bash
 mkdir build
 cd build
 cmake --install-prefix=$HOME ..
 make
 ``` 
 
-## To Use: 
+## Usage: 
+Profile a target application by preloading the PEAK library:
+```bash
+LD_PRELOAD=libpeak.so ./target_application
+``` 
 
-``LD_PRELOAD=libpeak.so ./target_application_here`` 
+## Configuration
+PEAK is configured via environment variables. Below are the available settings:
 
-## Settings
-```
-PEAK_TARGET=dgemm_,dgemv_         # functions that will be profiled
-                                  # - If using demangled names:
-                                  #     Only the first matching symbol per name will be selected.
-                                  # - If using mangled names:
-                                  #     The profiler will directly hook the symbol by exact match, 
-                                  #     without demangling or additional comparison.
-PEAK_COST=10                      # Upper limit of profiling cost in seconds. The monitoring process will detach if the total profiling cost exceeds this value.  
-                                  # The number of detachments is determined by dividing the total allowed cost by the cost of a single profiling operation.  
-PEAK_TARGET_GROUP=BLAS,LAPACK,FFTW  
-                                  # options include FFTW, PBLAS, ScaLAPACK, LAPACK, and BLAS for specifying target libraries for profiling
-PEAK_TARGET_FILE=/path/to/the/configuration/file
-                                  # list function names for profiling in the configuration file, one function name per line
-PEAK_HEARTBEAT_INTERVAL=1         # Interval (in seconds) at which the heartbeat monitor runs.
-                                  # This determines how frequently the system assesses whether profiling should be adjusted.
-                                  # If set to 0, the heartbeat monitor is disabled.
+| Variable | Description |
+| --- | --- |
+| `PEAK_TARGET` | Specifies the functions to be profiled, provided as a comma-separated list (e.g., `dgemm_,dgemv_`). When using demangled names, only the first matching symbol per name is selected. For mangled names, the profiler hooks the symbol by exact match without demangling or additional comparison. |
+| `PEAK_COST` | Defines the upper limit of profiling cost in seconds (e.g., `10`). The monitoring process detaches if the total profiling cost exceeds this value. The number of detachments is calculated by dividing the total allowed cost by the cost of a single profiling operation. |
+| `PEAK_TARGET_GROUP` | Specifies target libraries for profiling (e.g., `BLAS,LAPACK,FFTW`). Supported options include `FFTW`, `PBLAS`, `ScaLAPACK`, `LAPACK`, and `BLAS`. Multiple libraries can be specified in a comma-separated list. |
+| `PEAK_TARGET_FILE` | Path to a configuration file listing function names for profiling, with one function name per line (e.g., `/path/to/the/configuration/file`). |
+| `PEAK_HEARTBEAT_INTERVAL` | Sets the interval (in seconds) at which the heartbeat monitor runs to assess whether profiling adjustments are needed (e.g., `1`). If set to 0, the heartbeat monitor is disabled. |
+| `PEAK_HIBERNATION_CYCLE` | Determines how often the system checks for detach and reattach, based on the number of heartbeat cycles (e.g., `10`). A lower value enables faster response to overhead changes. If set to 0, reattachment is disabled, and the profiling system will not reattach after detaching due to high overhead. |
+| `PEAK_OVERHEAD_RATIO` | Defines the target profiling overhead ratio (e.g., `0.05`). If the actual overhead exceeds this ratio, the monitoring process detaches to reduce overhead. |
+| `PEAK_PAUSE_TIMEOUT` | Adjusts the maximum waiting time (in seconds) for a thread that does not call the target function or calls it infrequently to respond to pause and unpause commands (e.g., `0.01`). |
+| `PEAK_SIG_CONT_TIMEOUT` | Adjusts the maximum waiting time (in seconds) for a thread that does not call the target function or calls it infrequently to receive the continue signal (e.g., `0.01`). |
+| `PEAK_GPU_TARGET` | Specifies GPU kernels to be profiled, provided as a comma-separated list (e.g., `kernel1,kernel2`). Matching is performed via string comparison on the demangled kernel name, considering only the base kernel names. Namespaces and template parameters are excluded from matching (e.g., `void myspace::kernel1<int>(...)` matches `kernel1`). |
+| `PEAK_GPU_TARGET_FILE` | Path to a configuration file listing GPU kernel names for profiling, with one name per line (e.g., `/path/to/gpu/config/file`). |
+| `PEAK_GPU_MONITOR_ALL` | When set to `TRUE`, all GPU kernels are profiled, regardless of whether they are listed in `PEAK_GPU_TARGET` or the configuration file. If set to `FALSE` or unset, only the listed kernel names are monitored. |
 
-PEAK_HIBERNATION_CYCLE=10         # Determines how often the system checks whether it needs to detach and reattach, 
-                                  # based on the number of heartbeat cycles.
-                                  # A lower value makes the system respond more quickly to overhead changes.
-                                  # If set to 0, reattachment is disabled entirely. Once detached due to high overhead,
-                                  # the profiling system will not attempt to reattach.
+## Example Configuration
 
-PEAK_OVERHEAD_RATIO=0.05          # Target profiling overhead ratio. If the actual profiling overhead exceeds this ratio,
-                                  # the monitoring process will detach to reduce overhead.
-                                  
-PEAK_PAUSE_TIMEOUT=0.01           # For a thread that does not call the target function or calls it infrequently, 
-                                  # this variable adjusts the maximum waiting time (in seconds) for it to respond to the pause and unpause command.
-
-PEAK_SIG_CONT_TIMEOUT=0.01        # For a thread that does not call the target function or calls it infrequently, 
-                                  # this variable adjusts the maximum waiting time (in seconds) for the continue signal.
-
-PEAK_GPU_TARGET=kernel1,kernel2   # GPU kernels that will be profiled
-                                  # Matching is done via string comparison on the demangled kernel name
-                                  # Only the base kernel names are matched
-                                  # Namespaces and template parameters are not included in the matching process
-                                  # e.g.: If your kernel is named void myspace::kernel1<int>(...), 
-                                  # it will still match kernel1 in PEAK_GPU_TARGET.
-
-PEAK_GPU_TARGET_FILE=/path/to/gpu/config/file  
-                                  # Path to a configuration file listing GPU kernel names for profiling (one per line).
-PEAK_GPU_MONITOR_ALL=TRUE         # If set to TRUE, all GPU kernels will be profiled, 
-                                  # regardless of whether they're listed in PEAK_GPU_TARGET or the config file.
-                                  # If set to FALSE or unset, only the listed kernel names will be monitored.
+```bash
+export PEAK_TARGET=function1,function2
+export PEAK_COST=10
+export PEAK_TARGET_GROUP=BLAS,LAPACK
+export PEAK_GPU_TARGET=kernel1,kernel2
+export PEAK_GPU_MONITOR_ALL=TRUE
 ```
 
 ## Important Notes
 
 1. **Fortran Procedure Naming:**
-Append an '\_' to lower case fortran procedure names. For example, Fortran_Procedure_Name should be fortran_procedure_name_
+Append an underscore to lowercase Fortran procedure names (e.g., `Fortran_Procedure_Name` becomes `fortran_procedure_name_`).
 
-2. **PEAK_TARGET_CONFIG and PEAK_TARGET Behavior:**
-These variables are merged, combining their items into a unified list. Duplicate entries should be avoided but will be handled automatically.
+2. **PEAK_TARGET, PEAK_TARGET_GROUP and PEAK_TARGET_FILE Behavior:**
+These variables are merged, combining their items into a single list. Duplicate entries should be avoided but will be handled automatically.
 
 3. **GPU Kernel Profiling:**
 GPU profiling includes the warm-up time of kernels and the CUDA initialization overhead associated with the first kernel launch.
 
 ## Reference
-If you use PEAK in your research, please cite the following paper:
+If you use PEAK in your research, please cite:
 
 ```
 @inproceedings{10.1145/3624062.3624143,
@@ -95,3 +78,5 @@ If you use PEAK in your research, please cite the following paper:
 }
 ```
 
+## Contributing
+Contributions are welcome! Please submit issues or pull requests on the GitHub repository.
