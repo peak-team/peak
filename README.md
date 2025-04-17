@@ -2,7 +2,13 @@
 
 PEAK is a lightweight and easy-to-use performance evaluation tool designed with HPC systems in mind. With its user-friendly interface, PEAK provides detailed performance reports on programs, allowing users to quickly identify and resolve performance bottlenecks. Whether you're optimizing code for maximum performance or conducting regular performance evaluations, PEAK is the ideal solution for anyone looking to improve the performance of their programs. 
 
-## Compilation:
+## Features
+- **Lightweight**: Profiles only user-specified targets by default, ensuring minimal impact on performance.
+- **Adaptive Cost**: Adaptive profiling overhead based on user-defined limits for optimal balance between accuracy and performance
+- **Ease of Use**: Requires no recompilation and supports profiling of all functions in both dynamically and statically linked libraries.
+- **Comprehensive Profiling**: Supports CPU and GPU profiling with customizable targets.
+
+## Compilation
 
 ```bash
 mkdir build
@@ -11,7 +17,7 @@ cmake --install-prefix=$HOME ..
 make
 ``` 
 
-## Usage: 
+## Usage
 Profile a target application by preloading the PEAK library:
 ```bash
 LD_PRELOAD=libpeak.so ./target_application
