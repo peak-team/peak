@@ -6,7 +6,7 @@ static PthreadState pthread_create_state;
 GumMetalHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static size_t current_tid = 0;
-static gpointer* hook_address;
+static gpointer hook_address;
 extern pthread_t heartbeat_thread;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
