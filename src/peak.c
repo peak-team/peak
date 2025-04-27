@@ -97,13 +97,13 @@ void peak_init()
     cuda_interceptor_attach();
 #endif
     // general listener needs to be after pthread and mpi ones
-    peak_general_listener_attach();
     peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
     for (gint i = 0; i < peak_hook_address_count; i++) {
         peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
     }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     peak_detached = g_new0(gboolean, peak_hook_address_count);
+    peak_general_listener_attach();
     if (heartbeat_time != 0) {
         heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);

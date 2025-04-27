@@ -39,7 +39,7 @@ int syscall_interceptor_attach()
     hook_address = gum_find_function("close");
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(syscall_interceptor, 
-                                     hook_address, (gpointer*)&peak_close, 
+                                     hook_address, (gpointer)&peak_close,
                                      (gpointer*)(&original_close));
     }
     gum_interceptor_end_transaction(syscall_interceptor);
