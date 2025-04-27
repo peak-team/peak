@@ -211,7 +211,7 @@ int exit_interceptor_attach() {
     exit_address = gum_find_function("exit");
     if (exit_address) {
         replace_check = gum_interceptor_replace_fast(exit_interceptor,
-                                      exit_address, (gpointer*)&peak_exit,
+                                      exit_address, (gpointer)&peak_exit,
                                       (gpointer*)(&original_exit));
     }
     gum_interceptor_end_transaction(exit_interceptor);

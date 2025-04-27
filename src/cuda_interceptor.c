@@ -446,7 +446,7 @@ int cuda_interceptor_attach()
     if (hook_cuda_launch) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch,
-            (gpointer*)&peak_cuda_launch_kernel,
+            (gpointer)&peak_cuda_launch_kernel,
             (gpointer*)&original_cuda_launch_kernel);
     }
     
@@ -454,7 +454,7 @@ int cuda_interceptor_attach()
     if (hook_cuda_launch_cooperative) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative,
-            (gpointer*)&peak_cuda_launch_cooperative_kernel,
+            (gpointer)&peak_cuda_launch_cooperative_kernel,
             (gpointer*)&original_cuda_launch_cooperative_kernel);
     }
 
@@ -462,7 +462,7 @@ int cuda_interceptor_attach()
     if (hook_cuda_launch_cooperative_multiple_device) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative_multiple_device,
-            (gpointer*)&peak_cuda_launch_cooperative_kernel_multiple_device,
+            (gpointer)&peak_cuda_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device);
     }
 
@@ -470,7 +470,7 @@ int cuda_interceptor_attach()
     if (hook_cuda_launch_exc) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_exc,
-            (gpointer*)&peak_cuda_launch_kernel_exc,
+            (gpointer)&peak_cuda_launch_kernel_exc,
             (gpointer*)&original_cuda_launch_kernel_exc);
     }
 
@@ -478,7 +478,7 @@ int cuda_interceptor_attach()
     if (hook_cu_launch) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch,
-            (gpointer*)&peak_cu_launch_kernel,
+            (gpointer)&peak_cu_launch_kernel,
             (gpointer*)&original_cu_launch_kernel);
     }
 
@@ -486,7 +486,7 @@ int cuda_interceptor_attach()
     if (hook_cu_launch_cooperative) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative,
-            (gpointer*)&peak_cu_launch_cooperative_kernel,
+            (gpointer)&peak_cu_launch_cooperative_kernel,
             (gpointer*)&original_cu_launch_cooperative_kernel);
     }
 
@@ -494,7 +494,7 @@ int cuda_interceptor_attach()
     if (hook_cu_launch_cooperative_multiple_device) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative_multiple_device,
-            (gpointer*)&peak_cu_launch_cooperative_kernel_multiple_device,
+            (gpointer)&peak_cu_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device);
     }
 
@@ -502,7 +502,7 @@ int cuda_interceptor_attach()
     if (hook_cu_launch_ex) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_ex,
-            (gpointer*)&peak_cu_launch_kernel_ex,
+            (gpointer)&peak_cu_launch_kernel_ex,
             (gpointer*)&original_cu_launch_kernel_ex);
     }
     

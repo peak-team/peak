@@ -3,7 +3,7 @@
 static GumInterceptor* mpi_interceptor;
 
 static int peak_is_done = 0;
-static gpointer* hook_address;
+static gpointer hook_address;
 
 static int (*original_pmpi_finalize)(void);
 

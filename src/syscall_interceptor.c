@@ -2,7 +2,7 @@
 
 static GumInterceptor* syscall_interceptor;
 
-static gpointer* hook_address;
+static gpointer hook_address;
 
 static int (*original_close)(int);
 
