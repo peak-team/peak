@@ -25,7 +25,7 @@ extern float peak_detach_cost;
 extern float target_profile_ratio;
 extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
-static gulong peak_detach_count = G_MAXULONG;
+static gulong peak_detach_count = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 gboolean heartbeat_running = true; 
@@ -312,7 +312,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     pthread_t my_tid = pthread_self();
     size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
-    if (peak_detach_count == 0) {
+    if (peak_detach_cost == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -394,7 +394,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_count == 0) {
+    if (peak_detach_cost == 0) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
