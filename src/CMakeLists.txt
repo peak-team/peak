@@ -13,8 +13,11 @@ FILE(GLOB sources_peak_mpi
 FILE(GLOB sources_peak_cuda
     cuda_interceptor.cpp
 )
+
+if (CUDA_FOUND OR CUDAToolkit_FOUND)
 add_library(cuda_interceptor_obj OBJECT ${sources_peak_cuda})
 set_target_properties(cuda_interceptor_obj PROPERTIES LINKER_LANGUAGE CXX)
+endif()
 
 # Generate the shared library from the library sources
 if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
