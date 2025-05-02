@@ -660,7 +660,7 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
-                max_function_width, key,
+                max_function_width, truncate_string((const char *)key, max_function_width),
                 max_col_width, dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->total_time,
                 max_col_width, dim_info->max_time,
@@ -685,7 +685,7 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, key,
+                max_function_width, truncate_string((const char *)key, max_function_width),
                 max_col_width, (double)dim_info->total_block_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_block_size,
                 max_col_width, dim_info->min_block_size);
@@ -708,7 +708,7 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, key,
+                max_function_width, truncate_string((const char *)key, max_function_width),
                 max_col_width, (double)dim_info->total_grid_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_grid_size,
                 max_col_width, dim_info->min_grid_size);
