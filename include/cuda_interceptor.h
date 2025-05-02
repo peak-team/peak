@@ -5,15 +5,21 @@
  * @file cuda_interceptor.h
  * @brief Header file for CUDA function interception using Gum library
  */
-
 #include "frida-gum.h"
 #include "utils/utils.h"
-#include "utils/cxx_utils.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <nv_decode.h>
 #include <pthread.h>
 #include <string.h>
+
+#ifdef __cplusplus
+#include "utils/cxx_utils.h"
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <mutex>
+#endif
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -33,6 +39,9 @@
     _a < _b ? _a : _b;       \
 })
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 /**
  * @brief Attach CUDA function interception
  *
@@ -60,6 +69,10 @@ void cuda_interceptor_dettach();
  *
  */
 void cuda_interceptor_print(int is_MPI);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __CUDA_INTERCEPTOR_H */
 

@@ -11,6 +11,8 @@ static gpointer* hook_cu_launch;
 static gpointer* hook_cu_launch_cooperative;
 static gpointer* hook_cu_launch_cooperative_multiple_device;
 static gpointer* hook_cu_launch_ex;
+static cudaEvent_t* peak_gpu_cuda_start_event_array;
+static cudaEvent_t* peak_gpu_cuda_end_event_array;
 extern size_t peak_gpu_hook_address_count;
 extern char** peak_gpu_hook_strings;
 extern gboolean peak_gpu_monitor_all;
@@ -71,11 +73,19 @@ typedef struct {
 
 typedef struct {
     gchar* kernel_name;
-    struct timespec start_time;
     gulong total_threads;
     gulong grid_size;
     gulong block_size;
-} KernelTimingPayload;
+    cudaEvent_t* start_event;
+    cudaEvent_t* end_event;
+} KernelLaunchInfo;
+
+typedef struct {
+    std::vector<KernelLaunchInfo> launches;
+    std::mutex mtx;
+} KernelLaunchSeries;
+
+static std::unordered_map<std::string, KernelLaunchSeries> peak_kernel_event_map;
 
 gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
@@ -84,6 +94,7 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
 char* cu_demangle(char* mangled_name) {
     int status;
     size_t size = sizeof(char) * 1000;
+    // fixme: size might be wrong
     char* demangled_name = (char*)malloc(size);
     
     __cu_demangle(mangled_name, demangled_name, &size, &status);
@@ -95,10 +106,12 @@ char* cu_demangle(char* mangled_name) {
     return strdup(mangled_name);
 }
 
+
+// FIXME:
 static void update_kernel_map_info(const gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     gchar* key = g_strdup(kernel_name);
-    KernelDimInfo* dim_info = g_hash_table_lookup(cuda_kernel_local_dim_mapping, key);
+    KernelDimInfo* dim_info = (KernelDimInfo*) g_hash_table_lookup(cuda_kernel_local_dim_mapping, key);
 
     if (!dim_info) {
         dim_info = g_new(KernelDimInfo, 1);
@@ -134,6 +147,7 @@ static void update_kernel_map_info(const gchar* kernel_name, gulong total_thread
     }
 }
 
+// FIXME:
 void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     if (peak_gpu_monitor_all) {
@@ -161,44 +175,37 @@ void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong
     }
 }
 
-void CUDART_CB timing_callback(void* data) {
-    struct timespec end_time;
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-
-    KernelTimingPayload* payload = (KernelTimingPayload*)data;
-    gdouble elapsed_sec = (gdouble)(end_time.tv_sec - payload->start_time.tv_sec) +
-                      (gdouble)(end_time.tv_nsec - payload->start_time.tv_nsec) / 1e9;
-
-    insert_cuda_mapping_record(payload->kernel_name, payload->total_threads, payload->grid_size, payload->block_size, elapsed_sec);
-
-    g_free(payload->kernel_name);
-    g_free(payload);
-}
-
 static cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    g_free(kernel_name);
-
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, stream);
     cudaError_t result = original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc(stream, timing_callback, payload);
+    cudaEventRecord(*end, stream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+    g_free(kernel_name);
 
     return result;
 }
@@ -208,25 +215,32 @@ static cudaError_t peak_cuda_launch_cooperative_kernel(
     void** args, size_t sharedMem, cudaStream_t stream)
 {
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    g_free(kernel_name);
-
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel(func, gridDim, blockDim, args, sharedMem, stream);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc(stream, timing_callback, payload);
+    cudaEventRecord(*end, stream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+    g_free(kernel_name);
 
     return result;
 }
@@ -240,25 +254,32 @@ static cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
     cudaStream_t stream = launchParamsList->stream;
 
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    g_free(kernel_name);
-
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel_multiple_device(launchParamsList, numDevices, flags);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc(stream, timing_callback, payload);
+    cudaEventRecord(*end, stream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+    g_free(kernel_name);
 
     return result;
 }
@@ -272,25 +293,34 @@ static cudaError_t peak_cuda_launch_kernel_exc(
     cudaStream_t stream = config->stream;
 
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    g_free(kernel_name);
+    
 
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, stream);
     cudaError_t result = original_cuda_launch_kernel_exc(config, func, args);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc(stream, timing_callback, payload);
+    cudaEventRecord(*end, stream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+    g_free(kernel_name);
 
     return result;
 }
@@ -304,26 +334,33 @@ static CUresult peak_cu_launch_kernel(
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_kernel(func, gridDimX, gridDimY, gridDimZ,
                                                 blockDimX, blockDimY, blockDimZ,
                                                 sharedMemBytes, hStream, kernelParams, extra);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc((cudaStream_t)hStream, timing_callback, payload);
+    cudaEventRecord(*end, (cudaStream_t)hStream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
 
     return result;
 }
@@ -335,27 +372,35 @@ static CUresult peak_cu_launch_cooperative_kernel(
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams)
 {
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_cooperative_kernel(
                                                 func, gridDimX, gridDimY, gridDimZ,
                                                 blockDimX, blockDimY, blockDimZ,
                                                 sharedMemBytes, hStream, kernelParams);
 
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc((cudaStream_t)hStream, timing_callback, payload);
+    cudaEventRecord(*end, (cudaStream_t)hStream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
 
     return result;
 }
@@ -374,25 +419,32 @@ static CUresult peak_cu_launch_cooperative_kernel_multiple_device(
     CUstream hStream = launchParamsList->hStream;
 
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_cooperative_kernel_multiple_device(
                                     launchParamsList, numDevices, flags);
+    cudaEventRecord(*end, (cudaStream_t)hStream);
 
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc((cudaStream_t)hStream, timing_callback, payload);
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
 
     return result;
 }
@@ -410,39 +462,54 @@ static CUresult peak_cu_launch_kernel_ex(
     CUstream hStream = config->hStream;
 
     gchar* kernel_name = *(char**)((size_t)func + 8);
-    KernelTimingPayload* payload = g_new(KernelTimingPayload, 1);
-    payload->kernel_name = g_strdup(kernel_name);
-    
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_kernel_ex(config, func, kernelParams, extra);
-
-    // Register Callback Stream
-    payload->start_time = start_time;
-    payload->total_threads = total_threads;
-    payload->grid_size = grid_size;
-    payload->block_size = block_size;
-    cudaLaunchHostFunc((cudaStream_t)hStream, timing_callback, payload);
+    cudaEventRecord(*end, (cudaStream_t)hStream);
+    
+    KernelLaunchInfo info = {
+        .kernel_name = g_strdup(kernel_name),
+        .total_threads = total_threads,
+        .grid_size = grid_size,
+        .block_size = block_size,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_kernel_event_map[kernel_name];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
 
     return result;
 }
 
-int cuda_interceptor_attach()
+extern "C" int cuda_interceptor_attach()
 {
     cuda_kernel_local_dim_mapping = g_hash_table_new_full(g_str_hash, str_equal_function, NULL, g_free);
     g_mutex_init(&cuda_kernel_local_dim_mapping_mutex);
 
-    GumReplaceReturn replace_check = -1;
+    GumReplaceReturn replace_check = GUM_REPLACE_OK;
     cuda_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(cuda_interceptor);
 
-    hook_cuda_launch = gum_find_function("cudaLaunchKernel");
+    // Initialize cudaEvent_t array
+    peak_gpu_cuda_start_event_array = (cudaEvent_t*)malloc(sizeof(cudaEvent_t) * peak_gpu_hook_address_count);
+    peak_gpu_cuda_end_event_array = (cudaEvent_t*)malloc(sizeof(cudaEvent_t) * peak_gpu_hook_address_count);
+    for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
+        cudaEventCreate(&peak_gpu_cuda_start_event_array[i]);
+        cudaEventCreate(&peak_gpu_cuda_end_event_array[i]);
+    }
+
+    hook_cuda_launch = (gpointer*) gum_find_function("cudaLaunchKernel");
     if (hook_cuda_launch) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch,
@@ -450,7 +517,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cuda_launch_kernel);
     }
     
-    hook_cuda_launch_cooperative = gum_find_function("cudaLaunchCooperativeKernel");
+    hook_cuda_launch_cooperative = (gpointer*) gum_find_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative,
@@ -458,7 +525,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cuda_launch_cooperative_kernel);
     }
 
-    hook_cuda_launch_cooperative_multiple_device = gum_find_function("cudaLaunchCooperativeKernelMultiDevice");
+    hook_cuda_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cudaLaunchCooperativeKernelMultiDevice");
     if (hook_cuda_launch_cooperative_multiple_device) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative_multiple_device,
@@ -466,7 +533,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device);
     }
 
-    hook_cuda_launch_exc = gum_find_function("cudaLaunchKernelExC");
+    hook_cuda_launch_exc = (gpointer*) gum_find_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_exc,
@@ -474,7 +541,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cuda_launch_kernel_exc);
     }
 
-    hook_cu_launch = gum_find_function("cuLaunchKernel");
+    hook_cu_launch = (gpointer*) gum_find_function("cuLaunchKernel");
     if (hook_cu_launch) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch,
@@ -482,7 +549,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cu_launch_kernel);
     }
 
-    hook_cu_launch_cooperative = gum_find_function("cuLaunchCooperativeKernel");
+    hook_cu_launch_cooperative = (gpointer*) gum_find_function("cuLaunchCooperativeKernel");
     if (hook_cu_launch_cooperative) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative,
@@ -490,7 +557,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cu_launch_cooperative_kernel);
     }
 
-    hook_cu_launch_cooperative_multiple_device = gum_find_function("cuLaunchCooperativeKernelMultiDevice");
+    hook_cu_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cuLaunchCooperativeKernelMultiDevice");
     if (hook_cu_launch_cooperative_multiple_device) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative_multiple_device,
@@ -498,7 +565,7 @@ int cuda_interceptor_attach()
             (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device);
     }
 
-    hook_cu_launch_ex = gum_find_function("cuLaunchKernelEx");
+    hook_cu_launch_ex = (gpointer*) gum_find_function("cuLaunchKernelEx");
     if (hook_cu_launch_ex) {
         replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_ex,
@@ -511,7 +578,7 @@ int cuda_interceptor_attach()
     return replace_check;
 }
 
-void cuda_interceptor_dettach()
+extern "C" void cuda_interceptor_dettach()
 {
     if (hook_cuda_launch) {
         gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
@@ -538,6 +605,7 @@ void cuda_interceptor_dettach()
         gum_interceptor_revert(cuda_interceptor, hook_cu_launch_ex);
     }
     g_hash_table_destroy(cuda_kernel_local_dim_mapping);
+    peak_kernel_event_map.clear();
     g_object_unref(cuda_interceptor);
 }
 
@@ -549,7 +617,7 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
 
     g_hash_table_iter_init(&iter, hashTable);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
-        KernelDimInfo* dim_info = value;
+        KernelDimInfo* dim_info = (KernelDimInfo*) value;
         if (dim_info->total_kernel_call_cnt > 0) {
             have_output = TRUE;
             break;
@@ -561,8 +629,8 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
         const guint max_function_width = 40;
         const guint max_col_width = 9;
     
-        char* space_separator = malloc(row_width + 1);
-        char* row_separator = malloc(row_width + 1);
+        char* space_separator = (char *) malloc(row_width + 1);
+        char* row_separator = (char *)  malloc(row_width + 1);
         memset(space_separator, ' ', row_width);
         memset(row_separator, '-', row_width);
         space_separator[row_width] = '\0';
@@ -590,9 +658,9 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-            KernelDimInfo* dim_info = value;
+            KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
-                max_function_width, truncate_string(key, max_function_width),
+                max_function_width, key,
                 max_col_width, dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->total_time,
                 max_col_width, dim_info->max_time,
@@ -615,9 +683,9 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-            KernelDimInfo* dim_info = value;
+            KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, truncate_string(key, max_function_width),
+                max_function_width, key,
                 max_col_width, (double)dim_info->total_block_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_block_size,
                 max_col_width, dim_info->min_block_size);
@@ -638,9 +706,9 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-            KernelDimInfo* dim_info = value;
+            KernelDimInfo* dim_info = (KernelDimInfo*) value;
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, truncate_string(key, max_function_width),
+                max_function_width, key,
                 max_col_width, (double)dim_info->total_grid_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_grid_size,
                 max_col_width, dim_info->min_grid_size);
@@ -805,7 +873,30 @@ cuda_interceptor_reduce_result()
 }
 #endif
 
-void cuda_interceptor_print(int is_MPI) {
+static void cuda_sync_kernel_event() {
+    cudaDeviceSynchronize();
+    for (const auto& [_, series] : peak_kernel_event_map) {
+        for (const auto& launch : series.launches) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
+            insert_cuda_mapping_record(
+                launch.kernel_name,
+                launch.total_threads,
+                launch.grid_size,
+                launch.block_size,
+                ms / 1000.0
+            );
+            cudaEventDestroy(*(launch.start_event));
+            cudaEventDestroy(*(launch.end_event));
+            g_free(launch.kernel_name);
+            free(launch.start_event);
+            free(launch.end_event);
+        }
+    }
+}
+
+extern "C" void cuda_interceptor_print(int is_MPI) {
+    cuda_sync_kernel_event();
     #ifdef HAVE_MPI
         if (is_MPI) {
             cuda_interceptor_reduce_result();
