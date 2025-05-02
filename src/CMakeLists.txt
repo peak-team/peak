@@ -61,12 +61,14 @@ target_include_directories(peak
         ${LIBIBERTY_INCLUDE_DIR}
 )
 
+if (CUDA_FOUND OR CUDAToolkit_FOUND)
 target_include_directories(cuda_interceptor_obj
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
         ${LIBIBERTY_INCLUDE_DIR}
 )
+endif()
 
 target_link_libraries(peak
     PRIVATE
@@ -79,6 +81,7 @@ target_link_libraries(peak
         ${LIBIBERTY_LIB}
 )
 
+if (CUDA_FOUND OR CUDAToolkit_FOUND)
 target_link_libraries(cuda_interceptor_obj
     PRIVATE
         ${FRIDA_GUM_LIBRARIES}
@@ -89,12 +92,16 @@ target_link_libraries(cuda_interceptor_obj
         ${M_LIBRARY}
         ${LIBIBERTY_LIB}
 )
+endif()
 
 if(MPI_FOUND)
     target_link_libraries(peak 
         PRIVATE 
             MPI::MPI_C
     )
+endif()
+
+if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
     target_link_libraries(cuda_interceptor_obj 
         PRIVATE 
             MPI::MPI_C
