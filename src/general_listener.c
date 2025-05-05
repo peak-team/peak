@@ -352,7 +352,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         size_t hook_id = self->hook_id;
         peak_target_thread_called[hook_id][index] = true;
         if (self->num_calls[index] >= peak_detach_count) peak_need_detach[hook_id] = true;
-        if (peak_need_detach[hook_id]) {
+        if (peak_detach_count && peak_need_detach[hook_id]) {
             pthread_mutex_lock(&lock);
             array_listener_detached[hook_id] = TRUE;
             GumMetalHashTableIter peak_tid_iter;
