@@ -80,10 +80,14 @@ typedef struct {
     cudaEvent_t* end_event;
 } KernelLaunchInfo;
 
-typedef struct {
+struct KernelLaunchSeries{
     std::vector<KernelLaunchInfo> launches;
     std::mutex mtx;
-} KernelLaunchSeries;
+
+    KernelLaunchSeries() {
+        launches.reserve(100);  // Preallocate space for 1000 launches to avoid lock performance
+    }
+};
 
 static std::unordered_map<std::string, KernelLaunchSeries> peak_kernel_event_map;
 
@@ -94,7 +98,7 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
 char* cu_demangle(char* mangled_name) {
     int status;
     size_t size = sizeof(char) * 1000;
-    // fixme: size might be wrong
+    // Fixme: size might be wrong
     char* demangled_name = (char*)malloc(size);
     
     __cu_demangle(mangled_name, demangled_name, &size, &status);
@@ -106,8 +110,6 @@ char* cu_demangle(char* mangled_name) {
     return strdup(mangled_name);
 }
 
-
-// FIXME:
 static void update_kernel_map_info(const gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     gchar* key = g_strdup(kernel_name);
@@ -147,7 +149,6 @@ static void update_kernel_map_info(const gchar* kernel_name, gulong total_thread
     }
 }
 
-// FIXME:
 void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong grid_size, gulong block_size, gdouble elapsed_sec)
 {
     if (peak_gpu_monitor_all) {
