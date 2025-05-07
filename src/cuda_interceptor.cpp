@@ -1,7 +1,9 @@
 #include "cuda_interceptor.h"
 
 static GHashTable* cuda_kernel_local_dim_mapping;
+static GHashTable* cuda_graph_local_mapping;
 static GMutex cuda_kernel_local_dim_mapping_mutex;
+static GMutex cuda_graph_local_mapping_mutex;
 static GumInterceptor* cuda_interceptor;
 static gpointer* hook_cuda_launch;
 static gpointer* hook_cuda_launch_cooperative;
@@ -11,6 +13,8 @@ static gpointer* hook_cu_launch;
 static gpointer* hook_cu_launch_cooperative;
 static gpointer* hook_cu_launch_cooperative_multiple_device;
 static gpointer* hook_cu_launch_ex;
+static gpointer* hook_cuda_graph_launch;
+static gpointer* hook_cu_graph_launch;
 static cudaEvent_t* peak_gpu_cuda_start_event_array;
 static cudaEvent_t* peak_gpu_cuda_end_event_array;
 extern size_t peak_gpu_hook_address_count;
@@ -53,6 +57,12 @@ static CUresult (*original_cu_launch_kernel_ex)(
     const CUlaunchConfig* config, CUfunction func, 
     void** kernelParams, void** extra);
 
+static cudaError_t (*original_cuda_graph_launch)(
+    cudaGraphExec_t graphExec, cudaStream_t stream);
+
+static CUresult (*original_cu_graph_launch)( 
+    CUgraphExec hGraphExec, CUstream hStream);
+
 typedef struct {
     gulong total_gpu_threads;
     gulong max_gpu_threads;
@@ -85,11 +95,36 @@ struct KernelLaunchSeries{
     std::mutex mtx;
 
     KernelLaunchSeries() {
-        launches.reserve(100);  // Preallocate space for 1000 launches to avoid lock performance
+        launches.reserve(100);  // Preallocate space for 100 launches to avoid lock performance
+    }
+};
+
+typedef struct {
+    gulong total_graph_call_cnt;
+    gulong max_graph_call_cnt;
+    gulong min_graph_call_cnt;
+    gdouble total_time;
+    gdouble min_time;
+    gdouble max_time;
+} GraphRecordInfo;
+
+typedef struct {
+    CUgraphExec_st* graph;
+    cudaEvent_t* start_event;
+    cudaEvent_t* end_event;
+} GraphLaunchInfo;
+
+struct GraphLaunchSeries{
+    std::vector<GraphLaunchInfo> launches;
+    std::mutex mtx;
+
+    GraphLaunchSeries() {
+        launches.reserve(10);
     }
 };
 
 static std::unordered_map<std::string, KernelLaunchSeries> peak_kernel_event_map;
+static std::unordered_map<CUgraphExec_st*, GraphLaunchSeries> peak_graph_event_map;
 
 gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
@@ -174,6 +209,26 @@ void insert_cuda_mapping_record(gchar* kernel_name, gulong total_threads, gulong
             free(extract_kernel_name);
         }
     }
+}
+
+void insert_cuda_graph_record(CUgraphExec_st* graph, gdouble elapsed_sec)
+{
+    g_mutex_lock(&cuda_graph_local_mapping_mutex);
+    GraphRecordInfo* graph_info = (GraphRecordInfo*) g_hash_table_lookup(cuda_graph_local_mapping, graph);
+    if (!graph_info) {
+        graph_info = g_new(GraphRecordInfo, 1);
+        graph_info->total_graph_call_cnt = 1;
+        graph_info->total_time = elapsed_sec;
+        graph_info->max_time = elapsed_sec;
+        graph_info->min_time = elapsed_sec;
+        g_hash_table_insert(cuda_graph_local_mapping, graph, graph_info);
+    } else {
+        graph_info->total_graph_call_cnt++;
+        graph_info->total_time += elapsed_sec;
+        graph_info->max_time = max(graph_info->max_time, elapsed_sec);
+        graph_info->min_time = min(graph_info->min_time, elapsed_sec);
+    }
+    g_mutex_unlock(&cuda_graph_local_mapping_mutex);
 }
 
 static cudaError_t peak_cuda_launch_kernel(
@@ -492,10 +547,62 @@ static CUresult peak_cu_launch_kernel_ex(
     return result;
 }
 
+static cudaError_t peak_cuda_graph_launch( 
+    cudaGraphExec_t graphExec, cudaStream_t stream)
+{
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)stream);
+    cudaError_t result = original_cuda_graph_launch(graphExec, stream);
+    cudaEventRecord(*end, (cudaStream_t)stream);
+    
+    GraphLaunchInfo info = {
+        .graph = graphExec,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_graph_event_map[graphExec];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+
+    return result;
+}
+
+static CUresult peak_cu_graph_launch( 
+    CUgraphExec hGraphExec, CUstream hStream)
+{
+    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    cudaEventCreate(start);
+    cudaEventCreate(end);
+    cudaEventRecord(*start, (cudaStream_t)hStream);
+    CUresult result = original_cu_graph_launch(hGraphExec, hStream);
+    cudaEventRecord(*end, (cudaStream_t)hStream);
+
+    GraphLaunchInfo info = {
+        .graph = hGraphExec,
+        .start_event = start,
+        .end_event = end
+    };
+    auto& series = peak_graph_event_map[hGraphExec];
+    {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        series.launches.push_back(info);
+    }
+
+    return result;
+}
+
 extern "C" int cuda_interceptor_attach()
 {
     cuda_kernel_local_dim_mapping = g_hash_table_new_full(g_str_hash, str_equal_function, NULL, g_free);
     g_mutex_init(&cuda_kernel_local_dim_mapping_mutex);
+    cuda_graph_local_mapping = g_hash_table_new_full(g_direct_hash, g_int_equal, NULL, g_free);
+    g_mutex_init(&cuda_graph_local_mapping_mutex);
 
     GumReplaceReturn replace_check = GUM_REPLACE_OK;
     cuda_interceptor = gum_interceptor_obtain();
@@ -573,6 +680,22 @@ extern "C" int cuda_interceptor_attach()
             (gpointer)&peak_cu_launch_kernel_ex,
             (gpointer*)&original_cu_launch_kernel_ex);
     }
+
+    hook_cuda_graph_launch = (gpointer*) gum_find_function("cudaGraphLaunch");
+    if (hook_cuda_graph_launch) {
+        replace_check = gum_interceptor_replace_fast(
+            cuda_interceptor, hook_cuda_graph_launch,
+            (gpointer)&peak_cuda_graph_launch,
+            (gpointer*)&original_cuda_graph_launch);
+    }
+
+    hook_cu_graph_launch = (gpointer*) gum_find_function("cuGraphLaunch");
+    if (hook_cu_graph_launch) {
+        replace_check = gum_interceptor_replace_fast(
+            cuda_interceptor, hook_cu_graph_launch,
+            (gpointer)&peak_cu_graph_launch,
+            (gpointer*)&original_cu_graph_launch);
+    }
     
     gum_interceptor_end_transaction(cuda_interceptor);
 
@@ -605,12 +728,18 @@ extern "C" void cuda_interceptor_dettach()
     if (hook_cu_launch_ex) {
         gum_interceptor_revert(cuda_interceptor, hook_cu_launch_ex);
     }
+    if (hook_cuda_graph_launch) {
+        gum_interceptor_revert(cuda_interceptor, hook_cuda_graph_launch);
+    }
+    if (hook_cu_graph_launch) {
+        gum_interceptor_revert(cuda_interceptor, hook_cu_graph_launch);
+    }
     g_hash_table_destroy(cuda_kernel_local_dim_mapping);
     peak_kernel_event_map.clear();
     g_object_unref(cuda_interceptor);
 }
 
-static void cuda_interceptor_print_result(GHashTable* hashTable)
+static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
 {
     gboolean have_output = FALSE;
     GHashTableIter iter;
@@ -638,7 +767,7 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
         row_separator[row_width] = '\0';
     
         g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sGPU STATISTICS%*s\n", 
+        g_printerr("%*sGPU STATISTICS (Kernel)%*s\n", 
             (row_width - 15) / 2, "", 
             (row_width - 15 + 1) / 2, "");
         g_printerr("%s\n", row_separator);
@@ -721,9 +850,72 @@ static void cuda_interceptor_print_result(GHashTable* hashTable)
     }
 }
 
+static void cuda_interceptor_print_graph_result(GHashTable* hashTable)
+{
+    gboolean have_output = FALSE;
+    GHashTableIter iter;
+    gpointer key, value;
+
+    g_hash_table_iter_init(&iter, hashTable);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        GraphRecordInfo* graph_info = (GraphRecordInfo*) value;
+        if (graph_info->total_graph_call_cnt > 0) {
+            have_output = TRUE;
+            break;
+        }
+    }
+
+    if (have_output) {
+        const guint row_width = 100;
+        const guint max_col_width = 9;
+    
+        char* space_separator = (char *) malloc(row_width + 1);
+        char* row_separator = (char *)  malloc(row_width + 1);
+        memset(space_separator, ' ', row_width);
+        memset(row_separator, '-', row_width);
+        space_separator[row_width] = '\0';
+        row_separator[row_width] = '\0';
+    
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sGPU STATISTICS (Graph)%*s\n", 
+            (row_width - 15) / 2, "", 
+            (row_width - 15 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+    
+        // Section: Graph call count & time
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sGRAPH STATISTICS (GPU)%*s\n", 
+            (row_width - 26) / 2, "", 
+            (row_width - 26 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+        g_printerr("| %*s | %*s | %*s | %*s | %*s |\n",
+            max_col_width, "Graph",
+            max_col_width, "Calls",
+            max_col_width, "Total(s)",
+            max_col_width, "Max(s)",
+            max_col_width, "Min(s)");
+        g_printerr("%s\n", row_separator);
+    
+        g_hash_table_iter_init(&iter, hashTable);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            GraphRecordInfo* graph_info = (GraphRecordInfo*) value;
+            g_printerr("| %p | %*lu | %*.6f | %*.6f | %*.6f |\n",
+                key,
+                max_col_width, graph_info->total_graph_call_cnt,
+                max_col_width, graph_info->total_time,
+                max_col_width, graph_info->max_time,
+                max_col_width, graph_info->min_time);
+        }
+        g_printerr("%s\n", row_separator);
+
+        free(space_separator);
+        free(row_separator);
+    }
+}
+
 #ifdef HAVE_MPI
 static void
-cuda_interceptor_reduce_result()
+cuda_interceptor_reduce_kernel_result()
 {
     int world_rank, world_size;
     int init_flag;
@@ -846,7 +1038,7 @@ cuda_interceptor_reduce_result()
         MPI_Barrier(MPI_COMM_WORLD);
 
         if (world_rank == 0) {
-            cuda_interceptor_print_result(cuda_kernel_global_dim_mapping);
+            cuda_interceptor_print_kernel_result(cuda_kernel_global_dim_mapping);
             for (guint i = 0; i < global_kernel_count; i++) {
                 g_free(global_keys_array[i]);
             }
@@ -868,6 +1060,116 @@ cuda_interceptor_reduce_result()
     if (world_rank == 0) {
         g_hash_table_destroy(cuda_kernel_global_dim_mapping);
         g_free(kernel_count_array);
+        g_free(keys_buffer_array);
+        g_free(values_buffer_array);
+    }
+}
+
+static void
+cuda_interceptor_reduce_graph_result()
+{
+    int world_rank, world_size;
+    int init_flag;
+    MPI_Initialized(&init_flag);
+    if (!init_flag) {
+        MPI_Init(NULL, NULL);
+    }
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    GHashTable* cuda_graph_global_mapping = NULL;
+    if (world_rank == 0) {
+        cuda_graph_global_mapping = g_hash_table_new_full(g_direct_hash, g_int_equal, NULL, g_free);
+    }
+
+    gint local_graph_count = g_hash_table_size(cuda_graph_local_mapping);
+    gint local_key_size = local_graph_count * sizeof(CUgraphExec_st*);
+    gint local_values_size = local_graph_count * sizeof(GraphRecordInfo);
+    CUgraphExec_st** keys = g_new(CUgraphExec_st*, local_graph_count);
+    GraphRecordInfo* values = g_new(GraphRecordInfo, local_graph_count);
+
+    GHashTableIter iter;
+    gpointer key, value;
+    guint index = 0;
+    g_hash_table_iter_init(&iter, cuda_graph_local_mapping);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        keys[index] = *(CUgraphExec_st**) key;
+        values[index] = *(GraphRecordInfo*) value;
+        index++;
+    }
+
+    gulong global_graph_count;
+    gulong* graph_count_array = NULL;
+    gint* keys_buffer_array = NULL;
+    gint* values_buffer_array = NULL;
+    if (world_rank == 0) {
+        global_graph_count = 0;
+        graph_count_array = g_new(gulong, world_size);
+        keys_buffer_array = g_new(gint, world_size);
+        values_buffer_array = g_new(gint, world_size);
+    }
+    MPI_Reduce(&local_graph_count, &global_graph_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_graph_count, 1, MPI_INT, graph_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_key_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    if (global_graph_count > 0) {
+        gint *keys_offset_array = NULL;
+        gint *values_offset_array = NULL;
+        CUgraphExec_st** global_keys_array = NULL;
+        GraphRecordInfo* global_values_array = NULL;
+        if (world_rank == 0) {
+            // Key
+            global_keys_array = g_new(CUgraphExec_st*, global_graph_count);
+            keys_offset_array = g_new(gint, global_graph_count);
+            keys_offset_array[0] = 0;
+            for (guint i = 1; i < world_size; i++) {
+                keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
+            }
+
+            // Value
+            global_values_array = g_new(GraphRecordInfo, global_graph_count);
+            values_offset_array = g_new(gint, global_graph_count);
+            values_offset_array[0] = 0;
+            for (guint i = 1; i < world_size; i++) {
+                values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
+            }
+        }
+        MPI_Gatherv(keys, local_graph_count * sizeof(CUgraphExec_st*), MPI_BYTE, global_keys_array, keys_buffer_array, keys_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+        MPI_Gatherv(values, local_graph_count * sizeof(GraphRecordInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        if (world_rank == 0) {
+            // aggregate value
+            for (guint i = 0; i < global_graph_count; i++) {
+                GraphRecordInfo* existing = (GraphRecordInfo*) g_hash_table_lookup(cuda_graph_global_mapping, global_keys_array[i]);
+                if (existing) {
+                    existing->total_graph_call_cnt += global_values_array[i].total_graph_call_cnt;
+                    existing->total_time += global_values_array[i].total_time;
+                    existing->max_time = max(existing->max_time, global_values_array[i].max_time);
+                    existing->min_time = min(existing->min_time, global_values_array[i].min_time);
+                } else {
+                    g_hash_table_insert(cuda_graph_global_mapping, global_keys_array[i], g_memdup2(&global_values_array[i], sizeof(GraphRecordInfo)));
+                }
+            }
+        }
+        
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        if (world_rank == 0) {
+            cuda_interceptor_print_graph_result(cuda_graph_global_mapping);
+            g_free(keys_offset_array);
+            g_free(values_offset_array);
+            g_free(global_keys_array);
+            g_free(global_values_array);
+        }
+    }
+    
+
+    g_free(keys);
+    g_free(values);
+    if (world_rank == 0) {
+        g_hash_table_destroy(cuda_graph_global_mapping);
+        g_free(graph_count_array);
         g_free(keys_buffer_array);
         g_free(values_buffer_array);
     }
@@ -894,17 +1196,31 @@ static void cuda_sync_kernel_event() {
             free(launch.end_event);
         }
     }
+    for (const auto& [_, series] : peak_graph_event_map) {
+        for (const auto& launch : series.launches) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
+            insert_cuda_graph_record(launch.graph, ms / 1000.0);
+            cudaEventDestroy(*(launch.start_event));
+            cudaEventDestroy(*(launch.end_event));
+            free(launch.start_event);
+            free(launch.end_event);
+        }
+    }
 }
 
 extern "C" void cuda_interceptor_print(int is_MPI) {
     cuda_sync_kernel_event();
     #ifdef HAVE_MPI
         if (is_MPI) {
-            cuda_interceptor_reduce_result();
+            cuda_interceptor_reduce_kernel_result();
+            cuda_interceptor_reduce_graph_result();
         } else {
-            cuda_interceptor_print_result(cuda_kernel_local_dim_mapping);
+            cuda_interceptor_print_kernel_result(cuda_kernel_local_dim_mapping);
+            cuda_interceptor_print_graph_result(cuda_graph_local_mapping);
         }
     #else
-        cuda_interceptor_print_result(cuda_kernel_local_dim_mapping);
+        cuda_interceptor_print_kernel_result(cuda_kernel_local_dim_mapping);
+        cuda_interceptor_print_graph_result(cuda_graph_local_mapping);
     #endif
 }
