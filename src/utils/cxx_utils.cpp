@@ -99,3 +99,14 @@ extern "C" char* extract_function_name(const char* demangled) {
     free(noReturn);
     return nameOnly;
 }
+
+char* truncate_string(const char* s, int max_len) {
+    int len = strlen(s);
+    if (len <= max_len) return strdup(s);
+
+    char* result = (char*)malloc(max_len + 1);
+    strncpy(result, s, max_len - 3);
+    strcpy(result + max_len - 3, "...");
+    return result;
+}
+

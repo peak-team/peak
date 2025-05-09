@@ -94,18 +94,4 @@ double median_double(double* arr, size_t n);
  */
 int check_command(const char *str);
 
-/**
- * @brief Truncate a string and append ellipsis if it exceeds the specified length.
- *
- * This function creates a new dynamically allocated string. If the input string
- * `s` is longer than `max_len`, the returned string will contain the first
- * (max_len - 3) characters followed by "...". Otherwise, it returns a copy of the
- * original string.
- *
- * @param s The input null-terminated string to truncate.
- * @param max_len The maximum allowed length of the output string (including ellipsis).
- * @return A newly allocated null-terminated string. The caller is responsible for freeing it.
- */
-char* truncate_string(const char* s, size_t max_len);
-
 #endif /* __UTILS_H */
