@@ -88,6 +88,7 @@ typedef struct {
     gulong block_size;
     cudaEvent_t* start_event;
     cudaEvent_t* end_event;
+    cudaError_t result;
 } KernelLaunchInfo;
 
 struct KernelLaunchSeries{
@@ -112,6 +113,7 @@ typedef struct {
     CUgraphExec_st* graph;
     cudaEvent_t* start_event;
     cudaEvent_t* end_event;
+    cudaError_t result;
 } GraphLaunchInfo;
 
 struct GraphLaunchSeries{
@@ -247,14 +249,15 @@ static cudaError_t peak_cuda_launch_kernel(
     cudaEventRecord(*start, stream);
     cudaError_t result = original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
     cudaEventRecord(*end, stream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_name),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -289,7 +292,8 @@ static cudaError_t peak_cuda_launch_cooperative_kernel(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -328,7 +332,8 @@ static cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -369,7 +374,8 @@ static cudaError_t peak_cuda_launch_kernel_exc(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -410,7 +416,8 @@ static CUresult peak_cu_launch_kernel(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -450,7 +457,8 @@ static CUresult peak_cu_launch_cooperative_kernel(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -494,7 +502,8 @@ static CUresult peak_cu_launch_cooperative_kernel_multiple_device(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -536,7 +545,8 @@ static CUresult peak_cu_launch_kernel_ex(
         .grid_size = grid_size,
         .block_size = block_size,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_kernel_event_map[kernel_name];
     {
@@ -561,7 +571,8 @@ static cudaError_t peak_cuda_graph_launch(
     GraphLaunchInfo info = {
         .graph = graphExec,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_graph_event_map[graphExec];
     {
@@ -586,7 +597,8 @@ static CUresult peak_cu_graph_launch(
     GraphLaunchInfo info = {
         .graph = hGraphExec,
         .start_event = start,
-        .end_event = end
+        .end_event = end,
+        .result = (cudaError_t)result
     };
     auto& series = peak_graph_event_map[hGraphExec];
     {
@@ -823,7 +835,7 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
         g_printerr("%s\n", row_separator);
 
         g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sKERNEL THREAD SIZE%*s\n", 
+        g_printerr("%*sKERNEL GRID SIZE%*s\n", 
             (row_width - 21) / 2, "", 
             (row_width - 21 + 1) / 2, "");
         g_printerr("%s\n", row_separator);
@@ -1182,13 +1194,15 @@ static void cuda_sync_kernel_event() {
         for (const auto& launch : series.launches) {
             float ms = 0.0f;
             cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
-            insert_cuda_mapping_record(
-                launch.kernel_name,
-                launch.total_threads,
-                launch.grid_size,
-                launch.block_size,
-                ms / 1000.0
-            );
+            if (launch.result == cudaSuccess) {
+                insert_cuda_mapping_record(
+                    launch.kernel_name,
+                    launch.total_threads,
+                    launch.grid_size,
+                    launch.block_size,
+                    ms / 1000.0
+                );
+            }
             cudaEventDestroy(*(launch.start_event));
             cudaEventDestroy(*(launch.end_event));
             g_free(launch.kernel_name);
@@ -1200,7 +1214,9 @@ static void cuda_sync_kernel_event() {
         for (const auto& launch : series.launches) {
             float ms = 0.0f;
             cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
-            insert_cuda_graph_record(launch.graph, ms / 1000.0);
+            if (launch.result == cudaSuccess) {
+                insert_cuda_graph_record(launch.graph, ms / 1000.0);
+            }
             cudaEventDestroy(*(launch.start_event));
             cudaEventDestroy(*(launch.end_event));
             free(launch.start_event);
