@@ -40,6 +40,7 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_GPU_TARGET` | Specifies GPU kernels to be profiled, provided as a comma-separated list (e.g., `kernel1,kernel2`). Matching is performed via string comparison on the demangled kernel name, considering only the base kernel names. Namespaces and template parameters are excluded from matching (e.g., `void myspace::kernel1<int>(...)` matches `kernel1`). |
 | `PEAK_GPU_TARGET_FILE` | Path to a configuration file listing GPU kernel names for profiling, with one name per line (e.g., `/path/to/gpu/config/file`). |
 | `PEAK_GPU_MONITOR_ALL` | When set to `TRUE`, all GPU kernels are profiled, regardless of whether they are listed in `PEAK_GPU_TARGET` or the configuration file. If set to `FALSE` or unset, only the listed kernel names are monitored. |
+| `PEAK_NAME_TRUNCATE` | When set to `TRUE`, all function names and kernel names will be truncate to fit the output table. |
 
 ## Example Configuration
 
@@ -49,6 +50,7 @@ export PEAK_COST=10
 export PEAK_TARGET_GROUP=BLAS,LAPACK
 export PEAK_GPU_TARGET=kernel1,kernel2
 export PEAK_GPU_MONITOR_ALL=TRUE
+export PEAK_NAME_TRUNCATE=TRUE
 ```
 
 ## Important Notes
@@ -61,6 +63,9 @@ These variables are merged, combining their items into a single list. Duplicate 
 
 3. **GPU Kernel Profiling:**
 GPU profiling includes the warm-up time of kernels and the CUDA initialization overhead associated with the first kernel launch.
+
+4. **GPU CUDA Graph Profiling:**
+GPU CUDA Graph will be profiled as a single node or function, and only the execution time will be measured. However, if the graph is built using the stream capture process, the profiler will display the individual kernel launches that occurred during the stream capture. Note that in this case, the reported execution time and call count may not be accurate, as they reflect the capture process rather than the actual graph execution.
 
 ## Reference
 If you use PEAK in your research, please cite:

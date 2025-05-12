@@ -801,12 +801,14 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
+            char* truncated_name = truncate_string((const char *)key, max_function_width);
             g_printerr("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
-                max_function_width, truncate_string((const char *)key, max_function_width),
+                max_function_width, truncated_name,
                 max_col_width, dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->total_time,
                 max_col_width, dim_info->max_time,
                 max_col_width, dim_info->min_time);
+            free(truncated_name);
         }
         g_printerr("%s\n", row_separator);
     
@@ -826,11 +828,13 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
+            char* truncated_name = truncate_string((const char *)key, max_function_width);
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, truncate_string((const char *)key, max_function_width),
+                max_function_width, truncated_name,
                 max_col_width, (double)dim_info->total_block_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_block_size,
                 max_col_width, dim_info->min_block_size);
+            free(truncated_name);
         }
         g_printerr("%s\n", row_separator);
 
@@ -849,11 +853,13 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
+            char* truncated_name = truncate_string((const char *)key, max_function_width);
             g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
-                max_function_width, truncate_string((const char *)key, max_function_width),
+                max_function_width, truncated_name,
                 max_col_width, (double)dim_info->total_grid_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_grid_size,
                 max_col_width, dim_info->min_grid_size);
+            free(truncated_name);
         }
         g_printerr("%s\n", row_separator);
     
