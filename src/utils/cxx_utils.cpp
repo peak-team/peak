@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cxxabi.h>
 
+extern bool peak_truncate_function_name;
+
 /**
  * Removes the function parameter list from the symbol.
  * Properly handles nested parentheses.
@@ -101,6 +103,10 @@ extern "C" char* extract_function_name(const char* demangled) {
 }
 
 char* truncate_string(const char* s, int max_len) {
+    if (!peak_truncate_function_name) {
+        return strdup(s);
+    }
+
     int len = strlen(s);
     if (len <= max_len) return strdup(s);
 
