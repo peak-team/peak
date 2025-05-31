@@ -1,3 +1,7 @@
+[![GitHub Build Status](https://img.shields.io/github/actions/workflow/status/peak-team/peak/cmake.yml?branch=main&logo=GitHub)](https://github.com/peak-team/peak/actions/workflows/cmake.yml)
+[![GitHub Build Status](https://img.shields.io/github/actions/workflow/status/peak-team/peak/mpi.yml?branch=main&logo=GitHub&label=test)](https://github.com/peak-team/peak/actions/workflows/mpi.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/peak-team/peak)
+
 # PEAK (Performance Evaluation and Analysis Kit)
 
 PEAK is a lightweight and easy-to-use performance evaluation tool designed with HPC systems in mind. With its user-friendly interface, PEAK provides detailed performance reports on programs, allowing users to quickly identify and resolve performance bottlenecks. Whether you're optimizing code for maximum performance or conducting regular performance evaluations, PEAK is the ideal solution for anyone looking to improve the performance of their programs. 
