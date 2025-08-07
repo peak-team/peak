@@ -84,7 +84,7 @@ void pthread_pause_handler(int signal)
 
         // Wait for the signal with timeout
         if (sigtimedwait(&wait_set, NULL, &timeout) == -1 && errno == ETIMEDOUT) {
-            sem_post(&wait_set);
+            sem_post(&pthread_pause_sem);
         }
 
         // Restore the original signal mask
