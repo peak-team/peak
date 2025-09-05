@@ -135,12 +135,6 @@ void peak_fini()
         if (args) g_free(args);
     }
     peak_main_time = peak_second() - peak_main_time;
-    for (gint i = 0; i < peak_hook_address_count; i++) {
-        g_free(peak_target_thread_called[i]);
-    }
-    g_free(peak_target_thread_called);
-    g_free(peak_need_detach);
-    g_free(peak_detached);
 
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
@@ -164,6 +158,12 @@ void peak_fini()
     syscall_interceptor_dettach();
     pthread_listener_dettach();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        g_free(peak_target_thread_called[i]);
+    }
+    g_free(peak_target_thread_called);
+    g_free(peak_need_detach);
+    g_free(peak_detached);
 }
 
 #if defined(__APPLE__)
