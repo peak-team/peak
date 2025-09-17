@@ -181,6 +181,11 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+0\\.1"
     )
+
+    # Add test of paper
+    add_subdirectory(paper)
+
+
     # Add Cuda Test cases
     if(CUDA_FOUND OR CUDAToolkit_FOUND)
         add_subdirectory(cuda)
