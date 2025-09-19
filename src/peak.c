@@ -13,6 +13,7 @@
 #include "general_listener.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
+#include "dlopen_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
@@ -85,6 +86,7 @@ void peak_init()
 
     pthread_listener_attach();
     syscall_interceptor_attach();
+    dlopen_interceptor_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -156,6 +158,7 @@ void peak_fini()
 #endif
     peak_general_listener_dettach();
     syscall_interceptor_dettach();
+    dlopen_interceptor_dettach();
     pthread_listener_dettach();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
     for (gint i = 0; i < peak_hook_address_count; i++) {
