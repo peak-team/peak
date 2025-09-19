@@ -764,7 +764,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
                 if (!array_listener_detached[i]) {
-                    g_printerr("|%*s|%*.3e|%*.3e|%*.3e|%*.3e|%*.3e|\n",
+                    g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                max_function_width, truncated_name,
                                max_col_width, sum_total_time[i],
                                max_col_width, sum_exclusive_time[i],
@@ -774,7 +774,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                               * peak_general_overhead);
                 } else {
                     if (!array_listener_reattached[i])
-                        g_printerr("|%*s*|%*.3e|%*.3e|%*.3e|%*.3e|%*.3e|\n",
+                        g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                     max_function_width, truncated_name,
                                     max_col_width, sum_total_time[i],
                                     max_col_width, sum_exclusive_time[i],
@@ -783,7 +783,7 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                     max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
                                                     * peak_general_overhead);
                     else
-                        g_printerr("|%*s**|%*.3e|%*.3e|%*.3e|%*.3e|%*.3e|\n",
+                        g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
