@@ -1,6 +1,8 @@
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 
+typedef void (*fn_void)(void);
+
 static GumInterceptor* dlopen_interceptor;
 extern GumInterceptor* interceptor;
 extern GumInvocationListener** array_listener;
@@ -35,39 +37,12 @@ peak_dlopen(const char *filename, int flags) {
             continue;
         }
 
-        // TODO: Consider using dlsym to find the function in the newly loaded library
-        // TODO: Consider refactor code with cuda_interceptor.c
-        hook_address[i] = gum_find_function(peak_hook_strings[i]);
-        if (!hook_address[i]) {
-            // If not found, try to find by demangling all symbols and comparing
-            gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
-            GArray* addresses = gum_find_functions_matching(truncate_hook);
-            for (gsize j = 0; j < addresses->len; j++) {
-                gpointer addr = g_array_index(addresses, gpointer, j);
-                gchar* mangled = gum_symbol_name_from_address(addr);
-                gboolean function_match = FALSE;
-                if (!mangled) continue;
-            
-                char* demangled = cxa_demangle(mangled);
-                g_free(mangled);
-                if (!demangled) continue;
-
-                gchar* function_name = extract_function_name(demangled);
-                if (strcmp(peak_hook_strings[i], function_name) == 0) {
-                    hook_address[i] = addr;
-                    peak_demangled_strings[i] = g_strdup(demangled);
-                    function_match = TRUE;
-                }
-                free(demangled);
-                free(function_name);
-
-                if (function_match) {
-                    break;
-                }
-            }
-            g_array_free(addresses, TRUE);
-            g_free(truncate_hook);
-        } else {
+        // TODO: Consider list all symbols in the newly loaded library and parse the functions
+        // to find the target functions. This is more efficient than dlsym which only support mangled name
+        // but requires more code to parse the ELF file.  
+        fn_void dynamic_link_func = (fn_void)dlsym(handle, peak_hook_strings[i]);
+        if (dynamic_link_func) {
+            hook_address[i] = (gpointer)dynamic_link_func;
             char* demangled = cxa_demangle(peak_hook_strings[i]);
             peak_demangled_strings[i] = g_strdup(demangled);
             free(demangled);
