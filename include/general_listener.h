@@ -28,6 +28,9 @@
 
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
+#define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type())
+G_DECLARE_FINAL_TYPE(PeakGeneralListener, peak_general_listener, PEAKGENERAL, LISTENER, GObject)
+
 /**
  * @struct _PeakGeneralListener
  * @brief Struct representing the Peak General Listener
