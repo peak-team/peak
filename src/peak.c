@@ -239,8 +239,11 @@ void exit_interceptor_detach() {
 static int main_wrapper(int argc, char** argv, char** envp) {
     // Call peak_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
-    if (!exit_interceptor_attach())
+    if (!exit_interceptor_attach()) {
+        // TODO: if we remove this printf, we will have Aborted (core dumped) error.
+        g_printerr("Start PEAK Profiling...\n");
         peak_init();
+    }
 
     int ret = real_main(argc, argv, envp);
 
