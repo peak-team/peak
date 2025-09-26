@@ -1,13 +1,18 @@
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <dlfcn.h>
 
-/* local (static) function in libB -- NOT exported */
-static void b_static(void) {
-    puts("libB: b_static() (static)");
+static void whereis(const char *name, void *p) {
+    Dl_info info;
+    if (dladdr(p, &info) && info.dli_fname) {
+        printf("[where] %-12s @ %-18p from %s\n", name, p, info.dli_fname);
+    } else {
+        printf("[where] %-12s @ %-18p (dladdr: unknown)\n", name, p);
+    }
 }
 
-/* exported function in libB */
+__attribute__((visibility("default"), noinline))
 void b_dynamic(void) {
-    puts("libB: b_dynamic() start");
-    b_static(); /* allowed: internal call */
-    puts("libB: b_dynamic() end");
+    whereis("b_dynamic", (void*) &b_dynamic);
+    puts("libB: b_dynamic() says hello");
 }
