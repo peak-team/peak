@@ -973,7 +973,7 @@ cuda_interceptor_reduce_kernel_result()
         offset += strlen(local_keys[i]) + 1;
     }
 
-    gulong global_kernel_count;
+    gulong global_kernel_count = 0;
     gulong global_keys_length_sum;
     gulong* kernel_count_array = NULL;
     gint* keys_buffer_array = NULL;
@@ -985,7 +985,7 @@ cuda_interceptor_reduce_kernel_result()
         keys_buffer_array = g_new(gint, world_size);
         values_buffer_array = g_new(gint, world_size);
     }
-    MPI_Reduce(&local_kernel_count, &global_kernel_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_kernel_count, &global_kernel_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Reduce(&local_keys_buffer_size, &global_keys_length_sum, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_kernel_count, 1, MPI_INT, kernel_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_keys_buffer_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -1116,7 +1116,7 @@ cuda_interceptor_reduce_graph_result()
         index++;
     }
 
-    gulong global_graph_count;
+    gulong global_graph_count = 0;
     gulong* graph_count_array = NULL;
     gint* keys_buffer_array = NULL;
     gint* values_buffer_array = NULL;
@@ -1126,7 +1126,7 @@ cuda_interceptor_reduce_graph_result()
         keys_buffer_array = g_new(gint, world_size);
         values_buffer_array = g_new(gint, world_size);
     }
-    MPI_Reduce(&local_graph_count, &global_graph_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_graph_count, &global_graph_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Gather(&local_graph_count, 1, MPI_INT, graph_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_key_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
