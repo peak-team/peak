@@ -660,6 +660,7 @@ void peak_general_listener_attach()
         peak_general_overhead_bootstrapping();
         if (peak_detach_cost > 0)
             peak_detach_count = (peak_detach_cost > peak_general_overhead) ? peak_detach_cost / peak_general_overhead : 1;
+        peak_need_detach[0] = false;
     }
 }
 
