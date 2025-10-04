@@ -356,27 +356,29 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         if (self->num_calls[index] >= peak_detach_count) peak_need_detach[hook_id] = true;
         if (peak_detach_count && peak_need_detach[hook_id]) {
             pthread_mutex_lock(&lock);
-            array_listener_detached[hook_id] = TRUE;
-            GumMetalHashTableIter peak_tid_iter;
-            pthread_t peak_tid_key;
-            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
-                    pthread_pause(peak_tid_key);
+            if (!peak_detached[hook_id]) {
+                array_listener_detached[hook_id] = TRUE;
+                GumMetalHashTableIter peak_tid_iter;
+                pthread_t peak_tid_key;
+                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
+                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
+                    size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
+                    if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
+                        pthread_pause(peak_tid_key);
+                    
+                }
+                gum_interceptor_begin_transaction(interceptor);
+                gum_interceptor_detach(interceptor, listener);
+                gum_interceptor_end_transaction(interceptor);
+                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
+                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
+                    size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
+                    if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
+                        pthread_unpause(peak_tid_key);
                 
+                }
+                peak_detached[hook_id] = true;
             }
-            gum_interceptor_begin_transaction(interceptor);
-            gum_interceptor_detach(interceptor, listener);
-            gum_interceptor_end_transaction(interceptor);
-            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
-                    pthread_unpause(peak_tid_key);
-               
-            }
-            peak_detached[hook_id] = true;
             pthread_mutex_unlock(&lock);
             // gum_interceptor_revert(interceptor, hook_address[hook_id]);
             // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
