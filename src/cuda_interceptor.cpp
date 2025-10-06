@@ -1025,7 +1025,7 @@ cuda_interceptor_reduce_kernel_result()
             guint index = 0;
             for (guint i = 0; i < global_kernel_count; i++) {
                 guint len = strlen(global_keys_string + index);
-                global_keys_array[i] = g_new(gchar, len);
+                global_keys_array[i] = g_new(gchar, len+1);
                 strcpy(global_keys_array[i], global_keys_string + index);
                 index += len + 1;
             }
