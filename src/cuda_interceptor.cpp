@@ -973,7 +973,7 @@ cuda_interceptor_reduce_kernel_result()
         offset += strlen(local_keys[i]) + 1;
     }
 
-    gulong global_kernel_count;
+    gulong global_kernel_count = 0;
     gulong global_keys_length_sum;
     gulong* kernel_count_array = NULL;
     gint* keys_buffer_array = NULL;
@@ -1025,13 +1025,7 @@ cuda_interceptor_reduce_kernel_result()
     MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
-        if (global_kernel_count == 0) {
-            g_free(global_keys_string);
-            g_free(keys_offset_array);
-            g_free(values_offset_array);
-            g_free(global_keys_array);
-            g_free(global_values_array);
-        } else {
+        if (global_kernel_count > 0) {
             // Spilt global key strings into global key array
             global_keys_array = g_new(gchar*, global_kernel_count);
             guint index = 0;
@@ -1069,12 +1063,13 @@ cuda_interceptor_reduce_kernel_result()
             for (guint i = 0; i < global_kernel_count; i++) {
                 g_free(global_keys_array[i]);
             }
-            g_free(global_keys_string);
-            g_free(keys_offset_array);
-            g_free(values_offset_array);
-            g_free(global_keys_array);
-            g_free(global_values_array);
         }
+
+        g_free(global_keys_string);
+        g_free(keys_offset_array);
+        g_free(values_offset_array);
+        g_free(global_keys_array);
+        g_free(global_values_array);
     }
 
     for (guint i = 0; i < local_kernel_count; i++) {
@@ -1094,6 +1089,8 @@ cuda_interceptor_reduce_kernel_result()
 static void
 cuda_interceptor_reduce_graph_result()
 {
+    // FIXME: consider not using CUgraphExec_st* to determine unique graph, as it may not work across MPI ranks
+    
     int world_rank, world_size;
     int init_flag;
     MPI_Initialized(&init_flag);
@@ -1134,37 +1131,38 @@ cuda_interceptor_reduce_graph_result()
         keys_buffer_array = g_new(gint, world_size);
         values_buffer_array = g_new(gint, world_size);
     }
-    MPI_Allreduce(&local_graph_count, &global_graph_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Reduce(&local_graph_count, &global_graph_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_graph_count, 1, MPI_INT, graph_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_key_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     
-    if (global_graph_count > 0) {
-        gint *keys_offset_array = NULL;
-        gint *values_offset_array = NULL;
-        CUgraphExec_st** global_keys_array = NULL;
-        GraphRecordInfo* global_values_array = NULL;
-        if (world_rank == 0) {
-            // Key
-            global_keys_array = g_new(CUgraphExec_st*, global_graph_count);
-            keys_offset_array = g_new(gint, global_graph_count);
-            keys_offset_array[0] = 0;
-            for (guint i = 1; i < world_size; i++) {
-                keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
-            }
-
-            // Value
-            global_values_array = g_new(GraphRecordInfo, global_graph_count);
-            values_offset_array = g_new(gint, global_graph_count);
-            values_offset_array[0] = 0;
-            for (guint i = 1; i < world_size; i++) {
-                values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
-            }
+    gint *keys_offset_array = NULL;
+    gint *values_offset_array = NULL;
+    CUgraphExec_st** global_keys_array = NULL;
+    GraphRecordInfo* global_values_array = NULL;
+    
+    if (world_rank == 0) {
+        // Key
+        global_keys_array = g_new(CUgraphExec_st*, global_graph_count);
+        keys_offset_array = g_new(gint, world_size);
+        keys_offset_array[0] = 0;
+        for (guint i = 1; i < world_size; i++) {
+            keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
         }
-        MPI_Gatherv(keys, local_graph_count * sizeof(CUgraphExec_st*), MPI_BYTE, global_keys_array, keys_buffer_array, keys_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
-        MPI_Gatherv(values, local_graph_count * sizeof(GraphRecordInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
 
-        if (world_rank == 0) {
+        // Value
+        global_values_array = g_new(GraphRecordInfo, global_graph_count);
+        values_offset_array = g_new(gint, world_size);
+        values_offset_array[0] = 0;
+        for (guint i = 1; i < world_size; i++) {
+            values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
+        }
+    }
+    MPI_Gatherv(keys, local_graph_count * sizeof(CUgraphExec_st*), MPI_BYTE, global_keys_array, keys_buffer_array, keys_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(values, local_graph_count * sizeof(GraphRecordInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    if (world_rank == 0) {
+        if (global_graph_count > 0) {
             // aggregate value
             for (guint i = 0; i < global_graph_count; i++) {
                 GraphRecordInfo* existing = (GraphRecordInfo*) g_hash_table_lookup(cuda_graph_global_mapping, global_keys_array[i]);
@@ -1177,20 +1175,16 @@ cuda_interceptor_reduce_graph_result()
                     g_hash_table_insert(cuda_graph_global_mapping, global_keys_array[i], g_memdup2(&global_values_array[i], sizeof(GraphRecordInfo)));
                 }
             }
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
 
-        if (world_rank == 0) {
-            cuda_interceptor_print_graph_result(cuda_graph_global_mapping);
-            g_free(keys_offset_array);
-            g_free(values_offset_array);
-            g_free(global_keys_array);
-            g_free(global_values_array);
+            cuda_interceptor_print_graph_result(cuda_graph_global_mapping);            
         }
+
+        g_free(keys_offset_array);
+        g_free(values_offset_array);
+        g_free(global_keys_array);
+        g_free(global_values_array);
     }
     
-
     g_free(keys);
     g_free(values);
     if (world_rank == 0) {
