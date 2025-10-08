@@ -973,7 +973,7 @@ cuda_interceptor_reduce_kernel_result()
         offset += strlen(local_keys[i]) + 1;
     }
 
-    gulong global_kernel_count = 0;
+    gulong global_kernel_count;
     gulong global_keys_length_sum;
     gulong* kernel_count_array = NULL;
     gint* keys_buffer_array = NULL;
@@ -985,41 +985,53 @@ cuda_interceptor_reduce_kernel_result()
         keys_buffer_array = g_new(gint, world_size);
         values_buffer_array = g_new(gint, world_size);
     }
-    MPI_Allreduce(&local_kernel_count, &global_kernel_count, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Reduce(&local_kernel_count, &global_kernel_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_keys_buffer_size, &global_keys_length_sum, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_kernel_count, 1, MPI_INT, kernel_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_keys_buffer_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     
-    if (global_kernel_count > 0) {
-        gchar *global_keys_string = NULL;
-        gint *keys_offset_array = NULL;
-        gint *values_offset_array = NULL;
-        gchar **global_keys_array = NULL;
-        KernelDimInfo* global_values_array = NULL;
-        if (world_rank == 0) {
-            // Key
-            keys_offset_array = g_new(gint, world_size);
-            keys_offset_array[0] = 0;
-            for (guint i = 1; i < world_size; i++) {
-                keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
-            }
-            global_keys_string = g_new(gchar, global_keys_length_sum);
-            memset(global_keys_string, ' ', global_keys_length_sum - 1); // allocate string, pre-fill with spaces and null terminator
-            global_keys_string[global_keys_length_sum - 1] = '\0'; 
+    gchar *global_keys_string = NULL;
+    gint *keys_offset_array = NULL;
+    gint *values_offset_array = NULL;
+    gchar **global_keys_array = NULL;
+    KernelDimInfo* global_values_array = NULL;
 
-            // Value
-            global_values_array = g_new(KernelDimInfo, global_kernel_count);
-            values_offset_array = g_new(gint, global_kernel_count);
-            values_offset_array[0] = 0;
-            for (guint i = 1; i < world_size; i++) {
-                values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
-            }
+    if (world_rank == 0) {
+        // Key
+        keys_offset_array = g_new(gint, world_size);
+        keys_offset_array[0] = 0;
+        for (guint i = 1; i < world_size; i++) {
+            keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
         }
-        MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);  
-        MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+        global_keys_string = g_new(gchar, global_keys_length_sum == 0 ? 1 : global_keys_length_sum);
+        if (global_keys_length_sum > 0) {
+            memset(global_keys_string, '\0', global_keys_length_sum - 1); // allocate string, pre-fill with \0
+            global_keys_string[global_keys_length_sum - 1] = '\0'; 
+        } else {
+            global_keys_string[0] = '\0';
+        }
 
-        if (world_rank == 0) {
+        // Value
+        global_values_array = (global_kernel_count > 0) ? g_new(KernelDimInfo, global_kernel_count) : NULL;
+        values_offset_array = g_new(gint, world_size);
+        values_offset_array[0] = 0;
+        for (guint i = 1; i < world_size; i++) {
+            values_offset_array[i] = values_offset_array[i-1] + values_buffer_array[i-1];
+        }
+    }
+
+    MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);  
+    MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    if (world_rank == 0) {
+        if (global_kernel_count == 0) {
+            g_free(global_keys_string);
+            g_free(keys_offset_array);
+            g_free(values_offset_array);
+            g_free(global_keys_array);
+            g_free(global_values_array);
+        } else {
             // Spilt global key strings into global key array
             global_keys_array = g_new(gchar*, global_kernel_count);
             guint index = 0;
@@ -1051,12 +1063,9 @@ cuda_interceptor_reduce_kernel_result()
                     g_hash_table_insert(cuda_kernel_global_dim_mapping, g_strdup(global_keys_array[i]), g_memdup2(&global_values_array[i], sizeof(KernelDimInfo)));
                 }
             }
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
 
-        if (world_rank == 0) {
             cuda_interceptor_print_kernel_result(cuda_kernel_global_dim_mapping);
+
             for (guint i = 0; i < global_kernel_count; i++) {
                 g_free(global_keys_array[i]);
             }
@@ -1067,7 +1076,6 @@ cuda_interceptor_reduce_kernel_result()
             g_free(global_values_array);
         }
     }
-    
 
     for (guint i = 0; i < local_kernel_count; i++) {
         g_free(local_keys[i]);
@@ -1246,3 +1254,4 @@ extern "C" void cuda_interceptor_print(int is_MPI) {
         cuda_interceptor_print_graph_result(cuda_graph_local_mapping);
     #endif
 }
+
