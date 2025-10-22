@@ -181,6 +181,7 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+0\\.1"
     )
+
     # Add Cuda Test cases
     if(CUDA_FOUND OR CUDAToolkit_FOUND)
         add_subdirectory(cuda)
@@ -195,5 +196,8 @@ if(BUILD_TESTING)
         # set_tests_properties(test_pthread PROPERTIES ENVIRONMENT "PEAK_TARGET=main;${PRELOAD_VAR}")
     endif()
     
+    # Add test of dynamic library intercepting
+    add_subdirectory(dynamic_lib)
+
 endif()
 
