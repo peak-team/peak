@@ -77,7 +77,7 @@ void peak_init()
     peak_truncate_function_name = parse_env_to_bool(PEAK_NAME_TRUNCATE);
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
-    target_profile_ratio = parse_env_to_float(PEAK_OVERHEAD_RATIO_ENV);
+    target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
     post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
 
