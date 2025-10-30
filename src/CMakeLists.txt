@@ -7,6 +7,7 @@ FILE(GLOB sources_peak
     pthread_listener.c
     syscall_interceptor.c
     dlopen_interceptor.c
+    malloc_interceptor.c
 )
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
