@@ -1,5 +1,6 @@
 #ifndef __MALLOC_INTERCEPTOR_H
 #define __MALLOC_INTERCEPTOR_H
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>

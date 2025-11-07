@@ -417,6 +417,8 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
 
     if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
     pthread_mutex_unlock(&track_mutex);
+
+    if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
 }
 
 static AllocationEntry* find_tracking_entry(void* ptr) {
