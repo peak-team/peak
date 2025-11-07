@@ -1,4 +1,5 @@
 add_subdirectory(utils)
+add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 
 # Add all source files
 FILE(GLOB sources_peak
