@@ -14,6 +14,7 @@
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"
+#include "malloc_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
@@ -33,6 +34,7 @@
 #define PEAK_ENABLE_REATTACH_ENV        "PEAK_ENABLE_REATTACH"
 #define PEAK_PAUSE_TIMEOUT_ENV          "PEAK_PAUSE_TIMEOUT"
 #define PEAK_SIG_CONT_TIMEOUT_ENV       "PEAK_SIG_CONT_TIMEOUT"
+#define PEAK_MEMORY_PROFILE             "PEAK_MEMORY_PROFILE"
 #define PPID_FILE_NAME                  "/tmp/lock_peak_ppid_list"
 
 
@@ -57,6 +59,7 @@ double peak_main_time;
 float peak_detach_cost;
 gboolean peak_gpu_monitor_all = false;
 gboolean peak_truncate_function_name = false;
+gboolean peak_memory_profile = false;
 #ifdef HAVE_MPI
 static int found_MPI;
 static int flag_clean_fppid = 0;
@@ -81,13 +84,13 @@ void peak_init()
     target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
     post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
+    peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
 
     //gum_init_embedded();
 
     pthread_listener_attach();
     syscall_interceptor_attach();
     dlopen_interceptor_attach();
-    malloc_interceptor_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -127,6 +130,10 @@ void peak_init()
     }
     
     peak_main_time = peak_second();
+    
+    if (peak_memory_profile) {
+        malloc_interceptor_attach();
+    }
 }
 
 void peak_fini()
@@ -139,6 +146,9 @@ void peak_fini()
     }
     peak_main_time = peak_second() - peak_main_time;
 
+    if (peak_memory_profile) {
+        malloc_interceptor_dettach();
+    }
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
@@ -159,7 +169,6 @@ void peak_fini()
 #endif
     peak_general_listener_dettach();
     syscall_interceptor_dettach();
-    malloc_interceptor_dettach();
     dlopen_interceptor_dettach();
     pthread_listener_dettach();
     free_parsed_result(peak_hook_strings, peak_hook_address_count);

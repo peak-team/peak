@@ -1,11 +1,15 @@
 #ifndef __MALLOC_INTERCEPTOR_H
 #define __MALLOC_INTERCEPTOR_H
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -13,6 +17,15 @@
 #include <linux/limits.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <signal.h>
+#include <dlfcn.h> 
+#include <execinfo.h>   // backtrace()
+#include <inttypes.h>   // PRIu64, etc.
+
+#ifdef HAVE_MPI
+#include <mpi.h>
+#endif
 
 /**
  * @file malloc_interceptor.h
@@ -20,6 +33,8 @@
  */
 
 #include "frida-gum.h"
+#include "utils/cxx_utils.h"
+#include "utils/mpi_utils.h"
 
 /**
  * @brief Attach memory allocation function interception
