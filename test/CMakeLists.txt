@@ -199,5 +199,19 @@ if(BUILD_TESTING)
     # Add test of dynamic library intercepting
     add_subdirectory(dynamic_lib)
 
+    # Add test of memory allocation intercepting
+    add_subdirectory(memory)
+    add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
+    set_tests_properties(test_memory 
+        PROPERTIES 
+            ENVIRONMENT "PEAK_TARGET=performAllocation,performFree;PEAK_MEMORY_PROFILE=TRUE;${PRELOAD_VAR}"
+    )
+    set_tests_properties(test_memory
+        PROPERTIES 
+            PASS_REGULAR_EXPRESSION "performAllocation*\\|[ \t]+[0-9]+\\|.*performAllocation*\\|[ \t]+[0-9]+(\\.[0-9]+)?"
+            PASS_REGULAR_EXPRESSION "performFree*\\|[ \t]+[0-9]+\\|.*performFree*\\|[ \t]+[0-9]+(\\.[0-9]+)?"
+            PASS_REGULAR_EXPRESSION "Max usage \\(bytes\\):[ \t]*[0-9]+"
+    )
+
 endif()
 
