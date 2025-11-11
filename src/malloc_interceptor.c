@@ -516,21 +516,17 @@ static void* custom_realloc(void* ptr, size_t size) {
 }
 
 static void* custom_aligned_alloc(size_t alignment, size_t size) {
+    // No need to record tracking entry because malloc function called internally
+    // will record the memory allocation entry.
     void* ptr = original_aligned_alloc(alignment, size);
-    if (ptr) {
-        int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, size, 0, NULL, flag);
-    }
     return ptr;
 }
 
 static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    // No need to record tracking entry because malloc function called internally
+    // will record the memory allocation entry.
     int ret = original_posix_memalign(memptr, alignment, size);
-    if (ret == 0) {
-        int flag = peak_log_backtrace_malloc(*memptr, size);
-        add_tracking_entry(*memptr, size, 0, NULL, flag);
-    }
-    return 0;
+    return ret;
 }
 
 /*=========================
