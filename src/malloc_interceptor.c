@@ -54,6 +54,7 @@ typedef struct {
 /*=========================
   Globals
 =========================*/
+extern gboolean            peak_memory_track_all;
 extern size_t              peak_hook_address_count;
 extern char**              peak_hook_strings;
 static GumInterceptor*     malloc_interceptor;
@@ -133,6 +134,8 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
 }
 
 static int peak_log_backtrace_malloc(void* ret_ptr, size_t sz) {
+    if (peak_memory_track_all) return 1; // Track all memory allocation events
+
     if (in_backtrace) return 0; // prevent recursion
     int flag = 0;
     in_backtrace++;
