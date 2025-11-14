@@ -47,6 +47,7 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_MEMORY_PROFILE` *(Beta)* | Enables memory allocation profiling for the specified `PEAK_TARGET`. When set to `TRUE`, PEAK intercepts and records all memory allocation and deallocation events that occur during the target’s execution. |
 | `PEAK_MEMLOG_PATH` | Default: `/tmp/peak_memlog`. Specifies the output file path for the memory profile log (in CSV format). The log includes the following columns:<br>`timestamp (ns since start)`, `memory delta (bytes)`, `current memory usage (bytes)`, `thread ID (tid)`, and `operation` (`1 = allocation`, `2 = free`). |
 | `PEAK_MEMLOG_CHUNK_EVENTS` | Defualt: 5,000,000. Defines the initial and incremental size (in number of events) for the virtual memory buffer used to store memory profiling data. PEAK allocates this buffer in virtual memory and automatically expands it by this amount when additional space is required. |
+| `PEAK_MEMORY_TRACK_ALL` | Default: `FALSE`. Track all memory allocation evetns. If this flag is set `TRUE`, the memory profiler will not backtrace memory allocation event, nor it will record events according to `PEAK_TARGET`. |
 | `PEAK_NAME_TRUNCATE` | When set to `TRUE`, all function names and kernel names will be truncate to fit the output table. |
 
 ## Example Configuration
