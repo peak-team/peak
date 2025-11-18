@@ -1,4 +1,5 @@
 add_subdirectory(utils)
+add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 
 # Add all source files
 FILE(GLOB sources_peak
@@ -7,6 +8,7 @@ FILE(GLOB sources_peak
     pthread_listener.c
     syscall_interceptor.c
     dlopen_interceptor.c
+    malloc_interceptor.c
 )
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c

@@ -6,6 +6,14 @@ extern "C" {
 #endif
 
 /**
+ * Remove trailing offset for a mangled symbol with address.
+ *
+ * @param mangled_name_with_offset The mangled symbol (e.g., "_Z3fooi+0x01").
+ * @return void. Directly applied the changed to the string.
+ */
+void removeTrailingOffset(char* mangled_name_with_offset);
+
+/**
  * Demangles a C++ mangled symbol name (cxa).
  *
  * @param mangled_name The mangled symbol (e.g., "_Z3fooi").
