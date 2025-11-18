@@ -7,8 +7,6 @@
 typedef struct {
     void*   ptr;
     size_t  size;
-    int     is_mmap;
-    char*   filename;  // Store filename for mmap allocations
 } AllocationEntry;
 
 /*=========================
@@ -389,7 +387,7 @@ static void peak_memlog_finalize_to_csv(void) {
   Tracking table helpers
 =========================*/
 
-static void add_tracking_entry(void* ptr, size_t size, int is_mmap, char* filename, int log) {
+static void add_tracking_entry(void* ptr, size_t size, int log) {
     if (!track_table || cleanup_in_progress) return;
     if (!log) return;
 
@@ -398,8 +396,6 @@ static void add_tracking_entry(void* ptr, size_t size, int is_mmap, char* filena
 
     entry->ptr      = ptr;
     entry->size     = size;
-    entry->is_mmap  = is_mmap;
-    entry->filename = filename;  // May be NULL for non-mmap allocations
 
     pthread_mutex_lock(&track_mutex);
     gum_metal_hash_table_insert(track_table, ptr, entry);
@@ -433,11 +429,6 @@ static void remove_tracking_entry(void* ptr) {
         current_memory -= entry->size;
     }
     pthread_mutex_unlock(&track_mutex);
-
-    if (entry->filename) {
-        remove(entry->filename);
-        internal_free(entry->filename);
-    }
 
     if (entry) {
         peak_log_event(-((int64_t) entry->size), (uint64_t) current_memory, 2);
@@ -481,7 +472,7 @@ static void* custom_malloc(size_t size) {
     void* ptr = original_malloc(size);
     if (ptr) {
         int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, size, 0, NULL, flag);
+        add_tracking_entry(ptr, size, flag);
     }
     in_peak_alloc_hook = 0;
     return ptr;
@@ -505,7 +496,7 @@ static void* custom_calloc(size_t nmemb, size_t size) {
     void* ptr = original_calloc(nmemb, size);
     if (ptr) {
         int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, total_size, 0, NULL, flag);
+        add_tracking_entry(ptr, total_size, flag);
     } 
     return ptr;
 }
@@ -523,7 +514,7 @@ static void* custom_realloc(void* ptr, size_t size) {
     if (new_ptr) {
         remove_tracking_entry(ptr);
         int flag = peak_log_backtrace_malloc(new_ptr, size);
-        add_tracking_entry(new_ptr, size, 0, NULL, flag);
+        add_tracking_entry(new_ptr, size, flag);
     }
     return new_ptr;
 }
@@ -537,7 +528,7 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
     void* ptr = original_aligned_alloc(alignment, size);
     if (ptr) {
         int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, size, 0, NULL, flag);
+        add_tracking_entry(ptr, size, flag);
     }
     in_peak_alloc_hook = 0;
 
@@ -551,9 +542,9 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 
     in_peak_alloc_hook = 1;
     int ret = original_posix_memalign(memptr, alignment, size);
-    if (ptr) {
-        int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, size, 0, NULL, flag);
+    if (memptr) {
+        int flag = peak_log_backtrace_malloc(memptr, size);
+        add_tracking_entry(memptr, size, flag);
     }
     in_peak_alloc_hook = 0;
     return ret;
@@ -620,9 +611,17 @@ void malloc_interceptor_dettach(void) {
     if (aligned_alloc_addr) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
     if (posix_memalign_addr)gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
 
+    pthread_mutex_lock(&track_mutex);
+    pthread_mutex_lock(&caller_mutex);
+
     gum_metal_hash_table_unref(track_table);
+    track_table = NULL;
     gum_metal_hash_table_unref(memory_caller_target_table);
+    memory_caller_target_table = NULL;
     g_object_unref(malloc_interceptor);
+    
+    pthread_mutex_unlock(&caller_mutex);
+    pthread_mutex_unlock(&track_mutex);
 
     memory_usage_log_print();
     peak_memlog_finalize_to_csv();
