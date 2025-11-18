@@ -42,7 +42,7 @@ typedef struct {
     size_t   capacity_events;  // how many events can fit now
     size_t   chunk_events;     // growth step
     _Atomic size_t index;      // next event slot
-    _Atomic int    growing;    // CAS gate for growth
+    pthread_mutex_t resize_mutex; // protects resize (ftruncate + mremap)
     uint64_t t0_ns;
     int      initialized;
     char     tmp_path[512];    // mmapped temp file path (unlinked at end)
@@ -275,16 +275,22 @@ static void peak_memlog_open(void) {
     g_memlog.capacity_events = init_events;
     g_memlog.chunk_events    = chunk_ev;
     atomic_store(&g_memlog.index, 0);
-    atomic_store(&g_memlog.growing, 0);
+
+    // Initialize resize mutex on first successful open
+    pthread_mutex_init(&g_memlog.resize_mutex, NULL);
+
     g_memlog.initialized = 1;
 }
 
 static void peak_memlog_grow_if_needed(size_t want_index) {
     if (want_index < g_memlog.capacity_events) return;
 
-    int exp = 0;
-    if (!atomic_compare_exchange_strong(&g_memlog.growing, &exp, 1)) {
-        while (atomic_load(&g_memlog.growing) != 0) { /* brief spin */ }
+    pthread_mutex_lock(&g_memlog.resize_mutex);
+
+    // Double-check now that we hold the lock: another thread might have
+    // already grown the mapping while we were waiting.
+    if (want_index < g_memlog.capacity_events) {
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
         return;
     }
 
@@ -292,23 +298,29 @@ static void peak_memlog_grow_if_needed(size_t want_index) {
     size_t cap         = g_memlog.capacity_events;
     size_t chunk       = g_memlog.chunk_events;
 
-    size_t add_chunks = (need_events > cap) ? ((need_events - cap + chunk - 1) / chunk) : 0;
-    if (add_chunks == 0) { atomic_store(&g_memlog.growing, 0); return; }
+    size_t add_chunks = 0;
+    if (need_events > cap) {
+        add_chunks = (need_events - cap + chunk - 1) / chunk;
+    }
+    if (add_chunks == 0) {
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
+        return;
+    }
 
-    size_t old_bytes = g_memlog.map_bytes;
-    size_t new_events= cap + add_chunks * chunk;
-    size_t new_bytes = g_memlog.header_bytes + new_events * sizeof(PeakMemEvent);
+    size_t old_bytes  = g_memlog.map_bytes;
+    size_t new_events = cap + add_chunks * chunk;
+    size_t new_bytes  = g_memlog.header_bytes + new_events * sizeof(PeakMemEvent);
 
     if (ftruncate(g_memlog.fd, (off_t) new_bytes) != 0) {
         fprintf(stderr, "[peak] memlog: ftruncate grow failed: %s\n", strerror(errno));
-        atomic_store(&g_memlog.growing, 0);
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
         return;
     }
 
     void *new_map = mremap(g_memlog.map, old_bytes, new_bytes, MREMAP_MAYMOVE);
     if (new_map == MAP_FAILED) {
         fprintf(stderr, "[peak] memlog: mremap failed: %s (keeping old cap)\n", strerror(errno));
-        atomic_store(&g_memlog.growing, 0);
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
         return;
     }
 
@@ -316,7 +328,7 @@ static void peak_memlog_grow_if_needed(size_t want_index) {
     g_memlog.map_bytes       = new_bytes;
     g_memlog.capacity_events = new_events;
 
-    atomic_store(&g_memlog.growing, 0);
+    pthread_mutex_unlock(&g_memlog.resize_mutex);
 }
 
 static inline void peak_log_event(int64_t delta, uint64_t current, uint8_t op) {
@@ -542,7 +554,7 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 
     in_peak_alloc_hook = 1;
     int ret = original_posix_memalign(memptr, alignment, size);
-    if (memptr) {
+    if (ret == 0 && memptr != NULL) {
         int flag = peak_log_backtrace_malloc(memptr, size);
         add_tracking_entry(memptr, size, flag);
     }
@@ -625,4 +637,10 @@ void malloc_interceptor_dettach(void) {
 
     memory_usage_log_print();
     peak_memlog_finalize_to_csv();
+
+    // Clean up resize mutex
+    if (g_memlog.initialized) {
+        pthread_mutex_destroy(&g_memlog.resize_mutex);
+        g_memlog.initialized = 0;
+    }
 }
