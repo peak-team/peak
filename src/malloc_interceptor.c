@@ -662,6 +662,9 @@ void malloc_interceptor_detach(void) {
     pthread_mutex_unlock(&caller_mutex);
 
     g_object_unref(malloc_interceptor);
+    
+    pthread_mutex_unlock(&caller_mutex);
+    pthread_mutex_unlock(&track_mutex);
 
     memory_usage_log_print();
     peak_memlog_finalize_to_csv();
