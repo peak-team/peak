@@ -72,6 +72,7 @@ static gpointer            realloc_addr = NULL;
 static gpointer            aligned_alloc_addr = NULL;
 static gpointer            posix_memalign_addr = NULL;
 static PeakMemLog          g_memlog = {0};
+static __thread int        in_peak_alloc_hook = 0;
 static __thread int        in_backtrace = 0;
 
 /*=========================
@@ -469,11 +470,20 @@ static void init_table(void) {
 =========================*/
 
 static void* custom_malloc(size_t size) {
+    if (in_peak_alloc_hook) {
+        // If in_peak_alloc_hook is true, it means that the malloc is called by
+        // other peak intercepted memory allocation functions. To prevent logging error,
+        // we don't log here, just pass through.
+        return original_malloc(size);
+    }
+
+    in_peak_alloc_hook = 1;
     void* ptr = original_malloc(size);
     if (ptr) {
         int flag = peak_log_backtrace_malloc(ptr, size);
         add_tracking_entry(ptr, size, 0, NULL, flag);
     }
+    in_peak_alloc_hook = 0;
     return ptr;
 }
 
@@ -519,16 +529,33 @@ static void* custom_realloc(void* ptr, size_t size) {
 }
 
 static void* custom_aligned_alloc(size_t alignment, size_t size) {
-    // No need to record tracking entry because malloc function called internally
-    // will record the memory allocation entry.
+    if (in_peak_alloc_hook) {
+        return original_aligned_alloc(alignment, size);
+    }
+
+    in_peak_alloc_hook = 1;
     void* ptr = original_aligned_alloc(alignment, size);
+    if (ptr) {
+        int flag = peak_log_backtrace_malloc(ptr, size);
+        add_tracking_entry(ptr, size, 0, NULL, flag);
+    }
+    in_peak_alloc_hook = 0;
+
     return ptr;
 }
 
 static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
-    // No need to record tracking entry because malloc function called internally
-    // will record the memory allocation entry.
+    if (in_peak_alloc_hook) {
+        return original_posix_memalign(memptr, alignment, size);
+    }
+
+    in_peak_alloc_hook = 1;
     int ret = original_posix_memalign(memptr, alignment, size);
+    if (ptr) {
+        int flag = peak_log_backtrace_malloc(ptr, size);
+        add_tracking_entry(ptr, size, 0, NULL, flag);
+    }
+    in_peak_alloc_hook = 0;
     return ret;
 }
 
