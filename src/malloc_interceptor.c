@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "malloc_interceptor.h"
+#include "malloc_otf2.h"
 
 /*=========================
   Types
@@ -16,39 +17,6 @@ typedef struct {
 #ifndef PEAK_MEMLOG_CHUNK_EVENTS
 #define PEAK_MEMLOG_CHUNK_EVENTS (1u * 500u * 1000u) // grow step (0.5M events)
 #endif
-
-typedef struct {
-    uint64_t ts_ns;     // relative to t0_ns
-    int64_t  delta;     // +alloc / -free / +/-realloc
-    uint64_t current;   // current memory after applying delta
-    uint32_t tid;       // Linux thread id
-    uint8_t  op;        // 1=alloc,2=free,3=realloc_old,4=realloc_new
-} __attribute__((packed)) PeakMemEvent;
-
-typedef struct {
-    char     magic[8];       // "PEAKMEM\0", magic string indicating PEAK memory log file format
-    uint32_t header_bytes;   // page-aligned size of header
-    uint64_t t0_ns;          // base time
-    uint64_t clock_id;       // CLOCK_MONOTONIC_RAW
-    int32_t  mpi_rank;       // -1 if unknown
-    int32_t  pid;            // getpid()
-    int32_t  ppid;           // getppid()
-} __attribute__((packed)) PeakMemHeader;
-
-typedef struct {
-    int      fd;               // fd of temp binary file
-    void    *map;              // base mapping (header + events)
-    size_t   map_bytes;        // mapped size
-    size_t   header_bytes;     // aligned header length
-    size_t   capacity_events;  // how many events can fit now
-    size_t   chunk_events;     // growth step
-    _Atomic size_t index;      // next event slot
-    pthread_mutex_t resize_mutex; // protects resize (ftruncate + mremap)
-    uint64_t t0_ns;
-    int      initialized;
-    char     tmp_path[512];    // mmapped temp file path (unlinked at end)
-    char     csv_path[512];    // final CSV output path
-} PeakMemLog;
 
 /*=========================
   Globals
@@ -188,7 +156,7 @@ static int peak_log_backtrace_malloc() {
   Path builder (no malloc)
 =========================*/
 
-static void build_paths(char out_tmp[512], char out_csv[512]) {
+static void build_paths(char out_tmp[512], char out_csv[512], char out_otf2[512]) {
     char base[256] = {0};
     const char *env_path = getenv("PEAK_MEMLOG_PATH");
     if (env_path && *env_path) {
@@ -197,7 +165,7 @@ static void build_paths(char out_tmp[512], char out_csv[512]) {
         memcpy(base, env_path, n);
         base[n] = '\0';
     } else {
-        snprintf(base, sizeof(base), "/tmp/peak_memlog");
+        snprintf(base, sizeof(base), "./peak_memlog");
     }
 
     int rank = -1;
@@ -207,9 +175,11 @@ static void build_paths(char out_tmp[512], char out_csv[512]) {
     if (rank == -1) {
         snprintf(out_tmp, 512, "%s-p%d.tmp", base, pid);
         snprintf(out_csv, 512, "%s-p%d.csv", base, pid);
+        snprintf(out_otf2, 512, "p%d", pid);
     } else {
         snprintf(out_tmp, 512, "%s-r%d-p%d.tmp", base, rank, pid);
         snprintf(out_csv, 512, "%s-r%d-p%d.csv", base, rank, pid);
+        snprintf(out_otf2, 512, "r%d-p%d", rank, pid);
     }
 }
 
@@ -227,7 +197,7 @@ static void peak_memlog_open(void) {
         if (v > 1000) chunk_ev = (size_t) v;
     }
 
-    build_paths(g_memlog.tmp_path, g_memlog.csv_path);
+    build_paths(g_memlog.tmp_path, g_memlog.csv_path, g_memlog.otf2_prefix);
 
     int fd = open(g_memlog.tmp_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) {
@@ -279,6 +249,8 @@ static void peak_memlog_open(void) {
 
     // Initialize resize mutex on first successful open
     pthread_mutex_init(&g_memlog.resize_mutex, NULL);
+
+    peak_log_event(nsec_now(), (int64_t) 0, (uint64_t) 0, 1);
 
     g_memlog.initialized = 1;
 }
@@ -332,8 +304,8 @@ static void peak_memlog_grow_if_needed(size_t want_index) {
     pthread_mutex_unlock(&g_memlog.resize_mutex);
 }
 
-static inline void peak_log_event(int64_t delta, uint64_t current, uint8_t op) {
-    if (!g_memlog.initialized || !g_memlog.map || g_memlog.map == MAP_FAILED) return;
+static inline void peak_log_event(uint64_t ts, int64_t delta, uint64_t current, uint8_t op) {
+    if (!g_memlog.initialized || !g_memlog.map) return;
 
     size_t i = atomic_fetch_add_explicit(&g_memlog.index, 1, memory_order_relaxed);
     if (i >= g_memlog.capacity_events) {
@@ -343,7 +315,7 @@ static inline void peak_log_event(int64_t delta, uint64_t current, uint8_t op) {
 
     uint8_t *base = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
     PeakMemEvent *e = (PeakMemEvent *) (base + i * sizeof(PeakMemEvent));
-    e->ts_ns   = nsec_now() - g_memlog.t0_ns;
+    e->ts_ns   = ts;
     e->delta   = delta;
     e->current = current;
     e->tid     = peak_gettid();
@@ -361,8 +333,8 @@ static inline void peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
 }
 
 /* Convert the mmapped binary buffer to a CSV file (and remove the temp backing file). */
-static void peak_memlog_finalize_to_csv(void) {
-    if (!g_memlog.initialized || !g_memlog.map || g_memlog.map == MAP_FAILED) return;
+static void peak_memlog_finalize(void) {
+    if (!g_memlog.initialized || !g_memlog.map) return;
 
     size_t events = atomic_load_explicit(&g_memlog.index, memory_order_relaxed);
     size_t used_bytes = g_memlog.header_bytes + events * sizeof(PeakMemEvent);
@@ -370,6 +342,14 @@ static void peak_memlog_finalize_to_csv(void) {
     
     msync(g_memlog.map, used_bytes, MS_SYNC);
 
+    /* base pointer of the events region (after header) */
+    uint8_t *base_bytes = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
+    PeakMemEvent *base  = (PeakMemEvent *) base_bytes;
+
+    /* 1) OTF2 export */
+    peak_memlog_export_otf2(g_memlog.otf2_prefix, base, events);
+
+    /* 2) CSV export (exactly as before) */
     int fd_csv = open(g_memlog.csv_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
     if (fd_csv < 0) {
         fprintf(stderr, "[peak] memlog: open CSV %s failed: %s\n", g_memlog.csv_path, strerror(errno));
@@ -418,7 +398,7 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
     if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
     pthread_mutex_unlock(&track_mutex);
 
-    if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
+    if (log) peak_log_event(nsec_now(), (int64_t) size, (uint64_t) current_memory, 1);
 }
 
 static AllocationEntry* find_tracking_entry(void* ptr) {
@@ -445,7 +425,7 @@ static void remove_tracking_entry(void* ptr) {
     }
 
     if (entry) {
-        peak_log_event(-((int64_t) entry->size), (uint64_t) current_memory, 2);
+        peak_log_event(nsec_now(), -((int64_t) entry->size), (uint64_t) current_memory, 2);
         internal_free(entry);
     }
     pthread_mutex_unlock(&track_mutex);
@@ -667,7 +647,7 @@ void malloc_interceptor_detach(void) {
     pthread_mutex_unlock(&track_mutex);
 
     memory_usage_log_print();
-    peak_memlog_finalize_to_csv();
+    peak_memlog_finalize();
 
     // Clean up resize mutex
     if (g_memlog.initialized) {
