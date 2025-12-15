@@ -187,6 +187,73 @@ static void build_paths(char out_tmp[512], char out_csv[512], char out_otf2[512]
   Memlog: open / grow / event / finalize
 =========================*/
 
+static void peak_memlog_grow_if_needed(size_t want_index) {
+    if (want_index < g_memlog.capacity_events) return;
+
+    pthread_mutex_lock(&g_memlog.resize_mutex);
+
+    // Double-check now that we hold the lock: another thread might have
+    // already grown the mapping while we were waiting.
+    if (want_index < g_memlog.capacity_events) {
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
+        return;
+    }
+
+    size_t need_events = want_index + 1;
+    size_t cap         = g_memlog.capacity_events;
+    size_t chunk       = g_memlog.chunk_events;
+
+    size_t add_chunks = 0;
+    if (need_events > cap) {
+        add_chunks = (need_events - cap + chunk - 1) / chunk;
+    }
+    if (add_chunks == 0) {
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
+        return;
+    }
+
+    size_t old_bytes  = g_memlog.map_bytes;
+    size_t new_events = cap + add_chunks * chunk;
+    size_t new_bytes  = g_memlog.header_bytes + new_events * sizeof(PeakMemEvent);
+
+    if (ftruncate(g_memlog.fd, (off_t) new_bytes) != 0) {
+        fprintf(stderr, "[peak] memlog: ftruncate grow failed: %s\n", strerror(errno));
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
+        return;
+    }
+
+    void *new_map = mremap(g_memlog.map, old_bytes, new_bytes, MREMAP_MAYMOVE);
+    if (new_map == MAP_FAILED) {
+        fprintf(stderr, "[peak] memlog: mremap failed: %s (keeping old cap)\n", strerror(errno));
+        pthread_mutex_unlock(&g_memlog.resize_mutex);
+        return;
+    }
+
+    g_memlog.map             = new_map;
+    g_memlog.map_bytes       = new_bytes;
+    g_memlog.capacity_events = new_events;
+
+    pthread_mutex_unlock(&g_memlog.resize_mutex);
+}
+
+static inline void peak_log_event(uint64_t ts, int64_t delta, uint64_t current, uint8_t op) {
+    if (!g_memlog.initialized || !g_memlog.map) return;
+
+    size_t i = atomic_fetch_add_explicit(&g_memlog.index, 1, memory_order_relaxed);
+    if (i >= g_memlog.capacity_events) {
+        peak_memlog_grow_if_needed(i);
+        if (i >= g_memlog.capacity_events) return; // growth failed (rare)
+    }
+
+    uint8_t *base = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
+    PeakMemEvent *e = (PeakMemEvent *) (base + i * sizeof(PeakMemEvent));
+    e->ts_ns   = ts;
+    e->delta   = delta;
+    e->current = current;
+    e->tid     = peak_gettid();
+    e->op      = op;
+}
+
 static void peak_memlog_open(void) {
     if (g_memlog.initialized) return;
 
@@ -253,73 +320,6 @@ static void peak_memlog_open(void) {
     peak_log_event(nsec_now(), (int64_t) 0, (uint64_t) 0, 1);
 
     g_memlog.initialized = 1;
-}
-
-static void peak_memlog_grow_if_needed(size_t want_index) {
-    if (want_index < g_memlog.capacity_events) return;
-
-    pthread_mutex_lock(&g_memlog.resize_mutex);
-
-    // Double-check now that we hold the lock: another thread might have
-    // already grown the mapping while we were waiting.
-    if (want_index < g_memlog.capacity_events) {
-        pthread_mutex_unlock(&g_memlog.resize_mutex);
-        return;
-    }
-
-    size_t need_events = want_index + 1;
-    size_t cap         = g_memlog.capacity_events;
-    size_t chunk       = g_memlog.chunk_events;
-
-    size_t add_chunks = 0;
-    if (need_events > cap) {
-        add_chunks = (need_events - cap + chunk - 1) / chunk;
-    }
-    if (add_chunks == 0) {
-        pthread_mutex_unlock(&g_memlog.resize_mutex);
-        return;
-    }
-
-    size_t old_bytes  = g_memlog.map_bytes;
-    size_t new_events = cap + add_chunks * chunk;
-    size_t new_bytes  = g_memlog.header_bytes + new_events * sizeof(PeakMemEvent);
-
-    if (ftruncate(g_memlog.fd, (off_t) new_bytes) != 0) {
-        fprintf(stderr, "[peak] memlog: ftruncate grow failed: %s\n", strerror(errno));
-        pthread_mutex_unlock(&g_memlog.resize_mutex);
-        return;
-    }
-
-    void *new_map = mremap(g_memlog.map, old_bytes, new_bytes, MREMAP_MAYMOVE);
-    if (new_map == MAP_FAILED) {
-        fprintf(stderr, "[peak] memlog: mremap failed: %s (keeping old cap)\n", strerror(errno));
-        pthread_mutex_unlock(&g_memlog.resize_mutex);
-        return;
-    }
-
-    g_memlog.map             = new_map;
-    g_memlog.map_bytes       = new_bytes;
-    g_memlog.capacity_events = new_events;
-
-    pthread_mutex_unlock(&g_memlog.resize_mutex);
-}
-
-static inline void peak_log_event(uint64_t ts, int64_t delta, uint64_t current, uint8_t op) {
-    if (!g_memlog.initialized || !g_memlog.map) return;
-
-    size_t i = atomic_fetch_add_explicit(&g_memlog.index, 1, memory_order_relaxed);
-    if (i >= g_memlog.capacity_events) {
-        peak_memlog_grow_if_needed(i);
-        if (i >= g_memlog.capacity_events) return; // growth failed (rare)
-    }
-
-    uint8_t *base = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
-    PeakMemEvent *e = (PeakMemEvent *) (base + i * sizeof(PeakMemEvent));
-    e->ts_ns   = ts;
-    e->delta   = delta;
-    e->current = current;
-    e->tid     = peak_gettid();
-    e->op      = op;
 }
 
 /* small helper to keep CSV emit identical but clearer */
