@@ -150,7 +150,7 @@ void peak_fini()
     peak_main_time = peak_second() - peak_main_time;
 
     if (peak_memory_profile) {
-        malloc_interceptor_dettach();
+        malloc_interceptor_detach();
     }
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {

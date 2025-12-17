@@ -1,6 +1,5 @@
 #ifndef __MALLOC_INTERCEPTOR_H
 #define __MALLOC_INTERCEPTOR_H
-#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +53,6 @@ int malloc_interceptor_attach();
  *
  * @return void
  */
-void malloc_interceptor_dettach();
+void malloc_interceptor_detach();
 
 #endif /* __MALLOC_INTERCEPTOR_H */

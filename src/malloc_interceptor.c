@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "malloc_interceptor.h"
 
 /*=========================
@@ -118,7 +119,7 @@ static size_t page_align_up(size_t v) {
   MPI helper (as-is)
 =========================*/
 
-static int get_mpi_rank(int *rank) {
+static void get_mpi_rank(int *rank) {
     if (check_MPI()) {
         *rank = get_MPI_local_rank();
     }
@@ -132,7 +133,7 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
-static int peak_log_backtrace_malloc(void* ret_ptr, size_t sz) {
+static int peak_log_backtrace_malloc() {
     if (peak_memory_track_all) return 1; // Track all memory allocation events
 
     if (in_backtrace) return 0; // prevent recursion
@@ -200,7 +201,7 @@ static void build_paths(char out_tmp[512], char out_csv[512]) {
     }
 
     int rank = -1;
-    (void) get_mpi_rank(&rank);
+    get_mpi_rank(&rank);
 
     int pid = (int) getpid();
     if (rank == -1) {
@@ -263,7 +264,7 @@ static void peak_memlog_open(void) {
     hdr->clock_id     = (uint64_t) CLOCK_MONOTONIC_RAW;
 
     int rank = -1;
-    (void) get_mpi_rank(&rank);
+    get_mpi_rank(&rank);
     hdr->mpi_rank = rank;
     hdr->pid      = (int32_t) getpid();
     hdr->ppid     = (int32_t) getppid();
@@ -480,54 +481,78 @@ static void* custom_malloc(size_t size) {
         return original_malloc(size);
     }
 
+    int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
     void* ptr = original_malloc(size);
     if (ptr) {
-        int flag = peak_log_backtrace_malloc(ptr, size);
+        int flag = peak_log_backtrace_malloc();
         add_tracking_entry(ptr, size, flag);
     }
-    in_peak_alloc_hook = 0;
+    in_peak_alloc_hook = hook_val;
+
     return ptr;
 }
 
 static void custom_free(void* ptr) {
+    if (in_peak_alloc_hook) {
+        original_free(ptr);
+        return;
+    }
+
     if (!ptr) return;
+
+    int hook_val = in_peak_alloc_hook;
+    in_peak_alloc_hook = 1;
     original_free(ptr);
     AllocationEntry* entry = find_tracking_entry(ptr);
-    if (!entry) return;
-    remove_tracking_entry(ptr);
+    if (entry) remove_tracking_entry(ptr);
+    in_peak_alloc_hook = hook_val;
 }
 
 static void* custom_calloc(size_t nmemb, size_t size) {
+    if (in_peak_alloc_hook) {
+        return original_calloc(nmemb, size);
+    }
+
     if (size && nmemb > SIZE_MAX / size) {
         errno = ENOMEM;
         return NULL;
     }
 
+    int hook_val = in_peak_alloc_hook;
+    in_peak_alloc_hook = 1;
     size_t total_size = nmemb * size;
     void* ptr = original_calloc(nmemb, size);
     if (ptr) {
-        int flag = peak_log_backtrace_malloc(ptr, size);
+        int flag = peak_log_backtrace_malloc();
         add_tracking_entry(ptr, total_size, flag);
     } 
+    in_peak_alloc_hook = hook_val;
+
     return ptr;
 }
 
 static void* custom_realloc(void* ptr, size_t size) {
-    if (!ptr) return custom_malloc(size);
-    if (!size) { custom_free(ptr); return NULL; }
-
-    AllocationEntry* entry = find_tracking_entry(ptr);
-    if (!entry) {
+    if (in_peak_alloc_hook) {
         return original_realloc(ptr, size);
     }
 
+    if (!ptr) return custom_malloc(size);
+    if (!size) { custom_free(ptr); return NULL; }
+
+    int hook_val = in_peak_alloc_hook;
+    in_peak_alloc_hook = 1;
+    AllocationEntry* entry = find_tracking_entry(ptr);
+    if (entry) {
+        remove_tracking_entry(ptr);
+    }
     void* new_ptr = original_realloc(ptr, size);
     if (new_ptr) {
-        remove_tracking_entry(ptr);
-        int flag = peak_log_backtrace_malloc(new_ptr, size);
+        int flag = peak_log_backtrace_malloc();
         add_tracking_entry(new_ptr, size, flag);
     }
+    in_peak_alloc_hook = hook_val;
+
     return new_ptr;
 }
 
@@ -536,13 +561,15 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
         return original_aligned_alloc(alignment, size);
     }
 
+    int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
     void* ptr = original_aligned_alloc(alignment, size);
     if (ptr) {
-        int flag = peak_log_backtrace_malloc(ptr, size);
-        add_tracking_entry(ptr, size, flag);
+        size_t allocation_size = (size + alignment - 1) & ~(alignment - 1);
+        int flag = peak_log_backtrace_malloc();
+        add_tracking_entry(ptr, allocation_size, flag);
     }
-    in_peak_alloc_hook = 0;
+    in_peak_alloc_hook = hook_val;
 
     return ptr;
 }
@@ -552,13 +579,14 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
         return original_posix_memalign(memptr, alignment, size);
     }
 
+    int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
     int ret = original_posix_memalign(memptr, alignment, size);
     if (ret == 0 && memptr != NULL) {
-        int flag = peak_log_backtrace_malloc(memptr, size);
-        add_tracking_entry(memptr, size, flag);
+        int flag = peak_log_backtrace_malloc();
+        add_tracking_entry(*memptr, size, flag);
     }
-    in_peak_alloc_hook = 0;
+    in_peak_alloc_hook = hook_val;
     return ret;
 }
 
@@ -613,7 +641,7 @@ int malloc_interceptor_attach(void) {
     return 0;
 }
 
-void malloc_interceptor_dettach(void) {
+void malloc_interceptor_detach(void) {
     cleanup_in_progress = 1;
 
     if (malloc_addr)        gum_interceptor_revert(malloc_interceptor, malloc_addr);
