@@ -26,7 +26,7 @@ typedef struct {
 } __attribute__((packed)) PeakMemEvent;
 
 typedef struct {
-    char     magic[8];       // "PEAKMEM\0", indicating that the byte is PeakMemHeader
+    char     magic[8];       // "PEAKMEM\0", magic string indicating PEAK memory log file format
     uint32_t header_bytes;   // page-aligned size of header
     uint64_t t0_ns;          // base time
     uint64_t clock_id;       // CLOCK_MONOTONIC_RAW
@@ -333,7 +333,7 @@ static void peak_memlog_grow_if_needed(size_t want_index) {
 }
 
 static inline void peak_log_event(int64_t delta, uint64_t current, uint8_t op) {
-    if (!g_memlog.initialized || !g_memlog.map) return;
+    if (!g_memlog.initialized || !g_memlog.map || g_memlog.map == MAP_FAILED) return;
 
     size_t i = atomic_fetch_add_explicit(&g_memlog.index, 1, memory_order_relaxed);
     if (i >= g_memlog.capacity_events) {
@@ -362,7 +362,7 @@ static inline void peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
 
 /* Convert the mmapped binary buffer to a CSV file (and remove the temp backing file). */
 static void peak_memlog_finalize_to_csv(void) {
-    if (!g_memlog.initialized || !g_memlog.map) return;
+    if (!g_memlog.initialized || !g_memlog.map || g_memlog.map == MAP_FAILED) return;
 
     size_t events = atomic_load_explicit(&g_memlog.index, memory_order_relaxed);
     size_t used_bytes = g_memlog.header_bytes + events * sizeof(PeakMemEvent);
@@ -414,9 +414,9 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
     gum_metal_hash_table_insert(track_table, ptr, entry);
     current_memory += size;
     max_memory = current_memory > max_memory ? current_memory : max_memory;
-    pthread_mutex_unlock(&track_mutex);
 
     if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
+    pthread_mutex_unlock(&track_mutex);
 }
 
 static AllocationEntry* find_tracking_entry(void* ptr) {
@@ -441,12 +441,12 @@ static void remove_tracking_entry(void* ptr) {
         gum_metal_hash_table_remove(track_table, ptr);
         current_memory -= entry->size;
     }
-    pthread_mutex_unlock(&track_mutex);
 
     if (entry) {
         peak_log_event(-((int64_t) entry->size), (uint64_t) current_memory, 2);
         internal_free(entry);
     }
+    pthread_mutex_unlock(&track_mutex);
 }
 
 static void init_table(void) {
@@ -461,12 +461,11 @@ static void init_table(void) {
         exit(1);
     }
     
+    pthread_mutex_lock(&caller_mutex);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        pthread_mutex_lock(&caller_mutex);
         gum_metal_hash_table_insert(memory_caller_target_table, peak_hook_strings[i], peak_hook_strings[i]);
-        // char * f = gum_metal_hash_table_lookup(memory_caller_target_table, peak_hook_strings[i]);
-        pthread_mutex_unlock(&caller_mutex);
     }
+    pthread_mutex_unlock(&caller_mutex);
 }
 
 /*=========================
@@ -565,9 +564,8 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
     in_peak_alloc_hook = 1;
     void* ptr = original_aligned_alloc(alignment, size);
     if (ptr) {
-        size_t allocation_size = (size + alignment - 1) & ~(alignment - 1);
         int flag = peak_log_backtrace_malloc();
-        add_tracking_entry(ptr, allocation_size, flag);
+        add_tracking_entry(ptr, size, flag);
     }
     in_peak_alloc_hook = hook_val;
 
@@ -582,7 +580,7 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
     int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
     int ret = original_posix_memalign(memptr, alignment, size);
-    if (ret == 0 && memptr != NULL) {
+    if (ret == 0 && memptr != NULL && *memptr != NULL) {
         int flag = peak_log_backtrace_malloc();
         add_tracking_entry(*memptr, size, flag);
     }
@@ -652,16 +650,16 @@ void malloc_interceptor_detach(void) {
     if (posix_memalign_addr)gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
 
     pthread_mutex_lock(&track_mutex);
-    pthread_mutex_lock(&caller_mutex);
-
     gum_metal_hash_table_unref(track_table);
     track_table = NULL;
+    pthread_mutex_unlock(&track_mutex);
+
+    pthread_mutex_lock(&caller_mutex);
     gum_metal_hash_table_unref(memory_caller_target_table);
     memory_caller_target_table = NULL;
-    g_object_unref(malloc_interceptor);
-    
     pthread_mutex_unlock(&caller_mutex);
-    pthread_mutex_unlock(&track_mutex);
+
+    g_object_unref(malloc_interceptor);
 
     memory_usage_log_print();
     peak_memlog_finalize_to_csv();

@@ -87,8 +87,6 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
     void* ptr = nullptr;
     auto start = std::chrono::high_resolution_clock::now();
     
-    // Store original size to handle cases where size might be modified
-    size_t originalSize = size;
     std::string allocType = allocTypeToString(type);
 
     switch (type) {
@@ -287,7 +285,7 @@ void* threadFunction(void* arg) {
     auto threadDuration = std::chrono::duration_cast<std::chrono::milliseconds>(threadEndTime - threadStartTime);
 
     // Print thread summary
-    if (true) {
+    if (config.verbose) {
         std::lock_guard<std::mutex> lock(outputMutex);
         std::cout << "\n[Thread " << threadId << "] Summary:\n"
                   << "  Total requested: " << localTotalRequested << " bytes\n"
@@ -495,7 +493,7 @@ void printUsage(const char* programName) {
 
 int main(int argc, char* argv[]) {
     Config config;
-    config.totalSize = 1 * 1024 * 1024;  // 1GB default
+    config.totalSize = 1 * 1024 * 1024;     // 1MB default
     config.chunkSize = 1 * 1024;            // 1KB default
     config.alignment = 16;                  // 16 bytes default
     config.threadCount = 2;                 // 2 threads default
