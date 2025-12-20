@@ -77,6 +77,13 @@ char* extractFinalFunctionName(const char* s) {
     return lastColon ? strdup(lastColon + 1) : strdup(s);
 }
 
+extern "C" void removeTrailingOffset(char *func) {
+    char *p = strchr(func, '+');
+    if (p && strstr(p, "0x") == p + 1) {
+        *p = '\0';
+    }
+}
+
 extern "C" char* cxa_demangle(const char* name) {
     int status = 0;
     char* result = abi::__cxa_demangle(name, 0, 0, &status);
