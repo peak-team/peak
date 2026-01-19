@@ -16,16 +16,9 @@ static void* (*original_dlopen)(const char *filename, int flags);
 
 static void*
 peak_dlopen(const char *filename, int flags) {
-    // Clear any existing error
-    dlerror();
-
     void *handle = original_dlopen(filename, flags);
-    const char *err = dlerror();
     // If dlopen failed or no filename, don’t do rescan
-    if (err != NULL || handle == NULL || filename == NULL) {
-        if (err != NULL) {
-            g_printerr("dlopen error: %s\n", err);
-        }
+    if (handle == NULL || filename == NULL) {
         return handle;
     }
 
