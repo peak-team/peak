@@ -668,11 +668,25 @@ void peak_general_listener_attach()
 }
 
 static FILE* peak_stats_csv_open(void) {
-    const char* path = "peak_stats.csv";
+    char base[256] = {0};
+    char out_csv[512] = {0};
 
-    FILE* fp = fopen(path, "w");
+    const char *env_path = getenv("PEAK_STATSLOG_PATH");
+    if (env_path && *env_path) {
+        size_t n = strlen(env_path);
+        if (n >= sizeof(base)) n = sizeof(base) - 1;
+        memcpy(base, env_path, n);
+        base[n] = '\0';
+    } else {
+        snprintf(base, sizeof(base), "./peak_statslog");
+    }
+
+    int pid = (int) getpid();
+    snprintf(out_csv, 512, "%s-p%d.csv", base, pid);
+    
+    FILE* fp = fopen(out_csv, "w");
     if (!fp) {
-        g_printerr("[peak] failed to open stats csv '%s': %s\n", path, strerror(errno));
+        g_printerr("[peak] failed to open stats csv '%s': %s\n", out_csv, strerror(errno));
         return NULL;
     }
 
