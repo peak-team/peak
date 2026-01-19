@@ -1,6 +1,5 @@
 #ifndef __MALLOC_INTERCEPTOR_H
 #define __MALLOC_INTERCEPTOR_H
-#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +44,7 @@ typedef struct {
 } __attribute__((packed)) PeakMemEvent;
 
 typedef struct {
-    char     magic[8];       // "PEAKMEM\0", indicating that the byte is PeakMemHeader
+    char     magic[8];       // "PEAKMEM\0" magic string indicating PEAK memory log file format
     uint32_t header_bytes;   // page-aligned size of header
     uint64_t t0_ns;          // base time
     uint64_t clock_id;       // CLOCK_MONOTONIC_RAW

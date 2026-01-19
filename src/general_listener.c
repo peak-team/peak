@@ -720,8 +720,7 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
         return;
     }
 
-    FILE* csv = NULL;
-    csv = peak_stats_csv_open();
+    FILE* csv = peak_stats_csv_open();
 
     if (csv) {
         for (size_t i = 0; i < peak_hook_address_count; i++) {

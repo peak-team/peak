@@ -65,7 +65,7 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
 endif()
 
 # Find or download otf2
-if (NOT OTF2_LIBRARIES OR OTF2_LIBRARY_DIR)
+if (NOT OTF2_LIBRARIES AND NOT OTF2_LIBRARY_DIR)
     message(STATUS "Fetching otf2")
     include(cmake/otf2.cmake)
     fetch_otf2(

@@ -344,10 +344,10 @@ static void peak_memlog_finalize(void) {
 
     /* base pointer of the events region (after header) */
     uint8_t *base_bytes = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
-    PeakMemEvent *base  = (PeakMemEvent *) base_bytes;
+    PeakMemEvent *base_chunk  = (PeakMemEvent *) base_bytes;
 
     /* 1) OTF2 export */
-    peak_memlog_export_otf2(g_memlog.otf2_prefix, base, events);
+    peak_memlog_export_otf2(g_memlog.otf2_prefix, base_chunk, events);
 
     /* 2) CSV export (exactly as before) */
     int fd_csv = open(g_memlog.csv_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
@@ -394,8 +394,6 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
     gum_metal_hash_table_insert(track_table, ptr, entry);
     current_memory += size;
     max_memory = current_memory > max_memory ? current_memory : max_memory;
-
-    if (log) peak_log_event((int64_t) size, (uint64_t) current_memory, 1);
     pthread_mutex_unlock(&track_mutex);
 
     if (log) peak_log_event(nsec_now(), (int64_t) size, (uint64_t) current_memory, 1);
@@ -642,9 +640,6 @@ void malloc_interceptor_detach(void) {
     pthread_mutex_unlock(&caller_mutex);
 
     g_object_unref(malloc_interceptor);
-    
-    pthread_mutex_unlock(&caller_mutex);
-    pthread_mutex_unlock(&track_mutex);
 
     memory_usage_log_print();
     peak_memlog_finalize();
