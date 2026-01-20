@@ -9,6 +9,7 @@ FILE(GLOB sources_peak
     syscall_interceptor.c
     dlopen_interceptor.c
     malloc_interceptor.c
+    malloc_otf2.c
 )
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
@@ -62,6 +63,7 @@ target_include_directories(peak
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
         ${LIBIBERTY_INCLUDE_DIR}
+        ${OTF2_INCLUDE_DIRS}
 )
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
@@ -82,6 +84,7 @@ target_link_libraries(peak
         ${RESOLV_LIBRARY}
         ${M_LIBRARY}
         ${LIBIBERTY_LIB}
+        ${OTF2_LIBRARIES}
 )
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
