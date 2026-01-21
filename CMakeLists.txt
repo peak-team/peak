@@ -64,6 +64,19 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
     message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
 endif()
 
+# Find or download otf2
+if (NOT OTF2_LIBRARIES AND NOT OTF2_LIBRARY_DIR)
+    message(STATUS "Fetching otf2")
+    include(cmake/otf2.cmake)
+    fetch_otf2(
+        ${PROJECT_SOURCE_DIR}/cmake
+        ${PROJECT_BINARY_DIR}/otf2
+    )
+    message(STATUS "OTF2_LIBRARIES   = ${OTF2_LIBRARIES}")
+    message(STATUS "OTF2_INCLUDE_DIRS = ${OTF2_INCLUDE_DIRS}")
+    message(STATUS "OTF2_LIBRARY_DIR = ${OTF2_LIBRARY_DIR}")
+endif()
+
 # reference: https://cliutils.gitlab.io/modern-cmake/chapters/packages/MPI.html
 find_package(MPI)
 if(MPI_FOUND)

@@ -612,40 +612,43 @@ void peak_general_listener_attach()
             hook_address[i] = gum_find_function("peak_dlopen");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
-            if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
-                // peak_hook_strings is just function name
-                gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
-                GArray* addresses = gum_find_functions_matching(truncate_hook);
-                for (gsize j = 0; j < addresses->len; j++) {
-                    gpointer addr = g_array_index(addresses, gpointer, j);
-                    gchar* mangled = gum_symbol_name_from_address(addr);
-                    gboolean function_match = FALSE;
-                    if (!mangled) continue;
-                
-                    char* demangled = cxa_demangle(mangled);
-                    g_free(mangled);
-                    if (!demangled) continue;
-    
-                    gchar* function_name = extract_function_name(demangled);
-                    if (strcmp(peak_hook_strings[i], function_name) == 0) {
-                        hook_address[i] = addr;
-                        peak_demangled_strings[i] = g_strdup(demangled);
-                        function_match = TRUE;
-                    }
-                    free(demangled);
-                    free(function_name);
-
-                    if (function_match) {
-                        break;
-                    }
-                }
-                g_array_free(addresses, TRUE);
-                g_free(truncate_hook);
-            } else {
-                hook_address[i] = gum_find_function(peak_hook_strings[i]);
+            gpointer ptr = gum_find_function(peak_hook_strings[i]);
+            if (ptr) {
+                hook_address[i] = ptr;
                 char* demangled = cxa_demangle(peak_hook_strings[i]);
                 peak_demangled_strings[i] = g_strdup(demangled);
                 free(demangled);
+            } else {
+                if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
+                    // peak_hook_strings is just function name
+                    gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
+                    GArray* addresses = gum_find_functions_matching(truncate_hook);
+                    for (gsize j = 0; j < addresses->len; j++) {
+                        gpointer addr = g_array_index(addresses, gpointer, j);
+                        gchar* mangled = gum_symbol_name_from_address(addr);
+                        gboolean function_match = FALSE;
+                        if (!mangled) continue;
+                    
+                        char* demangled = cxa_demangle(mangled);
+                        g_free(mangled);
+                        if (!demangled) continue;
+        
+                        gchar* function_name = extract_function_name(demangled);
+                        if (strcmp(peak_hook_strings[i], function_name) == 0) {
+                            hook_address[i] = addr;
+                            peak_demangled_strings[i] = g_strdup(demangled);
+                            function_match = TRUE;
+                        }
+                        free(demangled);
+                        free(function_name);
+    
+                        if (function_match) {
+                            break;
+                        }
+                    }
+                    g_array_free(addresses, TRUE);
+                    g_free(truncate_hook);
+                }
             }
         }
         if (hook_address[i]) {
@@ -667,6 +670,82 @@ void peak_general_listener_attach()
     }
 }
 
+static FILE* peak_stats_csv_open(void) {
+    char base[256] = {0};
+    char out_csv[512] = {0};
+
+    const char *env_path = getenv("PEAK_STATSLOG_PATH");
+    if (env_path && *env_path) {
+        size_t n = strlen(env_path);
+        if (n >= sizeof(base)) n = sizeof(base) - 1;
+        memcpy(base, env_path, n);
+        base[n] = '\0';
+    } else {
+        snprintf(base, sizeof(base), "./peak_statslog");
+    }
+
+    int pid = (int) getpid();
+    snprintf(out_csv, 512, "%s-p%d.csv", base, pid);
+    
+    FILE* fp = fopen(out_csv, "w");
+    if (!fp) {
+        g_printerr("[peak] failed to open stats csv '%s': %s\n", out_csv, strerror(errno));
+        return NULL;
+    }
+
+    fprintf(fp,
+            "function,"
+            "count,per_thread,per_rank,call_max_s,call_min_s,"
+            "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s\n");
+    return fp;
+}
+
+static void
+peak_general_listener_export_csv_result(gulong* sum_num_calls,
+    gdouble* sum_total_time,
+    gdouble* max_total_time,
+    gdouble* min_total_time,
+    gdouble* sum_exclusive_time,
+    gfloat* sum_max_time,
+    gfloat* sum_min_time,
+    gulong* thread_count,
+    const int rank_count)
+{
+    gboolean have_output = FALSE;
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address[i] && sum_num_calls[i] != 0) {
+            have_output = TRUE;
+            break;
+        }
+    }
+
+    if (!have_output) {
+        return;
+    }
+
+    FILE* csv = peak_stats_csv_open();
+
+    if (csv) {
+        for (size_t i = 0; i < peak_hook_address_count; i++) {
+            if (hook_address[i] && sum_num_calls[i] != 0) {
+                fprintf(csv, "\"%s\",%lu,%lu,%lu,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
+                    peak_demangled_strings[i],
+                    (unsigned long)sum_num_calls[i],
+                    (unsigned long)sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                    (unsigned long)sum_num_calls[i] / rank_count,
+                    (double)sum_max_time[i],
+                    (double)sum_min_time[i],
+                    (double)sum_total_time[i],
+                    (double)sum_exclusive_time[i],
+                    (double)max_total_time[i],
+                    (double)min_total_time[i],
+                    (double)(sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0)) * peak_general_overhead);
+            }
+        }
+        fclose(csv);
+    }
+}
+
 static void
 peak_general_listener_print_result(gulong* sum_num_calls,
                                    gdouble* sum_total_time,
@@ -678,6 +757,17 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                    gulong* thread_count,
                                    const int rank_count)
 {
+    peak_general_listener_export_csv_result(sum_num_calls,
+                                            sum_total_time,
+                                            max_total_time,
+                                            min_total_time,
+                                            sum_exclusive_time,
+                                            sum_max_time,
+                                            sum_min_time,
+                                            thread_count,
+                                            rank_count
+    );
+
     guint max_function_width = 20;
     guint max_col_width = 10;
     guint row_width = max_function_width + max_col_width * 5 + 7;

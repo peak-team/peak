@@ -35,6 +35,40 @@
 #include "utils/cxx_utils.h"
 #include "utils/mpi_utils.h"
 
+typedef struct {
+    uint64_t ts_ns;     // relative to t0_ns
+    int64_t  delta;     // +alloc / -free / +/-realloc
+    uint64_t current;   // current memory after applying delta
+    uint32_t tid;       // Linux thread id
+    uint8_t  op;        // 1=alloc,2=free,3=realloc_old,4=realloc_new
+} __attribute__((packed)) PeakMemEvent;
+
+typedef struct {
+    char     magic[8];       // "PEAKMEM\0" magic string indicating PEAK memory log file format
+    uint32_t header_bytes;   // page-aligned size of header
+    uint64_t t0_ns;          // base time
+    uint64_t clock_id;       // CLOCK_MONOTONIC_RAW
+    int32_t  mpi_rank;       // -1 if unknown
+    int32_t  pid;            // getpid()
+    int32_t  ppid;           // getppid()
+} __attribute__((packed)) PeakMemHeader;
+
+typedef struct {
+    int      fd;               // fd of temp binary file
+    void    *map;              // base mapping (header + events)
+    size_t   map_bytes;        // mapped size
+    size_t   header_bytes;     // aligned header length
+    size_t   capacity_events;  // how many events can fit now
+    size_t   chunk_events;     // growth step
+    _Atomic size_t index;      // next event slot
+    pthread_mutex_t resize_mutex; // protects resize (ftruncate + mremap)
+    uint64_t t0_ns;
+    int      initialized;
+    char     tmp_path[512];    // mmapped temp file path (unlinked at end)
+    char     csv_path[512];    // final CSV output path
+    char     otf2_prefix[512];   // final otf2 output prefix (rank, pid)
+} PeakMemLog;
+
 /**
  * @brief Attach memory allocation function interception
  *
