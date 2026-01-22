@@ -1,0 +1,3 @@
+/home/runner/work/peak/peak/_codeql_build_dir/frida-gum/CMakeFiles/frida-gum.dir
+/home/runner/work/peak/peak/_codeql_build_dir/frida-gum/CMakeFiles/edit_cache.dir
+/home/runner/work/peak/peak/_codeql_build_dir/frida-gum/CMakeFiles/rebuild_cache.dir
