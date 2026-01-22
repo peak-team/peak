@@ -234,7 +234,7 @@ void* peak_heartbeat_monitor(void* arg) {
     pthread_t my_tid = pthread_self();
     
     while (heartbeat_running) {
-        heartbeat_counter ++;
+        heartbeat_counter++;
         total_execution_time = peak_second() - peak_main_time;
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && array_listener[i]) {
