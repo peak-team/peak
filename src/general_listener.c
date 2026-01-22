@@ -234,6 +234,7 @@ void* peak_heartbeat_monitor(void* arg) {
     pthread_t my_tid = pthread_self();
     
     while (heartbeat_running) {
+        heartbeat_counter++;
         total_execution_time = peak_second() - peak_main_time;
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && array_listener[i]) {
@@ -250,7 +251,7 @@ void* peak_heartbeat_monitor(void* arg) {
                     peak_need_detach[i] = TRUE;
                 }
                 if (check_interval != 0) {
-                    if ((++heartbeat_counter % check_interval) == 0) {
+                    if ((heartbeat_counter % check_interval) == 0) {
                     // g_printerr("total_num_calls: %d\n", total_num_calls);
                     // g_printerr("current_profile_ratio = %3e, target_profile_ratio = %3e, peak_need_detach = %d\n", current_profile_ratio, target_profile_ratio, peak_need_detach[i]);
                     // g_printerr("array_listener_detached: %d, array_listener_reattached: %d\n", array_listener_detached[i], array_listener_reattached[i]);
