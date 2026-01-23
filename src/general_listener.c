@@ -396,7 +396,6 @@ void* peak_heartbeat_monitor(void* arg) {
                     if (!(hook_address[i] && array_listener[i])) continue;
                     if (!peak_detached[i]) continue;
                     if (peak_need_detach[i]) continue;
-                    if (target_profile_ratio) continue;
 
                     if (ratio_snapshot[i] <= target_profile_ratio) {
                         double start_attach_time = peak_second();
