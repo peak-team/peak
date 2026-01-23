@@ -81,6 +81,32 @@ float parse_env_to_float(const char* env_var);
 float parse_env_to_float_ratio(const char* env_var);
 
 /**
+ * @brief Parses a floating point number from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a floating point number using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed floating point value, or 1.2 if the environment
+ *         variable is not set, is empty, or contains invalid characters.
+ */
+float parse_env_to_float_detach_factor(const char* env_var);
+
+/**
+ * @brief Parses a floating point number from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a floating point number using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed floating point value, or 0.85 if the environment
+ *         variable is not set, is empty, or contains invalid characters.
+ */
+float parse_env_to_float_reattach_factor(const char* env_var);
+
+/**
  * @brief Parses a time value in seconds from an environment variable and converts it to microseconds.
  *
  * This function retrieves the value of an environment variable as a string

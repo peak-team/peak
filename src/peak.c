@@ -31,6 +31,8 @@
 #define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
 #define PEAK_HIBERNATION_CYCLE_ENV      "PEAK_HIBERNATION_CYCLE"
 #define PEAK_OVERHEAD_RATIO_ENV         "PEAK_OVERHEAD_RATIO"
+#define PEAK_GLOBAL_OVERHEAD_RATIO_ENV  "PEAK_GLOBAL_OVERHEAD_RATIO"
+#define PEAK_GLOBAL_REATTACH_FACTOR_ENV "PEAK_GLOBAL_REATTACH_FACTOR"
 #define PEAK_ENABLE_REATTACH_ENV        "PEAK_ENABLE_REATTACH"
 #define PEAK_PAUSE_TIMEOUT_ENV          "PEAK_PAUSE_TIMEOUT"
 #define PEAK_SIG_CONT_TIMEOUT_ENV       "PEAK_SIG_CONT_TIMEOUT"
@@ -52,6 +54,9 @@ unsigned int check_interval;
 unsigned int post_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
+float global_target_ratio;
+float peak_global_reattach_factor;
+float peak_global_detach_factor;
 size_t peak_gpu_hook_address_count;
 char** peak_hook_strings;
 char** peak_gpu_hook_strings;
@@ -84,6 +89,9 @@ void peak_init()
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
     target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
+    global_target_ratio = parse_env_to_float_ratio(PEAK_GLOBAL_OVERHEAD_RATIO_ENV);
+    peak_global_detach_factor = parse_env_to_float_detach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
+    peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
     post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);

@@ -210,6 +210,50 @@ float parse_env_to_float_ratio(const char* env_var)
     return result;
 }
 
+
+float parse_env_to_float_detach_factor(const char* env_var)
+{
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        // Environment variable is not set or is empty
+        return 1.2f;
+    }
+
+    // Parse the string as a floating point number
+    char* endptr;
+    float result = strtof(varvalue, &endptr);
+
+    // Check for errors during parsing
+    if (*endptr != '\0') {
+        // The string contains invalid characters
+        return 1.2f;
+    }
+
+    return result;
+}
+
+float parse_env_to_float_reattach_factor(const char* env_var)
+{
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        // Environment variable is not set or is empty
+        return 0.85f;
+    }
+
+    // Parse the string as a floating point number
+    char* endptr;
+    float result = strtof(varvalue, &endptr);
+
+    // Check for errors during parsing
+    if (*endptr != '\0') {
+        // The string contains invalid characters
+        return 0.85f;
+    }
+
+    return result;
+}
+
+
 unsigned int parse_env_to_time(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {

@@ -23,13 +23,15 @@ extern gulong peak_max_num_threads;
 extern double peak_main_time;
 extern float peak_detach_cost;
 extern float target_profile_ratio;
+extern float global_target_ratio;
+extern float peak_global_reattach_factor;
+extern float peak_global_detach_factor;
 extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
 static gulong peak_detach_count = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
-gboolean heartbeat_running = true; 
-
+gboolean heartbeat_running = true;
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
 G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
@@ -225,79 +227,359 @@ int pthread_unpause(pthread_t thread)
     return 0;
 }
 
+typedef struct {
+    size_t index;
+    double ratio;  // hard-gate ratio
+    double rate;   // for global ordering only
+} OverheadEntry;
+
+// rate descending (global detach)
+static int compare_rate_de(const void* a, const void* b) {
+    const OverheadEntry* x = (const OverheadEntry*)a;
+    const OverheadEntry* y = (const OverheadEntry*)b;
+
+    if (x->rate < y->rate) return 1;
+    if (x->rate > y->rate) return -1;
+
+    // tie-break: larger ratio first
+    if (x->ratio < y->ratio) return 1;
+    if (x->ratio > y->ratio) return -1;
+    return 0;
+}
+
+// rate ascending (global reattach)
+static int compare_rate_inc(const void* a, const void* b) {
+    const OverheadEntry* x = (const OverheadEntry*)a;
+    const OverheadEntry* y = (const OverheadEntry*)b;
+
+    if (x->rate < y->rate) return -1;
+    if (x->rate > y->rate) return 1;
+
+    // tie-break: smaller ratio first
+    if (x->ratio < y->ratio) return -1;
+    if (x->ratio > y->ratio) return 1;
+    return 0;
+}
+
+static inline double clipd(double x, double lo, double hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
 void* peak_heartbeat_monitor(void* arg) {
-    unsigned int heartbeat_time = args->heartbeat_time;
+    unsigned int heartbeat_time = args->heartbeat_time;   // base sleep (us)
     unsigned int check_interval = args->check_interval;
+
+    const unsigned int HB_MIN_US   = 10000;     // hard min sleep
+    const unsigned int HB_MAX_US   = 500000;    // hard max sleep
+    const double       HB_K_ERR    = 3.0;       // sensitivity to overshoot
+    const double       HB_K_RATE   = 0.8;       // sensitivity to growth rate
+    const double       HB_EMA_A    = 0.3;       // EMA alpha in (0,1]
     unsigned int heartbeat_counter = 0;
-    double total_execution_time = 0.0;
+
     gum_interceptor_ignore_current_thread(interceptor);
     pthread_t my_tid = pthread_self();
-    
+
+    OverheadEntry* entries = g_new0(OverheadEntry, peak_hook_address_count);
+
+    double* ratio_snapshot = g_new0(double, peak_hook_address_count);
+    double* rate_snapshot  = g_new0(double, peak_hook_address_count);
+    double* prev_ratio     = g_new0(double, peak_hook_address_count);
+    double* prev_time      = g_new0(double, peak_hook_address_count);
+
+    double now0 = peak_second();
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        ratio_snapshot[i] = 0.0;
+        rate_snapshot[i]  = 0.0;
+        prev_ratio[i]     = 0.0;
+        prev_time[i]      = now0;
+    }
+
+    // ------------------------------
+    // Global dynamics state
+    // ------------------------------
+    double prev_global_overhead = 0.0;
+    double prev_global_time     = now0;
+    double ema_global_rate      = 0.0;
+
     while (heartbeat_running) {
         heartbeat_counter++;
-        total_execution_time = peak_second() - peak_main_time;
+        double now = peak_second();
+
+        double total_execution_time = now - peak_main_time;
+        if (total_execution_time <= 0.0) total_execution_time = 1e-12;
+
+        double global_overhead = 0.0;
+
         for (size_t i = 0; i < peak_hook_address_count; i++) {
-            if (hook_address[i] && array_listener[i]) {
-                PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
-                gulong total_num_calls = 0;
-                for (size_t j = 0; j < peak_max_num_threads; j++) {
-                    size_t index = j;
-                    total_num_calls += pg_listener->num_calls[index];
-                }
-                
-                double current_profile_ratio = (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
-                if (current_profile_ratio > target_profile_ratio && !peak_detached[i]) {
-                    // g_printerr("detach\n");
-                    peak_need_detach[i] = TRUE;
-                }
-                if (check_interval != 0) {
-                    if ((heartbeat_counter % check_interval) == 0) {
-                    // g_printerr("total_num_calls: %d\n", total_num_calls);
-                    // g_printerr("current_profile_ratio = %3e, target_profile_ratio = %3e, peak_need_detach = %d\n", current_profile_ratio, target_profile_ratio, peak_need_detach[i]);
-                    // g_printerr("array_listener_detached: %d, array_listener_reattached: %d\n", array_listener_detached[i], array_listener_reattached[i]);
-                        if (current_profile_ratio <= target_profile_ratio && peak_detached[i]) {
-                            // g_printerr("reattach\n");
-                            double start_attach_time = peak_second();
-                            pthread_mutex_lock(&lock);
-                            GumMetalHashTableIter peak_tid_iter;
-                            pthread_t peak_tid_key;
-                            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                                // g_print ("peak_tid_key %lu\n", peak_tid_key);
-                                // my_tid = pthread_self();
-                                size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                                if (peak_tid_key != my_tid && peak_target_thread_called[i][cur_mapped_tid])
-                                    pthread_pause(peak_tid_key);
-                            }
-                            gum_interceptor_begin_transaction(interceptor);
-                            gum_interceptor_attach(interceptor,
-                                                    hook_address[i],
-                                                    array_listener[i],
-                                                    NULL);
-                            gum_interceptor_end_transaction(interceptor);
-                            gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                            while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                                // g_print ("peak_tid_key %lu\n", peak_tid_key);
-                                // my_tid = pthread_self();
-                                size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                                if (peak_tid_key != my_tid && peak_target_thread_called[i][cur_mapped_tid])
-                                    pthread_unpause(peak_tid_key);
-                            }
-                            peak_need_detach[i] = FALSE;
-                            peak_detached[i] = FALSE;
-                            array_listener_reattached[i] = TRUE;
-                            pthread_mutex_unlock(&lock);
-                            double end_attach_time = peak_second();
-                            heartbeat_overhead[i] += end_attach_time - start_attach_time;
-                            // g_printerr("heartbeat_overhead = %3e\n", heartbeat_overhead[i]);
-                        }
-                    }
-                }
-                
+            if (!(hook_address[i] && array_listener[i])) {
+                ratio_snapshot[i] = 0.0;
+                rate_snapshot[i]  = 0.0;
+                prev_ratio[i]     = 0.0;
+                prev_time[i]      = now;
+                continue;
+            }
+
+            PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
+
+            gulong total_num_calls = 0;
+            for (size_t j = 0; j < peak_max_num_threads; j++) {
+                total_num_calls += pg_listener->num_calls[j];
+            }
+
+            double ratio =
+                (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
+
+            ratio_snapshot[i] = ratio;
+
+            double dt = now - prev_time[i];
+            if (dt <= 1e-12) dt = 1e-12;
+            rate_snapshot[i] = (ratio - prev_ratio[i]) / dt;
+
+            prev_ratio[i] = ratio;
+            prev_time[i]  = now;
+
+            if (!peak_detached[i]) {
+                global_overhead += ratio;
             }
         }
-        usleep(heartbeat_time);
+
+        // ------------------------------------------------------------
+        // 1) Per-target DETACH
+        // ------------------------------------------------------------
+        for (size_t i = 0; i < peak_hook_address_count; i++) {
+            if (!(hook_address[i] && array_listener[i])) continue;
+            if (peak_detached[i]) continue;
+
+            if (ratio_snapshot[i] > target_profile_ratio) {
+                peak_need_detach[i] = TRUE;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 2) Global DETACH
+        // ------------------------------------------------------------
+        if (global_overhead > global_target_ratio * peak_global_detach_factor) {
+            size_t n_attached = 0;
+            for (size_t i = 0; i < peak_hook_address_count; i++) {
+                if (!(hook_address[i] && array_listener[i])) continue;
+                if (peak_detached[i]) continue;
+
+                entries[n_attached].index = i;
+                entries[n_attached].ratio = ratio_snapshot[i];
+                entries[n_attached].rate  = rate_snapshot[i];
+                n_attached++;
+            }
+
+            if (n_attached > 1) {
+                qsort(entries, n_attached, sizeof(OverheadEntry), compare_rate_de);
+            }
+
+            double reduced = global_overhead;
+            for (size_t k = 0; k < n_attached && reduced > global_target_ratio; k++) {
+                
+                size_t idx = entries[k].index;
+                reduced -= entries[k].ratio;
+                peak_need_detach[idx] = TRUE;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 3) Reattach
+        // ------------------------------------------------------------
+        if (check_interval != 0 && (heartbeat_counter % check_interval) == 0) {
+            if (global_overhead <= peak_global_reattach_factor * global_target_ratio) {
+
+                // Per-target REATTACH
+                for (size_t i = 0; i < peak_hook_address_count; i++) {
+                    if (!(hook_address[i] && array_listener[i])) continue;
+                    if (!peak_detached[i]) continue;
+                    if (peak_need_detach[i]) continue;
+                    if (target_profile_ratio) continue;
+
+                    if (ratio_snapshot[i] <= target_profile_ratio) {
+                        double start_attach_time = peak_second();
+                        pthread_mutex_lock(&lock);
+
+                        GumMetalHashTableIter it;
+                        pthread_t tid_key;
+
+                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                            size_t mapped = (size_t)
+                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                                pthread_pause(tid_key);
+                        }
+
+                        gum_interceptor_begin_transaction(interceptor);
+                        gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
+                        gum_interceptor_end_transaction(interceptor);
+
+                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                            size_t mapped = (size_t)
+                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                                pthread_unpause(tid_key);
+                        }
+
+                        peak_need_detach[i] = FALSE;
+                        peak_detached[i] = FALSE;
+                        array_listener_reattached[i] = TRUE;
+
+                        pthread_mutex_unlock(&lock);
+
+                        double end_attach_time = peak_second();
+                        heartbeat_overhead[i] += end_attach_time - start_attach_time;
+
+                        PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
+                        gulong total_num_calls = 0;
+                        for (size_t j = 0; j < peak_max_num_threads; j++) {
+                            total_num_calls += pg_listener->num_calls[j];
+                        }
+
+                        double exec_at_attach = end_attach_time - peak_main_time;
+                        if (exec_at_attach <= 0.0) exec_at_attach = 1e-12;
+
+                        double ratio_at_attach =
+                            (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / exec_at_attach;
+
+                        ratio_snapshot[i] = ratio_at_attach;
+                        prev_time[i] = end_attach_time;
+                        prev_ratio[i] = ratio_at_attach;
+                        rate_snapshot[i] = 0.0;
+
+                        global_overhead += ratio_at_attach;
+
+                        if (global_overhead > peak_global_reattach_factor * global_target_ratio)
+                            break;
+                    }
+                }
+
+                // ----------------------------------------------------
+                // Global REATTACH
+                // ----------------------------------------------------
+                size_t detached_cnt = 0;
+                for (size_t i = 0; i < peak_hook_address_count; i++) {
+                    if (!(hook_address[i] && array_listener[i])) continue;
+                    if (!peak_detached[i]) continue;
+                    if (peak_need_detach[i]) continue;
+
+                    entries[detached_cnt].index = i;
+                    entries[detached_cnt].ratio = ratio_snapshot[i];
+                    entries[detached_cnt].rate  = rate_snapshot[i];
+                    detached_cnt++;
+                }
+
+                if (detached_cnt > 1) {
+                    qsort(entries, detached_cnt, sizeof(OverheadEntry), compare_rate_inc);
+                }
+
+                for (size_t k = 0; k < detached_cnt; k++) {
+                    size_t i = entries[k].index;
+
+                    if (!peak_detached[i]) continue;
+
+                    if (global_overhead + entries[k].ratio > global_target_ratio) {
+                        break;
+                    }
+
+                    double start_attach_time = peak_second();
+                    pthread_mutex_lock(&lock);
+
+                    GumMetalHashTableIter it;
+                    pthread_t tid_key;
+
+                    gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                    while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                        size_t mapped = (size_t)
+                            gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                        if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                            pthread_pause(tid_key);
+                    }
+
+                    gum_interceptor_begin_transaction(interceptor);
+                    gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
+                    gum_interceptor_end_transaction(interceptor);
+
+                    gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                    while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                        size_t mapped = (size_t)
+                            gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                        if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                            pthread_unpause(tid_key);
+                    }
+
+                    peak_need_detach[i] = FALSE;
+                    peak_detached[i] = FALSE;
+                    array_listener_reattached[i] = TRUE;
+
+                    pthread_mutex_unlock(&lock);
+
+                    double end_attach_time = peak_second();
+                    heartbeat_overhead[i] += end_attach_time - start_attach_time;
+
+                    PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
+                    gulong total_num_calls = 0;
+                    for (size_t j = 0; j < peak_max_num_threads; j++) {
+                        total_num_calls += pg_listener->num_calls[j];
+                    }
+
+                    double exec_at_attach = end_attach_time - peak_main_time;
+                    if (exec_at_attach <= 0.0) exec_at_attach = 1e-12;
+
+                    double ratio_at_attach =
+                        (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / exec_at_attach;
+
+                    ratio_snapshot[i] = ratio_at_attach;
+                    prev_time[i] = end_attach_time;
+                    prev_ratio[i] = ratio_at_attach;
+                    rate_snapshot[i] = 0.0;
+
+                    global_overhead += ratio_at_attach;
+
+                    if (global_overhead > peak_global_reattach_factor * global_target_ratio) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Adaptive heartbeat sleep
+        // ------------------------------------------------------------
+        double gdt = now - prev_global_time;
+        if (gdt <= 1e-12) gdt = 1e-12;
+
+        double global_rate = (global_overhead - prev_global_overhead) / gdt;
+        ema_global_rate = HB_EMA_A * global_rate + (1.0 - HB_EMA_A) * ema_global_rate;
+
+        prev_global_overhead = global_overhead;
+        prev_global_time     = now;
+
+        // error: how much we exceed global target (normalized)
+        double err = (global_target_ratio > 0.0) ? (global_overhead / global_target_ratio - 1.0) : 0.0;
+        if (err < 0.0) err = 0.0;
+
+        // only care positive growth (shrinking shouldn't speed up)
+        double pos_rate = (ema_global_rate > 0.0) ? ema_global_rate : 0.0;
+
+        // scale factor: faster when err/rate bigger
+        double scale = 1.0 / (1.0 + HB_K_ERR * err + HB_K_RATE * pos_rate);
+
+        double sleep_us = clipd((double)heartbeat_time * scale, (double)HB_MIN_US, (double)HB_MAX_US);
+
+        usleep(sleep_us);
     }
+
+    g_free(prev_time);
+    g_free(prev_ratio);
+    g_free(rate_snapshot);
+    g_free(ratio_snapshot);
+    g_free(entries);
+
     gum_interceptor_unignore_current_thread(interceptor);
     return NULL;
 }
@@ -377,6 +659,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
                 
                 }
                 peak_detached[hook_id] = true;
+                peak_need_detach[hook_id] = false;
             }
             pthread_mutex_unlock(&lock);
             // gum_interceptor_revert(interceptor, hook_address[hook_id]);
