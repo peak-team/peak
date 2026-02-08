@@ -26,6 +26,8 @@ extern float target_profile_ratio;
 extern float global_target_ratio;
 extern float peak_global_reattach_factor;
 extern float peak_global_detach_factor;
+extern bool enable_per_target_heartbeat;
+extern bool enable_global_heartbeat;
 extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
 static gulong peak_detach_count = 0;
@@ -348,40 +350,44 @@ void* peak_heartbeat_monitor(void* arg) {
         // ------------------------------------------------------------
         // 1) Per-target DETACH
         // ------------------------------------------------------------
-        for (size_t i = 0; i < peak_hook_address_count; i++) {
-            if (!(hook_address[i] && array_listener[i])) continue;
-            if (peak_detached[i]) continue;
+        if (enable_per_target_heartbeat) {
+            for (size_t i = 0; i < peak_hook_address_count; i++) {
+                if (!(hook_address[i] && array_listener[i])) continue;
+                if (peak_detached[i]) continue;
 
-            if (ratio_snapshot[i] > target_profile_ratio) {
-                peak_need_detach[i] = TRUE;
+                if (ratio_snapshot[i] > target_profile_ratio) {
+                    peak_need_detach[i] = TRUE;
+                }
             }
         }
 
         // ------------------------------------------------------------
         // 2) Global DETACH
         // ------------------------------------------------------------
-        if (global_overhead > global_target_ratio * peak_global_detach_factor) {
-            size_t n_attached = 0;
-            for (size_t i = 0; i < peak_hook_address_count; i++) {
-                if (!(hook_address[i] && array_listener[i])) continue;
-                if (peak_detached[i]) continue;
+        if (enable_global_heartbeat) {
+            if (global_overhead > global_target_ratio * peak_global_detach_factor) {
+                size_t n_attached = 0;
+                for (size_t i = 0; i < peak_hook_address_count; i++) {
+                    if (!(hook_address[i] && array_listener[i])) continue;
+                    if (peak_detached[i]) continue;
 
-                entries[n_attached].index = i;
-                entries[n_attached].ratio = ratio_snapshot[i];
-                entries[n_attached].rate  = rate_snapshot[i];
-                n_attached++;
-            }
+                    entries[n_attached].index = i;
+                    entries[n_attached].ratio = ratio_snapshot[i];
+                    entries[n_attached].rate  = rate_snapshot[i];
+                    n_attached++;
+                }
 
-            if (n_attached > 1) {
-                qsort(entries, n_attached, sizeof(OverheadEntry), compare_rate_de);
-            }
+                if (n_attached > 1) {
+                    qsort(entries, n_attached, sizeof(OverheadEntry), compare_rate_de);
+                }
 
-            double reduced = global_overhead;
-            for (size_t k = 0; k < n_attached && reduced > global_target_ratio; k++) {
-                
-                size_t idx = entries[k].index;
-                reduced -= entries[k].ratio;
-                peak_need_detach[idx] = TRUE;
+                double reduced = global_overhead;
+                for (size_t k = 0; k < n_attached && reduced > global_target_ratio; k++) {
+                    
+                    size_t idx = entries[k].index;
+                    reduced -= entries[k].ratio;
+                    peak_need_detach[idx] = TRUE;
+                }
             }
         }
 
@@ -389,9 +395,8 @@ void* peak_heartbeat_monitor(void* arg) {
         // 3) Reattach
         // ------------------------------------------------------------
         if (check_interval != 0 && (heartbeat_counter % check_interval) == 0) {
-            if (global_overhead <= peak_global_reattach_factor * global_target_ratio) {
-
-                // Per-target REATTACH
+            // Per-target REATTACH
+            if (enable_per_target_heartbeat) {
                 for (size_t i = 0; i < peak_hook_address_count; i++) {
                     if (!(hook_address[i] && array_listener[i])) continue;
                     if (!peak_detached[i]) continue;
@@ -451,96 +456,94 @@ void* peak_heartbeat_monitor(void* arg) {
                         rate_snapshot[i] = 0.0;
 
                         global_overhead += ratio_at_attach;
+                    }
+                }
+            }
+            // Global REATTACH
+            if (enable_global_heartbeat) {
+                if (global_overhead <= peak_global_reattach_factor * global_target_ratio) {
+                    size_t detached_cnt = 0;
+                    for (size_t i = 0; i < peak_hook_address_count; i++) {
+                        if (!(hook_address[i] && array_listener[i])) continue;
+                        if (!peak_detached[i]) continue;
+                        if (peak_need_detach[i]) continue;
 
-                        if (global_overhead > peak_global_reattach_factor * global_target_ratio)
+                        entries[detached_cnt].index = i;
+                        entries[detached_cnt].ratio = ratio_snapshot[i];
+                        entries[detached_cnt].rate  = rate_snapshot[i];
+                        detached_cnt++;
+                    }
+
+                    if (detached_cnt > 1) {
+                        qsort(entries, detached_cnt, sizeof(OverheadEntry), compare_rate_inc);
+                    }
+
+                    for (size_t k = 0; k < detached_cnt; k++) {
+                        size_t i = entries[k].index;
+
+                        if (!peak_detached[i]) continue;
+
+                        if (global_overhead + entries[k].ratio > global_target_ratio) {
                             break;
-                    }
-                }
+                        }
 
-                // ----------------------------------------------------
-                // Global REATTACH
-                // ----------------------------------------------------
-                size_t detached_cnt = 0;
-                for (size_t i = 0; i < peak_hook_address_count; i++) {
-                    if (!(hook_address[i] && array_listener[i])) continue;
-                    if (!peak_detached[i]) continue;
-                    if (peak_need_detach[i]) continue;
+                        double start_attach_time = peak_second();
+                        pthread_mutex_lock(&lock);
 
-                    entries[detached_cnt].index = i;
-                    entries[detached_cnt].ratio = ratio_snapshot[i];
-                    entries[detached_cnt].rate  = rate_snapshot[i];
-                    detached_cnt++;
-                }
+                        GumMetalHashTableIter it;
+                        pthread_t tid_key;
 
-                if (detached_cnt > 1) {
-                    qsort(entries, detached_cnt, sizeof(OverheadEntry), compare_rate_inc);
-                }
+                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                            size_t mapped = (size_t)
+                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                                pthread_pause(tid_key);
+                        }
 
-                for (size_t k = 0; k < detached_cnt; k++) {
-                    size_t i = entries[k].index;
+                        gum_interceptor_begin_transaction(interceptor);
+                        gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
+                        gum_interceptor_end_transaction(interceptor);
 
-                    if (!peak_detached[i]) continue;
+                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
+                            size_t mapped = (size_t)
+                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
+                                pthread_unpause(tid_key);
+                        }
 
-                    if (global_overhead + entries[k].ratio > global_target_ratio) {
-                        break;
-                    }
+                        peak_need_detach[i] = FALSE;
+                        peak_detached[i] = FALSE;
+                        array_listener_reattached[i] = TRUE;
 
-                    double start_attach_time = peak_second();
-                    pthread_mutex_lock(&lock);
+                        pthread_mutex_unlock(&lock);
 
-                    GumMetalHashTableIter it;
-                    pthread_t tid_key;
+                        double end_attach_time = peak_second();
+                        heartbeat_overhead[i] += end_attach_time - start_attach_time;
 
-                    gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                    while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                        size_t mapped = (size_t)
-                            gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                        if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                            pthread_pause(tid_key);
-                    }
+                        PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
+                        gulong total_num_calls = 0;
+                        for (size_t j = 0; j < peak_max_num_threads; j++) {
+                            total_num_calls += pg_listener->num_calls[j];
+                        }
 
-                    gum_interceptor_begin_transaction(interceptor);
-                    gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
-                    gum_interceptor_end_transaction(interceptor);
+                        double exec_at_attach = end_attach_time - peak_main_time;
+                        if (exec_at_attach <= 0.0) exec_at_attach = 1e-12;
 
-                    gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                    while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                        size_t mapped = (size_t)
-                            gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                        if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                            pthread_unpause(tid_key);
-                    }
+                        double ratio_at_attach =
+                            (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / exec_at_attach;
 
-                    peak_need_detach[i] = FALSE;
-                    peak_detached[i] = FALSE;
-                    array_listener_reattached[i] = TRUE;
+                        ratio_snapshot[i] = ratio_at_attach;
+                        prev_time[i] = end_attach_time;
+                        prev_ratio[i] = ratio_at_attach;
+                        rate_snapshot[i] = 0.0;
 
-                    pthread_mutex_unlock(&lock);
+                        global_overhead += ratio_at_attach;
 
-                    double end_attach_time = peak_second();
-                    heartbeat_overhead[i] += end_attach_time - start_attach_time;
-
-                    PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
-                    gulong total_num_calls = 0;
-                    for (size_t j = 0; j < peak_max_num_threads; j++) {
-                        total_num_calls += pg_listener->num_calls[j];
-                    }
-
-                    double exec_at_attach = end_attach_time - peak_main_time;
-                    if (exec_at_attach <= 0.0) exec_at_attach = 1e-12;
-
-                    double ratio_at_attach =
-                        (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / exec_at_attach;
-
-                    ratio_snapshot[i] = ratio_at_attach;
-                    prev_time[i] = end_attach_time;
-                    prev_ratio[i] = ratio_at_attach;
-                    rate_snapshot[i] = 0.0;
-
-                    global_overhead += ratio_at_attach;
-
-                    if (global_overhead > peak_global_reattach_factor * global_target_ratio) {
-                        break;
+                        if (global_overhead > peak_global_reattach_factor * global_target_ratio) {
+                            break;
+                        }
                     }
                 }
             }
@@ -562,11 +565,11 @@ void* peak_heartbeat_monitor(void* arg) {
         double err = (global_target_ratio > 0.0) ? (global_overhead / global_target_ratio - 1.0) : 0.0;
         if (err < 0.0) err = 0.0;
 
-        // only care positive growth (shrinking shouldn't speed up)
-        double pos_rate = (ema_global_rate > 0.0) ? ema_global_rate : 0.0;
+        // // only care positive growth (shrinking shouldn't speed up)
+        // double pos_rate = (ema_global_rate > 0.0) ? ema_global_rate : 0.0;
 
         // scale factor: faster when err/rate bigger
-        double scale = 1.0 / (1.0 + HB_K_ERR * err + HB_K_RATE * pos_rate);
+        double scale = 1.0 / (1.0 + HB_K_ERR * err + HB_K_RATE * ema_global_rate);
 
         double sleep_us = clipd((double)heartbeat_time * scale, (double)HB_MIN_US, (double)HB_MAX_US);
 
