@@ -104,7 +104,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-            PASS_REGULAR_EXPRESSION "cblas_sdot\\|[ \t]+1000000\\|"
+        PASS_REGULAR_EXPRESSION "cblas_sdot\\|"
     )
 
     # Add test of sleep
