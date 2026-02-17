@@ -222,6 +222,8 @@ static const char *check_list[] = {
     "ssh",
     "scp",
     "sftp",
+    "which",
+    "seq",
     NULL // Null terminator to mark the end of the list
 };
 
