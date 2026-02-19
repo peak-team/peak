@@ -12,11 +12,13 @@ endif()
 # You can change the version here if you ever upgrade
 set(OTF2_VERSION "3.1.1")
 
-set(OTF2_TARBALL_URL
+set(OTF2_URLS
     "https://perftools.pages.jsc.fz-juelich.de/cicd/otf2/tags/otf2-${OTF2_VERSION}/otf2-${OTF2_VERSION}.tar.gz"
+    "https://mirror.ucu.ac.ug/ubuntu/pool/universe/o/otf2/otf2_${OTF2_VERSION}.orig.tar.xz"
+    "https://ubuntu-mirror.ati.tn/pool/universe/o/otf2/otf2_${OTF2_VERSION}.orig.tar.xz"
 )
 
-message(STATUS "OTF2: downloading from ${OTF2_TARBALL_URL}")
+message(STATUS "OTF2: downloading from ${OTF2_URLS}")
 message(STATUS "OTF2: download root = @OTF2_DOWNLOAD_ROOT@")
 
 # For safety, we only really support Unix-y environments here
@@ -26,11 +28,15 @@ endif()
 
 ExternalProject_Add(
     otf2
-    URL          "${OTF2_TARBALL_URL}"
+    URL          "${OTF2_URLS}"
     PREFIX       "@OTF2_DOWNLOAD_ROOT@"
     SOURCE_DIR   "@OTF2_DOWNLOAD_ROOT@/otf2-src"
     BINARY_DIR   "@OTF2_DOWNLOAD_ROOT@/otf2-build"
-    INSTALL_DIR  "@OTF2_DOWNLOAD_ROOT@/otf2-install"
+    INSTALL_DIR  "@OTF2_DOWNLOAD_ROOT@"
+
+    TLS_VERIFY           ON
+    TIMEOUT              120
+    INACTIVITY_TIMEOUT   60
 
     # Autotools-style build
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
