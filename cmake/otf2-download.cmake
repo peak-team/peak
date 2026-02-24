@@ -39,7 +39,7 @@ ExternalProject_Add(
     INACTIVITY_TIMEOUT   60
 
     # Autotools-style build
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
+    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --disable-shared --enable-static
     BUILD_COMMAND     ${CMAKE_MAKE_PROGRAM}
     INSTALL_COMMAND   ${CMAKE_MAKE_PROGRAM} install
 
