@@ -220,7 +220,6 @@ static const char *check_list[] = {
     "npm",
     "git",
     "ssh",
-    "scp",
     "sftp",
     NULL // Null terminator to mark the end of the list
 };
