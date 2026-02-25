@@ -19,8 +19,8 @@ macro(fetch_otf2 _download_module_path _download_root)
         WORKING_DIRECTORY "${_download_root}"
     )
 
-    # Where we told ExternalProject to install OTF2
-    set(OTF2_ROOT "${_download_root}/otf2-install")
+    # Where ExternalProject to install OTF2
+    set(OTF2_ROOT "${_download_root}")
 
     # Includes: ${OTF2_ROOT}/include/otf2/otf2.h etc.
     set(OTF2_INCLUDE_DIRS "${OTF2_ROOT}/include")
