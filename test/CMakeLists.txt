@@ -51,9 +51,6 @@ if(BUILD_TESTING)
         set(PRELOAD_VAR "DYLD_INSERT_LIBRARIES=${PROJECT_BINARY_DIR}/src/libpeak.dylib")
     endif()
 
-    set(HEARTBEAT_OFF_ENV "PEAK_HEARTBEAT_INTERVAL=0")
-    set(HEARTBEAT_ON_ENV "PEAK_HEARTBEAT_INTERVAL=100000")
-
     configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)
     set(PEAK_TARGET_CONFIG_PATH ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf)
 
@@ -62,7 +59,7 @@ if(BUILD_TESTING)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_dgemm 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${PRELOAD_VAR}"
     )
     set_tests_properties(test_dgemm 
         PROPERTIES 
@@ -73,7 +70,7 @@ if(BUILD_TESTING)
     add_test(NAME test_target_config COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_target_config 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_GROUP=BLAS;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET_GROUP=BLAS;${PRELOAD_VAR}"
     )
     set_tests_properties(test_target_config 
         PROPERTIES 
@@ -84,7 +81,7 @@ if(BUILD_TESTING)
     add_test(NAME test_config_file COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
     set_tests_properties(test_config_file 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_FILE=${PEAK_TARGET_CONFIG_PATH};${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET_FILE=${PEAK_TARGET_CONFIG_PATH};${PRELOAD_VAR}"
     )
     set_tests_properties(test_config_file 
         PROPERTIES 
@@ -97,17 +94,17 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main;${HEARTBEAT_ON_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main;${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sdot
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=cblas_sdot,main;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=cblas_sdot,main;${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sdot
         PROPERTIES 
-        PASS_REGULAR_EXPRESSION "cblas_sdot\\|"
+            PASS_REGULAR_EXPRESSION "cblas_sdot\\|[ \t]+1000000\\|"
     )
 
     # Add test of sleep
@@ -116,12 +113,12 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_sleep
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sleep
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sleep
@@ -134,7 +131,7 @@ if(BUILD_TESTING)
     add_test(NAME test_recursive COMMAND ${PROJECT_BINARY_DIR}/test/recursive/test_recursive)
     set_tests_properties(test_recursive
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=functionA,functionB;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET=functionA,functionB;${PRELOAD_VAR}"
     )
 
     # Add test of fftw
@@ -142,7 +139,7 @@ if(BUILD_TESTING)
     add_test(NAME test_fftw COMMAND ${PROJECT_BINARY_DIR}/test/fftw/test_fftw)
     set_tests_properties(test_fftw
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_CONFIG=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET_CONFIG=FFTW;${PRELOAD_VAR}"
     )
     
     if(MPI_FOUND)
@@ -152,12 +149,12 @@ if(BUILD_TESTING)
         if(OpenMP_FOUND)
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                    ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
             )
         else()
             set_tests_properties(test_dgemm_mpi
                 PROPERTIES 
-                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                    ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;${PRELOAD_VAR}"
             )
         endif()
         set_tests_properties(test_dgemm_mpi
@@ -172,12 +169,12 @@ if(BUILD_TESTING)
     if(OpenMP_FOUND)
         set_tests_properties(test_heartbeat
             PROPERTIES 
-                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_heartbeat
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_heartbeat
@@ -207,7 +204,7 @@ if(BUILD_TESTING)
     add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
     set_tests_properties(test_memory 
         PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET=performAllocation,performFree;PEAK_MEMORY_PROFILE=TRUE;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET=performAllocation,performFree;PEAK_MEMORY_PROFILE=TRUE;${PRELOAD_VAR}"
     )
     set_tests_properties(test_memory
         PROPERTIES 
