@@ -49,7 +49,7 @@ gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
-extern gboolean heartbeat_running;
+extern volatile gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
@@ -95,7 +95,7 @@ void peak_init()
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
     target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
     global_target_ratio = parse_env_to_float_ratio(PEAK_GLOBAL_OVERHEAD_RATIO_ENV);
-    peak_global_detach_factor = parse_env_to_float_detach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
+    peak_global_detach_factor = parse_env_to_float_detach_factor(PEAK_GLOBAL_DETACH_FACTOR_ENV);
     peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
     enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
     enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
@@ -103,8 +103,7 @@ void peak_init()
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
-    printf("enable_per_target_heartbeat %d enable_global_heartbeat %d",enable_per_target_heartbeat, enable_global_heartbeat);
-
+   
     //gum_init_embedded();
 
     pthread_listener_attach();

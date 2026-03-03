@@ -1,4 +1,5 @@
 #include "general_listener.h"
+#include "pthread_listener.h"
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
@@ -7,7 +8,6 @@ GumInterceptor* interceptor;
 GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
 static gboolean* array_listener_reattached;
-extern GumMetalHashTable* peak_tid_mapping;
 extern gboolean* peak_need_detach;
 extern gboolean* peak_detached;
 extern PeakHeartbeatArgs* args;
@@ -30,10 +30,11 @@ extern bool enable_per_target_heartbeat;
 extern bool enable_global_heartbeat;
 extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
-static gulong peak_detach_count = 0;
+extern unsigned int heartbeat_time;
+static gulong peak_detach_count = G_MAXULONG;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
-gboolean heartbeat_running = true;
+volatile gboolean heartbeat_running = true;
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
 G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
@@ -46,6 +47,8 @@ typedef struct _PeakGeneralThreadState {
     gulong level;
     gulong capacity;
     gdouble* child_time;
+    pthread_t* tid_keys;
+    size_t* mapped_ids;
 } PeakGeneralThreadState;
 
 static __thread PeakGeneralThreadState thread_data;
@@ -289,6 +292,8 @@ void* peak_heartbeat_monitor(void* arg) {
     double* rate_snapshot  = g_new0(double, peak_hook_address_count);
     double* prev_ratio     = g_new0(double, peak_hook_address_count);
     double* prev_time      = g_new0(double, peak_hook_address_count);
+    pthread_t* hb_tid_keys = g_new0(pthread_t, peak_max_num_threads);
+    size_t* hb_mapped_ids = g_new0(size_t, peak_max_num_threads);
 
     double now0 = peak_second();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -334,6 +339,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
 
             ratio_snapshot[i] = ratio;
+            // g_printerr ("ratio %ld: %ld\n", i, total_num_calls);
 
             double dt = now - prev_time[i];
             if (dt <= 1e-12) dt = 1e-12;
@@ -347,10 +353,13 @@ void* peak_heartbeat_monitor(void* arg) {
             }
         }
 
+        g_printerr ("global_overhead %.3e\n", global_overhead);
+
         // ------------------------------------------------------------
         // 1) Per-target DETACH
         // ------------------------------------------------------------
         if (enable_per_target_heartbeat) {
+            pthread_mutex_lock(&lock);
             for (size_t i = 0; i < peak_hook_address_count; i++) {
                 if (!(hook_address[i] && array_listener[i])) continue;
                 if (peak_detached[i]) continue;
@@ -359,6 +368,7 @@ void* peak_heartbeat_monitor(void* arg) {
                     peak_need_detach[i] = TRUE;
                 }
             }
+             pthread_mutex_unlock(&lock);
         }
 
         // ------------------------------------------------------------
@@ -382,12 +392,17 @@ void* peak_heartbeat_monitor(void* arg) {
                 }
 
                 double reduced = global_overhead;
+                pthread_mutex_lock(&lock);
                 for (size_t k = 0; k < n_attached && reduced > global_target_ratio; k++) {
-                    
                     size_t idx = entries[k].index;
+
+                    if (!(hook_address[idx] && array_listener[idx])) continue;
+                    if (peak_detached[idx]) continue;
+
                     reduced -= entries[k].ratio;
                     peak_need_detach[idx] = TRUE;
                 }
+                pthread_mutex_unlock(&lock);
             }
         }
 
@@ -404,36 +419,50 @@ void* peak_heartbeat_monitor(void* arg) {
 
                     if (ratio_snapshot[i] <= target_profile_ratio) {
                         double start_attach_time = peak_second();
+                        gboolean did_attach = FALSE;
                         pthread_mutex_lock(&lock);
 
-                        GumMetalHashTableIter it;
-                        pthread_t tid_key;
+                        if (peak_detached[i] && !peak_need_detach[i]) {
+                            size_t snapshot_cap = peak_max_num_threads;
+                            size_t snapshot_count =
+                                pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
+                            for (size_t s = 0; s < snapshot_count; s++) {
+                                pthread_t tid_key = hb_tid_keys[s];
+                                size_t mapped = hb_mapped_ids[s];
+                                if (mapped < peak_max_num_threads &&
+                                    tid_key != my_tid &&
+                                    peak_target_thread_called[i][mapped]) {
+                                    pthread_pause(tid_key);
+                                }
+                            }
 
-                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                            size_t mapped = (size_t)
-                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                                pthread_pause(tid_key);
+                            gum_interceptor_begin_transaction(interceptor);
+                            gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
+                            gum_interceptor_end_transaction(interceptor);
+
+                            for (size_t s = 0; s < snapshot_count; s++) {
+                                pthread_t tid_key = hb_tid_keys[s];
+                                size_t mapped = hb_mapped_ids[s];
+                                if (mapped < peak_max_num_threads &&
+                                    tid_key != my_tid &&
+                                    peak_target_thread_called[i][mapped]) {
+                                    pthread_unpause(tid_key);
+                                }
+                            }
+
+                            peak_need_detach[i] = FALSE;
+                            peak_detached[i] = FALSE;
+                            array_listener_reattached[i] = TRUE;
+                            g_printerr ("Per-target REATTACH\n");
+
+                            did_attach = TRUE;
                         }
-
-                        gum_interceptor_begin_transaction(interceptor);
-                        gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
-                        gum_interceptor_end_transaction(interceptor);
-
-                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                            size_t mapped = (size_t)
-                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                                pthread_unpause(tid_key);
-                        }
-
-                        peak_need_detach[i] = FALSE;
-                        peak_detached[i] = FALSE;
-                        array_listener_reattached[i] = TRUE;
 
                         pthread_mutex_unlock(&lock);
+
+                        if (!did_attach) {
+                            continue;
+                        }
 
                         double end_attach_time = peak_second();
                         heartbeat_overhead[i] += end_attach_time - start_attach_time;
@@ -488,36 +517,50 @@ void* peak_heartbeat_monitor(void* arg) {
                         }
 
                         double start_attach_time = peak_second();
+                        gboolean did_attach = FALSE;
                         pthread_mutex_lock(&lock);
 
-                        GumMetalHashTableIter it;
-                        pthread_t tid_key;
+                        if (peak_detached[i] && !peak_need_detach[i]) {
+                            size_t snapshot_cap = peak_max_num_threads;
+                            size_t snapshot_count =
+                                pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
+                            for (size_t s = 0; s < snapshot_count; s++) {
+                                pthread_t tid_key = hb_tid_keys[s];
+                                size_t mapped = hb_mapped_ids[s];
+                                if (mapped < peak_max_num_threads &&
+                                    tid_key != my_tid &&
+                                    peak_target_thread_called[i][mapped]) {
+                                    pthread_pause(tid_key);
+                                }
+                            }
 
-                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                            size_t mapped = (size_t)
-                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                                pthread_pause(tid_key);
+                            gum_interceptor_begin_transaction(interceptor);
+                            gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
+                            gum_interceptor_end_transaction(interceptor);
+
+                            for (size_t s = 0; s < snapshot_count; s++) {
+                                pthread_t tid_key = hb_tid_keys[s];
+                                size_t mapped = hb_mapped_ids[s];
+                                if (mapped < peak_max_num_threads &&
+                                    tid_key != my_tid &&
+                                    peak_target_thread_called[i][mapped]) {
+                                    pthread_unpause(tid_key);
+                                }
+                            }
+
+                            peak_need_detach[i] = FALSE;
+                            peak_detached[i] = FALSE;
+                            array_listener_reattached[i] = TRUE;
+                            g_printerr ("Global REATTACH\n");
+
+                            did_attach = TRUE;
                         }
-
-                        gum_interceptor_begin_transaction(interceptor);
-                        gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
-                        gum_interceptor_end_transaction(interceptor);
-
-                        gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
-                        while (gum_metal_hash_table_iter_next(&it, (void**)&tid_key, NULL)) {
-                            size_t mapped = (size_t)
-                                gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-                            if (tid_key != my_tid && peak_target_thread_called[i][mapped])
-                                pthread_unpause(tid_key);
-                        }
-
-                        peak_need_detach[i] = FALSE;
-                        peak_detached[i] = FALSE;
-                        array_listener_reattached[i] = TRUE;
 
                         pthread_mutex_unlock(&lock);
+
+                        if (!did_attach) {
+                            continue;
+                        }
 
                         double end_attach_time = peak_second();
                         heartbeat_overhead[i] += end_attach_time - start_attach_time;
@@ -580,6 +623,8 @@ void* peak_heartbeat_monitor(void* arg) {
     g_free(prev_ratio);
     g_free(rate_snapshot);
     g_free(ratio_snapshot);
+    g_free(hb_mapped_ids);
+    g_free(hb_tid_keys);
     g_free(entries);
 
     gum_interceptor_unignore_current_thread(interceptor);
@@ -596,8 +641,12 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     gum_interceptor_ignore_current_thread(interceptor);
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     pthread_t my_tid = pthread_self();
-    size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
-    if (peak_detach_cost == 0) {
+    gboolean mapped_found = FALSE;
+    size_t mapped_tid = pthread_listener_lookup_thread(my_tid, &mapped_found);
+    if (!mapped_found || mapped_tid >= peak_max_num_threads) {
+        mapped_tid = 0;
+    }
+    if (peak_detach_cost == 0 && heartbeat_time == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -625,6 +674,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             thread_data.child_time = g_new(gdouble, 16);
             pthread_pause_enable();
         }
+        if (thread_data.tid_keys == NULL) {
+            thread_data.tid_keys   = g_new0(pthread_t, peak_max_num_threads);
+            thread_data.mapped_ids = g_new0(size_t,    peak_max_num_threads);
+        }
         thread_data.child_time[thread_data.level] = 0.0;
         thread_data.level++;
         if (thread_data.level == thread_data.capacity) {
@@ -636,37 +689,43 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         self->num_calls[index]++;
         size_t hook_id = self->hook_id;
         peak_target_thread_called[hook_id][index] = true;
+        pthread_mutex_lock(&lock);
         if (self->num_calls[index] >= peak_detach_count) peak_need_detach[hook_id] = true;
-        if (peak_detach_count && peak_need_detach[hook_id]) {
-            pthread_mutex_lock(&lock);
-            if (!peak_detached[hook_id]) {
-                array_listener_detached[hook_id] = TRUE;
-                GumMetalHashTableIter peak_tid_iter;
-                pthread_t peak_tid_key;
-                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                    size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                    if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
-                        pthread_pause(peak_tid_key);
-                    
+        if (!peak_detached[hook_id] && peak_need_detach[hook_id]) {
+            array_listener_detached[hook_id] = TRUE;
+            size_t snapshot_cap = peak_max_num_threads;
+            pthread_t* tid_keys = thread_data.tid_keys;
+            size_t* mapped_ids  = thread_data.mapped_ids;
+            size_t snapshot_count =
+                pthread_listener_snapshot_threads(tid_keys, mapped_ids, snapshot_cap);
+            for (size_t s = 0; s < snapshot_count; s++) {
+                pthread_t peak_tid_key = tid_keys[s];
+                size_t cur_mapped_tid = mapped_ids[s];
+                if (cur_mapped_tid < peak_max_num_threads &&
+                    peak_tid_key != my_tid &&
+                    peak_target_thread_called[hook_id][cur_mapped_tid]) {
+                    pthread_pause(peak_tid_key);
                 }
-                gum_interceptor_begin_transaction(interceptor);
-                gum_interceptor_detach(interceptor, listener);
-                gum_interceptor_end_transaction(interceptor);
-                gum_metal_hash_table_iter_init(&peak_tid_iter, peak_tid_mapping);
-                while (gum_metal_hash_table_iter_next(&peak_tid_iter, (void**)&peak_tid_key, NULL)) {
-                    size_t cur_mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(peak_tid_key)));
-                    if (peak_tid_key != my_tid && peak_target_thread_called[hook_id][cur_mapped_tid])
-                        pthread_unpause(peak_tid_key);
-                
-                }
-                peak_detached[hook_id] = true;
-                peak_need_detach[hook_id] = false;
             }
-            pthread_mutex_unlock(&lock);
-            // gum_interceptor_revert(interceptor, hook_address[hook_id]);
-            // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
+            gum_interceptor_begin_transaction(interceptor);
+            gum_interceptor_detach(interceptor, listener);
+            gum_interceptor_end_transaction(interceptor);
+            for (size_t s = 0; s < snapshot_count; s++) {
+                pthread_t peak_tid_key = tid_keys[s];
+                size_t cur_mapped_tid = mapped_ids[s];
+                if (cur_mapped_tid < peak_max_num_threads &&
+                    peak_tid_key != my_tid &&
+                    peak_target_thread_called[hook_id][cur_mapped_tid]) {
+                    pthread_unpause(peak_tid_key);
+                }
+            }
+            peak_detached[hook_id] = true;
+            peak_need_detach[hook_id] = false;
+            g_printerr("detach\n");
         }
+        pthread_mutex_unlock(&lock);
+        // gum_interceptor_revert(interceptor, hook_address[hook_id]);
+        // g_printerr ("revert hook_id %lu %p\n", hook_id, hook_address[hook_id]);
 
         if (check_interval != 0) pthread_pause_enable();
         else pthread_pause_disable();
@@ -682,7 +741,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_cost == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
@@ -696,7 +755,11 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         // PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
         double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
         // size_t hook_id = state->hook_id;
-        size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
+        gboolean mapped_found = FALSE;
+        size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
+        if (!mapped_found || mapped_tid >= peak_max_num_threads) {
+            mapped_tid = 0;
+        }
         end_time = end_time - *current_time;
         size_t index = mapped_tid;
         if (end_time > self->max_time[index])
@@ -732,7 +795,11 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         // PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
         double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
         // size_t hook_id = state->hook_id;
-        size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(pthread_self())));
+        gboolean mapped_found = FALSE;
+        size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
+        if (!mapped_found || mapped_tid >= peak_max_num_threads) {
+            mapped_tid = 0;
+        }
         end_time = end_time - *current_time;
         size_t index = mapped_tid;
         if (end_time > self->max_time[index])
@@ -1318,7 +1385,8 @@ void peak_general_listener_dettach()
 {
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
-            gum_interceptor_detach(interceptor, array_listener[i]);
+            if (!peak_detached[i])
+                gum_interceptor_detach(interceptor, array_listener[i]);
             peak_general_listener_free(PEAKGENERAL_LISTENER(array_listener[i]));
             g_object_unref(array_listener[i]);
         }
