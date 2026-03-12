@@ -99,8 +99,15 @@ void peak_general_listener_dettach();
  * @param arg A pointer to the arguments structure containing heartbeat settings.
  * @return NULL when the monitoring thread exits.
  */
+<<<<<<< HEAD
 void* peak_heartbeat_monitor(void* arg);
 extern gboolean heartbeat_running;
 extern pthread_mutex_t heartbeat_mutex;
 extern pthread_cond_t heartbeat_cond;
+=======
+void* peak_heartbeat_monitor();
+
+int pthread_pause(pthread_t thread, int* session_id_out);
+int pthread_unpause(pthread_t thread, int session_id);
+>>>>>>> fix: Add per-session pause tags and per-thread ack semaphores for robust pause/unpause synchronization
 #endif /* __GENERAL_LISTENER_H */
