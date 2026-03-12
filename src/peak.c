@@ -54,7 +54,7 @@ pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
-unsigned int post_wait_interval;
+unsigned int sig_stop_ack_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
 float global_target_ratio;
@@ -99,7 +99,7 @@ void peak_init()
     peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
     enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
     enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
-    post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
+    sig_stop_ack_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
@@ -303,4 +303,3 @@ int __libc_start_main(main_fn main, int argc, char** argv,
 #else
 #error Unsupported platform
 #endif
-

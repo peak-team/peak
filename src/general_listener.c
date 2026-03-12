@@ -1,5 +1,7 @@
+#define _GNU_SOURCE
 #include "general_listener.h"
 #include "pthread_listener.h"
+#include <stdatomic.h>
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
@@ -28,9 +30,10 @@ extern float peak_global_reattach_factor;
 extern float peak_global_detach_factor;
 extern bool enable_per_target_heartbeat;
 extern bool enable_global_heartbeat;
-extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
-static gulong peak_detach_count = 0;
+extern unsigned int sig_stop_ack_wait_interval;
+extern unsigned int heartbeat_time;
+static gulong peak_detach_count = G_MAXULONG;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 volatile gboolean heartbeat_running = true;
@@ -48,69 +51,105 @@ typedef struct _PeakGeneralThreadState {
     gdouble* child_time;
     pthread_t* tid_keys;
     size_t* mapped_ids;
+    int* pause_session_ids;
+    int* pause_status;
+    size_t self_mapped_id;
+    gboolean self_mapped_known;
 } PeakGeneralThreadState;
 
 static __thread PeakGeneralThreadState thread_data;
 
-sem_t pthread_pause_sem;
+static sem_t* pthread_pause_ack_sems;
+static volatile sig_atomic_t* pthread_pause_ack_sessions;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
+static __thread int last_cont_id = -1;
+static _Atomic int global_session_counter = 0;
 
-void pthread_pause_handler(int signal)
+void pthread_pause_handler(int signal, siginfo_t* info, void* context)
 {
-    //Post semaphore to confirm that signal is handled
-    sem_post(&pthread_pause_sem);
-    //Suspend if needed
+    (void)context;
+    int session_id = 0;
+    if (info != NULL) {
+        session_id = info->si_value.sival_int;
+    }
+
     if (signal == PEAK_SIG_STOP) {
-        sigset_t new_mask, original_mask, wait_set;
+        if (thread_data.self_mapped_known && thread_data.self_mapped_id < peak_max_num_threads) {
+            pthread_pause_ack_sessions[thread_data.self_mapped_id] = session_id;
+            sem_post(&pthread_pause_ack_sems[thread_data.self_mapped_id]);
+        }
 
-        // Block all signals except PEAK_SIG_CONT
-        sigfillset(&new_mask);
-        sigdelset(&new_mask, PEAK_SIG_CONT);
+        if (last_cont_id >= session_id) {
+            return;
+        }
 
-        // Apply the new signal mask
-        pthread_sigmask(SIG_SETMASK, &new_mask, &original_mask);
+        sigset_t block_set, original_mask, wait_set;
 
-        // Prepare to wait for PEAK_SIG_CONT
+        sigemptyset(&block_set);
+        sigaddset(&block_set, PEAK_SIG_CONT);
+        pthread_sigmask(SIG_BLOCK, &block_set, &original_mask);
+
+        if (last_cont_id >= session_id) {
+            pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
+            return;
+        }
+
         sigemptyset(&wait_set);
         sigaddset(&wait_set, PEAK_SIG_CONT);
 
-        struct timespec timeout;
-        clock_gettime(CLOCK_REALTIME, &timeout);
-        // in nanoseconds
-        timeout.tv_sec += sig_cont_wait_interval / 1000000000;
-        timeout.tv_nsec += sig_cont_wait_interval % 1000000000;
+        for (;;) {
+            siginfo_t cont_info;
+            struct timespec timeout;
+            int ret;
 
-        // ts.tv_nsec overflow
-        if (timeout.tv_nsec >= 1000000000) {
-            timeout.tv_sec += 1;
-            timeout.tv_nsec -= 1000000000;
+            clock_gettime(CLOCK_REALTIME, &timeout);
+            timeout.tv_sec += sig_cont_wait_interval / 1000000000;
+            timeout.tv_nsec += sig_cont_wait_interval % 1000000000;
+
+            if (timeout.tv_nsec >= 1000000000) {
+                timeout.tv_sec += 1;
+                timeout.tv_nsec -= 1000000000;
+            }
+
+            ret = sigtimedwait(&wait_set, &cont_info, &timeout);
+            if (ret == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+
+            if (ret == PEAK_SIG_CONT) {
+                int cont_id = cont_info.si_value.sival_int;
+
+                if (cont_id > last_cont_id) {
+                    last_cont_id = cont_id;
+                }
+
+                if (cont_id >= session_id) {
+                    break;
+                }
+            }
         }
 
-        // Wait for the signal with timeout
-        if (sigtimedwait(&wait_set, NULL, &timeout) == -1 && errno == ETIMEDOUT) {
-            sem_post(&pthread_pause_sem);
-        }
-
-        // Restore the original signal mask
         pthread_sigmask(SIG_SETMASK, &original_mask, NULL);
-
-        // sigset_t sigset;
-        // struct timespec timeout;
-        // sigfillset(&sigset);
-        // sigdelset(&sigset, PEAK_SIG_STOP);
-        // sigdelset(&sigset, PEAK_SIG_CONT);
-        // /*TODO: need to make this a standalone parameter*/
-        // // Set the timeout 
-        // timeout.tv_sec += post_wait_interval;
-        // sigtimedwait(&sigset, NULL, &timeout);
-        // // sigsuspend(&sigset); //Wait for next signal
-    } else
+    } else if (signal == PEAK_SIG_CONT) {
+        if (session_id > last_cont_id) {
+            last_cont_id = session_id;
+        }
+    } else {
         return;
+    }
 }
 
 void pthread_pause_once(void)
 {
-    sem_init(&pthread_pause_sem, 0, 1);
+    pthread_pause_ack_sems = g_new0(sem_t, peak_max_num_threads);
+    pthread_pause_ack_sessions = g_new0(sig_atomic_t, peak_max_num_threads);
+    for (size_t i = 0; i < peak_max_num_threads; i++) {
+        sem_init(&pthread_pause_ack_sems[i], 0, 0);
+        pthread_pause_ack_sessions[i] = -1;
+    }
 
     // Prepare sigset
     sigset_t sigset;
@@ -121,9 +160,9 @@ void pthread_pause_once(void)
     //Register signal handlers
     //We now use sigaction() instead of signal(), because it supports SA_RESTART
     const struct sigaction pause_sa = {
-        .sa_handler = pthread_pause_handler,
+        .sa_sigaction = pthread_pause_handler,
         .sa_mask = sigset,
-        .sa_flags = SA_RESTART,
+        .sa_flags = SA_RESTART | SA_SIGINFO,
         .sa_restorer = NULL
     };
     sigaction(PEAK_SIG_STOP, &pause_sa, NULL);
@@ -151,83 +190,94 @@ void pthread_pause_disable()
     //After unlocking mutex, you can enable pause again.
     pthread_pause_init();
 
-    //Make sure all signals are dispatched before we block them
-    //sem_wait(&pthread_pause_sem);
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    // in nanoseconds
-    ts.tv_sec += post_wait_interval / 1000000000;
-    ts.tv_nsec += post_wait_interval % 1000000000;
-
-    // ts.tv_nsec overflow
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000;
-    }
-
-    if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
-        sem_post(&pthread_pause_sem);
-    }
-
     //Block signals
     sigset_t sigset;
     sigemptyset(&sigset);
     sigaddset(&sigset, PEAK_SIG_STOP);
     sigaddset(&sigset, PEAK_SIG_CONT);
     pthread_sigmask(SIG_BLOCK, &sigset, NULL);
-
-    sem_post(&pthread_pause_sem);
 }
 
-int pthread_pause(pthread_t thread)
+static int pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session_id_out)
 {
+    union sigval sv;
+    int session_id = atomic_fetch_add(&global_session_counter, 1);
+
+    if (session_id_out != NULL) {
+        *session_id_out = -1;
+    }
+
+    if (mapped_id >= peak_max_num_threads) {
+        return -1;
+    }
+
+    sv.sival_int = session_id;
+
+    while (pthread_sigqueue(thread, PEAK_SIG_STOP, sv) == -1) {
+        if (errno != EAGAIN) {
+            return -1;
+        }
+        usleep(1000);
+    }
+
+    if (session_id_out != NULL) {
+        *session_id_out = session_id;
+    }
+
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += sig_stop_ack_wait_interval / 1000000000;
+    ts.tv_nsec += sig_stop_ack_wait_interval % 1000000000;
 
-    // in nanoseconds
-    ts.tv_sec += post_wait_interval / 1000000000;
-    ts.tv_nsec += post_wait_interval % 1000000000;
-
-    // ts.tv_nsec overflow
     if (ts.tv_nsec >= 1000000000) {
         ts.tv_sec += 1;
         ts.tv_nsec -= 1000000000;
     }
 
-    if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
-        sem_post(&pthread_pause_sem);
+    for (;;) {
+        if (sem_timedwait(&pthread_pause_ack_sems[mapped_id], &ts) == 0) {
+            if (pthread_pause_ack_sessions[mapped_id] == session_id) {
+                return 0;
+            }
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == ETIMEDOUT) {
+            return 1;
+        }
+        return -1;
     }
-    // sem_wait(&pthread_pause_sem);
-    //If signal queue is full, we keep retrying
-    while (pthread_kill(thread, PEAK_SIG_STOP) == EAGAIN)
-        usleep(1000);
-    //pthread_pause_yield();
-    return 0;
 }
 
-int pthread_unpause(pthread_t thread)
+int pthread_pause(pthread_t thread, int* session_id_out)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    gboolean mapped_found = FALSE;
+    size_t mapped_id = pthread_listener_lookup_thread(thread, &mapped_found);
 
-    // in nanoseconds
-    ts.tv_sec += post_wait_interval / 1000000000;
-    ts.tv_nsec += post_wait_interval % 1000000000;
-
-    // ts.tv_nsec overflow
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000;
+    if (!mapped_found || mapped_id >= peak_max_num_threads) {
+        if (session_id_out != NULL) {
+            *session_id_out = -1;
+        }
+        return -1;
     }
 
-    if (sem_timedwait(&pthread_pause_sem, &ts) == -1 && errno == ETIMEDOUT) {
-        sem_post(&pthread_pause_sem);
-    }
-    //If signal queue is full, we keep retrying
-    while (pthread_kill(thread, PEAK_SIG_CONT) == EAGAIN)
+    return pthread_pause_mapped(thread, mapped_id, session_id_out);
+}
+
+int pthread_unpause(pthread_t thread, int session_id)
+{
+    union sigval sv;
+    sv.sival_int = session_id;
+
+    while (pthread_sigqueue(thread, PEAK_SIG_CONT, sv) == -1) {
+        if (errno != EAGAIN) {
+            return -1;
+        }
         usleep(1000);
-    //pthread_pause_yield();
+    }
+
     return 0;
 }
 
@@ -293,6 +343,8 @@ void* peak_heartbeat_monitor(void* arg) {
     double* prev_time      = g_new0(double, peak_hook_address_count);
     pthread_t* hb_tid_keys = g_new0(pthread_t, peak_max_num_threads);
     size_t* hb_mapped_ids = g_new0(size_t, peak_max_num_threads);
+    int* hb_pause_session_ids = g_new0(int, peak_max_num_threads);
+    int* hb_pause_status = g_new0(int, peak_max_num_threads);
 
     double now0 = peak_second();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -352,7 +404,7 @@ void* peak_heartbeat_monitor(void* arg) {
             }
         }
 
-        g_printerr ("global_overhead %.3e\n", global_overhead);
+        // g_printerr ("global_overhead %.3e\n", global_overhead);
 
         // ------------------------------------------------------------
         // 1) Per-target DETACH
@@ -419,19 +471,25 @@ void* peak_heartbeat_monitor(void* arg) {
                     if (ratio_snapshot[i] <= target_profile_ratio) {
                         double start_attach_time = peak_second();
                         gboolean did_attach = FALSE;
+                        size_t snapshot_cap = peak_max_num_threads;
+                        size_t snapshot_count =
+                            pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
+                        for (size_t s = 0; s < snapshot_count; s++) {
+                            hb_pause_session_ids[s] = -1;
+                            hb_pause_status[s] = -1;
+                        }
+
                         pthread_mutex_lock(&lock);
 
                         if (peak_detached[i] && !peak_need_detach[i]) {
-                            size_t snapshot_cap = peak_max_num_threads;
-                            size_t snapshot_count =
-                                pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
                             for (size_t s = 0; s < snapshot_count; s++) {
                                 pthread_t tid_key = hb_tid_keys[s];
                                 size_t mapped = hb_mapped_ids[s];
                                 if (mapped < peak_max_num_threads &&
                                     tid_key != my_tid &&
                                     peak_target_thread_called[i][mapped]) {
-                                    pthread_pause(tid_key);
+                                    hb_pause_status[s] =
+                                        pthread_pause_mapped(tid_key, mapped, &hb_pause_session_ids[s]);
                                 }
                             }
 
@@ -444,15 +502,17 @@ void* peak_heartbeat_monitor(void* arg) {
                                 size_t mapped = hb_mapped_ids[s];
                                 if (mapped < peak_max_num_threads &&
                                     tid_key != my_tid &&
-                                    peak_target_thread_called[i][mapped]) {
-                                    pthread_unpause(tid_key);
+                                    peak_target_thread_called[i][mapped] &&
+                                    (hb_pause_status[s] == 0 || hb_pause_status[s] == 1) &&
+                                    hb_pause_session_ids[s] >= 0) {
+                                    pthread_unpause(tid_key, hb_pause_session_ids[s]);
                                 }
                             }
 
                             peak_need_detach[i] = FALSE;
                             peak_detached[i] = FALSE;
                             array_listener_reattached[i] = TRUE;
-                            g_printerr ("Per-target REATTACH\n");
+                            // g_printerr ("Per-target REATTACH\n");
 
                             did_attach = TRUE;
                         }
@@ -517,19 +577,25 @@ void* peak_heartbeat_monitor(void* arg) {
 
                         double start_attach_time = peak_second();
                         gboolean did_attach = FALSE;
+                        size_t snapshot_cap = peak_max_num_threads;
+                        size_t snapshot_count =
+                            pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
+                        for (size_t s = 0; s < snapshot_count; s++) {
+                            hb_pause_session_ids[s] = -1;
+                            hb_pause_status[s] = -1;
+                        }
+
                         pthread_mutex_lock(&lock);
 
                         if (peak_detached[i] && !peak_need_detach[i]) {
-                            size_t snapshot_cap = peak_max_num_threads;
-                            size_t snapshot_count =
-                                pthread_listener_snapshot_threads(hb_tid_keys, hb_mapped_ids, snapshot_cap);
                             for (size_t s = 0; s < snapshot_count; s++) {
                                 pthread_t tid_key = hb_tid_keys[s];
                                 size_t mapped = hb_mapped_ids[s];
                                 if (mapped < peak_max_num_threads &&
                                     tid_key != my_tid &&
                                     peak_target_thread_called[i][mapped]) {
-                                    pthread_pause(tid_key);
+                                    hb_pause_status[s] =
+                                        pthread_pause_mapped(tid_key, mapped, &hb_pause_session_ids[s]);
                                 }
                             }
 
@@ -542,15 +608,17 @@ void* peak_heartbeat_monitor(void* arg) {
                                 size_t mapped = hb_mapped_ids[s];
                                 if (mapped < peak_max_num_threads &&
                                     tid_key != my_tid &&
-                                    peak_target_thread_called[i][mapped]) {
-                                    pthread_unpause(tid_key);
+                                    peak_target_thread_called[i][mapped] &&
+                                    (hb_pause_status[s] == 0 || hb_pause_status[s] == 1) &&
+                                    hb_pause_session_ids[s] >= 0) {
+                                    pthread_unpause(tid_key, hb_pause_session_ids[s]);
                                 }
                             }
 
                             peak_need_detach[i] = FALSE;
                             peak_detached[i] = FALSE;
                             array_listener_reattached[i] = TRUE;
-                            g_printerr ("Global REATTACH\n");
+                            // g_printerr ("Global REATTACH\n");
 
                             did_attach = TRUE;
                         }
@@ -622,6 +690,8 @@ void* peak_heartbeat_monitor(void* arg) {
     g_free(prev_ratio);
     g_free(rate_snapshot);
     g_free(ratio_snapshot);
+    g_free(hb_pause_status);
+    g_free(hb_pause_session_ids);
     g_free(hb_mapped_ids);
     g_free(hb_tid_keys);
     g_free(entries);
@@ -645,6 +715,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     if (!mapped_found || mapped_tid >= peak_max_num_threads) {
         mapped_tid = 0;
     }
+    thread_data.self_mapped_id = mapped_tid;
+    thread_data.self_mapped_known = mapped_found && mapped_tid < peak_max_num_threads;
     if (peak_detach_cost == 0 && heartbeat_time == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
@@ -674,8 +746,12 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             pthread_pause_enable();
         }
         if (thread_data.tid_keys == NULL) {
+            pthread_pause_disable();
             thread_data.tid_keys   = g_new0(pthread_t, peak_max_num_threads);
             thread_data.mapped_ids = g_new0(size_t,    peak_max_num_threads);
+            thread_data.pause_session_ids = g_new0(int, peak_max_num_threads);
+            thread_data.pause_status = g_new0(int, peak_max_num_threads);
+            pthread_pause_enable();
         }
         thread_data.child_time[thread_data.level] = 0.0;
         thread_data.level++;
@@ -688,22 +764,30 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         self->num_calls[index]++;
         size_t hook_id = self->hook_id;
         peak_target_thread_called[hook_id][index] = true;
+        size_t snapshot_cap = peak_max_num_threads;
+        pthread_t* tid_keys = thread_data.tid_keys;
+        size_t* mapped_ids  = thread_data.mapped_ids;
+        int* pause_session_ids = thread_data.pause_session_ids;
+        int* pause_status = thread_data.pause_status;
+        size_t snapshot_count =
+            pthread_listener_snapshot_threads(tid_keys, mapped_ids, snapshot_cap);
+        for (size_t s = 0; s < snapshot_count; s++) {
+            pause_session_ids[s] = -1;
+            pause_status[s] = -1;
+        }
+
         pthread_mutex_lock(&lock);
         if (self->num_calls[index] >= peak_detach_count) peak_need_detach[hook_id] = true;
         if (!peak_detached[hook_id] && peak_need_detach[hook_id]) {
             array_listener_detached[hook_id] = TRUE;
-            size_t snapshot_cap = peak_max_num_threads;
-            pthread_t* tid_keys = thread_data.tid_keys;
-            size_t* mapped_ids  = thread_data.mapped_ids;
-            size_t snapshot_count =
-                pthread_listener_snapshot_threads(tid_keys, mapped_ids, snapshot_cap);
             for (size_t s = 0; s < snapshot_count; s++) {
                 pthread_t peak_tid_key = tid_keys[s];
                 size_t cur_mapped_tid = mapped_ids[s];
                 if (cur_mapped_tid < peak_max_num_threads &&
                     peak_tid_key != my_tid &&
                     peak_target_thread_called[hook_id][cur_mapped_tid]) {
-                    pthread_pause(peak_tid_key);
+                    pause_status[s] =
+                        pthread_pause_mapped(peak_tid_key, cur_mapped_tid, &pause_session_ids[s]);
                 }
             }
             gum_interceptor_begin_transaction(interceptor);
@@ -714,13 +798,15 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
                 size_t cur_mapped_tid = mapped_ids[s];
                 if (cur_mapped_tid < peak_max_num_threads &&
                     peak_tid_key != my_tid &&
-                    peak_target_thread_called[hook_id][cur_mapped_tid]) {
-                    pthread_unpause(peak_tid_key);
+                    peak_target_thread_called[hook_id][cur_mapped_tid] &&
+                    (pause_status[s] == 0 || pause_status[s] == 1) &&
+                    pause_session_ids[s] >= 0) {
+                    pthread_unpause(peak_tid_key, pause_session_ids[s]);
                 }
             }
             peak_detached[hook_id] = true;
             peak_need_detach[hook_id] = false;
-            g_printerr("detach\n");
+            // g_printerr("detach\n");
         }
         pthread_mutex_unlock(&lock);
         // gum_interceptor_revert(interceptor, hook_address[hook_id]);

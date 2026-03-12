@@ -48,6 +48,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
+    // g_print ("pthread_listener_on_enter %lu\n", *tid);
     g_mutex_unlock(&tid_mapping_mutex);
     // g_print ("pthread_listener_on_leave %lu\n", tid);
     if (!thread_state->is_original)
@@ -161,9 +162,6 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids, size_t* mapped, size_t
     gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
     while (count < capacity && gum_metal_hash_table_iter_next(&it, (void**) &tid_key, NULL)) {
         gpointer mapped_tid = gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
-        if (mapped_tid == NULL) {
-            continue;
-        }
         tids[count] = tid_key;
         mapped[count] = (size_t) mapped_tid;
         count++;
