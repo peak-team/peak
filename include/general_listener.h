@@ -99,5 +99,8 @@ void peak_general_listener_dettach();
  * @param arg A pointer to the arguments structure containing heartbeat settings.
  * @return NULL when the monitoring thread exits.
  */
-void* peak_heartbeat_monitor();
+void* peak_heartbeat_monitor(void* arg);
+extern gboolean heartbeat_running;
+extern pthread_mutex_t heartbeat_mutex;
+extern pthread_cond_t heartbeat_cond;
 #endif /* __GENERAL_LISTENER_H */

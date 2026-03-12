@@ -211,6 +211,7 @@ float parse_env_to_float_ratio(const char* env_var)
 }
 
 unsigned int parse_env_to_time(const char* env_var) {
+    const double max_heartbeat_seconds = (double)UINT_MAX / 1e6;
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {
         return 100000;
@@ -222,6 +223,10 @@ unsigned int parse_env_to_time(const char* env_var) {
 
     if (errno == ERANGE || seconds < 0 || endptr == varvalue || *endptr != '\0') {
         return 100000;
+    }
+
+    if (seconds > max_heartbeat_seconds) {
+        return UINT_MAX;
     }
 
     return (unsigned int)(seconds * 1e6);
