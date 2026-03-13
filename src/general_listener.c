@@ -28,6 +28,13 @@ extern unsigned long long sig_cont_wait_interval;
 extern unsigned int heartbeat_time;
 static gulong peak_detach_count = G_MAXULONG;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static gboolean gum_find_functions_matching_initialize = false;
+static GHashTable* gum_symbol_demangled_mapping;
+static GHashTable* gum_symbol_short_mapping;
+
+gboolean str_equal_function_general(gconstpointer a, gconstpointer b) {
+    return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
+}
 
 gboolean heartbeat_running = true;
 
@@ -582,6 +589,50 @@ peak_general_overhead_bootstrapping()
     g_free(time);
 }
 
+static void peak_build_symbol_map_once(void) {
+    gum_find_functions_matching_initialize = true;
+    GArray* addresses = gum_find_functions_matching("_Z*");
+    gum_symbol_demangled_mapping = g_hash_table_new_full(g_str_hash,
+                                                         str_equal_function_general,
+                                                         g_free,
+                                                         (GDestroyNotify) g_ptr_array_unref);
+    gum_symbol_short_mapping = g_hash_table_new_full(g_str_hash,
+                                                     str_equal_function_general,
+                                                     g_free,
+                                                     (GDestroyNotify) g_ptr_array_unref);
+
+    for (gsize j = 0; j < addresses->len; j++) {
+        gpointer addr = g_array_index(addresses, gpointer, j);
+        if (!addr) continue;
+        gchar* mangled = gum_symbol_name_from_address(addr);
+        if (!mangled) continue;
+
+        char* demangled = cxa_demangle(mangled);
+        g_free(mangled);
+        if (!demangled) continue;
+
+        GPtrArray* demangled_candidates = g_hash_table_lookup(gum_symbol_demangled_mapping, demangled);
+        if (!demangled_candidates) {
+            demangled_candidates = g_ptr_array_new();
+            g_hash_table_insert(gum_symbol_demangled_mapping, g_strdup(demangled), demangled_candidates);
+        }
+        g_ptr_array_add(demangled_candidates, addr);
+
+        char* function_name = extract_function_name(demangled);
+        GPtrArray* short_candidates = g_hash_table_lookup(gum_symbol_short_mapping, function_name);
+        if (!short_candidates) {
+            short_candidates = g_ptr_array_new();
+            g_hash_table_insert(gum_symbol_short_mapping, g_strdup(function_name), short_candidates);
+        }
+        g_ptr_array_add(short_candidates, addr);
+
+        free(function_name);
+        free(demangled);
+    }
+
+    g_array_free(addresses, TRUE);
+}
+
 void peak_general_listener_attach()
 {
     pthread_pause_enable();
@@ -646,35 +697,31 @@ void peak_general_listener_attach()
                 peak_demangled_strings[i] = g_strdup(demangled);
                 free(demangled);
             } else {
+                if (!gum_find_functions_matching_initialize) {
+                    peak_build_symbol_map_once();
+                }
+
                 if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
-                    // peak_hook_strings is just function name
-                    gchar* truncate_hook = g_strdup_printf("*%s*", peak_hook_strings[i]);
-                    GArray* addresses = gum_find_functions_matching(truncate_hook);
-                    for (gsize j = 0; j < addresses->len; j++) {
-                        gpointer addr = g_array_index(addresses, gpointer, j);
-                        gchar* mangled = gum_symbol_name_from_address(addr);
-                        gboolean function_match = FALSE;
-                        if (!mangled) continue;
-                    
-                        char* demangled = cxa_demangle(mangled);
-                        g_free(mangled);
-                        if (!demangled) continue;
-        
-                        gchar* function_name = extract_function_name(demangled);
-                        if (strcmp(peak_hook_strings[i], function_name) == 0) {
-                            hook_address[i] = addr;
+                    GPtrArray* candidates = g_hash_table_lookup(gum_symbol_demangled_mapping, peak_hook_strings[i]);
+                    if (candidates && candidates->len > 0) {
+                        // Candidate is demangled name and it will only match one symbol, so we can directly use it
+                        hook_address[i] = g_ptr_array_index(candidates, 0);
+                        peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+                    } else {
+                        // Candidates might be in short names mapping, try looking up in short mapping
+                        // if multiple candidates exist, we will use the first one
+                        candidates = g_hash_table_lookup(gum_symbol_short_mapping, peak_hook_strings[i]);
+                        if (candidates && candidates->len > 0) {
+                            hook_address[i] = g_ptr_array_index(candidates, 0);
+                            gchar* mangled = gum_symbol_name_from_address(hook_address[i]);
+                            if (!mangled) continue;
+                            char* demangled = cxa_demangle(mangled);
+                            g_free(mangled);
+                            if (!demangled) continue;
                             peak_demangled_strings[i] = g_strdup(demangled);
-                            function_match = TRUE;
-                        }
-                        free(demangled);
-                        free(function_name);
-    
-                        if (function_match) {
-                            break;
+                            free(demangled);
                         }
                     }
-                    g_array_free(addresses, TRUE);
-                    g_free(truncate_hook);
                 }
             }
         }
@@ -689,6 +736,13 @@ void peak_general_listener_attach()
         }
     }
     gum_interceptor_end_transaction(interceptor);
+    if (gum_find_functions_matching_initialize) {
+        g_hash_table_destroy(gum_symbol_demangled_mapping);
+        g_hash_table_destroy(gum_symbol_short_mapping);
+        gum_symbol_demangled_mapping = NULL;
+        gum_symbol_short_mapping = NULL;
+        gum_find_functions_matching_initialize = false;
+    }
     if (peak_hook_address_count) {
         peak_general_overhead_bootstrapping();
         if (peak_detach_cost > 0)
