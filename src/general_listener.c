@@ -59,8 +59,7 @@ typedef struct _PeakGeneralThreadState {
 
 static __thread PeakGeneralThreadState thread_data;
 
-static sem_t* pthread_pause_ack_sems;
-static volatile sig_atomic_t* pthread_pause_ack_sessions;
+static sem_t pthread_pause_sem;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 static __thread int last_cont_id = -1;
 static _Atomic int global_session_counter = 0;
@@ -74,10 +73,7 @@ void pthread_pause_handler(int signal, siginfo_t* info, void* context)
     }
 
     if (signal == PEAK_SIG_STOP) {
-        if (thread_data.self_mapped_known && thread_data.self_mapped_id < peak_max_num_threads) {
-            pthread_pause_ack_sessions[thread_data.self_mapped_id] = session_id;
-            sem_post(&pthread_pause_ack_sems[thread_data.self_mapped_id]);
-        }
+        sem_post(&pthread_pause_sem);
 
         if (last_cont_id >= session_id) {
             return;
@@ -144,12 +140,7 @@ void pthread_pause_handler(int signal, siginfo_t* info, void* context)
 
 void pthread_pause_once(void)
 {
-    pthread_pause_ack_sems = g_new0(sem_t, peak_max_num_threads);
-    pthread_pause_ack_sessions = g_new0(sig_atomic_t, peak_max_num_threads);
-    for (size_t i = 0; i < peak_max_num_threads; i++) {
-        sem_init(&pthread_pause_ack_sems[i], 0, 0);
-        pthread_pause_ack_sessions[i] = -1;
-    }
+    sem_init(&pthread_pause_sem, 0, 0);
 
     // Prepare sigset
     sigset_t sigset;
@@ -235,11 +226,8 @@ static int pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session
     }
 
     for (;;) {
-        if (sem_timedwait(&pthread_pause_ack_sems[mapped_id], &ts) == 0) {
-            if (pthread_pause_ack_sessions[mapped_id] == session_id) {
-                return 0;
-            }
-            continue;
+        if (sem_timedwait(&pthread_pause_sem, &ts) == 0) {
+            return 0;
         }
         if (errno == EINTR) {
             continue;
@@ -478,11 +466,19 @@ void* peak_heartbeat_monitor(void* arg) {
                             hb_pause_session_ids[s] = -1;
                             hb_pause_status[s] = -1;
                         }
-
+                        // double end_pthread = peak_second();
+                        // g_printerr ("end_pthread per %.3e\n", end_pthread - start_attach_time);
                         pthread_mutex_lock(&lock);
+                        // double pthread_mutex_lock_time = peak_second();
+                        // g_printerr ("pthread_mutex_lock_time per %.3e\n", pthread_mutex_lock_time - end_pthread);
+
 
                         if (peak_detached[i] && !peak_need_detach[i]) {
+                            //  double start_pause = peak_second();
+                            // g_printerr ("start_pause per\n");
+
                             for (size_t s = 0; s < snapshot_count; s++) {
+                               
                                 pthread_t tid_key = hb_tid_keys[s];
                                 size_t mapped = hb_mapped_ids[s];
                                 if (mapped < peak_max_num_threads &&
@@ -492,10 +488,16 @@ void* peak_heartbeat_monitor(void* arg) {
                                         pthread_pause_mapped(tid_key, mapped, &hb_pause_session_ids[s]);
                                 }
                             }
+                            // double end_pause = peak_second();
+                            // g_printerr ("end_pause per %.3e\n", end_pause - start_pause);
+
 
                             gum_interceptor_begin_transaction(interceptor);
                             gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
                             gum_interceptor_end_transaction(interceptor);
+
+                            //  double start_unpause = peak_second();
+                            // g_printerr ("start_unpause per %.3e\n", start_unpause - end_pause);
 
                             for (size_t s = 0; s < snapshot_count; s++) {
                                 pthread_t tid_key = hb_tid_keys[s];
@@ -508,6 +510,9 @@ void* peak_heartbeat_monitor(void* arg) {
                                     pthread_unpause(tid_key, hb_pause_session_ids[s]);
                                 }
                             }
+                            // double end_unpause = peak_second();
+                            // g_printerr ("end_unpause per %.3e\n", end_unpause - start_unpause);
+
 
                             peak_need_detach[i] = FALSE;
                             peak_detached[i] = FALSE;
@@ -518,6 +523,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         }
 
                         pthread_mutex_unlock(&lock);
+                        // g_printerr ("pthread_mutex_unlock per %.3e\n",  peak_second() - start_attach_time);
 
                         if (!did_attach) {
                             continue;
@@ -584,10 +590,16 @@ void* peak_heartbeat_monitor(void* arg) {
                             hb_pause_session_ids[s] = -1;
                             hb_pause_status[s] = -1;
                         }
-
+                        // double end_pthread = peak_second();
+                        // g_printerr ("end_pthread Global %.3e\n", end_pthread - start_attach_time);
                         pthread_mutex_lock(&lock);
+                        // double pthread_mutex_lock_time = peak_second();
+                        // g_printerr ("pthread_mutex_lock_time Global %.3e\n", pthread_mutex_lock_time - end_pthread);
 
                         if (peak_detached[i] && !peak_need_detach[i]) {
+                            // double start_pause = peak_second();
+                            // g_printerr ("start_pause Global\n");
+
                             for (size_t s = 0; s < snapshot_count; s++) {
                                 pthread_t tid_key = hb_tid_keys[s];
                                 size_t mapped = hb_mapped_ids[s];
@@ -598,10 +610,16 @@ void* peak_heartbeat_monitor(void* arg) {
                                         pthread_pause_mapped(tid_key, mapped, &hb_pause_session_ids[s]);
                                 }
                             }
+                            // double end_pause = peak_second();
+                            // g_printerr ("end_pause Global %.3e\n", end_pause - start_pause);
+
 
                             gum_interceptor_begin_transaction(interceptor);
                             gum_interceptor_attach(interceptor, hook_address[i], array_listener[i], NULL);
                             gum_interceptor_end_transaction(interceptor);
+
+                            // double start_unpause = peak_second();
+                            // g_printerr ("start_unpause Global %.3e\n", start_unpause - end_pause);
 
                             for (size_t s = 0; s < snapshot_count; s++) {
                                 pthread_t tid_key = hb_tid_keys[s];
@@ -615,6 +633,10 @@ void* peak_heartbeat_monitor(void* arg) {
                                 }
                             }
 
+                            // double end_unpause = peak_second();
+                            // g_printerr ("end_unpause Global %.3e\n", end_unpause - start_unpause);
+
+
                             peak_need_detach[i] = FALSE;
                             peak_detached[i] = FALSE;
                             array_listener_reattached[i] = TRUE;
@@ -624,6 +646,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         }
 
                         pthread_mutex_unlock(&lock);
+                        // g_printerr ("pthread_mutex_unlock Global %.3e\n",  peak_second() - start_attach_time);
 
                         if (!did_attach) {
                             continue;
