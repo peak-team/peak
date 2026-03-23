@@ -32,7 +32,7 @@ static gboolean gum_find_functions_matching_initialize = false;
 static GHashTable* gum_symbol_demangled_mapping;
 static GHashTable* gum_symbol_short_mapping;
 
-gboolean str_equal_function_general(gconstpointer a, gconstpointer b) {
+static gboolean str_equal_function_general(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
@@ -714,12 +714,21 @@ void peak_general_listener_attach()
                         if (candidates && candidates->len > 0) {
                             hook_address[i] = g_ptr_array_index(candidates, 0);
                             gchar* mangled = gum_symbol_name_from_address(hook_address[i]);
-                            if (!mangled) continue;
-                            char* demangled = cxa_demangle(mangled);
-                            g_free(mangled);
-                            if (!demangled) continue;
-                            peak_demangled_strings[i] = g_strdup(demangled);
-                            free(demangled);
+
+                            if (mangled != NULL) {
+                                char* demangled = cxa_demangle(mangled);
+                                g_free(mangled);
+                                if (demangled != NULL) {
+                                    peak_demangled_strings[i] = g_strdup(demangled);
+                                    free(demangled);
+                                } else {
+                                    /* Failed to demangle; fall back to original hook string */
+                                    peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+                                }
+                            } else {
+                                /* Failed to get mangled name; fall back to original hook string */
+                                peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+                            }
                         }
                     }
                 }
