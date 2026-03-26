@@ -57,6 +57,11 @@ typedef struct _PeakGeneralThreadState {
     gboolean self_mapped_known;
 } PeakGeneralThreadState;
 
+typedef struct _PeakInvocationData {
+    gdouble start_time;
+    gboolean initialized;
+} PeakInvocationData;
+
 static __thread PeakGeneralThreadState thread_data;
 
 static sem_t pthread_pause_sem;
@@ -838,9 +843,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         if (check_interval != 0) pthread_pause_enable();
         else pthread_pause_disable();
     }
-    double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
+    PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+    priv->start_time = peak_second();
+    priv->initialized = TRUE;
     gum_interceptor_unignore_current_thread(interceptor);
-    *current_time = peak_second();
 }
 
 static void
@@ -857,18 +863,23 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
                 thread_data.child_time = NULL;
                 g_free(tmp_ptr);
             }
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
+        PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+        if (!priv->initialized) {
+            gum_interceptor_unignore_current_thread(interceptor);
             return;
         }
         PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
         // PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-        double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
         // size_t hook_id = state->hook_id;
         gboolean mapped_found = FALSE;
         size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
         if (!mapped_found || mapped_tid >= peak_max_num_threads) {
             mapped_tid = 0;
         }
-        end_time = end_time - *current_time;
+        end_time = end_time - priv->start_time;
         size_t index = mapped_tid;
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
@@ -880,6 +891,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         if (thread_data.level > 0)
             thread_data.child_time[thread_data.level - 1] += end_time;
         self->exclusive_time[index] += end_time - thread_data.child_time[thread_data.level];
+        thread_data.child_time[thread_data.level] = 0.0;
+        priv->initialized = FALSE;
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;
@@ -897,18 +910,23 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
                 g_free(tmp_ptr);
                 pthread_pause_enable();
             }
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
+        PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+        if (!priv->initialized) {
+            gum_interceptor_unignore_current_thread(interceptor);
             return;
         }
         PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
         // PeakGeneralState* state = GUM_IC_GET_FUNC_DATA(ic, PeakGeneralState*);
-        double* current_time = GUM_IC_GET_INVOCATION_DATA(ic, double);
         // size_t hook_id = state->hook_id;
         gboolean mapped_found = FALSE;
         size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
         if (!mapped_found || mapped_tid >= peak_max_num_threads) {
             mapped_tid = 0;
         }
-        end_time = end_time - *current_time;
+        end_time = end_time - priv->start_time;
         size_t index = mapped_tid;
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
@@ -920,6 +938,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         if (thread_data.level > 0)
             thread_data.child_time[thread_data.level - 1] += end_time;
         self->exclusive_time[index] += end_time - thread_data.child_time[thread_data.level];
+        thread_data.child_time[thread_data.level] = 0.0;
+        priv->initialized = FALSE;
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;
