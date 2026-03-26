@@ -100,4 +100,7 @@ void peak_general_listener_dettach();
  * @return NULL when the monitoring thread exits.
  */
 void* peak_heartbeat_monitor();
+
+int pthread_pause(pthread_t thread, int* session_id_out);
+int pthread_unpause(pthread_t thread, int session_id);
 #endif /* __GENERAL_LISTENER_H */
