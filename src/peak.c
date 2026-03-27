@@ -44,7 +44,6 @@ gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
-extern gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
@@ -121,6 +120,9 @@ void peak_init()
         args = g_new0(PeakHeartbeatArgs, 1);
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
+        pthread_mutex_lock(&heartbeat_mutex);
+        heartbeat_running = true;
+        pthread_mutex_unlock(&heartbeat_mutex);
         // create heartbeat thread
         if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
             perror("Failed to create heartbeat thread");
@@ -142,7 +144,10 @@ void peak_init()
 void peak_fini()
 {
     if (heartbeat_time != 0) {
+        pthread_mutex_lock(&heartbeat_mutex);
         heartbeat_running = false;
+        pthread_cond_signal(&heartbeat_cond);
+        pthread_mutex_unlock(&heartbeat_mutex);
         pthread_join(heartbeat_thread, NULL);
         if (heartbeat_overhead) g_free(heartbeat_overhead);
         if (args) g_free(args);
@@ -288,4 +293,3 @@ int __libc_start_main(main_fn main, int argc, char** argv,
 #else
 #error Unsupported platform
 #endif
-

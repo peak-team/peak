@@ -25,10 +25,11 @@ extern float peak_detach_cost;
 extern float target_profile_ratio;
 extern unsigned int post_wait_interval;
 extern unsigned long long sig_cont_wait_interval;
-static gulong peak_detach_count = 0;
+extern unsigned int heartbeat_time;
+static gulong peak_detach_count = G_MAXULONG;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
-gboolean heartbeat_running = true; 
+gboolean heartbeat_running = true;
 
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
@@ -48,6 +49,8 @@ static __thread PeakGeneralThreadState thread_data;
 
 sem_t pthread_pause_sem;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
+pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
 
 void pthread_pause_handler(int signal)
 {
@@ -233,7 +236,14 @@ void* peak_heartbeat_monitor(void* arg) {
     gum_interceptor_ignore_current_thread(interceptor);
     pthread_t my_tid = pthread_self();
     
-    while (heartbeat_running) {
+    while (true) {
+        pthread_mutex_lock(&heartbeat_mutex);
+        if (!heartbeat_running) {
+            pthread_mutex_unlock(&heartbeat_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&heartbeat_mutex);
+
         heartbeat_counter++;
         total_execution_time = peak_second() - peak_main_time;
         for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -296,7 +306,23 @@ void* peak_heartbeat_monitor(void* arg) {
                 
             }
         }
-        usleep(heartbeat_time);
+        pthread_mutex_lock(&heartbeat_mutex);
+        if (!heartbeat_running) {
+            pthread_mutex_unlock(&heartbeat_mutex);
+            break;
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += heartbeat_time / 1000000U;
+        ts.tv_nsec += (long)(heartbeat_time % 1000000U) * 1000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+
+        (void)pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
+        pthread_mutex_unlock(&heartbeat_mutex);
     }
     gum_interceptor_unignore_current_thread(interceptor);
     return NULL;
@@ -313,7 +339,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     pthread_t my_tid = pthread_self();
     size_t mapped_tid = (size_t)(gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(my_tid)));
-    if (peak_detach_cost == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -397,7 +423,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_cost == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
