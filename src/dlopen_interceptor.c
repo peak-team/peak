@@ -16,6 +16,8 @@ static void* (*original_dlopen)(const char *filename, int flags);
 
 static void*
 peak_dlopen(const char *filename, int flags) {
+    g_printerr ("dlopen called with filename: %s\n", filename);
+
     void *handle = original_dlopen(filename, flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
