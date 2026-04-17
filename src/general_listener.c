@@ -31,7 +31,7 @@ extern float peak_global_detach_factor;
 extern bool enable_per_target_heartbeat;
 extern bool enable_global_heartbeat;
 extern unsigned long long sig_cont_wait_interval;
-extern unsigned int sig_stop_ack_wait_interval;
+extern unsigned long long sig_stop_ack_wait_interval;
 extern unsigned int heartbeat_time;
 static gulong peak_detach_count = G_MAXULONG;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
