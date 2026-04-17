@@ -49,7 +49,7 @@ gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
-extern volatile gboolean heartbeat_running;
+extern gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
