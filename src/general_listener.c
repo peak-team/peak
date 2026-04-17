@@ -719,7 +719,9 @@ void* peak_heartbeat_monitor(void* arg) {
         // scale factor: faster when err/rate bigger
         double scale = 1.0 / (1.0 + HB_K_ERR * err + HB_K_RATE * ema_global_rate);
 
-        double sleep_us = clipd((double)heartbeat_time * scale, (double)HB_MIN_US, (double)HB_MAX_US);
+        long long sleep_us = (long long)(clipd((double)heartbeat_time * scale,
+                                       (double)HB_MIN_US,
+                                       (double)HB_MAX_US) + 0.5);
 
         pthread_mutex_lock(&heartbeat_mutex);
         if (!heartbeat_running) {
