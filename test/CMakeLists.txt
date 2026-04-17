@@ -121,7 +121,7 @@ if(BUILD_TESTING)
     else()
         set_tests_properties(test_sleep
             PROPERTIES 
-                ENVIRONMENT "PEAK_TARGET=main,my_sleep_fun;${HEARTBEAT_OFF_ENV}c;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sleep
