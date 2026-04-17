@@ -89,7 +89,7 @@ float parse_env_to_float_ratio(const char* env_var);
  *
  * @param env_var The name of the environment variable to parse.
  * @return The parsed floating point value, or 1.2 if the environment
- *         variable is not set, is empty, or contains invalid characters.
+ *         variable is not set or contains invalid characters.
  */
 float parse_env_to_float_detach_factor(const char* env_var);
 
@@ -102,7 +102,7 @@ float parse_env_to_float_detach_factor(const char* env_var);
  *
  * @param env_var The name of the environment variable to parse.
  * @return The parsed floating point value, or 0.85 if the environment
- *         variable is not set, is empty, or contains invalid characters.
+ *         variable is not set or contains invalid characters.
  */
 float parse_env_to_float_reattach_factor(const char* env_var);
 
