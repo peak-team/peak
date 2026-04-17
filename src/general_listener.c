@@ -74,13 +74,10 @@ static __thread PeakGeneralThreadState thread_data;
 
 static sem_t pthread_pause_sem;
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
-<<<<<<< HEAD
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
-=======
 static __thread int last_cont_id = -1;
 static _Atomic int global_session_counter = 0;
->>>>>>> fix: Add per-session pause tags and per-thread ack semaphores for robust pause/unpause synchronization
 
 void pthread_pause_handler(int signal, siginfo_t* info, void* context)
 {
