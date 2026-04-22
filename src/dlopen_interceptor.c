@@ -34,6 +34,11 @@ peak_dlopen(const char *filename, int flags) {
         return handle;
     }
 
+    // If not RTLD_NOW (i.e., not immediate binding), skip hooking
+    if (!(flags & RTLD_NOW)) {
+        return handle;
+    }
+
     gum_interceptor_ignore_current_thread(interceptor);
     gum_interceptor_begin_transaction(interceptor);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
