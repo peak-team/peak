@@ -1,3 +1,4 @@
+
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 
@@ -14,9 +15,18 @@ extern char** peak_demangled_strings;
 
 static void* (*original_dlopen)(const char *filename, int flags);
 
+static inline long get_tid() {
+    return syscall(SYS_gettid);
+}
+
 static void*
 peak_dlopen(const char *filename, int flags) {
-    g_printerr ("dlopen called with filename: %s\n", filename);
+    long tid = get_tid();    
+
+    g_printerr("[peak][tid=%ld] dlopen(filename=%s, flags=0x%x)\n",
+               tid,
+               filename ? filename : "NULL",
+               flags);
 
     void *handle = original_dlopen(filename, flags);
     // If dlopen failed or no filename, don’t do rescan
