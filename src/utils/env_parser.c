@@ -291,6 +291,36 @@ unsigned int parse_env_to_interval(const char* env_var) {
     return (unsigned int)result;
 }
 
+unsigned int parse_env_to_uint_default(const char* env_var, unsigned int default_value) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return default_value;
+    }
+
+    char* endptr;
+    errno = 0;
+    unsigned long result = strtoul(varvalue, &endptr, 10);
+    if (errno == ERANGE || result > UINT_MAX || endptr == varvalue || *endptr != '\0') {
+        return default_value;
+    }
+    return (unsigned int)result;
+}
+
+double parse_env_to_double_default(const char* env_var, double default_value) {
+    char* varvalue = getenv(env_var);
+    if (varvalue == NULL) {
+        return default_value;
+    }
+
+    char* endptr;
+    errno = 0;
+    double result = strtod(varvalue, &endptr);
+    if (errno == ERANGE || endptr == varvalue || *endptr != '\0') {
+        return default_value;
+    }
+    return result;
+}
+
 unsigned long long parse_env_to_post_interval(const char* env_var) {
     char* varvalue = getenv(env_var);
     if (varvalue == NULL) {

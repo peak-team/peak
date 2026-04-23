@@ -12,7 +12,6 @@ static gboolean* array_listener_detached;
 static gboolean* array_listener_reattached;
 extern gboolean* peak_need_detach;
 extern gboolean* peak_detached;
-extern PeakHeartbeatArgs* args;
 extern gdouble* heartbeat_overhead;
 extern gboolean** peak_target_thread_called;
 extern unsigned int check_interval;
@@ -325,14 +324,14 @@ static inline double clipd(double x, double lo, double hi) {
 }
 
 void* peak_heartbeat_monitor(void* arg) {
-    unsigned int heartbeat_time = args->heartbeat_time;   // base sleep (us)
-    unsigned int check_interval = args->check_interval;
-
-    const unsigned int HB_MIN_US   = 10000;     // hard min sleep
-    const unsigned int HB_MAX_US   = 500000;    // hard max sleep
-    const double       HB_K_ERR    = 3.0;       // sensitivity to overshoot
-    const double       HB_K_RATE   = 0.8;       // sensitivity to growth rate
-    const double       HB_EMA_A    = 0.3;       // EMA alpha in (0,1]
+    PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
+    unsigned int heartbeat_time = heartbeat_args->heartbeat_time;   // base sleep (us)
+    unsigned int check_interval = heartbeat_args->check_interval;
+    unsigned int hb_min_us = heartbeat_args->hb_min_us;
+    unsigned int hb_max_us = heartbeat_args->hb_max_us;
+    double hb_k_err = heartbeat_args->hb_k_err;
+    double hb_k_rate = heartbeat_args->hb_k_rate;
+    double hb_ema_a = heartbeat_args->hb_ema_a;
     unsigned int heartbeat_counter = 0;
 
     gum_interceptor_ignore_current_thread(interceptor);
@@ -704,7 +703,7 @@ void* peak_heartbeat_monitor(void* arg) {
         if (gdt <= 1e-12) gdt = 1e-12;
 
         double global_rate = (global_overhead - prev_global_overhead) / gdt;
-        ema_global_rate = HB_EMA_A * global_rate + (1.0 - HB_EMA_A) * ema_global_rate;
+        ema_global_rate = hb_ema_a * global_rate + (1.0 - hb_ema_a) * ema_global_rate;
 
         prev_global_overhead = global_overhead;
         prev_global_time     = now;
@@ -717,11 +716,11 @@ void* peak_heartbeat_monitor(void* arg) {
         // double pos_rate = (ema_global_rate > 0.0) ? ema_global_rate : 0.0;
 
         // scale factor: faster when err/rate bigger
-        double scale = 1.0 / (1.0 + HB_K_ERR * err + HB_K_RATE * ema_global_rate);
+        double scale = 1.0 / (1.0 + hb_k_err * err + hb_k_rate * ema_global_rate);
 
         long long sleep_us = (long long)(clipd((double)heartbeat_time * scale,
-                                       (double)HB_MIN_US,
-                                       (double)HB_MAX_US) + 0.5);
+                                       (double)hb_min_us,
+                                       (double)hb_max_us) + 0.5);
 
         pthread_mutex_lock(&heartbeat_mutex);
         if (!heartbeat_running) {
