@@ -22,20 +22,31 @@ static inline long get_tid() {
 static void*
 peak_dlopen(const char *filename, int flags) {
     long tid = get_tid();    
-
+    
+    /*
     g_printerr("[peak][tid=%ld] dlopen(filename=%s, flags=0x%x)\n",
                tid,
                filename ? filename : "NULL",
                flags);
+    */
 
-    void *handle = original_dlopen(filename, flags);
-    // If dlopen failed or no filename, don’t do rescan
-    if (handle == NULL || filename == NULL) {
-        return handle;
+    // Force eager symbol resolution to ensure target symbols are available
+    // during the hooking phase. If RTLD_DEEPBIND is specified, preserve it;
+    // otherwise, enforce RTLD_NOW.
+    //
+    // Note:
+    // - Clearing the lower 4 bits removes existing binding mode flags
+    //   (e.g., RTLD_LAZY / RTLD_NOW / RTLD_GLOBAL / RTLD_LOCAL).
+    // - We then explicitly set RTLD_NOW or RTLD_DEEPBIND.
+    int binding_flags = flags & ~0xF | RTLD_NOW;
+    
+    if (flags & RTLD_DEEPBIND) {
+        binding_flags |= RTLD_DEEPBIND;
     }
 
-    // If not RTLD_NOW (i.e., not immediate binding), skip hooking
-    if (!(flags & RTLD_NOW)) {
+    void *handle = original_dlopen(filename, binding_flags);
+    // If dlopen failed or no filename, don’t do rescan
+    if (handle == NULL || filename == NULL) {
         return handle;
     }
 
