@@ -18,25 +18,35 @@
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
 
-#define PEAK_TARGET_ENV                 "PEAK_TARGET"
-#define PEAK_TARGET_FILE_ENV            "PEAK_TARGET_FILE"
-#define PEAK_TARGET_GROUP_ENV           "PEAK_TARGET_GROUP"
-#define PEAK_GPU_TARGET_ENV             "PEAK_GPU_TARGET"
-#define PEAK_GPU_TARGET_FILE_ENV        "PEAK_GPU_TARGET_FILE"
-// #define PEAK_GPU_TARGET_GROUP_ENV    "PEAK_GPU_TARGET_GROUP"
-#define PEAK_GPU_MONITOR_ALL            "PEAK_GPU_MONITOR_ALL"
-#define PEAK_NAME_TRUNCATE              "PEAK_NAME_TRUNCATE"
-#define PEAK_TARGET_DELIM               ','
-#define PEAK_COST_ENV                   "PEAK_COST"
-#define PEAK_HEARTBEAT_INTERVAL_ENV     "PEAK_HEARTBEAT_INTERVAL"
-#define PEAK_HIBERNATION_CYCLE_ENV      "PEAK_HIBERNATION_CYCLE"
-#define PEAK_OVERHEAD_RATIO_ENV         "PEAK_OVERHEAD_RATIO"
-#define PEAK_ENABLE_REATTACH_ENV        "PEAK_ENABLE_REATTACH"
-#define PEAK_PAUSE_TIMEOUT_ENV          "PEAK_PAUSE_TIMEOUT"
-#define PEAK_SIG_CONT_TIMEOUT_ENV       "PEAK_SIG_CONT_TIMEOUT"
-#define PEAK_MEMORY_PROFILE             "PEAK_MEMORY_PROFILE"
-#define PEAK_MEMORY_TRACK_ALL           "PEAK_MEMORY_TRACK_ALL"
-#define PPID_FILE_NAME                  "/tmp/lock_peak_ppid_list"
+#define PEAK_TARGET_ENV                        "PEAK_TARGET"
+#define PEAK_TARGET_FILE_ENV                   "PEAK_TARGET_FILE"
+#define PEAK_TARGET_GROUP_ENV                  "PEAK_TARGET_GROUP"
+#define PEAK_GPU_TARGET_ENV                    "PEAK_GPU_TARGET"
+#define PEAK_GPU_TARGET_FILE_ENV               "PEAK_GPU_TARGET_FILE"
+// #define PEAK_GPU_TARGET_GROUP_ENV           "PEAK_GPU_TARGET_GROUP"
+#define PEAK_GPU_MONITOR_ALL                   "PEAK_GPU_MONITOR_ALL"
+#define PEAK_NAME_TRUNCATE                     "PEAK_NAME_TRUNCATE"
+#define PEAK_TARGET_DELIM                     ','
+#define PEAK_COST_ENV                          "PEAK_COST"
+#define PEAK_HEARTBEAT_INTERVAL_ENV            "PEAK_HEARTBEAT_INTERVAL"
+#define PEAK_HIBERNATION_CYCLE_ENV             "PEAK_HIBERNATION_CYCLE"
+#define PEAK_OVERHEAD_RATIO_ENV                "PEAK_OVERHEAD_RATIO"
+#define PEAK_GLOBAL_OVERHEAD_RATIO_ENV         "PEAK_GLOBAL_OVERHEAD_RATIO"
+#define PEAK_GLOBAL_DETACH_FACTOR_ENV          "PEAK_GLOBAL_DETACH_FACTOR"
+#define PEAK_GLOBAL_REATTACH_FACTOR_ENV        "PEAK_GLOBAL_REATTACH_FACTOR"
+#define PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV   "PEAK_ENABLE_PER_TARGET_HEARTBEAT"
+#define PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV       "PEAK_ENABLE_GLOBAL_HEARTBEAT"
+#define PEAK_ENABLE_REATTACH_ENV               "PEAK_ENABLE_REATTACH"
+#define PEAK_PAUSE_TIMEOUT_ENV                 "PEAK_PAUSE_TIMEOUT"
+#define PEAK_SIG_CONT_TIMEOUT_ENV              "PEAK_SIG_CONT_TIMEOUT"
+#define PEAK_HB_MIN_US_ENV                     "PEAK_HB_MIN_US"
+#define PEAK_HB_MAX_US_ENV                     "PEAK_HB_MAX_US"
+#define PEAK_HB_K_ERR_ENV                      "PEAK_HB_K_ERR"
+#define PEAK_HB_K_RATE_ENV                     "PEAK_HB_K_RATE"
+#define PEAK_HB_EMA_A_ENV                      "PEAK_HB_EMA_A"
+#define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
+#define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
+#define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
 
 gboolean* peak_need_detach;
@@ -44,13 +54,24 @@ gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
+extern gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
-unsigned int post_wait_interval;
+unsigned int sig_stop_ack_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
+float global_target_ratio;
+float peak_global_reattach_factor;
+float peak_global_detach_factor;
+bool enable_per_target_heartbeat;
+bool enable_global_heartbeat;
+unsigned int hb_min_us;
+unsigned int hb_max_us;
+double hb_k_err;
+double hb_k_rate;
+double hb_ema_a;
 size_t peak_gpu_hook_address_count;
 char** peak_hook_strings;
 char** peak_gpu_hook_strings;
@@ -83,11 +104,27 @@ void peak_init()
     heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
     check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
     target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
-    post_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
+    global_target_ratio = parse_env_to_float_ratio(PEAK_GLOBAL_OVERHEAD_RATIO_ENV);
+    peak_global_detach_factor = parse_env_to_float_detach_factor(PEAK_GLOBAL_DETACH_FACTOR_ENV);
+    peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
+    enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
+    enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
+    sig_stop_ack_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
+    hb_min_us = parse_env_to_uint_default(PEAK_HB_MIN_US_ENV, 10000);
+    hb_max_us = parse_env_to_uint_default(PEAK_HB_MAX_US_ENV, 500000);
+    hb_k_err = parse_env_to_double_default(PEAK_HB_K_ERR_ENV, 3.0);
+    hb_k_rate = parse_env_to_double_default(PEAK_HB_K_RATE_ENV, 0.8);
+    hb_ema_a = parse_env_to_double_default(PEAK_HB_EMA_A_ENV, 0.3);
+    if (hb_max_us < hb_min_us) {
+        hb_max_us = hb_min_us;
+    }
+    if (hb_ema_a <= 0.0 || hb_ema_a > 1.0) {
+        hb_ema_a = 0.3;
+    }
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
-
+   
     //gum_init_embedded();
 
     pthread_listener_attach();
@@ -120,6 +157,11 @@ void peak_init()
         args = g_new0(PeakHeartbeatArgs, 1);
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
+        args->hb_min_us = hb_min_us;
+        args->hb_max_us = hb_max_us;
+        args->hb_k_err = hb_k_err;
+        args->hb_k_rate = hb_k_rate;
+        args->hb_ema_a = hb_ema_a;
         pthread_mutex_lock(&heartbeat_mutex);
         heartbeat_running = true;
         pthread_mutex_unlock(&heartbeat_mutex);

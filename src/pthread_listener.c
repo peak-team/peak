@@ -48,6 +48,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_insert(peak_tid_mapping, GUINT_TO_POINTER(tid), GUINT_TO_POINTER(current_tid));
     current_tid++;
+    // g_print ("pthread_listener_on_enter %lu\n", *tid);
     g_mutex_unlock(&tid_mapping_mutex);
     // g_print ("pthread_listener_on_leave %lu\n", tid);
     if (!thread_state->is_original)
@@ -81,11 +82,11 @@ static int
 peak_pthread_join(pthread_t thread, void **retval)
 {
     // g_printerr ("peak_pthread_join called on thread %ld\n",  thread);
+    int ret = original_pthread_join(thread, retval);
     g_mutex_lock(&tid_mapping_mutex);
     gum_metal_hash_table_remove(peak_tid_mapping, GUINT_TO_POINTER(thread));
-    current_tid--;
     g_mutex_unlock(&tid_mapping_mutex);
-    return original_pthread_join(thread, retval);
+    return ret;
 }
 
 void pthread_listener_attach()
@@ -132,4 +133,40 @@ void pthread_listener_dettach()
     g_mutex_clear(&tid_mapping_mutex);
     g_object_unref(pthread_create_listener);
     g_object_unref(pthread_create_interceptor);
+}
+
+size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found)
+{
+    gpointer value = NULL;
+    g_mutex_lock(&tid_mapping_mutex);
+    value = gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(thread));
+    g_mutex_unlock(&tid_mapping_mutex);
+
+    if (found != NULL) {
+        *found = (value != NULL);
+    }
+    return (size_t) value;
+}
+
+size_t pthread_listener_snapshot_threads(pthread_t* tids, size_t* mapped, size_t capacity)
+{
+    size_t count = 0;
+    GumMetalHashTableIter it;
+    pthread_t tid_key;
+
+    if (tids == NULL || mapped == NULL || capacity == 0) {
+        return 0;
+    }
+
+    g_mutex_lock(&tid_mapping_mutex);
+    gum_metal_hash_table_iter_init(&it, peak_tid_mapping);
+    while (count < capacity && gum_metal_hash_table_iter_next(&it, (void**) &tid_key, NULL)) {
+        gpointer mapped_tid = gum_metal_hash_table_lookup(peak_tid_mapping, GUINT_TO_POINTER(tid_key));
+        tids[count] = tid_key;
+        mapped[count] = (size_t) mapped_tid;
+        count++;
+    }
+    g_mutex_unlock(&tid_mapping_mutex);
+
+    return count;
 }

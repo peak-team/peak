@@ -40,6 +40,11 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_HEARTBEAT_INTERVAL` | Sets the interval (in seconds) at which the heartbeat monitor runs to assess whether profiling adjustments are needed (**default: `0.1`**). A smaller interval allows quicker adaptation to overhead changes. If set to 0, the heartbeat monitor is disabled. |
 | `PEAK_HIBERNATION_CYCLE` | Determines how often the system checks for detach and reattach, based on the number of heartbeat cycles (**default: `50`**). A smaller value enables faster reattachment decisions, while 0 disables reattachment entirely. If set to 0, reattachment is disabled, and the profiling system will not reattach after detaching due to high overhead. |
 | `PEAK_OVERHEAD_RATIO` | Defines the target profiling overhead ratio (**default: `0.1`**). If the actual overhead exceeds this ratio, the monitoring process detaches to reduce overhead. |
+| `PEAK_HB_MIN_US` | Sets the adaptive heartbeat monitor's minimum sleep interval in microseconds (**default: `10000`**). |
+| `PEAK_HB_MAX_US` | Sets the adaptive heartbeat monitor's maximum sleep interval in microseconds (**default: `500000`**). |
+| `PEAK_HB_K_ERR` | Controls adaptive heartbeat sensitivity to overhead target overshoot (**default: `3.0`**). |
+| `PEAK_HB_K_RATE` | Controls adaptive heartbeat sensitivity to overhead growth rate (**default: `0.8`**). |
+| `PEAK_HB_EMA_A` | Sets the exponential moving average alpha for global overhead growth rate; valid range is `(0, 1]` (**default: `0.3`**). |
 | `PEAK_PAUSE_TIMEOUT` | Adjusts the maximum waiting time (in seconds) for a thread that does not call the target function or calls it infrequently to respond to pause and unpause commands (e.g., `0.01`). |
 | `PEAK_SIG_CONT_TIMEOUT` | Adjusts the maximum waiting time (in seconds) for a thread that does not call the target function or calls it infrequently to receive the continue signal (e.g., `0.01`). |
 | `PEAK_GPU_TARGET` | Specifies GPU kernels to be profiled, provided as a comma-separated list (e.g., `kernel1,kernel2`). Matching is performed via string comparison on the demangled kernel name, considering only the base kernel names. Namespaces and template parameters are excluded from matching (e.g., `void myspace::kernel1<int>(...)` matches `kernel1`). |

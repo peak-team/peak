@@ -81,6 +81,32 @@ float parse_env_to_float(const char* env_var);
 float parse_env_to_float_ratio(const char* env_var);
 
 /**
+ * @brief Parses a floating point number from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a floating point number using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed floating point value, or 1.2 if the environment
+ *         variable is not set or contains invalid characters.
+ */
+float parse_env_to_float_detach_factor(const char* env_var);
+
+/**
+ * @brief Parses a floating point number from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and parses it as a floating point number using the standard library
+ * function strtof().
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @return The parsed floating point value, or 0.85 if the environment
+ *         variable is not set or contains invalid characters.
+ */
+float parse_env_to_float_reattach_factor(const char* env_var);
+
+/**
  * @brief Parses a time value in seconds from an environment variable and converts it to microseconds.
  *
  * This function retrieves the value of an environment variable as a string
@@ -109,6 +135,34 @@ unsigned int parse_env_to_time(const char* env_var);
  * @return The parsed unsigned integer value, or 5 if parsing fails.
  */
 unsigned int parse_env_to_interval(const char* env_var);
+
+/**
+ * @brief Parses an unsigned integer from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as an unsigned integer using the standard library
+ * function strtoul(). If the environment variable is not set, is empty, or
+ * contains invalid characters, the provided default value is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @param default_value The value to return when parsing fails.
+ * @return The parsed unsigned integer value, or default_value if parsing fails.
+ */
+unsigned int parse_env_to_uint_default(const char* env_var, unsigned int default_value);
+
+/**
+ * @brief Parses a double from an environment variable.
+ *
+ * This function retrieves the value of an environment variable as a string
+ * and attempts to parse it as a double using the standard library function
+ * strtod(). If the environment variable is not set, is empty, or contains
+ * invalid characters, the provided default value is returned.
+ *
+ * @param env_var The name of the environment variable to parse.
+ * @param default_value The value to return when parsing fails.
+ * @return The parsed double value, or default_value if parsing fails.
+ */
+double parse_env_to_double_default(const char* env_var, double default_value);
 
  /**
  * @brief Parses a time value in seconds from an environment variable and converts it to nanoseconds.

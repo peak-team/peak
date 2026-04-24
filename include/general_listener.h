@@ -52,6 +52,11 @@ struct _PeakGeneralListener {
 typedef struct {
     unsigned int heartbeat_time;
     unsigned int check_interval;
+    unsigned int hb_min_us;
+    unsigned int hb_max_us;
+    double hb_k_err;
+    double hb_k_rate;
+    double hb_ema_a;
 } PeakHeartbeatArgs;
 
 /**

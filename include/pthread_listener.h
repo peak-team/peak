@@ -71,4 +71,26 @@ void pthread_listener_dettach();
 
 extern GumMetalHashTable* peak_tid_mapping;
 
+/**
+ * @brief Thread-safe lookup from pthread_t to mapped thread id.
+ *
+ * @param thread pthread identifier to query.
+ * @param found output flag set to TRUE when mapping exists.
+ * @return mapped thread id when found, 0 otherwise.
+ */
+size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found);
+
+/**
+ * @brief Thread-safe snapshot of tracked threads and mapped ids.
+ *
+ * The caller provides output buffers and capacity. The function returns
+ * number of entries written (up to capacity).
+ *
+ * @param tids output buffer of pthread ids.
+ * @param mapped output buffer of mapped thread ids.
+ * @param capacity max entries to write.
+ * @return number of copied entries.
+ */
+size_t pthread_listener_snapshot_threads(pthread_t* tids, size_t* mapped, size_t capacity);
+
 #endif /* __PTHREAD_LISTENER_H */
