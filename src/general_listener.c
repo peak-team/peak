@@ -882,7 +882,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_cost == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
