@@ -13,6 +13,28 @@
 #include <dlfcn.h> 
 #include <unistd.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_DLOPEN_API __attribute__((visibility("default")))
+#else
+#define PEAK_DLOPEN_API
+#endif
+
+typedef struct {
+    unsigned long long enqueued;
+    unsigned long long drained;
+    unsigned long long requeued;
+    unsigned long long dropped_full;
+    unsigned long long dropped_closed;
+    unsigned long long dropped_noload;
+    unsigned long long dropped_requeue;
+    unsigned long long partial_success;
+    unsigned long long retained_handles;
+    size_t max_depth;
+    size_t queue_length;
+    unsigned int capacity;
+    unsigned int drain_budget;
+} PeakDlopenDynamicAttachDiagnostics;
+
 /**
  * @brief Attaches the dlopen interceptor.
  *
@@ -61,6 +83,38 @@ gboolean dlopen_interceptor_shutdown_dynamic_attach(void);
  * handle so application dlclose() cannot unload code that Gum still patches.
  */
 void dlopen_interceptor_release_retained_dynamic_handles(void);
+
+/**
+ * @brief Copies dynamic attach queue diagnostics.
+ *
+ * The counters are intentionally cumulative for the process lifetime so trace
+ * rows and offline diagnostics can correlate queue pressure across controller
+ * drains and shutdown.
+ */
+PEAK_DLOPEN_API void dlopen_interceptor_get_dynamic_attach_diagnostics(
+    PeakDlopenDynamicAttachDiagnostics* diagnostics);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_DLOPEN_API void dlopen_interceptor_test_reset_dynamic_attach(gboolean open);
+PEAK_DLOPEN_API void dlopen_interceptor_test_set_manual_drain(gboolean enabled);
+PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
+    const char* filename);
+PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_retry_dynamic_attach(
+    const char* filename);
+PEAK_DLOPEN_API void dlopen_interceptor_test_drain_dynamic_attach_queue(void);
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_normal_drain_dynamic_attach_queue(void);
+PEAK_DLOPEN_API void dlopen_interceptor_test_record_noload_drop(void);
+PEAK_DLOPEN_API void dlopen_interceptor_test_record_requeue_drop(void);
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_record_partial_success_with_retained_handle(void);
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_release_retained_dynamic_handles(void);
+PEAK_DLOPEN_API size_t dlopen_interceptor_test_retained_handle_slots(void);
+PEAK_DLOPEN_API gboolean dlopen_interceptor_test_retryable_prepare_status(
+    int status);
+PEAK_DLOPEN_API void dlopen_interceptor_test_trace_counters(const char* event);
+#endif
 
 /**
  * @brief Detaches the dlopen interceptor.

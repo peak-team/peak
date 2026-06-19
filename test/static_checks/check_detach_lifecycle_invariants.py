@@ -128,6 +128,61 @@ def check_stop_window_trace_gating(repo_root):
             "last_stop_window_us must gate before reading stored timing")
 
 
+def check_general_controller_dlopen_drain_order(repo_root):
+    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    body = extract_function(source, "peak_general_controller_thread_main")
+    process_positions = [
+        match.start()
+        for match in re.finditer(
+            r"\bpeak_general_controller_process_pending_unlocked\s*\(",
+            body,
+        )
+    ]
+    drain_positions = [
+        match.start()
+        for match in re.finditer(
+            r"\bdlopen_interceptor_drain_dynamic_attach_queue\s*\(",
+            body,
+        )
+    ]
+
+    require(process_positions,
+            "general controller thread must process pending target hooks")
+    require(drain_positions,
+            "general controller thread must drain dynamic dlopen attach queue")
+    for position in drain_positions:
+        require(any(process_position < position
+                    for process_position in process_positions),
+                "general controller must process pending target hooks before "
+                "draining dynamic dlopen attach work")
+
+
+def check_dlopen_test_hook_visibility(repo_root):
+    header = (repo_root / "include/dlopen_interceptor.h").read_text(
+        encoding="utf-8"
+    )
+    cmake = (repo_root / "src/CMakeLists.txt").read_text(encoding="utf-8")
+
+    for function in (
+        "dlopen_interceptor_drain_dynamic_attach_queue",
+        "dlopen_interceptor_release_retained_dynamic_handles",
+    ):
+        declaration = re.search(
+            r"(?:PEAK_DLOPEN_API\s+)?void\s+"
+            + re.escape(function)
+            + r"\s*\(",
+            header,
+        )
+        require(declaration is not None,
+                f"missing dlopen lifecycle declaration for {function}")
+        require("PEAK_DLOPEN_API" not in declaration.group(0),
+                f"{function} must not be default-visible production ABI")
+
+    require("target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)"
+            in cmake,
+            "PEAK_ENABLE_TEST_HOOKS must be private to libpeak test builds")
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: check_detach_lifecycle_invariants.py <repo-root>",
@@ -139,6 +194,8 @@ def main():
     check_support_hook_lifetimes(repo_root)
     check_dlopen_revert_transactions(repo_root)
     check_stop_window_trace_gating(repo_root)
+    check_general_controller_dlopen_drain_order(repo_root)
+    check_dlopen_test_hook_visibility(repo_root)
     print("detach_lifecycle_invariants_ok")
     return 0
 
