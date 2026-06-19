@@ -314,6 +314,26 @@ shared thunk, and other audited danger ranges. This prevents stale callers from
 causing a detach or reattach hang by waiting for a safe region they will never
 enter again.
 
+When several target hooks are already pending, strict mode batches retry-ready
+detach and reattach requests into one helper STOP window. The controller first
+validates the candidates and snapshots each hook's Gum metadata before stopping
+the process. While threads are stopped, every candidate is classified
+independently against the same helper PC snapshot. Safe candidates contribute
+their byte-write and audited safe-PC instructions to one helper instruction
+batch; unsafe or unclassified candidates keep their requested state and use the
+same bounded retry/backoff path as the single-hook implementation.
+
+Partial success is allowed only for independent candidates. The batch rejects
+duplicate hook ids, duplicate function addresses, missing reattach patch
+records, unsupported operations, missing Gum snapshots, and conflicting helper
+instructions. If combining otherwise safe candidates would make the helper
+instruction list ambiguous, the controller resumes without mutating that batch
+and leaves all valid candidates retryable. Once the helper starts any
+byte/register mutation, the old invariant still applies: helper failure is
+fatal because PEAK cannot prove what code or register state was left behind.
+Candidate collection uses a round-robin cursor so a wide pending set is not
+permanently biased toward low hook indexes.
+
 ## Reattach Sequence
 
 Reattach also mutates the target entry and must use the same external stop and
@@ -345,6 +365,15 @@ pending with bounded exponential backoff. This avoids dropping a physical
 detach opportunity because one hot thread happened to be stopped at an unsafe PC
 for a single snapshot. Shutdown uses a bounded retry loop and then fails closed
 by leaving listener state alive if safety still cannot be proven.
+
+`PEAK_DETACH_TRACE_PATH` records transition rows for offline diagnosis. The base
+columns are `time,hook_id,symbol,operation,result,physical,status`; strict
+batching extends each row with `retry_count`, `pending_age_s`, `batch_size`, and
+`stop_window_us`. The first seven fields are stable; parsers should treat the
+tail fields as optional diagnostics. `stop_window_us` is the measured
+helper-held STOP window when available, otherwise `0`. These extra fields are
+gathered only when tracing is enabled and should not be treated as part of
+PEAK's default per-call overhead model without separate analysis.
 
 ## Memory Lifetime
 
@@ -393,6 +422,18 @@ teardown. In compatibility mode dynamic attaches are intentionally asynchronous:
 a function called immediately after `dlopen()` may run before PEAK's controller
 has attached the new listener. Strict mode preserves the same queuing model but
 uses the helper guard for the eventual Gum attach.
+
+The target detach controller is serviced before dynamic attach drains in each
+controller cycle so a busy `dlopen` queue cannot starve pending target
+detach/reattach work. Dynamic attach remains a separate bounded queue rather
+than being mixed into the target-hook batch, because attach/replace work has
+different Gum metadata and publication invariants. Optional diagnostics are
+available through `PEAK_DLOPEN_DEBUG` and `PEAK_DLOPEN_TRACE_PATH`, which report
+enqueued, drained, requeued, queue-full drops, closed-queue drops, `RTLD_NOLOAD`
+drops, failed requeue drops, partial successes, retained handles, and max queue
+depth. Retryable dynamic attach requests are requeued without ending the drain
+budget early, so one temporarily unsafe library does not block later queued
+handles in the same controller cycle.
 
 Final `dlopen` replacement teardown is two-phase in strict mode. PEAK first
 uses the helper guarded `REVERT` operation to restore the real `dlopen` entry
@@ -462,6 +503,19 @@ threads at PCs that cannot be proven safe. Those retries are fail-closed and
 eventual reattach succeeds in the stress runs, but the no-skip diagnostic remains
 an opportunity target for a future audited single-step/breakpoint evacuation
 corridor.
+
+The deterministic fake-helper controller tests cover batched detach, batched
+reattach, and mixed safe/unsafe batches. The mixed case verifies that one unsafe
+candidate remains retryable while another independent candidate completes in the
+same STOP window. The helper failure tests still cover permission denial,
+timeout, malformed snapshots, evacuation errors, and release failures so the
+fatal-after-mutation boundary stays explicit.
+
+The hot-loop integration test has a paired-target mode that drives two exported
+target symbols in the same worker loop. Its strict trace assertion requires both
+targets to detach physically with `batch_size >= 2`, proving the general
+controller path, not only the low-level controller API, batches real pending
+hooks.
 
 ## Implementation Status
 
@@ -537,6 +591,18 @@ Completed in this branch:
 27. Added bounded retry around final strict `dlopen` revert prepare so transient
     helper/ptrace denial under high stress does not skip otherwise safe
     teardown.
+28. Batched retry-ready target-hook detach/reattach requests into one strict
+    STOP window, with per-candidate Gum snapshots captured before STOP,
+    independent classification against one helper PC snapshot, partial success
+    for provably independent safe candidates, and all-or-nothing retry when
+    helper instructions conflict.
+29. Extended strict transition tracing with retry count, pending age, batch
+    size, and diagnostic STOP-window timing, and added optional dynamic
+    `dlopen` queue diagnostics for drops, retries, partial successes, retained
+    handles, and queue depth.
+30. Added round-robin strict batch candidate collection, continued dynamic
+    `dlopen` drains after retryable requeues, and added paired-target hot-loop
+    integration coverage requiring batched physical detach trace rows.
 
 Remaining work:
 

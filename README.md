@@ -42,7 +42,9 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_ENABLE_REATTACH` | Enables heartbeat-driven physical reattach after a target has been detached (**default: enabled**). Set to `0` or `false` to keep physically detached targets detached until shutdown. |
 | `PEAK_OVERHEAD_RATIO` | Defines the target profiling overhead ratio (**default: `0.1`**). If the actual overhead exceeds this ratio, the monitoring process detaches to reduce overhead. |
 | `PEAK_MAX_NUM_THREADS` | Sets PEAK's internal tracked-thread capacity (**default: `online_cpu_count * 2`**). Raise this for hostile high-thread stress runs so worker threads plus PEAK controller/helper/main threads fit in the snapshot table. |
-| `PEAK_DETACH_TRACE_PATH` | Optional CSV path for strict detach-controller transition evidence. When set, PEAK appends `time,hook_id,symbol,operation,result,physical,status` rows for detach, reattach, and shutdown transitions. |
+| `PEAK_DETACH_TRACE_PATH` | Optional CSV path for strict detach-controller transition evidence. When set, PEAK appends `time,hook_id,symbol,operation,result,physical,status,retry_count,pending_age_s,batch_size,stop_window_us` rows for detach, reattach, and shutdown transitions. The first seven fields are stable; the final four fields are optional diagnostics. `stop_window_us` is the measured helper-held STOP window when available, otherwise `0`. |
+| `PEAK_DLOPEN_DEBUG` | Enables stderr diagnostics for queued dynamic `dlopen` attach/retry/drop/retained-handle counters when set to `1`, `true`, `yes`, or `on`. |
+| `PEAK_DLOPEN_TRACE_PATH` | Optional CSV path for dynamic `dlopen` queue diagnostics. Rows are `event,enqueued,drained,requeued,dropped_full,dropped_closed,dropped_noload,dropped_requeue,partial_success,retained_handles,max_depth`. |
 | `PEAK_HB_MIN_US` | Sets the adaptive heartbeat monitor's minimum sleep interval in microseconds (**default: `10000`**). |
 | `PEAK_HB_MAX_US` | Sets the adaptive heartbeat monitor's maximum sleep interval in microseconds (**default: `500000`**). |
 | `PEAK_HB_K_ERR` | Controls adaptive heartbeat sensitivity to overhead target overshoot (**default: `3.0`**). |

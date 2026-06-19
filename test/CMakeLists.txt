@@ -147,6 +147,25 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 240
                 PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
+        add_test(NAME test_detach_hotloop_batch_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_benchmark/run_detach_hotloop_stress.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_benchmark/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 30
+                    --paired-targets
+                    --disable-reattach
+                    --peak-cost 0
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-batch-trace
+                    --require-detach-batch-size 2
+                    --fail-on-transition-skips)
+        set_tests_properties(test_detach_hotloop_batch_strict
+            PROPERTIES
+                TIMEOUT 45
+                PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
         add_test(NAME test_detach_hotloop_reattach_stress
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_benchmark/run_detach_hotloop_stress.py

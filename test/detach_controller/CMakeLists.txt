@@ -142,6 +142,24 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_fake_helper_shutdown_sequence
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>")
+
+  add_test(NAME test_detach_controller_fake_helper_batch_detach
+    COMMAND test_detach_controller fake-helper-batch-detach)
+  set_tests_properties(test_detach_controller_fake_helper_batch_detach
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
+  add_test(NAME test_detach_controller_fake_helper_batch_mixed
+    COMMAND test_detach_controller fake-helper-batch-mixed)
+  set_tests_properties(test_detach_controller_fake_helper_batch_mixed
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=blocked-pc")
+
+  add_test(NAME test_detach_controller_fake_helper_batch_reattach
+    COMMAND test_detach_controller fake-helper-batch-reattach)
+  set_tests_properties(test_detach_controller_fake_helper_batch_reattach
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
 endif()
 
 add_test(NAME test_detach_controller_invalid_request
