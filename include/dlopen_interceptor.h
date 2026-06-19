@@ -12,7 +12,6 @@
 #include "frida-gum.h"
 #include <dlfcn.h> 
 #include <unistd.h>
-#include <sys/syscall.h>
 
 /**
  * @brief Attaches the dlopen interceptor.
