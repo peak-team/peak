@@ -600,7 +600,8 @@ main(int argc, char** argv)
                 strcmp(scenario, "synthetic-stop-file-once") == 0 ||
                 strcmp(scenario, "evacuate-error") == 0 ||
                 strcmp(scenario, "evacuate-release-failed") == 0 ||
-                strcmp(scenario, "resume-release-failed") == 0) {
+                strcmp(scenario, "resume-release-failed") == 0 ||
+                strcmp(scenario, "shutdown-missing-response") == 0) {
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_OK,
                                     0,
@@ -697,6 +698,10 @@ main(int argc, char** argv)
             log_command(request.command == PEAK_DETACH_HELPER_CMD_RESUME
                             ? "RESUME"
                             : "SHUTDOWN");
+            if (request.command == PEAK_DETACH_HELPER_CMD_SHUTDOWN &&
+                strcmp(scenario, "shutdown-missing-response") == 0) {
+                return 0;
+            }
             if (request.command == PEAK_DETACH_HELPER_CMD_RESUME) {
                 resume_count++;
                 if (strcmp(scenario, "resume-release-failed") == 0 &&
