@@ -121,9 +121,9 @@ The external helper provides thread control and PC classification:
 6. revalidate immediately before applying EVACUATE writes so any thread that
    appeared during the STOP/response window is caught before code bytes change;
 7. report whether the process is safe for controller detach;
-8. resume all stopped threads after ordinary mutations, or send an explicit
-   `SHUTDOWN` command that detaches tracees and exits the helper for final hook
-   shutdown. Helper protocol writes suppress `SIGPIPE` so a closed controller
+8. resume all stopped threads after ordinary mutations, and after final hook
+   shutdown send an explicit idle `SHUTDOWN` command that tells the helper to
+   exit. Helper protocol writes suppress `SIGPIPE` so a closed controller
    socket cannot kill the helper before its held-thread cleanup path runs.
 
 The helper should not call Gum APIs directly. Gum mutation remains in-process so
@@ -356,12 +356,16 @@ controller finishes the helper guard, resuming threads
 For final shutdown detach, PEAK restores original bytes under the helper guard
 and releases each hook-level stop with `RESUME`. After every hook has finished
 its Gum bookkeeping teardown, PEAK sends one helper `SHUTDOWN` command. The
-helper detaches any held tracees, reports status, and exits; any missing response
-or failed detach is fatal in strict mode because PEAK cannot prove the target's
-thread state. Gum bookkeeping detach for target hooks happens before the
-per-hook helper `finish` releases stopped threads; the final Gum flush happens
-after all hook-level shutdown guards have completed. This keeps Gum metadata
-mutation inside the same audited stop window as the physical entry-byte restore.
+helper detaches any idle tracee handles, reports status, and exits. A missing
+idle `SHUTDOWN` response fails closed: public teardown returns false and leaves
+listener-owned PEAK state alive so an unproven helper teardown cannot race a
+late Gum trampoline callback. By contrast, any helper release/resume failure
+after a STOP window or byte/register mutation is fatal in strict mode because
+PEAK cannot prove the target's thread state. Gum bookkeeping detach for target
+hooks happens before the per-hook helper `finish` releases stopped threads; the
+final Gum flush happens after all hook-level shutdown guards have completed.
+This keeps Gum metadata mutation inside the same audited stop window as the
+physical entry-byte restore.
 
 Steady-state detach/reattach prepare failures that return `TIMEOUT`,
 `CLASSIFY_FAILED`, or a recoverable helper `ERROR` keep the requested transition
@@ -399,7 +403,10 @@ Rules:
   implementation uses `gum_interceptor_flush()` for shutdown teardown.
 - Final shutdown sets all hooks to `PEAK_HOOK_SHUTDOWN`, restores target bytes
   physically under helper control, performs any still-needed Gum bookkeeping
-  detach after helper release, flushes Gum teardown, then frees PEAK state.
+  detach before helper release, sends the final idle helper `SHUTDOWN`, flushes
+  Gum teardown, then frees PEAK state. If bounded shutdown safety cannot be
+  proven before Gum mutation, or if the idle helper `SHUTDOWN` cannot be proven,
+  teardown fails closed and leaves callback-reachable state allocated.
 - Memory-profiling teardown first atomically blocks new malloc/free tracking,
   reverts and flushes the malloc Gum patches, waits for active allocator hooks
   to leave, and only then frees tracking tables and finalizes the mmap log.
@@ -570,7 +577,8 @@ Completed in this branch:
    through the strict controller guard.
 8. Made strict helper release failures fatal after any STOP window, added a
    `RELEASE_FAILED` helper status for unproven STOP cleanup, and sends one
-   explicit helper `SHUTDOWN` after final shutdown mutations are complete.
+   explicit idle helper `SHUTDOWN` after final shutdown mutations are complete;
+   an unproven idle `SHUTDOWN` fails closed by retaining listener state.
 9. Ordered malloc profiling detach after target-controller stop and before
    `dlopen`/Gum teardown, avoiding overlap with target mutations without
    profiling PEAK's own initialization or Gum teardown allocations.

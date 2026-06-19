@@ -3,6 +3,17 @@ add_executable(test_detach_controller
   ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
 )
 add_executable(test_detach_fake_helper test_detach_fake_helper.c)
+add_executable(test_detach_shutdown_preload test_detach_shutdown_preload.c)
+if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  add_executable(test_detach_listener_shutdown
+    test_detach_listener_shutdown.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener.c
+    ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
+    ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
+    $<TARGET_OBJECTS:utils_c>
+    $<TARGET_OBJECTS:utils_cxx>
+  )
+endif()
 
 target_include_directories(test_detach_fake_helper
   PRIVATE
@@ -18,6 +29,20 @@ target_include_directories(test_detach_controller
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   target_compile_definitions(test_detach_controller PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
 endif()
+if(TARGET test_detach_listener_shutdown)
+  target_include_directories(test_detach_listener_shutdown
+    PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+      ${FRIDA_GUM_INCLUDE_DIRS}
+  )
+  target_compile_definitions(test_detach_listener_shutdown
+    PRIVATE
+      PEAK_HAVE_GUM_PEAK_PC_API=1
+      PEAK_ENABLE_TEST_HOOKS=1)
+endif()
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+  target_link_options(test_detach_shutdown_preload PRIVATE -Wl,--export-dynamic)
+endif()
 
 target_link_libraries(test_detach_controller
   PRIVATE
@@ -28,6 +53,19 @@ target_link_libraries(test_detach_controller
     ${RESOLV_LIBRARY}
     ${M_LIBRARY}
 )
+if(TARGET test_detach_listener_shutdown)
+  target_link_libraries(test_detach_listener_shutdown
+    PRIVATE
+      ${FRIDA_GUM_LIBRARIES}
+      Threads::Threads
+      ${DL_LIBRARY}
+      ${RT_LIBRARY}
+      ${RESOLV_LIBRARY}
+      ${M_LIBRARY}
+      ${LIBIBERTY_LIB}
+  )
+  target_link_options(test_detach_listener_shutdown PRIVATE -Wl,--export-dynamic)
+endif()
 
 if(TARGET peak_detach_helper)
   add_custom_command(TARGET test_detach_controller POST_BUILD
@@ -100,6 +138,17 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
 endif()
 
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  function(add_fatal_safe_detach_test test_name test_arg fake_scenario)
+    add_test(NAME ${test_name}
+      COMMAND ${CMAKE_COMMAND}
+              -DTEST_EXECUTABLE=$<TARGET_FILE:test_detach_controller>
+              -DTEST_ARG=${test_arg}
+              -DHELPER_EXECUTABLE=$<TARGET_FILE:test_detach_fake_helper>
+              -DFAKE_SCENARIO=${fake_scenario}
+              ${ARGN}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/assert_fatal_failure.cmake)
+  endfunction()
+
   add_test(NAME test_detach_controller_batch_guards
     COMMAND test_detach_controller batch-guards)
   set_tests_properties(test_detach_controller_batch_guards
@@ -138,12 +187,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
         ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_fake_scenario}")
   endforeach()
 
-  add_test(NAME test_detach_controller_fake_helper_stop-release-failed
-    COMMAND test_detach_controller fake-helper-fail-closed)
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_stop-release-failed
+    fake-helper-fail-closed
+    stop-release-failed
+    -DEXPECTED_FATAL_DETAIL=stop.cleanup.failure)
   set_tests_properties(test_detach_controller_fake_helper_stop-release-failed
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=stop-release-failed"
-      WILL_FAIL TRUE)
+      LABELS "strict-detach-fatal")
 
   add_test(NAME test_detach_controller_fake_helper_evacuate-error
     COMMAND test_detach_controller fake-helper-fail-closed)
@@ -151,21 +202,17 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=evacuate-error")
 
-  foreach(_fake_scenario IN ITEMS evacuate-release-failed)
-    add_test(NAME test_detach_controller_fake_helper_${_fake_scenario}
-      COMMAND test_detach_controller fake-helper-fail-closed)
-    set_tests_properties(test_detach_controller_fake_helper_${_fake_scenario}
-      PROPERTIES
-        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_fake_scenario}"
-        WILL_FAIL TRUE)
-  endforeach()
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_evacuate-release-failed
+    fake-helper-fail-closed
+    evacuate-release-failed
+    -DEXPECTED_FATAL_DETAIL=stop.cleanup.failure)
 
-  add_test(NAME test_detach_controller_fake_helper_resume-release-failed
-    COMMAND test_detach_controller strict-helper-empty)
-  set_tests_properties(test_detach_controller_fake_helper_resume-release-failed
-    PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=resume-release-failed"
-      WILL_FAIL TRUE)
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_resume-release-failed
+    strict-helper-empty
+    resume-release-failed
+    -DEXPECTED_FATAL_DETAIL=stop.cleanup.failure)
 
   add_test(NAME test_detach_controller_fake_helper_shutdown_sequence
     COMMAND test_detach_controller fake-helper-shutdown-sequence)
@@ -179,12 +226,11 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
 
-  add_test(NAME test_detach_controller_fake_helper_batch_detach_resume-release-failed
-    COMMAND test_detach_controller fake-helper-batch-detach)
-  set_tests_properties(test_detach_controller_fake_helper_batch_detach_resume-release-failed
-    PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=resume-release-failed"
-      WILL_FAIL TRUE)
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_batch_detach_resume-release-failed
+    fake-helper-batch-detach
+    resume-release-failed
+    -DEXPECTED_FATAL_DETAIL=stop.cleanup.failure)
 
   add_test(NAME test_detach_controller_fake_helper_batch_abort_rollback
     COMMAND test_detach_controller fake-helper-batch-abort-rollback)
@@ -210,12 +256,33 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
 
-  add_test(NAME test_detach_controller_fake_helper_batch_reattach_resume-release-failed
-    COMMAND test_detach_controller fake-helper-batch-reattach)
-  set_tests_properties(test_detach_controller_fake_helper_batch_reattach_resume-release-failed
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_batch_reattach_resume-release-failed
+    fake-helper-batch-reattach
+    resume-release-failed
+    -DFAIL_RESUME_INDEX=2
+    -DEXPECTED_FATAL_DETAIL=stop.cleanup.failure)
+
+  add_test(NAME test_detach_controller_general_listener_shutdown_prepare_fail_closed
+    COMMAND test_detach_listener_shutdown general-listener-shutdown-prepare-fail-closed)
+  set_tests_properties(test_detach_controller_general_listener_shutdown_prepare_fail_closed
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=resume-release-failed;FAKE_DETACH_HELPER_FAIL_RESUME_INDEX=2"
-      WILL_FAIL TRUE)
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero"
+      PASS_REGULAR_EXPRESSION "general-listener-shutdown-prepare-fail-closed-ok")
+
+  add_test(NAME test_detach_controller_general_listener_idle_shutdown_io_fail_closed
+    COMMAND test_detach_listener_shutdown general-listener-idle-shutdown-io-fail-closed)
+  set_tests_properties(test_detach_controller_general_listener_idle_shutdown_io_fail_closed
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response"
+      PASS_REGULAR_EXPRESSION "general-listener-idle-shutdown-io-fail-closed-ok")
+
+  add_test(NAME test_detach_controller_preload_idle_shutdown_io_fail_closed
+    COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXECUTABLE=$<TARGET_FILE:test_detach_shutdown_preload>
+            -DPEAK_LIBRARY=$<TARGET_FILE:peak>
+            -DHELPER_EXECUTABLE=$<TARGET_FILE:test_detach_fake_helper>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/assert_preload_shutdown_fail_closed.cmake)
 endif()
 
 add_test(NAME test_detach_controller_invalid_request

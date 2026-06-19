@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
@@ -74,8 +75,73 @@ typedef struct {
     double pending_age_s;
 } PeakGeneralBatchCandidate;
 
+typedef enum {
+    PEAK_GENERAL_SHUTDOWN_FAILURE_NONE = 0,
+    PEAK_GENERAL_SHUTDOWN_FAILURE_PREPARE,
+    PEAK_GENERAL_SHUTDOWN_FAILURE_SNAPSHOT_UNSAFE,
+    PEAK_GENERAL_SHUTDOWN_FAILURE_PAUSE_FAILED
+} PeakGeneralShutdownFailureBucket;
+
+typedef struct {
+    PeakGeneralShutdownFailureBucket bucket;
+    PeakDetachStatus status;
+} PeakGeneralShutdownFailure;
+
 static double peak_general_controller_pending_age_for_trace_unlocked(size_t hook_id,
                                                                      double now);
+
+static unsigned int
+peak_general_controller_shutdown_drain_ms(void)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* value = g_getenv("PEAK_TEST_CONTROLLER_SHUTDOWN_DRAIN_MS");
+
+    if (value != NULL && value[0] != '\0') {
+        char* end = NULL;
+        unsigned long parsed = strtoul(value, &end, 10);
+
+        if (end != value && *end == '\0' && parsed <= G_MAXUINT) {
+            return (unsigned int)parsed;
+        }
+    }
+#endif
+
+    return peak_controller_shutdown_drain_ms;
+}
+
+static void
+peak_general_shutdown_failure_note(PeakGeneralShutdownFailure* failure,
+                                   PeakGeneralShutdownFailureBucket bucket,
+                                   PeakDetachStatus status)
+{
+    if (failure == NULL) {
+        return;
+    }
+
+    failure->bucket = bucket;
+    failure->status = status;
+}
+
+static const char*
+peak_general_shutdown_failure_bucket_string(
+    const PeakGeneralShutdownFailure* failure)
+{
+    if (failure == NULL) {
+        return "unknown";
+    }
+
+    switch (failure->bucket) {
+        case PEAK_GENERAL_SHUTDOWN_FAILURE_PREPARE:
+            return "prepare-exhausted";
+        case PEAK_GENERAL_SHUTDOWN_FAILURE_SNAPSHOT_UNSAFE:
+            return "snapshot-unsafe";
+        case PEAK_GENERAL_SHUTDOWN_FAILURE_PAUSE_FAILED:
+            return "pause-failed";
+        case PEAK_GENERAL_SHUTDOWN_FAILURE_NONE:
+        default:
+            return "unknown";
+    }
+}
 
 void peak_general_listener_controller_lock(void)
 {
@@ -1206,7 +1272,8 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                                                                int* pause_session_ids,
                                                                int* pause_status,
                                                                size_t snapshot_count,
-                                                               gboolean snapshot_complete)
+                                                               gboolean snapshot_complete,
+                                                               PeakGeneralShutdownFailure* failure)
 {
     if (!peak_general_hook_is_published_unlocked(hook_id)) {
         peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_SHUTDOWN);
@@ -1221,6 +1288,10 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                                                            array_listener[hook_id],
                                                            PEAK_DETACH_OPERATION_SHUTDOWN,
                                                            &prepare_status)) {
+            peak_general_shutdown_failure_note(
+                failure,
+                PEAK_GENERAL_SHUTDOWN_FAILURE_PREPARE,
+                prepare_status);
             return FALSE;
         }
         gboolean helper_applied_physical_patch =
@@ -1238,6 +1309,10 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                 peak_detach_controller_abort_after_failed_finish("detached shutdown snapshot abort",
                                                                 finish_status);
             }
+            peak_general_shutdown_failure_note(
+                failure,
+                PEAK_GENERAL_SHUTDOWN_FAILURE_SNAPSHOT_UNSAFE,
+                PEAK_DETACH_STATUS_CLASSIFY_FAILED);
             peak_general_controller_trace_mutation(hook_id,
                                                    PEAK_DETACH_OPERATION_SHUTDOWN,
                                                    "snapshot-unsafe",
@@ -1271,6 +1346,10 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                                                            array_listener[hook_id],
                                                            PEAK_DETACH_OPERATION_SHUTDOWN,
                                                            &prepare_status)) {
+            peak_general_shutdown_failure_note(
+                failure,
+                PEAK_GENERAL_SHUTDOWN_FAILURE_PREPARE,
+                prepare_status);
             return FALSE;
         }
         gboolean helper_holds_threads = peak_detach_controller_threads_are_held();
@@ -1290,6 +1369,10 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                 peak_detach_controller_abort_after_failed_finish("shutdown snapshot abort",
                                                                 finish_status);
             }
+            peak_general_shutdown_failure_note(
+                failure,
+                PEAK_GENERAL_SHUTDOWN_FAILURE_SNAPSHOT_UNSAFE,
+                PEAK_DETACH_STATUS_CLASSIFY_FAILED);
             peak_general_controller_trace_mutation(hook_id,
                                                    PEAK_DETACH_OPERATION_SHUTDOWN,
                                                    "snapshot-unsafe",
@@ -1315,6 +1398,10 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
                 peak_detach_controller_abort_after_failed_finish("shutdown pause abort",
                                                                 finish_status);
             }
+            peak_general_shutdown_failure_note(
+                failure,
+                PEAK_GENERAL_SHUTDOWN_FAILURE_PAUSE_FAILED,
+                PEAK_DETACH_STATUS_ERROR);
             peak_general_controller_trace_mutation(hook_id,
                                                    PEAK_DETACH_OPERATION_SHUTDOWN,
                                                    "pause-failed",
@@ -1890,8 +1977,10 @@ peak_general_listener_controller_stop(void)
 {
     gboolean should_join;
     pthread_t thread;
+    unsigned int shutdown_drain_ms =
+        peak_general_controller_shutdown_drain_ms();
 
-    if (!peak_general_listener_controller_drain(peak_controller_shutdown_drain_ms)) {
+    if (!peak_general_listener_controller_drain(shutdown_drain_ms)) {
         g_printerr("[peak] timed out draining pending target hook detach/reattach requests before controller shutdown\n");
     }
 
@@ -3163,8 +3252,14 @@ gboolean peak_general_listener_dettach()
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
             gboolean shutdown_ok = FALSE;
+            unsigned int shutdown_attempts = 0;
+            PeakGeneralShutdownFailure shutdown_failure = {
+                .bucket = PEAK_GENERAL_SHUTDOWN_FAILURE_NONE,
+                .status = PEAK_DETACH_STATUS_ERROR
+            };
             double deadline = peak_second() +
-                              ((double)peak_controller_shutdown_drain_ms / 1000.0);
+                              ((double)peak_general_controller_shutdown_drain_ms() /
+                               1000.0);
 
             do {
                 gboolean snapshot_complete = FALSE;
@@ -3178,6 +3273,7 @@ gboolean peak_general_listener_dettach()
                     pause_status[s] = -1;
                 }
 
+                shutdown_attempts++;
                 shutdown_ok = peak_general_controller_shutdown_hook_unlocked(
                     i,
                     controller_tid,
@@ -3186,7 +3282,8 @@ gboolean peak_general_listener_dettach()
                     pause_session_ids,
                     pause_status,
                     snapshot_count,
-                    snapshot_complete);
+                    snapshot_complete,
+                    &shutdown_failure);
                 if (shutdown_ok) {
                     break;
                 }
@@ -3202,7 +3299,12 @@ gboolean peak_general_listener_dettach()
                 g_free(pause_session_ids);
                 g_free(mapped_ids);
                 g_free(tid_keys);
-                g_printerr("[peak] Gum shutdown detach was not proven safe; leaving listener state alive\n");
+                g_printerr("[peak] Gum shutdown detach was not proven safe; bucket=%s status=%s attempts=%u; leaving listener state alive\n",
+                           peak_general_shutdown_failure_bucket_string(
+                               &shutdown_failure),
+                           peak_detach_controller_status_string(
+                               shutdown_failure.status),
+                           shutdown_attempts);
                 return FALSE;
             }
         }

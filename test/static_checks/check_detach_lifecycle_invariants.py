@@ -183,6 +183,33 @@ def check_dlopen_test_hook_visibility(repo_root):
             "PEAK_ENABLE_TEST_HOOKS must be private to libpeak test builds")
 
 
+def check_shutdown_fail_closed_docs(repo_root):
+    docs = (repo_root / "docs/physical-detach-controller.md").read_text(
+        encoding="utf-8"
+    )
+    general = (repo_root / "src/general_listener.c").read_text(
+        encoding="utf-8"
+    )
+    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+        encoding="utf-8"
+    )
+
+    require("A missing\nidle `SHUTDOWN` response fails closed" in docs,
+            "shutdown docs must describe idle SHUTDOWN fail-closed retention")
+    require("helper release/resume failure\nafter a STOP window" in docs,
+            "shutdown docs must keep post-mutation release failure fatal")
+    require("missing response\nor failed detach is fatal" not in docs,
+            "shutdown docs still describe idle SHUTDOWN failure as fatal")
+    require("bucket=%s status=%s attempts=%u; leaving listener state alive"
+            in general,
+            "shutdown fail-closed log must include bucket/status/attempts")
+    require("detach helper shutdown failed: %s; leaving listener state alive"
+            in general,
+            "idle helper shutdown failure must retain listener state")
+    require("detach helper was unavailable during idle shutdown" in controller,
+            "controller must identify idle helper shutdown failure separately")
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: check_detach_lifecycle_invariants.py <repo-root>",
@@ -196,6 +223,7 @@ def main():
     check_stop_window_trace_gating(repo_root)
     check_general_controller_dlopen_drain_order(repo_root)
     check_dlopen_test_hook_visibility(repo_root)
+    check_shutdown_fail_closed_docs(repo_root)
     print("detach_lifecycle_invariants_ok")
     return 0
 

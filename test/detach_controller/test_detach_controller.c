@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -2269,7 +2270,6 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "fake-helper-fail-closed") == 0) {
         return run_fake_helper_fail_closed();
     }
-
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return EXIT_FAILURE;
 }
