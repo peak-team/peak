@@ -373,13 +373,18 @@ by leaving listener state alive if safety still cannot be proven.
 `PEAK_DETACH_TRACE_PATH` records transition rows for offline diagnosis. The base
 columns are `time,hook_id,symbol,operation,result,physical,status`; strict
 batching extends each row with `retry_count`, `pending_age_s`, `batch_size`,
-`stop_window_us`, and `batch_id`. The first seven fields are stable; parsers
-should treat the tail fields as optional diagnostics. `stop_window_us` is the
-measured helper-held STOP window when available, otherwise `0`; `batch_id` is a
+`stop_window_us`, `batch_id`, and `last_retry_status`. The first seven fields
+are stable; parsers should treat every tail field as optional diagnostics and
+accept older rows that stop after `batch_id`. `last_retry_status` records the
+most recent retryable controller status for the hook, so a successful
+after-retry row can keep `status=safe` while still reporting the pre-reset retry
+reason such as `classify-failed`. `stop_window_us` is the measured helper-held
+STOP window when trace diagnostics are enabled, otherwise `0`; `batch_id` is a
 nonzero identifier shared by all rows emitted from one controller batch and `0`
-for single-row paths. These extra fields are gathered only when tracing is
-enabled and should not be treated as part of PEAK's default per-call overhead
-model without separate analysis.
+for single-row paths. STOP-window timing is collected only for
+`PEAK_DETACH_TRACE_PATH` diagnostics. Existing hot-callback timing remains part
+of the legacy overhead/profiling model and is separate from this STOP-window
+diagnostic path.
 
 ## Memory Lifetime
 
@@ -515,7 +520,10 @@ reattach, and mixed safe/unsafe batches. The mixed case verifies that one unsafe
 candidate remains retryable while another independent candidate completes in the
 same STOP window. The helper failure tests still cover permission denial,
 timeout, malformed snapshots, evacuation errors, and release failures so the
-fatal-after-mutation boundary stays explicit.
+fatal-after-mutation boundary stays explicit. A trace-disabled fake-helper
+runtime test also runs strict detach and reattach prepare/finish with
+`PEAK_DETACH_TRACE_PATH` unset and asserts `last_stop_window_us == 0`, proving
+STOP-window timing is not gathered for the default runtime path.
 Additional fake-helper Gum-PC corridor tests force STOP snapshots at real
 diagnostic PCs from an attached hook. They prove the exact
 `on_enter_trampoline` label sends `SET_PC(function_address)` for the stopped
@@ -530,7 +538,10 @@ for interior enter trampoline, leave trampoline, invoke trampoline, and enter
 thunk PCs through the general listener: the hook stays `DETACH_REQUESTED` with a
 retryable `prepare-failed,classify-failed` trace row, the first failed STOP window
 logs no `EVACUATE`, and the later retry drains once the fake helper returns a
-safe empty snapshot.
+safe empty snapshot. A focused reattach retry integration test first detaches a
+target, injects a one-shot unsupported-PC reattach failure, and then verifies the
+successful reattach trace row preserves the pre-reset `retry_count` and
+`last_retry_status=classify-failed` diagnostics.
 
 The hot-loop integration test has a paired-target mode that drives two exported
 target symbols in the same worker loop. Its strict trace assertion requires both
@@ -637,6 +648,9 @@ Completed in this branch:
     thunk PCs; the integrated test now checks helper command logs before and
     after retry so failed unsupported-PC attempts prove they avoided
     `EVACUATE`.
+34. Added trace-disabled runtime coverage for fake-helper strict detach and
+    reattach STOP windows, and added reattach success-after-retry trace coverage
+    proving `retry_count` and `last_retry_status` survive until the success row.
 
 Remaining work:
 

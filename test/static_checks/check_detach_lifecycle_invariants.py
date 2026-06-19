@@ -97,6 +97,37 @@ def check_dlopen_revert_transactions(repo_root):
                 "dlopen revert is missing nearby end_transaction")
 
 
+def check_stop_window_trace_gating(repo_root):
+    source = (repo_root / "src/peak_detach_controller.c").read_text(
+        encoding="utf-8"
+    )
+    gate = extract_function(
+        source, "peak_detach_controller_trace_diagnostics_enabled"
+    )
+    started = extract_function(
+        source, "peak_detach_controller_note_stop_window_started"
+    )
+    finished = extract_function(
+        source, "peak_detach_controller_note_stop_window_finished"
+    )
+    last_window = extract_function(
+        source, "peak_detach_controller_last_stop_window_us"
+    )
+
+    require("PEAK_DETACH_TRACE_PATH" in gate,
+            "STOP-window diagnostics must be gated by PEAK_DETACH_TRACE_PATH")
+    for label, body in (("start", started), ("finish", finished)):
+        require("peak_detach_controller_trace_diagnostics_enabled()" in body,
+                f"STOP-window {label} helper must check trace diagnostics")
+        require("last_stop_window_us = 0.0" in body,
+                f"STOP-window {label} helper must clear timing when disabled")
+    require("return 0.0;" in last_window,
+            "last_stop_window_us must return zero when diagnostics are disabled")
+    require(last_window.find("return 0.0;") <
+            last_window.find("peak_detach_controller_lock_mutation_guard"),
+            "last_stop_window_us must gate before reading stored timing")
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: check_detach_lifecycle_invariants.py <repo-root>",
@@ -107,6 +138,7 @@ def main():
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
     check_dlopen_revert_transactions(repo_root)
+    check_stop_window_trace_gating(repo_root)
     print("detach_lifecycle_invariants_ok")
     return 0
 

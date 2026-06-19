@@ -35,6 +35,18 @@ check_int(const char* label, int actual, int expected)
 }
 
 static void
+check_double_zero(const char* label, double actual)
+{
+    if (actual != 0.0) {
+        fprintf(stderr,
+                "FAIL: %s: expected 0.0, got %.9f\n",
+                label,
+                actual);
+        failures++;
+    }
+}
+
+static void
 check_status(const char* label,
              PeakDetachStatus actual,
              PeakDetachStatus expected)
@@ -723,6 +735,97 @@ run_strict_helper_empty(void)
     gum_deinit_embedded();
     worker_running = 0;
     pthread_join(worker, NULL);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_fake_helper_trace_disabled_stop_window(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr,
+            "fake-helper-trace-disabled-stop-window requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_trace_disabled_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (set_fake_helper_env_default("success-zero", log_template) != 0 ||
+        unsetenv("PEAK_DETACH_TRACE_PATH") != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    check_true("trace-disabled Gum attach", attach_status == GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+
+    PeakDetachRequest request = {
+        .hook_id = 29,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("trace-disabled detach prepare",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("trace-disabled detach physical",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_double_zero("trace-disabled detach prepare stop window",
+                      peak_detach_controller_last_stop_window_us());
+    check_finish("trace-disabled detach finish", &request, PEAK_DETACH_STATUS_SAFE);
+    check_double_zero("trace-disabled detach finish stop window",
+                      peak_detach_controller_last_stop_window_us());
+
+    request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    check_prepare("trace-disabled reattach prepare",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("trace-disabled reattach physical",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_double_zero("trace-disabled reattach prepare stop window",
+                      peak_detach_controller_last_stop_window_us());
+    check_finish("trace-disabled reattach finish", &request, PEAK_DETACH_STATUS_SAFE);
+    check_double_zero("trace-disabled reattach finish stop window",
+                      peak_detach_controller_last_stop_window_us());
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    check_true("trace-disabled helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+    check_status("trace-disabled helper shutdown status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 #endif
 }
@@ -2116,7 +2219,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-fail-closed\n",
+                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-fail-closed\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -2132,6 +2235,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "strict-helper-stale-caller") == 0) {
         return run_strict_helper_stale_caller();
+    }
+    if (strcmp(argv[1], "fake-helper-trace-disabled-stop-window") == 0) {
+        return run_fake_helper_trace_disabled_stop_window();
     }
     if (strcmp(argv[1], "fake-helper-shutdown-sequence") == 0) {
         return run_fake_helper_shutdown_sequence();
