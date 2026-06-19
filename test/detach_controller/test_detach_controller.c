@@ -1,0 +1,967 @@
+#include "peak_detach_controller.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+static int failures = 0;
+
+static void
+check_true(const char* label, int condition)
+{
+    if (!condition) {
+        fprintf(stderr, "FAIL: %s\n", label);
+        failures++;
+    }
+}
+
+static void
+check_int(const char* label, int actual, int expected)
+{
+    if (actual != expected) {
+        fprintf(stderr,
+                "FAIL: %s: expected %d, got %d\n",
+                label,
+                expected,
+                actual);
+        failures++;
+    }
+}
+
+static void
+check_string(const char* label, const char* actual, const char* expected)
+{
+    if (strcmp(actual, expected) != 0) {
+        fprintf(stderr,
+                "FAIL: %s: expected '%s', got '%s'\n",
+                label,
+                expected,
+                actual);
+        failures++;
+    }
+}
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static int
+count_proc_threads(void)
+{
+    DIR* dir = opendir("/proc/self/task");
+    int count = 0;
+
+    if (dir == NULL) {
+        return -1;
+    }
+
+    for (;;) {
+        struct dirent* entry;
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            break;
+        }
+        if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+            count++;
+        }
+    }
+
+    if (errno != 0) {
+        count = -1;
+    }
+    closedir(dir);
+    return count;
+}
+#endif
+
+static PeakDetachRequest
+valid_request(PeakDetachOperation operation)
+{
+    PeakDetachRequest request = {
+        .hook_id = 7,
+        .symbol_name = "test_symbol",
+        .function_address = (gpointer)0x1,
+        .interceptor = (GumInterceptor*)0x2,
+        .listener = (operation == PEAK_DETACH_OPERATION_ATTACH ||
+                     operation == PEAK_DETACH_OPERATION_REPLACE ||
+                     operation == PEAK_DETACH_OPERATION_REVERT)
+                        ? NULL
+                        : (GumInvocationListener*)0x3,
+        .operation = operation
+    };
+    return request;
+}
+
+static PeakDetachStatus
+expected_unavailable_strict_status(PeakDetachOperation operation)
+{
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    (void)operation;
+    return PEAK_DETACH_STATUS_UNSUPPORTED;
+#else
+    (void)operation;
+    return PEAK_DETACH_STATUS_MISSING_GUM_API;
+#endif
+}
+
+static void
+check_prepare(const char* label,
+              const PeakDetachRequest* request,
+              gboolean expected_prepared,
+              PeakDetachStatus expected_status)
+{
+    PeakDetachStatus status = PEAK_DETACH_STATUS_SAFE;
+    gboolean prepared =
+        peak_detach_controller_prepare_hook_mutation(request, &status);
+
+    check_true(label, prepared == expected_prepared);
+    if (status != expected_status) {
+        fprintf(stderr,
+                "FAIL: %s status: expected %s, got %s\n",
+                label,
+                peak_detach_controller_status_string(expected_status),
+                peak_detach_controller_status_string(status));
+        failures++;
+    }
+}
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static void
+check_finish(const char* label,
+             const PeakDetachRequest* request,
+             PeakDetachStatus expected_status)
+{
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    gboolean finished =
+        peak_detach_controller_finish_hook_mutation(request, &status);
+
+    check_true(label, finished == TRUE);
+    if (status != expected_status) {
+        fprintf(stderr,
+                "FAIL: %s finish status: expected %s, got %s\n",
+                label,
+                peak_detach_controller_status_string(expected_status),
+                peak_detach_controller_status_string(status));
+        failures++;
+    }
+}
+#endif
+
+static void
+check_string_tables(void)
+{
+    check_string("operation attach",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_ATTACH),
+                 "attach");
+    check_string("operation detach",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_DETACH),
+                 "detach");
+    check_string("operation reattach",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_REATTACH),
+                 "reattach");
+    check_string("operation shutdown",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_SHUTDOWN),
+                 "shutdown");
+    check_string("operation replace",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_REPLACE),
+                 "replace");
+    check_string("operation revert",
+                 peak_detach_controller_operation_string(PEAK_DETACH_OPERATION_REVERT),
+                 "revert");
+    check_string("operation unknown",
+                 peak_detach_controller_operation_string((PeakDetachOperation)999),
+                 "unknown");
+
+    check_string("status safe",
+                 peak_detach_controller_status_string(PEAK_DETACH_STATUS_SAFE),
+                 "safe");
+    check_string("status compatibility",
+                 peak_detach_controller_status_string(
+                     PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED),
+                 "compatibility-allowed");
+    check_string("status missing gum api",
+                 peak_detach_controller_status_string(
+                     PEAK_DETACH_STATUS_MISSING_GUM_API),
+                 "missing-gum-api");
+    check_string("status unsupported",
+                 peak_detach_controller_status_string(PEAK_DETACH_STATUS_UNSUPPORTED),
+                 "unsupported");
+    check_string("status unknown",
+                 peak_detach_controller_status_string((PeakDetachStatus)999),
+                 "unknown");
+}
+
+static int
+run_compatibility(void)
+{
+    PeakDetachOperation operations[] = {
+        PEAK_DETACH_OPERATION_ATTACH,
+        PEAK_DETACH_OPERATION_DETACH,
+        PEAK_DETACH_OPERATION_REATTACH,
+        PEAK_DETACH_OPERATION_SHUTDOWN,
+        PEAK_DETACH_OPERATION_REPLACE,
+        PEAK_DETACH_OPERATION_REVERT
+    };
+
+    check_string_tables();
+    for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+        PeakDetachRequest request = valid_request(operations[i]);
+        check_prepare(peak_detach_controller_operation_string(operations[i]),
+                      &request,
+                      TRUE,
+                      PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
+    }
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
+run_strict(void)
+{
+    PeakDetachOperation operations[] = {
+        PEAK_DETACH_OPERATION_ATTACH,
+        PEAK_DETACH_OPERATION_DETACH,
+        PEAK_DETACH_OPERATION_REATTACH,
+        PEAK_DETACH_OPERATION_SHUTDOWN,
+        PEAK_DETACH_OPERATION_REPLACE,
+        PEAK_DETACH_OPERATION_REVERT
+    };
+    for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
+        PeakDetachRequest request = valid_request(operations[i]);
+        PeakDetachStatus expected_status =
+            expected_unavailable_strict_status(operations[i]);
+
+        check_prepare(peak_detach_controller_operation_string(operations[i]),
+                      &request,
+                      FALSE,
+                      expected_status);
+    }
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static volatile int worker_running = 0;
+static pthread_mutex_t stale_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t stale_worker_cond = PTHREAD_COND_INITIALIZER;
+static int stale_worker_parked = 0;
+static int stale_worker_release = 0;
+static int stale_worker_calls = 0;
+static int stale_worker_warmup_calls = 1024;
+
+__attribute__((noinline, noclone))
+static void
+strict_helper_target(void)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    asm volatile(
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t" ::: "memory");
+#else
+    asm volatile("" ::: "memory");
+#endif
+}
+
+__attribute__((noinline, noclone))
+static void
+strict_helper_target_two(void)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    asm volatile(
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t"
+        "nop\n\t" ::: "memory");
+#else
+    asm volatile("" ::: "memory");
+#endif
+}
+
+static void*
+strict_helper_worker(void* arg)
+{
+    (void)arg;
+    worker_running = 1;
+    while (worker_running) {
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void*
+strict_helper_stale_worker(void* arg)
+{
+    (void)arg;
+
+    for (int i = 0; i < stale_worker_warmup_calls; i++) {
+        strict_helper_target();
+        stale_worker_calls++;
+    }
+
+    pthread_mutex_lock(&stale_worker_mutex);
+    stale_worker_parked = 1;
+    pthread_cond_broadcast(&stale_worker_cond);
+    while (!stale_worker_release) {
+        pthread_cond_wait(&stale_worker_cond, &stale_worker_mutex);
+    }
+    pthread_mutex_unlock(&stale_worker_mutex);
+    return NULL;
+}
+
+static void
+strict_helper_on_enter(GumInvocationContext* context, gpointer user_data)
+{
+    (void)context;
+    (void)user_data;
+}
+
+static void
+check_pc_state(const char* label,
+               GumInterceptor* interceptor,
+               GumInvocationListener* listener,
+               gpointer pc,
+               GumPeakPcState expected_state,
+               gpointer expected_safe_pc)
+{
+    GumPeakFunctionContext* ctx = NULL;
+    GumPeakPcState state = GUM_PEAK_PC_UNKNOWN;
+    gboolean classified =
+        gum_interceptor_peak_classify_pc(interceptor,
+                                         (gpointer)strict_helper_target,
+                                         listener,
+                                         pc,
+                                         &ctx,
+                                         &state);
+    char state_label[128];
+
+    snprintf(state_label, sizeof(state_label), "%s classify", label);
+    check_true(state_label, classified == TRUE);
+    snprintf(state_label, sizeof(state_label), "%s state", label);
+    check_true(state_label, state == expected_state);
+
+    gpointer safe_pc = gum_interceptor_peak_safe_pc(ctx, pc, state);
+    snprintf(state_label, sizeof(state_label), "%s safe pc", label);
+    check_true(state_label, safe_pc == expected_safe_pc);
+}
+
+static void
+check_strict_helper_pc_classification(GumInterceptor* interceptor,
+                                      GumInvocationListener* listener)
+{
+    GumPeakPcDiagnostics diagnostics;
+    gboolean got_diagnostics =
+        gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                                                (gpointer)strict_helper_target,
+                                                listener,
+                                                &diagnostics);
+
+    check_true("diagnostics available", got_diagnostics == TRUE);
+    if (!got_diagnostics) {
+        return;
+    }
+
+    check_true("diagnostics function address",
+               diagnostics.function_address == (gpointer)strict_helper_target);
+    check_true("diagnostics prologue length",
+               diagnostics.overwritten_prologue_len > 0 &&
+               diagnostics.overwritten_prologue_len <= GUM_PEAK_MAX_PROLOGUE_SIZE);
+    check_true("diagnostics trampoline slice",
+               diagnostics.trampoline_slice_start != NULL &&
+               diagnostics.trampoline_slice_size > 0);
+    check_true("diagnostics enter trampoline",
+               diagnostics.on_enter_trampoline != NULL);
+
+    check_pc_state("function entry",
+                   interceptor,
+                   listener,
+                   (gpointer)strict_helper_target,
+                   GUM_PEAK_PC_AT_PATCH_ENTRY,
+                   NULL);
+
+    check_pc_state("enter trampoline start",
+                   interceptor,
+                   listener,
+                   diagnostics.on_enter_trampoline,
+                   GUM_PEAK_PC_IN_ENTER_TRAMPOLINE,
+                   (gpointer)strict_helper_target);
+
+    if (diagnostics.on_leave_trampoline != NULL &&
+        (uintptr_t)diagnostics.on_leave_trampoline >
+            (uintptr_t)diagnostics.on_enter_trampoline) {
+        check_pc_state("enter trampoline interior",
+                       interceptor,
+                       listener,
+                       (gpointer)((guint8*)diagnostics.on_enter_trampoline + 1),
+                       GUM_PEAK_PC_IN_ENTER_TRAMPOLINE,
+                       NULL);
+
+        check_pc_state("leave trampoline start",
+                       interceptor,
+                       listener,
+                       diagnostics.on_leave_trampoline,
+                       GUM_PEAK_PC_IN_LEAVE_TRAMPOLINE,
+                       NULL);
+    }
+
+    if (diagnostics.on_invoke_trampoline != NULL) {
+        check_pc_state("invoke trampoline start",
+                       interceptor,
+                       listener,
+                       diagnostics.on_invoke_trampoline,
+                       GUM_PEAK_PC_IN_INVOKE_TRAMPOLINE,
+                       NULL);
+    }
+
+    if (diagnostics.enter_thunk_start != NULL &&
+        diagnostics.enter_thunk_size > 0) {
+        check_pc_state("shared enter thunk",
+                       interceptor,
+                       listener,
+                       diagnostics.enter_thunk_start,
+                       GUM_PEAK_PC_IN_DISPATCH,
+                       NULL);
+    }
+}
+#endif
+
+static int
+count_helper_log_entry(const char* path, const char* entry)
+{
+    FILE* fp = fopen(path, "r");
+    char line[128];
+    int count = 0;
+
+    if (fp == NULL) {
+        fprintf(stderr, "FAIL: open helper log %s: %s\n", path, strerror(errno));
+        failures++;
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, entry) == 0) {
+            count++;
+        }
+    }
+
+    fclose(fp);
+    return count;
+}
+
+static void
+check_helper_log_count(const char* path,
+                       const char* entry,
+                       int expected_count)
+{
+    char label[160];
+    int actual_count = count_helper_log_entry(path, entry);
+
+    snprintf(label, sizeof(label), "helper log %s", entry);
+    check_int(label, actual_count, expected_count);
+}
+
+static int
+run_strict_helper_empty(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "strict-helper-empty requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    pthread_t worker;
+    int thread_count;
+
+    if (pthread_create(&worker, NULL, strict_helper_worker, NULL) != 0) {
+        perror("pthread_create");
+        return EXIT_FAILURE;
+    }
+    while (!worker_running) {
+        usleep(1000);
+    }
+
+    thread_count = count_proc_threads();
+    if (thread_count < 2) {
+        worker_running = 0;
+        pthread_join(worker, NULL);
+        fprintf(stderr,
+                "strict-helper-empty requires a visible worker thread, got %d\n",
+                thread_count);
+        return 77;
+    }
+
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener =
+        gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    GumAttachReturn attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        worker_running = 0;
+        pthread_join(worker, NULL);
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+    check_strict_helper_pc_classification(interceptor, listener);
+
+    PeakDetachRequest request = {
+        .hook_id = 17,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("strict helper threaded physical detach",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper holds threaded stop",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("strict helper applies physical patch",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_finish("strict helper threaded resume", &request, PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper released threaded stop",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    check_prepare("strict helper threaded physical reattach",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper holds threaded reattach stop",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("strict helper reapplies physical patch",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_finish("strict helper threaded reattach resume",
+                 &request,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper released threaded reattach stop",
+               peak_detach_controller_threads_are_held() == FALSE);
+    strict_helper_target();
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    worker_running = 0;
+    pthread_join(worker, NULL);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_strict_helper_stale_caller(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "strict-helper-stale-caller requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    pthread_t worker;
+
+    stale_worker_parked = 0;
+    stale_worker_release = 0;
+    stale_worker_calls = 0;
+
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener =
+        gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    GumAttachReturn attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+
+    if (pthread_create(&worker, NULL, strict_helper_stale_worker, NULL) != 0) {
+        perror("pthread_create");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+
+    pthread_mutex_lock(&stale_worker_mutex);
+    while (!stale_worker_parked) {
+        pthread_cond_wait(&stale_worker_cond, &stale_worker_mutex);
+    }
+    pthread_mutex_unlock(&stale_worker_mutex);
+
+    check_int("stale worker warmup calls",
+              stale_worker_calls,
+              stale_worker_warmup_calls);
+    check_true("stale worker parked", stale_worker_parked == 1);
+
+    PeakDetachRequest request = {
+        .hook_id = 23,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("strict helper stale-caller physical detach",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper holds stale-caller stop",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("strict helper applies stale-caller physical patch",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_finish("strict helper stale-caller detach resume",
+                 &request,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper released stale-caller detach stop",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    check_prepare("strict helper stale-caller physical reattach",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper holds stale-caller reattach stop",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("strict helper reapplies stale-caller physical patch",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_finish("strict helper stale-caller reattach resume",
+                 &request,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_true("strict helper released stale-caller reattach stop",
+               peak_detach_controller_threads_are_held() == FALSE);
+    strict_helper_target();
+
+    pthread_mutex_lock(&stale_worker_mutex);
+    stale_worker_release = 1;
+    pthread_cond_broadcast(&stale_worker_cond);
+    pthread_mutex_unlock(&stale_worker_mutex);
+    pthread_join(worker, NULL);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_fake_helper_shutdown_sequence(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-shutdown-sequence requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener_one;
+    GumInvocationListener* listener_two;
+    GumAttachReturn attach_status;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "success-zero", 1) != 0 ||
+        setenv("FAKE_DETACH_HELPER_LOG", log_template, 1) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener_one = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    listener_two = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener_one,
+                               NULL);
+    check_true("first Gum attach for shutdown sequence",
+               attach_status == GUM_ATTACH_OK);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target_two,
+                               listener_two,
+                               NULL);
+    check_true("second Gum attach for shutdown sequence",
+               attach_status == GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+    strict_helper_target_two();
+
+    PeakDetachRequest request_one = {
+        .hook_id = 31,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener_one,
+        .operation = PEAK_DETACH_OPERATION_SHUTDOWN
+    };
+    PeakDetachRequest request_two = {
+        .hook_id = 32,
+        .symbol_name = "strict_helper_target_two",
+        .function_address = (gpointer)strict_helper_target_two,
+        .interceptor = interceptor,
+        .listener = listener_two,
+        .operation = PEAK_DETACH_OPERATION_SHUTDOWN
+    };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    check_prepare("first shutdown prepare",
+                  &request_one,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("first shutdown holds helper threads",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_finish("first shutdown finish resumes helper",
+                 &request_one,
+                 PEAK_DETACH_STATUS_SAFE);
+    gum_interceptor_detach(interceptor, listener_one);
+
+    check_prepare("second shutdown prepare",
+                  &request_two,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("second shutdown holds helper threads",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_finish("second shutdown finish resumes helper",
+                 &request_two,
+                 PEAK_DETACH_STATUS_SAFE);
+    gum_interceptor_detach(interceptor, listener_two);
+    gum_interceptor_flush(interceptor);
+
+    check_true("final helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+    check_true("final helper shutdown status",
+               status == PEAK_DETACH_STATUS_SAFE);
+
+    check_helper_log_count(log_template, "START", 1);
+    check_helper_log_count(log_template, "STOP", 2);
+    check_helper_log_count(log_template, "EVACUATE", 2);
+    check_helper_log_count(log_template, "RESUME", 2);
+    check_helper_log_count(log_template, "SHUTDOWN", 1);
+
+    g_object_unref(listener_one);
+    g_object_unref(listener_two);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_invalid(void)
+{
+    PeakDetachRequest request = valid_request(PEAK_DETACH_OPERATION_DETACH);
+    check_prepare("null request", NULL, FALSE, PEAK_DETACH_STATUS_ERROR);
+
+    request = valid_request(PEAK_DETACH_OPERATION_DETACH);
+    request.interceptor = NULL;
+    check_prepare("missing interceptor", &request, FALSE, PEAK_DETACH_STATUS_ERROR);
+
+    request = valid_request(PEAK_DETACH_OPERATION_DETACH);
+    request.function_address = NULL;
+    check_prepare("missing function address",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_ERROR);
+
+    request = valid_request(PEAK_DETACH_OPERATION_DETACH);
+    request.listener = NULL;
+    check_prepare("missing detach listener",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_ERROR);
+
+    request = valid_request(PEAK_DETACH_OPERATION_ATTACH);
+    check_prepare("attach listener optional",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
+
+    request = valid_request((PeakDetachOperation)999);
+    check_prepare("invalid operation",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_ERROR);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
+run_fake_helper_fail_closed(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-fail-closed requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    const char* scenario = getenv("FAKE_DETACH_HELPER_SCENARIO");
+    PeakDetachStatus expected = PEAK_DETACH_STATUS_ERROR;
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+
+    if (scenario == NULL) {
+        scenario = "stop-permission";
+    }
+
+    if (strcmp(scenario, "stop-permission") == 0) {
+        expected = PEAK_DETACH_STATUS_PERMISSION_DENIED;
+    } else if (strcmp(scenario, "stop-release-failed") == 0) {
+        expected = PEAK_DETACH_STATUS_ERROR;
+    } else if (strcmp(scenario, "stop-timeout") == 0) {
+        expected = PEAK_DETACH_STATUS_TIMEOUT;
+    } else if (strcmp(scenario, "bad-snapshot") == 0) {
+        expected = PEAK_DETACH_STATUS_ERROR;
+    } else if (strcmp(scenario, "blocked-pc") == 0) {
+        expected = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+    } else if (strcmp(scenario, "evacuate-error") == 0 ||
+               strcmp(scenario, "evacuate-release-failed") == 0) {
+        expected = PEAK_DETACH_STATUS_ERROR;
+    } else {
+        fprintf(stderr, "unknown fake helper scenario: %s\n", scenario);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+
+    PeakDetachRequest request = {
+        .hook_id = 23,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+    if (strcmp(scenario, "blocked-pc") == 0) {
+        request.blocked_pc_start = (gpointer)(uintptr_t)0x1200;
+        request.blocked_pc_size = 0x100;
+    }
+    check_prepare(scenario, &request, FALSE, expected);
+    check_true("fake helper failure leaves no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    PeakDetachStatus shutdown_status = PEAK_DETACH_STATUS_ERROR;
+    check_true("fake helper shutdown",
+               peak_detach_controller_shutdown_helper(&shutdown_status) == TRUE);
+    check_true("fake helper shutdown status",
+               shutdown_status == PEAK_DETACH_STATUS_SAFE ||
+               shutdown_status == PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+int
+main(int argc, char** argv)
+{
+    if (argc != 2) {
+        fprintf(stderr,
+                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-shutdown-sequence|invalid|fake-helper-fail-closed\n",
+                argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (strcmp(argv[1], "compatibility") == 0) {
+        return run_compatibility();
+    }
+    if (strcmp(argv[1], "strict") == 0) {
+        return run_strict();
+    }
+    if (strcmp(argv[1], "strict-helper-empty") == 0) {
+        return run_strict_helper_empty();
+    }
+    if (strcmp(argv[1], "strict-helper-stale-caller") == 0) {
+        return run_strict_helper_stale_caller();
+    }
+    if (strcmp(argv[1], "fake-helper-shutdown-sequence") == 0) {
+        return run_fake_helper_shutdown_sequence();
+    }
+    if (strcmp(argv[1], "invalid") == 0) {
+        return run_invalid();
+    }
+    if (strcmp(argv[1], "fake-helper-fail-closed") == 0) {
+        return run_fake_helper_fail_closed();
+    }
+
+    fprintf(stderr, "unknown scenario: %s\n", argv[1]);
+    return EXIT_FAILURE;
+}

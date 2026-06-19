@@ -9,11 +9,19 @@ int main(int argc, char** argv)
 {
     int rank, size;
     int i, j;
+    int iterations = 100;
     double A[N][N], B[N][N], C[N][N];
     double* D = (double*)malloc(N * N * sizeof(double));
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (argc > 1) {
+        iterations = atoi(argv[1]);
+        if (iterations <= 0) {
+            iterations = 100;
+        }
+    }
 
     // Initialize matrices A and B
     for (i = 0; i < N; i++) {
@@ -25,7 +33,7 @@ int main(int argc, char** argv)
 
 // Perform matrix multiplication
 #pragma omp parallel for
-    for (i = 0; i < 100; i++) {
+    for (i = 0; i < iterations; i++) {
         //C[i][j] += A[i][k] * B[k][j];
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, N, N, 1.0, &A[0][0], N, &B[0][0], N, 0.0, &C[0][0], N);
     }

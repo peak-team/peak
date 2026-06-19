@@ -48,6 +48,16 @@ int syscall_interceptor_attach()
 
 void syscall_interceptor_dettach()
 {
+    if (syscall_interceptor == NULL || hook_address == NULL) {
+        return;
+    }
+
+    gum_interceptor_begin_transaction(syscall_interceptor);
     gum_interceptor_revert(syscall_interceptor, hook_address);
-    g_object_unref(syscall_interceptor);
+    gum_interceptor_end_transaction(syscall_interceptor);
+    if (!gum_interceptor_flush(syscall_interceptor)) {
+        g_printerr("[peak] syscall interceptor teardown did not flush; leaving syscall interceptor state alive\n");
+        return;
+    }
+    hook_address = NULL;
 }

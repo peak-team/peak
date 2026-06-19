@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""High-contention strict physical-detach stress runner."""
+
+import argparse
+import csv
+import os
+import re
+import subprocess
+import sys
+
+
+CALLS_PER_SEC_RE = re.compile(r"calls_per_sec=([0-9.]+)")
+DETACHED_MARKER_RE = re.compile(
+    r"(?m)^\|\s*peak_detach_hot_target\*+\s*\|\s*[1-9][0-9]*\s*\|"
+)
+REATTACHED_MARKER_RE = re.compile(
+    r"(?m)^\|\s*peak_detach_hot_target\*\*\s*\|\s*[1-9][0-9]*\s*\|"
+)
+BAD_OUTPUT_RE = re.compile(
+    r"fatal|not proven safe|leaving listener state alive|"
+    r"detach helper shutdown failed|Gum .* failed|"
+    r"tracked thread snapshot exceeded|thread id .* exceeds|"
+    r"timed out draining pending target hook detach/reattach requests",
+    re.IGNORECASE,
+)
+TRANSITION_SKIP_RE = re.compile(
+    r"skipping Gum (detach|reattach)|classify-failed",
+    re.IGNORECASE,
+)
+TARGET_SYMBOL = "peak_detach_hot_target"
+
+
+def make_env(args, sample):
+    env = os.environ.copy()
+    max_threads = max(args.peak_max_threads, args.threads + args.thread_slack)
+    env.update(
+        {
+            "LD_PRELOAD": args.libpeak,
+            "PEAK_TARGET": "peak_detach_hot_target",
+            "PEAK_MAX_NUM_THREADS": str(max_threads),
+            "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
+            "PEAK_ENABLE_REATTACH": "1" if args.enable_reattach else "0",
+            "PEAK_COST": args.peak_cost,
+            "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
+            "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
+            "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
+            "PEAK_REQUIRE_SAFE_DETACH": "1",
+            "PEAK_SAFE_DETACH_MODE": "strict",
+            "PEAK_STATSLOG_PATH": f"{args.stats_prefix}-{sample}",
+        }
+    )
+    if args.trace_prefix:
+        env["PEAK_DETACH_TRACE_PATH"] = f"{args.trace_prefix}-{sample}.csv"
+    return env
+
+
+def trace_path(args, sample):
+    if not args.trace_prefix:
+        return None
+    return f"{args.trace_prefix}-{sample}.csv"
+
+
+def reset_trace(args, sample):
+    path = trace_path(args, sample)
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def trace_has_success(args, sample, operation):
+    path = trace_path(args, sample)
+    if not path:
+        return True
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+    except OSError:
+        return False
+
+    for fields in rows:
+        if (len(fields) >= 7 and
+                fields[2] == TARGET_SYMBOL and
+                fields[3] == operation and
+                fields[4] == "success" and
+                fields[5] == "1" and
+                fields[6] == "safe"):
+            return True
+    return False
+
+
+def run_sample(args, sample):
+    cmd = [
+        args.exe,
+        "--threads",
+        str(args.threads),
+        "--seconds",
+        str(args.seconds),
+    ]
+    reset_trace(args, sample)
+    completed = subprocess.run(
+        cmd,
+        env=make_env(args, sample),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=args.timeout,
+        check=False,
+    )
+    output = completed.stdout
+    calls_match = CALLS_PER_SEC_RE.search(output)
+    required_marker = REATTACHED_MARKER_RE if args.require_reattach else DETACHED_MARKER_RE
+    detached = DETACHED_MARKER_RE.search(output) is not None
+    marker_ok = required_marker.search(output) is not None
+    trace_detached = trace_has_success(args, sample, "detach")
+    trace_reattached = trace_has_success(args, sample, "reattach")
+    bad_output = BAD_OUTPUT_RE.search(output)
+    transition_skip = TRANSITION_SKIP_RE.search(output)
+    calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
+
+    if (completed.returncode != 0 or
+            calls_match is None or
+            calls_per_sec <= 0.0 or
+            not marker_ok or
+            not trace_detached or
+            (args.require_reattach and not trace_reattached) or
+            bad_output or
+            (args.fail_on_transition_skips and transition_skip)):
+        print(f"stress sample {sample} failed rc={completed.returncode}",
+              file=sys.stderr)
+        if calls_match is None:
+            print("missing calls_per_sec output", file=sys.stderr)
+        elif calls_per_sec <= 0.0:
+            print("calls_per_sec must be positive", file=sys.stderr)
+        if not marker_ok:
+            if args.require_reattach:
+                print("missing strict physical detach+reattach marker", file=sys.stderr)
+            else:
+                print("missing strict physical detach marker", file=sys.stderr)
+        if not trace_detached:
+            print("missing trace detach success", file=sys.stderr)
+        if args.require_reattach and not trace_reattached:
+            print("missing trace reattach success", file=sys.stderr)
+        if bad_output:
+            print(f"matched bad output: {bad_output.group(0)}", file=sys.stderr)
+        if args.fail_on_transition_skips and transition_skip:
+            print(f"matched transition skip: {transition_skip.group(0)}", file=sys.stderr)
+        print(output, file=sys.stderr)
+        raise SystemExit(1)
+
+    print(
+        f"stress sample={sample} threads={args.threads} "
+        f"calls_per_sec={calls_per_sec:.3f} detached_marker={detached} "
+        f"reattached_marker={REATTACHED_MARKER_RE.search(output) is not None}"
+    )
+    return calls_per_sec
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exe", required=True)
+    parser.add_argument("--libpeak", required=True)
+    parser.add_argument("--threads", type=int, default=32)
+    parser.add_argument("--seconds", type=int, default=1)
+    parser.add_argument("--samples", type=int, default=12)
+    parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--stats-prefix", default="/tmp/peak-hotloop-stress")
+    parser.add_argument("--heartbeat-interval", default="0.001")
+    parser.add_argument("--hibernation-cycle", type=int, default=1)
+    parser.add_argument("--overhead-ratio", default="0.000001")
+    parser.add_argument("--peak-cost", default="0.0000001")
+    parser.add_argument("--peak-max-threads", type=int, default=0)
+    parser.add_argument("--thread-slack", type=int, default=16)
+    parser.add_argument("--require-reattach", action="store_true")
+    parser.add_argument("--disable-reattach", action="store_false",
+                        dest="enable_reattach")
+    parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--trace-prefix", default="")
+    parser.set_defaults(enable_reattach=True)
+    args = parser.parse_args()
+
+    if args.threads <= 0 or args.seconds <= 0 or args.samples <= 0:
+        print("threads, seconds, and samples must be positive", file=sys.stderr)
+        return 2
+
+    values = [run_sample(args, sample) for sample in range(args.samples)]
+    print(
+        f"hotloop_stress_ok samples={args.samples} threads={args.threads} "
+        f"min_calls_per_sec={min(values):.3f} max_calls_per_sec={max(values):.3f}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

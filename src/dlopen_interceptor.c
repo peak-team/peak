@@ -3,8 +3,20 @@
 
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
+#include "peak_detach_controller.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
 
 typedef void (*fn_void)(void);
+
+#define PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY 256U
+#define PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET 64U
+#define PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS 5000L
+#define PEAK_DLOPEN_ENTRY_GUARD_BYTES 256U
+#define PEAK_DLOPEN_PREPARE_RETRY_ATTEMPTS 50U
+#define PEAK_DLOPEN_PREPARE_RETRY_SLEEP_NS 1000000L
 
 static GumInterceptor* dlopen_interceptor;
 extern GumInterceptor* interceptor;
@@ -21,52 +33,641 @@ static void* (*original_dlopen)(const char *filename, int flags);
 #define RTLD_BINDING_MASK (RTLD_LAZY | RTLD_NOW)
 #endif
 
+typedef enum {
+    PEAK_DLOPEN_CONTROLLER_CLOSED = 0,
+    PEAK_DLOPEN_CONTROLLER_OPEN,
+    PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN
+} PeakDlopenControllerState;
+
+typedef struct {
+    void* handle;
+    char* filename;
+} PeakDlopenDynamicAttachRequest;
+
+typedef enum {
+    PEAK_DLOPEN_ATTACH_DONE = 0,
+    PEAK_DLOPEN_ATTACH_RETRY
+} PeakDlopenAttachResult;
+
+static pthread_mutex_t dynamic_attach_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dynamic_attach_gate_cond = PTHREAD_COND_INITIALIZER;
+static PeakDlopenControllerState dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
+static unsigned int active_dynamic_attach_count = 0;
+static unsigned int active_dlopen_replacement_count = 0;
+static gboolean dynamic_attach_drain_active = FALSE;
+static PeakDlopenDynamicAttachRequest dynamic_attach_queue[PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY];
+static size_t dynamic_attach_queue_head = 0;
+static size_t dynamic_attach_queue_tail = 0;
+static size_t dynamic_attach_queue_length = 0;
+static gboolean dynamic_attach_queue_overflow_reported = FALSE;
+static GPtrArray* dynamic_attach_retained_handles = NULL;
+static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
+
+static gboolean
+dlopen_interceptor_prepare_is_retryable(PeakDetachStatus status)
+{
+    switch (status) {
+        case PEAK_DETACH_STATUS_TIMEOUT:
+        case PEAK_DETACH_STATUS_CLASSIFY_FAILED:
+        case PEAK_DETACH_STATUS_ERROR:
+        case PEAK_DETACH_STATUS_PERMISSION_DENIED:
+            return TRUE;
+        case PEAK_DETACH_STATUS_SAFE:
+        case PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED:
+        case PEAK_DETACH_STATUS_DISABLED:
+        case PEAK_DETACH_STATUS_UNSUPPORTED:
+        case PEAK_DETACH_STATUS_MISSING_GUM_API:
+        default:
+            return FALSE;
+    }
+}
+
+static gboolean
+dlopen_interceptor_prepare_hook_mutation_with_retry(
+    const PeakDetachRequest* request,
+    PeakDetachStatus* status_out)
+{
+    struct timespec retry_sleep = {
+        .tv_sec = 0,
+        .tv_nsec = PEAK_DLOPEN_PREPARE_RETRY_SLEEP_NS
+    };
+
+    for (unsigned int attempt = 0;
+         attempt < PEAK_DLOPEN_PREPARE_RETRY_ATTEMPTS;
+         attempt++) {
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+        if (peak_detach_controller_prepare_hook_mutation(request, &status)) {
+            if (status_out != NULL) {
+                *status_out = status;
+            }
+            return TRUE;
+        }
+        if (status_out != NULL) {
+            *status_out = status;
+        }
+        if (!dlopen_interceptor_prepare_is_retryable(status)) {
+            return FALSE;
+        }
+
+        nanosleep(&retry_sleep, NULL);
+    }
+
+    return FALSE;
+}
+
+static void
+dlopen_interceptor_add_milliseconds(struct timespec* ts, long milliseconds)
+{
+    ts->tv_sec += milliseconds / 1000L;
+    ts->tv_nsec += (milliseconds % 1000L) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static void
+dlopen_interceptor_close_retained_handle(gpointer handle)
+{
+    if (handle != NULL) {
+        dlclose(handle);
+    }
+}
+
+static gboolean
+dlopen_interceptor_queue_can_accept_unlocked(void)
+{
+    return dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN &&
+           dynamic_attach_queue_length < PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+}
+
+static void
+dlopen_interceptor_begin_replacement_call(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    active_dlopen_replacement_count++;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
+static void
+dlopen_interceptor_end_replacement_call(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (active_dlopen_replacement_count > 0) {
+        active_dlopen_replacement_count--;
+    }
+    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN) {
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
+static unsigned int
+dlopen_interceptor_active_replacement_count(void)
+{
+    unsigned int count;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    count = active_dlopen_replacement_count;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    return count;
+}
+
+static gboolean
+dlopen_interceptor_wait_for_dynamic_attach_idle(void)
+{
+    struct timespec deadline;
+    gboolean idle = TRUE;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    dlopen_interceptor_add_milliseconds(&deadline,
+                                        PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    while (active_dynamic_attach_count > 0) {
+        int wait_status =
+            pthread_cond_timedwait(&dynamic_attach_gate_cond,
+                                   &dynamic_attach_gate_mutex,
+                                   &deadline);
+        if (wait_status == ETIMEDOUT) {
+            idle = FALSE;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    return idle;
+}
+
+static gboolean
+dlopen_interceptor_wait_for_replacement_idle(void)
+{
+    struct timespec deadline;
+    gboolean idle = TRUE;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    dlopen_interceptor_add_milliseconds(&deadline,
+                                        PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    while (active_dlopen_replacement_count > 0) {
+        int wait_status =
+            pthread_cond_timedwait(&dynamic_attach_gate_cond,
+                                   &dynamic_attach_gate_mutex,
+                                   &deadline);
+        if (wait_status == ETIMEDOUT) {
+            idle = FALSE;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    return idle;
+}
+
+static void
+dlopen_interceptor_retain_dynamic_handle(void* handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dynamic_attach_retained_handles == NULL) {
+        dynamic_attach_retained_handles =
+            g_ptr_array_new_with_free_func(dlopen_interceptor_close_retained_handle);
+    }
+    g_ptr_array_add(dynamic_attach_retained_handles, handle);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
+static void*
+dlopen_interceptor_duplicate_dynamic_handle_reference(const char* filename)
+{
+#ifdef RTLD_NOLOAD
+    if (filename == NULL || original_dlopen == NULL) {
+        return NULL;
+    }
+    return original_dlopen(filename, RTLD_NOW | RTLD_NOLOAD);
+#else
+    (void)filename;
+    return NULL;
+#endif
+}
+
+static void
+dlopen_interceptor_release_dynamic_attach_request(PeakDlopenDynamicAttachRequest* request)
+{
+    if (request->handle != NULL) {
+        dlclose(request->handle);
+        request->handle = NULL;
+    }
+
+    g_free(request->filename);
+    request->filename = NULL;
+}
+
+static gboolean
+dlopen_interceptor_flush_teardown(void)
+{
+    const unsigned int max_attempts = 100;
+
+    if (dlopen_interceptor == NULL) {
+        return TRUE;
+    }
+
+    for (unsigned int attempt = 0; attempt < max_attempts; attempt++) {
+        if (gum_interceptor_flush(dlopen_interceptor)) {
+            return TRUE;
+        }
+        usleep(1000);
+    }
+
+    return gum_interceptor_flush(dlopen_interceptor);
+}
+
+static gboolean
+dlopen_interceptor_begin_dynamic_attach_drain(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN ||
+        dynamic_attach_drain_active ||
+        dynamic_attach_queue_length == 0) {
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        return FALSE;
+    }
+
+    dynamic_attach_drain_active = TRUE;
+    active_dynamic_attach_count++;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return TRUE;
+}
+
+static void
+dlopen_interceptor_end_dynamic_attach_drain(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_attach_drain_active = FALSE;
+    if (active_dynamic_attach_count > 0) {
+        active_dynamic_attach_count--;
+    }
+    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN &&
+        active_dynamic_attach_count == 0) {
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
+static void dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests);
+
+static gboolean
+dlopen_interceptor_pop_dynamic_attach_request(PeakDlopenDynamicAttachRequest* request)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dynamic_attach_queue_length == 0) {
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        return FALSE;
+    }
+
+    *request = dynamic_attach_queue[dynamic_attach_queue_head];
+    dynamic_attach_queue[dynamic_attach_queue_head].handle = NULL;
+    dynamic_attach_queue[dynamic_attach_queue_head].filename = NULL;
+    dynamic_attach_queue_head =
+        (dynamic_attach_queue_head + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+    dynamic_attach_queue_length--;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    return TRUE;
+}
+
+static gboolean
+dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest* request)
+{
+    gboolean requeued = FALSE;
+
+    if (request->handle == NULL) {
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dlopen_interceptor_queue_can_accept_unlocked()) {
+        dynamic_attach_queue[dynamic_attach_queue_tail] = *request;
+        dynamic_attach_queue_tail =
+            (dynamic_attach_queue_tail + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+        dynamic_attach_queue_length++;
+        pthread_cond_signal(&dynamic_attach_gate_cond);
+        request->handle = NULL;
+        request->filename = NULL;
+        requeued = TRUE;
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (requeued) {
+        peak_general_listener_controller_wake();
+    }
+    return requeued;
+}
+
+static void
+dlopen_interceptor_discard_dynamic_attach_queue(void)
+{
+    PeakDlopenDynamicAttachRequest request = { 0 };
+
+    while (dlopen_interceptor_pop_dynamic_attach_request(&request)) {
+        dlopen_interceptor_release_dynamic_attach_request(&request);
+    }
+}
+
+static gboolean
+dlopen_interceptor_enqueue_dynamic_attach_request(
+    const char* filename,
+    int binding_flags)
+{
+#ifdef RTLD_NOLOAD
+    gboolean can_accept;
+    void* retained_handle;
+    char* filename_copy;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    can_accept = dlopen_interceptor_queue_can_accept_unlocked();
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (!can_accept) {
+        return FALSE;
+    }
+
+    retained_handle = original_dlopen(filename, binding_flags | RTLD_NOLOAD);
+    if (retained_handle == NULL) {
+        return FALSE;
+    }
+
+    filename_copy = g_strdup(filename);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (!dlopen_interceptor_queue_can_accept_unlocked()) {
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        dlclose(retained_handle);
+        g_free(filename_copy);
+        return FALSE;
+    }
+
+    dynamic_attach_queue[dynamic_attach_queue_tail].handle = retained_handle;
+    dynamic_attach_queue[dynamic_attach_queue_tail].filename = filename_copy;
+    dynamic_attach_queue_tail =
+        (dynamic_attach_queue_tail + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+    dynamic_attach_queue_length++;
+    pthread_cond_signal(&dynamic_attach_gate_cond);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    peak_general_listener_controller_wake();
+
+    return TRUE;
+#else
+    (void)filename;
+    (void)binding_flags;
+    return FALSE;
+#endif
+}
+
+static PeakDlopenAttachResult
+dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
+{
+    gboolean retained_handle_for_hooks = FALSE;
+    gboolean retry_later = FALSE;
+
+    if (request->handle == NULL) {
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+
+    peak_general_listener_controller_lock();
+    if (interceptor == NULL ||
+        hook_address == NULL ||
+        array_listener == NULL ||
+        peak_hook_strings == NULL ||
+        peak_demangled_strings == NULL) {
+        peak_general_listener_controller_unlock();
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+
+    gum_interceptor_ignore_current_thread(interceptor);
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address[i] != NULL || array_listener[i] != NULL) {
+            continue;
+        }
+
+        fn_void dynamic_link_func = (fn_void)dlsym(request->handle, peak_hook_strings[i]);
+        if (dynamic_link_func == NULL) {
+            continue;
+        }
+
+        gpointer dynamic_hook_address = (gpointer)dynamic_link_func;
+        char* demangled = cxa_demangle(peak_hook_strings[i]);
+        char* demangled_copy =
+            g_strdup(demangled != NULL ? demangled : peak_hook_strings[i]);
+        free(demangled);
+
+        GumInvocationListener* new_listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+        PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
+
+        PeakDetachRequest mutation_request = {
+            .hook_id = i,
+            .symbol_name = peak_hook_strings[i],
+            .function_address = dynamic_hook_address,
+            .interceptor = interceptor,
+            .listener = new_listener,
+            .operation = PEAK_DETACH_OPERATION_ATTACH
+        };
+        PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+                                                          &detach_status)) {
+            if (detach_status == PEAK_DETACH_STATUS_CLASSIFY_FAILED ||
+                detach_status == PEAK_DETACH_STATUS_TIMEOUT) {
+                retry_later = TRUE;
+            }
+            g_printerr("[peak] %s dynamic Gum attach for hook %lu (%s): %s\n",
+                       retry_later ? "retrying" : "skipping",
+                       (unsigned long)i,
+                       peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>",
+                       peak_detach_controller_status_string(detach_status));
+            peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
+            g_object_unref(new_listener);
+            g_free(demangled_copy);
+            continue;
+        }
+
+        gum_interceptor_begin_transaction(interceptor);
+        GumAttachReturn attach_status =
+            gum_interceptor_attach(interceptor,
+                                   dynamic_hook_address,
+                                   new_listener,
+                                   NULL);
+        gum_interceptor_end_transaction(interceptor);
+        if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                         &detach_status)) {
+            peak_detach_controller_abort_after_failed_finish("dynamic attach finish",
+                                                            detach_status);
+        }
+        if (attach_status == GUM_ATTACH_OK) {
+            hook_address[i] = dynamic_hook_address;
+            peak_demangled_strings[i] = demangled_copy;
+            array_listener[i] = new_listener;
+            peak_general_listener_controller_mark_attached_unlocked(i);
+            retained_handle_for_hooks = TRUE;
+        } else {
+            peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
+            g_object_unref(new_listener);
+            g_free(demangled_copy);
+        }
+    }
+    gum_interceptor_unignore_current_thread(interceptor);
+    peak_general_listener_controller_unlock();
+
+    if (retained_handle_for_hooks && retry_later) {
+        void* hook_lifetime_handle =
+            dlopen_interceptor_duplicate_dynamic_handle_reference(request->filename);
+        if (hook_lifetime_handle != NULL) {
+            dlopen_interceptor_retain_dynamic_handle(hook_lifetime_handle);
+        } else {
+            g_printerr("[peak] dynamic attach partially succeeded but could not duplicate handle for retry; keeping attached hook lifetime and dropping retry for unresolved hooks\n");
+            dlopen_interceptor_retain_dynamic_handle(request->handle);
+            request->handle = NULL;
+            retry_later = FALSE;
+        }
+    } else if (retained_handle_for_hooks) {
+        dlopen_interceptor_retain_dynamic_handle(request->handle);
+        request->handle = NULL;
+    }
+    if (retry_later) {
+        return PEAK_DLOPEN_ATTACH_RETRY;
+    }
+    return PEAK_DLOPEN_ATTACH_DONE;
+}
+
+static void
+dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
+{
+    size_t drained = 0;
+    PeakDlopenDynamicAttachRequest request = { 0 };
+
+    if (dynamic_attach_drain_reentrant) {
+        return;
+    }
+
+    if (!dlopen_interceptor_begin_dynamic_attach_drain()) {
+        return;
+    }
+
+    dynamic_attach_drain_reentrant = TRUE;
+    while ((max_requests == 0 || drained < max_requests) &&
+           dlopen_interceptor_pop_dynamic_attach_request(&request)) {
+        PeakDlopenAttachResult result =
+            dlopen_interceptor_attach_from_request(&request);
+        if (result == PEAK_DLOPEN_ATTACH_RETRY &&
+            dlopen_interceptor_requeue_dynamic_attach_request(&request)) {
+            drained++;
+            break;
+        }
+        dlopen_interceptor_release_dynamic_attach_request(&request);
+        drained++;
+    }
+    dynamic_attach_drain_reentrant = FALSE;
+
+    dlopen_interceptor_end_dynamic_attach_drain();
+}
+
+void
+dlopen_interceptor_drain_dynamic_attach_queue(void)
+{
+    dlopen_interceptor_drain_dynamic_attach_queue_with_budget(
+        PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET);
+}
+
+void
+dlopen_interceptor_enable_dynamic_attach(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN &&
+        dlopen_interceptor != NULL &&
+        dlopen_hook_address != NULL &&
+        original_dlopen != NULL) {
+        dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_OPEN;
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
+gboolean
+dlopen_interceptor_shutdown_dynamic_attach(void)
+{
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (!dlopen_interceptor_wait_for_dynamic_attach_idle()) {
+        g_printerr("[peak] dlopen dynamic attach drain timed out; leaving dlopen interceptor state alive\n");
+        return FALSE;
+    }
+    if (!dlopen_interceptor_wait_for_replacement_idle()) {
+        g_printerr("[peak] dlopen replacement body drain timed out with %u active replacement calls; leaving dlopen interceptor state alive\n",
+                   dlopen_interceptor_active_replacement_count());
+        return FALSE;
+    }
+
+    dlopen_interceptor_discard_dynamic_attach_queue();
+    return TRUE;
+}
+
+void
+dlopen_interceptor_release_retained_dynamic_handles(void)
+{
+    GPtrArray* retained_handles = NULL;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    retained_handles = dynamic_attach_retained_handles;
+    dynamic_attach_retained_handles = NULL;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (retained_handles != NULL) {
+        g_ptr_array_free(retained_handles, TRUE);
+    }
+}
+
 static void*
 peak_dlopen(const char *filename, int flags) {
     // Force eager symbol resolution to ensure target symbols are available
     // during the hooking phase while preserving non-binding dlopen flags.
     int binding_flags = (flags & ~RTLD_BINDING_MASK) | RTLD_NOW;
+    void *handle;
 
-    void *handle = original_dlopen(filename, binding_flags);
+    dlopen_interceptor_begin_replacement_call();
+    handle = original_dlopen(filename, binding_flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
+        dlopen_interceptor_end_replacement_call();
         return handle;
     }
 
-    gum_interceptor_ignore_current_thread(interceptor);
-    gum_interceptor_begin_transaction(interceptor);
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (hook_address[i]) {
-            // If already hooked, skip rescan of the target function
-            continue;
-        }
+    if (!dlopen_interceptor_enqueue_dynamic_attach_request(filename, binding_flags)) {
+        gboolean should_report_overflow = FALSE;
 
-        // TODO: Consider list all symbols in the newly loaded library and parse the functions
-        // to find the target functions. This is more efficient than dlsym which only support mangled name
-        // but requires more code to parse the ELF file.  
-        fn_void dynamic_link_func = (fn_void)dlsym(handle, peak_hook_strings[i]);
-        if (dynamic_link_func) {
-            hook_address[i] = (gpointer)dynamic_link_func;
-            char* demangled = cxa_demangle(peak_hook_strings[i]);
-            peak_demangled_strings[i] = g_strdup(demangled);
-            free(demangled);
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        if (dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN &&
+            dynamic_attach_queue_length >= PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY &&
+            !dynamic_attach_queue_overflow_reported) {
+            dynamic_attach_queue_overflow_reported = TRUE;
+            should_report_overflow = TRUE;
         }
-        
-        if (hook_address[i]) {
-            // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
-            array_listener[i] = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-            PEAKGENERAL_LISTENER(array_listener[i])->hook_id = i;
-            gum_interceptor_attach(interceptor,
-                                   hook_address[i],
-                                   array_listener[i],
-                                   NULL);
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+        if (should_report_overflow) {
+            g_printerr("[peak] dlopen dynamic attach queue full; dropping later dynamic attach requests\n");
         }
     }
-    gum_interceptor_end_transaction(interceptor);
-    gum_interceptor_unignore_current_thread(interceptor);
 
-    // FIXME: didn't add peak_general_overhead_bootstrapping
-    
+    dlopen_interceptor_end_replacement_call();
     return handle;
 }
 
@@ -74,20 +675,137 @@ int dlopen_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
     dlopen_interceptor = gum_interceptor_obtain();
+    dlopen_hook_address = gum_find_function("dlopen");
+
+    if (dlopen_hook_address == NULL) {
+        return replace_check;
+    }
+
+    PeakDetachRequest mutation_request = {
+        .hook_id = 0,
+        .symbol_name = "dlopen",
+        .function_address = dlopen_hook_address,
+        .interceptor = dlopen_interceptor,
+        .listener = NULL,
+        .operation = PEAK_DETACH_OPERATION_REPLACE
+    };
+    PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+                                                      &detach_status)) {
+        g_printerr("[peak] skipping dlopen Gum replace: %s\n",
+                   peak_detach_controller_status_string(detach_status));
+        g_object_unref(dlopen_interceptor);
+        dlopen_interceptor = NULL;
+        dlopen_hook_address = NULL;
+        return replace_check;
+    }
 
     gum_interceptor_begin_transaction(dlopen_interceptor);
-    dlopen_hook_address = gum_find_function("dlopen");
-    if (dlopen_hook_address) {
-        replace_check = gum_interceptor_replace_fast(dlopen_interceptor, 
-                        dlopen_hook_address, (gpointer)&peak_dlopen,
-                                     (gpointer*)(&original_dlopen));
-    }
+    replace_check = gum_interceptor_replace_fast(dlopen_interceptor,
+                                                 dlopen_hook_address,
+                                                 (gpointer)&peak_dlopen,
+                                                 (gpointer*)(&original_dlopen));
     gum_interceptor_end_transaction(dlopen_interceptor);
+    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                     &detach_status)) {
+        peak_detach_controller_abort_after_failed_finish("dlopen replace finish",
+                                                        detach_status);
+    }
     return replace_check;
 }
 
-void dlopen_interceptor_dettach()
+gboolean dlopen_interceptor_dettach()
 {
-    gum_interceptor_revert(dlopen_interceptor, dlopen_hook_address);
-    g_object_unref(dlopen_interceptor);
+    gboolean entry_physically_restored = FALSE;
+
+    if (dlopen_interceptor != NULL && dlopen_hook_address != NULL) {
+        PeakDetachRequest mutation_request = {
+            .hook_id = 0,
+            .symbol_name = "dlopen",
+            .function_address = dlopen_hook_address,
+            .interceptor = dlopen_interceptor,
+            .listener = NULL,
+            .operation = PEAK_DETACH_OPERATION_REVERT,
+            .blocked_pc_start = (gpointer)&peak_dlopen,
+            .blocked_pc_size = PEAK_DLOPEN_ENTRY_GUARD_BYTES
+        };
+        PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!dlopen_interceptor_prepare_hook_mutation_with_retry(
+                &mutation_request,
+                &detach_status)) {
+            g_printerr("[peak] skipping dlopen Gum revert: %s\n",
+                       peak_detach_controller_status_string(detach_status));
+            return FALSE;
+        }
+        entry_physically_restored =
+            peak_detach_controller_current_mutation_uses_physical_patch();
+        if (!entry_physically_restored) {
+            gum_interceptor_begin_transaction(dlopen_interceptor);
+            gum_interceptor_revert(dlopen_interceptor, dlopen_hook_address);
+            gum_interceptor_end_transaction(dlopen_interceptor);
+        }
+        if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                         &detach_status)) {
+            peak_detach_controller_abort_after_failed_finish("dlopen revert finish",
+                                                            detach_status);
+        }
+    }
+
+    if (!dlopen_interceptor_shutdown_dynamic_attach()) {
+        return FALSE;
+    }
+
+    if (entry_physically_restored &&
+        dlopen_interceptor != NULL &&
+        dlopen_hook_address != NULL) {
+        PeakDetachRequest mutation_request = {
+            .hook_id = 0,
+            .symbol_name = "dlopen",
+            .function_address = dlopen_hook_address,
+            .interceptor = dlopen_interceptor,
+            .listener = NULL,
+            .operation = PEAK_DETACH_OPERATION_REVERT,
+            .blocked_pc_start = (gpointer)&peak_dlopen,
+            .blocked_pc_size = PEAK_DLOPEN_ENTRY_GUARD_BYTES
+        };
+        PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!dlopen_interceptor_prepare_hook_mutation_with_retry(
+                &mutation_request,
+                &detach_status)) {
+            g_printerr("[peak] skipping dlopen Gum metadata revert: %s\n",
+                       peak_detach_controller_status_string(detach_status));
+            return FALSE;
+        }
+        gum_interceptor_begin_transaction(dlopen_interceptor);
+        gum_interceptor_revert(dlopen_interceptor, dlopen_hook_address);
+        gum_interceptor_end_transaction(dlopen_interceptor);
+        if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                         &detach_status)) {
+            peak_detach_controller_abort_after_failed_finish("dlopen metadata revert finish",
+                                                            detach_status);
+        }
+    }
+
+    if (!dlopen_interceptor_flush_teardown()) {
+        g_printerr("[peak] dlopen interceptor teardown did not flush; leaving interceptor state alive\n");
+        return FALSE;
+    }
+    if (dlopen_interceptor != NULL) {
+        g_object_unref(dlopen_interceptor);
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
+    dynamic_attach_queue_head = 0;
+    dynamic_attach_queue_tail = 0;
+    dynamic_attach_queue_length = 0;
+    dynamic_attach_queue_overflow_reported = FALSE;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    dlopen_interceptor = NULL;
+    dlopen_hook_address = NULL;
+    return TRUE;
 }

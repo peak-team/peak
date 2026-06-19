@@ -1,5 +1,7 @@
 #include "cuda_interceptor.h"
 
+#define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
+
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
 static GMutex cuda_kernel_local_dim_mapping_mutex;
@@ -127,6 +129,25 @@ struct GraphLaunchSeries{
 
 static std::unordered_map<std::string, KernelLaunchSeries> peak_kernel_event_map;
 static std::unordered_map<CUgraphExec_st*, GraphLaunchSeries> peak_graph_event_map;
+static std::mutex peak_kernel_event_map_mutex;
+static std::mutex peak_graph_event_map_mutex;
+static std::mutex peak_cuda_lifecycle_mutex;
+static std::atomic_bool peak_cuda_accepting_events{false};
+static std::atomic_uint peak_cuda_in_flight{0};
+static gboolean peak_cuda_hooks_reverted;
+
+class PeakCudaInflightGuard {
+public:
+    PeakCudaInflightGuard()
+    {
+        peak_cuda_in_flight.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ~PeakCudaInflightGuard()
+    {
+        peak_cuda_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
 
 gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
@@ -233,25 +254,199 @@ void insert_cuda_graph_record(CUgraphExec_st* graph, gdouble elapsed_sec)
     g_mutex_unlock(&cuda_graph_local_mapping_mutex);
 }
 
-static cudaError_t peak_cuda_launch_kernel(
+static cudaEvent_t* peak_cuda_new_event_slot()
+{
+    cudaEvent_t* event = (cudaEvent_t*) calloc(1, sizeof(cudaEvent_t));
+    if (event == NULL) {
+        return NULL;
+    }
+    if (cudaEventCreate(event) != cudaSuccess) {
+        free(event);
+        return NULL;
+    }
+    return event;
+}
+
+static void peak_cuda_record_event(cudaEvent_t* event, cudaStream_t stream)
+{
+    if (event != NULL && *event != NULL) {
+        cudaEventRecord(*event, stream);
+    }
+}
+
+static void peak_cuda_release_event_pair(cudaEvent_t* start_event,
+                                         cudaEvent_t* end_event)
+{
+    if (start_event != NULL) {
+        if (*start_event != NULL) {
+            cudaEventDestroy(*start_event);
+        }
+        free(start_event);
+    }
+    if (end_event != NULL) {
+        if (*end_event != NULL) {
+            cudaEventDestroy(*end_event);
+        }
+        free(end_event);
+    }
+}
+
+static void peak_cuda_release_kernel_launch(KernelLaunchInfo* launch,
+                                            gboolean record_elapsed)
+{
+    if (launch == NULL) {
+        return;
+    }
+
+    if (record_elapsed &&
+        launch->start_event != NULL &&
+        launch->end_event != NULL &&
+        *(launch->start_event) != NULL &&
+        *(launch->end_event) != NULL) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, *(launch->start_event), *(launch->end_event));
+        if (launch->result == cudaSuccess) {
+            insert_cuda_mapping_record(
+                launch->kernel_name,
+                launch->total_threads,
+                launch->grid_size,
+                launch->block_size,
+                ms / 1000.0
+            );
+        }
+    }
+
+    peak_cuda_release_event_pair(launch->start_event, launch->end_event);
+    launch->start_event = NULL;
+    launch->end_event = NULL;
+    g_free(launch->kernel_name);
+    launch->kernel_name = NULL;
+}
+
+static void peak_cuda_release_graph_launch(GraphLaunchInfo* launch,
+                                           gboolean record_elapsed)
+{
+    if (launch == NULL) {
+        return;
+    }
+
+    if (record_elapsed &&
+        launch->start_event != NULL &&
+        launch->end_event != NULL &&
+        *(launch->start_event) != NULL &&
+        *(launch->end_event) != NULL) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, *(launch->start_event), *(launch->end_event));
+        if (launch->result == cudaSuccess) {
+            insert_cuda_graph_record(launch->graph, ms / 1000.0);
+        }
+    }
+
+    peak_cuda_release_event_pair(launch->start_event, launch->end_event);
+    launch->start_event = NULL;
+    launch->end_event = NULL;
+}
+
+static void peak_cuda_enqueue_kernel_launch(const gchar* kernel_name,
+                                            KernelLaunchInfo* info)
+{
+    const gchar* key = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
+    gboolean accepted = FALSE;
+
+    {
+        std::lock_guard<std::mutex> map_lock(peak_kernel_event_map_mutex);
+        if (peak_cuda_accepting_events.load(std::memory_order_acquire)) {
+            auto& series = peak_kernel_event_map[key];
+            std::lock_guard<std::mutex> lock(series.mtx);
+            series.launches.push_back(*info);
+            accepted = TRUE;
+        }
+    }
+
+    if (!accepted) {
+        peak_cuda_release_kernel_launch(info, FALSE);
+    }
+}
+
+static void peak_cuda_enqueue_graph_launch(CUgraphExec_st* graph,
+                                           GraphLaunchInfo* info)
+{
+    gboolean accepted = FALSE;
+
+    {
+        std::lock_guard<std::mutex> map_lock(peak_graph_event_map_mutex);
+        if (peak_cuda_accepting_events.load(std::memory_order_acquire)) {
+            auto& series = peak_graph_event_map[graph];
+            std::lock_guard<std::mutex> lock(series.mtx);
+            series.launches.push_back(*info);
+            accepted = TRUE;
+        }
+    }
+
+    if (!accepted) {
+        peak_cuda_release_graph_launch(info, FALSE);
+    }
+}
+
+static void peak_cuda_drain_kernel_event_map(gboolean record_elapsed)
+{
+    std::lock_guard<std::mutex> map_lock(peak_kernel_event_map_mutex);
+    for (auto& [_, series] : peak_kernel_event_map) {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        for (auto& launch : series.launches) {
+            peak_cuda_release_kernel_launch(&launch, record_elapsed);
+        }
+        series.launches.clear();
+    }
+    peak_kernel_event_map.clear();
+}
+
+static void peak_cuda_drain_graph_event_map(gboolean record_elapsed)
+{
+    std::lock_guard<std::mutex> map_lock(peak_graph_event_map_mutex);
+    for (auto& [_, series] : peak_graph_event_map) {
+        std::lock_guard<std::mutex> lock(series.mtx);
+        for (auto& launch : series.launches) {
+            peak_cuda_release_graph_launch(&launch, record_elapsed);
+        }
+        series.launches.clear();
+    }
+    peak_graph_event_map.clear();
+}
+
+static void peak_cuda_clear_hook_pointers()
+{
+    hook_cuda_launch = NULL;
+    hook_cuda_launch_cooperative = NULL;
+    hook_cuda_launch_cooperative_multiple_device = NULL;
+    hook_cuda_launch_exc = NULL;
+    hook_cu_launch = NULL;
+    hook_cu_launch_cooperative = NULL;
+    hook_cu_launch_cooperative_multiple_device = NULL;
+    hook_cu_launch_ex = NULL;
+    hook_cuda_graph_launch = NULL;
+    hook_cu_graph_launch = NULL;
+}
+
+PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
+    PeakCudaInflightGuard in_flight;
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, stream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_kernel(func, gridDim, blockDim, args, sharedMem, stream);
-    cudaEventRecord(*end, stream);
+    peak_cuda_record_event(end, stream);
 
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -259,35 +454,31 @@ static cudaError_t peak_cuda_launch_kernel(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
     g_free(kernel_name);
 
     return result;
 }
 
-static cudaError_t peak_cuda_launch_cooperative_kernel(
+PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
+    PeakCudaInflightGuard in_flight;
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, stream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel(func, gridDim, blockDim, args, sharedMem, stream);
-    cudaEventRecord(*end, stream);
+    peak_cuda_record_event(end, stream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -295,39 +486,35 @@ static cudaError_t peak_cuda_launch_cooperative_kernel(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
     g_free(kernel_name);
 
     return result;
 }
 
-static cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
+PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
     struct cudaLaunchParams* launchParamsList, unsigned int numDevices, unsigned int flags)
 {
+    PeakCudaInflightGuard in_flight;
     const void* func = launchParamsList->func;
     dim3 gridDim = launchParamsList->gridDim;
     dim3 blockDim = launchParamsList->blockDim;
     cudaStream_t stream = launchParamsList->stream;
 
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, stream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel_multiple_device(launchParamsList, numDevices, flags);
-    cudaEventRecord(*end, stream);
+    peak_cuda_record_event(end, stream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -335,41 +522,37 @@ static cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
     g_free(kernel_name);
 
     return result;
 }
 
-static cudaError_t peak_cuda_launch_kernel_exc(
+PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel_exc(
     const cudaLaunchConfig_t* config,
     const void* func, void** args)
 {
+    PeakCudaInflightGuard in_flight;
     dim3 gridDim = config->gridDim;
     dim3 blockDim = config->blockDim;
     cudaStream_t stream = config->stream;
 
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     
 
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
     gulong block_size = blockDim.x * blockDim.y * blockDim.z;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, stream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_kernel_exc(config, func, args);
-    cudaEventRecord(*end, stream);
+    peak_cuda_record_event(end, stream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -377,41 +560,37 @@ static cudaError_t peak_cuda_launch_kernel_exc(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
     g_free(kernel_name);
 
     return result;
 }
 
-static CUresult peak_cu_launch_kernel(
+PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel(
     CUfunction func,
     unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra)
 {
+    PeakCudaInflightGuard in_flight;
     // Kernel Name Address Source
     // https://forums.developer.nvidia.com/t/how-to-get-a-kernel-functions-name-through-its-pointer/37427/2
     gchar* kernel_name = *(char**)((size_t)func + 8);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)hStream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_kernel(func, gridDimX, gridDimY, gridDimZ,
                                                 blockDimX, blockDimY, blockDimZ,
                                                 sharedMemBytes, hStream, kernelParams, extra);
-    cudaEventRecord(*end, (cudaStream_t)hStream);
+    peak_cuda_record_event(end, (cudaStream_t)hStream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -419,40 +598,36 @@ static CUresult peak_cu_launch_kernel(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
 
     return result;
 }
 
-static CUresult peak_cu_launch_cooperative_kernel(
+PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel(
     CUfunction func,
     unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams)
 {
+    PeakCudaInflightGuard in_flight;
     gchar* kernel_name = *(char**)((size_t)func + 8);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)hStream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_cooperative_kernel(
                                                 func, gridDimX, gridDimY, gridDimZ,
                                                 blockDimX, blockDimY, blockDimZ,
                                                 sharedMemBytes, hStream, kernelParams);
 
-    cudaEventRecord(*end, (cudaStream_t)hStream);
+    peak_cuda_record_event(end, (cudaStream_t)hStream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -460,19 +635,16 @@ static CUresult peak_cu_launch_cooperative_kernel(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
 
     return result;
 }
 
-static CUresult peak_cu_launch_cooperative_kernel_multiple_device(
+PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel_multiple_device(
     CUDA_LAUNCH_PARAMS* launchParamsList,
     unsigned int numDevices, unsigned int flags)
 {
+    PeakCudaInflightGuard in_flight;
     CUfunction func = launchParamsList->function;
     unsigned int gridDimX = launchParamsList->gridDimX;
     unsigned int gridDimY = launchParamsList->gridDimY;
@@ -483,21 +655,20 @@ static CUresult peak_cu_launch_cooperative_kernel_multiple_device(
     CUstream hStream = launchParamsList->hStream;
 
     gchar* kernel_name = *(char**)((size_t)func + 8);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)hStream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_cooperative_kernel_multiple_device(
                                     launchParamsList, numDevices, flags);
-    cudaEventRecord(*end, (cudaStream_t)hStream);
+    peak_cuda_record_event(end, (cudaStream_t)hStream);
 
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -505,19 +676,16 @@ static CUresult peak_cu_launch_cooperative_kernel_multiple_device(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
 
     return result;
 }
 
-static CUresult peak_cu_launch_kernel_ex(
+PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
     const CUlaunchConfig* config, CUfunction func, 
     void** kernelParams, void** extra)
 {
+    PeakCudaInflightGuard in_flight;
     unsigned int gridDimX = config->gridDimX;
     unsigned int gridDimY = config->gridDimY;
     unsigned int gridDimZ = config->gridDimZ;
@@ -527,20 +695,19 @@ static CUresult peak_cu_launch_kernel_ex(
     CUstream hStream = config->hStream;
 
     gchar* kernel_name = *(char**)((size_t)func + 8);
+    const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
     gulong total_threads = (gridDimX * blockDimX) * (gridDimY * blockDimY) * (gridDimZ * blockDimZ);
     gulong grid_size = gridDimX * gridDimY * gridDimZ;
     gulong block_size = blockDimX * blockDimY * blockDimZ;
 
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)hStream);
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_kernel_ex(config, func, kernelParams, extra);
-    cudaEventRecord(*end, (cudaStream_t)hStream);
+    peak_cuda_record_event(end, (cudaStream_t)hStream);
     
     KernelLaunchInfo info = {
-        .kernel_name = g_strdup(kernel_name),
+        .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
         .grid_size = grid_size,
         .block_size = block_size,
@@ -548,25 +715,20 @@ static CUresult peak_cu_launch_kernel_ex(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_kernel_event_map[kernel_name];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_kernel_launch(kernel_label, &info);
 
     return result;
 }
 
-static cudaError_t peak_cuda_graph_launch( 
+PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_graph_launch(
     cudaGraphExec_t graphExec, cudaStream_t stream)
 {
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)stream);
+    PeakCudaInflightGuard in_flight;
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)stream);
     cudaError_t result = original_cuda_graph_launch(graphExec, stream);
-    cudaEventRecord(*end, (cudaStream_t)stream);
+    peak_cuda_record_event(end, (cudaStream_t)stream);
     
     GraphLaunchInfo info = {
         .graph = graphExec,
@@ -574,25 +736,20 @@ static cudaError_t peak_cuda_graph_launch(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_graph_event_map[graphExec];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_graph_launch(graphExec, &info);
 
     return result;
 }
 
-static CUresult peak_cu_graph_launch( 
+PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_graph_launch(
     CUgraphExec hGraphExec, CUstream hStream)
 {
-    cudaEvent_t* start = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEvent_t* end = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    cudaEventCreate(start);
-    cudaEventCreate(end);
-    cudaEventRecord(*start, (cudaStream_t)hStream);
+    PeakCudaInflightGuard in_flight;
+    cudaEvent_t* start = peak_cuda_new_event_slot();
+    cudaEvent_t* end = peak_cuda_new_event_slot();
+    peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_graph_launch(hGraphExec, hStream);
-    cudaEventRecord(*end, (cudaStream_t)hStream);
+    peak_cuda_record_event(end, (cudaStream_t)hStream);
 
     GraphLaunchInfo info = {
         .graph = hGraphExec,
@@ -600,155 +757,279 @@ static CUresult peak_cu_graph_launch(
         .end_event = end,
         .result = (cudaError_t)result
     };
-    auto& series = peak_graph_event_map[hGraphExec];
-    {
-        std::lock_guard<std::mutex> lock(series.mtx);
-        series.launches.push_back(info);
-    }
+    peak_cuda_enqueue_graph_launch(hGraphExec, &info);
 
     return result;
 }
 
 extern "C" int cuda_interceptor_attach()
 {
+    std::lock_guard<std::mutex> lifecycle_lock(peak_cuda_lifecycle_mutex);
+    peak_cuda_accepting_events.store(false, std::memory_order_release);
     cuda_kernel_local_dim_mapping = g_hash_table_new_full(g_str_hash, str_equal_function, NULL, g_free);
     g_mutex_init(&cuda_kernel_local_dim_mapping_mutex);
-    cuda_graph_local_mapping = g_hash_table_new_full(g_direct_hash, g_int_equal, NULL, g_free);
+    cuda_graph_local_mapping = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     g_mutex_init(&cuda_graph_local_mapping_mutex);
 
     GumReplaceReturn replace_check = GUM_REPLACE_OK;
-    cuda_interceptor = gum_interceptor_obtain();
+    GumReplaceReturn hook_replace_check = GUM_REPLACE_OK;
+    if (cuda_interceptor == NULL) {
+        cuda_interceptor = gum_interceptor_obtain();
+    }
+    peak_cuda_hooks_reverted = FALSE;
+    peak_cuda_clear_hook_pointers();
 
     gum_interceptor_begin_transaction(cuda_interceptor);
 
     // Initialize cudaEvent_t array
-    peak_gpu_cuda_start_event_array = (cudaEvent_t*)malloc(sizeof(cudaEvent_t) * peak_gpu_hook_address_count);
-    peak_gpu_cuda_end_event_array = (cudaEvent_t*)malloc(sizeof(cudaEvent_t) * peak_gpu_hook_address_count);
+    peak_gpu_cuda_start_event_array = g_new0(cudaEvent_t, peak_gpu_hook_address_count);
+    peak_gpu_cuda_end_event_array = g_new0(cudaEvent_t, peak_gpu_hook_address_count);
     for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
-        cudaEventCreate(&peak_gpu_cuda_start_event_array[i]);
-        cudaEventCreate(&peak_gpu_cuda_end_event_array[i]);
+        if (cudaEventCreate(&peak_gpu_cuda_start_event_array[i]) != cudaSuccess) {
+            peak_gpu_cuda_start_event_array[i] = NULL;
+        }
+        if (cudaEventCreate(&peak_gpu_cuda_end_event_array[i]) != cudaSuccess) {
+            peak_gpu_cuda_end_event_array[i] = NULL;
+        }
     }
 
     hook_cuda_launch = (gpointer*) gum_find_function("cudaLaunchKernel");
     if (hook_cuda_launch) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch,
             (gpointer)&peak_cuda_launch_kernel,
             (gpointer*)&original_cuda_launch_kernel);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cuda_launch = NULL;
+        }
     }
     
     hook_cuda_launch_cooperative = (gpointer*) gum_find_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative,
             (gpointer)&peak_cuda_launch_cooperative_kernel,
             (gpointer*)&original_cuda_launch_cooperative_kernel);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cuda_launch_cooperative = NULL;
+        }
     }
 
     hook_cuda_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cudaLaunchCooperativeKernelMultiDevice");
     if (hook_cuda_launch_cooperative_multiple_device) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative_multiple_device,
             (gpointer)&peak_cuda_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cuda_launch_cooperative_multiple_device = NULL;
+        }
     }
 
     hook_cuda_launch_exc = (gpointer*) gum_find_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_exc,
             (gpointer)&peak_cuda_launch_kernel_exc,
             (gpointer*)&original_cuda_launch_kernel_exc);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cuda_launch_exc = NULL;
+        }
     }
 
     hook_cu_launch = (gpointer*) gum_find_function("cuLaunchKernel");
     if (hook_cu_launch) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch,
             (gpointer)&peak_cu_launch_kernel,
             (gpointer*)&original_cu_launch_kernel);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cu_launch = NULL;
+        }
     }
 
     hook_cu_launch_cooperative = (gpointer*) gum_find_function("cuLaunchCooperativeKernel");
     if (hook_cu_launch_cooperative) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative,
             (gpointer)&peak_cu_launch_cooperative_kernel,
             (gpointer*)&original_cu_launch_cooperative_kernel);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cu_launch_cooperative = NULL;
+        }
     }
 
     hook_cu_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cuLaunchCooperativeKernelMultiDevice");
     if (hook_cu_launch_cooperative_multiple_device) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative_multiple_device,
             (gpointer)&peak_cu_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cu_launch_cooperative_multiple_device = NULL;
+        }
     }
 
     hook_cu_launch_ex = (gpointer*) gum_find_function("cuLaunchKernelEx");
     if (hook_cu_launch_ex) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_ex,
             (gpointer)&peak_cu_launch_kernel_ex,
             (gpointer*)&original_cu_launch_kernel_ex);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cu_launch_ex = NULL;
+        }
     }
 
     hook_cuda_graph_launch = (gpointer*) gum_find_function("cudaGraphLaunch");
     if (hook_cuda_graph_launch) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_graph_launch,
             (gpointer)&peak_cuda_graph_launch,
             (gpointer*)&original_cuda_graph_launch);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cuda_graph_launch = NULL;
+        }
     }
 
     hook_cu_graph_launch = (gpointer*) gum_find_function("cuGraphLaunch");
     if (hook_cu_graph_launch) {
-        replace_check = gum_interceptor_replace_fast(
+        hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_graph_launch,
             (gpointer)&peak_cu_graph_launch,
             (gpointer*)&original_cu_graph_launch);
+        if (hook_replace_check != GUM_REPLACE_OK) {
+            if (replace_check == GUM_REPLACE_OK) {
+                replace_check = hook_replace_check;
+            }
+            hook_cu_graph_launch = NULL;
+        }
     }
     
     gum_interceptor_end_transaction(cuda_interceptor);
+    peak_cuda_accepting_events.store(true, std::memory_order_release);
 
     return replace_check;
 }
 
 extern "C" void cuda_interceptor_dettach()
 {
-    if (hook_cuda_launch) {
-        gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
+    std::lock_guard<std::mutex> lifecycle_lock(peak_cuda_lifecycle_mutex);
+    if (cuda_interceptor == NULL) {
+        return;
     }
-    if (hook_cuda_launch_cooperative) {
-        gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_cooperative);
+
+    peak_cuda_accepting_events.store(false, std::memory_order_release);
+    if (!peak_cuda_hooks_reverted) {
+        gum_interceptor_begin_transaction(cuda_interceptor);
+        if (hook_cuda_launch) {
+            gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
+        }
+        if (hook_cuda_launch_cooperative) {
+            gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_cooperative);
+        }
+        if (hook_cuda_launch_cooperative_multiple_device) {
+            gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_cooperative_multiple_device);
+        }
+        if (hook_cuda_launch_exc) {
+            gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_exc);
+        }
+        if (hook_cu_launch) {
+            gum_interceptor_revert(cuda_interceptor, hook_cu_launch);
+        }
+        if (hook_cu_launch_cooperative) {
+            gum_interceptor_revert(cuda_interceptor, hook_cu_launch_cooperative);
+        }
+        if (hook_cu_launch_cooperative_multiple_device) {
+            gum_interceptor_revert(cuda_interceptor, hook_cu_launch_cooperative_multiple_device);
+        }
+        if (hook_cu_launch_ex) {
+            gum_interceptor_revert(cuda_interceptor, hook_cu_launch_ex);
+        }
+        if (hook_cuda_graph_launch) {
+            gum_interceptor_revert(cuda_interceptor, hook_cuda_graph_launch);
+        }
+        if (hook_cu_graph_launch) {
+            gum_interceptor_revert(cuda_interceptor, hook_cu_graph_launch);
+        }
+        gum_interceptor_end_transaction(cuda_interceptor);
+
+        if (!gum_interceptor_flush(cuda_interceptor)) {
+            g_printerr("[peak] CUDA interceptor teardown did not flush; leaving CUDA interceptor state alive\n");
+            return;
+        }
+
+        peak_cuda_hooks_reverted = TRUE;
+        peak_cuda_clear_hook_pointers();
     }
-    if (hook_cuda_launch_cooperative_multiple_device) {
-        gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_cooperative_multiple_device);
+
+    unsigned int active_cuda_wrappers = peak_cuda_in_flight.load(std::memory_order_acquire);
+    if (active_cuda_wrappers != 0) {
+        g_printerr("[peak] CUDA interceptor teardown observed %u active wrapper(s); keeping Gum trampoline state alive\n",
+                   active_cuda_wrappers);
     }
-    if (hook_cuda_launch_exc) {
-        gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_exc);
+
+    peak_cuda_drain_kernel_event_map(FALSE);
+    peak_cuda_drain_graph_event_map(FALSE);
+
+    for (size_t i = 0; i < peak_gpu_hook_address_count; i++) {
+        if (peak_gpu_cuda_start_event_array != NULL &&
+            peak_gpu_cuda_start_event_array[i] != NULL) {
+            cudaEventDestroy(peak_gpu_cuda_start_event_array[i]);
+        }
+        if (peak_gpu_cuda_end_event_array != NULL &&
+            peak_gpu_cuda_end_event_array[i] != NULL) {
+            cudaEventDestroy(peak_gpu_cuda_end_event_array[i]);
+        }
     }
-    if (hook_cu_launch) {
-        gum_interceptor_revert(cuda_interceptor, hook_cu_launch);
+    g_free(peak_gpu_cuda_start_event_array);
+    g_free(peak_gpu_cuda_end_event_array);
+    peak_gpu_cuda_start_event_array = NULL;
+    peak_gpu_cuda_end_event_array = NULL;
+
+    if (cuda_kernel_local_dim_mapping != NULL) {
+        g_hash_table_destroy(cuda_kernel_local_dim_mapping);
+        cuda_kernel_local_dim_mapping = NULL;
+        g_mutex_clear(&cuda_kernel_local_dim_mapping_mutex);
     }
-    if (hook_cu_launch_cooperative) {
-        gum_interceptor_revert(cuda_interceptor, hook_cu_launch_cooperative);
+    if (cuda_graph_local_mapping != NULL) {
+        g_hash_table_destroy(cuda_graph_local_mapping);
+        cuda_graph_local_mapping = NULL;
+        g_mutex_clear(&cuda_graph_local_mapping_mutex);
     }
-    if (hook_cu_launch_cooperative_multiple_device) {
-        gum_interceptor_revert(cuda_interceptor, hook_cu_launch_cooperative_multiple_device);
-    }
-    if (hook_cu_launch_ex) {
-        gum_interceptor_revert(cuda_interceptor, hook_cu_launch_ex);
-    }
-    if (hook_cuda_graph_launch) {
-        gum_interceptor_revert(cuda_interceptor, hook_cuda_graph_launch);
-    }
-    if (hook_cu_graph_launch) {
-        gum_interceptor_revert(cuda_interceptor, hook_cu_graph_launch);
-    }
-    g_hash_table_destroy(cuda_kernel_local_dim_mapping);
-    peak_kernel_event_map.clear();
-    g_object_unref(cuda_interceptor);
+    /*
+     * Keep cuda_interceptor referenced after physical detach. A target thread may
+     * already be at a wrapper entry before PeakCudaInflightGuard executes, and
+     * that wrapper can still need Gum's original trampoline. Retaining this
+     * bounded state avoids a teardown race without delaying physical detach.
+     */
 }
 
 static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
@@ -931,6 +1212,59 @@ static void cuda_interceptor_print_graph_result(GHashTable* hashTable)
     }
 }
 
+static void cuda_interceptor_print_graph_mpi_result(const gint* ranks,
+                                                    CUgraphExec_st** graphs,
+                                                    const GraphRecordInfo* values,
+                                                    gint count)
+{
+    gboolean have_output = FALSE;
+    for (gint i = 0; i < count; i++) {
+        if (values[i].total_graph_call_cnt > 0) {
+            have_output = TRUE;
+            break;
+        }
+    }
+
+    if (have_output) {
+        const guint row_width = 112;
+        const guint max_col_width = 9;
+
+        char* row_separator = (char *) malloc(row_width + 1);
+        memset(row_separator, '-', row_width);
+        row_separator[row_width] = '\0';
+
+        g_printerr("\n%s\n", row_separator);
+        g_printerr("%*sGRAPH STATISTICS (GPU, MPI)%*s\n",
+            (row_width - 27) / 2, "",
+            (row_width - 27 + 1) / 2, "");
+        g_printerr("%s\n", row_separator);
+        g_printerr("| %*s | %*s | %*s | %*s | %*s | %*s |\n",
+            max_col_width, "Rank",
+            18, "Graph",
+            max_col_width, "Calls",
+            max_col_width, "Total(s)",
+            max_col_width, "Max(s)",
+            max_col_width, "Min(s)");
+        g_printerr("%s\n", row_separator);
+
+        for (gint i = 0; i < count; i++) {
+            if (values[i].total_graph_call_cnt == 0) {
+                continue;
+            }
+            g_printerr("| %*d | %18p | %*lu | %*.6f | %*.6f | %*.6f |\n",
+                max_col_width, ranks[i],
+                graphs[i],
+                max_col_width, values[i].total_graph_call_cnt,
+                max_col_width, values[i].total_time,
+                max_col_width, values[i].max_time,
+                max_col_width, values[i].min_time);
+        }
+        g_printerr("%s\n", row_separator);
+
+        free(row_separator);
+    }
+}
+
 #ifdef HAVE_MPI
 static void
 cuda_interceptor_reduce_kernel_result()
@@ -1100,11 +1434,6 @@ cuda_interceptor_reduce_graph_result()
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    GHashTable* cuda_graph_global_mapping = NULL;
-    if (world_rank == 0) {
-        cuda_graph_global_mapping = g_hash_table_new_full(g_direct_hash, g_int_equal, NULL, g_free);
-    }
-
     gint local_graph_count = g_hash_table_size(cuda_graph_local_mapping);
     gint local_key_size = local_graph_count * sizeof(CUgraphExec_st*);
     gint local_values_size = local_graph_count * sizeof(GraphRecordInfo);
@@ -1116,18 +1445,18 @@ cuda_interceptor_reduce_graph_result()
     guint index = 0;
     g_hash_table_iter_init(&iter, cuda_graph_local_mapping);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
-        keys[index] = *(CUgraphExec_st**) key;
+        keys[index] = (CUgraphExec_st*) key;
         values[index] = *(GraphRecordInfo*) value;
         index++;
     }
 
-    gulong global_graph_count = 0;
-    gulong* graph_count_array = NULL;
+    gint global_graph_count = 0;
+    gint* graph_count_array = NULL;
     gint* keys_buffer_array = NULL;
     gint* values_buffer_array = NULL;
     if (world_rank == 0) {
         global_graph_count = 0;
-        graph_count_array = g_new(gulong, world_size);
+        graph_count_array = g_new(gint, world_size);
         keys_buffer_array = g_new(gint, world_size);
         values_buffer_array = g_new(gint, world_size);
     }
@@ -1140,14 +1469,23 @@ cuda_interceptor_reduce_graph_result()
     gint *values_offset_array = NULL;
     CUgraphExec_st** global_keys_array = NULL;
     GraphRecordInfo* global_values_array = NULL;
+    gint* global_rank_array = NULL;
     
     if (world_rank == 0) {
         // Key
         global_keys_array = g_new(CUgraphExec_st*, global_graph_count);
+        global_rank_array = g_new(gint, global_graph_count);
         keys_offset_array = g_new(gint, world_size);
         keys_offset_array[0] = 0;
+        gint graph_offset = 0;
+        for (guint i = 0; i < (guint) graph_count_array[0]; i++) {
+            global_rank_array[graph_offset++] = 0;
+        }
         for (guint i = 1; i < world_size; i++) {
             keys_offset_array[i] = keys_offset_array[i-1] + keys_buffer_array[i-1];
+            for (guint j = 0; j < (guint) graph_count_array[i]; j++) {
+                global_rank_array[graph_offset++] = i;
+            }
         }
 
         // Value
@@ -1163,24 +1501,15 @@ cuda_interceptor_reduce_graph_result()
 
     if (world_rank == 0) {
         if (global_graph_count > 0) {
-            // aggregate value
-            for (guint i = 0; i < global_graph_count; i++) {
-                GraphRecordInfo* existing = (GraphRecordInfo*) g_hash_table_lookup(cuda_graph_global_mapping, global_keys_array[i]);
-                if (existing) {
-                    existing->total_graph_call_cnt += global_values_array[i].total_graph_call_cnt;
-                    existing->total_time += global_values_array[i].total_time;
-                    existing->max_time = max(existing->max_time, global_values_array[i].max_time);
-                    existing->min_time = min(existing->min_time, global_values_array[i].min_time);
-                } else {
-                    g_hash_table_insert(cuda_graph_global_mapping, global_keys_array[i], g_memdup2(&global_values_array[i], sizeof(GraphRecordInfo)));
-                }
-            }
-
-            cuda_interceptor_print_graph_result(cuda_graph_global_mapping);            
+            cuda_interceptor_print_graph_mpi_result(global_rank_array,
+                                                    global_keys_array,
+                                                    global_values_array,
+                                                    global_graph_count);
         }
 
         g_free(keys_offset_array);
         g_free(values_offset_array);
+        g_free(global_rank_array);
         g_free(global_keys_array);
         g_free(global_values_array);
     }
@@ -1188,7 +1517,6 @@ cuda_interceptor_reduce_graph_result()
     g_free(keys);
     g_free(values);
     if (world_rank == 0) {
-        g_hash_table_destroy(cuda_graph_global_mapping);
         g_free(graph_count_array);
         g_free(keys_buffer_array);
         g_free(values_buffer_array);
@@ -1198,42 +1526,17 @@ cuda_interceptor_reduce_graph_result()
 
 static void cuda_sync_kernel_event() {
     cudaDeviceSynchronize();
-    for (const auto& [_, series] : peak_kernel_event_map) {
-        for (const auto& launch : series.launches) {
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
-            if (launch.result == cudaSuccess) {
-                insert_cuda_mapping_record(
-                    launch.kernel_name,
-                    launch.total_threads,
-                    launch.grid_size,
-                    launch.block_size,
-                    ms / 1000.0
-                );
-            }
-            cudaEventDestroy(*(launch.start_event));
-            cudaEventDestroy(*(launch.end_event));
-            g_free(launch.kernel_name);
-            free(launch.start_event);
-            free(launch.end_event);
-        }
-    }
-    for (const auto& [_, series] : peak_graph_event_map) {
-        for (const auto& launch : series.launches) {
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, *(launch.start_event), *(launch.end_event));
-            if (launch.result == cudaSuccess) {
-                insert_cuda_graph_record(launch.graph, ms / 1000.0);
-            }
-            cudaEventDestroy(*(launch.start_event));
-            cudaEventDestroy(*(launch.end_event));
-            free(launch.start_event);
-            free(launch.end_event);
-        }
-    }
+    peak_cuda_drain_kernel_event_map(TRUE);
+    peak_cuda_drain_graph_event_map(TRUE);
 }
 
 extern "C" void cuda_interceptor_print(int is_MPI) {
+    std::lock_guard<std::mutex> lifecycle_lock(peak_cuda_lifecycle_mutex);
+    if (cuda_kernel_local_dim_mapping == NULL ||
+        cuda_graph_local_mapping == NULL) {
+        return;
+    }
+    peak_cuda_accepting_events.store(false, std::memory_order_release);
     cuda_sync_kernel_event();
     #ifdef HAVE_MPI
         if (is_MPI) {
@@ -1248,4 +1551,3 @@ extern "C" void cuda_interceptor_print(int is_MPI) {
         cuda_interceptor_print_graph_result(cuda_graph_local_mapping);
     #endif
 }
-

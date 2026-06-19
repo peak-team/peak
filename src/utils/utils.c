@@ -118,6 +118,7 @@ double median_double(double* arr, size_t n)
 
 // Hardcoded list of substrings, null-terminated
 static const char *check_list[] = {
+    "peak_detach_helper",   // Peak's out-of-process safe-detach helper
     "ibrun",                // TACC-specific launcher
     "mpirun",               // Generic MPI launcher (Open MPI, MPICH, etc.)
     "mpiexec",              // Alias for mpirun in many MPI distributions

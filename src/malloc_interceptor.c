@@ -29,7 +29,8 @@ static pthread_mutex_t     track_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t     caller_mutex = PTHREAD_MUTEX_INITIALIZER;
 static GumMetalHashTable*  track_table = NULL;
 static GumMetalHashTable*  memory_caller_target_table = NULL;
-static int                 cleanup_in_progress = 0;
+static _Atomic int         cleanup_in_progress = 0;
+static _Atomic int         active_alloc_hooks = 0;
 static gulong              max_memory = 0;
 static gulong              current_memory = 0;
 static gpointer            malloc_addr = NULL;
@@ -381,7 +382,7 @@ static void peak_memlog_finalize(void) {
 =========================*/
 
 static void add_tracking_entry(void* ptr, size_t size, int log) {
-    if (!track_table || cleanup_in_progress) return;
+    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return;
     if (!log) return;
 
     AllocationEntry* entry = internal_malloc(sizeof(AllocationEntry));
@@ -400,7 +401,7 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
 }
 
 static AllocationEntry* find_tracking_entry(void* ptr) {
-    if (!track_table || cleanup_in_progress) return NULL;
+    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return NULL;
 
     pthread_mutex_lock(&track_mutex);
     AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
@@ -413,7 +414,7 @@ static AllocationEntry* find_tracking_entry(void* ptr) {
 }
 
 static void remove_tracking_entry(void* ptr) {
-    if (!track_table || cleanup_in_progress) return;
+    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return;
 
     pthread_mutex_lock(&track_mutex);
     AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
@@ -452,11 +453,39 @@ static void init_table(void) {
   Custom alloc family (no logic changes)
 =========================*/
 
+static int malloc_hook_enter(void)
+{
+    if (in_peak_alloc_hook ||
+        atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
+        return 0;
+    }
+
+    atomic_fetch_add_explicit(&active_alloc_hooks, 1, memory_order_acquire);
+    if (atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
+        atomic_fetch_sub_explicit(&active_alloc_hooks, 1, memory_order_release);
+        return 0;
+    }
+    return 1;
+}
+
+static void malloc_hook_leave(void)
+{
+    atomic_fetch_sub_explicit(&active_alloc_hooks, 1, memory_order_release);
+}
+
+static int malloc_interceptor_wait_for_quiescence(void)
+{
+    for (unsigned int attempt = 0; attempt < 1000; attempt++) {
+        if (atomic_load_explicit(&active_alloc_hooks, memory_order_acquire) == 0) {
+            return 1;
+        }
+        usleep(1000);
+    }
+    return atomic_load_explicit(&active_alloc_hooks, memory_order_acquire) == 0;
+}
+
 static void* custom_malloc(size_t size) {
-    if (in_peak_alloc_hook) {
-        // If in_peak_alloc_hook is true, it means that the malloc is called by
-        // other peak intercepted memory allocation functions. To prevent logging error,
-        // we don't log here, just pass through.
+    if (!malloc_hook_enter()) {
         return original_malloc(size);
     }
 
@@ -468,17 +497,18 @@ static void* custom_malloc(size_t size) {
         add_tracking_entry(ptr, size, flag);
     }
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
 
     return ptr;
 }
 
 static void custom_free(void* ptr) {
-    if (in_peak_alloc_hook) {
+    if (!ptr) return;
+
+    if (!malloc_hook_enter()) {
         original_free(ptr);
         return;
     }
-
-    if (!ptr) return;
 
     int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
@@ -486,15 +516,17 @@ static void custom_free(void* ptr) {
     AllocationEntry* entry = find_tracking_entry(ptr);
     if (entry) remove_tracking_entry(ptr);
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
 }
 
 static void* custom_calloc(size_t nmemb, size_t size) {
-    if (in_peak_alloc_hook) {
+    if (!malloc_hook_enter()) {
         return original_calloc(nmemb, size);
     }
 
     if (size && nmemb > SIZE_MAX / size) {
         errno = ENOMEM;
+        malloc_hook_leave();
         return NULL;
     }
 
@@ -507,17 +539,38 @@ static void* custom_calloc(size_t nmemb, size_t size) {
         add_tracking_entry(ptr, total_size, flag);
     } 
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
 
     return ptr;
 }
 
 static void* custom_realloc(void* ptr, size_t size) {
-    if (in_peak_alloc_hook) {
+    if (!malloc_hook_enter()) {
         return original_realloc(ptr, size);
     }
 
-    if (!ptr) return custom_malloc(size);
-    if (!size) { custom_free(ptr); return NULL; }
+    if (!ptr) {
+        int hook_val = in_peak_alloc_hook;
+        in_peak_alloc_hook = 1;
+        void* new_ptr = original_malloc(size);
+        if (new_ptr) {
+            int flag = peak_log_backtrace_malloc();
+            add_tracking_entry(new_ptr, size, flag);
+        }
+        in_peak_alloc_hook = hook_val;
+        malloc_hook_leave();
+        return new_ptr;
+    }
+    if (!size) {
+        int hook_val = in_peak_alloc_hook;
+        in_peak_alloc_hook = 1;
+        original_free(ptr);
+        AllocationEntry* entry = find_tracking_entry(ptr);
+        if (entry) remove_tracking_entry(ptr);
+        in_peak_alloc_hook = hook_val;
+        malloc_hook_leave();
+        return NULL;
+    }
 
     int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
@@ -531,12 +584,13 @@ static void* custom_realloc(void* ptr, size_t size) {
         add_tracking_entry(new_ptr, size, flag);
     }
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
 
     return new_ptr;
 }
 
 static void* custom_aligned_alloc(size_t alignment, size_t size) {
-    if (in_peak_alloc_hook) {
+    if (!malloc_hook_enter()) {
         return original_aligned_alloc(alignment, size);
     }
 
@@ -548,12 +602,13 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
         add_tracking_entry(ptr, size, flag);
     }
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
 
     return ptr;
 }
 
 static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
-    if (in_peak_alloc_hook) {
+    if (!malloc_hook_enter()) {
         return original_posix_memalign(memptr, alignment, size);
     }
 
@@ -565,6 +620,7 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
         add_tracking_entry(*memptr, size, flag);
     }
     in_peak_alloc_hook = hook_val;
+    malloc_hook_leave();
     return ret;
 }
 
@@ -620,14 +676,23 @@ int malloc_interceptor_attach(void) {
 }
 
 void malloc_interceptor_detach(void) {
-    cleanup_in_progress = 1;
+    atomic_store_explicit(&cleanup_in_progress, 1, memory_order_release);
 
+    gum_interceptor_begin_transaction(malloc_interceptor);
     if (malloc_addr)        gum_interceptor_revert(malloc_interceptor, malloc_addr);
     if (free_addr)          gum_interceptor_revert(malloc_interceptor, free_addr);
     if (calloc_addr)        gum_interceptor_revert(malloc_interceptor, calloc_addr);
     if (realloc_addr)       gum_interceptor_revert(malloc_interceptor, realloc_addr);
     if (aligned_alloc_addr) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
     if (posix_memalign_addr)gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
+    gum_interceptor_end_transaction(malloc_interceptor);
+
+    if (!gum_interceptor_flush(malloc_interceptor) ||
+        !malloc_interceptor_wait_for_quiescence()) {
+        fprintf(stderr,
+                "Memory allocation interceptor teardown did not quiesce; leaving profiler state alive\n");
+        return;
+    }
 
     pthread_mutex_lock(&track_mutex);
     gum_metal_hash_table_unref(track_table);

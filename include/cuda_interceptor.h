@@ -15,6 +15,7 @@
 
 #ifdef __cplusplus
 #include "utils/cxx_utils.h"
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -75,4 +76,3 @@ void cuda_interceptor_print(int is_MPI);
 #endif
 
 #endif /* __CUDA_INTERCEPTOR_H */
-

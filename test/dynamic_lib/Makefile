@@ -1,5 +1,6 @@
-# Build matrix for A<->B and main, plus a CPython extension "customCpackage"
-# Requires Python dev headers (python3-config available)
+# Build matrix for A<->B and main, plus a CPython extension "customCpackage".
+# CMake passes Python flags when it owns the build; standalone make falls back
+# to python-config.
 CC      ?= gcc
 AR      ?= ar
 CFLAGS  ?= -O2 -fPIC -Wall -Wextra -fvisibility=hidden
@@ -8,9 +9,9 @@ RPATH   := -Wl,-rpath,'$$ORIGIN'
 
 # Python config
 PYTHON          ?= python3
-PY_INCLUDE      := $(shell $(PYTHON)-config --includes 2>/dev/null || $(PYTHON)-config --includes)
-PY_LDFLAGS      := $(shell $(PYTHON)-config --ldflags 2>/dev/null || $(PYTHON)-config --ldflags)
-PY_EXT_SUFFIX   := $(shell $(PYTHON) -c 'import sysconfig;print(sysconfig.get_config_var("EXT_SUFFIX") or "")')
+PY_INCLUDE      ?= $(shell $(PYTHON)-config --includes 2>/dev/null || $(PYTHON)-config --includes)
+PY_LDFLAGS      ?= $(shell $(PYTHON)-config --ldflags 2>/dev/null || $(PYTHON)-config --ldflags)
+PY_EXT_SUFFIX   ?= $(shell $(PYTHON) -c 'import sysconfig;print(sysconfig.get_config_var("EXT_SUFFIX") or "")')
 
 # Sources
 LIBA_SRC := libA.c

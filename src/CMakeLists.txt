@@ -6,6 +6,7 @@ FILE(GLOB sources_peak
     peak.c
     general_listener.c
     pthread_listener.c
+    peak_detach_controller.c
     syscall_interceptor.c
     dlopen_interceptor.c
     malloc_interceptor.c
@@ -58,6 +59,20 @@ else()
     )
 endif()
 
+if(PEAK_DETACH_HELPER_SUPPORTED)
+    add_executable(peak_detach_helper peak_detach_helper.c)
+    target_include_directories(peak_detach_helper
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(peak
+        PRIVATE
+            "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
+            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_PREFIX}/bin/peak_detach_helper\""
+    )
+    add_dependencies(peak peak_detach_helper)
+endif()
+
 target_include_directories(peak
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include
@@ -65,6 +80,10 @@ target_include_directories(peak
         ${LIBIBERTY_INCLUDE_DIR}
         ${OTF2_INCLUDE_DIRS}
 )
+
+if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+    target_compile_definitions(peak PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
+endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
 target_include_directories(cuda_interceptor_obj
@@ -124,4 +143,7 @@ elseif(CUDAToolkit_FOUND)
     target_link_options(peak PRIVATE -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR})
 endif()
 
-install (TARGETS peak DESTINATION lib)
+install(TARGETS peak DESTINATION lib)
+if(TARGET peak_detach_helper)
+    install(TARGETS peak_detach_helper DESTINATION bin)
+endif()

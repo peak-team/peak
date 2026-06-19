@@ -23,20 +23,8 @@ def load_library(lib_candidates, mode=None):
     raise OSError(f"Failed to load any of {lib_candidates}: {last_err}")
 
 # ---- Call helpers for libA exports ----
-def call_a_dynamic_calls_b_dynamic(libA):
-    fn = libA.a_dynamic_calls_b_dynamic
-    fn.argtypes = []
-    fn.restype  = None
-    fn()
-
-def call_a_dynamic_calls_a_static(libA):
-    fn = libA.a_dynamic_calls_a_static
-    fn.argtypes = []
-    fn.restype  = None
-    fn()
-
-def call_a_test_try_resolve_b_static(libA):
-    fn = libA.a_test_try_resolve_b_static
+def call_a_call(libA):
+    fn = libA.a_call
     fn.argtypes = []
     fn.restype  = None
     fn()
@@ -54,11 +42,10 @@ def main():
                    help="Seconds to sleep before first dlopen (default 0.5).")
     p.add_argument("--which", default="A", choices=["A","B","both"],
                    help="Which library API to exercise: libA, libB, or both. Default=A.")
-    p.add_argument("--a-funcs", default="all",
-                   help="Comma list from {adb, aas, arst}. "
-                        "adb=a_dynamic_calls_b_dynamic, "
-                        "aas=a_dynamic_calls_a_static, "
-                        "arst=a_test_try_resolve_b_static. Default=all.")
+    p.add_argument("--a-variant", default="dynB", choices=["dynB","staB"],
+                   help="Which libA shared-library variant to load. Default=dynB.")
+    p.add_argument("--duration", type=float, default=0.0,
+                   help="Loop calls until this many seconds have elapsed. Default calls once.")
     p.add_argument("--b-func", default="b_dynamic",
                    help="Function in libB to call (currently only b_dynamic).")
     args = p.parse_args()
@@ -72,26 +59,17 @@ def main():
     mode = None
 
     if args.which in ("A", "both"):
-        # Load libA (this will, on first call, dlopen libB internally)
-        libA, chosenA = load_library(["./libA.so", "libA.so"], mode=mode)
+        libA_name = "libA_dynB.so" if args.a_variant == "dynB" else "libA_staB.so"
+        libA, chosenA = load_library([f"./{libA_name}", libA_name], mode=mode)
         print(f"[py] dlopen success: {chosenA}")
 
-        # Decide which A functions to call
-        if args.a_funcs == "all":
-            a_calls = ["adb", "aas", "arst"]
-        else:
-            a_calls = [x.strip() for x in args.a_funcs.split(",") if x.strip()]
-
-        print(f"[py] calling libA funcs: {a_calls}")
-        for tag in a_calls:
-            if tag == "adb":
-                call_a_dynamic_calls_b_dynamic(libA)
-            elif tag == "aas":
-                call_a_dynamic_calls_a_static(libA)
-            elif tag == "arst":
-                call_a_test_try_resolve_b_static(libA)
-            else:
-                print(f"[py] unknown libA func tag: {tag}", file=sys.stderr)
+        print("[py] calling libA.a_call()")
+        deadline = time.time() + args.duration
+        calls = 0
+        while calls == 0 or time.time() < deadline:
+            call_a_call(libA)
+            calls += 1
+        print(f"[py] libA.a_call calls={calls}")
 
     if args.which in ("B", "both"):
         # Load libB directly and call its exported function
