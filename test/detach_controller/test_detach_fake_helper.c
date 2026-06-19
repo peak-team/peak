@@ -106,6 +106,25 @@ log_command(const char* command)
     fclose(fp);
 }
 
+static long
+env_long_default(const char* name, long fallback)
+{
+    const char* value = getenv(name);
+    char* end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return fallback;
+    }
+    return parsed;
+}
+
 static int
 drain_instructions(int fd, uint32_t instruction_count)
 {
@@ -139,6 +158,9 @@ main(int argc, char** argv)
     if (scenario == NULL) {
         scenario = "stop-permission";
     }
+    long resume_count = 0;
+    long fail_resume_index =
+        env_long_default("FAKE_DETACH_HELPER_FAIL_RESUME_INDEX", 0);
 
     if (!environment_is_sanitized()) {
         (void)send_response((int)fd,
@@ -266,13 +288,17 @@ main(int argc, char** argv)
             log_command(request.command == PEAK_DETACH_HELPER_CMD_RESUME
                             ? "RESUME"
                             : "SHUTDOWN");
-            if (request.command == PEAK_DETACH_HELPER_CMD_RESUME &&
-                strcmp(scenario, "resume-release-failed") == 0) {
-                (void)send_response((int)fd,
-                                    PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED,
-                                    EIO,
-                                    0);
-                continue;
+            if (request.command == PEAK_DETACH_HELPER_CMD_RESUME) {
+                resume_count++;
+                if (strcmp(scenario, "resume-release-failed") == 0 &&
+                    (fail_resume_index <= 0 ||
+                     resume_count == fail_resume_index)) {
+                    (void)send_response((int)fd,
+                                        PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED,
+                                        EIO,
+                                        0);
+                    continue;
+                }
             }
             (void)send_response((int)fd,
                                 PEAK_DETACH_HELPER_STATUS_OK,

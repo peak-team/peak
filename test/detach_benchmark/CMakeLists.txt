@@ -1,5 +1,16 @@
 add_executable(test_detach_hotloop test_detach_hotloop.c)
-target_link_libraries(test_detach_hotloop PRIVATE Threads::Threads)
+target_include_directories(test_detach_hotloop
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${FRIDA_GUM_INCLUDE_DIRS}
+)
+if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  target_compile_definitions(test_detach_hotloop PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
+endif()
+target_link_libraries(test_detach_hotloop PRIVATE Threads::Threads ${DL_LIBRARY})
+if(MPI_C_FOUND)
+  target_link_libraries(test_detach_hotloop PRIVATE MPI::MPI_C)
+endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_detach_hotloop PRIVATE -Wl,--export-dynamic)
 endif()

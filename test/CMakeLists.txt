@@ -166,6 +166,34 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 45
                 PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
+        if(TARGET test_detach_fake_helper)
+            add_test(NAME test_detach_hotloop_batch_retry_preserves_pending_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_benchmark/test_detach_hotloop
+                        --controller-batch-retry-check)
+            set_tests_properties(test_detach_hotloop_batch_retry_preserves_pending_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
+                    TIMEOUT 30)
+        endif()
+        add_test(NAME test_detach_hotloop_batch_reattach_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_benchmark/run_detach_hotloop_stress.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_benchmark/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 3
+                    --samples 1
+                    --timeout 45
+                    --paired-targets
+                    --overhead-ratio 0.01
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-batch-reattach-trace
+                    --require-detach-batch-size 2
+                    --require-reattach-batch-size 2)
+        set_tests_properties(test_detach_hotloop_batch_reattach_strict
+            PROPERTIES
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
         add_test(NAME test_detach_hotloop_reattach_stress
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_benchmark/run_detach_hotloop_stress.py

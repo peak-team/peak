@@ -10,8 +10,8 @@
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
 
-GumInterceptor* interceptor;
-GumInvocationListener** array_listener;
+PEAK_API GumInterceptor* interceptor;
+PEAK_API GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
 static gboolean* array_listener_reattached;
 static gboolean* array_listener_gum_detached;
@@ -26,7 +26,7 @@ extern gboolean* peak_detached;
 extern gdouble* heartbeat_overhead;
 extern gboolean** peak_target_thread_called;
 extern unsigned int check_interval;
-gpointer* hook_address = NULL;
+PEAK_API gpointer* hook_address = NULL;
 static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
@@ -61,6 +61,7 @@ static const double peak_controller_retry_base_delay = 0.001;
 static const double peak_controller_retry_max_delay = 0.050;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static size_t peak_general_controller_batch_cursor = 0;
+static unsigned int peak_general_controller_next_batch_id = 1;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
 typedef struct {
@@ -119,7 +120,8 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                                               unsigned int retry_count,
                                               double pending_age_s,
                                               unsigned int batch_size,
-                                              double stop_window_us)
+                                              double stop_window_us,
+                                              unsigned int batch_id)
 {
     const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
     FILE* fp;
@@ -132,7 +134,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f\n",
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u\n",
                 peak_second(),
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
@@ -146,7 +148,8 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 retry_count,
                 pending_age_s,
                 batch_size,
-                stop_window_us);
+                stop_window_us,
+                batch_id);
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
@@ -170,7 +173,22 @@ peak_general_controller_trace_mutation(size_t hook_id,
                                                       : 0,
                                                   0.0,
                                                   1,
-                                                  0.0);
+                                                  0.0,
+                                                  0);
+}
+
+static unsigned int
+peak_general_controller_allocate_batch_id_unlocked(void)
+{
+    unsigned int batch_id = peak_general_controller_next_batch_id++;
+
+    if (batch_id == 0) {
+        batch_id = peak_general_controller_next_batch_id++;
+    }
+    if (peak_general_controller_next_batch_id == 0) {
+        peak_general_controller_next_batch_id = 1;
+    }
+    return batch_id;
 }
 
 static gboolean
@@ -1446,6 +1464,7 @@ peak_general_controller_process_pending_batch_unlocked(void)
     size_t prepared_count = 0;
     double now = peak_second();
     double stop_window_us = 0.0;
+    unsigned int batch_id = 0;
     PeakDetachStatus batch_status = PEAK_DETACH_STATUS_ERROR;
     gboolean mutation_ok[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
     GumAttachReturn attach_status[PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES];
@@ -1459,6 +1478,7 @@ peak_general_controller_process_pending_batch_unlocked(void)
     if (candidate_count == 0) {
         return FALSE;
     }
+    batch_id = peak_general_controller_allocate_batch_id_unlocked();
     for (size_t i = 0; i < candidate_count; i++) {
         mutation_ok[i] = TRUE;
         attach_status[i] = GUM_ATTACH_OK;
@@ -1538,7 +1558,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
                     0,
                     candidates[i].pending_age_s,
                     (unsigned int)candidate_count,
-                    stop_window_us);
+                    stop_window_us,
+                    batch_id);
                 continue;
             }
 
@@ -1557,7 +1578,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
                     0,
                     candidates[i].pending_age_s,
                     (unsigned int)candidate_count,
-                    stop_window_us);
+                    stop_window_us,
+                    batch_id);
                 peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
                 peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                            PEAK_HOOK_DETACHED);
@@ -1579,7 +1601,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
                 0,
                 candidates[i].pending_age_s,
                 (unsigned int)candidate_count,
-                stop_window_us);
+                stop_window_us,
+                batch_id);
         }
     }
 
@@ -1603,7 +1626,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
             peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0,
             candidates[i].pending_age_s,
             (unsigned int)candidate_count,
-            stop_window_us);
+            stop_window_us,
+            batch_id);
     }
 
     return prepared_count > 0;

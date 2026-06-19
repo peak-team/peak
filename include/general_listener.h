@@ -27,6 +27,12 @@
 #include "utils/utils.h"
 #include "utils/cxx_utils.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_API __attribute__((visibility("default")))
+#else
+#define PEAK_API
+#endif
+
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
 #define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type())
@@ -114,7 +120,7 @@ gboolean peak_general_listener_dettach();
  * This is separated from detach so final statistics can be printed after
  * pending target hook state transitions have stopped.
  */
-void peak_general_listener_controller_stop(void);
+PEAK_API void peak_general_listener_controller_stop(void);
 
 /**
  * @brief Processes pending detach/reattach requests for a bounded interval.
@@ -123,7 +129,7 @@ void peak_general_listener_controller_stop(void);
  * A FALSE result means the caller should keep teardown conservative because at
  * least one transition could not be proven safe before the deadline.
  */
-gboolean peak_general_listener_controller_drain(unsigned int timeout_ms);
+PEAK_API gboolean peak_general_listener_controller_drain(unsigned int timeout_ms);
 
 /**
  * @brief Acquires the general listener controller lock.
@@ -162,7 +168,7 @@ void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id);
  * @param hook_id Index of the hooked function.
  * @return TRUE if the request is accepted or already pending.
  */
-gboolean peak_general_listener_request_detach(size_t hook_id);
+PEAK_API gboolean peak_general_listener_request_detach(size_t hook_id);
 
 /**
  * @brief Requests controller-owned reattach for a detached hooked function.
@@ -173,7 +179,7 @@ gboolean peak_general_listener_request_detach(size_t hook_id);
  * @param hook_id Index of the hooked function.
  * @return TRUE if the request is accepted or already pending.
  */
-gboolean peak_general_listener_request_reattach(size_t hook_id);
+PEAK_API gboolean peak_general_listener_request_reattach(size_t hook_id);
 
 /**
  * @brief Returns the current controller-facing state for a hooked function.
@@ -181,7 +187,7 @@ gboolean peak_general_listener_request_reattach(size_t hook_id);
  * @param hook_id Index of the hooked function.
  * @return Current hook state, or PEAK_HOOK_UNRESOLVED for invalid/unpublished hooks.
  */
-PeakHookState peak_general_listener_hook_state(size_t hook_id);
+PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 
 /**
  * @brief Monitors the heartbeat of the Peak profiling system.

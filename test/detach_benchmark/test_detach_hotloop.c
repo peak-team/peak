@@ -1,4 +1,8 @@
 #define _GNU_SOURCE
+#include "frida-gum.h"
+#include "general_listener.h"
+
+#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -110,6 +114,228 @@ parse_long_arg(int argc, char** argv, const char* name, long fallback)
     return fallback;
 }
 
+static void*
+required_symbol(const char* name)
+{
+    void* symbol = dlsym(RTLD_DEFAULT, name);
+
+    if (symbol == NULL) {
+        fprintf(stderr, "missing required symbol %s: %s\n", name, dlerror());
+    }
+    return symbol;
+}
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+typedef gboolean (*PeakRequestDetachFn)(size_t hook_id);
+typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
+typedef void (*PeakControllerStopFn)(void);
+typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
+
+static int
+parse_csv_line(char* line, char** fields, size_t field_count)
+{
+    size_t count = 0;
+    char* saveptr = NULL;
+    char* token = strtok_r(line, ",\r\n", &saveptr);
+
+    while (token != NULL && count < field_count) {
+        fields[count++] = token;
+        token = strtok_r(NULL, ",\r\n", &saveptr);
+    }
+    return (int)count;
+}
+
+static int
+find_retry_batch_id(const char* trace_path, char* batch_id, size_t batch_id_size)
+{
+    FILE* fp = fopen(trace_path, "r");
+    char line[1024];
+
+    if (fp == NULL) {
+        perror("fopen trace");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[12];
+        int count = parse_csv_line(line, fields, 12);
+
+        if (count >= 12 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "prepare-failed") == 0 &&
+            strcmp(fields[6], "classify-failed") == 0 &&
+            atoi(fields[7]) > 0 &&
+            atoi(fields[9]) >= 2 &&
+            strcmp(fields[11], "0") != 0) {
+            snprintf(batch_id, batch_id_size, "%s", fields[11]);
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int
+trace_proves_retry_preservation(const char* trace_path, const char* retry_batch_id)
+{
+    FILE* fp = fopen(trace_path, "r");
+    char line[1024];
+    int peer_succeeded_in_retry_batch = 0;
+    int target_succeeded_later = 0;
+
+    if (fp == NULL) {
+        perror("fopen trace");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[12];
+        int count = parse_csv_line(line, fields, 12);
+
+        if (count < 12) {
+            continue;
+        }
+
+        if (strcmp(fields[2], "peak_detach_hot_target_two") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "success") == 0 &&
+            strcmp(fields[5], "1") == 0 &&
+            strcmp(fields[6], "safe") == 0 &&
+            atoi(fields[9]) >= 2 &&
+            strcmp(fields[11], retry_batch_id) == 0) {
+            peer_succeeded_in_retry_batch = 1;
+        }
+
+        if (strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "success") == 0 &&
+            strcmp(fields[5], "1") == 0 &&
+            strcmp(fields[6], "safe") == 0 &&
+            strcmp(fields[11], retry_batch_id) != 0 &&
+            atof(fields[8]) > 0.0) {
+            target_succeeded_later = 1;
+        }
+    }
+
+    fclose(fp);
+    if (!peer_succeeded_in_retry_batch) {
+        fprintf(stderr, "missing peer success in retry batch %s\n", retry_batch_id);
+    }
+    if (!target_succeeded_later) {
+        fprintf(stderr, "missing later retried success for peak_detach_hot_target\n");
+    }
+    return peer_succeeded_in_retry_batch && target_succeeded_later;
+}
+
+static int
+run_controller_batch_retry_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    GumInvocationListener* original_listener = NULL;
+    char retry_batch_id[32];
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+
+    if (*hook_count < 2 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*listeners_slot)[1] == NULL ||
+        (*hook_addresses_slot)[0] == NULL ||
+        (*hook_addresses_slot)[1] == NULL) {
+        fprintf(stderr, "preloaded PEAK hooks are not initialized for two targets\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED ||
+        hook_state(1) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected both hooks to start attached\n");
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    unlink(trace_path);
+
+    controller_stop();
+    if (!request_detach(0) || !request_detach(1)) {
+        fprintf(stderr, "failed to queue both detach requests\n");
+        return 2;
+    }
+
+    original_listener = (*listeners_slot)[0];
+    (*listeners_slot)[0] = (*listeners_slot)[1];
+    if (controller_drain(0)) {
+        (*listeners_slot)[0] = original_listener;
+        fprintf(stderr, "first poisoned drain unexpectedly cleared all pending work\n");
+        return 2;
+    }
+    (*listeners_slot)[0] = original_listener;
+    if (hook_state(0) != PEAK_HOOK_DETACHED ||
+        hook_state(1) != PEAK_HOOK_DETACHED) {
+        if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED ||
+            hook_state(1) != PEAK_HOOK_DETACHED) {
+            fprintf(stderr,
+                    "expected poisoned hook pending and peer detached after first batch\n");
+            return 2;
+        }
+    }
+    if (!controller_drain(1000)) {
+        fprintf(stderr, "controller did not drain restored retry batch\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED ||
+        hook_state(1) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected both hooks detached after restored retry drain\n");
+        return 2;
+    }
+    if (!find_retry_batch_id(trace_path, retry_batch_id, sizeof(retry_batch_id))) {
+        fprintf(stderr, "missing retryable prepare-failed batch trace\n");
+        return 2;
+    }
+    if (!trace_proves_retry_preservation(trace_path, retry_batch_id)) {
+        return 2;
+    }
+
+    printf("controller_batch_retry_ok batch_id=%s\n", retry_batch_id);
+    return 0;
+}
+#else
+static int
+run_controller_batch_retry_check(void)
+{
+    fprintf(stderr, "controller batch retry check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+#endif
+
 static int
 start_gate_init(StartGate* gate, long expected)
 {
@@ -160,6 +386,10 @@ start_gate_destroy(StartGate* gate)
 int
 main(int argc, char** argv)
 {
+    if (has_flag_arg(argc, argv, "--controller-batch-retry-check")) {
+        return run_controller_batch_retry_check();
+    }
+
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
