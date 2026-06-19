@@ -175,6 +175,18 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
                     TIMEOUT 30)
+            foreach(_unsupported_gum_pc_case IN ITEMS on-enter-plus-one on-leave on-invoke enter-thunk)
+                add_test(NAME test_detach_hotloop_unsupported_gum_pc_${_unsupported_gum_pc_case}_preserves_pending_strict
+                    COMMAND ${PROJECT_BINARY_DIR}/test/detach_benchmark/test_detach_hotloop
+                            --controller-unsupported-gum-pc-retry-check
+                            --unsupported-gum-pc-case ${_unsupported_gum_pc_case})
+                set_tests_properties(test_detach_hotloop_unsupported_gum_pc_${_unsupported_gum_pc_case}_preserves_pending_strict
+                    PROPERTIES
+                        ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_benchmark/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-trace.csv;${PRELOAD_VAR}"
+                        PASS_REGULAR_EXPRESSION "controller_unsupported_gum_pc_retry_ok"
+                        SKIP_RETURN_CODE 77
+                        TIMEOUT 30)
+            endforeach()
         endif()
         add_test(NAME test_detach_hotloop_batch_reattach_strict
             COMMAND ${Python3_EXECUTABLE}

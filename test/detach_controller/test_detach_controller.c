@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -519,6 +520,114 @@ set_fake_helper_env_default(const char* default_scenario, const char* log_path)
     }
     return 0;
 }
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static int
+set_fake_helper_pointer_env(const char* name, gpointer pointer)
+{
+    char value[2 + sizeof(uintptr_t) * 2 + 1];
+
+    snprintf(value, sizeof(value), "0x%" PRIxPTR, (uintptr_t)pointer);
+    return setenv(name, value, 1);
+}
+
+static int
+set_fake_helper_uint_env(const char* name, guint value)
+{
+    char text[32];
+
+    snprintf(text, sizeof(text), "%u", value);
+    return setenv(name, text, 1);
+}
+
+static int
+set_fake_helper_hex_bytes_env(const char* name,
+                              const guint8* bytes,
+                              guint byte_count)
+{
+    char text[GUM_PEAK_MAX_PROLOGUE_SIZE * 2 + 1];
+
+    if (byte_count > GUM_PEAK_MAX_PROLOGUE_SIZE) {
+        return -1;
+    }
+    for (guint i = 0; i < byte_count; i++) {
+        snprintf(&text[i * 2], sizeof(text) - i * 2, "%02x", bytes[i]);
+    }
+    text[byte_count * 2] = '\0';
+    return setenv(name, text, 1);
+}
+
+static int
+resolve_fake_helper_gum_pc_case(const char* pc_case,
+                                const GumPeakPcDiagnostics* diagnostics,
+                                gpointer* pc_out,
+                                gboolean* expect_prepared_out)
+{
+    if (pc_case == NULL || pc_case[0] == '\0') {
+        pc_case = "on-enter";
+    }
+
+    if (strcmp(pc_case, "on-enter") == 0) {
+        if (diagnostics->on_enter_trampoline == NULL) {
+            fprintf(stderr, "on-enter diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->on_enter_trampoline;
+        *expect_prepared_out = TRUE;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-enter-plus-one") == 0) {
+        gpointer pc;
+
+        if (diagnostics->on_enter_trampoline == NULL ||
+            diagnostics->on_leave_trampoline == NULL ||
+            (uintptr_t)diagnostics->on_enter_trampoline + 1 >=
+                (uintptr_t)diagnostics->on_leave_trampoline) {
+            fprintf(stderr, "on-enter-plus-one diagnostic PC unavailable\n");
+            return 0;
+        }
+        pc = (gpointer)((guint8*)diagnostics->on_enter_trampoline + 1);
+        *pc_out = pc;
+        *expect_prepared_out = FALSE;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-leave") == 0) {
+        if (diagnostics->on_leave_trampoline == NULL) {
+            fprintf(stderr, "on-leave diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->on_leave_trampoline;
+        *expect_prepared_out = FALSE;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-invoke") == 0) {
+        if (diagnostics->on_invoke_trampoline == NULL) {
+            fprintf(stderr, "on-invoke diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->on_invoke_trampoline;
+        *expect_prepared_out = FALSE;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "enter-thunk") == 0) {
+        if (diagnostics->enter_thunk_start == NULL ||
+            diagnostics->enter_thunk_size == 0) {
+            fprintf(stderr, "enter-thunk diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->enter_thunk_start;
+        *expect_prepared_out = FALSE;
+        return 1;
+    }
+
+    fprintf(stderr, "unknown Gum PC corridor case: %s\n", pc_case);
+    return -1;
+}
+#endif
 
 static int
 run_strict_helper_empty(void)
@@ -1698,6 +1807,225 @@ run_invalid(void)
 }
 
 static int
+run_fake_helper_gum_pc_corridor(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-gum-pc-corridor requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    const char* pc_case = getenv("FAKE_DETACH_CONTROLLER_GUM_PC_CASE");
+    char log_template[] = "/tmp/peak_fake_helper_gum_pc_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+    GumPeakPcDiagnostics diagnostics;
+    guint8 active_patch[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 original_prologue[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint prologue_len = 0;
+    gpointer stop_pc = NULL;
+    gboolean expect_prepared = FALSE;
+    int resolved;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "synthetic-stop", 1) != 0 ||
+        setenv("FAKE_DETACH_HELPER_LOG", log_template, 1) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+
+    check_true("Gum corridor diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(
+                   interceptor,
+                   (gpointer)strict_helper_target,
+                   listener,
+                   &diagnostics) == TRUE);
+    if (failures != 0) {
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    resolved = resolve_fake_helper_gum_pc_case(pc_case,
+                                               &diagnostics,
+                                               &stop_pc,
+                                               &expect_prepared);
+    if (resolved < 0) {
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+    if (resolved == 0) {
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return 77;
+    }
+    if (set_fake_helper_pointer_env("FAKE_DETACH_HELPER_STOP_PC",
+                                    stop_pc) != 0 ||
+        setenv("FAKE_DETACH_HELPER_STOP_TID", "target-pid", 1) != 0) {
+        perror("setenv");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    if (expect_prepared) {
+        check_true("Gum corridor function patch",
+                   gum_interceptor_peak_get_function_patch(
+                       interceptor,
+                       (gpointer)strict_helper_target,
+                       listener,
+                       active_patch,
+                       original_prologue,
+                       &prologue_len) == TRUE);
+        check_true("Gum corridor function patch length",
+                   prologue_len > 0 &&
+                       prologue_len <= GUM_PEAK_MAX_PROLOGUE_SIZE);
+        if (failures != 0) {
+            gum_interceptor_detach(interceptor, listener);
+            gum_interceptor_flush(interceptor);
+            g_object_unref(listener);
+            g_object_unref(interceptor);
+            gum_deinit_embedded();
+            unlink(log_template);
+            return EXIT_FAILURE;
+        }
+        if (setenv("FAKE_DETACH_HELPER_EXPECT_EVACUATE_ACTIONS",
+                   "SET_PC,WRITE_MEMORY",
+                   1) != 0 ||
+            setenv("FAKE_DETACH_HELPER_EXPECT_SET_PC_TID",
+                   "target-pid",
+                   1) != 0 ||
+            set_fake_helper_pointer_env("FAKE_DETACH_HELPER_EXPECT_SET_PC",
+                                        (gpointer)strict_helper_target) != 0 ||
+            set_fake_helper_pointer_env("FAKE_DETACH_HELPER_EXPECT_WRITE_ADDRESS",
+                                        (gpointer)strict_helper_target) != 0 ||
+            set_fake_helper_uint_env("FAKE_DETACH_HELPER_EXPECT_WRITE_SIZE",
+                                     prologue_len) != 0 ||
+            set_fake_helper_hex_bytes_env(
+                "FAKE_DETACH_HELPER_EXPECT_WRITE_BYTES_HEX",
+                original_prologue,
+                prologue_len) != 0) {
+            perror("setenv");
+            gum_interceptor_detach(interceptor, listener);
+            gum_interceptor_flush(interceptor);
+            g_object_unref(listener);
+            g_object_unref(interceptor);
+            gum_deinit_embedded();
+            unlink(log_template);
+            return EXIT_FAILURE;
+        }
+    } else {
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_EVACUATE_ACTIONS");
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_SET_PC");
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_SET_PC_TID");
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_WRITE_ADDRESS");
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_WRITE_SIZE");
+        unsetenv("FAKE_DETACH_HELPER_EXPECT_WRITE_BYTES_HEX");
+    }
+
+    PeakDetachRequest request = {
+        .hook_id = 111,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    if (expect_prepared) {
+        check_prepare("Gum exact on-enter corridor",
+                      &request,
+                      TRUE,
+                      PEAK_DETACH_STATUS_SAFE);
+        check_true("Gum exact on-enter holds helper threads",
+                   peak_detach_controller_threads_are_held() == TRUE);
+        check_true("Gum exact on-enter uses physical patch",
+                   peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+        check_finish("Gum exact on-enter finish",
+                     &request,
+                     PEAK_DETACH_STATUS_SAFE);
+        check_true("Gum exact on-enter released helper threads",
+                   peak_detach_controller_threads_are_held() == FALSE);
+    } else {
+        check_prepare("Gum unsupported PC fails closed",
+                      &request,
+                      FALSE,
+                      PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+        check_true("Gum unsupported PC leaves no held mutation",
+                   peak_detach_controller_threads_are_held() == FALSE);
+        check_true("Gum unsupported PC leaves no physical mutation",
+                   peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
+    }
+
+    check_true("Gum corridor helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+    check_status("Gum corridor helper shutdown status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+
+    check_helper_log_count(log_template, "START", 1);
+    check_helper_log_count(log_template, "STOP", 1);
+    check_helper_log_count(log_template,
+                           "EVACUATE",
+                           expect_prepared ? 1 : 0);
+    check_helper_log_count(log_template, "RESUME", 1);
+    check_helper_log_count(log_template, "SHUTDOWN", 1);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_fake_helper_fail_closed(void)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
@@ -1788,7 +2116,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-fail-closed\n",
+                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-fail-closed\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -1828,6 +2156,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "invalid") == 0) {
         return run_invalid();
+    }
+    if (strcmp(argv[1], "fake-helper-gum-pc-corridor") == 0) {
+        return run_fake_helper_gum_pc_corridor();
     }
     if (strcmp(argv[1], "fake-helper-fail-closed") == 0) {
         return run_fake_helper_fail_closed();

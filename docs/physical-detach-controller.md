@@ -170,8 +170,12 @@ Detach rules:
 The implemented overlay is intentionally conservative: it classifies the
 per-function trampoline slice and shared enter/leave thunk ranges, but the helper
 only redirects a stopped thread when the Gum API returns a concrete safe PC.
-Trampoline or dispatch PCs without an explicit safe PC fail closed and are
-retried later. This keeps strict mode from guessing its way through Gum internals.
+The currently audited direct rewrite corridor is the exact `on_enter_trampoline`
+label, which redirects to the target `function_address`. Interior enter
+trampoline PCs, leave/invoke trampoline PCs, and shared thunk/dispatch PCs do not
+have an audited direct rewrite yet; they fail closed with `CLASSIFY_FAILED` and
+are retried later. This keeps strict mode from guessing its way through Gum
+internals.
 
 ## Gum Devkit Changes
 
@@ -512,6 +516,21 @@ candidate remains retryable while another independent candidate completes in the
 same STOP window. The helper failure tests still cover permission denial,
 timeout, malformed snapshots, evacuation errors, and release failures so the
 fatal-after-mutation boundary stays explicit.
+Additional fake-helper Gum-PC corridor tests force STOP snapshots at real
+diagnostic PCs from an attached hook. They prove the exact
+`on_enter_trampoline` label sends `SET_PC(function_address)` for the stopped
+target-like TID and a physical entry-byte `WRITE_MEMORY` whose address, size,
+and bytes match the Gum-reported original prologue. The fake helper can model
+synthetic STOP TIDs as itself, the target pid, or an explicit numeric value, and
+the corridor test validates `SET_PC` against the target-pid case. Unsupported
+Gum PC classes send `RESUME`, do not send `EVACUATE` in the failing attempt,
+leave no held mutation, and remain retryable `CLASSIFY_FAILED` prepares. The
+LD_PRELOAD hot-loop controller matrix covers the same unsupported-real-PC path
+for interior enter trampoline, leave trampoline, invoke trampoline, and enter
+thunk PCs through the general listener: the hook stays `DETACH_REQUESTED` with a
+retryable `prepare-failed,classify-failed` trace row, the first failed STOP window
+logs no `EVACUATE`, and the later retry drains once the fake helper returns a
+safe empty snapshot.
 
 The hot-loop integration test has a paired-target mode that drives two exported
 target symbols in the same worker loop. Its strict trace assertion requires both
@@ -605,6 +624,19 @@ Completed in this branch:
 30. Added round-robin strict batch candidate collection, continued dynamic
     `dlopen` drains after retryable requeues, and added paired-target hot-loop
     integration coverage requiring batched physical detach trace rows.
+31. Added deterministic fake-helper Gum-PC corridor coverage for real attached
+    hook diagnostics: exact `on_enter_trampoline` is the only audited direct
+    `SET_PC` rewrite today, and interior trampoline/dispatch PCs fail closed
+    without an `EVACUATE` mutation.
+32. Strengthened fake-helper EVACUATE validation to check the stopped snapshot
+    TID plus exact Gum original-prologue write size/bytes, and added LD_PRELOAD
+    hot-loop coverage proving unsupported real Gum PCs preserve pending detach
+    state until a later retry can complete.
+33. Expanded unsupported Gum-PC coverage to a general-listener matrix for
+    interior enter trampoline, leave trampoline, invoke trampoline, and enter
+    thunk PCs; the integrated test now checks helper command logs before and
+    after retry so failed unsupported-PC attempts prove they avoided
+    `EVACUATE`.
 
 Remaining work:
 
