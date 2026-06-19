@@ -107,6 +107,22 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_fake_helper_gum_pc_on_enter
+    COMMAND test_detach_controller fake-helper-gum-pc-corridor)
+  set_tests_properties(test_detach_controller_fake_helper_gum_pc_on_enter
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_CONTROLLER_GUM_PC_CASE=on-enter"
+      SKIP_RETURN_CODE 77)
+
+  foreach(_gum_pc_case IN ITEMS on-enter-plus-one on-leave on-invoke enter-thunk)
+    add_test(NAME test_detach_controller_fake_helper_gum_pc_${_gum_pc_case}
+      COMMAND test_detach_controller fake-helper-gum-pc-corridor)
+    set_tests_properties(test_detach_controller_fake_helper_gum_pc_${_gum_pc_case}
+      PROPERTIES
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_CONTROLLER_GUM_PC_CASE=${_gum_pc_case}"
+        SKIP_RETURN_CODE 77)
+  endforeach()
+
   foreach(_fake_scenario IN ITEMS stop-permission stop-timeout bad-snapshot blocked-pc)
     add_test(NAME test_detach_controller_fake_helper_${_fake_scenario}
       COMMAND test_detach_controller fake-helper-fail-closed)

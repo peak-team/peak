@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -126,10 +127,142 @@ required_symbol(const char* name)
 }
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static const char*
+parse_string_arg(int argc, char** argv, const char* name)
+{
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], name) == 0) {
+            return argv[i + 1];
+        }
+    }
+    return NULL;
+}
+
 typedef gboolean (*PeakRequestDetachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
 typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
+typedef gboolean (*PeakGumGetPcDiagnosticsFn)(
+    GumInterceptor* interceptor,
+    gpointer function_address,
+    GumInvocationListener* listener,
+    GumPeakPcDiagnostics* diagnostics);
+
+static int
+set_pointer_env(const char* name, gpointer pointer)
+{
+    char value[2 + sizeof(uintptr_t) * 2 + 1];
+
+    snprintf(value, sizeof(value), "0x%" PRIxPTR, (uintptr_t)pointer);
+    return setenv(name, value, 1);
+}
+
+static int
+write_pointer_file(const char* path, gpointer pointer)
+{
+    FILE* fp = fopen(path, "w");
+
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fprintf(fp, "0x%" PRIxPTR "\n", (uintptr_t)pointer) < 0) {
+        fclose(fp);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void
+unlink_if_path(const char* path)
+{
+    if (path != NULL && path[0] != '\0') {
+        unlink(path);
+    }
+}
+
+static gpointer
+choose_unsupported_gum_pc(const GumPeakPcDiagnostics* diagnostics)
+{
+    if (diagnostics->on_leave_trampoline != NULL) {
+        return diagnostics->on_leave_trampoline;
+    }
+    if (diagnostics->on_invoke_trampoline != NULL) {
+        return diagnostics->on_invoke_trampoline;
+    }
+    if (diagnostics->enter_thunk_start != NULL &&
+        diagnostics->enter_thunk_size > 0) {
+        return diagnostics->enter_thunk_start;
+    }
+    if (diagnostics->on_enter_trampoline != NULL &&
+        diagnostics->on_leave_trampoline != NULL &&
+        (uintptr_t)diagnostics->on_enter_trampoline + 1 <
+            (uintptr_t)diagnostics->on_leave_trampoline) {
+        return (gpointer)((guint8*)diagnostics->on_enter_trampoline + 1);
+    }
+    return NULL;
+}
+
+static int
+resolve_unsupported_gum_pc_case(const char* pc_case,
+                                const GumPeakPcDiagnostics* diagnostics,
+                                gpointer* pc_out)
+{
+    if (pc_case == NULL || pc_case[0] == '\0' ||
+        strcmp(pc_case, "first-available") == 0) {
+        *pc_out = choose_unsupported_gum_pc(diagnostics);
+        if (*pc_out == NULL) {
+            fprintf(stderr, "no unsupported Gum diagnostic PC available\n");
+            return 0;
+        }
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-enter-plus-one") == 0) {
+        if (diagnostics->on_enter_trampoline == NULL ||
+            diagnostics->on_leave_trampoline == NULL ||
+            (uintptr_t)diagnostics->on_enter_trampoline + 1 >=
+                (uintptr_t)diagnostics->on_leave_trampoline) {
+            fprintf(stderr, "on-enter-plus-one diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = (gpointer)((guint8*)diagnostics->on_enter_trampoline + 1);
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-leave") == 0) {
+        if (diagnostics->on_leave_trampoline == NULL) {
+            fprintf(stderr, "on-leave diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->on_leave_trampoline;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "on-invoke") == 0) {
+        if (diagnostics->on_invoke_trampoline == NULL) {
+            fprintf(stderr, "on-invoke diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->on_invoke_trampoline;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "enter-thunk") == 0) {
+        if (diagnostics->enter_thunk_start == NULL ||
+            diagnostics->enter_thunk_size == 0) {
+            fprintf(stderr, "enter-thunk diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->enter_thunk_start;
+        return 1;
+    }
+
+    fprintf(stderr, "unknown unsupported Gum PC case: %s\n", pc_case);
+    return -1;
+}
 
 static int
 parse_csv_line(char* line, char** fields, size_t field_count)
@@ -143,6 +276,45 @@ parse_csv_line(char* line, char** fields, size_t field_count)
         token = strtok_r(NULL, ",\r\n", &saveptr);
     }
     return (int)count;
+}
+
+static int
+count_helper_log_entry(const char* path, const char* entry)
+{
+    FILE* fp = fopen(path, "r");
+    char line[128];
+    int count = 0;
+
+    if (fp == NULL) {
+        fprintf(stderr, "open helper log %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, entry) == 0) {
+            count++;
+        }
+    }
+
+    fclose(fp);
+    return count;
+}
+
+static int
+helper_log_count_is(const char* path, const char* entry, int expected)
+{
+    int actual = count_helper_log_entry(path, entry);
+
+    if (actual != expected) {
+        fprintf(stderr,
+                "helper log %s count: expected %d, got %d\n",
+                entry,
+                expected,
+                actual);
+        return 0;
+    }
+    return 1;
 }
 
 static int
@@ -228,6 +400,87 @@ trace_proves_retry_preservation(const char* trace_path, const char* retry_batch_
         fprintf(stderr, "missing later retried success for peak_detach_hot_target\n");
     }
     return peer_succeeded_in_retry_batch && target_succeeded_later;
+}
+
+static int
+trace_has_retryable_classify_failure_without_success(const char* trace_path,
+                                                     const char* symbol,
+                                                     char* batch_id,
+                                                     size_t batch_id_size)
+{
+    FILE* fp = fopen(trace_path, "r");
+    char line[1024];
+    int saw_failure = 0;
+    int saw_success = 0;
+
+    if (fp == NULL) {
+        perror("fopen trace");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[12];
+        int count = parse_csv_line(line, fields, 12);
+
+        if (count < 12 ||
+            strcmp(fields[2], symbol) != 0 ||
+            strcmp(fields[3], "detach") != 0) {
+            continue;
+        }
+
+        if (strcmp(fields[4], "prepare-failed") == 0 &&
+            strcmp(fields[6], "classify-failed") == 0 &&
+            atoi(fields[7]) > 0) {
+            saw_failure = 1;
+            snprintf(batch_id, batch_id_size, "%s", fields[11]);
+        }
+
+        if (strcmp(fields[4], "success") == 0) {
+            saw_success = 1;
+        }
+    }
+
+    fclose(fp);
+    if (!saw_failure) {
+        fprintf(stderr, "missing retryable classify-failed trace for %s\n", symbol);
+    }
+    if (saw_success) {
+        fprintf(stderr, "unexpected success trace for pending %s\n", symbol);
+    }
+    return saw_failure && !saw_success;
+}
+
+static int
+trace_has_detach_success(const char* trace_path, const char* symbol)
+{
+    FILE* fp = fopen(trace_path, "r");
+    char line[1024];
+    int saw_success = 0;
+
+    if (fp == NULL) {
+        perror("fopen trace");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[12];
+        int count = parse_csv_line(line, fields, 12);
+
+        if (count >= 12 &&
+            strcmp(fields[2], symbol) == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "success") == 0 &&
+            strcmp(fields[6], "safe") == 0) {
+            saw_success = 1;
+            break;
+        }
+    }
+
+    fclose(fp);
+    if (!saw_success) {
+        fprintf(stderr, "missing later detach success trace for %s\n", symbol);
+    }
+    return saw_success;
 }
 
 static int
@@ -327,11 +580,206 @@ run_controller_batch_retry_check(void)
     printf("controller_batch_retry_ok batch_id=%s\n", retry_batch_id);
     return 0;
 }
+
+static int
+run_controller_unsupported_gum_pc_retry_check(int argc, char** argv)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    PeakGumGetPcDiagnosticsFn get_pc_diagnostics =
+        (PeakGumGetPcDiagnosticsFn)required_symbol(
+            "gum_interceptor_peak_get_pc_diagnostics");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    const char* stop_pc_file = getenv("FAKE_DETACH_HELPER_STOP_PC_FILE");
+    const char* helper_log_path = getenv("FAKE_DETACH_HELPER_LOG");
+    const char* pc_case = parse_string_arg(argc, argv, "--unsupported-gum-pc-case");
+    char helper_log_template[] = "/tmp/peak_hotloop_unsupported_gum_pc_log_XXXXXX";
+    int helper_log_fd;
+    GumPeakPcDiagnostics diagnostics;
+    gpointer unsupported_pc = NULL;
+    char retry_batch_id[32] = "";
+    int resolved;
+
+    if (pc_case == NULL || pc_case[0] == '\0') {
+        pc_case = getenv("PEAK_UNSUPPORTED_GUM_PC_CASE");
+    }
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL ||
+        get_pc_diagnostics == NULL) {
+        return 2;
+    }
+
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+
+    if (!get_pc_diagnostics(*interceptor_slot,
+                            (*hook_addresses_slot)[0],
+                            (*listeners_slot)[0],
+                            &diagnostics)) {
+        fprintf(stderr, "Gum PC diagnostics unavailable for hotloop hook\n");
+        return 77;
+    }
+    resolved =
+        resolve_unsupported_gum_pc_case(pc_case, &diagnostics, &unsupported_pc);
+    if (resolved < 0) {
+        return 2;
+    }
+    if (resolved == 0) {
+        return 77;
+    }
+
+    if (helper_log_path == NULL || helper_log_path[0] == '\0') {
+        helper_log_fd = mkstemp(helper_log_template);
+        if (helper_log_fd < 0) {
+            perror("mkstemp helper log");
+            return 2;
+        }
+        close(helper_log_fd);
+        helper_log_path = helper_log_template;
+        if (setenv("FAKE_DETACH_HELPER_LOG", helper_log_path, 1) != 0) {
+            perror("setenv helper log");
+            unlink(helper_log_path);
+            return 2;
+        }
+    } else {
+        unlink(helper_log_path);
+    }
+
+    unlink(trace_path);
+    if (stop_pc_file != NULL && stop_pc_file[0] != '\0') {
+        unlink_if_path(stop_pc_file);
+        if (write_pointer_file(stop_pc_file, unsupported_pc) != 0) {
+            perror("write stop PC file");
+            unlink_if_path(helper_log_path);
+            unlink_if_path(stop_pc_file);
+            return 2;
+        }
+    } else {
+        if (setenv("FAKE_DETACH_HELPER_SCENARIO", "synthetic-stop-once", 1) != 0 ||
+            set_pointer_env("FAKE_DETACH_HELPER_STOP_PC", unsupported_pc) != 0) {
+            perror("setenv");
+            unlink_if_path(helper_log_path);
+            return 2;
+        }
+    }
+
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue detach request\n");
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+
+    if (controller_drain(0)) {
+        fprintf(stderr, "unsupported Gum PC drain unexpectedly completed\n");
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED) {
+        fprintf(stderr, "expected unsupported Gum PC hook to remain pending\n");
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (!trace_has_retryable_classify_failure_without_success(
+            trace_path,
+            "peak_detach_hot_target",
+            retry_batch_id,
+            sizeof(retry_batch_id))) {
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (!helper_log_count_is(helper_log_path, "STOP", 1) ||
+        !helper_log_count_is(helper_log_path, "RESUME", 1) ||
+        !helper_log_count_is(helper_log_path, "EVACUATE", 0)) {
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+
+    if (!controller_drain(1000)) {
+        fprintf(stderr, "controller did not drain restored Gum PC retry\n");
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected hook detached after restored retry drain\n");
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (!trace_has_detach_success(trace_path, "peak_detach_hot_target")) {
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+    if (!helper_log_count_is(helper_log_path, "STOP", 2) ||
+        !helper_log_count_is(helper_log_path, "RESUME", 2) ||
+        !helper_log_count_is(helper_log_path, "EVACUATE", 1)) {
+        unlink_if_path(helper_log_path);
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+
+    printf("controller_unsupported_gum_pc_retry_ok case=%s batch_id=%s\n",
+           pc_case != NULL && pc_case[0] != '\0' ? pc_case : "first-available",
+           retry_batch_id);
+    unlink_if_path(helper_log_path);
+    unlink_if_path(stop_pc_file);
+    return 0;
+}
 #else
 static int
 run_controller_batch_retry_check(void)
 {
     fprintf(stderr, "controller batch retry check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+
+static int
+run_controller_unsupported_gum_pc_retry_check(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "controller unsupported Gum PC check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
     return 77;
 }
 #endif
@@ -388,6 +836,9 @@ main(int argc, char** argv)
 {
     if (has_flag_arg(argc, argv, "--controller-batch-retry-check")) {
         return run_controller_batch_retry_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-unsupported-gum-pc-retry-check")) {
+        return run_controller_unsupported_gum_pc_retry_check(argc, argv);
     }
 
     long threads = parse_long_arg(argc, argv, "--threads", 4);
