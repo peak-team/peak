@@ -17,6 +17,7 @@ LIBA_SRC := libA.c
 LIBB_SRC := libB.c
 MAIN_SRC := main.c
 PY_SRC   := customCpackage.c
+FLAGS_TEST_SRC := dlopen_flags_test.c
 
 LIBA_O   := libA.pic.o
 LIBB_O   := libB.pic.o
@@ -29,6 +30,7 @@ PY_O     := customCpackage.pic.o
 .PHONY: all clean explain
 all: libB.so libB.a libA_dynB.so libA_staB.so libA.a \
      main_dynA_dynB main_dynA_staB main_staA_dynB main_staA_staB \
+     dlopen_flags_test \
      customCpackage_dynA_dynB$(PY_EXT_SUFFIX) \
      customCpackage_dynA_staB$(PY_EXT_SUFFIX) \
      customCpackage_staA_dynB$(PY_EXT_SUFFIX) \
@@ -98,6 +100,9 @@ main_staA_dynB: $(MAIN_O) libA.a libB.so
 main_staA_staB: $(MAIN_O) libA.a libB.a
 	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -lB -Wl,-Bdynamic $(RPATH)
 
+dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl
+
 # --------------------------------------------------------------------
 # Python extension modules: four combinations
 # --------------------------------------------------------------------
@@ -128,4 +133,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test customCpackage*.so

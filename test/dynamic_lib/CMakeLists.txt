@@ -41,3 +41,14 @@ add_custom_target(dynamic_lib_clean
   COMMENT "Cleaning dynamic_lib artifacts via Makefile"
   VERBATIM
 )
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+  add_test(NAME test_dynamic_lib_dlopen_flags
+    COMMAND ${DL_DIR}/dlopen_flags_test
+  )
+  set_tests_properties(test_dynamic_lib_dlopen_flags
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+  )
+endif()

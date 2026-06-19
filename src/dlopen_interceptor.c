@@ -1,3 +1,6 @@
+#define _GNU_SOURCE
+#include <dlfcn.h>
+
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 
@@ -14,9 +17,17 @@ extern char** peak_demangled_strings;
 
 static void* (*original_dlopen)(const char *filename, int flags);
 
+#ifndef RTLD_BINDING_MASK
+#define RTLD_BINDING_MASK (RTLD_LAZY | RTLD_NOW)
+#endif
+
 static void*
 peak_dlopen(const char *filename, int flags) {
-    void *handle = original_dlopen(filename, flags);
+    // Force eager symbol resolution to ensure target symbols are available
+    // during the hooking phase while preserving non-binding dlopen flags.
+    int binding_flags = (flags & ~RTLD_BINDING_MASK) | RTLD_NOW;
+
+    void *handle = original_dlopen(filename, binding_flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
         return handle;
