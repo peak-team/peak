@@ -442,9 +442,15 @@ different Gum metadata and publication invariants. Optional diagnostics are
 available through `PEAK_DLOPEN_DEBUG` and `PEAK_DLOPEN_TRACE_PATH`, which report
 enqueued, drained, requeued, queue-full drops, closed-queue drops, `RTLD_NOLOAD`
 drops, failed requeue drops, partial successes, retained handles, and max queue
-depth. Retryable dynamic attach requests are requeued without ending the drain
-budget early, so one temporarily unsafe library does not block later queued
-handles in the same controller cycle.
+depth, plus the current queue length, fixed queue capacity, and drain budget.
+Each dynamic attach drain snapshots the queue length at the start of the
+controller cycle and drains at most that snapshot size and at most the fixed
+budget. Retryable dynamic attach requests are requeued for a later controller
+cycle, so one temporarily unsafe library cannot consume the entire same-cycle
+budget by being reprocessed repeatedly. Dynamic attach prepare retries are
+limited to transient `TIMEOUT`, `CLASSIFY_FAILED`, and recoverable `ERROR`
+statuses; `PERMISSION_DENIED` is treated as terminal for queued dynamic attach
+work so persistent ptrace policy failures cannot pin queue slots indefinitely.
 
 Final `dlopen` replacement teardown is two-phase in strict mode. PEAK first
 uses the helper guarded `REVERT` operation to restore the real `dlopen` entry

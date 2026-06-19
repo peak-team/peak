@@ -101,6 +101,7 @@ if(BUILD_TESTING)
 
     add_subdirectory(detach_controller)
     add_subdirectory(detach_benchmark)
+    add_subdirectory(dlopen_controller)
     set(PEAK_STRICT_DETACH_BENCHMARK_MIN_RATIO "0.80" CACHE STRING
         "Minimum current strict physical-detach throughput as a fraction of no-preload throughput")
     set(PEAK_STRICT_DETACH_STRESS_THREADS "32" CACHE STRING
