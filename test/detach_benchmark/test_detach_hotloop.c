@@ -27,10 +27,20 @@ void peak_detach_hot_target(uint64_t value)
     asm volatile("" ::: "memory");
 }
 
+__attribute__((noinline))
+void peak_detach_hot_target_two(uint64_t value)
+{
+    atomic_fetch_xor_explicit(&side_effect,
+                              value ^ UINT64_C(0x9e3779b97f4a7c15),
+                              memory_order_relaxed);
+    asm volatile("" ::: "memory");
+}
+
 typedef struct {
     uint64_t calls;
     unsigned int seed;
     StartGate* start_gate;
+    int paired_targets;
 } WorkerState;
 
 static double
@@ -63,11 +73,25 @@ worker_main(void* arg)
 
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
         peak_detach_hot_target((uint64_t)(seed + local_calls));
+        if (state->paired_targets) {
+            peak_detach_hot_target_two((uint64_t)(seed ^ local_calls));
+        }
         local_calls++;
     }
 
     state->calls = local_calls;
     return NULL;
+}
+
+static int
+has_flag_arg(int argc, char** argv, const char* name)
+{
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static long
@@ -138,6 +162,7 @@ main(int argc, char** argv)
 {
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
+    int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
     WorkerState* states = calloc((size_t)threads, sizeof(*states));
     StartGate gate;
@@ -158,6 +183,7 @@ main(int argc, char** argv)
     for (long i = 0; i < threads; i++) {
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
         states[i].start_gate = &gate;
+        states[i].paired_targets = paired_targets;
         if (pthread_create(&tids[i], NULL, worker_main, &states[i]) != 0) {
             perror("pthread_create");
             atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);

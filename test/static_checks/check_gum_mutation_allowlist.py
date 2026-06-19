@@ -32,10 +32,10 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 3,
-        "detach": 4,
-        "begin_transaction": 7,
-        "end_transaction": 7,
+        "attach": 4,
+        "detach": 5,
+        "begin_transaction": 9,
+        "end_transaction": 9,
         "flush": 2,
     },
     ("support-init", "src/mpi_interceptor.c"): {
@@ -102,6 +102,7 @@ FUNCTION_ANCHORS = {
         "peak_general_controller_detach_if_requested_unlocked": "strict-controller",
         "peak_general_controller_reattach_if_requested_unlocked": "strict-controller",
         "peak_general_controller_shutdown_hook_unlocked": "strict-controller",
+        "peak_general_controller_process_pending_batch_unlocked": "strict-controller",
         "peak_general_controller_flush_teardown": "strict-controller",
         "peak_general_overhead_bootstrapping": "strict-controller",
         "peak_general_listener_attach": "strict-controller",

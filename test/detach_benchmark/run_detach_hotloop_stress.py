@@ -28,22 +28,29 @@ TRANSITION_SKIP_RE = re.compile(
     re.IGNORECASE,
 )
 TARGET_SYMBOL = "peak_detach_hot_target"
+PAIRED_TARGET_SYMBOL = "peak_detach_hot_target_two"
 
 
 def make_env(args, sample):
     env = os.environ.copy()
     max_threads = max(args.peak_max_threads, args.threads + args.thread_slack)
+    peak_target = TARGET_SYMBOL
+    if args.paired_targets:
+        peak_target = f"{TARGET_SYMBOL},{PAIRED_TARGET_SYMBOL}"
     env.update(
         {
             "LD_PRELOAD": args.libpeak,
-            "PEAK_TARGET": "peak_detach_hot_target",
+            "PEAK_TARGET": peak_target,
             "PEAK_MAX_NUM_THREADS": str(max_threads),
             "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
+            "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
             "PEAK_ENABLE_REATTACH": "1" if args.enable_reattach else "0",
             "PEAK_COST": args.peak_cost,
             "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
             "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
             "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
+            "PEAK_HB_MIN_US": args.hb_min_us,
+            "PEAK_HB_MAX_US": args.hb_max_us,
             "PEAK_REQUIRE_SAFE_DETACH": "1",
             "PEAK_SAFE_DETACH_MODE": "strict",
             "PEAK_STATSLOG_PATH": f"{args.stats_prefix}-{sample}",
@@ -92,6 +99,57 @@ def trace_has_success(args, sample, operation):
     return False
 
 
+def trace_has_required_batch(args, sample, operation):
+    if args.require_detach_batch_size <= 0:
+        return True
+
+    path = trace_path(args, sample)
+    if not path:
+        return False
+
+    required_symbols = {TARGET_SYMBOL}
+    if args.paired_targets:
+        required_symbols.add(PAIRED_TARGET_SYMBOL)
+    seen = set()
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+    except OSError:
+        return False
+
+    for fields in rows:
+        if len(fields) < 7 or fields[2] not in required_symbols:
+            continue
+        batch_size = 0
+        if len(fields) >= 10:
+            try:
+                batch_size = int(fields[9])
+            except ValueError:
+                batch_size = 0
+        if fields[3] == operation and (
+                fields[4] in {"prepare-failed", "gum-failed"} or
+                fields[6] == "classify-failed"):
+            print(f"unexpected transition row for {fields[2]}: {fields}",
+                  file=sys.stderr)
+            return False
+        if (len(fields) >= 11 and
+                fields[3] == operation and
+                fields[4] == "success" and
+                fields[5] == "1" and
+                fields[6] == "safe" and
+                fields[7] == "0" and
+                batch_size >= args.require_detach_batch_size):
+            seen.add(fields[2])
+
+    missing = required_symbols - seen
+    if missing:
+        print(f"missing required batched trace rows for {sorted(missing)}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def run_sample(args, sample):
     cmd = [
         args.exe,
@@ -100,6 +158,8 @@ def run_sample(args, sample):
         "--seconds",
         str(args.seconds),
     ]
+    if args.paired_targets:
+        cmd.append("--paired-targets")
     reset_trace(args, sample)
     completed = subprocess.run(
         cmd,
@@ -117,6 +177,7 @@ def run_sample(args, sample):
     marker_ok = required_marker.search(output) is not None
     trace_detached = trace_has_success(args, sample, "detach")
     trace_reattached = trace_has_success(args, sample, "reattach")
+    trace_batched = trace_has_required_batch(args, sample, "detach")
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
@@ -126,6 +187,7 @@ def run_sample(args, sample):
             calls_per_sec <= 0.0 or
             not marker_ok or
             not trace_detached or
+            not trace_batched or
             (args.require_reattach and not trace_reattached) or
             bad_output or
             (args.fail_on_transition_skips and transition_skip)):
@@ -142,6 +204,8 @@ def run_sample(args, sample):
                 print("missing strict physical detach marker", file=sys.stderr)
         if not trace_detached:
             print("missing trace detach success", file=sys.stderr)
+        if not trace_batched:
+            print("missing required batched trace evidence", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
         if bad_output:
@@ -172,11 +236,15 @@ def main():
     parser.add_argument("--hibernation-cycle", type=int, default=1)
     parser.add_argument("--overhead-ratio", default="0.000001")
     parser.add_argument("--peak-cost", default="0.0000001")
+    parser.add_argument("--hb-min-us", default="1000")
+    parser.add_argument("--hb-max-us", default="1000")
     parser.add_argument("--peak-max-threads", type=int, default=0)
     parser.add_argument("--thread-slack", type=int, default=16)
     parser.add_argument("--require-reattach", action="store_true")
     parser.add_argument("--disable-reattach", action="store_false",
                         dest="enable_reattach")
+    parser.add_argument("--paired-targets", action="store_true")
+    parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)

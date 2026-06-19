@@ -37,16 +37,36 @@ typedef struct {
     size_t blocked_pc_size;
 } PeakDetachRequest;
 
+typedef struct {
+    gboolean prepared;
+    gboolean uses_physical_patch;
+    PeakDetachStatus status;
+} PeakDetachBatchResult;
+
 gboolean peak_detach_controller_prepare_hook_mutation(
     const PeakDetachRequest* request,
+    PeakDetachStatus* status_out);
+
+gboolean peak_detach_controller_strict_batch_supported(void);
+
+gboolean peak_detach_controller_prepare_hook_mutation_batch(
+    const PeakDetachRequest* requests,
+    size_t request_count,
+    PeakDetachBatchResult* results,
+    size_t* prepared_count_out,
     PeakDetachStatus* status_out);
 
 gboolean peak_detach_controller_threads_are_held(void);
 
 gboolean peak_detach_controller_current_mutation_uses_physical_patch(void);
 
+double peak_detach_controller_last_stop_window_us(void);
+
 gboolean peak_detach_controller_finish_hook_mutation(
     const PeakDetachRequest* request,
+    PeakDetachStatus* status_out);
+
+gboolean peak_detach_controller_finish_hook_mutation_batch(
     PeakDetachStatus* status_out);
 
 gboolean peak_detach_controller_shutdown_helper(PeakDetachStatus* status_out);
