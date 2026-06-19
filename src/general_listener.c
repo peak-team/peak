@@ -70,8 +70,12 @@ typedef struct {
     PeakDetachOperation operation;
     PeakHookState stable_state;
     unsigned int retry_count;
+    PeakDetachStatus last_retry_status;
     double pending_age_s;
 } PeakGeneralBatchCandidate;
+
+static double peak_general_controller_pending_age_for_trace_unlocked(size_t hook_id,
+                                                                     double now);
 
 void peak_general_listener_controller_lock(void)
 {
@@ -121,7 +125,8 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                                               double pending_age_s,
                                               unsigned int batch_size,
                                               double stop_window_us,
-                                              unsigned int batch_id)
+                                              unsigned int batch_id,
+                                              PeakDetachStatus last_retry_status)
 {
     const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
     FILE* fp;
@@ -134,7 +139,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u\n",
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s\n",
                 peak_second(),
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
@@ -149,7 +154,8 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 pending_age_s,
                 batch_size,
                 stop_window_us,
-                batch_id);
+                batch_id,
+                peak_detach_controller_status_string(last_retry_status));
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
@@ -162,6 +168,10 @@ peak_general_controller_trace_mutation(size_t hook_id,
                                        gboolean physical,
                                        PeakDetachStatus status)
 {
+    if (!peak_general_controller_trace_enabled()) {
+        return;
+    }
+
     peak_general_controller_trace_mutation_detail(hook_id,
                                                   operation,
                                                   result,
@@ -173,8 +183,12 @@ peak_general_controller_trace_mutation(size_t hook_id,
                                                       : 0,
                                                   0.0,
                                                   1,
-                                                  0.0,
-                                                  0);
+                                                  peak_detach_controller_last_stop_window_us(),
+                                                  0,
+                                                  hook_id < peak_hook_address_count &&
+                                                          peak_hook_last_retry_status != NULL
+                                                      ? peak_hook_last_retry_status[hook_id]
+                                                      : PEAK_DETACH_STATUS_SAFE);
 }
 
 static unsigned int
@@ -1000,13 +1014,29 @@ static gboolean peak_general_controller_detach_if_requested_unlocked(
     }
 
     array_listener_detached[hook_id] = TRUE;
-    peak_general_controller_reset_retry_unlocked(hook_id);
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_DETACHED);
-    peak_general_controller_trace_mutation(hook_id,
-                                           PEAK_DETACH_OPERATION_DETACH,
-                                           "success",
-                                           helper_applied_physical_patch,
-                                           finish_status);
+    if (peak_general_controller_trace_enabled()) {
+        unsigned int retry_count =
+            peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0;
+        PeakDetachStatus last_retry_status =
+            peak_hook_last_retry_status != NULL ? peak_hook_last_retry_status[hook_id]
+                                                : PEAK_DETACH_STATUS_SAFE;
+
+        peak_general_controller_trace_mutation_detail(
+            hook_id,
+            PEAK_DETACH_OPERATION_DETACH,
+            "success",
+            helper_applied_physical_patch,
+            finish_status,
+            retry_count,
+            peak_general_controller_pending_age_for_trace_unlocked(hook_id,
+                                                                   peak_second()),
+            1,
+            peak_detach_controller_last_stop_window_us(),
+            0,
+            last_retry_status);
+    }
+    peak_general_controller_reset_retry_unlocked(hook_id);
     return TRUE;
 }
 
@@ -1143,13 +1173,29 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
     array_listener_gum_detached[hook_id] = FALSE;
     array_listener_gum_detach_flushed[hook_id] = TRUE;
     array_listener_reattached[hook_id] = TRUE;
-    peak_general_controller_reset_retry_unlocked(hook_id);
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
-    peak_general_controller_trace_mutation(hook_id,
-                                           PEAK_DETACH_OPERATION_REATTACH,
-                                           "success",
-                                           helper_applied_physical_patch,
-                                           finish_status);
+    if (peak_general_controller_trace_enabled()) {
+        unsigned int retry_count =
+            peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0;
+        PeakDetachStatus last_retry_status =
+            peak_hook_last_retry_status != NULL ? peak_hook_last_retry_status[hook_id]
+                                                : PEAK_DETACH_STATUS_SAFE;
+
+        peak_general_controller_trace_mutation_detail(
+            hook_id,
+            PEAK_DETACH_OPERATION_REATTACH,
+            "success",
+            helper_applied_physical_patch,
+            finish_status,
+            retry_count,
+            peak_general_controller_pending_age_for_trace_unlocked(hook_id,
+                                                                   peak_second()),
+            1,
+            peak_detach_controller_last_stop_window_us(),
+            0,
+            last_retry_status);
+    }
+    peak_general_controller_reset_retry_unlocked(hook_id);
     return TRUE;
 }
 
@@ -1432,6 +1478,9 @@ peak_general_controller_collect_batch_unlocked(
             .operation = operation,
             .stable_state = stable_state,
             .retry_count = peak_hook_retry_count != NULL ? peak_hook_retry_count[i] : 0,
+            .last_retry_status = peak_hook_last_retry_status != NULL
+                                      ? peak_hook_last_retry_status[i]
+                                      : PEAK_DETACH_STATUS_SAFE,
             .pending_age_s =
                 peak_general_controller_pending_age_for_trace_unlocked(i, now)
         };
@@ -1546,7 +1595,6 @@ peak_general_controller_process_pending_batch_unlocked(void)
             }
             if (candidates[i].operation == PEAK_DETACH_OPERATION_DETACH) {
                 array_listener_detached[candidates[i].hook_id] = TRUE;
-                peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
                 peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                            PEAK_HOOK_DETACHED);
                 peak_general_controller_trace_mutation_detail(
@@ -1555,11 +1603,13 @@ peak_general_controller_process_pending_batch_unlocked(void)
                     "success",
                     results[i].uses_physical_patch,
                     finish_status,
-                    0,
+                    candidates[i].retry_count,
                     candidates[i].pending_age_s,
                     (unsigned int)candidate_count,
                     stop_window_us,
-                    batch_id);
+                    batch_id,
+                    candidates[i].last_retry_status);
+                peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
                 continue;
             }
 
@@ -1575,11 +1625,12 @@ peak_general_controller_process_pending_batch_unlocked(void)
                     "gum-failed",
                     results[i].uses_physical_patch,
                     finish_status,
-                    0,
+                    candidates[i].retry_count,
                     candidates[i].pending_age_s,
                     (unsigned int)candidate_count,
                     stop_window_us,
-                    batch_id);
+                    batch_id,
+                    candidates[i].last_retry_status);
                 peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
                 peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                            PEAK_HOOK_DETACHED);
@@ -1589,7 +1640,6 @@ peak_general_controller_process_pending_batch_unlocked(void)
             array_listener_gum_detached[candidates[i].hook_id] = FALSE;
             array_listener_gum_detach_flushed[candidates[i].hook_id] = TRUE;
             array_listener_reattached[candidates[i].hook_id] = TRUE;
-            peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
             peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                        PEAK_HOOK_ATTACHED);
             peak_general_controller_trace_mutation_detail(
@@ -1598,11 +1648,13 @@ peak_general_controller_process_pending_batch_unlocked(void)
                 "success",
                 results[i].uses_physical_patch,
                 finish_status,
-                0,
+                candidates[i].retry_count,
                 candidates[i].pending_age_s,
                 (unsigned int)candidate_count,
                 stop_window_us,
-                batch_id);
+                batch_id,
+                candidates[i].last_retry_status);
+            peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
         }
     }
 
@@ -1627,7 +1679,10 @@ peak_general_controller_process_pending_batch_unlocked(void)
             candidates[i].pending_age_s,
             (unsigned int)candidate_count,
             stop_window_us,
-            batch_id);
+            batch_id,
+            peak_hook_last_retry_status != NULL
+                ? peak_hook_last_retry_status[hook_id]
+                : PEAK_DETACH_STATUS_SAFE);
     }
 
     return prepared_count > 0;

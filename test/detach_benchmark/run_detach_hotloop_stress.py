@@ -77,6 +77,26 @@ def reset_trace(args, sample):
         pass
 
 
+def trace_row_has_diagnostics(fields, expected_last_retry_status=None):
+    if len(fields) < 12:
+        return False
+    if expected_last_retry_status is not None and len(fields) < 13:
+        return False
+    try:
+        retry_count = int(fields[7])
+        pending_age_s = float(fields[8])
+        batch_size = int(fields[9])
+        stop_window_us = float(fields[10])
+        batch_id = int(fields[11])
+    except ValueError:
+        return False
+    if (expected_last_retry_status is not None and
+            fields[12] != expected_last_retry_status):
+        return False
+    return (retry_count >= 0 and pending_age_s >= 0.0 and
+            batch_size >= 1 and stop_window_us > 0.0 and batch_id != 0)
+
+
 def trace_has_success(args, sample, operation):
     path = trace_path(args, sample)
     if not path:
@@ -94,7 +114,9 @@ def trace_has_success(args, sample, operation):
                 fields[3] == operation and
                 fields[4] == "success" and
                 fields[5] == "1" and
-                fields[6] == "safe"):
+                fields[6] == "safe" and
+                (not args.require_trace_diagnostics or
+                 trace_row_has_diagnostics(fields, "safe"))):
             return True
     return False
 
@@ -147,7 +169,9 @@ def trace_has_required_batch(args, sample, operation, required_size):
                 fields[5] == "1" and
                 fields[6] == "safe" and
                 fields[11] != "0" and
-                batch_size >= required_size):
+                batch_size >= required_size and
+                (not args.require_trace_diagnostics or
+                 trace_row_has_diagnostics(fields, "safe"))):
             batch_key = (fields[3], fields[11])
             batch_groups.setdefault(batch_key, set()).add(fields[2])
 
@@ -269,6 +293,7 @@ def main():
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--require-trace-diagnostics", action="store_true")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)
     args = parser.parse_args()

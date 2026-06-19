@@ -107,6 +107,13 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_fake_helper_trace_disabled_stop_window
+    COMMAND test_detach_controller fake-helper-trace-disabled-stop-window)
+  set_tests_properties(test_detach_controller_fake_helper_trace_disabled_stop_window
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero"
+      SKIP_RETURN_CODE 77)
+
   add_test(NAME test_detach_controller_fake_helper_gum_pc_on_enter
     COMMAND test_detach_controller fake-helper-gum-pc-corridor)
   set_tests_properties(test_detach_controller_fake_helper_gum_pc_on_enter
