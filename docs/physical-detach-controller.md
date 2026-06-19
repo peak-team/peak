@@ -368,12 +368,14 @@ by leaving listener state alive if safety still cannot be proven.
 
 `PEAK_DETACH_TRACE_PATH` records transition rows for offline diagnosis. The base
 columns are `time,hook_id,symbol,operation,result,physical,status`; strict
-batching extends each row with `retry_count`, `pending_age_s`, `batch_size`, and
-`stop_window_us`. The first seven fields are stable; parsers should treat the
-tail fields as optional diagnostics. `stop_window_us` is the measured
-helper-held STOP window when available, otherwise `0`. These extra fields are
-gathered only when tracing is enabled and should not be treated as part of
-PEAK's default per-call overhead model without separate analysis.
+batching extends each row with `retry_count`, `pending_age_s`, `batch_size`,
+`stop_window_us`, and `batch_id`. The first seven fields are stable; parsers
+should treat the tail fields as optional diagnostics. `stop_window_us` is the
+measured helper-held STOP window when available, otherwise `0`; `batch_id` is a
+nonzero identifier shared by all rows emitted from one controller batch and `0`
+for single-row paths. These extra fields are gathered only when tracing is
+enabled and should not be treated as part of PEAK's default per-call overhead
+model without separate analysis.
 
 ## Memory Lifetime
 

@@ -1497,6 +1497,23 @@ peak_detach_controller_append_candidate_mutation(
     }
     return TRUE;
 }
+
+static PeakDetachStatus
+peak_detach_controller_empty_batch_status(const PeakDetachBatchResult* results,
+                                          size_t result_count)
+{
+    gboolean all_unsupported = TRUE;
+
+    for (size_t i = 0; i < result_count; i++) {
+        if (results[i].status != PEAK_DETACH_STATUS_UNSUPPORTED) {
+            all_unsupported = FALSE;
+            break;
+        }
+    }
+
+    return all_unsupported ? PEAK_DETACH_STATUS_UNSUPPORTED :
+                             PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+}
 #endif
 
 gboolean
@@ -1746,7 +1763,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
         }
         if (requests[i].operation != PEAK_DETACH_OPERATION_DETACH &&
             requests[i].operation != PEAK_DETACH_OPERATION_REATTACH) {
-            results[i].status = PEAK_DETACH_STATUS_ERROR;
+            results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
             continue;
         }
 
@@ -1800,7 +1817,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
     }
 
     if (valid_count == 0) {
-        status = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+        status = peak_detach_controller_empty_batch_status(results,
+                                                           usable_count);
         goto fail_without_stop_locked;
     }
 

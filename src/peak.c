@@ -57,7 +57,7 @@ gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
 extern _Atomic gboolean heartbeat_running;
 pthread_t heartbeat_thread;
-size_t peak_hook_address_count;
+PEAK_API size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
 unsigned long long sig_stop_ack_wait_interval;

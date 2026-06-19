@@ -99,24 +99,30 @@ def trace_has_success(args, sample, operation):
     return False
 
 
-def trace_has_required_batch(args, sample, operation):
-    if args.require_detach_batch_size <= 0:
-        return True
-
+def read_trace_rows(args, sample):
     path = trace_path(args, sample)
     if not path:
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return list(csv.reader(handle))
+    except OSError:
+        return None
+
+
+def trace_has_required_batch(args, sample, operation, required_size):
+    if required_size <= 0:
+        return True
+
+    rows = read_trace_rows(args, sample)
+    if rows is None:
         return False
 
     required_symbols = {TARGET_SYMBOL}
     if args.paired_targets:
         required_symbols.add(PAIRED_TARGET_SYMBOL)
-    seen = set()
-
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            rows = list(csv.reader(handle))
-    except OSError:
-        return False
+    batch_groups = {}
 
     for fields in rows:
         if len(fields) < 7 or fields[2] not in required_symbols:
@@ -130,24 +136,34 @@ def trace_has_required_batch(args, sample, operation):
         if fields[3] == operation and (
                 fields[4] in {"prepare-failed", "gum-failed"} or
                 fields[6] == "classify-failed"):
-            print(f"unexpected transition row for {fields[2]}: {fields}",
-                  file=sys.stderr)
-            return False
-        if (len(fields) >= 11 and
+            if args.fail_on_transition_skips:
+                print(f"unexpected transition row for {fields[2]}: {fields}",
+                      file=sys.stderr)
+                return False
+            continue
+        if (len(fields) >= 12 and
                 fields[3] == operation and
                 fields[4] == "success" and
                 fields[5] == "1" and
                 fields[6] == "safe" and
-                fields[7] == "0" and
-                batch_size >= args.require_detach_batch_size):
-            seen.add(fields[2])
+                fields[11] != "0" and
+                batch_size >= required_size):
+            batch_key = (fields[3], fields[11])
+            batch_groups.setdefault(batch_key, set()).add(fields[2])
 
-    missing = required_symbols - seen
-    if missing:
-        print(f"missing required batched trace rows for {sorted(missing)}",
+    for symbols in batch_groups.values():
+        if required_symbols.issubset(symbols):
+            return True
+
+    print(f"missing same-batch {operation} trace rows for "
+          f"{sorted(required_symbols)}",
+          file=sys.stderr)
+    for key, symbols in sorted(batch_groups.items()):
+        missing = required_symbols - symbols
+        if missing:
+            print(f"batch key {key} missing {sorted(missing)}",
               file=sys.stderr)
-        return False
-    return True
+    return False
 
 
 def run_sample(args, sample):
@@ -177,7 +193,10 @@ def run_sample(args, sample):
     marker_ok = required_marker.search(output) is not None
     trace_detached = trace_has_success(args, sample, "detach")
     trace_reattached = trace_has_success(args, sample, "reattach")
-    trace_batched = trace_has_required_batch(args, sample, "detach")
+    trace_detach_batched = trace_has_required_batch(
+        args, sample, "detach", args.require_detach_batch_size)
+    trace_reattach_batched = trace_has_required_batch(
+        args, sample, "reattach", args.require_reattach_batch_size)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
@@ -187,7 +206,8 @@ def run_sample(args, sample):
             calls_per_sec <= 0.0 or
             not marker_ok or
             not trace_detached or
-            not trace_batched or
+            not trace_detach_batched or
+            not trace_reattach_batched or
             (args.require_reattach and not trace_reattached) or
             bad_output or
             (args.fail_on_transition_skips and transition_skip)):
@@ -204,8 +224,10 @@ def run_sample(args, sample):
                 print("missing strict physical detach marker", file=sys.stderr)
         if not trace_detached:
             print("missing trace detach success", file=sys.stderr)
-        if not trace_batched:
-            print("missing required batched trace evidence", file=sys.stderr)
+        if not trace_detach_batched:
+            print("missing required batched detach trace evidence", file=sys.stderr)
+        if not trace_reattach_batched:
+            print("missing required batched reattach trace evidence", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
         if bad_output:
@@ -245,6 +267,7 @@ def main():
                         dest="enable_reattach")
     parser.add_argument("--paired-targets", action="store_true")
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
+    parser.add_argument("--require-reattach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)
@@ -253,6 +276,8 @@ def main():
     if args.threads <= 0 or args.seconds <= 0 or args.samples <= 0:
         print("threads, seconds, and samples must be positive", file=sys.stderr)
         return 2
+    if args.require_reattach_batch_size > 0:
+        args.require_reattach = True
 
     values = [run_sample(args, sample) for sample in range(args.samples)]
     print(
