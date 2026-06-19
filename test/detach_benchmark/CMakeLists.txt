@@ -1,0 +1,11 @@
+add_executable(test_detach_hotloop test_detach_hotloop.c)
+target_link_libraries(test_detach_hotloop PRIVATE Threads::Threads)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_detach_hotloop PRIVATE -Wl,--export-dynamic)
+endif()
+
+add_executable(test_detach_stale_threads test_detach_stale_threads.c)
+target_link_libraries(test_detach_stale_threads PRIVATE Threads::Threads)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_detach_stale_threads PRIVATE -Wl,--export-dynamic)
+endif()

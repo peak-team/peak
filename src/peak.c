@@ -44,6 +44,7 @@
 #define PEAK_HB_K_ERR_ENV                      "PEAK_HB_K_ERR"
 #define PEAK_HB_K_RATE_ENV                     "PEAK_HB_K_RATE"
 #define PEAK_HB_EMA_A_ENV                      "PEAK_HB_EMA_A"
+#define PEAK_MAX_NUM_THREADS_ENV               "PEAK_MAX_NUM_THREADS"
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
@@ -54,12 +55,12 @@ gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
 PeakHeartbeatArgs* args;
-extern gboolean heartbeat_running;
+extern _Atomic gboolean heartbeat_running;
 pthread_t heartbeat_thread;
 size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
-unsigned int sig_stop_ack_wait_interval;
+unsigned long long sig_stop_ack_wait_interval;
 unsigned long long sig_cont_wait_interval;
 float target_profile_ratio;
 float global_target_ratio;
@@ -67,6 +68,7 @@ float peak_global_reattach_factor;
 float peak_global_detach_factor;
 bool enable_per_target_heartbeat;
 bool enable_global_heartbeat;
+bool enable_reattach;
 unsigned int hb_min_us;
 unsigned int hb_max_us;
 double hb_k_err;
@@ -90,7 +92,10 @@ static int flag_clean_fppid = 0;
 void peak_init()
 {
 
-    peak_max_num_threads = sysconf(_SC_NPROCESSORS_ONLN) * 2;
+    gulong default_max_threads = (gulong)sysconf(_SC_NPROCESSORS_ONLN) * 2;
+    peak_max_num_threads =
+        parse_env_to_uint_default(PEAK_MAX_NUM_THREADS_ENV,
+                                  (unsigned int)default_max_threads);
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
@@ -109,6 +114,9 @@ void peak_init()
     peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
     enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
     enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
+    const char* enable_reattach_env = getenv(PEAK_ENABLE_REATTACH_ENV);
+    enable_reattach =
+        (enable_reattach_env == NULL) || parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
     sig_stop_ack_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
     hb_min_us = parse_env_to_uint_default(PEAK_HB_MIN_US_ENV, 10000);
@@ -152,6 +160,7 @@ void peak_init()
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     peak_detached = g_new0(gboolean, peak_hook_address_count);
     peak_general_listener_attach();
+    dlopen_interceptor_enable_dynamic_attach();
     if (heartbeat_time != 0) {
         heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);
@@ -163,7 +172,7 @@ void peak_init()
         args->hb_k_rate = hb_k_rate;
         args->hb_ema_a = hb_ema_a;
         pthread_mutex_lock(&heartbeat_mutex);
-        heartbeat_running = true;
+        atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
         // create heartbeat thread
         if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
@@ -187,7 +196,7 @@ void peak_fini()
 {
     if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
-        heartbeat_running = false;
+        atomic_store(&heartbeat_running, false);
         pthread_cond_signal(&heartbeat_cond);
         pthread_mutex_unlock(&heartbeat_mutex);
         pthread_join(heartbeat_thread, NULL);
@@ -196,8 +205,19 @@ void peak_fini()
     }
     peak_main_time = peak_second() - peak_main_time;
 
+    peak_general_listener_controller_stop();
     if (peak_memory_profile) {
         malloc_interceptor_detach();
+    }
+    gboolean dlopen_shutdown_flushed = dlopen_interceptor_dettach();
+    if (!dlopen_shutdown_flushed) {
+    #ifdef HAVE_MPI
+        if (flag_clean_fppid) {
+            remove_ppid_file(PPID_FILE_NAME);
+        }
+    #endif
+        g_printerr("[peak] Skipping remaining PEAK teardown because dlopen replacement teardown was not proven safe\n");
+        return;
     }
 #ifdef HAVE_MPI
     if (flag_clean_fppid) {
@@ -217,17 +237,29 @@ void peak_fini()
     cuda_interceptor_dettach();
     #endif
 #endif
-    peak_general_listener_dettach();
-    syscall_interceptor_dettach();
-    dlopen_interceptor_dettach();
-    pthread_listener_dettach();
-    free_parsed_result(peak_hook_strings, peak_hook_address_count);
-    for (gint i = 0; i < peak_hook_address_count; i++) {
-        g_free(peak_target_thread_called[i]);
+    gboolean general_listener_shutdown_flushed = peak_general_listener_dettach();
+    if (general_listener_shutdown_flushed) {
+        dlopen_interceptor_release_retained_dynamic_handles();
     }
-    g_free(peak_target_thread_called);
-    g_free(peak_need_detach);
-    g_free(peak_detached);
+    syscall_interceptor_dettach();
+    if (general_listener_shutdown_flushed) {
+        if (!pthread_listener_dettach()) {
+            g_printerr("[peak] Leaving pthread listener bookkeeping allocated for in-flight callbacks\n");
+        }
+    } else {
+        g_printerr("[peak] Skipping pthread listener cleanup because general listener teardown is still reachable\n");
+    }
+    free_parsed_result(peak_hook_strings, peak_hook_address_count);
+    if (general_listener_shutdown_flushed) {
+        for (gint i = 0; i < peak_hook_address_count; i++) {
+            g_free(peak_target_thread_called[i]);
+        }
+        g_free(peak_target_thread_called);
+        g_free(peak_need_detach);
+        g_free(peak_detached);
+    } else {
+        g_printerr("[peak] Leaving general listener bookkeeping allocated for in-flight callbacks\n");
+    }
 }
 
 #if defined(__APPLE__)
@@ -247,7 +279,7 @@ static libc_start_main_fn real___libc_start_main = NULL;
 // Original function pointer for `exit`
 static void (*original_exit)(int) = NULL;
 static GumInterceptor* exit_interceptor = NULL;
-static gpointer* exit_address = NULL;
+static gpointer exit_address = NULL;
 void exit_interceptor_detach();
 
 static void
@@ -292,9 +324,18 @@ int exit_interceptor_attach() {
  * original behavior.
  */
 void exit_interceptor_detach() {
+    if (exit_interceptor == NULL || exit_address == NULL) {
+        return;
+    }
+
+    gum_interceptor_begin_transaction(exit_interceptor);
     gum_interceptor_revert(exit_interceptor, exit_address);
-    g_object_unref(exit_interceptor);
-    gum_deinit_embedded();
+    gum_interceptor_end_transaction(exit_interceptor);
+    if (!gum_interceptor_flush(exit_interceptor)) {
+        g_printerr("[peak] exit interceptor teardown did not flush; leaving exit interceptor state alive\n");
+        return;
+    }
+    exit_address = NULL;
 }
 
 static int main_wrapper(int argc, char** argv, char** envp) {

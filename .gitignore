@@ -101,3 +101,8 @@ dkms.conf
 build/
 _codeql_build_dir/
 _codeql_detected_source_root
+
+# dynamic_lib test build artifacts generated in the source test directory
+test/dynamic_lib/main_*
+test/dynamic_lib/dlopen_flags_test
+test/dynamic_lib/peak_statslog*.csv

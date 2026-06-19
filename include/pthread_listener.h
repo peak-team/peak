@@ -40,6 +40,7 @@ typedef struct _PthreadState PthreadState;
 struct _PthreadState {
     pthread_t* child_tid;
     gboolean is_original;
+    void* start_context;
 };
 
 /**
@@ -65,11 +66,13 @@ void pthread_listener_attach();
  * This function detaches the PthreadListener from the pthread_create function and releases related resources
  * including the thread id mapping hash table, the GumInterceptor object, and the PthreadListener object.
  *
- * @return void
+ * @return TRUE when Gum teardown flushed and pthread listener state was freed.
+ *         FALSE means PEAK intentionally left state alive because callbacks may
+ *         still be reachable.
  */
-void pthread_listener_dettach();
+gboolean pthread_listener_dettach();
 
-extern GumMetalHashTable* peak_tid_mapping;
+extern GHashTable* peak_tid_mapping;
 
 /**
  * @brief Thread-safe lookup from pthread_t to mapped thread id.
@@ -83,14 +86,19 @@ size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found);
 /**
  * @brief Thread-safe snapshot of tracked threads and mapped ids.
  *
- * The caller provides output buffers and capacity. The function returns
- * number of entries written (up to capacity).
+ * The caller provides output buffers and capacity. The function returns number
+ * of entries written (up to capacity). complete is set to FALSE when the
+ * tracked-thread set did not fit in the caller's buffers.
  *
  * @param tids output buffer of pthread ids.
  * @param mapped output buffer of mapped thread ids.
  * @param capacity max entries to write.
+ * @param complete output flag set to TRUE if all tracked threads were copied.
  * @return number of copied entries.
  */
-size_t pthread_listener_snapshot_threads(pthread_t* tids, size_t* mapped, size_t capacity);
+size_t pthread_listener_snapshot_threads(pthread_t* tids,
+                                         size_t* mapped,
+                                         size_t capacity,
+                                         gboolean* complete);
 
 #endif /* __PTHREAD_LISTENER_H */

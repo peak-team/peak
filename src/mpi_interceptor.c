@@ -45,8 +45,18 @@ int mpi_interceptor_attach()
 
 void mpi_interceptor_dettach()
 {
+    if (mpi_interceptor == NULL || hook_address == NULL) {
+        return;
+    }
+
     peak_is_done = 1;
     peak_pmpi_finalize();
+    gum_interceptor_begin_transaction(mpi_interceptor);
     gum_interceptor_revert(mpi_interceptor, hook_address);
-    g_object_unref(mpi_interceptor);
+    gum_interceptor_end_transaction(mpi_interceptor);
+    if (!gum_interceptor_flush(mpi_interceptor)) {
+        g_printerr("[peak] MPI interceptor teardown did not flush; leaving MPI interceptor state alive\n");
+        return;
+    }
+    hook_address = NULL;
 }

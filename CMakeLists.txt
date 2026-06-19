@@ -52,17 +52,23 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     message(STATUS "RT_LIBRARY   = ${RT_LIBRARY}")
 endif()
 
-# Find or download frida-gum
-if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
-    message(STATUS "Fetching frida-gum")
-    include(cmake/frida-gum.cmake)
-    fetch_frida_gum(
-        ${PROJECT_SOURCE_DIR}/cmake
-        ${PROJECT_BINARY_DIR}/frida-gum
-    )
-    message(STATUS "FRIDA_GUM_LIBRARIES   = ${FRIDA_GUM_LIBRARIES}")
-    message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
+# Find, validate, or download frida-gum
+include(cmake/frida-gum.cmake)
+configure_frida_gum(
+    ${PROJECT_SOURCE_DIR}/cmake
+    ${PROJECT_BINARY_DIR}/frida-gum
+)
+message(STATUS "FRIDA_GUM_LIBRARIES   = ${FRIDA_GUM_LIBRARIES}")
+message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
+message(STATUS "PEAK_GUM_PEAK_API_AVAILABLE = ${PEAK_GUM_PEAK_API_AVAILABLE}")
+message(STATUS "PEAK_GUM_PEAK_PC_API_AVAILABLE = ${PEAK_GUM_PEAK_PC_API_AVAILABLE}")
+
+set(PEAK_DETACH_HELPER_SUPPORTED OFF)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(PEAK_DETACH_HELPER_SUPPORTED ON)
 endif()
+message(STATUS "PEAK_DETACH_HELPER_SUPPORTED = ${PEAK_DETACH_HELPER_SUPPORTED}")
 
 # Find or download otf2
 if (NOT OTF2_LIBRARIES AND NOT OTF2_LIBRARY_DIR)

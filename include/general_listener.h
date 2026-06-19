@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -30,6 +31,17 @@ typedef struct _PeakGeneralListener PeakGeneralListener;
 
 #define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type())
 G_DECLARE_FINAL_TYPE(PeakGeneralListener, peak_general_listener, PEAKGENERAL, LISTENER, GObject)
+
+typedef enum {
+    PEAK_HOOK_UNRESOLVED = 0,
+    PEAK_HOOK_ATTACHED,
+    PEAK_HOOK_DETACH_REQUESTED,
+    PEAK_HOOK_DETACHING,
+    PEAK_HOOK_DETACHED,
+    PEAK_HOOK_REATTACH_REQUESTED,
+    PEAK_HOOK_REATTACHING,
+    PEAK_HOOK_SHUTDOWN
+} PeakHookState;
 
 /**
  * @struct _PeakGeneralListener
@@ -81,13 +93,95 @@ void peak_general_listener_attach();
 void peak_general_listener_print(int is_MPI);
 
 /**
+ * @brief Frees per-listener statistics arrays before releasing the GObject.
+ */
+void peak_general_listener_free(PeakGeneralListener* self);
+
+/**
  * @brief Detaches the Peak General Listener.
  *
  * This function detaches the Peak General Listener and frees the memory allocated for it.
  *
- * @return void
+ * @return TRUE when Gum teardown flushed and listener-owned state was freed.
+ *         FALSE means PEAK intentionally left callback state alive to avoid
+ *         freeing data that in-flight Gum trampolines may still reference.
  */
-void peak_general_listener_dettach();
+gboolean peak_general_listener_dettach();
+
+/**
+ * @brief Stops the background target-hook controller worker.
+ *
+ * This is separated from detach so final statistics can be printed after
+ * pending target hook state transitions have stopped.
+ */
+void peak_general_listener_controller_stop(void);
+
+/**
+ * @brief Processes pending detach/reattach requests for a bounded interval.
+ *
+ * Returns TRUE when there are no pending target-hook lifecycle requests left.
+ * A FALSE result means the caller should keep teardown conservative because at
+ * least one transition could not be proven safe before the deadline.
+ */
+gboolean peak_general_listener_controller_drain(unsigned int timeout_ms);
+
+/**
+ * @brief Acquires the general listener controller lock.
+ *
+ * Dynamic attach uses this to serialize Gum lifecycle mutation with heartbeat
+ * detach/reattach until the full controller queue is available.
+ */
+void peak_general_listener_controller_lock(void);
+
+/**
+ * @brief Releases the general listener controller lock.
+ */
+void peak_general_listener_controller_unlock(void);
+
+/**
+ * @brief Wakes the general listener controller worker.
+ *
+ * Hot callbacks and dynamic dlopen enqueue paths use this to request that the
+ * controller thread process pending Gum lifecycle work outside the callback.
+ */
+void peak_general_listener_controller_wake(void);
+
+/**
+ * @brief Marks a dynamically published hook attached.
+ *
+ * The caller must hold the general listener controller lock.
+ */
+void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id);
+
+/**
+ * @brief Requests controller-owned physical detach for a hooked function.
+ *
+ * This function records a state transition request. The controller execution
+ * path decides when and how to perform Gum lifecycle mutation.
+ *
+ * @param hook_id Index of the hooked function.
+ * @return TRUE if the request is accepted or already pending.
+ */
+gboolean peak_general_listener_request_detach(size_t hook_id);
+
+/**
+ * @brief Requests controller-owned reattach for a detached hooked function.
+ *
+ * This function records a state transition request. The controller execution
+ * path decides when and how to perform Gum lifecycle mutation.
+ *
+ * @param hook_id Index of the hooked function.
+ * @return TRUE if the request is accepted or already pending.
+ */
+gboolean peak_general_listener_request_reattach(size_t hook_id);
+
+/**
+ * @brief Returns the current controller-facing state for a hooked function.
+ *
+ * @param hook_id Index of the hooked function.
+ * @return Current hook state, or PEAK_HOOK_UNRESOLVED for invalid/unpublished hooks.
+ */
+PeakHookState peak_general_listener_hook_state(size_t hook_id);
 
 /**
  * @brief Monitors the heartbeat of the Peak profiling system.
@@ -105,7 +199,7 @@ void peak_general_listener_dettach();
  * @return NULL when the monitoring thread exits.
  */
 void* peak_heartbeat_monitor(void* arg);
-extern gboolean heartbeat_running;
+extern _Atomic gboolean heartbeat_running;
 extern pthread_mutex_t heartbeat_mutex;
 extern pthread_cond_t heartbeat_cond;
 #endif /* __GENERAL_LISTENER_H */

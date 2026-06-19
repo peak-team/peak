@@ -2,7 +2,11 @@
 set -euo pipefail
 PY="${PYTHON_BIN:-python3}"
 
-EXT="@PY_EXT_SUFFIX@"
+EXT="$("$PY" - <<'PYCODE'
+import sysconfig
+print(sysconfig.get_config_var("EXT_SUFFIX") or ".so")
+PYCODE
+)"
 MOD_SRC="customCpackage_staA_staB${EXT}"
 MOD_DST="customCpackage${EXT}"
 

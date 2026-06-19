@@ -39,7 +39,10 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_TARGET_FILE` | Path to a configuration file listing function names for profiling, with one function name per line (e.g., `/path/to/the/configuration/file`). |
 | `PEAK_HEARTBEAT_INTERVAL` | Sets the interval (in seconds) at which the heartbeat monitor runs to assess whether profiling adjustments are needed (**default: `0.1`**). A smaller interval allows quicker adaptation to overhead changes. If set to 0, the heartbeat monitor is disabled. |
 | `PEAK_HIBERNATION_CYCLE` | Determines how often the system checks for detach and reattach, based on the number of heartbeat cycles (**default: `50`**). A smaller value enables faster reattachment decisions, while 0 disables reattachment entirely. If set to 0, reattachment is disabled, and the profiling system will not reattach after detaching due to high overhead. |
+| `PEAK_ENABLE_REATTACH` | Enables heartbeat-driven physical reattach after a target has been detached (**default: enabled**). Set to `0` or `false` to keep physically detached targets detached until shutdown. |
 | `PEAK_OVERHEAD_RATIO` | Defines the target profiling overhead ratio (**default: `0.1`**). If the actual overhead exceeds this ratio, the monitoring process detaches to reduce overhead. |
+| `PEAK_MAX_NUM_THREADS` | Sets PEAK's internal tracked-thread capacity (**default: `online_cpu_count * 2`**). Raise this for hostile high-thread stress runs so worker threads plus PEAK controller/helper/main threads fit in the snapshot table. |
+| `PEAK_DETACH_TRACE_PATH` | Optional CSV path for strict detach-controller transition evidence. When set, PEAK appends `time,hook_id,symbol,operation,result,physical,status` rows for detach, reattach, and shutdown transitions. |
 | `PEAK_HB_MIN_US` | Sets the adaptive heartbeat monitor's minimum sleep interval in microseconds (**default: `10000`**). |
 | `PEAK_HB_MAX_US` | Sets the adaptive heartbeat monitor's maximum sleep interval in microseconds (**default: `500000`**). |
 | `PEAK_HB_K_ERR` | Controls adaptive heartbeat sensitivity to overhead target overshoot (**default: `3.0`**). |
