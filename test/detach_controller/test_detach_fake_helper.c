@@ -267,6 +267,8 @@ instruction_action_name(uint32_t action)
             return "SET_PC";
         case PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY:
             return "WRITE_MEMORY";
+        case PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE:
+            return "SINGLE_STEP_OUT_OF_RANGE";
         default:
             return "UNKNOWN";
     }
@@ -317,6 +319,9 @@ validate_expected_actions(const PeakDetachHelperInstruction* instructions,
             expected_action = PEAK_DETACH_HELPER_INSTRUCTION_SET_PC;
         } else if (strcmp(cursor, "WRITE_MEMORY") == 0) {
             expected_action = PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY;
+        } else if (strcmp(cursor, "SINGLE_STEP_OUT_OF_RANGE") == 0) {
+            expected_action =
+                PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE;
         } else {
             fprintf(stderr, "unknown expected action: %s\n", cursor);
             free(copy);
@@ -622,11 +627,45 @@ main(int argc, char** argv)
                                     0);
                 continue;
             }
-            if (strcmp(scenario, "stop-timeout") == 0) {
+            if (strcmp(scenario, "stop-timeout") == 0 ||
+                strcmp(scenario, "stop-timeout-delayed") == 0) {
+                if (strcmp(scenario, "stop-timeout-delayed") == 0) {
+                    usleep(5500 * 1000);
+                }
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_TIMEOUT,
                                     ETIMEDOUT,
                                     0);
+                continue;
+            }
+            if (strcmp(scenario, "duplicate-snapshot") == 0) {
+                uint64_t pc = 0;
+                if (env_u64("FAKE_DETACH_HELPER_STOP_PC", &pc) <= 0) {
+                    (void)send_response((int)fd,
+                                        PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR,
+                                        EINVAL,
+                                        0);
+                    continue;
+                }
+                PeakDetachHelperThreadSnapshot snapshots[2] = {
+                    {
+                        .tid = (int32_t)getpid(),
+                        .status = PEAK_DETACH_HELPER_THREAD_OK,
+                        .pc = pc
+                    },
+                    {
+                        .tid = (int32_t)getpid(),
+                        .status = PEAK_DETACH_HELPER_THREAD_OK,
+                        .pc = pc
+                    }
+                };
+                if (send_response((int)fd,
+                                  PEAK_DETACH_HELPER_STATUS_OK,
+                                  0,
+                                  2) != 0 ||
+                    write_exact((int)fd, snapshots, sizeof(snapshots)) != 0) {
+                    return 1;
+                }
                 continue;
             }
             if (strcmp(scenario, "bad-snapshot") == 0) {

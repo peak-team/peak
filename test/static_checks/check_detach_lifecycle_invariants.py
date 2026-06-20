@@ -225,6 +225,9 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_handler = extract_function(
         controller, "peak_detach_controller_signal_handler"
     )
+    signal_wait_for_release = extract_function(
+        controller, "peak_detach_controller_signal_wait_for_release"
+    )
     signal_release = extract_function(
         controller, "peak_detach_controller_signal_release"
     )
@@ -238,7 +241,8 @@ def check_signal_backend_strict_invariants(repo_root):
 
     require("_Atomic int rewrite_status" in controller,
             "signal backend must keep observable per-thread rewrite status")
-    require("rewrite_ok ? 1 : -1" in signal_handler,
+    require("peak_detach_controller_signal_wait_for_release" in signal_handler and
+            "rewrite_ok ? 1 : -1" in signal_wait_for_release,
             "signal handler must publish PC rewrite success/failure")
     require("rewrite_status" in signal_release and "return FALSE" in signal_release,
             "signal release must fail if an intended PC rewrite did not succeed")

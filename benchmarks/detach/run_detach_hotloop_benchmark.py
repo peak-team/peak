@@ -26,7 +26,7 @@ def run_one(exe, env, threads, seconds, timeout):
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=timeout,
         check=False,
     )

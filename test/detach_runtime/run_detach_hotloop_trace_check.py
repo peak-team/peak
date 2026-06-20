@@ -10,6 +10,7 @@ import sys
 
 
 CALLS_PER_SEC_RE = re.compile(r"calls_per_sec=([0-9.]+)")
+SPAWNED_THREADS_RE = re.compile(r"\bspawned_threads=([0-9]+)\b")
 DETACHED_MARKER_RE = re.compile(
     r"(?m)^\|\s*peak_detach_hot_target\*+\s*\|\s*[1-9][0-9]*\s*\|"
 )
@@ -56,6 +57,18 @@ def make_env(args, sample):
             "PEAK_STATSLOG_PATH": f"{args.stats_prefix}-{sample}",
         }
     )
+    if args.detach_count:
+        env["PEAK_DETACH_COUNT"] = args.detach_count
+    if args.detach_backend:
+        env["PEAK_DETACH_BACKEND"] = args.detach_backend
+        if args.detach_backend == "signal":
+            env["PEAK_SAFE_DETACH_MODE"] = "signal"
+            env.setdefault("PEAK_DETACH_HELPER", "/no/such/peak_detach_helper")
+    if args.detach_helper:
+        env["PEAK_DETACH_HELPER"] = args.detach_helper
+    if args.helper_retry_log_prefix:
+        env["G_TEST_PEAK_DETACH_HELPER_STOP_RETRY_ONCE"] = "1"
+        env["G_TEST_PEAK_DETACH_HELPER_RETRY_LOG"] = helper_retry_log_path(args, sample)
     if args.trace_prefix:
         env["PEAK_DETACH_TRACE_PATH"] = f"{args.trace_prefix}-{sample}.csv"
     return env
@@ -67,14 +80,31 @@ def trace_path(args, sample):
     return f"{args.trace_prefix}-{sample}.csv"
 
 
+def helper_retry_log_path(args, sample):
+    if not args.helper_retry_log_prefix:
+        return None
+    return f"{args.helper_retry_log_prefix}-{sample}.log"
+
+
 def reset_trace(args, sample):
-    path = trace_path(args, sample)
+    for path in (trace_path(args, sample), helper_retry_log_path(args, sample)):
+        if not path:
+            continue
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def helper_retry_was_exercised(args, sample):
+    path = helper_retry_log_path(args, sample)
     if not path:
-        return
+        return True
     try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
+        with open(path, "r", encoding="utf-8") as handle:
+            return "stop_snapshot_retry" in handle.read()
+    except OSError:
+        return False
 
 
 def trace_row_has_diagnostics(fields, expected_last_retry_status=None):
@@ -116,7 +146,7 @@ def trace_has_success(args, sample, operation):
                 fields[5] == "1" and
                 fields[6] == "safe" and
                 (not args.require_trace_diagnostics or
-                 trace_row_has_diagnostics(fields, "safe"))):
+                 trace_row_has_diagnostics(fields))):
             return True
     return False
 
@@ -171,7 +201,7 @@ def trace_has_required_batch(args, sample, operation, required_size):
                 fields[11] != "0" and
                 batch_size >= required_size and
                 (not args.require_trace_diagnostics or
-                 trace_row_has_diagnostics(fields, "safe"))):
+                 trace_row_has_diagnostics(fields))):
             batch_key = (fields[3], fields[11])
             batch_groups.setdefault(batch_key, set()).add(fields[2])
 
@@ -190,6 +220,88 @@ def trace_has_required_batch(args, sample, operation, required_size):
     return False
 
 
+def trace_transition_counts(args, sample):
+    rows = read_trace_rows(args, sample)
+    counts = {
+        "detach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+        "reattach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+    }
+    if rows is None:
+        return counts
+
+    tracked_symbols = {TARGET_SYMBOL}
+    if args.paired_targets:
+        tracked_symbols.add(PAIRED_TARGET_SYMBOL)
+
+    for fields in rows:
+        if len(fields) < 7 or fields[2] not in tracked_symbols:
+            continue
+        operation = fields[3]
+        if operation not in counts:
+            continue
+        if fields[6] == "classify-failed" or (
+                len(fields) >= 13 and fields[12] == "classify-failed"):
+            counts[operation]["classify_failed"] += 1
+        if fields[4] == "prepare-failed":
+            counts[operation]["prepare_failed"] += 1
+        if fields[4] == "gum-failed":
+            counts[operation]["gum_failed"] += 1
+
+    return counts
+
+
+def trace_transition_count(counts, operation, name):
+    if operation == "all":
+        return sum(values[name] for values in counts.values())
+    return counts[operation][name]
+
+
+def trace_has_helper_unavailable(args, sample):
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False
+
+    for fields in rows:
+        if len(fields) < 14 or fields[2] != TARGET_SYMBOL:
+            continue
+        if (fields[4] == "prepare-failed" and
+                fields[6] in {"permission-denied", "unsupported"} and
+                fields[13] == "helper-stop-status"):
+            return True
+    return False
+
+
+def trace_transition_limits_ok(args, sample):
+    counts = trace_transition_counts(args, sample)
+    limits = (
+        ("all", "classify_failed", args.max_classify_failed),
+        ("detach", "classify_failed", args.max_detach_classify_failed),
+        ("reattach", "classify_failed", args.max_reattach_classify_failed),
+    )
+    ok = True
+
+    if args.fail_on_transition_skips:
+        limits = limits + (
+            ("all", "classify_failed", 0),
+            ("all", "prepare_failed", 0),
+            ("all", "gum_failed", 0),
+        )
+
+    for operation, name, limit in limits:
+        if limit < 0:
+            continue
+        value = trace_transition_count(counts, operation, name)
+        if value > limit:
+            print(
+                f"trace transition limit exceeded sample={sample} "
+                f"operation={operation} {name}={value} limit={limit}",
+                file=sys.stderr,
+            )
+            ok = False
+
+    return ok
+
+
 def run_sample(args, sample):
     cmd = [
         args.exe,
@@ -200,18 +312,25 @@ def run_sample(args, sample):
     ]
     if args.paired_targets:
         cmd.append("--paired-targets")
+    if args.spawn_transient_threads:
+        cmd.extend([
+            "--spawn-transient-threads",
+            "--spawner-threads",
+            str(args.spawner_threads),
+        ])
     reset_trace(args, sample)
     completed = subprocess.run(
         cmd,
         env=make_env(args, sample),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=args.timeout,
         check=False,
     )
     output = completed.stdout
     calls_match = CALLS_PER_SEC_RE.search(output)
+    spawned_match = SPAWNED_THREADS_RE.search(output)
     required_marker = REATTACHED_MARKER_RE if args.require_reattach else DETACHED_MARKER_RE
     detached = DETACHED_MARKER_RE.search(output) is not None
     marker_ok = required_marker.search(output) is not None
@@ -221,20 +340,32 @@ def run_sample(args, sample):
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
         args, sample, "reattach", args.require_reattach_batch_size)
+    trace_transition_ok = trace_transition_limits_ok(args, sample)
+    helper_retry_ok = helper_retry_was_exercised(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
+    spawned_threads = int(spawned_match.group(1)) if spawned_match else 0
 
-    if (completed.returncode != 0 or
-            calls_match is None or
-            calls_per_sec <= 0.0 or
-            not marker_ok or
-            not trace_detached or
-            not trace_detach_batched or
-            not trace_reattach_batched or
-            (args.require_reattach and not trace_reattached) or
-            bad_output or
-            (args.fail_on_transition_skips and transition_skip)):
+    failed = (
+        completed.returncode != 0 or
+        calls_match is None or
+        calls_per_sec <= 0.0 or
+        not marker_ok or
+        not trace_detached or
+        not trace_detach_batched or
+        not trace_reattach_batched or
+        not trace_transition_ok or
+        not helper_retry_ok or
+        (args.require_reattach and not trace_reattached) or
+        (args.spawn_transient_threads and spawned_threads <= 0) or
+        bad_output or
+        (args.fail_on_transition_skips and transition_skip)
+    )
+    if failed:
+        if args.skip_helper_unavailable and trace_has_helper_unavailable(args, sample):
+            print("helper backend unavailable for this platform/policy; skipping")
+            raise SystemExit(77)
         print(f"trace check sample {sample} failed rc={completed.returncode}",
               file=sys.stderr)
         if calls_match is None:
@@ -252,8 +383,14 @@ def run_sample(args, sample):
             print("missing required batched detach trace evidence", file=sys.stderr)
         if not trace_reattach_batched:
             print("missing required batched reattach trace evidence", file=sys.stderr)
+        if not trace_transition_ok:
+            print("trace transition limits failed", file=sys.stderr)
+        if not helper_retry_ok:
+            print("helper STOP snapshot retry was not exercised", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
+        if args.spawn_transient_threads and spawned_threads <= 0:
+            print("transient thread spawners did not create workers", file=sys.stderr)
         if bad_output:
             print(f"matched bad output: {bad_output.group(0)}", file=sys.stderr)
         if args.fail_on_transition_skips and transition_skip:
@@ -264,7 +401,8 @@ def run_sample(args, sample):
     print(
         f"trace_check sample={sample} threads={args.threads} "
         f"calls_per_sec={calls_per_sec:.3f} detached_marker={detached} "
-        f"reattached_marker={REATTACHED_MARKER_RE.search(output) is not None}"
+        f"reattached_marker={REATTACHED_MARKER_RE.search(output) is not None} "
+        f"spawned_threads={spawned_threads}"
     )
     return calls_per_sec
 
@@ -281,7 +419,8 @@ def main():
     parser.add_argument("--heartbeat-interval", default="0.001")
     parser.add_argument("--hibernation-cycle", type=int, default=1)
     parser.add_argument("--overhead-ratio", default="0.000001")
-    parser.add_argument("--peak-cost", default="0.0000001")
+    parser.add_argument("--peak-cost", default="0.000000000001")
+    parser.add_argument("--detach-count", default="")
     parser.add_argument("--hb-min-us", default="1000")
     parser.add_argument("--hb-max-us", default="1000")
     parser.add_argument("--peak-max-threads", type=int, default=0)
@@ -290,16 +429,30 @@ def main():
     parser.add_argument("--disable-reattach", action="store_false",
                         dest="enable_reattach")
     parser.add_argument("--paired-targets", action="store_true")
+    parser.add_argument("--spawn-transient-threads", action="store_true")
+    parser.add_argument("--spawner-threads", type=int, default=2)
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--max-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
     parser.add_argument("--require-trace-diagnostics", action="store_true")
+    parser.add_argument("--detach-backend", choices=("helper", "signal"),
+                        default="")
+    parser.add_argument("--detach-helper", default="")
+    parser.add_argument("--helper-retry-log-prefix", default="")
+    parser.add_argument("--skip-helper-unavailable", action="store_true")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)
     args = parser.parse_args()
 
-    if args.threads <= 0 or args.seconds <= 0 or args.samples <= 0:
-        print("threads, seconds, and samples must be positive", file=sys.stderr)
+    if (args.threads <= 0 or args.seconds <= 0 or args.samples <= 0 or
+            args.spawner_threads <= 0):
+        print(
+            "threads, seconds, samples, and spawner-threads must be positive",
+            file=sys.stderr,
+        )
         return 2
     if args.require_reattach_batch_size > 0:
         args.require_reattach = True

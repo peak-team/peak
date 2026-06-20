@@ -121,14 +121,14 @@ if(BUILD_TESTING)
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 4 --seconds 2)
         set_tests_properties(test_detach_hotloop_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
                 TIMEOUT 20)
         add_test(NAME test_detach_hotloop_signal_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 2)
         set_tests_properties(test_detach_hotloop_signal_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
                 TIMEOUT 45)
@@ -141,7 +141,7 @@ if(BUILD_TESTING)
                     --spawner-threads 4)
         set_tests_properties(test_detach_hotloop_signal_thread_spawn_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=256;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/signal-thread-spawn-trace.csv;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=256;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/signal-thread-spawn-trace.csv;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "spawned_threads=[1-9][0-9]*.*trace_detach_success=1"
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
                 TIMEOUT 60)
@@ -175,24 +175,36 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
                     TIMEOUT 30)
-            add_test(NAME test_detach_hotloop_reattach_retry_preserves_pending_strict
+            add_test(NAME test_detach_hotloop_reattach_entry_byte_gum_pc_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                         --controller-reattach-retry-check)
-            set_tests_properties(test_detach_hotloop_reattach_retry_preserves_pending_strict
+            set_tests_properties(test_detach_hotloop_reattach_entry_byte_gum_pc_strict
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-pc.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-trace.csv;${PRELOAD_VAR}"
-                    PASS_REGULAR_EXPRESSION "controller_reattach_retry_ok"
+                    PASS_REGULAR_EXPRESSION "controller_reattach_entry_bytes_ok"
                     SKIP_RETURN_CODE 77
                     TIMEOUT 30)
+            foreach(_reattach_gum_pc_case IN ITEMS on-enter-plus-one on-leave on-invoke enter-thunk)
+                add_test(NAME test_detach_hotloop_reattach_entry_byte_gum_pc_${_reattach_gum_pc_case}_strict
+                    COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                            --controller-reattach-retry-check
+                            --unsupported-gum-pc-case ${_reattach_gum_pc_case})
+                set_tests_properties(test_detach_hotloop_reattach_entry_byte_gum_pc_${_reattach_gum_pc_case}_strict
+                    PROPERTIES
+                        ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-${_reattach_gum_pc_case}-pc.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-${_reattach_gum_pc_case}-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-${_reattach_gum_pc_case}-trace.csv;${PRELOAD_VAR}"
+                        PASS_REGULAR_EXPRESSION "controller_reattach_entry_bytes_ok"
+                        SKIP_RETURN_CODE 77
+                        TIMEOUT 30)
+            endforeach()
             foreach(_unsupported_gum_pc_case IN ITEMS on-enter-plus-one on-leave on-invoke enter-thunk)
-                add_test(NAME test_detach_hotloop_unsupported_gum_pc_${_unsupported_gum_pc_case}_preserves_pending_strict
+                add_test(NAME test_detach_hotloop_entry_byte_gum_pc_${_unsupported_gum_pc_case}_strict
                     COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                             --controller-unsupported-gum-pc-retry-check
                             --unsupported-gum-pc-case ${_unsupported_gum_pc_case})
-                set_tests_properties(test_detach_hotloop_unsupported_gum_pc_${_unsupported_gum_pc_case}_preserves_pending_strict
+                set_tests_properties(test_detach_hotloop_entry_byte_gum_pc_${_unsupported_gum_pc_case}_strict
                     PROPERTIES
                         ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-trace.csv;${PRELOAD_VAR}"
-                        PASS_REGULAR_EXPRESSION "controller_unsupported_gum_pc_retry_ok"
+                        PASS_REGULAR_EXPRESSION "controller_unsupported_gum_pc_entry_bytes_ok"
                         SKIP_RETURN_CODE 77
                         TIMEOUT 30)
             endforeach()
@@ -215,6 +227,80 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_signal_reattach_trace_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 60
+                    --overhead-ratio 0.01
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-reattach-trace
+                    --require-reattach
+                    --require-trace-diagnostics
+                    --detach-backend signal
+                    --fail-on-transition-skips
+                    --max-reattach-classify-failed 0)
+        set_tests_properties(test_detach_hotloop_signal_reattach_trace_strict
+            PROPERTIES
+                TIMEOUT 75
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77)
+        add_test(NAME test_detach_hotloop_signal_thread_spawn_reattach_trace_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 8
+                    --seconds 5
+                    --samples 2
+                    --timeout 180
+                    --overhead-ratio 0.01
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-spawn-reattach-trace
+                    --require-reattach
+                    --require-trace-diagnostics
+                    --detach-backend signal
+                    --spawn-transient-threads
+                    --spawner-threads 4
+                    --peak-max-threads 256
+                    --thread-slack 128
+                    --fail-on-transition-skips
+                    --max-reattach-classify-failed 0)
+        set_tests_properties(test_detach_hotloop_signal_thread_spawn_reattach_trace_strict
+            PROPERTIES
+                TIMEOUT 210
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77)
+        add_test(NAME test_detach_hotloop_helper_thread_spawn_reattach_trace_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 8
+                    --seconds 5
+                    --samples 2
+                    --timeout 180
+                    --overhead-ratio 0.01
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-trace
+                    --require-reattach
+                    --require-trace-diagnostics
+                    --detach-backend helper
+                    --detach-helper $<TARGET_FILE:test_peak_detach_helper>
+                    --helper-retry-log-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-retry
+                    --spawn-transient-threads
+                    --spawner-threads 4
+                    --peak-max-threads 256
+                    --thread-slack 128
+                    --fail-on-transition-skips
+                    --max-reattach-classify-failed 0
+                    --skip-helper-unavailable)
+        set_tests_properties(test_detach_hotloop_helper_thread_spawn_reattach_trace_strict
+            PROPERTIES
+                TIMEOUT 210
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77)
         add_test(NAME test_detach_stale_threads_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
                     --active-threads 8

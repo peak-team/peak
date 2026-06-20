@@ -1,0 +1,50 @@
+[project]
+name = "peak"
+default_suite = "smoke"
+
+[stage]
+include = [
+  "benchmarks",
+  "cmake",
+  "docs",
+  "include",
+  "src",
+  "test",
+  "CMakeLists.txt",
+]
+exclude = [
+  ".git",
+  "build",
+  "build-*",
+  "cmake-build-*",
+  "install",
+  "tmp",
+  ".cache",
+  ".pytest_cache",
+]
+
+[suites.smoke]
+partition = { vista = "gg", frontera = "development" }
+nodes = 1
+tasks = 1
+time = "02:00:00"
+
+[suites.debug]
+partition = { vista = "gg", frontera = "development" }
+nodes = 1
+tasks = 1
+time = "02:00:00"
+
+[systems.vista.suites.smoke]
+partition = "gg"
+nodes = 1
+tasks = 1
+time = "02:00:00"
+command = "env PEAK_HPC_DURATION=5 PEAK_HPC_SAMPLES=12 PEAK_HPC_BASELINE_SAMPLES=3 PEAK_HPC_TIMEOUT=480 PEAK_HPC_OVERHEAD_RATIO=0.01 PEAK_HPC_EXPECTED_CPUSET_CPUS=144 PEAK_HPC_MAX_CLASSIFY_FAILED=0 PEAK_HPC_MAX_PREPARE_FAILED=0 PEAK_HPC_MAX_GUM_FAILED=0 PEAK_HPC_OUT=extreme-vista-smoke-results bash benchmarks/detach/hpc_extreme_detach_bench.sh vista-smoke 144 0-143 vista_auto_reattach_zero:auto:reattach vista_signal_reattach_zero:signal:reattach"
+
+[systems.frontera.suites.smoke]
+partition = "development"
+nodes = 1
+tasks = 1
+time = "02:00:00"
+command = "env PEAK_HPC_CMAKE_ARGS='-DPEAK_ENABLE_MPI=OFF -DCMAKE_C_COMPILER=/opt/apps/gcc/8.3.0/bin/gcc -DCMAKE_CXX_COMPILER=/opt/apps/gcc/8.3.0/bin/g++' PEAK_HPC_DURATION=5 PEAK_HPC_SAMPLES=12 PEAK_HPC_BASELINE_SAMPLES=3 PEAK_HPC_TIMEOUT=360 PEAK_HPC_OVERHEAD_RATIO=0.01 PEAK_HPC_EXPECTED_CPUSET_CPUS=56 PEAK_HPC_MAX_CLASSIFY_FAILED=0 PEAK_HPC_MAX_PREPARE_FAILED=0 PEAK_HPC_MAX_GUM_FAILED=0 PEAK_HPC_OUT=extreme-frontera-smoke-results bash benchmarks/detach/hpc_extreme_detach_bench.sh frontera-smoke 56 0-55 frontera_auto_reattach_zero:auto:reattach frontera_helper_reattach_zero:helper:reattach"

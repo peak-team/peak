@@ -64,7 +64,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --seconds ${PEAK_STRICT_DETACH_STRESS_SECONDS}
             --samples ${PEAK_STRICT_DETACH_STRESS_SAMPLES}
             --disable-reattach
-            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-detach-trace)
+            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-detach-trace
+            --fail-on-transition-skips)
   set_tests_properties(benchmark_detach_hotloop_high_thread_stress
     PROPERTIES
       LABELS "benchmark;stress"
@@ -82,8 +83,30 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --samples 6
             --overhead-ratio 0.01
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-reattach-trace
-            --require-reattach)
+            --require-reattach
+            --fail-on-transition-skips)
   set_tests_properties(benchmark_detach_hotloop_reattach_stress
+    PROPERTIES
+      LABELS "benchmark;stress"
+      RESOURCE_LOCK peak_detach_benchmark
+      TIMEOUT 240
+      PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
+
+  add_test(NAME benchmark_detach_hotloop_signal_reattach_stress
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/run_detach_hotloop_stress.py
+            --exe $<TARGET_FILE:benchmark_detach_hotloop>
+            --libpeak $<TARGET_FILE:peak>
+            --threads ${PEAK_STRICT_DETACH_STRESS_THREADS}
+            --seconds 3
+            --samples 6
+            --overhead-ratio 0.01
+            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-signal-reattach-trace
+            --require-reattach
+            --detach-backend signal
+            --fail-on-transition-skips
+            --max-reattach-classify-failed 0)
+  set_tests_properties(benchmark_detach_hotloop_signal_reattach_stress
     PROPERTIES
       LABELS "benchmark;stress"
       RESOURCE_LOCK peak_detach_benchmark
@@ -102,7 +125,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --seconds 2
             --samples 6
             --stale-mode parked
-            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-stress-trace)
+            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-stress-trace
+            --fail-on-transition-skips)
   set_tests_properties(benchmark_detach_stale_threads_stress
     PROPERTIES
       LABELS "benchmark;stress"
@@ -122,7 +146,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --seconds 2
             --samples 4
             --stale-mode unrelated-spin
-            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-unrelated-spin-trace)
+            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-unrelated-spin-trace
+            --fail-on-transition-skips)
   set_tests_properties(benchmark_detach_stale_threads_unrelated_spin_stress
     PROPERTIES
       LABELS "benchmark;stress"
@@ -145,7 +170,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --overhead-ratio 0.01
             --require-reattach
             --stale-mode parked
-            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-reattach-stress-trace)
+            --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-reattach-stress-trace
+            --detach-backend signal
+            --fail-on-transition-skips
+            --max-reattach-classify-failed 0)
   set_tests_properties(benchmark_detach_stale_threads_reattach_stress
     PROPERTIES
       LABELS "benchmark;stress"
