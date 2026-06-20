@@ -16,6 +16,7 @@
 
 static atomic_int stop_requested;
 static atomic_uint_fast64_t side_effect;
+static atomic_uint_fast64_t spawned_worker_count;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -48,12 +49,41 @@ typedef struct {
     int paired_targets;
 } WorkerState;
 
+typedef struct {
+    unsigned int seed;
+} SpawnedWorkerState;
+
+typedef struct {
+    unsigned int seed;
+    uint64_t created;
+} SpawnerState;
+
 static double
 monotonic_seconds(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void
+sleep_for_seconds(long seconds)
+{
+    double deadline = monotonic_seconds() + (double)seconds;
+
+    for (;;) {
+        double remaining = deadline - monotonic_seconds();
+        if (remaining <= 0.0) {
+            return;
+        }
+        struct timespec ts;
+        ts.tv_sec = (time_t)remaining;
+        ts.tv_nsec = (long)((remaining - (double)ts.tv_sec) * 1000000000.0);
+        if (ts.tv_nsec < 0) {
+            ts.tv_nsec = 0;
+        }
+        nanosleep(&ts, NULL);
+    }
 }
 
 static void*
@@ -85,6 +115,46 @@ worker_main(void* arg)
     }
 
     state->calls = local_calls;
+    return NULL;
+}
+
+static void*
+spawned_worker_main(void* arg)
+{
+    SpawnedWorkerState* state = (SpawnedWorkerState*)arg;
+    unsigned int seed = state->seed;
+
+    for (uint64_t i = 0; i < 32; i++) {
+        peak_detach_hot_target((uint64_t)(seed + i));
+    }
+    free(state);
+    return NULL;
+}
+
+static void*
+spawner_main(void* arg)
+{
+    SpawnerState* state = (SpawnerState*)arg;
+
+    while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
+        SpawnedWorkerState* child_state = malloc(sizeof(*child_state));
+        pthread_t child;
+
+        if (child_state == NULL) {
+            break;
+        }
+        child_state->seed = state->seed + (unsigned int)state->created;
+        if (pthread_create(&child, NULL, spawned_worker_main, child_state) != 0) {
+            free(child_state);
+            break;
+        }
+        pthread_join(child, NULL);
+        state->created++;
+    }
+
+    atomic_fetch_add_explicit(&spawned_worker_count,
+                              state->created,
+                              memory_order_relaxed);
     return NULL;
 }
 
@@ -468,6 +538,41 @@ trace_has_retryable_classify_failure_without_success(const char* trace_path,
                 symbol);
     }
     return saw_failure && !saw_success;
+}
+
+static int
+trace_has_physical_detach_success(const char* trace_path)
+{
+    FILE* fp;
+    char line[1024];
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        return 0;
+    }
+
+    fp = fopen(trace_path, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[13];
+        int count = parse_csv_line(line, fields, 13);
+
+        if (count >= 12 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "success") == 0 &&
+            strcmp(fields[5], "1") == 0 &&
+            strcmp(fields[6], "safe") == 0 &&
+            atof(fields[10]) > 0.0) {
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    return 0;
 }
 
 static int
@@ -1112,24 +1217,42 @@ main(int argc, char** argv)
 
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
+    long spawner_threads = parse_long_arg(argc, argv, "--spawner-threads", 2);
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
+    int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
     WorkerState* states = calloc((size_t)threads, sizeof(*states));
+    pthread_t* spawner_tids = NULL;
+    SpawnerState* spawner_states = NULL;
     StartGate gate;
     long created_threads = 0;
-    if (tids == NULL || states == NULL) {
+    long created_spawners = 0;
+    if (spawn_transient_threads) {
+        spawner_tids = calloc((size_t)spawner_threads, sizeof(*spawner_tids));
+        spawner_states = calloc((size_t)spawner_threads, sizeof(*spawner_states));
+    }
+    if (tids == NULL || states == NULL ||
+        (spawn_transient_threads &&
+         (spawner_tids == NULL || spawner_states == NULL))) {
         perror("calloc");
+        free(tids);
+        free(states);
+        free(spawner_tids);
+        free(spawner_states);
         return 2;
     }
     if (start_gate_init(&gate, threads + 1) != 0) {
         perror("start_gate_init");
         free(tids);
         free(states);
+        free(spawner_tids);
+        free(spawner_states);
         return 2;
     }
 
     atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
     atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
+    atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
     for (long i = 0; i < threads; i++) {
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
         states[i].start_gate = &gate;
@@ -1144,15 +1267,47 @@ main(int argc, char** argv)
             start_gate_destroy(&gate);
             free(tids);
             free(states);
+            free(spawner_tids);
+            free(spawner_states);
             return 2;
         }
         created_threads++;
     }
 
     start_gate_wait(&gate);
+    if (spawn_transient_threads) {
+        for (long i = 0; i < spawner_threads; i++) {
+            spawner_states[i].seed = 0x7f4a7c15u + (unsigned int)i;
+            if (pthread_create(&spawner_tids[i],
+                               NULL,
+                               spawner_main,
+                               &spawner_states[i]) != 0) {
+                perror("pthread_create spawner");
+                atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+                for (long j = 0; j < created_spawners; j++) {
+                    pthread_join(spawner_tids[j], NULL);
+                }
+                for (long j = 0; j < created_threads; j++) {
+                    pthread_join(tids[j], NULL);
+                }
+                start_gate_destroy(&gate);
+                free(tids);
+                free(states);
+                free(spawner_tids);
+                free(spawner_states);
+                return 2;
+            }
+            created_spawners++;
+        }
+    }
+
     double start = monotonic_seconds();
-    usleep((useconds_t)seconds * 1000000u);
+    sleep_for_seconds(seconds);
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+
+    for (long i = 0; i < created_spawners; i++) {
+        pthread_join(spawner_tids[i], NULL);
+    }
 
     uint64_t calls = 0;
     for (long i = 0; i < threads; i++) {
@@ -1160,17 +1315,26 @@ main(int argc, char** argv)
         calls += states[i].calls;
     }
     double elapsed = monotonic_seconds() - start;
+    int trace_detach_success = 0;
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    trace_detach_success =
+        trace_has_physical_detach_success(getenv("PEAK_DETACH_TRACE_PATH"));
+#endif
 
-    printf("threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu\n",
+    printf("threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu spawned_threads=%lu trace_detach_success=%d\n",
            threads,
            seconds,
            (unsigned long)calls,
            elapsed,
            (double)calls / elapsed,
-           (unsigned long)atomic_load_explicit(&side_effect, memory_order_relaxed));
+           (unsigned long)atomic_load_explicit(&side_effect, memory_order_relaxed),
+           (unsigned long)atomic_load_explicit(&spawned_worker_count, memory_order_relaxed),
+           trace_detach_success);
 
     start_gate_destroy(&gate);
     free(tids);
     free(states);
+    free(spawner_tids);
+    free(spawner_states);
     return 0;
 }

@@ -50,7 +50,7 @@ PEAK_TEST_EXPORT __attribute__((noinline, noclone))
 void
 strict_helper_target(void)
 {
-#if defined(__x86_64__) || defined(__amd64__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
     asm volatile(
         "nop\n\t"
         "nop\n\t"

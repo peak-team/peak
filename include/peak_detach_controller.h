@@ -62,6 +62,11 @@ gboolean peak_detach_controller_current_mutation_uses_physical_patch(void);
 
 double peak_detach_controller_last_stop_window_us(void);
 
+void peak_detach_controller_wait_for_mutation_window(void);
+
+void peak_detach_controller_note_thread_creation_gate_installed(
+    gboolean installed);
+
 gboolean peak_detach_controller_finish_hook_mutation(
     const PeakDetachRequest* request,
     PeakDetachStatus* status_out);

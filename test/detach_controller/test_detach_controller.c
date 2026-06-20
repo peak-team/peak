@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -286,7 +287,7 @@ __attribute__((noinline, noclone))
 static void
 strict_helper_target(void)
 {
-#if defined(__x86_64__) || defined(__amd64__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
     asm volatile(
         "nop\n\t"
         "nop\n\t"
@@ -313,7 +314,7 @@ __attribute__((noinline, noclone))
 static void
 strict_helper_target_two(void)
 {
-#if defined(__x86_64__) || defined(__amd64__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
     asm volatile(
         "nop\n\t"
         "nop\n\t"
@@ -364,6 +365,23 @@ strict_helper_stale_worker(void* arg)
         pthread_cond_wait(&stale_worker_cond, &stale_worker_mutex);
     }
     pthread_mutex_unlock(&stale_worker_mutex);
+    return NULL;
+}
+
+static void*
+strict_helper_signal_blocked_worker(void* arg)
+{
+    sigset_t blocked;
+
+    (void)arg;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGRTMIN + 2);
+    (void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+
+    worker_running = 1;
+    while (worker_running) {
+        strict_helper_target();
+    }
     return NULL;
 }
 
@@ -651,6 +669,9 @@ run_strict_helper_empty(void)
 #else
     pthread_t worker;
     int thread_count;
+    gboolean signal_backend =
+        g_getenv("PEAK_DETACH_BACKEND") != NULL &&
+        g_ascii_strcasecmp(g_getenv("PEAK_DETACH_BACKEND"), "signal") == 0;
 
     if (pthread_create(&worker, NULL, strict_helper_worker, NULL) != 0) {
         perror("pthread_create");
@@ -691,6 +712,9 @@ run_strict_helper_empty(void)
     gum_interceptor_flush(interceptor);
     strict_helper_target();
     check_strict_helper_pc_classification(interceptor, listener);
+    if (signal_backend) {
+        peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    }
 
     PeakDetachRequest request = {
         .hook_id = 17,
@@ -701,10 +725,25 @@ run_strict_helper_empty(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
-    check_prepare("strict helper threaded physical detach",
-                  &request,
-                  TRUE,
-                  PEAK_DETACH_STATUS_SAFE);
+    PeakDetachStatus prepare_status = PEAK_DETACH_STATUS_ERROR;
+    gboolean prepared =
+        peak_detach_controller_prepare_hook_mutation(&request, &prepare_status);
+    if (!prepared && prepare_status == PEAK_DETACH_STATUS_PERMISSION_DENIED) {
+        fprintf(stderr,
+                "strict-helper-empty skipped: ptrace permission denied\n");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        worker_running = 0;
+        pthread_join(worker, NULL);
+        return 77;
+    }
+    check_true("strict helper threaded physical detach", prepared == TRUE);
+    check_status("strict helper threaded physical detach status",
+                 prepare_status,
+                 PEAK_DETACH_STATUS_SAFE);
     check_true("strict helper holds threaded stop",
                peak_detach_controller_threads_are_held() == TRUE);
     check_true("strict helper applies physical patch",
@@ -839,6 +878,9 @@ run_strict_helper_stale_caller(void)
     return 77;
 #else
     pthread_t worker;
+    gboolean signal_backend =
+        g_getenv("PEAK_DETACH_BACKEND") != NULL &&
+        g_ascii_strcasecmp(g_getenv("PEAK_DETACH_BACKEND"), "signal") == 0;
 
     stale_worker_parked = 0;
     stale_worker_release = 0;
@@ -882,6 +924,9 @@ run_strict_helper_stale_caller(void)
               stale_worker_calls,
               stale_worker_warmup_calls);
     check_true("stale worker parked", stale_worker_parked == 1);
+    if (signal_backend) {
+        peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    }
 
     PeakDetachRequest request = {
         .hook_id = 23,
@@ -892,10 +937,28 @@ run_strict_helper_stale_caller(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
-    check_prepare("strict helper stale-caller physical detach",
-                  &request,
-                  TRUE,
-                  PEAK_DETACH_STATUS_SAFE);
+    PeakDetachStatus prepare_status = PEAK_DETACH_STATUS_ERROR;
+    gboolean prepared =
+        peak_detach_controller_prepare_hook_mutation(&request, &prepare_status);
+    if (!prepared && prepare_status == PEAK_DETACH_STATUS_PERMISSION_DENIED) {
+        fprintf(stderr,
+                "strict-helper-stale-caller skipped: ptrace permission denied\n");
+        pthread_mutex_lock(&stale_worker_mutex);
+        stale_worker_release = 1;
+        pthread_cond_broadcast(&stale_worker_cond);
+        pthread_mutex_unlock(&stale_worker_mutex);
+        pthread_join(worker, NULL);
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return 77;
+    }
+    check_true("strict helper stale-caller physical detach", prepared == TRUE);
+    check_status("strict helper stale-caller physical detach status",
+                 prepare_status,
+                 PEAK_DETACH_STATUS_SAFE);
     check_true("strict helper holds stale-caller stop",
                peak_detach_controller_threads_are_held() == TRUE);
     check_true("strict helper applies stale-caller physical patch",
@@ -2130,6 +2193,138 @@ run_fake_helper_gum_pc_corridor(void)
 }
 
 static int
+run_signal_backend_blocked_thread(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "signal-backend-blocked-thread requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    pthread_t worker;
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+
+    worker_running = 0;
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+
+    if (pthread_create(&worker, NULL, strict_helper_signal_blocked_worker, NULL) != 0) {
+        perror("pthread_create");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+    while (!worker_running) {
+        usleep(1000);
+    }
+
+    PeakDetachRequest request = {
+        .hook_id = 127,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("signal backend blocked thread timeout",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_TIMEOUT);
+    check_true("signal backend blocked thread leaves no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+    check_true("signal backend blocked thread leaves no physical mutation",
+               peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
+
+    worker_running = 0;
+    pthread_join(worker, NULL);
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_signal_backend_missing_thread_gate(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "signal-backend-missing-thread-gate requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    if (attach_status != GUM_ATTACH_OK) {
+        fprintf(stderr, "gum_interceptor_attach failed: %d\n", attach_status);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+    peak_detach_controller_note_thread_creation_gate_installed(FALSE);
+
+    PeakDetachRequest request = {
+        .hook_id = 128,
+        .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("signal backend missing pthread gate",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_UNSUPPORTED);
+    check_true("signal backend missing pthread gate leaves no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+    check_true("signal backend missing pthread gate leaves no physical mutation",
+               peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_fake_helper_fail_closed(void)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
@@ -2220,7 +2415,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-fail-closed\n",
+                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-fail-closed|signal-backend-blocked-thread|signal-backend-missing-thread-gate\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -2269,6 +2464,12 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-fail-closed") == 0) {
         return run_fake_helper_fail_closed();
+    }
+    if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
+        return run_signal_backend_blocked_thread();
+    }
+    if (strcmp(argv[1], "signal-backend-missing-thread-gate") == 0) {
+        return run_signal_backend_missing_thread_gate();
     }
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return EXIT_FAILURE;

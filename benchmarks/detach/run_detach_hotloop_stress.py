@@ -56,6 +56,11 @@ def make_env(args, sample):
             "PEAK_STATSLOG_PATH": f"{args.stats_prefix}-{sample}",
         }
     )
+    if args.detach_backend:
+        env["PEAK_DETACH_BACKEND"] = args.detach_backend
+        if args.detach_backend == "signal":
+            env["PEAK_SAFE_DETACH_MODE"] = "signal"
+            env.setdefault("PEAK_DETACH_HELPER", "/no/such/peak_detach_helper")
     if args.trace_prefix:
         env["PEAK_DETACH_TRACE_PATH"] = f"{args.trace_prefix}-{sample}.csv"
     return env
@@ -294,6 +299,8 @@ def main():
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
     parser.add_argument("--require-trace-diagnostics", action="store_true")
+    parser.add_argument("--detach-backend", choices=("helper", "signal"),
+                        default="")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)
     args = parser.parse_args()

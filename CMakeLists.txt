@@ -65,7 +65,7 @@ message(STATUS "PEAK_GUM_PEAK_PC_API_AVAILABLE = ${PEAK_GUM_PEAK_PC_API_AVAILABL
 
 set(PEAK_DETACH_HELPER_SUPPORTED OFF)
 if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
     set(PEAK_DETACH_HELPER_SUPPORTED ON)
 endif()
 message(STATUS "PEAK_DETACH_HELPER_SUPPORTED = ${PEAK_DETACH_HELPER_SUPPORTED}")
@@ -91,7 +91,7 @@ if(MPI_FOUND)
 endif()
 
 # Find CUDA
-# Define the option to disable CUDA profiling feature, use -DBUILD_CUDA_PROFILE=OFF to enable tests
+# Define the option to enable CUDA profiling and CUDA tests, use -DBUILD_CUDA_PROFILE=OFF to disable them.
 option(BUILD_CUDA_PROFILE "Build CUDA kernel profiling feature" ON)
 if (BUILD_CUDA_PROFILE)
     if (CMAKE_VERSION VERSION_LESS 3.17)

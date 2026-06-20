@@ -21,21 +21,30 @@ This branch keeps two explicit runtime modes:
   state is kept alive until Gum teardown flushes. The legacy signal pause path
   is still only a best-effort mitigation and does not see every OS thread.
 - Strict mode is selected with `PEAK_REQUIRE_SAFE_DETACH=1` or
-  `PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger`. Strict mode refuses
-  target-function Gum attach, detach, reattach, and shutdown detach unless PEAK
-  can use the patched-Gum/helper path described below. `dlopen` replace/revert
-  is also guarded because it changes a process-wide Gum patch site. With stock
-  Gum, startup target hooks are skipped, already-attached target hooks remain
-  attached, and PEAK logs why target mutation was skipped. Process-lifetime
-  support hooks for pthread/syscall/MPI/CUDA keep explicit startup/shutdown
+  `PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` / `signal`. Strict mode
+  refuses target-function Gum attach, detach, reattach, and shutdown detach
+  unless PEAK can use patched-Gum PC classification plus a strict stop backend.
+  The default `strict` backend tries the external helper first and can fall back
+  to the signal backend only on real permission denial; `helper`/`debugger` force
+  ptrace-helper behavior; `signal` forces the in-process signal backend. `dlopen`
+  replace/revert is also guarded because it changes a process-wide Gum patch
+  site. With stock Gum, startup target hooks are skipped, already-attached target
+  hooks remain attached, and PEAK logs why target mutation was skipped.
+  Process-lifetime support hooks for pthread/syscall/MPI/CUDA keep explicit
+  startup/shutdown
   ordering outside steady-state target detach. Malloc profiling still attaches
   after PEAK initialization so it does not profile PEAK setup allocations, but
   shutdown stops the target controller before malloc detach so allocator Gum
   mutations do not overlap target physical detach/reattach windows.
 
-The signal pause path is not considered strict-safe. It cannot classify program
-counters, cannot advance only audited PEAK/Gum safe regions, and cannot prove
-that untracked or newly created threads are outside Gum code.
+The legacy cooperative signal pause path is not considered strict-safe. It
+cannot classify program counters, cannot advance only audited PEAK/Gum safe
+regions, and cannot prove that untracked or newly created threads are outside
+Gum code. The strict signal backend described below is a separate mechanism: it
+parks enumerated Linux TIDs in an async-signal-safe corridor, captures their PCs
+from `ucontext_t`, classifies those PCs with the patched Gum API, performs only
+audited PC rewrites and byte writes, and fails closed if any thread does not
+arrive or cannot be released safely.
 
 ## Current Failure Mode
 
@@ -129,15 +138,50 @@ The external helper provides thread control and PC classification:
 The helper should not call Gum APIs directly. Gum mutation remains in-process so
 it can operate on Gum's live data structures.
 
-The current code implements this Linux x86_64 helper path behind the
-patched-Gum capability check. The default Linux x86_64 CMake path now constructs
-a PEAK-patched Frida Gum devkit by copying the downloaded devkit and appending
-PEAK's PC API implementation to the archive. Stock Gum still reports
-`missing-gum-api` in strict mode. Non-x86_64 Linux builds do not build the helper
-until the register access path is implemented with the appropriate `ptrace`
-regset API. When `PR_SET_PTRACER` is unavailable and returns `EINVAL`/`ENOSYS`,
-PEAK falls back to the helper's real `ptrace` attempt; actual permission failures
-still fail closed.
+### Strict signal backend
+
+On systems where ptrace is denied, PEAK can use
+`PEAK_SAFE_DETACH_MODE=signal` or `PEAK_DETACH_BACKEND=signal`. This backend is
+not the legacy pause mitigation. The controller installs a real-time signal
+handler, enumerates `/proc/self/task`, sends the signal to every non-controller
+TID with `tgkill`, and requires every active slot to report arrival before any
+patch write. Threads park in a dependency-free atomic loop inside the signal
+handler. The handler records the interrupted PC from `ucontext_t`; the
+controller classifies the resulting snapshot with the same patched-Gum PC API as
+the helper path.
+
+Signal evacuation uses the same instruction model as the helper. Existing-hook
+mutations (`detach`, `reattach`, `shutdown`, and `revert`) require a Gum PC
+diagnostic snapshot for the target hook before classification; missing Gum
+corridor metadata is `CLASSIFY_FAILED`, not an implicit safe state. Before any
+write, the controller validates every `SET_PC` target, validates every
+`WRITE_MEMORY`, and re-scans `/proc/self/task` to ensure no unheld TID is
+present. PC rewrites are published back to each parked handler, and release only
+reports success after each handler confirms the rewrite succeeded. If a signal is
+masked, a thread never arrives, cleanup cannot prove release, or a rewrite fails,
+strict mode fails closed; after a physical byte/register mutation starts,
+release failure is fatal.
+
+Because a new pthread can appear after a `/proc/self/task` scan, strict mutation
+windows also hold a lightweight pthread creation gate. PEAK's pthread wrapper
+tracks the newborn thread and waits before entering user code while a strict
+physical mutation is active. The signal backend refuses to start unless the
+pthread wrapper has confirmed that `pthread_create` interception is installed;
+without that confirmation, signal-backed physical mutation is `UNSUPPORTED`.
+This gate is held from immediately before STOP until `finish_hook_mutation`
+resumes the stopped or parked threads. Direct raw `clone(2)` users outside
+pthread are not covered by this user-space gate and remain a separate hardening
+surface.
+
+The current code implements this Linux x86_64 and Linux Arm64 helper path behind
+the patched-Gum capability check. The default Linux x86_64 and Linux Arm64 CMake
+paths now construct a PEAK-patched Frida Gum devkit by copying the downloaded
+devkit and appending PEAK's PC API implementation to the archive. Stock Gum still
+reports `missing-gum-api` in strict mode. The helper uses `PTRACE_GETREGS` /
+`PTRACE_SETREGS` on x86_64 and `PTRACE_GETREGSET` / `PTRACE_SETREGSET` with
+`NT_PRSTATUS` on Arm64. When `PR_SET_PTRACER` is unavailable and returns
+`EINVAL`/`ENOSYS`, PEAK falls back to the helper's real `ptrace` attempt; actual
+permission failures still fail closed.
 
 ## PC Classification
 
@@ -179,16 +223,19 @@ internals.
 
 ## Gum Devkit Changes
 
-The current CMake downloads a prebuilt Frida Gum devkit. On Linux x86_64 the
-default `auto` provider copies that devkit to a PEAK-patched devkit directory,
-appends the PEAK PC API implementation object to `libfrida-gum.a`, and appends
-the public API declarations to `frida-gum.h`. A caller may also provide a patched
-devkit explicitly with `PEAK_FRIDA_GUM_PROVIDER=patched-devkit`.
+The current CMake downloads a prebuilt Frida Gum devkit. On Linux x86_64 and
+Linux Arm64 the default `auto` provider copies that devkit to a PEAK-patched
+devkit directory, appends the PEAK PC API implementation object to
+`libfrida-gum.a`, and appends the public API declarations to `frida-gum.h`. A
+caller may also provide a patched devkit explicitly with
+`PEAK_FRIDA_GUM_PROVIDER=patched-devkit`.
 
 The selected devkit must expose:
 
 ```c
 #define GUM_PEAK_PC_API_VERSION 1
+#define GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64 0x01060509u
+#define GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64 0x02060509u
 
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
@@ -288,24 +335,24 @@ For hook `H`:
 ```text
 callback or heartbeat requests detach(H)
 controller marks H DETACH_REQUESTED
-controller validates helper availability and snapshots Gum metadata for H
-controller asks helper to stop threads and report PCs for H
+controller validates strict backend availability and snapshots Gum metadata for H
+controller asks the selected backend to hold threads and report PCs for H
 controller classifies PCs from the pre-STOP Gum snapshot
-controller asks helper to redirect evacuable Gum PCs to safe labels
-helper keeps all non-controller threads stopped
-helper reports all threads safe, or reports fail-closed
+controller asks the backend to redirect evacuable Gum PCs to safe labels
+backend keeps all non-controller threads stopped or parked
+backend reports all threads safe, or reports fail-closed
 
 if all threads safe:
     controller marks H DETACHING
     controller abandons active PEAK samples for H
-    helper writes H's original prologue bytes back to the target entry
+    selected backend writes H's original prologue bytes back to the target entry
     controller marks H DETACHED
     controller keeps PEAK listener-owned memory and Gum bookkeeping alive
-    controller finishes the helper guard, resuming threads
+    controller finishes the strict guard, resuming or releasing threads
 else:
     controller keeps H DETACH_REQUESTED for retry on transient strict failures
     or returns H to ATTACHED on terminal policy failures
-    controller asks helper to resume threads without Gum mutation
+    controller asks the selected backend to resume/release threads without Gum mutation
 ```
 
 Active samples are abandoned, not waited on. This avoids the hot-loop problem

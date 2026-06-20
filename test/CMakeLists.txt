@@ -1,5 +1,7 @@
 include(CTest)
 if(BUILD_TESTING)
+    option(PEAK_BUILD_DYNAMIC_LIB_TESTS "Build dynamic dlopen/Python extension tests" ON)
+
     # Find or download blas only for tests
     find_package(BLAS)
     if(NOT BLAS_FOUND)
@@ -30,13 +32,15 @@ if(BUILD_TESTING)
     find_package(OpenMP)
     find_package(MPI)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    if (CMAKE_VERSION VERSION_LESS 3.17)
-        find_package(CUDA)
-    else()
-        find_package(CUDAToolkit)
-    endif()
-    if (CUDA_FOUND OR CUDAToolkit_FOUND)
-        include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS}) 
+    if(BUILD_CUDA_PROFILE)
+        if (CMAKE_VERSION VERSION_LESS 3.17)
+            find_package(CUDA)
+        else()
+            find_package(CUDAToolkit)
+        endif()
+        if (CUDA_FOUND OR CUDAToolkit_FOUND)
+            include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
     endif()
 
     include (FortranCInterface)
@@ -70,6 +74,14 @@ if(BUILD_TESTING)
     set_tests_properties(test_cuda_interceptor_consistency
         PROPERTIES
             PASS_REGULAR_EXPRESSION "cuda_interceptor_consistency_ok")
+
+    add_test(NAME test_arm_detach_support
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_arm_detach_support.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_arm_detach_support
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "arm_detach_support_ok")
 
     add_test(NAME test_detach_lifecycle_invariants
         COMMAND ${Python3_EXECUTABLE}
@@ -112,6 +124,28 @@ if(BUILD_TESTING)
                 ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
                 TIMEOUT 20)
+        add_test(NAME test_detach_hotloop_signal_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 2)
+        set_tests_properties(test_detach_hotloop_signal_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
+                FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
+                TIMEOUT 45)
+
+        add_test(NAME test_detach_hotloop_signal_thread_spawn_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --threads 8
+                    --seconds 3
+                    --spawn-transient-threads
+                    --spawner-threads 4)
+        set_tests_properties(test_detach_hotloop_signal_thread_spawn_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=256;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/signal-thread-spawn-trace.csv;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "spawned_threads=[1-9][0-9]*.*trace_detach_success=1"
+                FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
+                TIMEOUT 60)
+
         add_test(NAME test_detach_hotloop_batch_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -138,7 +172,7 @@ if(BUILD_TESTING)
                         --controller-batch-retry-check)
             set_tests_properties(test_detach_hotloop_batch_retry_preserves_pending_strict
                 PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
                     TIMEOUT 30)
             add_test(NAME test_detach_hotloop_reattach_retry_preserves_pending_strict
@@ -146,7 +180,7 @@ if(BUILD_TESTING)
                         --controller-reattach-retry-check)
             set_tests_properties(test_detach_hotloop_reattach_retry_preserves_pending_strict
                 PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-pc.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-trace.csv;${PRELOAD_VAR}"
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-pc.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_reattach_retry_ok"
                     SKIP_RETURN_CODE 77
                     TIMEOUT 30)
@@ -157,7 +191,7 @@ if(BUILD_TESTING)
                             --unsupported-gum-pc-case ${_unsupported_gum_pc_case})
                 set_tests_properties(test_detach_hotloop_unsupported_gum_pc_${_unsupported_gum_pc_case}_preserves_pending_strict
                     PROPERTIES
-                        ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-trace.csv;${PRELOAD_VAR}"
+                        ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}.txt;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-helper.log;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-unsupported-gum-pc-${_unsupported_gum_pc_case}-trace.csv;${PRELOAD_VAR}"
                         PASS_REGULAR_EXPRESSION "controller_unsupported_gum_pc_retry_ok"
                         SKIP_RETURN_CODE 77
                         TIMEOUT 30)
@@ -194,6 +228,35 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "peak_detach_stale_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests"
                 TIMEOUT 40)
+        add_test(NAME test_detach_stale_threads_signal_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
+                    --active-threads 8
+                    --stale-threads 24
+                    --stale-calls 2048
+                    --active-after-stale
+                    --seconds 2)
+        set_tests_properties(test_detach_stale_threads_signal_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_stale_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "peak_detach_stale_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
+                FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
+                TIMEOUT 45)
+
+        add_test(NAME test_detach_stale_threads_signal_unrelated_spin_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
+                    --active-threads 8
+                    --stale-threads 16
+                    --stale-calls 2048
+                    --active-after-stale
+                    --seconds 2
+                    --stale-mode unrelated-spin)
+        set_tests_properties(test_detach_stale_threads_signal_unrelated_spin_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_stale_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "stale_mode=unrelated-spin.*stale_blocked=16.*stale_calls=32768.*unrelated_effect=[1-9][0-9]*"
+                FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
+                TIMEOUT 45)
+
         add_test(NAME test_detach_stale_threads_strict_low_tracking_capacity
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
                     --active-threads 8
@@ -398,7 +461,7 @@ if(BUILD_TESTING)
     )
 
     # Add Cuda Test cases
-    if(CUDA_FOUND OR CUDAToolkit_FOUND)
+    if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))
         add_subdirectory(cuda)
 
         # add_test(NAME test_ompmpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/parallel_tests/test_omp_mpi)
@@ -412,7 +475,9 @@ if(BUILD_TESTING)
     endif()
     
     # Add test of dynamic library intercepting
-    add_subdirectory(dynamic_lib)
+    if(PEAK_BUILD_DYNAMIC_LIB_TESTS)
+        add_subdirectory(dynamic_lib)
+    endif()
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)

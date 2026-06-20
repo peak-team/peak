@@ -1,4 +1,5 @@
 #include "pthread_listener.h"
+#include "peak_detach_controller.h"
 
 #include <string.h>
 
@@ -69,6 +70,7 @@ peak_pthread_start(void* data)
     }
 
     pthread_cleanup_push(peak_pthread_start_cleanup, context);
+    peak_detach_controller_wait_for_mutation_window();
     ret = start_routine(start_arg);
     pthread_cleanup_pop(1);
 
@@ -215,15 +217,20 @@ void pthread_listener_attach()
 
     pthread_create_interceptor = gum_interceptor_obtain();
     pthread_create_listener = g_object_new(PTHREAD_TYPE_LISTENER, NULL);
+    peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 
     gum_interceptor_begin_transaction(pthread_create_interceptor);
     pthread_create_hook_address = gum_find_function("pthread_create");
     if (pthread_create_hook_address) {
         // g_print ("pthread_create found at %p\n",  hook_address);
-        gum_interceptor_attach(pthread_create_interceptor,
-                               pthread_create_hook_address,
-                               pthread_create_listener,
-                               &pthread_create_state);
+        GumAttachReturn attach_status =
+            gum_interceptor_attach(pthread_create_interceptor,
+                                   pthread_create_hook_address,
+                                   pthread_create_listener,
+                                   &pthread_create_state);
+        if (attach_status == GUM_ATTACH_OK) {
+            peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+        }
     }
     pthread_join_hook_address = gum_find_function("pthread_join");
     if (pthread_join_hook_address) {

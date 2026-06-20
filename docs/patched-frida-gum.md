@@ -2,11 +2,11 @@
 
 PEAK can build with either the stock prebuilt Frida Gum devkit or a PEAK-patched
 devkit exposing the PC classification and safe-point hooks described in
-`docs/physical-detach-controller.md`. On Linux x86_64 the default `auto`
-provider now downloads the Frida Gum devkit, copies it to a PEAK-patched devkit
-directory, and appends PEAK's Gum PC API implementation to the archive. Other
-platforms keep using the stock prebuilt devkit unless a patched devkit is
-selected explicitly.
+`docs/physical-detach-controller.md`. On Linux x86_64 and Linux Arm64 the
+default `auto` provider now downloads the Frida Gum devkit, copies it to a
+PEAK-patched devkit directory, and appends PEAK's Gum PC API implementation to
+the archive. Other platforms keep using the stock prebuilt devkit unless a
+patched devkit is selected explicitly.
 
 ## Default Provider
 
@@ -16,8 +16,9 @@ No extra configuration is required for the default build:
 cmake -S . -B build
 ```
 
-On Linux x86_64 this produces `frida-gum-peak-patched/libfrida-gum.a` in the
-build tree and validates that the linked headers and archive expose the PEAK ABI.
+On Linux x86_64 and Linux Arm64 this produces
+`frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the
+linked headers and archive expose the architecture-specific PEAK ABI.
 The downloaded Frida Gum 16.5.9 archives are pinned with SHA-256 hashes in
 `cmake/frida-gum-download.cmake`.
 
@@ -109,21 +110,35 @@ the PEAK API.
 
 This branch wires the selected Gum provider into PEAK's runtime capability
 checks. When `PEAK_REQUIRE_SAFE_DETACH=1` or
-`PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` is set, PEAK refuses Gum
-mutation if the selected Gum headers do not expose the PEAK API.
+`PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` / `signal` is set, PEAK
+refuses Gum mutation if the selected Gum headers do not expose the PEAK API.
+`PEAK_DETACH_BACKEND=helper` forces the external ptrace helper,
+`PEAK_DETACH_BACKEND=signal` forces the in-process strict signal backend, and
+plain `strict` uses `auto`: helper first, with signal fallback only when the
+helper path is denied by policy.
 
 With stock Gum, strict mode still fails closed with `missing-gum-api`. With a
-patched devkit, PEAK starts `peak_detach_helper` (or the executable named by
-`PEAK_DETACH_HELPER`) and uses it to stop every non-controller Linux TID, read
-PCs, let the in-process controller classify those PCs through the patched Gum
-API, optionally move audited trampoline PCs to Gum-provided safe PCs, perform the
-physical patch write while all other threads remain stopped, and then
-detach/resume the threads. Gum bookkeeping detach is intentionally deferred until
-after the helper releases threads, or until final shutdown, so PEAK restores the
-target entry without asking non-thread-safe Gum code to modify live patches in
-the dangerous window.
+patched devkit, PEAK uses a strict stop backend to hold every non-controller
+Linux TID, read PCs, let the in-process controller classify those PCs through
+the patched Gum API, optionally move audited trampoline PCs to Gum-provided safe
+PCs, perform the physical patch write while all other threads remain stopped or
+parked, and then detach/resume or release the threads. Gum bookkeeping detach is
+intentionally deferred until after the strict backend releases threads, or until
+final shutdown, so PEAK restores the target entry without asking
+non-thread-safe Gum code to modify live patches in the dangerous window.
 
-The helper is currently built on Linux x86_64 and installed as
+The signal backend is intended for ptrace-restricted environments. It parks
+threads in an async-signal-safe atomic corridor, confirms each required PC
+rewrite before release, revalidates `/proc/self/task` immediately before byte
+writes, and holds PEAK's pthread-start gate until `finish_hook_mutation` releases
+the mutation window. Existing-hook mutations require Gum PC diagnostics; missing
+corridor metadata is a fail-closed classification error. Signal-backed physical
+mutation also requires the `pthread_create` wrapper to confirm that the thread
+creation gate is installed. A masked signal, missing arrival, unknown PC, failed
+rewrite, missing pthread gate, or failed release is fail-closed; after a physical
+byte/register mutation starts, failed release is fatal.
+
+The helper is currently built on Linux x86_64 and Linux Arm64 and installed as
 `bin/peak_detach_helper`. At runtime, `PEAK_DETACH_HELPER` has priority when
 set. Otherwise the library tries a relocation-safe path derived from the loaded
 `libpeak.so` location
