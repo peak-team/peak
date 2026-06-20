@@ -84,7 +84,7 @@ target_include_directories(peak
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     target_compile_definitions(peak PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
 endif()
-if(BUILD_TESTING)
+if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
 endif()
 

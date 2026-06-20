@@ -122,11 +122,24 @@ if (BUILD_CUDA_PROFILE)
     endif()
 endif()
 
-add_subdirectory(src)
-
-# Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests
+# Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests.
+# BUILD_TESTING is also accepted for compatibility with standard CTest builds.
 option(BUILD_TESTS "Build tests" OFF)
 if(BUILD_TESTS)
+    set(BUILD_TESTING ON CACHE BOOL "Build tests" FORCE)
+else()
+    option(BUILD_TESTING "Build tests" OFF)
+endif()
+option(PEAK_BUILD_BENCHMARKS "Build PEAK benchmark/stress targets" OFF)
+if(BUILD_TESTING OR PEAK_BUILD_BENCHMARKS)
     enable_testing()
+endif()
+
+add_subdirectory(src)
+
+if(BUILD_TESTING)
     add_subdirectory(test)
+endif()
+if(PEAK_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
