@@ -36,6 +36,46 @@ typedef struct {
 static PeakHeldThread held_threads[PEAK_DETACH_HELPER_MAX_THREADS];
 static size_t held_thread_count = 0;
 
+#if defined(PEAK_DETACH_HELPER_ENABLE_TEST_HOOKS)
+static int test_stop_retry_injected = 0;
+
+static int
+test_env_enabled(const char* name)
+{
+    const char* value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int
+test_should_inject_stop_snapshot_retry(void)
+{
+    if (test_stop_retry_injected ||
+        !test_env_enabled("G_TEST_PEAK_DETACH_HELPER_STOP_RETRY_ONCE")) {
+        return 0;
+    }
+    test_stop_retry_injected = 1;
+    return 1;
+}
+
+static void
+test_record_stop_snapshot_retry(void)
+{
+    const char* path = getenv("G_TEST_PEAK_DETACH_HELPER_RETRY_LOG");
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) {
+        return;
+    }
+    const char message[] = "stop_snapshot_retry\n";
+    ssize_t ignored = write(fd, message, sizeof(message) - 1u);
+    (void)ignored;
+    close(fd);
+}
+#endif
+
 static int
 read_exact(int fd, void* buffer, size_t size)
 {
@@ -143,6 +183,57 @@ cleanup_held_threads_or_release_failed(PeakDetachHelperStatus intended_status,
     }
 
     return intended_status;
+}
+
+static int
+stop_snapshot_error_is_retryable(PeakDetachHelperStatus status, int errno_value)
+{
+    if (status != PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR &&
+        status != PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR) {
+        return 0;
+    }
+
+    return errno_value == ESRCH || errno_value == EAGAIN ||
+           errno_value == EINTR || errno_value == EIO;
+}
+
+static PeakDetachHelperStatus
+cleanup_or_retry_stop_snapshot(PeakDetachHelperStatus intended_status,
+                               int* errno_out,
+                               long deadline,
+                               int* retry_out)
+{
+    int original_errno = errno_out != NULL ? *errno_out : 0;
+    PeakDetachHelperStatus status;
+
+    if (retry_out != NULL) {
+        *retry_out = 0;
+    }
+
+    status = cleanup_held_threads_or_release_failed(intended_status, errno_out);
+    if (status != intended_status) {
+        return status;
+    }
+
+    if (!stop_snapshot_error_is_retryable(intended_status, original_errno)) {
+        return status;
+    }
+
+    if (monotonic_milliseconds() >= deadline) {
+        if (errno_out != NULL) {
+            *errno_out = ETIMEDOUT;
+        }
+        return PEAK_DETACH_HELPER_STATUS_TIMEOUT;
+    }
+
+    if (errno_out != NULL) {
+        *errno_out = 0;
+    }
+    if (retry_out != NULL) {
+        *retry_out = 1;
+    }
+    usleep(1000);
+    return PEAK_DETACH_HELPER_STATUS_OK;
 }
 
 static int
@@ -402,10 +493,13 @@ static PeakDetachHelperStatus
 stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
 {
     char task_path[64];
-    DIR* task_dir;
     PeakDetachHelperThreadSnapshot snapshots[PEAK_DETACH_HELPER_MAX_THREADS];
     uint32_t snapshot_count = 0;
+    long deadline =
+        monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
 
+restart_stop_snapshot:
+    snapshot_count = 0;
     *errno_out = 0;
     if (cleanup_held_threads_or_release_failed(
             PEAK_DETACH_HELPER_STATUS_OK,
@@ -414,116 +508,181 @@ stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
     }
 
     snprintf(task_path, sizeof(task_path), "/proc/%ld/task", (long)pid);
-    task_dir = opendir(task_path);
-    if (task_dir == NULL) {
-        *errno_out = errno;
-        return errno == EACCES || errno == EPERM ?
-            PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
-            PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
-    }
 
     for (;;) {
-        struct dirent* entry;
-        pid_t tid;
-        PeakDetachHelperThreadSnapshot* snapshot;
-
-        errno = 0;
-        entry = readdir(task_dir);
-        if (entry == NULL) {
-            break;
+        DIR* task_dir = opendir(task_path);
+        if (task_dir == NULL) {
+            *errno_out = errno;
+            return errno == EACCES || errno == EPERM ?
+                PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
+                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
         }
 
-        if (parse_tid_name(entry->d_name, &tid) != 0 ||
-            tid == controller_tid) {
-            continue;
-        }
+        for (;;) {
+            struct dirent* entry;
+            pid_t tid;
+            PeakDetachHelperThreadSnapshot* snapshot;
 
-        if (snapshot_count >= PEAK_DETACH_HELPER_MAX_THREADS) {
-            closedir(task_dir);
-            *errno_out = E2BIG;
-            return cleanup_held_threads_or_release_failed(
-                PEAK_DETACH_HELPER_STATUS_THREAD_LIMIT,
-                errno_out);
-        }
+            errno = 0;
+            entry = readdir(task_dir);
+            if (entry == NULL) {
+                break;
+            }
 
-        snapshot = &snapshots[snapshot_count];
-        snapshot->tid = tid;
-        snapshot->status = PEAK_DETACH_HELPER_THREAD_OK;
-        snapshot->pc = 0;
+            if (parse_tid_name(entry->d_name, &tid) != 0 ||
+                tid == controller_tid || tid_is_held(tid)) {
+                continue;
+            }
+
+            if (snapshot_count >= PEAK_DETACH_HELPER_MAX_THREADS ||
+                held_thread_count >= PEAK_DETACH_HELPER_MAX_THREADS) {
+                closedir(task_dir);
+                *errno_out = E2BIG;
+                return cleanup_held_threads_or_release_failed(
+                    PEAK_DETACH_HELPER_STATUS_THREAD_LIMIT,
+                    errno_out);
+            }
+
+            snapshot = &snapshots[snapshot_count];
+            snapshot->tid = tid;
+            snapshot->status = PEAK_DETACH_HELPER_THREAD_OK;
+            snapshot->pc = 0;
 
 #if defined(PTRACE_SEIZE) && defined(PTRACE_INTERRUPT)
-        if (ptrace(PTRACE_SEIZE, tid, NULL, (void*)0) != 0) {
-            PeakDetachHelperStatus intended_status;
-            *errno_out = errno;
-            closedir(task_dir);
-            intended_status = *errno_out == EACCES || *errno_out == EPERM ?
-                PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
-                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
-            return cleanup_held_threads_or_release_failed(intended_status,
-                                                          errno_out);
-        }
+            if (ptrace(PTRACE_SEIZE, tid, NULL, (void*)0) != 0) {
+                PeakDetachHelperStatus intended_status;
+                *errno_out = errno;
+                closedir(task_dir);
+                intended_status = *errno_out == EACCES || *errno_out == EPERM ?
+                    PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
+                    PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+                int retry_snapshot = 0;
+                PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
+                    intended_status,
+                    errno_out,
+                    deadline,
+                    &retry_snapshot);
+                if (retry_snapshot) {
+                    goto restart_stop_snapshot;
+                }
+                return status;
+            }
 
-        PeakHeldThread* held_thread = &held_threads[held_thread_count];
-        held_thread->tid = tid;
-        held_thread->attached = 1;
-        held_thread->detach_signal = 0;
-        held_thread_count++;
+            PeakHeldThread* held_thread = &held_threads[held_thread_count];
+            held_thread->tid = tid;
+            held_thread->attached = 1;
+            held_thread->detach_signal = 0;
+            held_thread_count++;
 
-        if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
-            PeakDetachHelperStatus intended_status;
-            *errno_out = errno;
-            closedir(task_dir);
-            intended_status = *errno_out == EACCES || *errno_out == EPERM ?
-                PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
-                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
-            return cleanup_held_threads_or_release_failed(intended_status,
-                                                          errno_out);
-        }
+            if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
+                PeakDetachHelperStatus intended_status;
+                *errno_out = errno;
+                closedir(task_dir);
+                intended_status = *errno_out == EACCES || *errno_out == EPERM ?
+                    PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
+                    PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+                int retry_snapshot = 0;
+                PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
+                    intended_status,
+                    errno_out,
+                    deadline,
+                    &retry_snapshot);
+                if (retry_snapshot) {
+                    goto restart_stop_snapshot;
+                }
+                return status;
+            }
 
-        if (wait_for_ptrace_stop(tid, &held_thread->detach_signal) != 0) {
-            PeakDetachHelperStatus intended_status;
-            *errno_out = errno;
-            closedir(task_dir);
-            intended_status = *errno_out == ETIMEDOUT ?
-                PEAK_DETACH_HELPER_STATUS_TIMEOUT :
-                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
-            return cleanup_held_threads_or_release_failed(intended_status,
-                                                          errno_out);
-        }
+            if (wait_for_ptrace_stop(tid, &held_thread->detach_signal) != 0) {
+                PeakDetachHelperStatus intended_status;
+                *errno_out = errno;
+                closedir(task_dir);
+                intended_status = *errno_out == ETIMEDOUT ?
+                    PEAK_DETACH_HELPER_STATUS_TIMEOUT :
+                    PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+                int retry_snapshot = 0;
+                PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
+                    intended_status,
+                    errno_out,
+                    deadline,
+                    &retry_snapshot);
+                if (retry_snapshot) {
+                    goto restart_stop_snapshot;
+                }
+                return status;
+            }
 #else
-        *errno_out = ENOTSUP;
-        closedir(task_dir);
-        return cleanup_held_threads_or_release_failed(
-            PEAK_DETACH_HELPER_STATUS_UNSUPPORTED,
-            errno_out);
+            *errno_out = ENOTSUP;
+            closedir(task_dir);
+            return cleanup_held_threads_or_release_failed(
+                PEAK_DETACH_HELPER_STATUS_UNSUPPORTED,
+                errno_out);
 #endif
 
-        PeakRegs regs;
-        if (peak_regs_get(tid, &regs) != 0) {
+            PeakRegs regs;
+            if (peak_regs_get(tid, &regs) != 0) {
+                *errno_out = errno;
+                closedir(task_dir);
+                int retry_snapshot = 0;
+                PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
+                    PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR,
+                    errno_out,
+                    deadline,
+                    &retry_snapshot);
+                if (retry_snapshot) {
+                    goto restart_stop_snapshot;
+                }
+                return status;
+            }
+
+#if defined(PEAK_DETACH_HELPER_ENABLE_TEST_HOOKS)
+            if (test_should_inject_stop_snapshot_retry()) {
+                *errno_out = ESRCH;
+                closedir(task_dir);
+                int retry_snapshot = 0;
+                PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
+                    PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR,
+                    errno_out,
+                    deadline,
+                    &retry_snapshot);
+                if (retry_snapshot) {
+                    test_record_stop_snapshot_retry();
+                    goto restart_stop_snapshot;
+                }
+                return status;
+            }
+#endif
+
+            snapshot->pc = peak_regs_pc(&regs);
+            snapshot_count++;
+        }
+
+        if (errno != 0) {
             *errno_out = errno;
             closedir(task_dir);
             return cleanup_held_threads_or_release_failed(
-                PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR,
+                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR,
                 errno_out);
         }
 
-        snapshot->pc = peak_regs_pc(&regs);
-        snapshot_count++;
-    }
-
-    if (errno != 0) {
-        *errno_out = errno;
         closedir(task_dir);
-        return cleanup_held_threads_or_release_failed(
-            PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR,
-            errno_out);
-    }
 
-    closedir(task_dir);
-
-    PeakDetachHelperStatus verify_status =
-        verify_no_unstopped_threads(pid, controller_tid, errno_out);
-    if (verify_status != PEAK_DETACH_HELPER_STATUS_OK) {
+        PeakDetachHelperStatus verify_status =
+            verify_no_unstopped_threads(pid, controller_tid, errno_out);
+        if (verify_status == PEAK_DETACH_HELPER_STATUS_OK) {
+            break;
+        }
+        if (verify_status == PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR &&
+            *errno_out == EAGAIN) {
+            if (monotonic_milliseconds() >= deadline) {
+                *errno_out = ETIMEDOUT;
+                return cleanup_held_threads_or_release_failed(
+                    PEAK_DETACH_HELPER_STATUS_TIMEOUT,
+                    errno_out);
+            }
+            usleep(1000);
+            continue;
+        }
         return cleanup_held_threads_or_release_failed(verify_status,
                                                       errno_out);
     }
@@ -739,6 +898,62 @@ verify_tracee_memory(pid_t pid,
     return 0;
 }
 
+static int
+pc_in_range(uint64_t pc, uint64_t address, uint32_t size)
+{
+    uint64_t finish;
+
+    if (address == 0 || size == 0) {
+        return 0;
+    }
+    finish = address + (uint64_t)size;
+    if (finish <= address) {
+        return 0;
+    }
+
+    return pc >= address && pc < finish;
+}
+
+static int
+wait_for_single_step_stop(pid_t tid, int* stop_signal_out)
+{
+    long deadline = monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
+
+    if (stop_signal_out != NULL) {
+        *stop_signal_out = 0;
+    }
+
+    for (;;) {
+        int status = 0;
+        pid_t waited = waitpid(tid, &status, __WALL | WNOHANG);
+
+        if (waited < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (waited == 0) {
+            if (monotonic_milliseconds() >= deadline) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            usleep(1000);
+            continue;
+        }
+        if (WIFSTOPPED(status)) {
+            if (stop_signal_out != NULL) {
+                *stop_signal_out = WSTOPSIG(status);
+            }
+            return 0;
+        }
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            errno = ESRCH;
+            return -1;
+        }
+    }
+}
+
 static PeakDetachHelperStatus
 validate_instruction(const PeakDetachHelperInstruction* instruction,
                      int* errno_out)
@@ -762,6 +977,25 @@ validate_instruction(const PeakDetachHelperInstruction* instruction,
         return PEAK_DETACH_HELPER_STATUS_OK;
     }
 
+    if (instruction->action ==
+        PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE) {
+        PeakHeldThread* held_thread = find_held_thread((pid_t)instruction->tid);
+
+        if (held_thread == NULL || !held_thread->attached) {
+            *errno_out = ESRCH;
+            return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+        }
+        if (instruction->address == 0 ||
+            instruction->size == 0 ||
+            instruction->size > PEAK_DETACH_HELPER_MAX_PATCH_BYTES ||
+            instruction->address + (uint64_t)instruction->size <=
+                instruction->address) {
+            *errno_out = EINVAL;
+            return PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR;
+        }
+        return PEAK_DETACH_HELPER_STATUS_OK;
+    }
+
     if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY) {
         if (instruction->address == 0 ||
             instruction->size == 0 ||
@@ -774,6 +1008,65 @@ validate_instruction(const PeakDetachHelperInstruction* instruction,
 
     *errno_out = EINVAL;
     return PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR;
+}
+
+static PeakDetachHelperStatus
+apply_single_step_out_of_range_instruction(
+    const PeakDetachHelperInstruction* instruction,
+    int* errno_out)
+{
+    PeakHeldThread* held_thread = find_held_thread((pid_t)instruction->tid);
+    PeakRegs regs;
+    uint32_t max_steps = instruction->size + 4u;
+
+    if (held_thread == NULL || !held_thread->attached) {
+        *errno_out = ESRCH;
+        return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+    }
+    if (max_steps < 8u) {
+        max_steps = 8u;
+    }
+
+    for (uint32_t step = 0; step < max_steps; step++) {
+        uint64_t pc;
+        int stop_signal = 0;
+
+        if (peak_regs_get(held_thread->tid, &regs) != 0) {
+            *errno_out = errno;
+            return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
+        }
+        pc = peak_regs_pc(&regs);
+        if (!pc_in_range(pc, instruction->address, instruction->size)) {
+            return PEAK_DETACH_HELPER_STATUS_OK;
+        }
+
+        if (ptrace(PTRACE_SINGLESTEP, held_thread->tid, NULL, NULL) != 0) {
+            *errno_out = errno;
+            return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+        }
+        if (wait_for_single_step_stop(held_thread->tid, &stop_signal) != 0) {
+            *errno_out = errno;
+            return *errno_out == ETIMEDOUT
+                ? PEAK_DETACH_HELPER_STATUS_TIMEOUT
+                : PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+        }
+        if (stop_signal != SIGTRAP) {
+            held_thread->detach_signal = stop_signal;
+            *errno_out = EINTR;
+            return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+        }
+    }
+
+    if (peak_regs_get(held_thread->tid, &regs) != 0) {
+        *errno_out = errno;
+        return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
+    }
+    if (pc_in_range(peak_regs_pc(&regs), instruction->address, instruction->size)) {
+        *errno_out = ETIMEDOUT;
+        return PEAK_DETACH_HELPER_STATUS_TIMEOUT;
+    }
+
+    return PEAK_DETACH_HELPER_STATUS_OK;
 }
 
 static PeakDetachHelperStatus
@@ -853,6 +1146,24 @@ apply_instructions(pid_t pid,
 
     PeakDetachHelperStatus verify_status =
         verify_no_unstopped_threads(pid, controller_tid, errno_out);
+    if (verify_status != PEAK_DETACH_HELPER_STATUS_OK) {
+        return verify_status;
+    }
+
+    for (uint32_t i = 0; i < instruction_count; i++) {
+        const PeakDetachHelperInstruction* instruction = &instructions[i];
+        if (instruction->action ==
+            PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE) {
+            PeakDetachHelperStatus status =
+                apply_single_step_out_of_range_instruction(instruction,
+                                                           errno_out);
+            if (status != PEAK_DETACH_HELPER_STATUS_OK) {
+                return status;
+            }
+        }
+    }
+
+    verify_status = verify_no_unstopped_threads(pid, controller_tid, errno_out);
     if (verify_status != PEAK_DETACH_HELPER_STATUS_OK) {
         return verify_status;
     }

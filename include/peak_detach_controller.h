@@ -4,6 +4,7 @@
 #include "frida-gum.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum {
     PEAK_DETACH_OPERATION_ATTACH = 0,
@@ -43,6 +44,13 @@ typedef struct {
     PeakDetachStatus status;
 } PeakDetachBatchResult;
 
+typedef struct {
+    const char* reason;
+    long tid;
+    uintptr_t pc;
+    uintptr_t aux;
+} PeakDetachFailureDetail;
+
 gboolean peak_detach_controller_prepare_hook_mutation(
     const PeakDetachRequest* request,
     PeakDetachStatus* status_out);
@@ -61,6 +69,9 @@ gboolean peak_detach_controller_threads_are_held(void);
 gboolean peak_detach_controller_current_mutation_uses_physical_patch(void);
 
 double peak_detach_controller_last_stop_window_us(void);
+
+const PeakDetachFailureDetail*
+peak_detach_controller_last_failure_detail(void);
 
 void peak_detach_controller_wait_for_mutation_window(void);
 

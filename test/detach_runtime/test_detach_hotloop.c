@@ -18,6 +18,13 @@ static atomic_int stop_requested;
 static atomic_uint_fast64_t side_effect;
 static atomic_uint_fast64_t spawned_worker_count;
 
+#define PEAK_DETACH_HOT_BURST 64
+#define PEAK_DETACH_HOT_NOP_SLED \
+    "nop\n\t" "nop\n\t" "nop\n\t" "nop\n\t" \
+    "nop\n\t" "nop\n\t" "nop\n\t" "nop\n\t" \
+    "nop\n\t" "nop\n\t" "nop\n\t" "nop\n\t" \
+    "nop\n\t" "nop\n\t" "nop\n\t" "nop\n\t"
+
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -26,20 +33,18 @@ typedef struct {
     int open;
 } StartGate;
 
-__attribute__((noinline))
+__attribute__((noinline, noclone, used, externally_visible, visibility("default")))
 void peak_detach_hot_target(uint64_t value)
 {
-    atomic_fetch_add_explicit(&side_effect, value + 1, memory_order_relaxed);
-    asm volatile("" ::: "memory");
+    (void)value;
+    asm volatile(PEAK_DETACH_HOT_NOP_SLED ::: "memory");
 }
 
-__attribute__((noinline))
+__attribute__((noinline, noclone, used, externally_visible, visibility("default")))
 void peak_detach_hot_target_two(uint64_t value)
 {
-    atomic_fetch_xor_explicit(&side_effect,
-                              value ^ UINT64_C(0x9e3779b97f4a7c15),
-                              memory_order_relaxed);
-    asm volatile("" ::: "memory");
+    (void)value;
+    asm volatile(PEAK_DETACH_HOT_NOP_SLED ::: "memory");
 }
 
 typedef struct {
@@ -107,13 +112,18 @@ worker_main(void* arg)
     pthread_mutex_unlock(&state->start_gate->mutex);
 
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
-        peak_detach_hot_target((uint64_t)(seed + local_calls));
-        if (state->paired_targets) {
-            peak_detach_hot_target_two((uint64_t)(seed ^ local_calls));
+        for (int burst = 0; burst < PEAK_DETACH_HOT_BURST; burst++) {
+            peak_detach_hot_target((uint64_t)(seed + local_calls));
+            if (state->paired_targets) {
+                peak_detach_hot_target_two((uint64_t)(seed ^ local_calls));
+            }
+            local_calls++;
         }
-        local_calls++;
     }
 
+    atomic_fetch_add_explicit(&side_effect,
+                              ((uint64_t)seed << 32) ^ local_calls,
+                              memory_order_relaxed);
     state->calls = local_calls;
     return NULL;
 }
@@ -127,6 +137,9 @@ spawned_worker_main(void* arg)
     for (uint64_t i = 0; i < 32; i++) {
         peak_detach_hot_target((uint64_t)(seed + i));
     }
+    atomic_fetch_add_explicit(&side_effect,
+                              ((uint64_t)seed << 32) ^ UINT64_C(32),
+                              memory_order_relaxed);
     free(state);
     return NULL;
 }
@@ -482,16 +495,14 @@ trace_proves_retry_preservation(const char* trace_path, const char* retry_batch_
 }
 
 static int
-trace_has_retryable_classify_failure_without_success(const char* trace_path,
-                                                     const char* symbol,
-                                                     const char* operation,
-                                                     char* batch_id,
-                                                     size_t batch_id_size)
+trace_has_entry_byte_only_success_without_classify_failure(const char* trace_path,
+                                                           const char* symbol,
+                                                           const char* operation)
 {
     FILE* fp = fopen(trace_path, "r");
     char line[1024];
-    int saw_failure = 0;
     int saw_success = 0;
+    int saw_classify_failure = 0;
 
     if (fp == NULL) {
         perror("fopen trace");
@@ -508,36 +519,35 @@ trace_has_retryable_classify_failure_without_success(const char* trace_path,
             continue;
         }
 
-        if (strcmp(fields[4], "prepare-failed") == 0 &&
-            strcmp(fields[6], "classify-failed") == 0 &&
-            atoi(fields[7]) > 0 &&
-            atof(fields[10]) > 0.0 &&
-            strcmp(fields[11], "0") != 0 &&
-            count >= 13 &&
-            strcmp(fields[12], "classify-failed") == 0) {
-            saw_failure = 1;
-            snprintf(batch_id, batch_id_size, "%s", fields[11]);
+        if ((strcmp(fields[4], "prepare-failed") == 0 &&
+             strcmp(fields[6], "classify-failed") == 0) ||
+            (count >= 13 && strcmp(fields[12], "classify-failed") == 0)) {
+            saw_classify_failure = 1;
         }
 
-        if (strcmp(fields[4], "success") == 0) {
+        if (strcmp(fields[4], "success") == 0 &&
+            strcmp(fields[5], "1") == 0 &&
+            strcmp(fields[6], "safe") == 0 &&
+            atof(fields[10]) > 0.0 &&
+            (count < 13 || strcmp(fields[12], "safe") == 0)) {
             saw_success = 1;
         }
     }
 
     fclose(fp);
-    if (!saw_failure) {
+    if (!saw_success) {
         fprintf(stderr,
-                "missing retryable classify-failed %s trace for %s\n",
+                "missing entry-byte-only %s success trace for %s\n",
                 operation,
                 symbol);
     }
-    if (saw_success) {
+    if (saw_classify_failure) {
         fprintf(stderr,
-                "unexpected %s success trace for pending %s\n",
+                "unexpected classify-failed %s trace for %s\n",
                 operation,
                 symbol);
     }
-    return saw_failure && !saw_success;
+    return saw_success && !saw_classify_failure;
 }
 
 static int
@@ -573,50 +583,6 @@ trace_has_physical_detach_success(const char* trace_path)
 
     fclose(fp);
     return 0;
-}
-
-static int
-trace_has_success_after_retry(const char* trace_path,
-                              const char* symbol,
-                              const char* operation)
-{
-    FILE* fp = fopen(trace_path, "r");
-    char line[1024];
-    int saw_success = 0;
-
-    if (fp == NULL) {
-        perror("fopen trace");
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char* fields[13];
-        int count = parse_csv_line(line, fields, 13);
-
-        if (count >= 13 &&
-            strcmp(fields[2], symbol) == 0 &&
-            strcmp(fields[3], operation) == 0 &&
-            strcmp(fields[4], "success") == 0 &&
-            strcmp(fields[5], "1") == 0 &&
-            strcmp(fields[6], "safe") == 0 &&
-            atoi(fields[7]) > 0 &&
-            atof(fields[8]) > 0.0 &&
-            atof(fields[10]) > 0.0 &&
-            strcmp(fields[11], "0") != 0 &&
-            strcmp(fields[12], "classify-failed") == 0) {
-            saw_success = 1;
-            break;
-        }
-    }
-
-    fclose(fp);
-    if (!saw_success) {
-        fprintf(stderr,
-                "missing later %s success trace for %s\n",
-                operation,
-                symbol);
-    }
-    return saw_success;
 }
 
 static int
@@ -745,7 +711,6 @@ run_controller_unsupported_gum_pc_retry_check(int argc, char** argv)
     int helper_log_fd;
     GumPeakPcDiagnostics diagnostics;
     gpointer unsupported_pc = NULL;
-    char retry_batch_id[32] = "";
     int resolved;
 
     if (pc_case == NULL || pc_case[0] == '\0') {
@@ -841,66 +806,36 @@ run_controller_unsupported_gum_pc_retry_check(int argc, char** argv)
         return 2;
     }
 
-    if (controller_drain(0)) {
-        fprintf(stderr, "unsupported Gum PC drain unexpectedly completed\n");
+    if (!controller_drain(1000)) {
+        fprintf(stderr, "controller did not drain entry-byte-only Gum PC detach\n");
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
-    if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED) {
-        fprintf(stderr, "expected unsupported Gum PC hook to remain pending\n");
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected unsupported Gum PC hook detached\n");
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
-    if (!trace_has_retryable_classify_failure_without_success(
+    if (!trace_has_entry_byte_only_success_without_classify_failure(
             trace_path,
             "peak_detach_hot_target",
-            "detach",
-            retry_batch_id,
-            sizeof(retry_batch_id))) {
+            "detach")) {
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
     if (!helper_log_count_is(helper_log_path, "STOP", 1) ||
         !helper_log_count_is(helper_log_path, "RESUME", 1) ||
-        !helper_log_count_is(helper_log_path, "EVACUATE", 0)) {
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-
-    if (!controller_drain(1000)) {
-        fprintf(stderr, "controller did not drain restored Gum PC retry\n");
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-    if (hook_state(0) != PEAK_HOOK_DETACHED) {
-        fprintf(stderr, "expected hook detached after restored retry drain\n");
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-    if (!trace_has_success_after_retry(trace_path,
-                                       "peak_detach_hot_target",
-                                       "detach")) {
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-    if (!helper_log_count_is(helper_log_path, "STOP", 2) ||
-        !helper_log_count_is(helper_log_path, "RESUME", 2) ||
         !helper_log_count_is(helper_log_path, "EVACUATE", 1)) {
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
 
-    printf("controller_unsupported_gum_pc_retry_ok case=%s batch_id=%s\n",
-           pc_case != NULL && pc_case[0] != '\0' ? pc_case : "first-available",
-           retry_batch_id);
+    printf("controller_unsupported_gum_pc_entry_bytes_ok case=%s\n",
+           pc_case != NULL && pc_case[0] != '\0' ? pc_case : "first-available");
     unlink_if_path(helper_log_path);
     unlink_if_path(stop_pc_file);
     return 0;
@@ -938,7 +873,6 @@ run_controller_reattach_retry_check(int argc, char** argv)
     int stop_pc_fd = -1;
     GumPeakPcDiagnostics diagnostics;
     gpointer unsupported_pc = NULL;
-    char retry_batch_id[32] = "";
     int resolved;
 
     if (pc_case == NULL || pc_case[0] == '\0') {
@@ -1070,59 +1004,36 @@ run_controller_reattach_retry_check(int argc, char** argv)
         unlink_if_path(stop_pc_file);
         return 2;
     }
-    if (controller_drain(0)) {
-        fprintf(stderr, "unsupported Gum PC reattach unexpectedly completed\n");
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-    if (hook_state(0) != PEAK_HOOK_REATTACH_REQUESTED) {
-        fprintf(stderr, "expected reattach hook to remain pending\n");
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-    if (!trace_has_retryable_classify_failure_without_success(
-            trace_path,
-            "peak_detach_hot_target",
-            "reattach",
-            retry_batch_id,
-            sizeof(retry_batch_id))) {
-        unlink_if_path(helper_log_path);
-        unlink_if_path(stop_pc_file);
-        return 2;
-    }
-
     if (!controller_drain(1000)) {
-        fprintf(stderr, "controller did not drain restored reattach retry\n");
+        fprintf(stderr, "controller did not drain entry-byte-only Gum PC reattach\n");
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
     if (hook_state(0) != PEAK_HOOK_ATTACHED) {
-        fprintf(stderr, "expected hook attached after restored reattach retry\n");
+        fprintf(stderr, "expected hook attached after entry-byte-only reattach\n");
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
-    if (!trace_has_success_after_retry(trace_path,
-                                       "peak_detach_hot_target",
-                                       "reattach")) {
+    if (!trace_has_entry_byte_only_success_without_classify_failure(
+            trace_path,
+            "peak_detach_hot_target",
+            "reattach")) {
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
-    if (!helper_log_count_is(helper_log_path, "STOP", 3) ||
-        !helper_log_count_is(helper_log_path, "RESUME", 3) ||
+    if (!helper_log_count_is(helper_log_path, "STOP", 2) ||
+        !helper_log_count_is(helper_log_path, "RESUME", 2) ||
         !helper_log_count_is(helper_log_path, "EVACUATE", 2)) {
         unlink_if_path(helper_log_path);
         unlink_if_path(stop_pc_file);
         return 2;
     }
 
-    printf("controller_reattach_retry_ok case=%s batch_id=%s\n",
-           pc_case != NULL && pc_case[0] != '\0' ? pc_case : "first-available",
-           retry_batch_id);
+    printf("controller_reattach_entry_bytes_ok case=%s\n",
+           pc_case != NULL && pc_case[0] != '\0' ? pc_case : "first-available");
     unlink_if_path(helper_log_path);
     unlink_if_path(stop_pc_file);
     (void)stop_pc_fd;

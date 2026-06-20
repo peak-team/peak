@@ -145,22 +145,42 @@ On systems where ptrace is denied, PEAK can use
 not the legacy pause mitigation. The controller installs a real-time signal
 handler, enumerates `/proc/self/task`, sends the signal to every non-controller
 TID with `tgkill`, and requires every active slot to report arrival before any
-patch write. Threads park in a dependency-free atomic loop inside the signal
-handler. The handler records the interrupted PC from `ucontext_t`; the
-controller classifies the resulting snapshot with the same patched-Gum PC API as
-the helper path.
+patch write. If a TID exits after enumeration but before signal-handler arrival,
+the controller deactivates that slot after verifying the TID no longer exists
+instead of waiting for a safe-region arrival that can never happen. If a TID
+appears in `/proc/self/task` during the initial stop verification but was not
+in the first held set, the controller admits it into the same epoch, sends the
+strict signal, waits for its handler to park and report a PC, and includes that
+thread in the snapshot that will be classified. Threads that do arrive park in
+a dependency-free atomic loop inside the signal handler. The handler records
+the interrupted PC from `ucontext_t`; the controller classifies the resulting
+snapshot with the same patched-Gum PC API as the helper path.
 
-Signal evacuation uses the same instruction model as the helper. Existing-hook
-mutations (`detach`, `reattach`, `shutdown`, and `revert`) require a Gum PC
-diagnostic snapshot for the target hook before classification; missing Gum
-corridor metadata is `CLASSIFY_FAILED`, not an implicit safe state. Before any
-write, the controller validates every `SET_PC` target, validates every
-`WRITE_MEMORY`, and re-scans `/proc/self/task` to ensure no unheld TID is
-present. PC rewrites are published back to each parked handler, and release only
-reports success after each handler confirms the rewrite succeeded. If a signal is
-masked, a thread never arrives, cleanup cannot prove release, or a rewrite fails,
-strict mode fails closed; after a physical byte/register mutation starts,
-release failure is fatal.
+Signal evacuation shares the same stopped-thread classification path as the
+helper. It supports direct `SET_PC` rewrites, `WRITE_MEMORY` commits, and a
+ptrace-free `SINGLE_STEP_OUT_OF_RANGE` implementation for reattach snapshots
+stopped inside the original target prologue. For that case the controller plants
+a temporary architecture breakpoint at `function_address + overwritten_len`,
+lets only the affected signal-held thread return from the parking handler,
+catches the breakpoint in PEAK's SIGTRAP handler, parks the thread again at the
+safe PC, restores the original breakpoint bytes, revalidates the stopped thread
+set, and only then writes the active entry patch. PEAK installs this handler as
+a chain-safe SIGTRAP handler: traps that do not match an active PEAK evacuation
+epoch/TID/breakpoint are forwarded to the previously installed action. Any
+timeout or failed breakpoint restore is fatal because PEAK can no longer prove
+the stopped-thread state. Existing-hook mutations (`detach`, `reattach`, `shutdown`, and `revert`) require
+a Gum PC diagnostic snapshot for the target hook before classification; missing
+Gum corridor metadata is `CLASSIFY_FAILED`, not an implicit safe state. Before
+any write, the controller validates every supported `SET_PC` target, validates
+every `WRITE_MEMORY`, and re-scans `/proc/self/task` to ensure no unheld TID is
+present. After PC classification has completed, newly observed unheld TIDs are
+not admitted silently because their PCs were not part of the proven-safe
+snapshot; those cases fail closed with reason-level diagnostics and are retried
+before any byte mutation. PC rewrites are published back to each parked handler,
+and release only reports success after each handler confirms the rewrite
+succeeded. If a signal is masked, a thread never arrives, cleanup cannot prove
+release, or a rewrite fails, strict mode fails closed; after a physical
+byte/register mutation starts, release failure is fatal.
 
 Because a new pthread can appear after a `/proc/self/task` scan, strict mutation
 windows also hold a lightweight pthread creation gate. PEAK's pthread wrapper
@@ -211,15 +231,28 @@ Detach rules:
 - `PEAK_PC_IN_GUM_CRITICAL` or `PEAK_PC_UNKNOWN`: do not detach unless Gum has
   been patched so the range has a bounded evacuation route.
 
-The implemented overlay is intentionally conservative: it classifies the
-per-function trampoline slice and shared enter/leave thunk ranges, but the helper
-only redirects a stopped thread when the Gum API returns a concrete safe PC.
-The currently audited direct rewrite corridor is the exact `on_enter_trampoline`
-label, which redirects to the target `function_address`. Interior enter
-trampoline PCs, leave/invoke trampoline PCs, and shared thunk/dispatch PCs do not
-have an audited direct rewrite yet; they fail closed with `CLASSIFY_FAILED` and
-are retried later. This keeps strict mode from guessing its way through Gum
-internals.
+The implemented overlay now treats PC disposition as operation-specific. For
+physical entry-byte-only `detach` and `reattach`, stopped threads already inside
+this hook's Gum enter, invoke, or leave trampoline ranges, or inside the shared
+enter/leave thunk ranges reported by Gum diagnostics, are `SAFE_NO_ACTION`:
+PEAK writes only target entry bytes and keeps Gum listener and trampoline
+metadata alive, so the in-flight Gum execution can finish on its current path.
+The shared thunk ranges are not uniquely attributed to one hook, but
+entry-byte-only mutation does not modify shared Gum code or free Gum metadata.
+These PCs do not require `SET_PC` evacuation and should not be counted as
+`CLASSIFY_FAILED`. For operations that mutate or release Gum metadata, the old
+fail-closed rule remains: a Gum PC needs an explicit Gum-provided safe PC or the
+operation is retried later. Reattach remains stricter for the target prologue:
+`pc == function_address` is accepted because no original prologue byte has
+executed yet. With helper-held
+threads, an interior PC in the overwritten prologue emits a pre-write
+`SINGLE_STEP_OUT_OF_RANGE` evacuation instruction; the helper single-steps that
+thread while the original bytes are still installed, stops again once the PC is
+outside the overwritten range, and only then commits the active patch bytes. With
+the signal backend, the same logical instruction is implemented with an
+in-process temporary breakpoint corridor instead of ptrace single-step, so the
+thread advances only to the first safe PC and parks again before the active patch
+bytes are written.
 
 ## Gum Devkit Changes
 
@@ -393,11 +426,12 @@ classification mechanism:
 ```text
 controller marks H REATTACHING
 controller validates helper availability and snapshots Gum metadata
-controller asks helper to stop threads and report PCs
-controller classifies PCs from the pre-STOP Gum snapshot and asks helper to apply Gum safe-PC redirects
-helper writes H's previously recorded active Gum patch bytes back to the target entry
+controller asks the selected strict backend to stop threads and report PCs
+controller classifies PCs from the pre-STOP Gum snapshot using operation-specific dispositions
+backend evacuates any supported interior-prologue PCs before mutation
+backend writes H's previously recorded active Gum patch bytes back to the target entry
 controller marks H ATTACHED
-controller finishes the helper guard, resuming threads
+controller finishes the backend guard, resuming threads
 ```
 
 For final shutdown detach, PEAK restores original bytes under the helper guard
@@ -424,18 +458,24 @@ by leaving listener state alive if safety still cannot be proven.
 `PEAK_DETACH_TRACE_PATH` records transition rows for offline diagnosis. The base
 columns are `time,hook_id,symbol,operation,result,physical,status`; strict
 batching extends each row with `retry_count`, `pending_age_s`, `batch_size`,
-`stop_window_us`, `batch_id`, and `last_retry_status`. The first seven fields
-are stable; parsers should treat every tail field as optional diagnostics and
-accept older rows that stop after `batch_id`. `last_retry_status` records the
-most recent retryable controller status for the hook, so a successful
-after-retry row can keep `status=safe` while still reporting the pre-reset retry
-reason such as `classify-failed`. `stop_window_us` is the measured helper-held
-STOP window when trace diagnostics are enabled, otherwise `0`; `batch_id` is a
-nonzero identifier shared by all rows emitted from one controller batch and `0`
-for single-row paths. STOP-window timing is collected only for
-`PEAK_DETACH_TRACE_PATH` diagnostics. Existing hot-callback timing remains part
-of the legacy overhead/profiling model and is separate from this STOP-window
-diagnostic path.
+`stop_window_us`, `batch_id`, and `last_retry_status`. Current diagnostics also
+append `failure_reason`, `failure_tid`, `failure_pc`, and `failure_aux` so
+collapsed statuses such as `prepare-failed,classify-failed` can be traced back
+to a concrete verifier or PC-classifier branch. The first seven fields are
+stable; parsers should treat every tail field as optional diagnostics and accept
+older rows that stop after `batch_id`. `last_retry_status` records the most
+recent retryable controller status for the hook, so a successful after-retry row
+can keep `status=safe` while still reporting the pre-reset retry reason such as
+`classify-failed`. `stop_window_us` is the measured helper-held STOP window when
+trace diagnostics are enabled, otherwise `0`; `batch_id` is a nonzero identifier
+shared by all rows emitted from one controller batch and `0` for single-row
+paths. STOP-window timing is collected only for `PEAK_DETACH_TRACE_PATH`
+diagnostics. Existing hot-callback timing remains part of the legacy
+overhead/profiling model and is separate from this STOP-window diagnostic path.
+The hot-loop stress runner now parses these trace rows directly: manual
+benchmark tests can fail on any transition skip or on configured per-operation
+`classify-failed` limits, so a retry storm cannot be hidden by one eventual safe
+detach/reattach success.
 
 ## Memory Lifetime
 
@@ -568,12 +608,11 @@ with a deliberately low `PEAK_MAX_NUM_THREADS` to ensure the helper's `/proc`
 thread enumeration, not PEAK's historical per-thread accounting table, is the
 strict safety gate.
 
-`--fail-on-transition-skips` is a stricter diagnostic mode. It currently exposes
-safe retry attempts in very hot 64-thread reattach loops where the helper stops
-threads at PCs that cannot be proven safe. Those retries are fail-closed and
-eventual reattach succeeds in the stress runs, but the no-skip diagnostic remains
-an opportunity target for a future audited single-step/breakpoint evacuation
-corridor.
+`--fail-on-transition-skips` is a stricter diagnostic mode. The hot-loop stress
+runners also accept per-operation classify-failed budgets, so helper or signal
+reattach runs can require zero retry rows when the relevant prologue evacuation
+corridor is expected to handle the stopped PCs. This keeps retry storms visible
+even when a later transition eventually succeeds.
 
 The deterministic fake-helper controller tests cover batched detach, batched
 reattach, and mixed safe/unsafe batches. The mixed case verifies that one unsafe
@@ -585,23 +624,22 @@ runtime test also runs strict detach and reattach prepare/finish with
 `PEAK_DETACH_TRACE_PATH` unset and asserts `last_stop_window_us == 0`, proving
 STOP-window timing is not gathered for the default runtime path.
 Additional fake-helper Gum-PC corridor tests force STOP snapshots at real
-diagnostic PCs from an attached hook. They prove the exact
-`on_enter_trampoline` label sends `SET_PC(function_address)` for the stopped
-target-like TID and a physical entry-byte `WRITE_MEMORY` whose address, size,
-and bytes match the Gum-reported original prologue. The fake helper can model
-synthetic STOP TIDs as itself, the target pid, or an explicit numeric value, and
-the corridor test validates `SET_PC` against the target-pid case. Unsupported
-Gum PC classes send `RESUME`, do not send `EVACUATE` in the failing attempt,
-leave no held mutation, and remain retryable `CLASSIFY_FAILED` prepares. The
-LD_PRELOAD hot-loop controller matrix covers the same unsupported-real-PC path
-for interior enter trampoline, leave trampoline, invoke trampoline, and enter
-thunk PCs through the general listener: the hook stays `DETACH_REQUESTED` with a
-retryable `prepare-failed,classify-failed` trace row, the first failed STOP window
-logs no `EVACUATE`, and the later retry drains once the fake helper returns a
-safe empty snapshot. A focused reattach retry integration test first detaches a
-target, injects a one-shot unsupported-PC reattach failure, and then verifies the
-successful reattach trace row preserves the pre-reset `retry_count` and
-`last_retry_status=classify-failed` diagnostics.
+diagnostic PCs from an attached hook. They prove physical entry-byte-only
+`detach` writes only `WRITE_MEMORY` for exact `on_enter_trampoline`, interior
+enter trampoline, leave trampoline, invoke trampoline, and shared enter-thunk
+PCs. The fake helper validates the write address, size, and bytes against the
+Gum-reported original prologue, and the tests assert no `SET_PC` evacuation is
+needed for these in-flight Gum PCs. The LD_PRELOAD hot-loop controller matrix
+covers the same real-PC classes through the general listener and now requires
+immediate physical success with no same-operation `classify-failed` trace rows.
+A focused reattach integration test first detaches a target, injects a one-shot
+Gum-PC reattach snapshot, and verifies immediate physical reattach success. A
+runtime reattach Gum-PC matrix covers the same interior enter, leave, invoke,
+and shared enter-thunk cases for physical reattach. A separate
+fake-helper reattach patch-entry test proves the exact target
+`function_address` is accepted for reattach, while `function_address + 1` in the
+original prologue emits `SINGLE_STEP_OUT_OF_RANGE,WRITE_MEMORY` and completes
+physical reattach under the helper backend.
 
 The hot-loop integration test has a paired-target mode that drives two exported
 target symbols in the same worker loop. Its strict trace assertion requires both
@@ -697,38 +735,89 @@ Completed in this branch:
     `dlopen` drains after retryable requeues, and added paired-target hot-loop
     integration coverage requiring batched physical detach trace rows.
 31. Added deterministic fake-helper Gum-PC corridor coverage for real attached
-    hook diagnostics: exact `on_enter_trampoline` is the only audited direct
-    `SET_PC` rewrite today, and interior trampoline/dispatch PCs fail closed
-    without an `EVACUATE` mutation.
-32. Strengthened fake-helper EVACUATE validation to check the stopped snapshot
-    TID plus exact Gum original-prologue write size/bytes, and added LD_PRELOAD
-    hot-loop coverage proving unsupported real Gum PCs preserve pending detach
-    state until a later retry can complete.
-33. Expanded unsupported Gum-PC coverage to a general-listener matrix for
+    hook diagnostics: physical entry-byte-only detach now treats enter, invoke,
+    leave, and shared dispatch/thunk PCs as safe-no-action; runtime reattach
+    matrix coverage proves the same disposition for physical reattach,
+    commits only the target entry-byte `WRITE_MEMORY`, and leaves Gum metadata
+    alive for in-flight trampoline users.
+32. Strengthened fake-helper EVACUATE validation to check exact Gum
+    original-prologue write size/bytes, and added LD_PRELOAD hot-loop coverage
+    proving those real Gum PCs complete immediately without `SET_PC` or
+    `CLASSIFY_FAILED` for entry-byte-only mutation.
+33. Added exact reattach patch-entry coverage proving `function_address` is
+    safe for reattach, and added helper prologue-step coverage for
+    `function_address + 1` in the overwritten prologue. Expanded Gum-PC coverage
+    to a general-listener matrix for
     interior enter trampoline, leave trampoline, invoke trampoline, and enter
-    thunk PCs; the integrated test now checks helper command logs before and
-    after retry so failed unsupported-PC attempts prove they avoided
-    `EVACUATE`.
+    thunk PCs; the integrated tests now require immediate physical success,
+    helper `EVACUATE`, and no same-operation `CLASSIFY_FAILED` row.
 34. Added trace-disabled runtime coverage for fake-helper strict detach and
     reattach STOP windows, and added reattach success-after-retry trace coverage
     proving `retry_count` and `last_retry_status` survive until the success row.
+35. Added helper-driven `SINGLE_STEP_OUT_OF_RANGE` evacuation for reattach
+    snapshots stopped inside the overwritten original prologue. The helper
+    advances those threads before entry-byte writes and the fake-helper tests
+    assert the `SINGLE_STEP_OUT_OF_RANGE,WRITE_MEMORY` ordering for
+    `function_address + 1`.
+36. Strengthened the signal backend strictness boundary: parked threads record
+    PC-rewrite success before release is reported, signal cleanup failures on
+    abort paths are fatal instead of silent best-effort cleanup, and signal mode
+    refuses physical mutation unless pthread creation is intercepted so newborn
+    threads block outside user code during the mutation window.
+37. Tightened hot-loop stress validation so benchmark/manual HPC runners can
+    fail on trace-level `classify-failed`, `prepare-failed`, or `gum-failed`
+    transition rows instead of accepting a run that eventually succeeds after a
+    long retry storm.
+38. Added ptrace-free signal-mode prologue evacuation for physical reattach: a
+    temporary breakpoint advances only a thread stopped inside the original
+    overwritten prologue to `function_address + overwritten_len`, parks it again
+    in the signal backend, restores the temporary breakpoint bytes, revalidates
+    stopped-thread coverage, and then commits the active entry patch. A CI-scale
+    signal reattach trace test now requires zero reattach `CLASSIFY_FAILED`
+    rows.
+39. Fixed the signal stop arrival race for threads that exit after `/proc`
+    enumeration but before handler arrival. The controller now deactivates
+    unarrived TIDs once `tgkill(pid, tid, 0)` proves they no longer exist, so
+    stale exiting callers do not force timeout retries.
+40. Made the signal-mode temporary breakpoint handler chain-safe so PEAK can
+    install its SIGTRAP action even when another handler already exists, while
+    forwarding unrelated traps to the previous action.
+41. Added reason-level strict trace diagnostics and fixed the signal stop
+    `/proc` race where a TID appears after the first enumeration. Initial stop
+    verification now admits the new TID into the held epoch, waits for its
+    handler PC snapshot, and classifies it before mutation. Vista ARM64 full-core
+    signal and auto reattach stress both passed 12 samples with zero
+    classify/prepare/Gum failures.
+42. Fixed the matching helper-side `/proc` race: when the helper verifies that a
+    newly observed TID appeared after the first enumeration, it now keeps the
+    already stopped threads held, loops back to stop only newly appeared TIDs
+    under the controller's thread-creation gate, and times out rather than
+    releasing/retrying an otherwise safe transition. Helper STOP failures now
+    also populate trace failure diagnostics with helper status and errno. Current
+    full-core validation passed with zero classify/prepare/Gum failures on
+    Frontera development x86_64 (56 threads, auto and helper reattach, 12
+    samples each) and Vista gg ARM64 (144 threads, auto and signal reattach, 12
+    samples each).
 
 Remaining work:
 
 1. Add CI coverage using the auto-patched Linux x86_64 devkit plus
    `PEAK_DETACH_HELPER`.
-2. Add a true no-skip evacuation corridor for hot reattach loops. This likely
-   needs helper-driven single-step or breakpoint advancement to an audited safe
-   point; direct PC rewriting remains limited to Gum's exact enter-trampoline
-   label.
+2. Promote the successful manual Vista ARM64 and Frontera x86_64 full-core
+   zero-transition stress shapes into easier-to-run HPC suites so they can be
+   repeated after each major controller change without hand-written session
+   commands.
 3. Add a true live-RIP unsafe-PC test that forces a stopped thread's actual
    register state into each Gum trampoline/shared-thunk region, complementing
    the deterministic classifier tests that exercise those PCs directly.
 4. Extend helper support to other architectures with the appropriate register
    access and PC-write APIs.
-5. Add job-control/group-stop preservation tests and, if needed, a
+5. Add stress tests that explicitly force blocked signal delivery and
+   pthread-create races in runtime mode, complementing the controller-level
+   signal tests and the existing spawner hot-loop coverage.
+6. Add job-control/group-stop preservation tests and, if needed, a
    `PTRACE_LISTEN` path for threads that were already group-stopped before the
    helper interrupt.
-6. Reduce the strict stop window further so future attach/replace operations can
+7. Reduce the strict stop window further so future attach/replace operations can
    prebuild all Gum/GLib state before stopping target threads, leaving only
    audited byte/register commits inside the debugger-held window.

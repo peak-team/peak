@@ -18,6 +18,10 @@ BAD_OUTPUT_RE = re.compile(
     r"timed out draining pending target hook detach/reattach requests",
     re.IGNORECASE,
 )
+TRANSITION_SKIP_RE = re.compile(
+    r"skipping Gum (detach|reattach)|classify-failed",
+    re.IGNORECASE,
+)
 TARGET_SYMBOL = "peak_detach_stale_target"
 
 
@@ -50,6 +54,11 @@ def make_env(args, sample):
             "PEAK_STATSLOG_PATH": f"{args.stats_prefix}-{sample}",
         }
     )
+    if args.detach_backend:
+        env["PEAK_DETACH_BACKEND"] = args.detach_backend
+        if args.detach_backend == "signal":
+            env["PEAK_SAFE_DETACH_MODE"] = "signal"
+            env.setdefault("PEAK_DETACH_HELPER", "/no/such/peak_detach_helper")
     if args.trace_prefix:
         env["PEAK_DETACH_TRACE_PATH"] = f"{args.trace_prefix}-{sample}.csv"
     return env
@@ -72,14 +81,10 @@ def reset_trace(args, sample):
 
 
 def trace_has_success(args, sample, operation):
-    path = trace_path(args, sample)
-    if not path:
-        return True
-
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            rows = list(csv.reader(handle))
-    except OSError:
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        if not trace_path(args, sample):
+            return True
         return False
 
     for fields in rows:
@@ -91,6 +96,102 @@ def trace_has_success(args, sample, operation):
                 fields[6] == "safe"):
             return True
     return False
+
+
+def read_trace_rows(args, sample):
+    path = trace_path(args, sample)
+    if not path:
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return list(csv.reader(handle))
+    except OSError:
+        return None
+
+
+def trace_transition_counts(args, sample):
+    rows = read_trace_rows(args, sample)
+    counts = {
+        "detach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+        "reattach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+    }
+    if rows is None:
+        return counts
+
+    for fields in rows:
+        if len(fields) < 7 or fields[2] != TARGET_SYMBOL:
+            continue
+        operation = fields[3]
+        if operation not in counts:
+            continue
+        if fields[6] == "classify-failed" or (
+                len(fields) >= 13 and fields[12] == "classify-failed"):
+            counts[operation]["classify_failed"] += 1
+        if fields[4] == "prepare-failed":
+            counts[operation]["prepare_failed"] += 1
+        if fields[4] == "gum-failed":
+            counts[operation]["gum_failed"] += 1
+
+    return counts
+
+
+def trace_transition_count(counts, operation, name):
+    if operation == "all":
+        return sum(values[name] for values in counts.values())
+    return counts[operation][name]
+
+
+def print_trace_transition_counts(sample, counts):
+    for operation in ("detach", "reattach"):
+        values = counts[operation]
+        print(
+            f"trace transition counts sample={sample} operation={operation} "
+            f"classify_failed={values['classify_failed']} "
+            f"prepare_failed={values['prepare_failed']} "
+            f"gum_failed={values['gum_failed']}",
+            file=sys.stderr,
+        )
+
+
+def trace_transition_limits_ok(args, sample):
+    counts = trace_transition_counts(args, sample)
+    limits = (
+        ("all", "classify_failed", args.max_classify_failed),
+        ("all", "prepare_failed", args.max_prepare_failed),
+        ("all", "gum_failed", args.max_gum_failed),
+        ("detach", "classify_failed", args.max_detach_classify_failed),
+        ("detach", "prepare_failed", args.max_detach_prepare_failed),
+        ("detach", "gum_failed", args.max_detach_gum_failed),
+        ("reattach", "classify_failed", args.max_reattach_classify_failed),
+        ("reattach", "prepare_failed", args.max_reattach_prepare_failed),
+        ("reattach", "gum_failed", args.max_reattach_gum_failed),
+    )
+    ok = True
+
+    if args.fail_on_transition_skips:
+        limits = limits + (
+            ("all", "classify_failed", 0),
+            ("all", "prepare_failed", 0),
+            ("all", "gum_failed", 0),
+        )
+
+    for operation, name, limit in limits:
+        if limit < 0:
+            continue
+        value = trace_transition_count(counts, operation, name)
+        if value > limit:
+            print(
+                f"trace transition limit exceeded sample={sample} "
+                f"operation={operation} {name}={value} limit={limit}",
+                file=sys.stderr,
+            )
+            ok = False
+
+    if not ok:
+        print_trace_transition_counts(sample, counts)
+
+    return ok
 
 
 def int_values(output):
@@ -122,7 +223,7 @@ def run_sample(args, sample):
         env=make_env(args, sample),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=args.timeout,
         check=False,
     )
@@ -136,7 +237,9 @@ def run_sample(args, sample):
     marker_ok = marker_re(args.require_reattach).search(output) is not None
     trace_detached = trace_has_success(args, sample, "detach")
     trace_reattached = trace_has_success(args, sample, "reattach")
+    trace_transition_ok = trace_transition_limits_ok(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
+    transition_skip = TRANSITION_SKIP_RE.search(output)
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
     expected_stale_calls = args.stale_threads * args.stale_calls
 
@@ -149,8 +252,10 @@ def run_sample(args, sample):
             side_effect == 0 or
             not marker_ok or
             not trace_detached or
+            not trace_transition_ok or
             (args.require_reattach and not trace_reattached) or
-            bad_output):
+            bad_output or
+            (args.fail_on_transition_skips and transition_skip)):
         print(f"stale stress sample {sample} failed rc={completed.returncode}",
               file=sys.stderr)
         if calls_match is None:
@@ -173,10 +278,15 @@ def run_sample(args, sample):
             print("missing required strict detach marker", file=sys.stderr)
         if not trace_detached:
             print("missing trace detach success", file=sys.stderr)
+        if not trace_transition_ok:
+            print("trace transition limits failed", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
         if bad_output:
             print(f"matched bad output: {bad_output.group(0)}", file=sys.stderr)
+        if args.fail_on_transition_skips and transition_skip:
+            print(f"matched transition skip: {transition_skip.group(0)}",
+                  file=sys.stderr)
         print(output, file=sys.stderr)
         raise SystemExit(1)
 
@@ -211,6 +321,18 @@ def main():
     parser.add_argument("--active-after-stale", action="store_true")
     parser.add_argument("--stale-mode", default="parked",
                         choices=["parked", "unrelated-spin", "unrelated-sleep"])
+    parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--max-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-gum-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-gum-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-gum-failed", type=int, default=-1)
+    parser.add_argument("--detach-backend", choices=("helper", "signal"),
+                        default="")
     args = parser.parse_args()
 
     if (args.active_threads <= 0 or

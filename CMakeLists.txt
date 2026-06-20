@@ -83,11 +83,20 @@ if (NOT OTF2_LIBRARIES AND NOT OTF2_LIBRARY_DIR)
     message(STATUS "OTF2_LIBRARY_DIR = ${OTF2_LIBRARY_DIR}")
 endif()
 
-# reference: https://cliutils.gitlab.io/modern-cmake/chapters/packages/MPI.html
-find_package(MPI)
-if(MPI_FOUND)
-    message(STATUS "Run: ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} ${MPIEXEC_MAX_NUMPROCS} ${MPIEXEC_PREFLAGS} EXECUTABLE ${MPIEXEC_POSTFLAGS} ARGS")
-    add_definitions(-DHAVE_MPI)
+option(PEAK_ENABLE_MPI "Enable MPI support" ON)
+if(PEAK_ENABLE_MPI)
+    # reference: https://cliutils.gitlab.io/modern-cmake/chapters/packages/MPI.html
+    find_package(MPI)
+    if(MPI_FOUND)
+        message(STATUS "Run: ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} ${MPIEXEC_MAX_NUMPROCS} ${MPIEXEC_PREFLAGS} EXECUTABLE ${MPIEXEC_POSTFLAGS} ARGS")
+        add_definitions(-DHAVE_MPI)
+    endif()
+else()
+    set(MPI_FOUND FALSE)
+    set(MPI_C_FOUND FALSE)
+    set(MPI_CXX_FOUND FALSE)
+    set(MPI_Fortran_FOUND FALSE)
+    message(STATUS "MPI support disabled by PEAK_ENABLE_MPI=OFF")
 endif()
 
 # Find CUDA

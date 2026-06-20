@@ -3,6 +3,8 @@
 #include "dlopen_interceptor.h"
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
+#include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -46,6 +48,7 @@ extern unsigned long long sig_cont_wait_interval;
 extern unsigned long long sig_stop_ack_wait_interval;
 extern unsigned int heartbeat_time;
 static gulong peak_detach_count = G_MAXULONG;
+static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 _Atomic gboolean heartbeat_running = true;
 static pthread_t general_controller_thread;
@@ -64,6 +67,30 @@ static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
+
+static gboolean
+peak_general_listener_parse_detach_count_override(gulong* count_out)
+{
+    const char* value = getenv("PEAK_DETACH_COUNT");
+
+    if (value == NULL || value[0] == '\0') {
+        return FALSE;
+    }
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+
+    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0) {
+        g_printerr("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
+        return FALSE;
+    }
+
+    if (count_out != NULL) {
+        *count_out = (gulong)parsed;
+    }
+    return TRUE;
+}
 
 typedef struct {
     size_t hook_id;
@@ -195,6 +222,12 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                                               PeakDetachStatus last_retry_status)
 {
     const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
+    const PeakDetachFailureDetail* failure_detail =
+        peak_detach_controller_last_failure_detail();
+    const char* failure_reason =
+        failure_detail != NULL && failure_detail->reason != NULL
+            ? failure_detail->reason
+            : "none";
     FILE* fp;
 
     if (path == NULL || path[0] == '\0') {
@@ -205,7 +238,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s\n",
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx\n",
                 peak_second(),
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
@@ -221,7 +254,11 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 batch_size,
                 stop_window_us,
                 batch_id,
-                peak_detach_controller_status_string(last_retry_status));
+                peak_detach_controller_status_string(last_retry_status),
+                failure_reason,
+                failure_detail != NULL ? failure_detail->tid : 0,
+                (unsigned long long)(failure_detail != NULL ? failure_detail->pc : 0),
+                (unsigned long long)(failure_detail != NULL ? failure_detail->aux : 0));
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
@@ -2323,7 +2360,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     }
     thread_data.self_mapped_id = mapped_tid;
     thread_data.self_mapped_known = mapped_found && mapped_tid < peak_max_num_threads;
-    if (peak_detach_cost == 0 && heartbeat_time == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0 &&
+        !peak_detach_count_overridden) {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
         // g_print ("hook_id %lu max %lu tid %lu ncall %p \n", hook_id, peak_max_num_threads, mapped_tid, self->num_calls);
         size_t index = mapped_tid;
@@ -2390,7 +2428,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 {
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_cost == 0 && heartbeat_time == 0) {
+    if (peak_detach_cost == 0 && heartbeat_time == 0 &&
+        !peak_detach_count_overridden) {
         if (!listener || g_object_is_floating(listener)) {
             thread_data.level--;
             if (thread_data.level == 0) {
@@ -2862,7 +2901,9 @@ void peak_general_listener_attach()
     }
     if (peak_hook_address_count) {
         peak_general_overhead_bootstrapping();
-        if (peak_detach_cost > 0) {
+        peak_detach_count_overridden =
+            peak_general_listener_parse_detach_count_override(&peak_detach_count);
+        if (!peak_detach_count_overridden && peak_detach_cost > 0) {
             if (peak_general_overhead > 0.0) {
                 peak_detach_count =
                     (peak_detach_cost > peak_general_overhead) ?

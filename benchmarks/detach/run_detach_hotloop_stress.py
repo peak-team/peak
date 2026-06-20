@@ -46,6 +46,7 @@ def make_env(args, sample):
             "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
             "PEAK_ENABLE_REATTACH": "1" if args.enable_reattach else "0",
             "PEAK_COST": args.peak_cost,
+            "PEAK_DETACH_COUNT": args.detach_count,
             "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
             "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
             "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
@@ -121,7 +122,7 @@ def trace_has_success(args, sample, operation):
                 fields[5] == "1" and
                 fields[6] == "safe" and
                 (not args.require_trace_diagnostics or
-                 trace_row_has_diagnostics(fields, "safe"))):
+                 trace_row_has_diagnostics(fields))):
             return True
     return False
 
@@ -176,7 +177,7 @@ def trace_has_required_batch(args, sample, operation, required_size):
                 fields[11] != "0" and
                 batch_size >= required_size and
                 (not args.require_trace_diagnostics or
-                 trace_row_has_diagnostics(fields, "safe"))):
+                 trace_row_has_diagnostics(fields))):
             batch_key = (fields[3], fields[11])
             batch_groups.setdefault(batch_key, set()).add(fields[2])
 
@@ -195,6 +196,79 @@ def trace_has_required_batch(args, sample, operation, required_size):
     return False
 
 
+def trace_transition_counts(args, sample):
+    rows = read_trace_rows(args, sample)
+    counts = {
+        "detach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+        "reattach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+    }
+    if rows is None:
+        return counts
+
+    tracked_symbols = {TARGET_SYMBOL}
+    if args.paired_targets:
+        tracked_symbols.add(PAIRED_TARGET_SYMBOL)
+
+    for fields in rows:
+        if len(fields) < 7 or fields[2] not in tracked_symbols:
+            continue
+        operation = fields[3]
+        if operation not in counts:
+            continue
+        if fields[6] == "classify-failed" or (
+                len(fields) >= 13 and fields[12] == "classify-failed"):
+            counts[operation]["classify_failed"] += 1
+        if fields[4] == "prepare-failed":
+            counts[operation]["prepare_failed"] += 1
+        if fields[4] == "gum-failed":
+            counts[operation]["gum_failed"] += 1
+
+    return counts
+
+
+def trace_transition_count(counts, operation, name):
+    if operation == "all":
+        return sum(values[name] for values in counts.values())
+    return counts[operation][name]
+
+
+def trace_transition_limits_ok(args, sample):
+    counts = trace_transition_counts(args, sample)
+    limits = (
+        ("all", "classify_failed", args.max_classify_failed),
+        ("all", "prepare_failed", args.max_prepare_failed),
+        ("all", "gum_failed", args.max_gum_failed),
+        ("detach", "classify_failed", args.max_detach_classify_failed),
+        ("detach", "prepare_failed", args.max_detach_prepare_failed),
+        ("detach", "gum_failed", args.max_detach_gum_failed),
+        ("reattach", "classify_failed", args.max_reattach_classify_failed),
+        ("reattach", "prepare_failed", args.max_reattach_prepare_failed),
+        ("reattach", "gum_failed", args.max_reattach_gum_failed),
+    )
+    ok = True
+
+    if args.fail_on_transition_skips:
+        limits = limits + (
+            ("all", "classify_failed", 0),
+            ("all", "prepare_failed", 0),
+            ("all", "gum_failed", 0),
+        )
+
+    for operation, name, limit in limits:
+        if limit < 0:
+            continue
+        value = trace_transition_count(counts, operation, name)
+        if value > limit:
+            print(
+                f"trace transition limit exceeded sample={sample} "
+                f"operation={operation} {name}={value} limit={limit}",
+                file=sys.stderr,
+            )
+            ok = False
+
+    return ok
+
+
 def run_sample(args, sample):
     cmd = [
         args.exe,
@@ -211,7 +285,7 @@ def run_sample(args, sample):
         env=make_env(args, sample),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        universal_newlines=True,
         timeout=args.timeout,
         check=False,
     )
@@ -226,6 +300,7 @@ def run_sample(args, sample):
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
         args, sample, "reattach", args.require_reattach_batch_size)
+    trace_transition_ok = trace_transition_limits_ok(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
@@ -237,6 +312,7 @@ def run_sample(args, sample):
             not trace_detached or
             not trace_detach_batched or
             not trace_reattach_batched or
+            not trace_transition_ok or
             (args.require_reattach and not trace_reattached) or
             bad_output or
             (args.fail_on_transition_skips and transition_skip)):
@@ -257,6 +333,8 @@ def run_sample(args, sample):
             print("missing required batched detach trace evidence", file=sys.stderr)
         if not trace_reattach_batched:
             print("missing required batched reattach trace evidence", file=sys.stderr)
+        if not trace_transition_ok:
+            print("trace transition limits failed", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
         if bad_output:
@@ -286,7 +364,8 @@ def main():
     parser.add_argument("--heartbeat-interval", default="0.001")
     parser.add_argument("--hibernation-cycle", type=int, default=1)
     parser.add_argument("--overhead-ratio", default="0.000001")
-    parser.add_argument("--peak-cost", default="0.0000001")
+    parser.add_argument("--peak-cost", default="0.000000000001")
+    parser.add_argument("--detach-count", default="1")
     parser.add_argument("--hb-min-us", default="1000")
     parser.add_argument("--hb-max-us", default="1000")
     parser.add_argument("--peak-max-threads", type=int, default=0)
@@ -298,6 +377,15 @@ def main():
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
     parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--max-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-gum-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-detach-gum-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-prepare-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-gum-failed", type=int, default=-1)
     parser.add_argument("--require-trace-diagnostics", action="store_true")
     parser.add_argument("--detach-backend", choices=("helper", "signal"),
                         default="")
