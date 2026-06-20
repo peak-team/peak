@@ -210,6 +210,104 @@ def check_shutdown_fail_closed_docs(repo_root):
             "controller must identify idle helper shutdown failure separately")
 
 
+def check_signal_backend_strict_invariants(repo_root):
+    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+        encoding="utf-8"
+    )
+    pthread_listener = (repo_root / "src/pthread_listener.c").read_text(
+        encoding="utf-8"
+    )
+    tests = (repo_root / "test/CMakeLists.txt").read_text(encoding="utf-8")
+    controller_tests = (
+        repo_root / "test/detach_controller/CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    signal_handler = extract_function(
+        controller, "peak_detach_controller_signal_handler"
+    )
+    signal_release = extract_function(
+        controller, "peak_detach_controller_signal_release"
+    )
+    signal_stop = extract_function(
+        controller, "peak_detach_controller_signal_stop_threads"
+    )
+    signal_evacuate = extract_function(
+        controller, "peak_detach_controller_signal_evacuate"
+    )
+    pthread_start = extract_function(pthread_listener, "peak_pthread_start")
+
+    require("_Atomic int rewrite_status" in controller,
+            "signal backend must keep observable per-thread rewrite status")
+    require("rewrite_ok ? 1 : -1" in signal_handler,
+            "signal handler must publish PC rewrite success/failure")
+    require("rewrite_status" in signal_release and "return FALSE" in signal_release,
+            "signal release must fail if an intended PC rewrite did not succeed")
+    require("peak_detach_controller_signal_release_or_fatal" in controller,
+            "signal cleanup failures must use release-or-fatal helper")
+    for token in (
+        "signal stop tgkill failure",
+        "signal stop timeout",
+        "signal stop verification failure",
+        "signal stop snapshot overflow",
+    ):
+        require(token in signal_stop,
+                f"signal stop cleanup path missing fatal context: {token}")
+    require("strict_mutation_thread_gate" in controller,
+            "strict signal/helper mutation windows must gate new pthread starts")
+    require("strict_mutation_thread_gate_installed" in controller,
+            "signal backend must know whether pthread_create gate is installed")
+    require("peak_detach_controller_note_thread_creation_gate_installed" in controller,
+            "pthread listener must be able to publish gate installation")
+    require("pthread_create interception is not installed" in controller,
+            "signal backend must fail closed when pthread_create gate is unavailable")
+    require("peak_detach_controller_note_thread_creation_gate_installed(TRUE)" in pthread_listener,
+            "pthread listener must publish successful pthread_create hook installation")
+    require("peak_detach_controller_begin_thread_creation_gate" in controller,
+            "controller must begin the new-thread gate before STOP")
+    require("peak_detach_controller_end_thread_creation_gate" in controller,
+            "controller must release the new-thread gate on finish/failure")
+    require("peak_detach_controller_wait_for_mutation_window" in pthread_start,
+            "pthread start wrapper must wait for strict mutation windows")
+    require(pthread_start.find("peak_detach_controller_wait_for_mutation_window") <
+            pthread_start.find("ret = start_routine"),
+            "pthread start wrapper must gate before entering user code")
+    require(signal_evacuate.find(
+                "peak_detach_controller_signal_verify_no_unheld_threads") <
+            signal_evacuate.find(
+                "peak_detach_controller_signal_write_memory"),
+            "signal evacuate must revalidate held threads before patch writes")
+    capture_snapshot = extract_function(
+        controller, "peak_detach_controller_capture_gum_snapshot"
+    )
+    require("needs_existing_hook_context" in capture_snapshot and
+            "PEAK_DETACH_OPERATION_REATTACH" in capture_snapshot and
+            "PEAK_DETACH_STATUS_CLASSIFY_FAILED" in capture_snapshot and
+            "return FALSE" in capture_snapshot,
+            "missing Gum PC diagnostics must fail closed for existing-hook mutations")
+    for test_name in (
+        "test_detach_hotloop_signal_strict",
+        "test_detach_hotloop_signal_thread_spawn_strict",
+        "test_detach_stale_threads_signal_strict",
+        "test_detach_stale_threads_signal_unrelated_spin_strict",
+    ):
+        require(test_name in tests,
+                f"missing signal strict runtime test {test_name}")
+    require("test_detach_controller_signal_backend_blocked_thread" in controller_tests,
+            "missing blocked-signal fail-closed controller test")
+    require("test_detach_controller_signal_backend_missing_thread_gate" in controller_tests,
+            "missing signal backend missing-pthread-gate fail-closed controller test")
+    require("PEAK_DETACH_TRACE_PATH" in tests and
+            "signal-thread-spawn-trace" in tests and
+            "trace_detach_success=1" in tests,
+            "transient signal pthread test must prove trace-backed mutation evidence")
+    benchmark_runner = (repo_root / "benchmarks/detach/run_detach_hotloop_stress.py").read_text(encoding="utf-8")
+    require("--detach-backend" in benchmark_runner,
+            "hotloop benchmark must support backend-pinned signal stress")
+    require("PEAK_DETACH_BACKEND=helper" in tests and
+            "PEAK_DETACH_BACKEND=helper" in controller_tests,
+            "fake-helper tests must force helper backend, not auto signal fallback")
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: check_detach_lifecycle_invariants.py <repo-root>",
@@ -224,6 +322,7 @@ def main():
     check_general_controller_dlopen_drain_order(repo_root)
     check_dlopen_test_hook_visibility(repo_root)
     check_shutdown_fail_closed_docs(repo_root)
+    check_signal_backend_strict_invariants(repo_root)
     print("detach_lifecycle_invariants_ok")
     return 0
 

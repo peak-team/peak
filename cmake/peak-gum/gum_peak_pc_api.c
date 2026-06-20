@@ -3,7 +3,7 @@
  * PEAK Frida Gum 16.5.9 devkit overlay.
  *
  * This file is compiled as an extra archive member and is intentionally tied to
- * the 16.5.9 linux-x86_64 devkit downloaded by PEAK. It mirrors only the Gum
+ * the 16.5.9 Linux x86_64 and arm64 devkits downloaded by PEAK. It mirrors only the Gum
  * private fields needed for PC classification and fails closed for ambiguous
  * trampoline PCs.
  */
@@ -13,8 +13,9 @@
 #include <string.h>
 #include "frida-gum.h"
 
-#if !defined(__linux__) || !(defined(__x86_64__) || defined(__amd64__))
-# error "PEAK Gum PC overlay is only implemented for linux-x86_64"
+#if !defined(__linux__) || \
+    !(defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+# error "PEAK Gum PC overlay is only implemented for linux-x86_64 and linux-arm64"
 #endif
 
 #if !defined(GUM_PEAK_PC_API_VERSION) || GUM_PEAK_PC_API_VERSION != 1
@@ -29,8 +30,12 @@ typedef guint8 PeakGumInterceptorType16;
 
 typedef struct _PeakGumInterceptorBackend16 PeakGumInterceptorBackend16;
 typedef struct _PeakGumFunctionContext16 PeakGumFunctionContext16;
-typedef struct _PeakGumX86Relocator16 PeakGumX86Relocator16;
 typedef union _PeakGumFunctionContextBackendData16 PeakGumFunctionContextBackendData16;
+
+#if defined(__x86_64__) || defined(__amd64__)
+#define PEAK_GUM_PC_ABI_FINGERPRINT \
+    GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64
+typedef struct _PeakGumX86Relocator16 PeakGumX86Relocator16;
 
 struct _PeakGumX86Relocator16 {
     volatile gint ref_count;
@@ -53,6 +58,37 @@ struct _PeakGumInterceptorBackend16 {
     GumCodeSlice * enter_thunk;
     GumCodeSlice * leave_thunk;
 };
+#elif defined(__aarch64__)
+#define PEAK_GUM_PC_ABI_FINGERPRINT \
+    GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64
+typedef struct _PeakGumArm64Relocator16 PeakGumArm64Relocator16;
+
+struct _PeakGumArm64Relocator16 {
+    volatile gint ref_count;
+    csh capstone;
+    const guint8 * input_start;
+    const guint8 * input_cur;
+    GumAddress input_pc;
+    cs_insn ** input_insns;
+    GumArm64Writer * output;
+    guint inpos;
+    guint outpos;
+    gboolean eob;
+    gboolean eoi;
+};
+
+struct _PeakGumInterceptorBackend16 {
+    GRecMutex * mutex;
+    GumCodeAllocator * allocator;
+    GumArm64Writer writer;
+    PeakGumArm64Relocator16 relocator;
+    gpointer thunks;
+    gpointer enter_thunk;
+    gpointer leave_thunk;
+};
+#else
+# error "Unsupported PEAK Gum PC overlay architecture"
+#endif
 
 typedef struct _PeakGumInterceptorTransaction16 {
     gboolean is_dirty;
@@ -120,7 +156,11 @@ typedef struct _PeakGumListenerEntry16 {
 
 G_STATIC_ASSERT(sizeof(PeakGumFunctionContextBackendData16) == 2 * GLIB_SIZEOF_VOID_P);
 G_STATIC_ASSERT(sizeof(((PeakGumFunctionContext16 *) 0)->overwritten_prologue) == 32);
+#if defined(__x86_64__) || defined(__amd64__)
 G_STATIC_ASSERT(sizeof(PeakGumX86Relocator16) >= 8 * GLIB_SIZEOF_VOID_P);
+#elif defined(__aarch64__)
+G_STATIC_ASSERT(sizeof(PeakGumArm64Relocator16) >= 8 * GLIB_SIZEOF_VOID_P);
+#endif
 
 static gboolean
 peak_gum_pointer_in_range(gpointer pointer, gpointer start, gsize size)
@@ -187,6 +227,7 @@ peak_gum_pc_in_shared_thunk(PeakGumInterceptor16 * interceptor, gpointer pc)
     }
 
     backend = interceptor->backend;
+#if defined(__x86_64__) || defined(__amd64__)
     return (backend->enter_thunk != NULL &&
             peak_gum_pointer_in_range(pc,
                                       backend->enter_thunk->data,
@@ -195,6 +236,53 @@ peak_gum_pc_in_shared_thunk(PeakGumInterceptor16 * interceptor, gpointer pc)
             peak_gum_pointer_in_range(pc,
                                       backend->leave_thunk->data,
                                       backend->leave_thunk->size));
+#elif defined(__aarch64__)
+    if (backend->thunks == NULL) {
+        return FALSE;
+    }
+    return peak_gum_pointer_in_range(pc,
+                                     backend->thunks,
+                                     (gsize)gum_query_page_size());
+#else
+    return FALSE;
+#endif
+}
+
+static void
+peak_gum_fill_shared_thunk_diagnostics(
+    PeakGumInterceptorBackend16 * backend,
+    GumPeakPcDiagnostics * diagnostics)
+{
+    if (backend == NULL || diagnostics == NULL) {
+        return;
+    }
+
+#if defined(__x86_64__) || defined(__amd64__)
+    if (backend->enter_thunk != NULL) {
+        diagnostics->enter_thunk_start = backend->enter_thunk->data;
+        diagnostics->enter_thunk_size = backend->enter_thunk->size;
+    }
+    if (backend->leave_thunk != NULL) {
+        diagnostics->leave_thunk_start = backend->leave_thunk->data;
+        diagnostics->leave_thunk_size = backend->leave_thunk->size;
+    }
+#elif defined(__aarch64__)
+    if (backend->thunks != NULL) {
+        diagnostics->enter_thunk_start = backend->thunks;
+        diagnostics->enter_thunk_size = (gsize)gum_query_page_size();
+    }
+    if (backend->leave_thunk != NULL) {
+        guint8 * page_end = backend->thunks != NULL
+            ? (guint8 *)backend->thunks + gum_query_page_size()
+            : NULL;
+        guint8 * leave_start = (guint8 *)backend->leave_thunk;
+
+        diagnostics->leave_thunk_start = backend->leave_thunk;
+        if (page_end != NULL && leave_start < page_end) {
+            diagnostics->leave_thunk_size = (gsize)(page_end - leave_start);
+        }
+    }
+#endif
 }
 
 
@@ -231,7 +319,7 @@ peak_gum_find_context(GumInterceptor * interceptor,
 guint
 gum_interceptor_peak_abi_fingerprint(void)
 {
-    return GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64;
+    return PEAK_GUM_PC_ABI_FINGERPRINT;
 }
 
 gboolean
@@ -307,14 +395,7 @@ gum_interceptor_peak_get_pc_diagnostics(GumInterceptor * interceptor,
     diagnostics->on_enter_trampoline = private_context->on_enter_trampoline;
     diagnostics->on_leave_trampoline = private_context->on_leave_trampoline;
     diagnostics->on_invoke_trampoline = private_context->on_invoke_trampoline;
-    if (backend != NULL && backend->enter_thunk != NULL) {
-        diagnostics->enter_thunk_start = backend->enter_thunk->data;
-        diagnostics->enter_thunk_size = backend->enter_thunk->size;
-    }
-    if (backend != NULL && backend->leave_thunk != NULL) {
-        diagnostics->leave_thunk_start = backend->leave_thunk->data;
-        diagnostics->leave_thunk_size = backend->leave_thunk->size;
-    }
+    peak_gum_fill_shared_thunk_diagnostics(backend, diagnostics);
 
     return TRUE;
 }

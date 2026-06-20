@@ -6,13 +6,21 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__aarch64__)
+#include <asm/ptrace.h>
+#include <elf.h>
+#include <sys/uio.h>
+#endif
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#if defined(__x86_64__) || defined(__amd64__)
 #include <sys/user.h>
+#endif
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -204,30 +212,112 @@ wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
     }
 }
 
-static uint64_t
-peak_regs_pc(const struct user_regs_struct* regs)
+#if defined(__x86_64__) || defined(__amd64__)
+#define PEAK_DETACH_HELPER_PLATFORM_SUPPORTED 1
+typedef struct user_regs_struct PeakRegs;
+
+static int
+peak_regs_get(pid_t tid, PeakRegs* regs)
 {
-#if defined(__x86_64__)
-    return (uint64_t)regs->rip;
-#else
-    (void)regs;
-    return 0;
-#endif
+    return ptrace(PTRACE_GETREGS, tid, NULL, regs);
 }
 
 static int
-peak_regs_set_pc(struct user_regs_struct* regs, uint64_t pc)
+peak_regs_set(pid_t tid, const PeakRegs* regs)
 {
-#if defined(__x86_64__)
+    return ptrace(PTRACE_SETREGS, tid, NULL, (void*)regs);
+}
+
+static uint64_t
+peak_regs_pc(const PeakRegs* regs)
+{
+    return (uint64_t)regs->rip;
+}
+
+static int
+peak_regs_set_pc(PeakRegs* regs, uint64_t pc)
+{
     regs->rip = pc;
     return 0;
+}
+#elif defined(__aarch64__) && defined(PTRACE_GETREGSET) && \
+    defined(PTRACE_SETREGSET) && defined(NT_PRSTATUS)
+#define PEAK_DETACH_HELPER_PLATFORM_SUPPORTED 1
+typedef struct user_pt_regs PeakRegs;
+
+static int
+peak_regs_get(pid_t tid, PeakRegs* regs)
+{
+    struct iovec iov;
+
+    memset(regs, 0, sizeof(*regs));
+    iov.iov_base = regs;
+    iov.iov_len = sizeof(*regs);
+    return ptrace(PTRACE_GETREGSET, tid, (void*)NT_PRSTATUS, &iov);
+}
+
+static int
+peak_regs_set(pid_t tid, const PeakRegs* regs)
+{
+    struct iovec iov;
+
+    iov.iov_base = (void*)regs;
+    iov.iov_len = sizeof(*regs);
+    return ptrace(PTRACE_SETREGSET, tid, (void*)NT_PRSTATUS, &iov);
+}
+
+static uint64_t
+peak_regs_pc(const PeakRegs* regs)
+{
+    return (uint64_t)regs->pc;
+}
+
+static int
+peak_regs_set_pc(PeakRegs* regs, uint64_t pc)
+{
+    regs->pc = pc;
+    return 0;
+}
 #else
+#define PEAK_DETACH_HELPER_PLATFORM_SUPPORTED 0
+typedef struct {
+    int unused;
+} PeakRegs;
+
+static int
+peak_regs_get(pid_t tid, PeakRegs* regs)
+{
+    (void)tid;
+    (void)regs;
+    errno = ENOTSUP;
+    return -1;
+}
+
+static int
+peak_regs_set(pid_t tid, const PeakRegs* regs)
+{
+    (void)tid;
+    (void)regs;
+    errno = ENOTSUP;
+    return -1;
+}
+
+static uint64_t
+peak_regs_pc(const PeakRegs* regs)
+{
+    (void)regs;
+    return 0;
+}
+
+static int
+peak_regs_set_pc(PeakRegs* regs, uint64_t pc)
+{
     (void)regs;
     (void)pc;
     errno = ENOTSUP;
     return -1;
-#endif
 }
+#endif
 
 static PeakHeldThread*
 find_held_thread(pid_t tid)
@@ -408,8 +498,8 @@ stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
             errno_out);
 #endif
 
-        struct user_regs_struct regs;
-        if (ptrace(PTRACE_GETREGS, tid, NULL, &regs) != 0) {
+        PeakRegs regs;
+        if (peak_regs_get(tid, &regs) != 0) {
             *errno_out = errno;
             closedir(task_dir);
             return cleanup_held_threads_or_release_failed(
@@ -655,13 +745,13 @@ validate_instruction(const PeakDetachHelperInstruction* instruction,
 {
     if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_SET_PC) {
         PeakHeldThread* held_thread = find_held_thread((pid_t)instruction->tid);
-        struct user_regs_struct regs;
+        PeakRegs regs;
 
         if (held_thread == NULL || !held_thread->attached) {
             *errno_out = ESRCH;
             return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
         }
-        if (ptrace(PTRACE_GETREGS, held_thread->tid, NULL, &regs) != 0) {
+        if (peak_regs_get(held_thread->tid, &regs) != 0) {
             *errno_out = errno;
             return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
         }
@@ -711,23 +801,23 @@ apply_set_pc_instruction(const PeakDetachHelperInstruction* instruction,
                          int* errno_out)
 {
     PeakHeldThread* held_thread = find_held_thread((pid_t)instruction->tid);
-    struct user_regs_struct regs;
+    PeakRegs regs;
 
     if (held_thread == NULL || !held_thread->attached) {
         *errno_out = ESRCH;
         return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
     }
 
-    if (ptrace(PTRACE_GETREGS, held_thread->tid, NULL, &regs) != 0) {
+    if (peak_regs_get(held_thread->tid, &regs) != 0) {
         *errno_out = errno;
         return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
     }
     if (peak_regs_set_pc(&regs, instruction->pc) != 0 ||
-        ptrace(PTRACE_SETREGS, held_thread->tid, NULL, &regs) != 0) {
+        peak_regs_set(held_thread->tid, &regs) != 0) {
         *errno_out = errno;
         return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
     }
-    if (ptrace(PTRACE_GETREGS, held_thread->tid, NULL, &regs) != 0) {
+    if (peak_regs_get(held_thread->tid, &regs) != 0) {
         *errno_out = errno;
         return PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR;
     }
@@ -940,7 +1030,7 @@ main(int argc, char** argv)
         return 0;
     }
 
-#if !defined(__linux__) || !defined(__x86_64__)
+#if !defined(__linux__) || !PEAK_DETACH_HELPER_PLATFORM_SUPPORTED
     (void)argc;
     (void)argv;
     fprintf(stderr, "peak_detach_helper: unsupported platform\n");

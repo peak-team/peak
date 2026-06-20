@@ -14,7 +14,7 @@ void
 peak_shutdown_preload_target(void)
 {
     preload_target_calls++;
-#if defined(__x86_64__) || defined(__amd64__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
     asm volatile(
         "nop\n\t"
         "nop\n\t"

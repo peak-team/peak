@@ -55,7 +55,7 @@ endmacro()
 function(_peak_can_auto_patch_frida_gum _out_var)
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_processor)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-       _peak_processor MATCHES "^(x86_64|amd64)$")
+       _peak_processor MATCHES "^(x86_64|amd64|aarch64|arm64)$")
         set(${_out_var} ON PARENT_SCOPE)
     else()
         set(${_out_var} OFF PARENT_SCOPE)
@@ -201,7 +201,10 @@ function(_peak_validate_frida_gum_peak_api)
 #error Unsupported PEAK Gum PC API version
 #endif
 #if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64)
-#error Missing PEAK Gum private-layout ABI fingerprint
+#error Missing PEAK Gum x86_64 private-layout ABI fingerprint
+#endif
+#if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64)
+#error Missing PEAK Gum arm64 private-layout ABI fingerprint
 #endif
 
 int main(void)
@@ -241,6 +244,7 @@ int main(void)
 
     (void) GUM_PEAK_PC_API_VERSION;
     (void) GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64;
+    (void) GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64;
     (void) sizeof(GumPeakFunctionContext *);
     (void) sizeof(GumPeakPcState);
     (void) sizeof(GumPeakPcDiagnostics);
@@ -251,10 +255,24 @@ int main(void)
     (void) GUM_PEAK_PC_IN_LEAVE_TRAMPOLINE;
     (void) GUM_PEAK_PC_IN_DISPATCH;
     (void) GUM_PEAK_PC_UNKNOWN;
+#if defined(__x86_64__) || defined(__amd64__)
     if (abi_fingerprint() !=
         GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64) {
         return 1;
     }
+#elif defined(__aarch64__)
+    if (abi_fingerprint() !=
+        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64) {
+        return 1;
+    }
+#else
+    if (abi_fingerprint() !=
+        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64 &&
+        abi_fingerprint() !=
+        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64) {
+        return 1;
+    }
+#endif
     (void) classify_pc;
     (void) safe_pc;
     (void) get_function_patch;

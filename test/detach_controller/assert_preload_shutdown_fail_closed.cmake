@@ -15,6 +15,7 @@ execute_process(
           "PEAK_HEARTBEAT_INTERVAL=0"
           "PEAK_REQUIRE_SAFE_DETACH=1"
           "PEAK_SAFE_DETACH_MODE=strict"
+          "PEAK_DETACH_BACKEND=helper"
           "PEAK_DETACH_HELPER=${HELPER_EXECUTABLE}"
           "FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response"
           "${TEST_EXECUTABLE}"
