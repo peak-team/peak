@@ -1,0 +1,43 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  detach-benchmarks:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set reusable strings
+      id: strings
+      shell: bash
+      run: |
+        echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
+
+    - name: Configure CMake
+      run: >
+        cmake -B ${{ steps.strings.outputs.build-output-dir }}
+        -DCMAKE_BUILD_TYPE=Release
+        -DBUILD_TESTS=OFF
+        -DPEAK_BUILD_BENCHMARKS=ON
+        -S ${{ github.workspace }}
+
+    - name: Build
+      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config Release
+
+    - name: Run Benchmarks
+      working-directory: ${{ steps.strings.outputs.build-output-dir }}
+      run: ctest --build-config Release -L "benchmark" -j1 -V
+
+    - name: Upload benchmark traces
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: detach-benchmark-traces
+        path: |
+          ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.csv
+          ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.log
+          ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.txt
+        if-no-files-found: ignore

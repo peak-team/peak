@@ -99,6 +99,7 @@ dkms.conf
 
 # build directory 
 build/
+build-*/
 _codeql_build_dir/
 _codeql_detected_source_root
 

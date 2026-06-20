@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run PEAK detach hot-loop throughput comparisons.
 
-This is intentionally a lightweight harness around test_detach_hotloop.  It is
-not a CTest because it can compare against an independently built baseline
-branch, but it makes the manual benchmark recipe reproducible.
+This is intentionally a lightweight harness around the detach hot-loop
+benchmark driver. It can run under the manual benchmark CTest lane or compare
+against an independently built baseline branch.
 """
 
 import argparse
