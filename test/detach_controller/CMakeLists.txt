@@ -227,12 +227,23 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
         SKIP_RETURN_CODE 77)
   endforeach()
 
-  add_test(NAME test_detach_controller_fake_helper_gum_pc_shutdown_on-invoke
-    COMMAND test_detach_controller fake-helper-gum-pc-corridor)
-  set_tests_properties(test_detach_controller_fake_helper_gum_pc_shutdown_on-invoke
-    PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_CONTROLLER_GUM_PC_CASE=on-invoke;FAKE_DETACH_CONTROLLER_GUM_PC_OPERATION=shutdown"
-      SKIP_RETURN_CODE 77)
+  foreach(_detach_patch_pc_case IN ITEMS patch-entry patch-entry-plus-one)
+    add_test(NAME test_detach_controller_fake_helper_detach_${_detach_patch_pc_case}
+      COMMAND test_detach_controller fake-helper-gum-pc-corridor)
+    set_tests_properties(test_detach_controller_fake_helper_detach_${_detach_patch_pc_case}
+      PROPERTIES
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_CONTROLLER_GUM_PC_CASE=${_detach_patch_pc_case}"
+        SKIP_RETURN_CODE 77)
+  endforeach()
+
+  foreach(_shutdown_pc_case IN ITEMS on-invoke patch-entry-plus-one)
+    add_test(NAME test_detach_controller_fake_helper_shutdown_${_shutdown_pc_case}
+      COMMAND test_detach_controller fake-helper-gum-pc-corridor)
+    set_tests_properties(test_detach_controller_fake_helper_shutdown_${_shutdown_pc_case}
+      PROPERTIES
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_CONTROLLER_GUM_PC_CASE=${_shutdown_pc_case};FAKE_DETACH_CONTROLLER_GUM_PC_OPERATION=shutdown"
+        SKIP_RETURN_CODE 77)
+  endforeach()
 
 
   foreach(_reattach_patch_pc_case IN ITEMS entry entry-plus-one)
