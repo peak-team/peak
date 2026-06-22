@@ -57,6 +57,10 @@ typedef enum {
 typedef struct {
     gboolean active;
     gboolean uses_physical_patch;
+    gboolean mutates_entry_bytes;
+    gboolean mutates_gum_metadata;
+    gboolean frees_listener_state;
+    gboolean requires_target_entry_idle;
     PeakDetachOperation operation;
     PeakDetachHoldBackend backend;
     PeakDetachHelperInstruction instructions[PEAK_DETACH_HELPER_MAX_INSTRUCTIONS];
@@ -2776,6 +2780,7 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
             return FALSE;
         }
         mutation->uses_physical_patch = TRUE;
+        mutation->mutates_entry_bytes = TRUE;
         return TRUE;
     }
 
@@ -2792,50 +2797,96 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
         return FALSE;
     }
 
+    PeakDetachPhysicalPatchRecord* detach_record = NULL;
+    gboolean detach_record_created = FALSE;
+
     if (request->operation == PEAK_DETACH_OPERATION_DETACH) {
-        PeakDetachPhysicalPatchRecord* record =
+        detach_record =
             peak_detach_controller_find_physical_patch_record(request->hook_id,
-                                                              TRUE);
-        if (record == NULL) {
+                                                              FALSE);
+        if (detach_record == NULL) {
+            detach_record = peak_detach_controller_find_physical_patch_record(
+                request->hook_id,
+                TRUE);
+            detach_record_created = TRUE;
+        }
+        if (detach_record == NULL) {
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_ERROR;
             }
             return FALSE;
         }
-        record->function_address = request->function_address;
-        record->patch_size = (uint32_t)snapshot->prologue_len;
-        memcpy(record->active_patch,
-               snapshot->active_patch,
-               snapshot->prologue_len);
     }
 
     if (!peak_detach_controller_append_write_instruction(mutation,
                                                          request->function_address,
                                                          snapshot->original_prologue,
                                                          (uint32_t)snapshot->prologue_len)) {
+        if (detach_record_created) {
+            memset(detach_record, 0, sizeof(*detach_record));
+        }
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_ERROR;
         }
         return FALSE;
     }
 
+    if (detach_record != NULL) {
+        detach_record->function_address = request->function_address;
+        detach_record->patch_size = (uint32_t)snapshot->prologue_len;
+        memcpy(detach_record->active_patch,
+               snapshot->active_patch,
+               snapshot->prologue_len);
+    }
+
     mutation->uses_physical_patch = TRUE;
+    mutation->mutates_entry_bytes = TRUE;
     return TRUE;
 }
 
-static gboolean
-peak_detach_controller_operation_patches_entry(PeakDetachOperation operation)
+static void
+peak_detach_controller_init_mutation_semantics(
+    PeakDetachHeldMutation* mutation,
+    PeakDetachOperation operation)
 {
-    return operation == PEAK_DETACH_OPERATION_ATTACH ||
-           operation == PEAK_DETACH_OPERATION_REPLACE ||
-           operation == PEAK_DETACH_OPERATION_REVERT;
+    /* Gum-PC safe-no-action is guarded by these semantics, not operation names. */
+    mutation->mutates_entry_bytes = FALSE;
+    mutation->mutates_gum_metadata = TRUE;
+    mutation->frees_listener_state = TRUE;
+    mutation->requires_target_entry_idle = FALSE;
+
+    switch (operation) {
+        case PEAK_DETACH_OPERATION_DETACH:
+        case PEAK_DETACH_OPERATION_REATTACH:
+            mutation->mutates_entry_bytes = TRUE;
+            mutation->mutates_gum_metadata = FALSE;
+            mutation->frees_listener_state = FALSE;
+            break;
+
+        case PEAK_DETACH_OPERATION_ATTACH:
+        case PEAK_DETACH_OPERATION_SHUTDOWN:
+        case PEAK_DETACH_OPERATION_REPLACE:
+        case PEAK_DETACH_OPERATION_REVERT:
+            mutation->mutates_entry_bytes = TRUE;
+            mutation->mutates_gum_metadata = TRUE;
+            mutation->frees_listener_state =
+                operation == PEAK_DETACH_OPERATION_SHUTDOWN;
+            mutation->requires_target_entry_idle =
+                operation != PEAK_DETACH_OPERATION_SHUTDOWN;
+            break;
+
+        default:
+            break;
+    }
 }
 
 static gboolean
-peak_detach_controller_operation_is_entry_byte_only(PeakDetachOperation operation)
+peak_detach_controller_mutation_is_physical_entry_bytes_only(
+    const PeakDetachHeldMutation* mutation)
 {
-    return operation == PEAK_DETACH_OPERATION_DETACH ||
-           operation == PEAK_DETACH_OPERATION_REATTACH;
+    return mutation->mutates_entry_bytes &&
+           !mutation->mutates_gum_metadata &&
+           !mutation->frees_listener_state;
 }
 
 static gboolean
@@ -2851,6 +2902,8 @@ peak_detach_controller_classify_stopped_threads(
     mutation->instruction_count = 0;
     mutation->uses_physical_patch = FALSE;
     mutation->operation = request->operation;
+    peak_detach_controller_init_mutation_semantics(mutation,
+                                                   request->operation);
 
     for (uint32_t i = 0; i < snapshot_count; i++) {
         PeakDetachHelperThreadSnapshot* thread_snapshot = &snapshots[i];
@@ -2892,7 +2945,7 @@ peak_detach_controller_classify_stopped_threads(
             return FALSE;
         }
 
-        if (peak_detach_controller_operation_patches_entry(request->operation) &&
+        if (mutation->requires_target_entry_idle &&
             peak_detach_controller_pointer_in_range(
                 pc, request->function_address, GUM_PEAK_MAX_PROLOGUE_SIZE)) {
             peak_detach_controller_note_failure_detail(
@@ -2914,6 +2967,23 @@ peak_detach_controller_classify_stopped_threads(
                 break;
 
             case GUM_PEAK_PC_AT_PATCH_ENTRY:
+                if (request->operation == PEAK_DETACH_OPERATION_DETACH ||
+                    request->operation == PEAK_DETACH_OPERATION_SHUTDOWN) {
+                    if (pc == request->function_address) {
+                        break;
+                    }
+                    peak_detach_controller_note_failure_detail(
+                        request->operation == PEAK_DETACH_OPERATION_DETACH
+                            ? "detach-patch-interior-pc"
+                            : "shutdown-patch-interior-pc",
+                        (long)thread_snapshot->tid,
+                        (uintptr_t)pc,
+                        (uintptr_t)snapshot->diagnostics.overwritten_prologue_len);
+                    if (status_out != NULL) {
+                        *status_out = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+                    }
+                    return FALSE;
+                }
                 if (request->operation == PEAK_DETACH_OPERATION_REATTACH) {
                     gsize prologue_len =
                         snapshot->diagnostics.overwritten_prologue_len;
@@ -2943,26 +3013,14 @@ peak_detach_controller_classify_stopped_threads(
                     }
                     return FALSE;
                 }
-                if (request->operation == PEAK_DETACH_OPERATION_ATTACH ||
-                    request->operation == PEAK_DETACH_OPERATION_REPLACE) {
-                    peak_detach_controller_note_failure_detail(
-                        "attach-prologue-pc",
-                        (long)thread_snapshot->tid,
-                        (uintptr_t)pc,
-                        (uintptr_t)request->operation);
-                    if (status_out != NULL) {
-                        *status_out = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
-                    }
-                    return FALSE;
-                }
                 break;
 
             case GUM_PEAK_PC_IN_ENTER_TRAMPOLINE:
             case GUM_PEAK_PC_IN_INVOKE_TRAMPOLINE:
             case GUM_PEAK_PC_IN_LEAVE_TRAMPOLINE:
             case GUM_PEAK_PC_IN_DISPATCH: {
-                if (peak_detach_controller_operation_is_entry_byte_only(
-                        request->operation)) {
+                if (peak_detach_controller_mutation_is_physical_entry_bytes_only(
+                        mutation)) {
                     break;
                 }
 
@@ -3124,6 +3182,15 @@ peak_detach_controller_append_candidate_mutation(
 
     aggregate->uses_physical_patch =
         aggregate->uses_physical_patch || candidate->uses_physical_patch;
+    aggregate->mutates_entry_bytes =
+        aggregate->mutates_entry_bytes || candidate->mutates_entry_bytes;
+    aggregate->mutates_gum_metadata =
+        aggregate->mutates_gum_metadata || candidate->mutates_gum_metadata;
+    aggregate->frees_listener_state =
+        aggregate->frees_listener_state || candidate->frees_listener_state;
+    aggregate->requires_target_entry_idle =
+        aggregate->requires_target_entry_idle ||
+        candidate->requires_target_entry_idle;
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
@@ -3941,6 +4008,10 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_end_thread_creation_gate();
         held_mutation.active = FALSE;
         held_mutation.uses_physical_patch = FALSE;
+        held_mutation.mutates_entry_bytes = FALSE;
+        held_mutation.mutates_gum_metadata = FALSE;
+        held_mutation.frees_listener_state = FALSE;
+        held_mutation.requires_target_entry_idle = FALSE;
         held_mutation.operation = PEAK_DETACH_OPERATION_ATTACH;
         held_mutation.backend = PEAK_DETACH_HOLD_BACKEND_NONE;
         held_mutation.instruction_count = 0;

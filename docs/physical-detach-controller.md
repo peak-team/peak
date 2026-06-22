@@ -222,8 +222,10 @@ typedef enum {
 Detach rules:
 
 - `PEAK_PC_SAFE`: safe.
-- `PEAK_PC_AT_PATCH_ENTRY`: safe. The original prologue can be restored while
-  all threads are stopped; the thread has not entered the trampoline yet.
+- `PEAK_PC_AT_PATCH_ENTRY`: safe for physical detach/shutdown restore only
+  when `pc == function_address`. An interior PC in the active patch range is not
+  a valid continuation after restoring the original prologue, so PEAK fails
+  closed instead of resuming that thread in mixed patch/prologue bytes.
 - `PEAK_PC_IN_TARGET_BODY`: safe. The thread is already past the overwritten
   prologue, and detach affects future entries.
 - `PEAK_PC_IN_PEAK_EVACUATION`: advance this thread to a PEAK safe label.
@@ -231,28 +233,35 @@ Detach rules:
 - `PEAK_PC_IN_GUM_CRITICAL` or `PEAK_PC_UNKNOWN`: do not detach unless Gum has
   been patched so the range has a bounded evacuation route.
 
-The implemented overlay now treats PC disposition as operation-specific. For
+The implemented overlay now treats PC disposition as operation-specific and
+records the held mutation shape explicitly: whether it mutates target entry
+bytes, mutates Gum metadata, or frees listener-owned state. The
+`SAFE_NO_ACTION` relaxation for Gum PCs is allowed only when the candidate
+mutates entry bytes and does not mutate Gum metadata or free listener state. For
 physical entry-byte-only `detach` and `reattach`, stopped threads already inside
 this hook's Gum enter, invoke, or leave trampoline ranges, or inside the shared
-enter/leave thunk ranges reported by Gum diagnostics, are `SAFE_NO_ACTION`:
-PEAK writes only target entry bytes and keeps Gum listener and trampoline
-metadata alive, so the in-flight Gum execution can finish on its current path.
-The shared thunk ranges are not uniquely attributed to one hook, but
+enter/leave thunk ranges reported by Gum diagnostics, are therefore safe to
+leave in place. The physical path invariants are: PEAK writes only target entry
+bytes, does not call Gum detach/revert, does not free listener-owned PEAK data,
+does not destroy Gum context or trampoline memory, and keeps in-flight Gum
+trampoline execution able to reach the old listener/context until it naturally
+returns. The shared thunk ranges are not uniquely attributed to one hook, but
 entry-byte-only mutation does not modify shared Gum code or free Gum metadata.
 These PCs do not require `SET_PC` evacuation and should not be counted as
-`CLASSIFY_FAILED`. For operations that mutate or release Gum metadata, the old
-fail-closed rule remains: a Gum PC needs an explicit Gum-provided safe PC or the
-operation is retried later. Reattach remains stricter for the target prologue:
-`pc == function_address` is accepted because no original prologue byte has
-executed yet. With helper-held
-threads, an interior PC in the overwritten prologue emits a pre-write
-`SINGLE_STEP_OUT_OF_RANGE` evacuation instruction; the helper single-steps that
-thread while the original bytes are still installed, stops again once the PC is
-outside the overwritten range, and only then commits the active patch bytes. With
-the signal backend, the same logical instruction is implemented with an
-in-process temporary breakpoint corridor instead of ptrace single-step, so the
-thread advances only to the first safe PC and parks again before the active patch
-bytes are written.
+`CLASSIFY_FAILED`. Gum metadata mutation, shutdown, and revert paths must not
+use this relaxation; they still require an explicit Gum-provided safe PC or a
+retry. Shutdown also fails closed for active-patch interior PCs because Gum
+metadata may be detached before stopped threads are released. Reattach remains
+stricter for the target prologue: `pc ==
+function_address` is accepted because no original prologue byte has executed
+yet. With helper-held threads, an interior PC in the overwritten prologue emits
+a pre-write `SINGLE_STEP_OUT_OF_RANGE` evacuation instruction; the helper
+single-steps that thread while the original bytes are still installed, stops
+again once the PC is outside the overwritten range, and only then commits the
+active patch bytes. With the signal backend, the same logical instruction is
+implemented with an in-process temporary breakpoint corridor instead of ptrace
+single-step, so the thread advances only to the first safe PC and parks again
+before the active patch bytes are written.
 
 ## Gum Devkit Changes
 
@@ -798,6 +807,12 @@ Completed in this branch:
     Frontera development x86_64 (56 threads, auto and helper reattach, 12
     samples each) and Vista gg ARM64 (144 threads, auto and signal reattach, 12
     samples each).
+43. Made the entry-byte-only relaxation explicit in the held mutation flags and
+    tightened physical detach/shutdown at `PEAK_PC_AT_PATCH_ENTRY`: only
+    `pc == function_address` is accepted, while an interior active-patch PC now
+    fails closed before entry bytes or Gum metadata are changed. Deterministic
+    fake-helper coverage exercises both the accepted detach entry PC and the
+    rejected detach/shutdown `function_address + 1` regression cases.
 
 Remaining work:
 

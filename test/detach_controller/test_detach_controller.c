@@ -598,6 +598,27 @@ resolve_fake_helper_gum_pc_case(const char* pc_case,
         pc_case = "on-enter";
     }
 
+    if (strcmp(pc_case, "patch-entry") == 0) {
+        if (diagnostics->function_address == NULL) {
+            fprintf(stderr, "patch-entry diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = diagnostics->function_address;
+        *expect_prepared_out = TRUE;
+        return 1;
+    }
+
+    if (strcmp(pc_case, "patch-entry-plus-one") == 0) {
+        if (diagnostics->function_address == NULL ||
+            diagnostics->overwritten_prologue_len <= 1) {
+            fprintf(stderr, "patch-entry-plus-one diagnostic PC unavailable\n");
+            return 0;
+        }
+        *pc_out = (gpointer)((guint8*)diagnostics->function_address + 1);
+        *expect_prepared_out = FALSE;
+        return 1;
+    }
+
     if (strcmp(pc_case, "on-enter") == 0) {
         if (diagnostics->on_enter_trampoline == NULL) {
             fprintf(stderr, "on-enter diagnostic PC unavailable\n");
@@ -1981,6 +2002,8 @@ run_fake_helper_gum_pc_corridor(void)
     return 77;
 #else
     const char* pc_case = getenv("FAKE_DETACH_CONTROLLER_GUM_PC_CASE");
+    const char* effective_pc_case =
+        pc_case != NULL && pc_case[0] != '\0' ? pc_case : "on-enter";
     char log_template[] = "/tmp/peak_fake_helper_gum_pc_log_XXXXXX";
     int log_fd = mkstemp(log_template);
     GumInterceptor* interceptor;
@@ -2048,7 +2071,7 @@ run_fake_helper_gum_pc_corridor(void)
         return EXIT_FAILURE;
     }
 
-    resolved = resolve_fake_helper_gum_pc_case(pc_case,
+    resolved = resolve_fake_helper_gum_pc_case(effective_pc_case,
                                                &diagnostics,
                                                &stop_pc,
                                                &expect_prepared);
@@ -2166,6 +2189,16 @@ run_fake_helper_gum_pc_corridor(void)
                       &request,
                       FALSE,
                       PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+        if (strcmp(effective_pc_case, "patch-entry-plus-one") == 0) {
+            const PeakDetachFailureDetail* detail =
+                peak_detach_controller_last_failure_detail();
+            check_string("patch-entry failure reason",
+                         detail->reason,
+                         expect_metadata_fail ? "shutdown-patch-interior-pc"
+                                              : "detach-patch-interior-pc");
+            check_true("patch-entry failure pc",
+                       detail->pc == (uintptr_t)stop_pc);
+        }
         check_true("Gum entry-byte corridor holds helper threads",
                    peak_detach_controller_threads_are_held() == FALSE);
         check_true("Gum entry-byte corridor uses physical patch",
