@@ -386,6 +386,24 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
 
+  add_test(NAME test_detach_controller_fake_helper_listener_canonical_address
+    COMMAND test_detach_controller fake-helper-listener-canonical-address)
+  set_tests_properties(test_detach_controller_fake_helper_listener_canonical_address
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
+  add_test(NAME test_detach_controller_fake_helper_listener_ambiguous_address
+    COMMAND test_detach_controller fake-helper-listener-ambiguous-address)
+  set_tests_properties(test_detach_controller_fake_helper_listener_ambiguous_address
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
+  add_test(NAME test_detach_controller_fake_helper_batch_canonical_duplicate
+    COMMAND test_detach_controller fake-helper-batch-canonical-duplicate)
+  set_tests_properties(test_detach_controller_fake_helper_batch_canonical_duplicate
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
   add_test(NAME test_detach_controller_fake_helper_batch_reattach
     COMMAND test_detach_controller fake-helper-batch-reattach)
   set_tests_properties(test_detach_controller_fake_helper_batch_reattach

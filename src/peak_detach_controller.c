@@ -3112,6 +3112,20 @@ peak_detach_controller_safe_pc_from_snapshot(
     return NULL;
 }
 
+static gpointer
+peak_detach_controller_canonical_function_address(
+    const PeakDetachRequest* request,
+    const PeakDetachGumSnapshot* snapshot)
+{
+    if (snapshot != NULL &&
+        snapshot->has_context &&
+        snapshot->diagnostics.function_address != NULL) {
+        return snapshot->diagnostics.function_address;
+    }
+
+    return request != NULL ? request->function_address : NULL;
+}
+
 static gboolean
 peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
                                              const PeakDetachGumSnapshot* snapshot,
@@ -3125,16 +3139,19 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
         return TRUE;
     }
 
+    gpointer patch_address =
+        peak_detach_controller_canonical_function_address(request, snapshot);
+
     if (request->operation == PEAK_DETACH_OPERATION_REATTACH) {
         PeakDetachPhysicalPatchRecord* record =
             peak_detach_controller_find_physical_patch_record(request->hook_id,
                                                               FALSE);
         if (record == NULL || record->patch_size == 0 ||
-            record->function_address != request->function_address) {
+            record->function_address != patch_address) {
             peak_detach_controller_note_failure_detail(
                 "reattach-patch-record-missing",
                 0,
-                (uintptr_t)request->function_address,
+                (uintptr_t)patch_address,
                 record != NULL ? (uintptr_t)record->patch_size : 0);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
@@ -3143,7 +3160,7 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
         }
 
         if (!peak_detach_controller_append_write_instruction(mutation,
-                                                             request->function_address,
+                                                             patch_address,
                                                              record->active_patch,
                                                              record->patch_size)) {
             if (status_out != NULL) {
@@ -3191,7 +3208,7 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
     }
 
     if (!peak_detach_controller_append_write_instruction(mutation,
-                                                         request->function_address,
+                                                         patch_address,
                                                          snapshot->original_prologue,
                                                          (uint32_t)snapshot->prologue_len)) {
         if (detach_record_created) {
@@ -3204,7 +3221,7 @@ peak_detach_controller_append_physical_patch(const PeakDetachRequest* request,
     }
 
     if (detach_record != NULL) {
-        detach_record->function_address = request->function_address;
+        detach_record->function_address = patch_address;
         detach_record->patch_size = (uint32_t)snapshot->prologue_len;
         memcpy(detach_record->active_patch,
                snapshot->active_patch,
@@ -3281,6 +3298,9 @@ peak_detach_controller_classify_stopped_threads(
         PeakDetachHelperThreadSnapshot* thread_snapshot = &snapshots[i];
         GumPeakPcState state = GUM_PEAK_PC_UNKNOWN;
         gpointer pc = (gpointer)(uintptr_t)thread_snapshot->pc;
+        gpointer function_address =
+            peak_detach_controller_canonical_function_address(request,
+                                                              snapshot);
 
         for (uint32_t j = 0; j < i; j++) {
             if (snapshots[j].tid == thread_snapshot->tid) {
@@ -3319,7 +3339,7 @@ peak_detach_controller_classify_stopped_threads(
 
         if (mutation->requires_target_entry_idle &&
             peak_detach_controller_pointer_in_range(
-                pc, request->function_address, GUM_PEAK_MAX_PROLOGUE_SIZE)) {
+                pc, function_address, GUM_PEAK_MAX_PROLOGUE_SIZE)) {
             peak_detach_controller_note_failure_detail(
                 "entry-patch-live-pc",
                 (long)thread_snapshot->tid,
@@ -3341,7 +3361,7 @@ peak_detach_controller_classify_stopped_threads(
             case GUM_PEAK_PC_AT_PATCH_ENTRY:
                 if (request->operation == PEAK_DETACH_OPERATION_DETACH ||
                     request->operation == PEAK_DETACH_OPERATION_SHUTDOWN) {
-                    if (pc == request->function_address) {
+                    if (pc == function_address) {
                         break;
                     }
                     peak_detach_controller_note_failure_detail(
@@ -3360,7 +3380,7 @@ peak_detach_controller_classify_stopped_threads(
                     gsize prologue_len =
                         snapshot->diagnostics.overwritten_prologue_len;
 
-                    if (pc == request->function_address) {
+                    if (pc == function_address) {
                         break;
                     }
                     if ((backend == PEAK_DETACH_HOLD_BACKEND_HELPER ||
@@ -3371,7 +3391,7 @@ peak_detach_controller_classify_stopped_threads(
                         peak_detach_controller_append_single_step_out_of_range_instruction(
                             mutation,
                             (pid_t)thread_snapshot->tid,
-                            request->function_address,
+                            function_address,
                             (uint32_t)prologue_len)) {
                         break;
                     }
@@ -3984,8 +4004,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
                 peak_detach_controller_find_physical_patch_record(
                     requests[i].hook_id,
                     FALSE);
-            if (record == NULL || record->patch_size == 0 ||
-                record->function_address != requests[i].function_address) {
+            if (record == NULL || record->patch_size == 0) {
                 peak_detach_controller_note_failure_detail(
                     "batch-reattach-patch-record-missing",
                     0,
@@ -4004,6 +4023,52 @@ peak_detach_controller_prepare_hook_mutation_batch(
             continue;
         }
         valid_count++;
+    }
+
+    if (valid_count > 1) {
+        gboolean duplicate_indices[PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS] = { FALSE };
+
+        for (size_t i = 0; i < usable_count; i++) {
+            if (!candidates[i].valid) {
+                continue;
+            }
+            gpointer address_i =
+                peak_detach_controller_canonical_function_address(
+                    &requests[i],
+                    &candidates[i].snapshot);
+
+            for (size_t j = i + 1; j < usable_count; j++) {
+                if (!candidates[j].valid) {
+                    continue;
+                }
+                gpointer address_j =
+                    peak_detach_controller_canonical_function_address(
+                        &requests[j],
+                        &candidates[j].snapshot);
+
+                if (requests[i].hook_id == requests[j].hook_id ||
+                    address_i == address_j) {
+                    peak_detach_controller_note_failure_detail(
+                        "batch-canonical-duplicate",
+                        0,
+                        (uintptr_t)address_i,
+                        (uintptr_t)address_j);
+                    duplicate_indices[i] = TRUE;
+                    duplicate_indices[j] = TRUE;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < usable_count; i++) {
+            if (!duplicate_indices[i] || !candidates[i].valid) {
+                continue;
+            }
+            candidates[i].valid = FALSE;
+            results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
+            if (valid_count > 0) {
+                valid_count--;
+            }
+        }
     }
 
     if (valid_count == 0) {

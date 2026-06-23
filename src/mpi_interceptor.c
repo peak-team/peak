@@ -3,9 +3,58 @@
 static GumInterceptor* mpi_interceptor;
 
 static int peak_is_done = 0;
+static int peak_delayed_finalize_allowed = 0;
+typedef enum {
+    PEAK_MPI_FINALIZE_NOT_REQUESTED = 0,
+    PEAK_MPI_FINALIZE_REQUESTED = 1,
+    PEAK_MPI_FINALIZE_IN_PROGRESS = 2,
+    PEAK_MPI_FINALIZE_DONE = 3,
+} PeakMpiFinalizeState;
+
+static int peak_finalize_state = PEAK_MPI_FINALIZE_NOT_REQUESTED;
 static gpointer hook_address;
 
 static int (*original_pmpi_finalize)(void);
+
+static void
+mpi_interceptor_mark_finalize_requested(void)
+{
+    int expected = PEAK_MPI_FINALIZE_NOT_REQUESTED;
+
+    (void)__atomic_compare_exchange_n(
+        &peak_finalize_state,
+        &expected,
+        PEAK_MPI_FINALIZE_REQUESTED,
+        FALSE,
+        __ATOMIC_ACQ_REL,
+        __ATOMIC_ACQUIRE);
+}
+
+static int
+mpi_interceptor_call_original_finalize_once(void)
+{
+    int expected = PEAK_MPI_FINALIZE_REQUESTED;
+
+    if (original_pmpi_finalize == NULL) {
+        return 0;
+    }
+
+    if (!__atomic_compare_exchange_n(
+            &peak_finalize_state,
+            &expected,
+            PEAK_MPI_FINALIZE_IN_PROGRESS,
+            FALSE,
+            __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE)) {
+        return 0;
+    }
+
+    int result = original_pmpi_finalize();
+    __atomic_store_n(&peak_finalize_state,
+                     PEAK_MPI_FINALIZE_DONE,
+                     __ATOMIC_RELEASE);
+    return result;
+}
 
 /**
  * @brief Custom implementation of `PMPI_Finalize` function
@@ -20,10 +69,17 @@ static int
 peak_pmpi_finalize(void)
 {
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
-    if (peak_is_done)
-        return original_pmpi_finalize();
-    else
-        return 0;
+    mpi_interceptor_mark_finalize_requested();
+    if (__atomic_load_n(&peak_is_done, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&peak_delayed_finalize_allowed, __ATOMIC_ACQUIRE))
+        return mpi_interceptor_call_original_finalize_once();
+    return 0;
+}
+
+int mpi_interceptor_finalize_was_requested()
+{
+    return __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE) !=
+           PEAK_MPI_FINALIZE_NOT_REQUESTED;
 }
 
 int mpi_interceptor_attach()
@@ -43,14 +99,19 @@ int mpi_interceptor_attach()
     return replace_check;
 }
 
-void mpi_interceptor_dettach()
+void mpi_interceptor_dettach(int allow_delayed_finalize)
 {
     if (mpi_interceptor == NULL || hook_address == NULL) {
         return;
     }
 
-    peak_is_done = 1;
-    peak_pmpi_finalize();
+    __atomic_store_n(&peak_delayed_finalize_allowed,
+                     allow_delayed_finalize ? 1 : 0,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_is_done, 1, __ATOMIC_RELEASE);
+    if (allow_delayed_finalize && mpi_interceptor_finalize_was_requested()) {
+        mpi_interceptor_call_original_finalize_once();
+    }
     gum_interceptor_begin_transaction(mpi_interceptor);
     gum_interceptor_revert(mpi_interceptor, hook_address);
     gum_interceptor_end_transaction(mpi_interceptor);
