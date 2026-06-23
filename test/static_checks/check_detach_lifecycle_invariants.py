@@ -233,6 +233,9 @@ def check_signal_backend_strict_invariants(repo_root):
     controller_tests = (
         repo_root / "test/detach_controller/test_detach_controller.c"
     ).read_text(encoding="utf-8")
+    runtime_hotloop = (
+        repo_root / "test/detach_runtime/test_detach_hotloop.c"
+    ).read_text(encoding="utf-8")
     signal_handler = extract_function(
         controller, "peak_detach_controller_signal_handler"
     )
@@ -281,15 +284,28 @@ def check_signal_backend_strict_invariants(repo_root):
     require("pthread_create interception is not installed" in controller,
             "signal backend must fail closed when pthread_create gate is unavailable")
     require("peak_signal_policy_choose_reserved_signal" in controller and
-            "peak_signal_policy_cookie_matches" in signal_handler and
+            "peak_signal_policy_cookie_matches_async" in signal_handler and
             "peak_signal_policy_send_thread_signal" in signal_stop and
             "SYS_rt_tgsigqueueinfo" in signal_policy,
             "signal backend must reserve a signal and authenticate stop delivery with rt_tgsigqueueinfo cookies")
+    require("peak_signal_policy_cookie_matches(" not in signal_handler and
+            "peak_signal_policy_cookie_for_preinitialized" in signal_policy and
+            "base == 0" in signal_policy,
+            "signal handler cookie authentication must use only preinitialized async-safe state")
     require("peak_signal_policy_cookie_for" not in signal_public_header and
             "peak_signal_policy_cookie_matches" not in signal_public_header and
             "peak_signal_policy_send_thread_signal" not in signal_public_header and
             "PEAK_SIGNAL_POLICY_INTERNAL" in signal_internal_header,
             "signal stop cookie helpers must be internal, not public user-callable API")
+    require("peak_signal_policy_atomics_lock_free" in signal_internal_header and
+            "peak_signal_policy_atomics_lock_free()" in controller and
+            "static _Atomic int signal_backend_signum" in controller and
+            "atomic_is_lock_free(&signal_backend_signum)" in controller and
+            "atomic_is_lock_free(&signal_slot_count)" in controller and
+            "atomic_is_lock_free(&signal_slots[0].tid)" in controller and
+            "atomic_is_lock_free(&unexpected_delivery_count)" in signal_policy and
+            "atomic_is_lock_free(&cookie_base)" in signal_policy,
+            "signal backend support must include signal-policy atomics used from handler context")
     require("peak_signal_policy_protective_handler" in signal_policy and
             "peak_signal_policy_install_protective_handler" in signal_policy and
             "peak_signal_policy_clear_reserved_signal" in signal_policy and
@@ -333,6 +349,8 @@ def check_signal_backend_strict_invariants(repo_root):
     require('__asm__("syscall")' in signal_policy and
             "peak_signal_policy_syscall" in signal_policy and
             "peak_signal_policy_safe_read" in signal_policy and
+            "/proc/self/maps" not in signal_policy and
+            "SYS_pread64" in signal_policy and
             "SYS_process_vm_readv" in signal_policy and
             "syscall:rt_sigprocmask" in signal_policy and
             "syscall:rt_sigaction" in signal_policy and
@@ -343,6 +361,14 @@ def check_signal_backend_strict_invariants(repo_root):
             "syscall:tgkill" in signal_policy and
             "syscall:rt_tgsigqueueinfo" in signal_policy,
             "signal policy must guard common raw syscall routes for reserved RT signal collisions")
+    require("peak_signal_policy_should_hide_raw_sigaction_query" in signal_policy and
+            "PeakSignalPolicyRawSigaction action" in signal_policy and
+            "errno = EFAULT" in signal_policy and
+            "SYS_pwrite64" not in signal_policy and
+            "raw_query_protected=1" in runtime_hotloop and
+            "raw_query_readonly_failed=1" in runtime_hotloop and
+            "raw rt_sigaction query leaked non-default PEAK action fields" in runtime_hotloop,
+            "raw rt_sigaction query must hide or fail closed before exposing reserved-signal semantics")
     require("peak_signal_policy_event_signal" in signal_policy and
             '"timer_create"' in signal_policy and
             "peak_signal_policy_prepare_event_for_user(evp" in signal_policy and
@@ -371,12 +397,21 @@ def check_signal_backend_strict_invariants(repo_root):
             "pthread_once(&cookie_once" in signal_policy,
             "signal policy cookie base must be initialized exactly once")
     require("PEAK_REQUIRE_SAFE_DETACH" not in signal_policy and
+            "PEAK_SIGNAL_RESERVE_EARLY" in signal_policy and
+            "forced-only" in signal_policy and
             "mode == NULL" in signal_policy and
             "strcasecmp(mode, \"strict\") == 0" in signal_policy and
             "strcasecmp(mode, \"auto\") == 0" in signal_policy and
             "strcasecmp(backend, \"signal\") == 0" in signal_policy and
             "strcasecmp(mode, \"helper\") == 0" in signal_policy,
             "signal policy must reserve early for strict-auto but not helper-only mode")
+    require("test_detach_controller_signal_reserve_early_never" in controller_tests_cmake and
+            "PEAK_SIGNAL_RESERVE_EARLY=never" in controller_tests_cmake and
+            "signal-reserve-early-never" in controller_tests and
+            "test_detach_controller_signal_reserve_helper_auto" in controller_tests_cmake and
+            "PEAK_DETACH_BACKEND=helper;PEAK_DETACH_SIGNAL=auto" in controller_tests_cmake and
+            "signal-reserve-helper-auto" in controller_tests,
+            "signal reserve-early compatibility knob must have controller-level coverage")
     require("peak_detach_controller_note_thread_creation_gate_installed(TRUE)" in pthread_listener,
             "pthread listener must publish successful pthread_create hook installation")
     require("peak_detach_controller_begin_thread_creation_gate" in controller,
@@ -428,7 +463,6 @@ def check_signal_backend_strict_invariants(repo_root):
             "signal-thread-spawn-trace" in tests and
             "trace_detach_success=1" in tests,
             "transient signal pthread test must prove trace-backed mutation evidence")
-    runtime_hotloop = (repo_root / "test/detach_runtime/test_detach_hotloop.c").read_text(encoding="utf-8")
     require("--signal-blocked-delivery-check" in tests and
             "signal_blocked_delivery_ok" in tests and
             "--signal-user-collision-check" in tests and
@@ -446,6 +480,7 @@ def check_signal_backend_strict_invariants(repo_root):
     require("--signal-user-collision-check" in runtime_hotloop and
             "migration_count=" in runtime_hotloop and
             "handler_preserved=1" in runtime_hotloop and
+            "raw_query_protected=1" in runtime_hotloop and
             "mask_preserved=1" in runtime_hotloop and
             "wait_preserved=1" in runtime_hotloop and
             "signalfd_preserved=1" in runtime_hotloop and

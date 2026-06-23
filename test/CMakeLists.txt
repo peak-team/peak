@@ -163,7 +163,7 @@ if(BUILD_TESTING)
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-user-collision-trace.csv;${PRELOAD_VAR}"
                 TIMEOUT 30
-                PASS_REGULAR_EXPRESSION "signal_user_collision_ok.*detach_success=1.*migration_count=[1-9][0-9]*.*handler_preserved=1.*mask_preserved=1.*wait_preserved=1.*signalfd_preserved=1.*timer_preserved=1.*mq_migrated=1.*syscall_migrated=1.*worker_calls=[1-9][0-9]*")
+                PASS_REGULAR_EXPRESSION "signal_user_collision_ok.*detach_success=1.*migration_count=[1-9][0-9]*.*handler_preserved=1.*raw_query_protected=1.*raw_query_readonly_failed=1.*mask_preserved=1.*wait_preserved=1.*signalfd_preserved=1.*timer_preserved=1.*mq_migrated=1.*syscall_migrated=1.*worker_calls=[1-9][0-9]*")
 
         add_test(NAME test_detach_hotloop_signal_forced_collision_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop

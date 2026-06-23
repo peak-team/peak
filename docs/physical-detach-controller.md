@@ -140,10 +140,18 @@ can operate on Gum's live data structures.
 On systems where ptrace is denied, PEAK can use
 `PEAK_SAFE_DETACH_MODE=signal` or `PEAK_DETACH_BACKEND=signal`. This backend is
 not the legacy pause mitigation. PEAK reserves a process-lifetime real-time
-signal early for strict-auto runs, installs a protective lease handler
-immediately, protects that lease through exported signal-policy wrappers for
-common libc signal APIs, and replaces the lease handler with a
+signal early for strict-auto runs by default, installs a protective lease
+handler immediately, protects that lease through exported signal-policy
+wrappers for common libc signal APIs, and replaces the lease handler with a
 cookie-authenticated `SA_SIGINFO` stop handler when the backend is activated.
+`PEAK_SIGNAL_RESERVE_EARLY=auto|always|forced-only|never` controls this
+constructor-time lease. `auto` keeps the default strict-auto behavior, `always`
+leases whenever the signal backend is supported, `forced-only` leases early
+only when `PEAK_DETACH_SIGNAL` names a concrete RT signal, and `never` avoids
+the early compatibility footprint. Explicit helper/debugger backend selection
+does not reserve early for `PEAK_DETACH_SIGNAL=auto`. Disabling early leasing
+loses protection against user constructors that claim a signal before helper
+fallback selects the signal backend.
 The controller enumerates `/proc/self/task`,
 sends each non-controller TID a queued thread-directed signal with
 `rt_tgsigqueueinfo`, and accepts arrival only when the handler sees the expected
@@ -169,6 +177,15 @@ fails closed with `signal-unexpected-delivery`, while helper-backed mutation
 remains independent. Before every signal-backed stop, PEAK revalidates that its
 handler still owns the current reserved signal and that no unexpected
 non-cookie delivery has contaminated the backend.
+PEAK virtualizes the reserved-signal disposition for normal user introspection:
+wrapped `sigaction(signum, NULL, oldact)` and wrapped
+`syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current
+or transitioning PEAK signal never expose the protective or stop handler. The
+libc wrapper reports a default handler; the raw `syscall()` wrapper reports the
+same sanitized default action when PEAK can safely copy it to user memory, or
+fails closed with `EFAULT` if the sanitized copy-out cannot be proven safe. A
+later attempt to install, wait on, block, consume, generate, or send that same
+signal still triggers migration or fails closed.
 If a TID has the reserved signal truly blocked, strict signal mutation fails
 closed before any patch write. A short mask recheck distinguishes that condition
 from the kernel's tiny handler-unwind window where the delivered signal may
@@ -853,3 +870,10 @@ Completed in this branch:
     forced blocked delivery, user signal-collision migration, and bad-cookie
     contamination cases while requiring successful physical detach after
     collision migration.
+45. Tightened signal lease robustness: signal-handler cookie authentication now
+    uses only preinitialized async-safe state, signal backend support checks
+    the signal-policy atomics touched from handler context, guarded user-pointer
+    inspection uses kernel-mediated reads instead of maps-plus-memcpy, raw
+    `rt_sigaction` read-only queries either return sanitized default state or
+    fail closed before exposing PEAK handlers, and `PEAK_SIGNAL_RESERVE_EARLY`
+    makes the strict-auto early lease compatibility tradeoff explicit.
