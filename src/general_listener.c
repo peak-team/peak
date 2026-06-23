@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -856,7 +857,178 @@ peak_general_controller_is_current_thread(void)
            pthread_equal(pthread_self(), general_controller_owner_thread);
 }
 
+static gboolean
+peak_general_listener_provider_is_perfmap(const char* provider_name)
+{
+    return provider_name != NULL &&
+           (g_ascii_strcasecmp(provider_name, "perfmap") == 0 ||
+            g_ascii_strcasecmp(provider_name, "perf-map") == 0);
+}
+
+static gboolean
+peak_general_listener_v8_optimized_symbol_matches_target(const char* target_name,
+                                                         const char* symbol_name)
+{
+    const char* cursor = NULL;
+    size_t target_len;
+    size_t logical_len = 0;
+
+    if (target_name == NULL || symbol_name == NULL) {
+        return FALSE;
+    }
+
+    if (g_str_has_prefix(symbol_name, "JS:")) {
+        cursor = symbol_name + 3;
+    } else if (g_str_has_prefix(symbol_name, "LazyCompile:")) {
+        cursor = symbol_name + 12;
+    } else {
+        return FALSE;
+    }
+
+    if (*cursor != '*') {
+        return FALSE;
+    }
+    cursor++;
+    if (*cursor == '\0') {
+        return FALSE;
+    }
+
+    while (cursor[logical_len] != '\0' &&
+           !g_ascii_isspace((guchar)cursor[logical_len])) {
+        logical_len++;
+    }
+
+    target_len = strlen(target_name);
+    return target_len == logical_len &&
+           strncmp(target_name, cursor, logical_len) == 0;
+}
+
+static gboolean
+peak_general_listener_dynamic_symbol_matches_target(const char* target_name,
+                                                    const char* symbol_name,
+                                                    const char* provider_name)
+{
+    if (target_name == NULL || symbol_name == NULL) {
+        return FALSE;
+    }
+
+    if (strcmp(target_name, symbol_name) == 0) {
+        return TRUE;
+    }
+
+    if (!peak_general_listener_provider_is_perfmap(provider_name)) {
+        return FALSE;
+    }
+
+    return peak_general_listener_v8_optimized_symbol_matches_target(target_name,
+                                                                    symbol_name);
+}
+
 gboolean
+peak_general_listener_dynamic_symbol_matches_any_target(const char* symbol_name,
+                                                        const char* provider_name)
+{
+    gboolean matched = FALSE;
+
+    if (symbol_name == NULL || symbol_name[0] == '\0') {
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&lock);
+    if (peak_hook_strings != NULL) {
+        for (size_t i = 0; i < peak_hook_address_count; i++) {
+            if (peak_hook_strings[i] != NULL &&
+                peak_general_listener_dynamic_symbol_matches_target(
+                    peak_hook_strings[i],
+                    symbol_name,
+                    provider_name)) {
+                matched = TRUE;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lock);
+
+    return matched;
+}
+
+static gboolean
+peak_general_listener_expand_dynamic_hook_tables_unlocked(
+    const char* target_name,
+    size_t* hook_id_out)
+{
+    size_t old_count = peak_hook_address_count;
+    size_t new_count = old_count + 1;
+    char* target_copy = NULL;
+    char** new_hook_strings;
+
+    if (target_name == NULL || target_name[0] == '\0') {
+        return FALSE;
+    }
+
+    target_copy = strdup(target_name);
+    if (target_copy == NULL) {
+        return FALSE;
+    }
+
+    new_hook_strings = realloc(peak_hook_strings,
+                               sizeof(char*) * new_count);
+    if (new_hook_strings == NULL) {
+        free(target_copy);
+        return FALSE;
+    }
+    peak_hook_strings = new_hook_strings;
+
+    array_listener = g_renew(GumInvocationListener*, array_listener, new_count);
+    array_listener_detached = g_renew(gboolean, array_listener_detached, new_count);
+    array_listener_reattached = g_renew(gboolean, array_listener_reattached, new_count);
+    array_listener_gum_detached =
+        g_renew(gboolean, array_listener_gum_detached, new_count);
+    array_listener_gum_detach_flushed =
+        g_renew(gboolean, array_listener_gum_detach_flushed, new_count);
+    peak_hook_states = g_renew(PeakHookState, peak_hook_states, new_count);
+    peak_hook_next_retry_time = g_renew(double, peak_hook_next_retry_time, new_count);
+    peak_hook_pending_observed_time =
+        g_renew(double, peak_hook_pending_observed_time, new_count);
+    peak_hook_retry_count =
+        g_renew(unsigned int, peak_hook_retry_count, new_count);
+    peak_hook_last_retry_status =
+        g_renew(PeakDetachStatus, peak_hook_last_retry_status, new_count);
+    hook_address = g_renew(gpointer, hook_address, new_count);
+    peak_demangled_strings = g_renew(char*, peak_demangled_strings, new_count);
+    peak_need_detach = g_renew(gboolean, peak_need_detach, new_count);
+    peak_detached = g_renew(gboolean, peak_detached, new_count);
+    if (heartbeat_overhead != NULL) {
+        heartbeat_overhead = g_renew(gdouble, heartbeat_overhead, new_count);
+    }
+
+    peak_hook_strings[old_count] = target_copy;
+    array_listener[old_count] = NULL;
+    array_listener_detached[old_count] = FALSE;
+    array_listener_reattached[old_count] = FALSE;
+    array_listener_gum_detached[old_count] = FALSE;
+    array_listener_gum_detach_flushed[old_count] = TRUE;
+    peak_hook_states[old_count] = PEAK_HOOK_UNRESOLVED;
+    peak_hook_next_retry_time[old_count] = 0.0;
+    peak_hook_pending_observed_time[old_count] = 0.0;
+    peak_hook_retry_count[old_count] = 0;
+    peak_hook_last_retry_status[old_count] = PEAK_DETACH_STATUS_SAFE;
+    hook_address[old_count] = NULL;
+    peak_demangled_strings[old_count] = NULL;
+    peak_need_detach[old_count] = FALSE;
+    peak_detached[old_count] = FALSE;
+    if (heartbeat_overhead != NULL) {
+        heartbeat_overhead[old_count] = 0.0;
+    }
+
+    peak_hook_address_count = new_count;
+    if (hook_id_out != NULL) {
+        *hook_id_out = old_count;
+    }
+    return TRUE;
+}
+
+PeakDynamicAttachResult
 peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                                             gpointer symbol_address,
                                             gsize symbol_size,
@@ -866,15 +1038,15 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
     if (symbol_name == NULL || symbol_name[0] == '\0' ||
         symbol_address == NULL || peak_hook_address_count == 0) {
-        return FALSE;
+        return PEAK_DYNAMIC_ATTACH_NO_MATCH;
     }
 
     if (!peak_general_controller_is_current_thread()) {
         g_printerr("[peak] refusing JIT dynamic attach outside the general listener controller thread\n");
-        return FALSE;
+        return PEAK_DYNAMIC_ATTACH_FAILED;
     }
 
-    gboolean attached = FALSE;
+    PeakDynamicAttachResult result = PEAK_DYNAMIC_ATTACH_NO_MATCH;
 
     pthread_mutex_lock(&lock);
     if (peak_hook_strings == NULL ||
@@ -882,18 +1054,58 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         array_listener == NULL ||
         peak_hook_states == NULL) {
         pthread_mutex_unlock(&lock);
-        return FALSE;
+        return PEAK_DYNAMIC_ATTACH_FAILED;
     }
 
+    gboolean matched_target = FALSE;
+    gboolean duplicate_address = FALSE;
+    const char* target_for_new_generation = NULL;
+    size_t selected_hook_id = (size_t)-1;
+
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (peak_hook_strings[i] == NULL ||
-            strcmp(peak_hook_strings[i], symbol_name) != 0 ||
-            hook_address[i] != NULL ||
-            array_listener[i] != NULL ||
-            peak_hook_states[i] != PEAK_HOOK_UNRESOLVED) {
+        if (peak_hook_strings[i] == NULL) {
+            continue;
+        }
+        if (!peak_general_listener_dynamic_symbol_matches_target(
+                peak_hook_strings[i],
+                symbol_name,
+                provider_name)) {
             continue;
         }
 
+        matched_target = TRUE;
+        if (target_for_new_generation == NULL) {
+            target_for_new_generation = peak_hook_strings[i];
+        }
+
+        if (hook_address[i] == symbol_address) {
+            duplicate_address = TRUE;
+            result = PEAK_DYNAMIC_ATTACH_NO_MATCH;
+            break;
+        }
+
+        if (selected_hook_id == (size_t)-1 &&
+            hook_address[i] == NULL &&
+            array_listener[i] == NULL &&
+            peak_hook_states[i] == PEAK_HOOK_UNRESOLVED) {
+            selected_hook_id = i;
+        }
+    }
+
+    if (result == PEAK_DYNAMIC_ATTACH_NO_MATCH &&
+        matched_target &&
+        !duplicate_address &&
+        selected_hook_id == (size_t)-1) {
+        if (!peak_general_listener_expand_dynamic_hook_tables_unlocked(
+                target_for_new_generation,
+                &selected_hook_id)) {
+            pthread_mutex_unlock(&lock);
+            return PEAK_DYNAMIC_ATTACH_FAILED;
+        }
+    }
+
+    if (!duplicate_address && selected_hook_id != (size_t)-1) {
+        size_t i = selected_hook_id;
         GumInvocationListener* new_listener =
             g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
         PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
@@ -910,14 +1122,19 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
         if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                           &detach_status)) {
-            g_printerr("[peak] skipping JIT attach for hook %lu (%s) from %s: %s\n",
+            result = peak_general_controller_status_is_retryable(detach_status) ?
+                         PEAK_DYNAMIC_ATTACH_RETRY :
+                         PEAK_DYNAMIC_ATTACH_FAILED;
+            g_printerr("[peak] %s JIT attach for hook %lu (%s) from %s: %s\n",
+                       result == PEAK_DYNAMIC_ATTACH_RETRY ? "retrying" : "skipping",
                        (unsigned long)i,
                        symbol_name,
                        provider_name != NULL ? provider_name : "<unknown>",
                        peak_detach_controller_status_string(detach_status));
             peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
             g_object_unref(new_listener);
-            break;
+            pthread_mutex_unlock(&lock);
+            return result;
         }
 
         gum_interceptor_begin_transaction(interceptor);
@@ -934,13 +1151,13 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         if (attach_status == GUM_ATTACH_OK) {
             hook_address[i] = symbol_address;
             g_free(peak_demangled_strings[i]);
-            peak_demangled_strings[i] = g_strdup(symbol_name);
+            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
             array_listener[i] = new_listener;
             array_listener_gum_detached[i] = FALSE;
             array_listener_gum_detach_flushed[i] = TRUE;
             peak_general_controller_reset_retry_unlocked(i);
             peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
-            attached = TRUE;
+            result = PEAK_DYNAMIC_ATTACH_ATTACHED;
         } else {
             g_printerr("[peak] Gum JIT attach failed for hook %lu (%s) from %s, status=%d\n",
                        (unsigned long)i,
@@ -949,12 +1166,12 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                        attach_status);
             peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
             g_object_unref(new_listener);
+            result = PEAK_DYNAMIC_ATTACH_FAILED;
         }
-        break;
     }
 
     pthread_mutex_unlock(&lock);
-    return attached;
+    return result;
 }
 
 static gboolean peak_general_controller_pause_called_threads(
@@ -2066,7 +2283,16 @@ peak_general_controller_thread_main(void* arg)
         should_run = general_controller_running;
         pthread_mutex_unlock(&general_controller_wake_mutex);
         if (!should_run) {
-            peak_jit_provider_drain_pending();
+            double deadline =
+                peak_second() +
+                ((double)peak_general_controller_shutdown_drain_ms() / 1000.0);
+            while (peak_jit_provider_drain_pending()) {
+                if (peak_second() >= deadline) {
+                    (void)peak_jit_provider_drain_pending_force_not_exec_timeout();
+                    break;
+                }
+                usleep(1000);
+            }
             break;
         }
 
@@ -2230,11 +2456,31 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
+    size_t heartbeat_capacity = peak_hook_address_count;
 
     while (atomic_load(&heartbeat_running)) {
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
         double now = peak_second();
+
+        pthread_mutex_lock(&lock);
+        size_t current_hook_count = peak_hook_address_count;
+        pthread_mutex_unlock(&lock);
+        if (current_hook_count > heartbeat_capacity) {
+            size_t old_capacity = heartbeat_capacity;
+            entries = g_renew(OverheadEntry, entries, current_hook_count);
+            ratio_snapshot = g_renew(double, ratio_snapshot, current_hook_count);
+            rate_snapshot = g_renew(double, rate_snapshot, current_hook_count);
+            prev_ratio = g_renew(double, prev_ratio, current_hook_count);
+            prev_time = g_renew(double, prev_time, current_hook_count);
+            for (size_t i = old_capacity; i < current_hook_count; i++) {
+                ratio_snapshot[i] = 0.0;
+                rate_snapshot[i] = 0.0;
+                prev_ratio[i] = 0.0;
+                prev_time[i] = now;
+            }
+            heartbeat_capacity = current_hook_count;
+        }
 
         double total_execution_time = now - peak_main_time;
         if (total_execution_time <= 0.0) total_execution_time = 1e-12;
@@ -2242,7 +2488,7 @@ void* peak_heartbeat_monitor(void* arg) {
         double global_overhead = 0.0;
 
         pthread_mutex_lock(&lock);
-        for (size_t i = 0; i < peak_hook_address_count; i++) {
+        for (size_t i = 0; i < heartbeat_capacity; i++) {
             if (!(hook_address[i] && array_listener[i])) {
                 ratio_snapshot[i] = 0.0;
                 rate_snapshot[i]  = 0.0;
@@ -2284,7 +2530,7 @@ void* peak_heartbeat_monitor(void* arg) {
         // ------------------------------------------------------------
         if (enable_per_target_heartbeat) {
             pthread_mutex_lock(&lock);
-            for (size_t i = 0; i < peak_hook_address_count; i++) {
+            for (size_t i = 0; i < heartbeat_capacity; i++) {
                 if (!(hook_address[i] && array_listener[i])) continue;
                 if (peak_detached[i]) continue;
 
@@ -2302,7 +2548,7 @@ void* peak_heartbeat_monitor(void* arg) {
             if (global_overhead > global_target_ratio * peak_global_detach_factor) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
-                for (size_t i = 0; i < peak_hook_address_count; i++) {
+                for (size_t i = 0; i < heartbeat_capacity; i++) {
                     if (!(hook_address[i] && array_listener[i])) continue;
                     if (peak_detached[i]) continue;
 
@@ -2338,7 +2584,7 @@ void* peak_heartbeat_monitor(void* arg) {
             (heartbeat_counter % check_interval) == 0) {
             // Per-target REATTACH
             if (enable_per_target_heartbeat) {
-                for (size_t i = 0; i < peak_hook_address_count; i++) {
+                for (size_t i = 0; i < heartbeat_capacity; i++) {
                     pthread_mutex_lock(&lock);
                     gboolean should_consider =
                         (hook_address[i] && array_listener[i] &&
@@ -2358,7 +2604,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 if (global_overhead <= peak_global_reattach_factor * global_target_ratio) {
                     size_t detached_cnt = 0;
                     pthread_mutex_lock(&lock);
-                    for (size_t i = 0; i < peak_hook_address_count; i++) {
+                    for (size_t i = 0; i < heartbeat_capacity; i++) {
                         if (!(hook_address[i] && array_listener[i])) continue;
                         if (!peak_detached[i]) continue;
                         if (peak_need_detach[i]) continue;
@@ -2517,7 +2763,9 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         }
         self->num_calls[index]++;
         size_t hook_id = self->hook_id;
-        peak_target_thread_called[hook_id][index] = true;
+        if (self->target_thread_called != NULL) {
+            self->target_thread_called[index] = TRUE;
+        }
         gboolean detach_requested = FALSE;
 
         pthread_mutex_lock(&lock);
@@ -2669,6 +2917,7 @@ peak_general_listener_init(PeakGeneralListener* self)
     self->exclusive_time = g_new0(gdouble, total_count);
     self->max_time = g_new0(gfloat, total_count);
     self->min_time = g_new0(gfloat, total_count);
+    self->target_thread_called = g_new0(gboolean, total_count);
     // g_print ("total count %lu self->num_calls %lu\n", total_count, self->num_calls[0]);
 }
 
@@ -2680,6 +2929,8 @@ peak_general_listener_free(PeakGeneralListener* self)
     g_free(self->exclusive_time);
     g_free(self->max_time);
     g_free(self->min_time);
+    g_free(self->target_thread_called);
+    self->target_thread_called = NULL;
 }
 
 __attribute__((noinline)) static void peak_general_overhead_dummy_func()
@@ -3261,6 +3512,60 @@ peak_general_listener_print_result(gulong* sum_num_calls,
 }
 
 #ifdef HAVE_MPI
+static uint64_t
+peak_general_listener_slot_identity_hash(size_t hook_id)
+{
+    const unsigned char* text;
+    uint64_t hash = 1469598103934665603ULL;
+
+    if (hook_id >= peak_hook_address_count) {
+        return 0;
+    }
+
+    text = (const unsigned char*)
+        (peak_demangled_strings != NULL && peak_demangled_strings[hook_id] != NULL ?
+             peak_demangled_strings[hook_id] :
+             peak_hook_strings != NULL && peak_hook_strings[hook_id] != NULL ?
+                 peak_hook_strings[hook_id] : "");
+
+    while (*text != '\0') {
+        hash ^= (uint64_t)*text++;
+        hash *= 1099511628211ULL;
+    }
+
+    return hash;
+}
+
+static gboolean
+peak_general_listener_has_duplicate_slot_names(void)
+{
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        const char* left =
+            peak_demangled_strings != NULL && peak_demangled_strings[i] != NULL ?
+                peak_demangled_strings[i] :
+                peak_hook_strings != NULL && peak_hook_strings[i] != NULL ?
+                    peak_hook_strings[i] : NULL;
+
+        if (left == NULL) {
+            continue;
+        }
+
+        for (size_t j = i + 1; j < peak_hook_address_count; j++) {
+            const char* right =
+                peak_demangled_strings != NULL && peak_demangled_strings[j] != NULL ?
+                    peak_demangled_strings[j] :
+                    peak_hook_strings != NULL && peak_hook_strings[j] != NULL ?
+                        peak_hook_strings[j] : NULL;
+
+            if (right != NULL && strcmp(left, right) == 0) {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
 static void
 peak_general_listener_reduce_result(gulong* sum_num_calls,
                                     gdouble* sum_total_time,
@@ -3278,6 +3583,109 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
         MPI_Init(NULL, NULL);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    gulong local_hook_count = (gulong)peak_hook_address_count;
+    gulong min_hook_count = 0;
+    gulong max_hook_count = 0;
+    MPI_Allreduce(&local_hook_count,
+                  &min_hook_count,
+                  1,
+                  MPI_UNSIGNED_LONG,
+                  MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&local_hook_count,
+                  &max_hook_count,
+                  1,
+                  MPI_UNSIGNED_LONG,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    int local_duplicate_names =
+        peak_general_listener_has_duplicate_slot_names() ? 1 : 0;
+    int any_duplicate_names = 0;
+    MPI_Allreduce(&local_duplicate_names,
+                  &any_duplicate_names,
+                  1,
+                  MPI_INT,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (any_duplicate_names) {
+        if (rank == 0) {
+            g_printerr("[peak] MPI output contains duplicate hook names, "
+                       "likely from multiple JIT generations; writing "
+                       "rank-local PEAK output\n");
+        }
+        peak_general_listener_print_result(sum_num_calls,
+                                           sum_total_time,
+                                           max_total_time,
+                                           min_total_time,
+                                           sum_exclusive_time,
+                                           sum_max_time,
+                                           sum_min_time,
+                                           thread_count,
+                                           1);
+        return;
+    }
+    if (min_hook_count != max_hook_count) {
+        if (rank == 0) {
+            g_printerr("[peak] MPI ranks observed different JIT hook counts "
+                       "(min=%lu max=%lu); writing rank-local PEAK output\n",
+                       (unsigned long)min_hook_count,
+                       (unsigned long)max_hook_count);
+        }
+        peak_general_listener_print_result(sum_num_calls,
+                                           sum_total_time,
+                                           max_total_time,
+                                           min_total_time,
+                                           sum_exclusive_time,
+                                           sum_max_time,
+                                           sum_min_time,
+                                           thread_count,
+                                           1);
+        return;
+    }
+    uint64_t* slot_hashes = g_new0(uint64_t, peak_hook_address_count);
+    uint64_t* min_slot_hashes = g_new0(uint64_t, peak_hook_address_count);
+    uint64_t* max_slot_hashes = g_new0(uint64_t, peak_hook_address_count);
+    gboolean slot_identity_mismatch = FALSE;
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        slot_hashes[i] = peak_general_listener_slot_identity_hash(i);
+    }
+    MPI_Allreduce(slot_hashes,
+                  min_slot_hashes,
+                  peak_hook_address_count,
+                  MPI_UNSIGNED_LONG_LONG,
+                  MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(slot_hashes,
+                  max_slot_hashes,
+                  peak_hook_address_count,
+                  MPI_UNSIGNED_LONG_LONG,
+                  MPI_MAX,
+                  MPI_COMM_WORLD);
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (min_slot_hashes[i] != max_slot_hashes[i]) {
+            slot_identity_mismatch = TRUE;
+            break;
+        }
+    }
+    g_free(max_slot_hashes);
+    g_free(min_slot_hashes);
+    g_free(slot_hashes);
+    if (slot_identity_mismatch) {
+        if (rank == 0) {
+            g_printerr("[peak] MPI ranks observed different JIT hook slot "
+                       "identities; writing rank-local PEAK output\n");
+        }
+        peak_general_listener_print_result(sum_num_calls,
+                                           sum_total_time,
+                                           max_total_time,
+                                           min_total_time,
+                                           sum_exclusive_time,
+                                           sum_max_time,
+                                           sum_min_time,
+                                           thread_count,
+                                           1);
+        return;
+    }
     gulong* mpi_sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_max_total_time = g_new0(gdouble, peak_hook_address_count);
@@ -3287,6 +3695,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gfloat* mpi_sum_min_time = g_new0(gfloat, peak_hook_address_count);
     gulong* mpi_thread_count = g_new0(gulong, peak_hook_address_count);
     gboolean* mpi_array_listener_detached = g_new0(gboolean, peak_hook_address_count);
+    gboolean* mpi_array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
     MPI_Reduce(sum_num_calls, mpi_sum_num_calls, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -3296,8 +3705,11 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     MPI_Reduce(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(array_listener_reattached, mpi_array_listener_reattached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
     g_free(array_listener_detached);
+    g_free(array_listener_reattached);
     array_listener_detached = mpi_array_listener_detached;
+    array_listener_reattached = mpi_array_listener_reattached;
     if (rank == 0) {
         peak_general_listener_print_result(mpi_sum_num_calls,
                                            mpi_sum_total_time,
