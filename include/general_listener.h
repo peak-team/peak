@@ -65,6 +65,7 @@ struct _PeakGeneralListener {
     gdouble* exclusive_time;
     gfloat* max_time;
     gfloat* min_time;
+    gboolean* target_thread_called;
 };
 
 typedef struct {

@@ -18,7 +18,14 @@ typedef int (*PeakJitFn)(int);
 
 typedef enum {
     PEAK_JIT_WITH_PERF_MAP,
-    PEAK_JIT_WITHOUT_METADATA
+    PEAK_JIT_WITHOUT_METADATA,
+    PEAK_JIT_WITH_PARTIAL_PERF_MAP,
+    PEAK_JIT_WITH_PRE_EXEC_PERF_MAP,
+    PEAK_JIT_WITH_TWO_GENERATIONS,
+    PEAK_JIT_WITH_STALE_THEN_VALID,
+    PEAK_JIT_WITH_DUPLICATE_PERF_MAP,
+    PEAK_JIT_WITH_MALFORMED_THEN_VALID,
+    PEAK_JIT_WITH_OVERLONG_THEN_VALID
 } PeakJitMode;
 
 static int
@@ -85,8 +92,11 @@ static void
 print_usage(const char* argv0)
 {
     fprintf(stderr,
-            "usage: %s (--with-perf-map|--without-metadata) "
-            "[--iterations N] [--metadata-sleep-us N]\n",
+            "usage: %s (--with-perf-map|--without-metadata|--with-partial-perf-map|"
+            "--with-pre-exec-perf-map|--with-two-generations|--with-stale-then-valid|"
+            "--with-duplicate-perf-map|--with-malformed-then-valid|"
+            "--with-overlong-then-valid) "
+            "[--iterations N] [--metadata-sleep-us N] [--symbol NAME]\n",
             argv0);
 }
 
@@ -116,12 +126,14 @@ parse_args(int argc,
            char** argv,
            PeakJitMode* mode,
            unsigned long* iterations,
-           unsigned long* metadata_sleep_us)
+           unsigned long* metadata_sleep_us,
+           const char** symbol_name)
 {
     int saw_mode = 0;
 
     *iterations = PEAK_JIT_DEFAULT_ITERATIONS;
     *metadata_sleep_us = 50000UL;
+    *symbol_name = PEAK_JIT_SYMBOL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--with-perf-map") == 0) {
@@ -129,6 +141,27 @@ parse_args(int argc,
             saw_mode++;
         } else if (strcmp(argv[i], "--without-metadata") == 0) {
             *mode = PEAK_JIT_WITHOUT_METADATA;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-partial-perf-map") == 0) {
+            *mode = PEAK_JIT_WITH_PARTIAL_PERF_MAP;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-pre-exec-perf-map") == 0) {
+            *mode = PEAK_JIT_WITH_PRE_EXEC_PERF_MAP;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-two-generations") == 0) {
+            *mode = PEAK_JIT_WITH_TWO_GENERATIONS;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-stale-then-valid") == 0) {
+            *mode = PEAK_JIT_WITH_STALE_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-duplicate-perf-map") == 0) {
+            *mode = PEAK_JIT_WITH_DUPLICATE_PERF_MAP;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-malformed-then-valid") == 0) {
+            *mode = PEAK_JIT_WITH_MALFORMED_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-overlong-then-valid") == 0) {
+            *mode = PEAK_JIT_WITH_OVERLONG_THEN_VALID;
             saw_mode++;
         } else if (strcmp(argv[i], "--iterations") == 0) {
             if (i + 1 >= argc ||
@@ -143,6 +176,13 @@ parse_args(int argc,
                 fprintf(stderr, "invalid --metadata-sleep-us value\n");
                 return -1;
             }
+            i++;
+        } else if (strcmp(argv[i], "--symbol") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                fprintf(stderr, "invalid --symbol value\n");
+                return -1;
+            }
+            *symbol_name = argv[i + 1];
             i++;
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -181,7 +221,7 @@ perf_map_path(char* path, size_t path_size)
 }
 
 static int
-write_perf_map_row(void* code, size_t code_size)
+write_perf_map_row(void* code, size_t code_size, const char* symbol_name)
 {
     char path[256];
     FILE* fp;
@@ -204,10 +244,142 @@ write_perf_map_row(void* code, size_t code_size)
             "%" PRIxPTR " %zx %s\n",
             (uintptr_t)code,
             code_size,
-            PEAK_JIT_SYMBOL);
+            symbol_name);
     if (fclose(fp) != 0) {
         fprintf(stderr,
                 "failed to close perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+write_malformed_perf_map_row(void* code)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        fprintf(stderr, "failed to build perf-map path\n");
+        return -1;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        fprintf(stderr,
+                "failed to open perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "%" PRIxPTR " 10%s\n", (uintptr_t)code, PEAK_JIT_SYMBOL);
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "failed to close perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+write_overlong_perf_map_row(void* code, size_t code_size)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        fprintf(stderr, "failed to build perf-map path\n");
+        return -1;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        fprintf(stderr,
+                "failed to open perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "%" PRIxPTR " %zx ", (uintptr_t)code, code_size);
+    for (size_t i = 0; i < 5000; i++) {
+        fputc('x', fp);
+    }
+    fputc('\n', fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "failed to close perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+write_partial_perf_map_prefix(void* code, size_t code_size)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        fprintf(stderr, "failed to build perf-map path\n");
+        return -1;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        fprintf(stderr,
+                "failed to open perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "%" PRIxPTR " %zx ", (uintptr_t)code, code_size);
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "failed to close partial perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+complete_partial_perf_map_row(const char* symbol_name)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        fprintf(stderr, "failed to build perf-map path\n");
+        return -1;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        fprintf(stderr,
+                "failed to reopen perf-map '%s': %s\n",
+                path,
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "%s\n", symbol_name);
+    if (fclose(fp) != 0) {
+        fprintf(stderr,
+                "failed to close completed perf-map '%s': %s\n",
                 path,
                 strerror(errno));
         return -1;
@@ -227,7 +399,29 @@ unlink_stale_perf_map(void)
 }
 
 static int
-allocate_jit_code(void** code, size_t* code_size)
+make_jit_code_executable(void* code, size_t code_size)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+
+    if (page_size <= 0) {
+        fprintf(stderr, "unsupported runtime: sysconf(_SC_PAGESIZE) failed\n");
+        return PEAK_JIT_SKIP;
+    }
+
+    __builtin___clear_cache((char*)code, (char*)code + code_size);
+
+    if (mprotect(code, (size_t)page_size, PROT_READ | PROT_EXEC) != 0) {
+        fprintf(stderr,
+                "unsupported runtime: mprotect RX failed: %s\n",
+                strerror(errno));
+        return PEAK_JIT_SKIP;
+    }
+
+    return 0;
+}
+
+static int
+allocate_jit_code_with_mode(void** code, size_t* code_size, int executable)
 {
     long page_size = sysconf(_SC_PAGESIZE);
     size_t map_size;
@@ -262,19 +456,49 @@ allocate_jit_code(void** code, size_t* code_size)
 
     __builtin___clear_cache((char*)mapping, (char*)mapping + emitted_size);
 
-    if (mprotect(mapping, map_size, PROT_READ | PROT_EXEC) != 0) {
-        int saved_errno = errno;
-
-        munmap(mapping, map_size);
-        fprintf(stderr,
-                "unsupported runtime: mprotect RX failed: %s\n",
-                strerror(saved_errno));
-        return PEAK_JIT_SKIP;
+    if (executable) {
+        int rc = make_jit_code_executable(mapping, emitted_size);
+        if (rc != 0) {
+            munmap(mapping, map_size);
+            return rc;
+        }
     }
 
     *code = mapping;
     *code_size = emitted_size;
     return 0;
+}
+
+static int
+allocate_jit_code(void** code, size_t* code_size)
+{
+    return allocate_jit_code_with_mode(code, code_size, 1);
+}
+
+static const char*
+mode_name(PeakJitMode mode)
+{
+    switch (mode) {
+        case PEAK_JIT_WITH_PERF_MAP:
+            return "with-perf-map";
+        case PEAK_JIT_WITH_PARTIAL_PERF_MAP:
+            return "with-partial-perf-map";
+        case PEAK_JIT_WITH_PRE_EXEC_PERF_MAP:
+            return "with-pre-exec-perf-map";
+        case PEAK_JIT_WITH_TWO_GENERATIONS:
+            return "with-two-generations";
+        case PEAK_JIT_WITH_STALE_THEN_VALID:
+            return "with-stale-then-valid";
+        case PEAK_JIT_WITH_DUPLICATE_PERF_MAP:
+            return "with-duplicate-perf-map";
+        case PEAK_JIT_WITH_MALFORMED_THEN_VALID:
+            return "with-malformed-then-valid";
+        case PEAK_JIT_WITH_OVERLONG_THEN_VALID:
+            return "with-overlong-then-valid";
+        case PEAK_JIT_WITHOUT_METADATA:
+        default:
+            return "without-metadata";
+    }
 }
 
 int
@@ -287,6 +511,7 @@ main(int argc, char** argv)
     volatile unsigned long long total = 0;
     volatile PeakJitFn hot_fn;
     unsigned long metadata_sleep_us;
+    const char* symbol_name;
     int rc;
     int expected;
 
@@ -296,25 +521,132 @@ main(int argc, char** argv)
         return PEAK_JIT_SKIP;
     }
 
-    if (parse_args(argc, argv, &mode, &iterations, &metadata_sleep_us) != 0) {
+    if (parse_args(argc,
+                   argv,
+                   &mode,
+                   &iterations,
+                   &metadata_sleep_us,
+                   &symbol_name) != 0) {
         print_usage(argv[0]);
         return 2;
     }
 
     unlink_stale_perf_map();
 
-    rc = allocate_jit_code(&code, &code_size);
+    rc = (mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
+          mode == PEAK_JIT_WITH_STALE_THEN_VALID) ?
+             allocate_jit_code_with_mode(&code, &code_size, 0) :
+             allocate_jit_code(&code, &code_size);
     if (rc != 0) {
         return rc;
     }
 
-    if (mode == PEAK_JIT_WITH_PERF_MAP &&
-        write_perf_map_row(code, code_size) != 0) {
+    if ((mode == PEAK_JIT_WITH_PERF_MAP ||
+         mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
+         mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
+         mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
+         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP) &&
+        write_perf_map_row(code, code_size, symbol_name) != 0) {
         munmap(code, (size_t)sysconf(_SC_PAGESIZE));
         return PEAK_JIT_SKIP;
     }
-    if (mode == PEAK_JIT_WITH_PERF_MAP && metadata_sleep_us > 0) {
+    if (mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP &&
+        write_perf_map_row(code, code_size, symbol_name) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_MALFORMED_THEN_VALID &&
+        write_malformed_perf_map_row(code) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID &&
+        write_overlong_perf_map_row(code, code_size) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_MALFORMED_THEN_VALID &&
+        write_perf_map_row(code, code_size, symbol_name) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID &&
+        write_perf_map_row(code, code_size, symbol_name) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_PARTIAL_PERF_MAP &&
+        write_partial_perf_map_prefix(code, code_size) != 0) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
+    if (mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        rc = make_jit_code_executable(code, code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        usleep(10000);
+    }
+    if (mode == PEAK_JIT_WITH_STALE_THEN_VALID) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        rc = allocate_jit_code(&second_code, &second_code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        if (write_perf_map_row(second_code, second_code_size, symbol_name) != 0) {
+            munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_TWO_GENERATIONS) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        rc = allocate_jit_code(&second_code, &second_code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        if (write_perf_map_row(second_code, second_code_size, symbol_name) != 0) {
+            munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if ((mode == PEAK_JIT_WITH_PERF_MAP ||
+         mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
+         mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
+         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
+         mode == PEAK_JIT_WITH_MALFORMED_THEN_VALID ||
+         mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID) &&
+        metadata_sleep_us > 0) {
         usleep(metadata_sleep_us);
+    }
+    if (mode == PEAK_JIT_WITH_PARTIAL_PERF_MAP) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (complete_partial_perf_map_row(symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        usleep(10000);
     }
 
     hot_fn = (PeakJitFn)code;
@@ -325,9 +657,9 @@ main(int argc, char** argv)
     expected = hot_fn(41);
     printf("peak_jit_fixture_ok mode=%s pid=%ld symbol=%s calls=%lu "
            "result=%d checksum=%llu code=%p size=%zu\n",
-           mode == PEAK_JIT_WITH_PERF_MAP ? "with-perf-map" : "without-metadata",
+           mode_name(mode),
            (long)getpid(),
-           PEAK_JIT_SYMBOL,
+           symbol_name,
            iterations + 1,
            expected,
            (unsigned long long)total,

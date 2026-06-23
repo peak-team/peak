@@ -11,7 +11,7 @@ PEAK is a lightweight and easy-to-use performance evaluation tool designed with 
 - **Adaptive Cost**: Adaptive profiling overhead based on user-defined limits for optimal balance between accuracy and performance
 - **Ease of Use**: Requires no recompilation and supports profiling of all functions in both dynamically and statically linked libraries.
 - **Comprehensive Profiling**: Supports CPU and GPU profiling with customizable targets.
-- **JIT Metadata Profiling**: Can attach to metadata-published JIT code, starting with Linux perf-map providers.
+- **JIT Metadata Profiling**: Can attach to JIT code published through runtime metadata, starting with Linux perf-map providers.
 
 ## Compilation
 
@@ -51,10 +51,12 @@ PEAK is configured via environment variables. Below are the available settings:
 | `PEAK_DETACH_TRACE_PATH` | Optional CSV path for strict detach-controller transition evidence. When set, PEAK appends `time,hook_id,symbol,operation,result,physical,status,retry_count,pending_age_s,batch_size,stop_window_us,batch_id` rows for detach, reattach, and shutdown transitions. The first seven fields are stable; the final five fields are optional diagnostics. `stop_window_us` is the measured helper-held STOP window when available, otherwise `0`; `batch_id` is nonzero for rows emitted by one controller batch and `0` for single-row paths. |
 | `PEAK_DLOPEN_DEBUG` | Enables stderr diagnostics for queued dynamic `dlopen` attach/retry/drop/retained-handle counters when set to `1`, `true`, `yes`, or `on`. |
 | `PEAK_DLOPEN_TRACE_PATH` | Optional CSV path for dynamic `dlopen` queue diagnostics. Rows are `event,enqueued,drained,requeued,dropped_full,dropped_closed,dropped_noload,dropped_requeue,partial_success,retained_handles,max_depth`. |
-| `PEAK_JIT_ENABLE` | Enables JIT metadata providers when set to `1`, `true`, `yes`, or `on`. JIT profiling still requires matching `PEAK_TARGET` names. |
+| `PEAK_JIT_ENABLE` | Enables JIT metadata providers when set to `1`, `true`, `yes`, or `on`. JIT profiling still requires matching `PEAK_TARGET` names. Explicit JIT mode also lets known JIT runtimes such as `node`/`nodejs` initialize PEAK even though they are normally skipped as tool commands. |
 | `PEAK_JIT_PROVIDER` | Comma-separated JIT metadata providers. The current provider is `perfmap` / `perf-map`, which consumes Linux `/tmp/perf-<pid>.map` style metadata. |
 | `PEAK_JIT_MAP_PATH` | Optional perf-map path override. If unset, the perf-map provider reads `/tmp/perf-<pid>.map`. |
-| `PEAK_JIT_TRACE_PATH` | Optional CSV diagnostics for JIT provider events and perf-map records. Rows include provider, symbol name, address, size, and result. |
+| `PEAK_JIT_TRACE_PATH` | Optional CSV diagnostics for JIT provider events and perf-map records. Rows include provider, symbol name, address, size, and result (`attached`, `not-matched`, `not-executable`, `not-executable-retry`, `not-executable-timeout`, `partial-record`, `overlong-record`, `attach-retry`, or `attach-failed`). |
+| `PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS` | Default: `1000`. Bounds how long the perf-map provider keeps retrying a matching target row whose code range is not executable yet before dropping that pending retry as stale. Later perf-map rows continue to drain while the stale row is pending. |
+| `PEAK_JIT_DRAIN_RECORD_BUDGET` | Default: `1024`. Bounds how many perf-map or pending retry records one controller-thread drain pass processes before yielding back to detach/reattach work. |
 | `PEAK_HB_MIN_US` | Sets the adaptive heartbeat monitor's minimum sleep interval in microseconds (**default: `10000`**). |
 | `PEAK_HB_MAX_US` | Sets the adaptive heartbeat monitor's maximum sleep interval in microseconds (**default: `500000`**). |
 | `PEAK_HB_K_ERR` | Controls adaptive heartbeat sensitivity to overhead target overshoot (**default: `3.0`**). |
@@ -99,8 +101,15 @@ GPU CUDA Graph will be profiled as a single node or function, and only the execu
 
 5. **JIT Profiling:**
 PEAK does not infer function names or boundaries from anonymous executable pages.
-JIT targets require runtime metadata. See [docs/jit-profiling.md](docs/jit-profiling.md)
-for the perf-map provider, backend-independence guarantees, and lifetime limits.
+JIT targets require runtime metadata. The default Linux test suite covers the
+native perf-map provider, metadata-before-`PROT_EXEC` retry, and multiple code
+generations for one target, heartbeat-on dynamic table growth, CSV-safe V8-style
+names, plus stale non-executable target rows followed by valid generations; real
+runtime preload tests such as Node/V8 can be
+enabled with `-DPEAK_ENABLE_JIT_RUNTIME_PRELOAD_TESTS=ON` when the strict attach
+backend is supported for that runtime. See
+[docs/jit-profiling.md](docs/jit-profiling.md) for provider guarantees and
+lifetime limits.
 
 ## Reference
 If you use PEAK in your research, please cite:

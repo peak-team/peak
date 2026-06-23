@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -48,6 +50,7 @@
 #define PEAK_MAX_NUM_THREADS_ENV               "PEAK_MAX_NUM_THREADS"
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
+#define PEAK_JIT_ENABLE_ENV                    "PEAK_JIT_ENABLE"
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
 
@@ -55,6 +58,7 @@ gboolean* peak_need_detach;
 gboolean* peak_detached;
 gdouble* heartbeat_overhead;
 gboolean** peak_target_thread_called;
+static size_t peak_target_thread_called_count;
 PeakHeartbeatArgs* args;
 extern _Atomic gboolean heartbeat_running;
 pthread_t heartbeat_thread;
@@ -155,6 +159,7 @@ void peak_init()
 #endif
     // general listener needs to be after pthread and mpi ones
     peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
+    peak_target_thread_called_count = peak_hook_address_count;
     for (gint i = 0; i < peak_hook_address_count; i++) {
         peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
     }
@@ -202,8 +207,14 @@ void peak_fini()
         pthread_cond_signal(&heartbeat_cond);
         pthread_mutex_unlock(&heartbeat_mutex);
         pthread_join(heartbeat_thread, NULL);
-        if (heartbeat_overhead) g_free(heartbeat_overhead);
-        if (args) g_free(args);
+        if (heartbeat_overhead) {
+            g_free(heartbeat_overhead);
+            heartbeat_overhead = NULL;
+        }
+        if (args) {
+            g_free(args);
+            args = NULL;
+        }
     }
     peak_main_time = peak_second() - peak_main_time;
 
@@ -254,10 +265,12 @@ void peak_fini()
     }
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
     if (general_listener_shutdown_flushed) {
-        for (gint i = 0; i < peak_hook_address_count; i++) {
+        for (size_t i = 0; i < peak_target_thread_called_count; i++) {
             g_free(peak_target_thread_called[i]);
         }
         g_free(peak_target_thread_called);
+        peak_target_thread_called = NULL;
+        peak_target_thread_called_count = 0;
         g_free(peak_need_detach);
         g_free(peak_detached);
     } else {
@@ -278,6 +291,54 @@ typedef int (*libc_start_main_fn)(main_fn, int, char**,
 
 static main_fn real_main = NULL;
 static libc_start_main_fn real___libc_start_main = NULL;
+
+static gboolean
+peak_env_truthy(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "1") == 0 ||
+            g_ascii_strcasecmp(value, "true") == 0 ||
+            g_ascii_strcasecmp(value, "yes") == 0 ||
+            g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static const char*
+peak_command_base_name(const char* path)
+{
+    const char* base;
+
+    if (path == NULL) {
+        return NULL;
+    }
+
+    base = strrchr(path, '/');
+    return base != NULL ? base + 1 : path;
+}
+
+static gboolean
+peak_command_is_jit_runtime(const char* command)
+{
+    const char* base = peak_command_base_name(command);
+
+    return base != NULL &&
+           (strcmp(base, "node") == 0 ||
+            strcmp(base, "nodejs") == 0);
+}
+
+static gboolean
+peak_should_wrap_main(const char* command)
+{
+    if (command == NULL) {
+        return FALSE;
+    }
+
+    if (!check_command(command)) {
+        return TRUE;
+    }
+
+    return peak_env_truthy(getenv(PEAK_JIT_ENABLE_ENV)) &&
+           peak_command_is_jit_runtime(command);
+}
 
 // Original function pointer for `exit`
 static void (*original_exit)(int) = NULL;
@@ -369,8 +430,8 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     // Store the original main function pointer
     real_main = main;
 
-    // Decide whether to use the main wrapper based on argv[0]
-    if (argv[0] && !check_command(argv[0])) {
+    // Decide whether to use the main wrapper based on argv[0].
+    if (peak_should_wrap_main(argv[0])) {
         return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
     } else {
         return real___libc_start_main(main, argc, argv, init, fini, rtld_fini, stack_end);

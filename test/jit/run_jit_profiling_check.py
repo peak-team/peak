@@ -23,7 +23,7 @@ def merge_preload(libpeak):
     return libpeak
 
 
-def make_env(libpeak, stats_prefix, map_path, trace_path):
+def make_env(libpeak, stats_prefix, map_path, trace_path, extra_env=None):
     env = os.environ.copy()
     env.update(
         {
@@ -41,15 +41,119 @@ def make_env(libpeak, stats_prefix, map_path, trace_path):
             "PEAK_COST": "0",
         }
     )
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
 def mode_flag(mode):
-    if mode in ("positive", "final-drain"):
+    if mode in (
+        "positive",
+        "final-drain",
+        "retry-attach",
+        "final-drain-retry",
+        "v8-js-optimized",
+        "v8-js-csv-name",
+        "v8-lazycompile-optimized",
+    ):
         return "--with-perf-map"
+    if mode == "partial-record":
+        return "--with-partial-perf-map"
+    if mode == "pre-exec":
+        return "--with-pre-exec-perf-map"
+    if mode == "two-generations":
+        return "--with-two-generations"
+    if mode == "two-generations-heartbeat":
+        return "--with-two-generations"
+    if mode == "stale-then-valid":
+        return "--with-stale-then-valid"
+    if mode == "stale-then-valid-default-timeout":
+        return "--with-stale-then-valid"
+    if mode == "final-drain-stale-then-valid":
+        return "--with-stale-then-valid"
+    if mode == "duplicate-record":
+        return "--with-duplicate-perf-map"
+    if mode == "malformed-then-valid":
+        return "--with-malformed-then-valid"
+    if mode == "overlong-then-valid":
+        return "--with-overlong-then-valid"
     if mode == "negative":
         return "--without-metadata"
     raise ValueError(f"unknown mode: {mode}")
+
+
+def metadata_symbol(mode):
+    if mode == "v8-js-optimized":
+        return f"JS:*{JIT_SYMBOL} /tmp/peak_jit_fixture.js:1:25"
+    if mode == "v8-js-csv-name":
+        return f"JS:*{JIT_SYMBOL} /tmp/peak,jit \"fixture\".js:1:25"
+    if mode == "v8-lazycompile-optimized":
+        return f"LazyCompile:*{JIT_SYMBOL} /tmp/peak_jit_fixture.js:1:25"
+    return JIT_SYMBOL
+
+
+def expects_attached_record(mode):
+    return mode in (
+        "positive",
+        "final-drain",
+        "retry-attach",
+        "pre-exec",
+        "two-generations",
+        "stale-then-valid",
+        "stale-then-valid-default-timeout",
+        "final-drain-stale-then-valid",
+        "duplicate-record",
+        "malformed-then-valid",
+        "overlong-then-valid",
+        "final-drain-retry",
+        "partial-record",
+        "v8-js-optimized",
+        "v8-js-csv-name",
+        "v8-lazycompile-optimized",
+        "two-generations-heartbeat",
+    )
+
+
+def expects_positive_count(mode):
+    return mode in (
+        "positive",
+        "retry-attach",
+        "pre-exec",
+        "two-generations",
+        "stale-then-valid",
+        "stale-then-valid-default-timeout",
+        "duplicate-record",
+        "malformed-then-valid",
+        "overlong-then-valid",
+        "partial-record",
+        "v8-js-optimized",
+        "v8-js-csv-name",
+        "v8-lazycompile-optimized",
+        "two-generations-heartbeat",
+    )
+
+
+def extra_env_for_mode(mode):
+    if mode in ("retry-attach", "final-drain-retry"):
+        return {"PEAK_JIT_TEST_ATTACH_SEQUENCE": "retry,real"}
+    if mode == "stale-then-valid":
+        return {"PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "20"}
+    if mode == "two-generations-heartbeat":
+        return {
+            "PEAK_HEARTBEAT_INTERVAL": "0.01",
+            "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
+            "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
+            "PEAK_ENABLE_REATTACH": "0",
+            "PEAK_COST": "0",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    return {}
+
+
+def expected_attached_records(mode):
+    if mode in ("two-generations", "two-generations-heartbeat"):
+        return 2
+    return 1
 
 
 def find_stats_csv(stats_prefix, pid):
@@ -89,6 +193,27 @@ def read_text(path):
         return handle.read()
 
 
+def read_trace(path):
+    text = read_text(path)
+    rows = list(csv.reader(text.splitlines()))
+    return text, rows
+
+
+def trace_rows_with_result(rows, result):
+    return [
+        row
+        for row in rows
+        if len(row) >= 7
+        and row[1] == "perfmap-record"
+        and row[2] == "perfmap"
+        and row[6] == result
+    ]
+
+
+def trace_has_result(rows, result):
+    return bool(trace_rows_with_result(rows, result))
+
+
 def cleanup_perf_map(pid):
     path = f"/tmp/perf-{pid}.map"
     try:
@@ -113,11 +238,19 @@ def run_one(args, tmpdir, mode):
         "--iterations",
         str(args.iterations),
         "--metadata-sleep-us",
-        "0" if mode == "final-drain" else str(args.metadata_sleep_us),
+        "0" if mode in ("final-drain", "final-drain-retry", "final-drain-stale-then-valid") else str(args.metadata_sleep_us),
+        "--symbol",
+        metadata_symbol(mode),
     ]
     completed = subprocess.run(
         command,
-        env=make_env(args.libpeak, stats_prefix, map_path, trace_path),
+        env=make_env(
+            args.libpeak,
+            stats_prefix,
+            map_path,
+            trace_path,
+            extra_env_for_mode(mode),
+        ),
         cwd=tmpdir,
         text=True,
         stdout=subprocess.PIPE,
@@ -157,28 +290,79 @@ def run_one(args, tmpdir, mode):
     except FileNotFoundError:
         pass
 
-    if mode in ("positive", "final-drain"):
-        trace = read_text(trace_path)
-        attached_records = [
-            line
-            for line in trace.splitlines()
-            if ",perfmap-record,perfmap," in line and line.endswith(",attached")
-        ]
-        if len(attached_records) != 1:
+    if expects_attached_record(mode):
+        trace, trace_rows = read_trace(trace_path)
+        attached_records = trace_rows_with_result(trace_rows, "attached")
+        expected_attached = expected_attached_records(mode)
+        if len(attached_records) != expected_attached:
             raise AssertionError(
-                f"expected exactly one attached perf-map record, got "
+                f"expected exactly {expected_attached} attached perf-map record(s), got "
                 f"{len(attached_records)}\ntrace={trace}\n{output}"
             )
-    if mode == "positive":
+        if mode in ("retry-attach", "final-drain-retry"):
+            retry_indexes = [
+                index
+                for index, row in enumerate(trace_rows)
+                if len(row) >= 7
+                and row[1] == "perfmap-record"
+                and row[2] == "perfmap"
+                and row[6] == "attach-retry"
+            ]
+            attached_index = trace_rows.index(attached_records[0])
+            if not retry_indexes or retry_indexes[0] >= attached_index:
+                raise AssertionError(
+                    f"{mode} did not retain the perf-map record across an "
+                    f"attach retry\ntrace={trace}\n{output}"
+                )
+        if mode == "partial-record" and not trace_has_result(trace_rows, "partial-record"):
+            raise AssertionError(
+                "partial-record mode did not observe a partial perf-map row "
+                f"before attach\ntrace={trace}\n{output}"
+            )
+        if mode == "pre-exec" and not trace_has_result(trace_rows, "not-executable-retry"):
+            raise AssertionError(
+                "pre-exec mode did not retain a matching perf-map row while "
+                f"the code was still non-executable\ntrace={trace}\n{output}"
+            )
+        if mode in ("stale-then-valid", "final-drain-stale-then-valid") and not trace_has_result(trace_rows, "not-executable-timeout"):
+            raise AssertionError(
+                f"{mode} mode did not time out a stale non-executable "
+                f"target row before attaching the valid generation\ntrace={trace}\n{output}"
+            )
+        if mode == "stale-then-valid-default-timeout" and not trace_has_result(trace_rows, "not-executable-retry"):
+            raise AssertionError(
+                "stale-then-valid-default-timeout did not retain the stale "
+                f"row as pending while still scanning later metadata\ntrace={trace}\n{output}"
+            )
+        if mode == "duplicate-record" and not trace_has_result(trace_rows, "not-matched"):
+            raise AssertionError(
+                "duplicate-record mode did not observe a no-op duplicate row "
+                f"after attach\ntrace={trace}\n{output}"
+            )
+        if mode == "overlong-then-valid" and not trace_has_result(trace_rows, "overlong-record"):
+            raise AssertionError(
+                "overlong-then-valid mode did not skip an overlong complete "
+                f"row before attaching the valid generation\ntrace={trace}\n{output}"
+            )
+        if mode == "v8-js-csv-name":
+            names = [row[3] for row in trace_rows if len(row) >= 7]
+            expected = metadata_symbol(mode)
+            if expected not in names:
+                raise AssertionError(
+                    "v8-js-csv-name did not preserve a comma/quote-heavy "
+                    f"symbol as one CSV field\nexpected={expected}\n"
+                    f"rows={trace_rows}\ntrace={trace}\n{output}"
+                )
+    if expects_positive_count(mode):
         if stats_csv is None:
             raise AssertionError(
-                f"positive JIT run did not create stats csv for pid {pid}\n"
+                f"{mode} JIT run did not create stats csv for pid {pid}\n"
                 f"expected prefix: {stats_prefix}\n{output}"
             )
         if count <= 0:
             trace = read_text(trace_path)
             raise AssertionError(
-                f"positive JIT run did not record {JIT_SYMBOL}; "
+                f"{mode} JIT run did not record {JIT_SYMBOL}; "
                 f"stats_csv={stats_csv}\nrows={rows}\ntrace={trace}\n{output}"
             )
     elif mode == "negative":
@@ -207,7 +391,27 @@ def main():
     parser.add_argument("--libpeak", required=True)
     parser.add_argument(
         "--mode",
-        choices=("positive", "negative", "both", "final-drain"),
+        choices=(
+            "positive",
+            "negative",
+            "both",
+            "final-drain",
+            "final-drain-retry",
+            "final-drain-stale-then-valid",
+            "retry-attach",
+            "partial-record",
+            "pre-exec",
+            "two-generations",
+            "stale-then-valid",
+            "stale-then-valid-default-timeout",
+            "duplicate-record",
+            "malformed-then-valid",
+            "overlong-then-valid",
+            "v8-js-optimized",
+            "v8-js-csv-name",
+            "v8-lazycompile-optimized",
+            "two-generations-heartbeat",
+        ),
         default="both",
     )
     parser.add_argument("--iterations", type=int, default=1000000)
