@@ -383,7 +383,10 @@ run_idle_shutdown_io_fail_closed(void)
                detach_with_stderr_capture(&detach_log) == FALSE);
     check_contains("public idle shutdown I/O failure log",
                    detach_log,
-                   "detach helper shutdown failed: error; leaving listener state alive");
+                   "detach helper shutdown failed:");
+    check_contains("public idle shutdown I/O failure retains listener log",
+                   detach_log,
+                   "leaving listener state alive");
     check_true("public idle shutdown I/O failure retains hook addresses",
                hook_address != NULL && hook_address[0] != NULL);
     check_true("public idle shutdown I/O failure retains listener state",

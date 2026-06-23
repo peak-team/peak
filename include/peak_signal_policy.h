@@ -9,6 +9,7 @@
 
 PEAK_SIGNAL_POLICY_API int peak_signal_policy_unexpected_delivery_count(void);
 PEAK_SIGNAL_POLICY_API int peak_signal_policy_conflict_count(void);
+PEAK_SIGNAL_POLICY_API int peak_signal_policy_migration_count(void);
 PEAK_SIGNAL_POLICY_API const char* peak_signal_policy_last_conflict_api(void);
 
 #ifdef PEAK_ENABLE_TEST_HOOKS

@@ -42,7 +42,7 @@ write_exact(int fd, const void* buffer, size_t size)
     size_t done = 0;
 
     while (done < size) {
-        ssize_t n = send(fd, cursor + done, size - done, MSG_NOSIGNAL);
+        ssize_t n = write(fd, cursor + done, size - done);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -505,6 +505,7 @@ main(int argc, char** argv)
         env_long_default("FAKE_DETACH_HELPER_FAIL_RESUME_INDEX", 0);
 
     if (!environment_is_sanitized()) {
+        log_command("UNSANITIZED_ENV");
         (void)send_response((int)fd,
                             PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR,
                             EPERM,
@@ -513,6 +514,11 @@ main(int argc, char** argv)
     }
 
     if (send_response((int)fd, PEAK_DETACH_HELPER_STATUS_OK, 0, 0) != 0) {
+        log_command("HANDSHAKE_SEND_FAILED");
+        fprintf(stderr,
+                "fake helper handshake send failed: fd=%ld errno=%d\n",
+                fd,
+                errno);
         return 1;
     }
     log_command("START");
@@ -620,6 +626,9 @@ main(int argc, char** argv)
                                     0);
                 continue;
             }
+            if (strcmp(scenario, "stop-missing-response") == 0) {
+                return 0;
+            }
             if (strcmp(scenario, "stop-release-failed") == 0) {
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED,
@@ -635,6 +644,13 @@ main(int argc, char** argv)
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_TIMEOUT,
                                     ETIMEDOUT,
+                                    0);
+                continue;
+            }
+            if (strcmp(scenario, "stop-unsupported") == 0) {
+                (void)send_response((int)fd,
+                                    PEAK_DETACH_HELPER_STATUS_UNSUPPORTED,
+                                    ENOSYS,
                                     0);
                 continue;
             }

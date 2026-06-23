@@ -106,7 +106,7 @@ write_exact(int fd, const void* buffer, size_t size)
     size_t done = 0;
 
     while (done < size) {
-        ssize_t n = send(fd, cursor + done, size - done, MSG_NOSIGNAL);
+        ssize_t n = write(fd, cursor + done, size - done);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;

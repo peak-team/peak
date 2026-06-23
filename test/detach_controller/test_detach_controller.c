@@ -150,11 +150,17 @@ check_prepare(const char* label,
 
     check_true(label, prepared == expected_prepared);
     if (status != expected_status) {
+        const PeakDetachFailureDetail* detail =
+            peak_detach_controller_last_failure_detail();
         fprintf(stderr,
-                "FAIL: %s status: expected %s, got %s\n",
+                "FAIL: %s status: expected %s, got %s (reason=%s tid=%ld pc=0x%llx aux=0x%llx)\n",
                 label,
                 peak_detach_controller_status_string(expected_status),
-                peak_detach_controller_status_string(status));
+                peak_detach_controller_status_string(status),
+                detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+                detail != NULL ? (long)detail->tid : 0L,
+                (unsigned long long)(detail != NULL ? detail->pc : 0),
+                (unsigned long long)(detail != NULL ? detail->aux : 0));
         failures++;
     }
 }
@@ -226,7 +232,7 @@ check_string_tables(void)
 }
 
 static int
-run_compatibility(void)
+run_strict(void)
 {
     PeakDetachOperation operations[] = {
         PEAK_DETACH_OPERATION_ATTACH,
@@ -238,28 +244,6 @@ run_compatibility(void)
     };
 
     check_string_tables();
-    for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
-        PeakDetachRequest request = valid_request(operations[i]);
-        check_prepare(peak_detach_controller_operation_string(operations[i]),
-                      &request,
-                      TRUE,
-                      PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
-    }
-
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-}
-
-static int
-run_strict(void)
-{
-    PeakDetachOperation operations[] = {
-        PEAK_DETACH_OPERATION_ATTACH,
-        PEAK_DETACH_OPERATION_DETACH,
-        PEAK_DETACH_OPERATION_REATTACH,
-        PEAK_DETACH_OPERATION_SHUTDOWN,
-        PEAK_DETACH_OPERATION_REPLACE,
-        PEAK_DETACH_OPERATION_REVERT
-    };
     for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
         PeakDetachRequest request = valid_request(operations[i]);
         PeakDetachStatus expected_status =
@@ -1147,6 +1131,9 @@ run_fake_helper_batch_detach(void)
     PeakDetachBatchResult results[2];
     size_t prepared_count = 0;
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    const char* scenario;
+    const char* helper_path;
+    int helper_expected_to_start;
 
     if (log_fd < 0) {
         perror("mkstemp");
@@ -1158,6 +1145,14 @@ run_fake_helper_batch_detach(void)
         unlink(log_template);
         return EXIT_FAILURE;
     }
+    scenario = getenv("FAKE_DETACH_HELPER_SCENARIO");
+    if (scenario == NULL || scenario[0] == '\0') {
+        scenario = "success-zero";
+    }
+    helper_path = getenv("PEAK_DETACH_HELPER");
+    helper_expected_to_start =
+        helper_path == NULL || helper_path[0] == '\0' ||
+        access(helper_path, X_OK) == 0;
 
     gum_init_embedded();
     interceptor = gum_interceptor_obtain();
@@ -1230,11 +1225,22 @@ run_fake_helper_batch_detach(void)
     check_true("batch helper shutdown",
                peak_detach_controller_shutdown_helper(&status) == TRUE);
 
-    check_helper_log_count(log_template, "START", 1);
-    check_helper_log_count(log_template, "STOP", 1);
-    check_helper_log_count(log_template, "EVACUATE", 1);
-    check_helper_log_count(log_template, "RESUME", 1);
-    check_helper_log_count(log_template, "SHUTDOWN", 1);
+    check_helper_log_count(log_template, "START",
+                           helper_expected_to_start ? 1 : 0);
+    check_helper_log_count(log_template, "STOP",
+                           helper_expected_to_start ? 1 : 0);
+    if (!helper_expected_to_start ||
+        strcmp(scenario, "stop-permission") == 0 ||
+        strcmp(scenario, "stop-timeout") == 0 ||
+        strcmp(scenario, "stop-unsupported") == 0) {
+        check_helper_log_count(log_template, "EVACUATE", 0);
+        check_helper_log_count(log_template, "RESUME", 0);
+        check_helper_log_count(log_template, "SHUTDOWN", 0);
+    } else {
+        check_helper_log_count(log_template, "EVACUATE", 1);
+        check_helper_log_count(log_template, "RESUME", 1);
+        check_helper_log_count(log_template, "SHUTDOWN", 1);
+    }
 
     g_object_unref(listener_one);
     g_object_unref(listener_two);
@@ -1978,12 +1984,6 @@ run_invalid(void)
                   FALSE,
                   PEAK_DETACH_STATUS_ERROR);
 
-    request = valid_request(PEAK_DETACH_OPERATION_ATTACH);
-    check_prepare("attach listener optional",
-                  &request,
-                  TRUE,
-                  PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
-
     request = valid_request((PeakDetachOperation)999);
     check_prepare("invalid operation",
                   &request,
@@ -2632,6 +2632,8 @@ run_fake_helper_fail_closed(void)
 
     if (strcmp(scenario, "stop-permission") == 0) {
         expected = PEAK_DETACH_STATUS_PERMISSION_DENIED;
+    } else if (strcmp(scenario, "stop-missing-response") == 0) {
+        expected = PEAK_DETACH_STATUS_ERROR;
     } else if (strcmp(scenario, "stop-release-failed") == 0) {
         expected = PEAK_DETACH_STATUS_ERROR;
     } else if (strcmp(scenario, "stop-timeout") == 0 ||
@@ -2729,7 +2731,8 @@ run_fake_helper_auto_fallback(void)
         scenario = "stop-permission";
     }
     if (strcmp(scenario, "stop-permission") != 0 &&
-        strcmp(scenario, "stop-timeout") != 0) {
+        strcmp(scenario, "stop-timeout") != 0 &&
+        strcmp(scenario, "stop-unsupported") != 0) {
         fprintf(stderr, "unsupported auto fallback fake helper scenario: %s\n", scenario);
         return EXIT_FAILURE;
     }
@@ -2792,7 +2795,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s compatibility|strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -2801,9 +2804,6 @@ main(int argc, char** argv)
         peak_detach_controller_note_thread_creation_gate_installed(TRUE);
     }
 
-    if (strcmp(argv[1], "compatibility") == 0) {
-        return run_compatibility();
-    }
     if (strcmp(argv[1], "strict") == 0) {
         return run_strict();
     }
