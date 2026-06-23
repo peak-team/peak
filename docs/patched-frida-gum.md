@@ -137,14 +137,17 @@ guards that lease through the common dynamically linked libc signal APIs, and
 sends thread-directed stop requests with hidden `rt_tgsigqueueinfo` cookies so
 unrelated user signal traffic cannot satisfy a PEAK parked-thread slot. User
 attempts through those libc APIs to steal, block, wait on, signalfd-use,
-timer-generate, or send the reserved signal cause PEAK to migrate its lease to
-another available unblocked RT signal before forwarding the user call. If PEAK
-cannot migrate because the signal was forced, no replacement is available, or a
-mutation window is active, the user call fails with `EINVAL` and signal-backed
-mutation remains fail-closed. Direct raw syscalls or inline assembly are outside
-this wrapper boundary, but an actual delivered reserved signal without a valid
-PEAK cookie contaminates the signal backend and makes signal-backed mutation
-fail closed. The backend parks threads in an
+timer/mqueue/AIO-generate, or send the reserved signal cause PEAK to migrate its
+lease to another available unblocked RT signal before forwarding the user call.
+PEAK also guards dynamically linked `syscall()` calls for the common signal
+syscalls that can steal, block, wait on, consume, or generate the reserved RT
+signal. If PEAK cannot migrate because the signal was forced, no replacement is
+available, or a mutation window is active, the user call fails with `EINVAL` and
+signal-backed mutation remains fail-closed. Direct syscall instructions from
+inline assembly, static code outside the preload symbol path, or JIT code are
+outside this wrapper boundary, but an actual delivered reserved signal without a
+valid PEAK cookie contaminates the signal backend and makes signal-backed
+mutation fail closed. The backend parks threads in an
 async-signal-safe atomic corridor, confirms each required PC rewrite before
 release, revalidates `/proc/self/task` immediately before byte writes, and
 holds PEAK's pthread-start gate until `finish_hook_mutation` releases the

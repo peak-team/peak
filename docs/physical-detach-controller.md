@@ -148,15 +148,21 @@ The controller enumerates `/proc/self/task`,
 sends each non-controller TID a queued thread-directed signal with
 `rt_tgsigqueueinfo`, and accepts arrival only when the handler sees the expected
 hidden epoch/TID cookie. Ordinary user `kill`, `pthread_kill`, timer,
-`sigqueue`, `sigwait`, `signalfd`, temporary-mask, or signal-mask traffic cannot
-satisfy a PEAK stop slot. Attempts through normal dynamically linked libc APIs
-to install a user handler for PEAK's reserved signal, block it, wait on it,
-consume it through `signalfd`, generate it through a timer, or send it cause
-PEAK to migrate the lease to another available unblocked RT signal before
-forwarding the user call. If PEAK cannot migrate because the signal was forced,
-all replacement candidates are unavailable, or a mutation window is active, the
-user call fails with `EINVAL` and no patch write is attempted. Direct raw
-syscalls or inline assembly are outside this user-space wrapper boundary; if
+`mq_notify`, POSIX AIO, `sigqueue`, `sigwait`, `signalfd`, temporary-mask, or
+signal-mask traffic cannot satisfy a PEAK stop slot. Attempts through normal
+dynamically linked libc APIs to install a user handler for PEAK's reserved
+signal, block it, wait on it, consume it through `signalfd`, generate it through
+timer/mqueue/AIO notification, or send it cause PEAK to migrate the lease to
+another available unblocked RT signal before forwarding the user call. PEAK
+also guards dynamically linked `syscall()` calls for the signal-related syscalls
+that can steal, block, wait on, consume, or generate the reserved RT signal,
+including `rt_sigaction`, `rt_sigprocmask`, `rt_sigtimedwait`, `signalfd4`,
+`timer_create`, `mq_notify`, `tgkill`, `rt_sigqueueinfo`, and
+`rt_tgsigqueueinfo`. If PEAK cannot migrate because the signal was forced, all
+replacement candidates are unavailable, or a mutation window is active, the
+user call fails with `EINVAL` and no patch write is attempted. Truly direct
+syscall instructions from inline assembly, static code outside the preload
+symbol path, or JIT code remain outside this user-space wrapper boundary; if
 they actually deliver PEAK's reserved signal without a valid cookie, that
 delivery is treated as backend contamination and signal-backed mutation then
 fails closed with `signal-unexpected-delivery`, while helper-backed mutation

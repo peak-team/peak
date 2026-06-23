@@ -2723,6 +2723,7 @@ run_fake_helper_auto_fallback(void)
     return 77;
 #else
     const char* scenario = getenv("FAKE_DETACH_HELPER_SCENARIO");
+    const char* log_path = getenv("FAKE_DETACH_HELPER_LOG");
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
@@ -2735,6 +2736,9 @@ run_fake_helper_auto_fallback(void)
         strcmp(scenario, "stop-unsupported") != 0) {
         fprintf(stderr, "unsupported auto fallback fake helper scenario: %s\n", scenario);
         return EXIT_FAILURE;
+    }
+    if (log_path != NULL && log_path[0] != '\0') {
+        unlink(log_path);
     }
 
     gum_init_embedded();
@@ -2778,6 +2782,14 @@ run_fake_helper_auto_fallback(void)
     check_status("auto fallback helper shutdown status",
                  shutdown_status,
                  PEAK_DETACH_STATUS_SAFE);
+    if (log_path != NULL && log_path[0] != '\0') {
+        check_helper_log_count(log_path, "START", 1);
+        check_helper_log_count(log_path, "STOP", 1);
+        check_helper_log_count(log_path, "EVACUATE", 0);
+        check_helper_log_count(log_path, "RESUME", 0);
+        check_helper_log_count(log_path, "SHUTDOWN", 0);
+        unlink(log_path);
+    }
 
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);

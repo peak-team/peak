@@ -256,7 +256,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       COMMAND test_detach_controller fake-helper-auto-fallback)
     set_tests_properties(test_detach_controller_fake_helper_auto_fallback_${_auto_fallback_scenario}
       PROPERTIES
-        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_auto_fallback_scenario}"
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_auto_fallback_scenario};FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_controller/auto-fallback-${_auto_fallback_scenario}.log"
         SKIP_RETURN_CODE 77)
   endforeach()
 
