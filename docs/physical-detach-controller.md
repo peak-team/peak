@@ -380,6 +380,20 @@ Gum already has the key internal metadata:
 The PEAK-specific Gum API turns that internal knowledge into reliable PC
 classification and safe-point addresses.
 
+The diagnostics lookup treats the listener as the authoritative hook identity
+when Gum cannot find a context under the requested function-address key. Some
+real binaries can expose a live listener while Gum records the function context
+under a canonical address that differs from the symbol address PEAK originally
+stored. In that case the patched Gum overlay scans active contexts for the
+listener and returns the canonical `function_address` only when exactly one
+active context owns that listener. Exact-address lookup remains valid for a
+shared listener because the address identifies the context; only listener-only
+stale-address recovery fails closed when multiple active contexts match instead
+of letting hash-table iteration choose a patch target. Physical entry-byte
+writes, patch records, and target-entry PC checks use the recovered canonical
+address instead of the stale request address, avoiding repeated
+`gum-diagnostics-missing` retries for a hook that is actually live.
+
 ## Evacuation Corridors
 
 Unsafe threads should not be advanced through arbitrary C runtime code. They may
@@ -465,7 +479,10 @@ same bounded retry/backoff path as the single-hook implementation.
 Partial success is allowed only for independent candidates. The batch rejects
 duplicate hook ids, duplicate function addresses, missing reattach patch
 records, unsupported operations, missing Gum snapshots, and conflicting helper
-instructions. If combining otherwise safe candidates would make the helper
+instructions. Duplicate detection is repeated after Gum snapshot capture using
+the recovered canonical function addresses, so two stale raw requests cannot
+canonicalize to the same physical patch target and be hidden by duplicate write
+coalescing. If combining otherwise safe candidates would make the helper
 instruction list ambiguous, the controller resumes without mutating that batch
 and leaves all valid candidates retryable. Once the helper starts any
 byte/register mutation, the old invariant still applies: helper failure is
@@ -552,6 +569,40 @@ Rules:
 - Memory-profiling teardown first atomically blocks new malloc/free tracking,
   reverts and flushes the malloc Gum patches, waits for active allocator hooks
   to leave, and only then frees tracking tables and finalizes the mmap log.
+
+## MPI Abnormal Exit
+
+PEAK delays the real `PMPI_Finalize()` until profiler output has been written
+when the application reaches a clean MPI finalization path. Error exits are
+different: a setup failure may unwind only a subset of ranks, and adding PEAK
+collectives or replaying the delayed real `PMPI_Finalize()` from that state can
+hang or crash the MPI job.
+
+The MPI finalizer interposer therefore records whether the application attempted
+`PMPI_Finalize()`, but `peak_fini()` only enables MPI-reduced output and delayed
+real finalization when `PEAK_MPI_COLLECTIVE_OUTPUT=1`, the process exits
+cleanly, `MPI_Initialized()` is true, and `MPI_Finalized()` is false. Strict
+safe-detach mode leaves `PEAK_MPI_COLLECTIVE_OUTPUT` disabled by default so
+rank-local PEAK teardown decisions cannot mismatch across ranks and strand a
+subset of the job in a PEAK-owned collective. If the process exits with a
+nonzero status, collective output is disabled, or the MPI runtime is no longer
+collective-safe, PEAK writes rank-local output, skips MPI reductions, and
+reverts the interceptor without allowing a concurrent intercepted
+`PMPI_Finalize()` to call the real MPI finalizer.
+
+When collective output is explicitly enabled, PEAK first performs a small MPI
+handshake to verify that every participating rank observed the application's
+`PMPI_Finalize()` request. If any rank did not observe it, all ranks fall back
+to rank-local output instead of splitting between collective and non-collective
+teardown paths.
+
+`peak_fini()` is process-single-entry: the first caller owns teardown and later
+callers wait for that teardown to finish without touching Gum, MPI, or
+PEAK-owned listener arrays. At process exit this avoids double-revert,
+double-free, mixed MPI output decisions, and a racing thread reaching the real
+`exit()` while another thread is still writing PEAK output. The first
+intercepted `exit()` status wins so a later racing `exit(0)` cannot turn an
+already-recorded nonzero teardown into a collective-safe clean exit.
 
 ## Dynamic `dlopen`
 
@@ -878,3 +929,33 @@ Completed in this branch:
     `rt_sigaction` read-only queries either return sanitized default state or
     fail closed before exposing PEAK handlers, and `PEAK_SIGNAL_RESERVE_EARLY`
     makes the strict-auto early lease compatibility tradeoff explicit.
+46. Hardened MPI abnormal-exit teardown: PEAK now records application
+    `PMPI_Finalize()` requests but only performs MPI-reduced output and delayed
+    real `PMPI_Finalize()` on clean exit while MPI is still initialized and not
+    finalized. Nonzero exit paths write rank-local output and skip PEAK-driven
+    MPI collectives/finalize, preventing MILC-style setup termination from
+    turning into Intel MPI finalization crashes or rank hangs. `peak_fini()` is
+    single-entry per process and racing exit callers wait for the owner, so they
+    cannot double-run or interrupt Gum/MPI teardown; the first intercepted exit
+    status wins. Aggregate MPI output is now explicit through
+    `PEAK_MPI_COLLECTIVE_OUTPUT=1` and uses an all-rank finalize-observed
+    handshake before PEAK reductions. Regression coverage exercises no-finalize
+    exit, finalize-then-nonzero-exit, subset-finalize nonzero exit, strict
+    default subset-finalize clean exit, aggregate-output opt-in subset-finalize
+    clean exit, and finalize-then-nonzero-return MPI lifecycles.
+47. Made Gum context lookup listener-canonical: if strict detach cannot find a
+    Gum context under the request address but the listener is still attached,
+    the patched Gum overlay scans active contexts for that listener and returns
+    the context's canonical function address. The controller now uses that
+    canonical address for physical patch writes, patch records, and entry-range
+    decisions. Regression coverage passes a deliberately mismatched address with
+    the correct listener and verifies the helper writes original bytes to the
+    recovered canonical address instead of failing with
+    `gum-diagnostics-missing`.
+48. Closed two strict-safety edges in canonical recovery: listener-only Gum
+    lookup now fails closed if the same listener is attached to multiple active
+    contexts, and batched detach/reattach rejects duplicate canonical patch
+    targets after snapshot capture. Regression coverage now exercises a shared
+    listener attached to two functions and two stale batch requests that both
+    resolve to one canonical function, preventing hash-order-dependent patch
+    selection and duplicate-write coalescing from masking unsafe batches.

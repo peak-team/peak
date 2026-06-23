@@ -218,6 +218,45 @@ peak_gum_context_has_listener(PeakGumFunctionContext16 * context,
 }
 
 static gboolean
+peak_gum_context_is_usable(PeakGumFunctionContext16 * context)
+{
+    return context != NULL && !context->destroyed && context->activated;
+}
+
+static PeakGumFunctionContext16 *
+peak_gum_find_context_by_listener(PeakGumInterceptor16 * interceptor,
+                                  GumInvocationListener * listener)
+{
+    GHashTableIter iter;
+    gpointer key;
+    gpointer value;
+    PeakGumFunctionContext16 * match = NULL;
+
+    if (interceptor == NULL ||
+        interceptor->function_by_address == NULL ||
+        listener == NULL) {
+        return NULL;
+    }
+
+    g_hash_table_iter_init(&iter, interceptor->function_by_address);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        PeakGumFunctionContext16 * context =
+            (PeakGumFunctionContext16 *)value;
+
+        (void)key;
+        if (peak_gum_context_is_usable(context) &&
+            peak_gum_context_has_listener(context, listener)) {
+            if (match != NULL) {
+                return NULL;
+            }
+            match = context;
+        }
+    }
+
+    return match;
+}
+
+static gboolean
 peak_gum_pc_in_shared_thunk(PeakGumInterceptor16 * interceptor, gpointer pc)
 {
     PeakGumInterceptorBackend16 * backend;
@@ -304,16 +343,12 @@ peak_gum_find_context(GumInterceptor * interceptor,
               private_interceptor->function_by_address, function_address)
         : NULL;
 
-    if (private_context == NULL || private_context->destroyed ||
-        !private_context->activated) {
-        return NULL;
+    if (peak_gum_context_is_usable(private_context) &&
+        peak_gum_context_has_listener(private_context, listener)) {
+        return private_context;
     }
 
-    if (!peak_gum_context_has_listener(private_context, listener)) {
-        return NULL;
-    }
-
-    return private_context;
+    return peak_gum_find_context_by_listener(private_interceptor, listener);
 }
 
 guint

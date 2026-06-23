@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,6 +53,7 @@
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_JIT_ENABLE_ENV                    "PEAK_JIT_ENABLE"
+#define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
 
@@ -93,6 +96,54 @@ gboolean peak_memory_track_all = false;
 static int found_MPI;
 static int flag_clean_fppid = 0;
 #endif
+
+static _Atomic int peak_exit_status_known = 0;
+static _Atomic int peak_exit_status_value = 0;
+typedef enum {
+    PEAK_FINI_NOT_STARTED = 0,
+    PEAK_FINI_IN_PROGRESS = 1,
+    PEAK_FINI_DONE = 2,
+} PeakFiniState;
+
+static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
+
+static gboolean
+peak_env_value_truthy(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "1") == 0 ||
+            g_ascii_strcasecmp(value, "true") == 0 ||
+            g_ascii_strcasecmp(value, "yes") == 0 ||
+            g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static gboolean
+peak_strict_safe_detach_mode_is_enabled(void)
+{
+    const char* mode = getenv("PEAK_SAFE_DETACH_MODE");
+
+    return mode == NULL || mode[0] == '\0' ||
+           g_ascii_strcasecmp(mode, "strict") == 0 ||
+           g_ascii_strcasecmp(mode, "auto") == 0 ||
+           g_ascii_strcasecmp(mode, "helper") == 0 ||
+           g_ascii_strcasecmp(mode, "debugger") == 0 ||
+           g_ascii_strcasecmp(mode, "ptrace") == 0 ||
+           g_ascii_strcasecmp(mode, "signal") == 0 ||
+           g_ascii_strcasecmp(mode, "signals") == 0 ||
+           g_ascii_strcasecmp(mode, "in-process") == 0;
+}
+
+static gboolean
+peak_mpi_collective_output_enabled(void)
+{
+    const char* value = getenv(PEAK_MPI_COLLECTIVE_OUTPUT_ENV);
+
+    if (value != NULL && value[0] != '\0') {
+        return peak_env_value_truthy(value);
+    }
+
+    return !peak_strict_safe_detach_mode_is_enabled();
+}
 
 void peak_init()
 {
@@ -199,7 +250,35 @@ void peak_init()
     }
 }
 
-void peak_fini()
+#ifdef HAVE_MPI
+static int
+peak_mpi_runtime_allows_collectives(void)
+{
+    int initialized = 0;
+    int finalized = 0;
+
+    MPI_Initialized(&initialized);
+    MPI_Finalized(&finalized);
+    return initialized && !finalized;
+}
+
+static int
+peak_mpi_all_ranks_requested_finalize(int local_requested)
+{
+    int all_requested = 0;
+
+    MPI_Allreduce(&local_requested,
+                  &all_requested,
+                  1,
+                  MPI_INT,
+                  MPI_MIN,
+                  MPI_COMM_WORLD);
+    return all_requested != 0;
+}
+#endif
+
+static void
+peak_fini_impl(void)
 {
     if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
@@ -237,13 +316,51 @@ void peak_fini()
     if (flag_clean_fppid) {
         remove_ppid_file(PPID_FILE_NAME);
     }
-    peak_general_listener_print(found_MPI);
+    int exit_status_known =
+        atomic_load_explicit(&peak_exit_status_known, memory_order_acquire);
+    int exit_status =
+        atomic_load_explicit(&peak_exit_status_value, memory_order_acquire);
+    int abnormal_exit = exit_status_known == 2 && exit_status != 0;
+    /*
+     * Error exits often happen while only a subset of ranks is unwinding.  Do
+     * not let PEAK introduce MPI collectives or delayed PMPI_Finalize there;
+     * rank-local output is the only safe profiler behavior.
+     */
+    int mpi_collective_output_enabled =
+        found_MPI && peak_mpi_collective_output_enabled();
+    int mpi_runtime_can_collect =
+        found_MPI && peak_mpi_runtime_allows_collectives();
+    int local_requested_mpi_finalize =
+        mpi_interceptor_finalize_was_requested();
+    int all_ranks_requested_mpi_finalize = 0;
+    if (mpi_collective_output_enabled && mpi_runtime_can_collect &&
+        !abnormal_exit) {
+        all_ranks_requested_mpi_finalize =
+            peak_mpi_all_ranks_requested_finalize(
+                local_requested_mpi_finalize ? 1 : 0);
+    }
+    int app_requested_mpi_finalize =
+        mpi_collective_output_enabled && mpi_runtime_can_collect &&
+        !abnormal_exit && all_ranks_requested_mpi_finalize;
+    if (found_MPI && abnormal_exit && local_requested_mpi_finalize) {
+        g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; writing rank-local output and skipping PEAK-driven MPI_Finalize\n",
+                   exit_status);
+    } else if (found_MPI && !mpi_collective_output_enabled) {
+        g_printerr("[peak] MPI collective output is disabled for strict teardown; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
+    } else if (found_MPI && !mpi_runtime_can_collect) {
+        g_printerr("[peak] MPI runtime is not in a collective-safe state; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
+    } else if (found_MPI && !all_ranks_requested_mpi_finalize) {
+        g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
+    } else if (found_MPI && !app_requested_mpi_finalize) {
+        g_printerr("[peak] PMPI_Finalize was not observed; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
+    }
+    peak_general_listener_print(app_requested_mpi_finalize);
     #ifdef HAVE_CUDA
-        cuda_interceptor_print(found_MPI);
+        cuda_interceptor_print(app_requested_mpi_finalize);
         cuda_interceptor_dettach();
     #endif
     if (found_MPI)
-        mpi_interceptor_dettach();
+        mpi_interceptor_dettach(app_requested_mpi_finalize);
 #else
     peak_general_listener_print(0);
     #ifdef HAVE_CUDA
@@ -275,6 +392,29 @@ void peak_fini()
         g_free(peak_detached);
     } else {
         g_printerr("[peak] Leaving general listener bookkeeping allocated for in-flight callbacks\n");
+    }
+}
+
+void peak_fini()
+{
+    int expected = PEAK_FINI_NOT_STARTED;
+
+    if (atomic_compare_exchange_strong_explicit(
+            &peak_fini_state,
+            &expected,
+            PEAK_FINI_IN_PROGRESS,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        peak_fini_impl();
+        atomic_store_explicit(&peak_fini_state,
+                              PEAK_FINI_DONE,
+                              memory_order_release);
+        return;
+    }
+
+    while (atomic_load_explicit(&peak_fini_state, memory_order_acquire) ==
+           PEAK_FINI_IN_PROGRESS) {
+        sched_yield();
     }
 }
 
@@ -350,6 +490,24 @@ static void
 peak_exit(int status) {
     //g_printerr("Custom exit called with status: %d\n", status);
 
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&peak_exit_status_known,
+                                                &expected,
+                                                1,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        atomic_store_explicit(&peak_exit_status_value,
+                              status,
+                              memory_order_release);
+        atomic_store_explicit(&peak_exit_status_known,
+                              2,
+                              memory_order_release);
+    } else {
+        while (atomic_load_explicit(&peak_exit_status_known,
+                                    memory_order_acquire) == 1) {
+            sched_yield();
+        }
+    }
     peak_fini();
     atexit(exit_interceptor_detach);
 

@@ -1625,6 +1625,384 @@ run_fake_helper_batch_missing_gum_snapshot(void)
 }
 
 static int
+run_fake_helper_listener_canonical_address(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-listener-canonical-address requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_listener_canonical_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+    GumPeakPcDiagnostics diagnostics;
+    guint8 active_patch[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 original_prologue[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint prologue_len = 0;
+    PeakDetachBatchResult batch_result;
+    size_t prepared_count = 0;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (set_fake_helper_env_default("success-zero", log_template) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    check_true("canonical listener Gum attach",
+               attach_status == GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+
+    check_true("canonical listener diagnostics via mismatched address",
+               gum_interceptor_peak_get_pc_diagnostics(
+                   interceptor,
+                   (gpointer)strict_helper_target_two,
+                   listener,
+                   &diagnostics) == TRUE);
+    check_true("canonical listener recovered function address",
+               diagnostics.function_address == (gpointer)strict_helper_target);
+    check_true("canonical listener function patch via mismatched address",
+               gum_interceptor_peak_get_function_patch(
+                   interceptor,
+                   (gpointer)strict_helper_target_two,
+                   listener,
+                   active_patch,
+                   original_prologue,
+                   &prologue_len) == TRUE);
+    check_true("canonical listener prologue length",
+               prologue_len > 0 && prologue_len <= GUM_PEAK_MAX_PROLOGUE_SIZE);
+    if (failures != 0) {
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    if (setenv("FAKE_DETACH_HELPER_EXPECT_EVACUATE_ACTIONS",
+               "WRITE_MEMORY",
+               1) != 0 ||
+        set_fake_helper_pointer_env("FAKE_DETACH_HELPER_EXPECT_WRITE_ADDRESS",
+                                    diagnostics.function_address) != 0 ||
+        set_fake_helper_uint_env("FAKE_DETACH_HELPER_EXPECT_WRITE_SIZE",
+                                 prologue_len) != 0 ||
+        set_fake_helper_hex_bytes_env(
+            "FAKE_DETACH_HELPER_EXPECT_WRITE_BYTES_HEX",
+            original_prologue,
+            prologue_len) != 0) {
+        perror("setenv");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    PeakDetachRequest request = {
+        .hook_id = 59,
+        .symbol_name = "strict_helper_target_wrong_address",
+        .function_address = (gpointer)strict_helper_target_two,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+
+    check_prepare("canonical listener detach prepare",
+                  &request,
+                  TRUE,
+                  PEAK_DETACH_STATUS_SAFE);
+    check_true("canonical listener helper holds threads",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("canonical listener uses physical patch",
+               peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
+    check_finish("canonical listener detach finish",
+                 &request,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_true("canonical listener released helper threads",
+               peak_detach_controller_threads_are_held() == FALSE);
+    check_true("canonical listener helper shutdown after detach",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+
+    if (setenv("FAKE_DETACH_HELPER_EXPECT_EVACUATE_ACTIONS",
+               "WRITE_MEMORY",
+               1) != 0 ||
+        set_fake_helper_pointer_env("FAKE_DETACH_HELPER_EXPECT_WRITE_ADDRESS",
+                                    diagnostics.function_address) != 0 ||
+        set_fake_helper_uint_env("FAKE_DETACH_HELPER_EXPECT_WRITE_SIZE",
+                                 prologue_len) != 0 ||
+        set_fake_helper_hex_bytes_env(
+            "FAKE_DETACH_HELPER_EXPECT_WRITE_BYTES_HEX",
+            active_patch,
+            prologue_len) != 0) {
+        perror("setenv");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    memset(&batch_result, 0, sizeof(batch_result));
+    prepared_count = 0;
+    check_true("canonical listener batch reattach prepare",
+               peak_detach_controller_prepare_hook_mutation_batch(
+                   &request,
+                   1,
+                   &batch_result,
+                   &prepared_count,
+                   &status) == TRUE);
+    check_status("canonical listener batch reattach status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_int("canonical listener batch reattach prepared count",
+              (int)prepared_count,
+              1);
+    check_true("canonical listener batch reattach prepared",
+               batch_result.prepared == TRUE);
+    check_true("canonical listener batch reattach physical",
+               batch_result.uses_physical_patch == TRUE);
+    check_true("canonical listener batch reattach finish",
+               peak_detach_controller_finish_hook_mutation_batch(&status) == TRUE);
+    check_status("canonical listener batch reattach finish status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_true("canonical listener batch reattach released helper threads",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    check_true("canonical listener helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+
+    check_helper_log_count(log_template, "START", 2);
+    check_helper_log_count(log_template, "STOP", 2);
+    check_helper_log_count(log_template, "EVACUATE", 2);
+    check_helper_log_count(log_template, "RESUME", 2);
+    check_helper_log_count(log_template, "SHUTDOWN", 2);
+
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_fake_helper_listener_ambiguous_address(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-listener-ambiguous-address requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+    GumPeakPcDiagnostics diagnostics;
+    guint8 active_patch[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 original_prologue[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint prologue_len = 0;
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    check_true("ambiguous listener first Gum attach",
+               attach_status == GUM_ATTACH_OK);
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target_two,
+                               listener,
+                               NULL);
+    check_true("ambiguous listener second Gum attach",
+               attach_status == GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+    strict_helper_target_two();
+
+    check_true("ambiguous listener direct first diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(
+                   interceptor,
+                   (gpointer)strict_helper_target,
+                   listener,
+                   &diagnostics) == TRUE);
+    check_true("ambiguous listener direct first canonical address",
+               diagnostics.function_address == (gpointer)strict_helper_target);
+    check_true("ambiguous listener direct second diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(
+                   interceptor,
+                   (gpointer)strict_helper_target_two,
+                   listener,
+                   &diagnostics) == TRUE);
+    check_true("ambiguous listener direct second canonical address",
+               diagnostics.function_address == (gpointer)strict_helper_target_two);
+    check_true("ambiguous listener stale diagnostics fail closed",
+               gum_interceptor_peak_get_pc_diagnostics(
+                   interceptor,
+                   (gpointer)strict_helper_worker,
+                   listener,
+                   &diagnostics) == FALSE);
+    check_true("ambiguous listener stale patch fail closed",
+               gum_interceptor_peak_get_function_patch(
+                   interceptor,
+                   (gpointer)strict_helper_worker,
+                   listener,
+                   active_patch,
+                   original_prologue,
+                   &prologue_len) == FALSE);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_fake_helper_batch_canonical_duplicate(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-batch-canonical-duplicate requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_batch_canonical_dup_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    GumAttachReturn attach_status;
+    PeakDetachBatchResult results[2];
+    size_t prepared_count = 99;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_SAFE;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (set_fake_helper_env_default("success-zero", log_template) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    attach_status =
+        gum_interceptor_attach(interceptor,
+                               (gpointer)strict_helper_target,
+                               listener,
+                               NULL);
+    check_true("canonical duplicate Gum attach",
+               attach_status == GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+
+    PeakDetachRequest requests[2] = {
+        {
+            .hook_id = 63,
+            .symbol_name = "strict_helper_target_stale_one",
+            .function_address = (gpointer)strict_helper_target_two,
+            .interceptor = interceptor,
+            .listener = listener,
+            .operation = PEAK_DETACH_OPERATION_DETACH
+        },
+        {
+            .hook_id = 64,
+            .symbol_name = "strict_helper_target_stale_two",
+            .function_address = (gpointer)strict_helper_worker,
+            .interceptor = interceptor,
+            .listener = listener,
+            .operation = PEAK_DETACH_OPERATION_DETACH
+        }
+    };
+
+    memset(results, 0xff, sizeof(results));
+    check_true("canonical duplicate batch prepare fails",
+               peak_detach_controller_prepare_hook_mutation_batch(
+                   requests,
+                   2,
+                   results,
+                   &prepared_count,
+                   &status) == FALSE);
+    check_status("canonical duplicate batch status",
+                 status,
+                 PEAK_DETACH_STATUS_UNSUPPORTED);
+    check_int("canonical duplicate prepared count", (int)prepared_count, 0);
+    check_true("canonical duplicate first not prepared",
+               results[0].prepared == FALSE);
+    check_true("canonical duplicate second not prepared",
+               results[1].prepared == FALSE);
+    check_status("canonical duplicate first status",
+                 results[0].status,
+                 PEAK_DETACH_STATUS_UNSUPPORTED);
+    check_status("canonical duplicate second status",
+                 results[1].status,
+                 PEAK_DETACH_STATUS_UNSUPPORTED);
+    check_true("canonical duplicate no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    const PeakDetachFailureDetail* detail =
+        peak_detach_controller_last_failure_detail();
+    check_true("canonical duplicate failure detail",
+               detail != NULL &&
+               detail->reason != NULL &&
+               strcmp(detail->reason, "batch-canonical-duplicate") == 0);
+
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    check_true("canonical duplicate helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+
+    check_helper_log_count(log_template, "START", 0);
+    check_helper_log_count(log_template, "STOP", 0);
+    check_helper_log_count(log_template, "EVACUATE", 0);
+    check_helper_log_count(log_template, "RESUME", 0);
+    check_helper_log_count(log_template, "SHUTDOWN", 0);
+
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_fake_helper_batch_reattach(void)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
@@ -2827,7 +3205,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -2862,6 +3240,15 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-batch-missing-gum-snapshot") == 0) {
         return run_fake_helper_batch_missing_gum_snapshot();
+    }
+    if (strcmp(argv[1], "fake-helper-listener-canonical-address") == 0) {
+        return run_fake_helper_listener_canonical_address();
+    }
+    if (strcmp(argv[1], "fake-helper-listener-ambiguous-address") == 0) {
+        return run_fake_helper_listener_ambiguous_address();
+    }
+    if (strcmp(argv[1], "fake-helper-batch-canonical-duplicate") == 0) {
+        return run_fake_helper_batch_canonical_duplicate();
     }
     if (strcmp(argv[1], "fake-helper-batch-reattach") == 0) {
         return run_fake_helper_batch_reattach();

@@ -22,12 +22,17 @@
 int mpi_interceptor_attach();
 
 /**
+ * @brief Returns non-zero after the application has attempted PMPI_Finalize.
+ */
+int mpi_interceptor_finalize_was_requested();
+
+/**
  * @brief Detach MPI function interception
  *
  * This function detaches the previously attached MPI function interception and releases any resources used by the Gum library.
  *
  * @return void
  */
-void mpi_interceptor_dettach();
+void mpi_interceptor_dettach(int allow_delayed_finalize);
 
 #endif /* __MPI_INTERCEPTOR_H */
