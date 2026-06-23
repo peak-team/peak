@@ -32,10 +32,10 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 4,
+        "attach": 5,
         "detach": 5,
-        "begin_transaction": 9,
-        "end_transaction": 9,
+        "begin_transaction": 10,
+        "end_transaction": 10,
         "flush": 2,
     },
     ("support-init", "src/mpi_interceptor.c"): {
@@ -105,6 +105,7 @@ FUNCTION_ANCHORS = {
         "peak_general_controller_process_pending_batch_unlocked": "strict-controller",
         "peak_general_controller_flush_teardown": "strict-controller",
         "peak_general_overhead_bootstrapping": "strict-controller",
+        "peak_general_listener_dynamic_attach_symbol": "strict-controller",
         "peak_general_listener_attach": "strict-controller",
     },
     "src/malloc_interceptor.c": {
