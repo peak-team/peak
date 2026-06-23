@@ -6,6 +6,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_DETACH_CONTROLLER_TEST_API __attribute__((visibility("default")))
+#else
+#define PEAK_DETACH_CONTROLLER_TEST_API
+#endif
+
 typedef enum {
     PEAK_DETACH_OPERATION_ATTACH = 0,
     PEAK_DETACH_OPERATION_DETACH,
@@ -77,6 +83,17 @@ void peak_detach_controller_wait_for_mutation_window(void);
 
 void peak_detach_controller_note_thread_creation_gate_installed(
     gboolean installed);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_thread_creation_gate_epoch(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API size_t
+peak_detach_controller_test_gate_waiter_count(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_signal_backend_signum(void);
+#endif
 
 gboolean peak_detach_controller_finish_hook_mutation(
     const PeakDetachRequest* request,

@@ -5,18 +5,24 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <signal.h>
+#include <sys/signalfd.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 static atomic_int stop_requested;
+static atomic_int unblock_backend_signal_requested;
+static atomic_int user_signal_handler_count;
 static atomic_uint_fast64_t side_effect;
 static atomic_uint_fast64_t spawned_worker_count;
+static atomic_uint_fast64_t blocked_signal_thread_count;
 
 #define PEAK_DETACH_HOT_BURST 64
 #define PEAK_DETACH_HOT_NOP_SLED \
@@ -32,6 +38,50 @@ typedef struct {
     long arrived;
     int open;
 } StartGate;
+
+static void start_gate_wait(StartGate* gate);
+static int start_gate_init(StartGate* gate, long expected);
+static void start_gate_abort(StartGate* gate);
+static void start_gate_destroy(StartGate* gate);
+
+static void
+user_collision_signal_handler(int signo)
+{
+    (void)signo;
+    atomic_fetch_add_explicit(&user_signal_handler_count,
+                              1,
+                              memory_order_relaxed);
+}
+
+static int
+expect_errno_failure(const char* label, int rc, int expected_errno)
+{
+    if (rc == 0 || errno != expected_errno) {
+        fprintf(stderr,
+                "%s unexpectedly succeeded or returned wrong errno: rc=%d errno=%d expected=%d\n",
+                label,
+                rc,
+                errno,
+                expected_errno);
+        return 0;
+    }
+    return 1;
+}
+
+static int
+expect_error_code(const char* label, int rc, int expected)
+{
+    if (rc != expected) {
+        fprintf(stderr,
+                "%s returned wrong error code: rc=%d expected=%d errno=%d\n",
+                label,
+                rc,
+                expected,
+                errno);
+        return 0;
+    }
+    return 1;
+}
 
 __attribute__((noinline, noclone, used, externally_visible, visibility("default")))
 void peak_detach_hot_target(uint64_t value)
@@ -52,6 +102,8 @@ typedef struct {
     unsigned int seed;
     StartGate* start_gate;
     int paired_targets;
+    int block_backend_signal;
+    int wait_to_unblock_backend_signal;
 } WorkerState;
 
 typedef struct {
@@ -62,6 +114,31 @@ typedef struct {
     unsigned int seed;
     uint64_t created;
 } SpawnerState;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int open;
+} ReleaseGate;
+
+typedef struct {
+    atomic_int* child_started;
+    atomic_int* child_started_while_gate;
+    int (*gate_epoch)(void);
+    unsigned int seed;
+} GateRaceChildState;
+
+typedef struct {
+    StartGate* ready_gate;
+    ReleaseGate* release_gate;
+    atomic_int* child_started;
+    atomic_int* child_started_while_gate;
+    atomic_int* create_attempted_during_gate;
+    int (*gate_epoch)(void);
+    unsigned int seed;
+    int create_status;
+    int join_status;
+} GateRaceCreatorState;
 
 static double
 monotonic_seconds(void)
@@ -91,12 +168,61 @@ sleep_for_seconds(long seconds)
     }
 }
 
+static int
+backend_signal_number(void)
+{
+    typedef int (*PeakSignalBackendSignumFn)(void);
+    PeakSignalBackendSignumFn selected =
+        (PeakSignalBackendSignumFn)dlsym(
+            RTLD_DEFAULT,
+            "peak_detach_controller_test_signal_backend_signum");
+    int signo = selected != NULL ? selected() : SIGRTMIN + 2;
+
+    if (signo > SIGRTMAX) {
+        return 0;
+    }
+    return signo;
+}
+
+static int
+set_backend_signal_blocked(int blocked)
+{
+    int signo = backend_signal_number();
+    sigset_t set;
+
+    if (signo == 0) {
+        return -1;
+    }
+    if (blocked) {
+        typedef int (*PeakSignalTestBlockFn)(void);
+        PeakSignalTestBlockFn block_reserved =
+            (PeakSignalTestBlockFn)dlsym(
+                RTLD_DEFAULT,
+                "peak_signal_policy_test_block_reserved_for_current_thread");
+        if (block_reserved != NULL) {
+            return block_reserved();
+        }
+    }
+    sigemptyset(&set);
+    sigaddset(&set, signo);
+    return pthread_sigmask(blocked ? SIG_BLOCK : SIG_UNBLOCK, &set, NULL);
+}
+
 static void*
 worker_main(void* arg)
 {
     WorkerState* state = (WorkerState*)arg;
     uint64_t local_calls = 0;
     unsigned int seed = state->seed;
+    int backend_signal_blocked = 0;
+
+    if (state->block_backend_signal &&
+        set_backend_signal_blocked(1) == 0) {
+        backend_signal_blocked = 1;
+        atomic_fetch_add_explicit(&blocked_signal_thread_count,
+                                  1,
+                                  memory_order_relaxed);
+    }
 
     pthread_mutex_lock(&state->start_gate->mutex);
     state->start_gate->arrived++;
@@ -112,6 +238,14 @@ worker_main(void* arg)
     pthread_mutex_unlock(&state->start_gate->mutex);
 
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
+        if (backend_signal_blocked &&
+            state->wait_to_unblock_backend_signal &&
+            atomic_load_explicit(&unblock_backend_signal_requested,
+                                 memory_order_acquire)) {
+            if (set_backend_signal_blocked(0) == 0) {
+                backend_signal_blocked = 0;
+            }
+        }
         for (int burst = 0; burst < PEAK_DETACH_HOT_BURST; burst++) {
             peak_detach_hot_target((uint64_t)(seed + local_calls));
             if (state->paired_targets) {
@@ -141,6 +275,100 @@ spawned_worker_main(void* arg)
                               ((uint64_t)seed << 32) ^ UINT64_C(32),
                               memory_order_relaxed);
     free(state);
+    return NULL;
+}
+
+static int
+release_gate_init(ReleaseGate* gate)
+{
+    memset(gate, 0, sizeof(*gate));
+    if (pthread_mutex_init(&gate->mutex, NULL) != 0) {
+        return -1;
+    }
+    if (pthread_cond_init(&gate->cond, NULL) != 0) {
+        pthread_mutex_destroy(&gate->mutex);
+        return -1;
+    }
+    return 0;
+}
+
+static void
+release_gate_wait(ReleaseGate* gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    while (!gate->open) {
+        pthread_cond_wait(&gate->cond, &gate->mutex);
+    }
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void
+release_gate_open(ReleaseGate* gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    gate->open = 1;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void
+release_gate_destroy(ReleaseGate* gate)
+{
+    pthread_cond_destroy(&gate->cond);
+    pthread_mutex_destroy(&gate->mutex);
+}
+
+static void*
+gate_race_child_main(void* arg)
+{
+    GateRaceChildState* state = (GateRaceChildState*)arg;
+    unsigned int seed = state->seed;
+
+    if (state->gate_epoch != NULL && state->gate_epoch() != 0) {
+        atomic_fetch_add_explicit(state->child_started_while_gate,
+                                  1,
+                                  memory_order_release);
+    }
+    atomic_fetch_add_explicit(state->child_started, 1, memory_order_release);
+    for (uint64_t i = 0; i < 32; i++) {
+        peak_detach_hot_target((uint64_t)(seed + i));
+    }
+    free(state);
+    return NULL;
+}
+
+static void*
+gate_race_creator_main(void* arg)
+{
+    GateRaceCreatorState* state = (GateRaceCreatorState*)arg;
+    GateRaceChildState* child_state;
+    pthread_t child;
+
+    start_gate_wait(state->ready_gate);
+    release_gate_wait(state->release_gate);
+
+    child_state = malloc(sizeof(*child_state));
+    if (child_state == NULL) {
+        state->create_status = ENOMEM;
+        return NULL;
+    }
+    child_state->child_started = state->child_started;
+    child_state->child_started_while_gate = state->child_started_while_gate;
+    child_state->gate_epoch = state->gate_epoch;
+    child_state->seed = state->seed;
+
+    if (state->gate_epoch != NULL && state->gate_epoch() != 0) {
+        atomic_fetch_add_explicit(state->create_attempted_during_gate,
+                                  1,
+                                  memory_order_release);
+    }
+    state->create_status =
+        pthread_create(&child, NULL, gate_race_child_main, child_state);
+    if (state->create_status != 0) {
+        free(child_state);
+        return NULL;
+    }
+    state->join_status = pthread_join(child, NULL);
     return NULL;
 }
 
@@ -226,11 +454,23 @@ typedef gboolean (*PeakRequestReattachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
 typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
+typedef int (*PeakControllerGateEpochFn)(void);
+typedef size_t (*PeakControllerGateWaiterCountFn)(void);
+typedef int (*PeakSignalBackendSignumFn)(void);
+typedef int (*PeakSignalConflictCountFn)(void);
+typedef int (*PeakSignalUnexpectedDeliveryCountFn)(void);
+typedef int (*PeakSignalBadCookieFn)(void);
 typedef gboolean (*PeakGumGetPcDiagnosticsFn)(
     GumInterceptor* interceptor,
     gpointer function_address,
     GumInvocationListener* listener,
     GumPeakPcDiagnostics* diagnostics);
+
+typedef struct {
+    PeakControllerDrainFn drain;
+    unsigned int timeout_ms;
+    gboolean drained;
+} ControllerDrainState;
 
 static int
 set_pointer_env(const char* name, gpointer pointer)
@@ -257,6 +497,15 @@ write_pointer_file(const char* path, gpointer pointer)
         return -1;
     }
     return 0;
+}
+
+static void*
+controller_drain_main(void* arg)
+{
+    ControllerDrainState* state = (ControllerDrainState*)arg;
+
+    state->drained = state->drain(state->timeout_ms);
+    return NULL;
 }
 
 static void
@@ -576,6 +825,76 @@ trace_has_physical_detach_success(const char* trace_path)
             strcmp(fields[5], "1") == 0 &&
             strcmp(fields[6], "safe") == 0 &&
             atof(fields[10]) > 0.0) {
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int
+trace_has_detach_prepare_blocked_signal(const char* trace_path)
+{
+    FILE* fp;
+    char line[1024];
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        return 0;
+    }
+
+    fp = fopen(trace_path, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[17];
+        int count = parse_csv_line(line, fields, 17);
+
+        if (count >= 14 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "prepare-failed") == 0 &&
+            strcmp(fields[5], "0") == 0 &&
+            strcmp(fields[6], "unsupported") == 0 &&
+            strcmp(fields[13], "signal-reserved-blocked") == 0) {
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static int
+trace_has_detach_prepare_unexpected_signal(const char* trace_path)
+{
+    FILE* fp;
+    char line[1024];
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        return 0;
+    }
+
+    fp = fopen(trace_path, "r");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[17];
+        int count = parse_csv_line(line, fields, 17);
+
+        if (count >= 14 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], "detach") == 0 &&
+            strcmp(fields[4], "prepare-failed") == 0 &&
+            strcmp(fields[5], "0") == 0 &&
+            strcmp(fields[6], "unsupported") == 0 &&
+            strcmp(fields[13], "signal-unexpected-delivery") == 0) {
             fclose(fp);
             return 1;
         }
@@ -1039,6 +1358,901 @@ run_controller_reattach_retry_check(int argc, char** argv)
     (void)stop_pc_fd;
     return 0;
 }
+
+static int
+run_signal_blocked_delivery_check(int argc, char** argv)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    long threads = parse_long_arg(argc, argv, "--threads", 4);
+    pthread_t* tids = NULL;
+    WorkerState* states = NULL;
+    StartGate gate;
+    int gate_initialized = 0;
+    long created_threads = 0;
+    int ok = 0;
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+
+    tids = calloc((size_t)threads, sizeof(*tids));
+    states = calloc((size_t)threads, sizeof(*states));
+    if (tids == NULL || states == NULL) {
+        perror("calloc");
+        goto cleanup;
+    }
+    if (start_gate_init(&gate, threads + 1) != 0) {
+        perror("start_gate_init");
+        goto cleanup;
+    }
+    gate_initialized = 1;
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
+    atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
+
+    for (long i = 0; i < threads; i++) {
+        states[i].seed = (unsigned int)(0x6a09e667u + (unsigned int)i);
+        states[i].start_gate = &gate;
+        states[i].paired_targets = 0;
+        states[i].block_backend_signal = 1;
+        states[i].wait_to_unblock_backend_signal = 1;
+        if (pthread_create(&tids[i], NULL, worker_main, &states[i]) != 0) {
+            perror("pthread_create blocked worker");
+            goto cleanup;
+        }
+        created_threads++;
+    }
+    start_gate_wait(&gate);
+
+    if (atomic_load_explicit(&blocked_signal_thread_count,
+                             memory_order_acquire) != (uint64_t)threads) {
+        fprintf(stderr,
+                "expected all workers to block backend signal: got %lu expected %ld\n",
+                (unsigned long)atomic_load_explicit(&blocked_signal_thread_count,
+                                                    memory_order_relaxed),
+                threads);
+        goto cleanup;
+    }
+
+    unlink(trace_path);
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue blocked-signal detach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr, "blocked-signal detach did not drain after fast failure\n");
+        goto cleanup;
+    }
+    if (hook_state(0) == PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "blocked-signal detach physically detached\n");
+        goto cleanup;
+    }
+    if (!trace_has_detach_prepare_blocked_signal(trace_path)) {
+        fprintf(stderr, "missing blocked-signal fail-closed trace\n");
+        goto cleanup;
+    }
+
+    ok = 1;
+
+cleanup:
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          1,
+                          memory_order_release);
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (gate_initialized) {
+        start_gate_abort(&gate);
+    }
+    for (long i = 0; i < created_threads; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    if (ok) {
+        (void)controller_drain(2000);
+    }
+    if (gate_initialized) {
+        start_gate_destroy(&gate);
+    }
+    free(tids);
+    free(states);
+
+    if (!ok) {
+        return 2;
+    }
+
+    printf("signal_blocked_delivery_ok blocked_signal_threads=%lu blocked_fast_fail=1\n",
+           (unsigned long)atomic_load_explicit(&blocked_signal_thread_count,
+                                               memory_order_relaxed));
+    return 0;
+}
+
+static int
+run_signal_user_collision_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalConflictCountFn conflict_count =
+        (PeakSignalConflictCountFn)required_symbol(
+            "peak_signal_policy_conflict_count");
+    PeakSignalUnexpectedDeliveryCountFn unexpected_count =
+        (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
+            "peak_signal_policy_unexpected_delivery_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    int collision_signum = SIGRTMIN + 2;
+    int reserved_signum;
+    int conflicts_before;
+    int conflicts_after;
+    int expected_conflicts = 0;
+    int unexpected_before;
+    sigset_t set;
+    sigset_t oldset;
+    struct timespec zero_timeout = { 0, 0 };
+    pthread_t worker;
+    WorkerState worker_state;
+    StartGate worker_gate;
+    int worker_started = 0;
+    int worker_gate_initialized = 0;
+    int collision_ok = 0;
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        conflict_count == NULL ||
+        unexpected_count == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    if (collision_signum > SIGRTMAX) {
+        return 77;
+    }
+
+    atomic_store_explicit(&user_signal_handler_count, 0, memory_order_relaxed);
+    struct sigaction user_action;
+    memset(&user_action, 0, sizeof(user_action));
+    sigemptyset(&user_action.sa_mask);
+    user_action.sa_handler = user_collision_signal_handler;
+    if (sigaction(collision_signum, &user_action, NULL) != 0) {
+        perror("sigaction user collision signal");
+        return 2;
+    }
+    if (raise(collision_signum) != 0) {
+        perror("raise user collision signal");
+        return 2;
+    }
+    if (atomic_load_explicit(&user_signal_handler_count,
+                             memory_order_relaxed) != 1) {
+        fprintf(stderr, "user collision signal handler was not preserved\n");
+        return 2;
+    }
+
+    reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "signal backend did not reserve a real-time signal\n");
+        return 2;
+    }
+    if (reserved_signum == collision_signum) {
+        fprintf(stderr, "reserved signal collided with user-owned signal\n");
+        return 2;
+    }
+
+    conflicts_before = conflict_count();
+    unexpected_before = unexpected_count();
+
+    user_action.sa_handler = user_collision_signal_handler;
+    errno = 0;
+    if (!expect_errno_failure("sigaction reserved signal",
+                              sigaction(reserved_signum, &user_action, NULL),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (signal(reserved_signum, user_collision_signal_handler) != SIG_ERR ||
+        errno != EINVAL) {
+        fprintf(stderr,
+                "signal reserved signal unexpectedly succeeded: errno=%d\n",
+                errno);
+        return 2;
+    }
+    expected_conflicts++;
+
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    errno = 0;
+    if (!expect_error_code("pthread_sigmask reserved signal",
+                           pthread_sigmask(SIG_BLOCK, &set, NULL),
+                           EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("sigprocmask reserved signal",
+                              sigprocmask(SIG_BLOCK, &set, NULL),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    int waited_signal = 0;
+    errno = 0;
+    if (!expect_error_code("sigwait reserved signal",
+                           sigwait(&set, &waited_signal),
+                           EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("sigwaitinfo reserved signal",
+                              sigwaitinfo(&set, NULL),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("sigtimedwait reserved signal",
+                              sigtimedwait(&set, NULL, &zero_timeout),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("signalfd reserved signal",
+                              signalfd(-1, &set, 0),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("signalfd4 reserved signal",
+                              signalfd(-1, &set, SFD_CLOEXEC),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    struct sigevent ev;
+    timer_t timerid;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = reserved_signum;
+    errno = 0;
+    if (!expect_errno_failure("timer_create reserved SIGEV_SIGNAL",
+                              timer_create(CLOCK_MONOTONIC, &ev, &timerid),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+#ifdef SIGEV_THREAD_ID
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_THREAD_ID;
+    ev.sigev_signo = reserved_signum;
+    ev._sigev_un._tid = getpid();
+    errno = 0;
+    if (!expect_errno_failure("timer_create reserved SIGEV_THREAD_ID",
+                              timer_create(CLOCK_MONOTONIC, &ev, &timerid),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+#endif
+
+    errno = 0;
+    if (!expect_errno_failure("sigsuspend reserved signal",
+                              sigsuspend(&set),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("pselect reserved signal",
+                              pselect(0,
+                                      NULL,
+                                      NULL,
+                                      NULL,
+                                      &zero_timeout,
+                                      &set),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("ppoll reserved signal",
+                              ppoll(NULL, 0, &zero_timeout, &set),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    sigemptyset(&oldset);
+    if (pthread_sigmask(SIG_BLOCK, NULL, &oldset) != 0) {
+        perror("pthread_sigmask query");
+        return 2;
+    }
+    if (sigismember(&oldset, reserved_signum) == 1) {
+        fprintf(stderr, "reserved signal became blocked after denied policy calls\n");
+        return 2;
+    }
+
+    errno = 0;
+    if (!expect_errno_failure("kill reserved signal",
+                              kill(getpid(), reserved_signum),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_error_code("pthread_kill reserved signal",
+                           pthread_kill(pthread_self(), reserved_signum),
+                           EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    union sigval value;
+    memset(&value, 0, sizeof(value));
+    errno = 0;
+    if (!expect_errno_failure("sigqueue reserved signal",
+                              sigqueue(getpid(), reserved_signum, value),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    errno = 0;
+    if (!expect_errno_failure("raise reserved signal",
+                              raise(reserved_signum),
+                              EINVAL)) {
+        return 2;
+    }
+    expected_conflicts++;
+
+    if (unexpected_count() != unexpected_before) {
+        fprintf(stderr, "denied collision generated unexpected PEAK delivery\n");
+        return 2;
+    }
+    conflicts_after = conflict_count();
+    if (conflicts_after < conflicts_before + expected_conflicts) {
+        fprintf(stderr,
+                "expected at least %d recorded signal policy conflicts: before=%d after=%d\n",
+                expected_conflicts,
+                conflicts_before,
+                conflicts_after);
+        return 2;
+    }
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
+    atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
+    if (start_gate_init(&worker_gate, 2) != 0) {
+        perror("start_gate_init collision worker");
+        return 2;
+    }
+    worker_gate_initialized = 1;
+    memset(&worker_state, 0, sizeof(worker_state));
+    worker_state.seed = 0x31415926u;
+    worker_state.start_gate = &worker_gate;
+    worker_state.paired_targets = 0;
+    worker_state.block_backend_signal = 0;
+    worker_state.wait_to_unblock_backend_signal = 0;
+    if (pthread_create(&worker, NULL, worker_main, &worker_state) != 0) {
+        perror("pthread_create collision worker");
+        goto collision_cleanup;
+    }
+    worker_started = 1;
+    start_gate_wait(&worker_gate);
+
+    unlink(trace_path);
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue collision detach request\n");
+        goto collision_cleanup;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr, "collision detach did not drain\n");
+        goto collision_cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "collision detach did not physically detach\n");
+        goto collision_cleanup;
+    }
+    if (!trace_has_physical_detach_success(trace_path)) {
+        fprintf(stderr, "missing physical detach success trace after collision\n");
+        goto collision_cleanup;
+    }
+    collision_ok = 1;
+
+collision_cleanup:
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (worker_gate_initialized) {
+        start_gate_abort(&worker_gate);
+    }
+    if (worker_started) {
+        pthread_join(worker, NULL);
+    }
+    if (worker_gate_initialized) {
+        start_gate_destroy(&worker_gate);
+    }
+
+    if (!collision_ok) {
+        return 2;
+    }
+
+    printf("signal_user_collision_ok user_signal=%d reserved_signal=%d detach_success=1 reserved_steal_denied=1 mask_denied=1 wait_denied=1 signalfd_denied=1 timer_denied=1 send_denied=1 worker_calls=%lu conflicts=%d\n",
+           collision_signum,
+           reserved_signum,
+           (unsigned long)worker_state.calls,
+           conflicts_after - conflicts_before);
+    return 0;
+}
+
+static int
+run_signal_bad_cookie_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalUnexpectedDeliveryCountFn unexpected_count =
+        (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
+            "peak_signal_policy_unexpected_delivery_count");
+    PeakSignalBadCookieFn send_bad_cookie =
+        (PeakSignalBadCookieFn)required_symbol(
+            "peak_signal_policy_test_send_bad_cookie_to_current_thread");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        unexpected_count == NULL ||
+        send_bad_cookie == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    int reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "signal backend did not reserve a real-time signal\n");
+        return 2;
+    }
+
+    int unexpected_before = unexpected_count();
+    if (send_bad_cookie() != 0) {
+        perror("send bad-cookie reserved signal");
+        return 2;
+    }
+    double deadline = monotonic_seconds() + 2.0;
+    while (unexpected_count() == unexpected_before &&
+           monotonic_seconds() < deadline) {
+        usleep(1000);
+    }
+    if (unexpected_count() <= unexpected_before) {
+        fprintf(stderr, "bad-cookie reserved signal was not recorded\n");
+        return 2;
+    }
+
+    unlink(trace_path);
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue bad-cookie detach request\n");
+        return 2;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr, "bad-cookie detach did not drain\n");
+        return 2;
+    }
+    if (hook_state(0) == PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "bad-cookie contamination physically detached\n");
+        return 2;
+    }
+    if (!trace_has_detach_prepare_unexpected_signal(trace_path)) {
+        fprintf(stderr, "missing bad-cookie contamination fail-closed trace\n");
+        return 2;
+    }
+
+    printf("signal_bad_cookie_ok reserved_signal=%d contamination_seen=1 detach_blocked=1\n",
+           reserved_signum);
+    return 0;
+}
+
+static int
+run_pthread_gate_race_check(int argc, char** argv)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakRequestReattachFn request_reattach =
+        (PeakRequestReattachFn)required_symbol("peak_general_listener_request_reattach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakControllerGateEpochFn gate_epoch =
+        (PeakControllerGateEpochFn)required_symbol(
+            "peak_detach_controller_test_thread_creation_gate_epoch");
+    PeakControllerGateWaiterCountFn gate_waiter_count =
+        (PeakControllerGateWaiterCountFn)required_symbol(
+            "peak_detach_controller_test_gate_waiter_count");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    long threads = parse_long_arg(argc, argv, "--threads", 4);
+    long creator_threads = parse_long_arg(argc, argv, "--creator-threads", 2);
+    pthread_t* tids = NULL;
+    WorkerState* states = NULL;
+    pthread_t* creator_tids = NULL;
+    GateRaceCreatorState* creator_states = NULL;
+    StartGate worker_gate;
+    StartGate creator_ready_gate;
+    ReleaseGate creator_release_gate;
+    int worker_gate_initialized = 0;
+    int creator_ready_gate_initialized = 0;
+    int creator_release_gate_initialized = 0;
+    atomic_int child_started;
+    long created_threads = 0;
+    long created_creators = 0;
+    pthread_t drain_thread;
+    ControllerDrainState drain_state;
+    size_t gate_waiters = 0;
+    int child_started_before_release = -1;
+    atomic_int child_started_while_gate;
+    atomic_int create_attempted_during_gate;
+    int saw_gate = 0;
+    int ok = 0;
+
+    if (request_detach == NULL ||
+        request_reattach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        gate_epoch == NULL ||
+        gate_waiter_count == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    unlink(trace_path);
+
+    tids = calloc((size_t)threads, sizeof(*tids));
+    states = calloc((size_t)threads, sizeof(*states));
+    creator_tids = calloc((size_t)creator_threads, sizeof(*creator_tids));
+    creator_states =
+        calloc((size_t)creator_threads, sizeof(*creator_states));
+    if (tids == NULL ||
+        states == NULL ||
+        creator_tids == NULL ||
+        creator_states == NULL) {
+        perror("calloc");
+        goto cleanup;
+    }
+    if (start_gate_init(&worker_gate, threads + 1) != 0) {
+        perror("gate init");
+        goto cleanup;
+    }
+    worker_gate_initialized = 1;
+    if (start_gate_init(&creator_ready_gate, creator_threads + 1) != 0) {
+        perror("gate init");
+        goto cleanup;
+    }
+    creator_ready_gate_initialized = 1;
+    if (release_gate_init(&creator_release_gate) != 0) {
+        perror("gate init");
+        goto cleanup;
+    }
+    creator_release_gate_initialized = 1;
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
+    atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
+    atomic_init(&child_started, 0);
+    atomic_init(&child_started_while_gate, 0);
+    atomic_init(&create_attempted_during_gate, 0);
+
+    for (long i = 0; i < threads; i++) {
+        states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
+        states[i].start_gate = &worker_gate;
+        states[i].paired_targets = 0;
+        states[i].block_backend_signal = 1;
+        states[i].wait_to_unblock_backend_signal = 1;
+        if (pthread_create(&tids[i], NULL, worker_main, &states[i]) != 0) {
+            perror("pthread_create worker");
+            goto cleanup;
+        }
+        created_threads++;
+    }
+    start_gate_wait(&worker_gate);
+
+    for (long i = 0; i < creator_threads; i++) {
+        creator_states[i].ready_gate = &creator_ready_gate;
+        creator_states[i].release_gate = &creator_release_gate;
+        creator_states[i].child_started = &child_started;
+        creator_states[i].child_started_while_gate = &child_started_while_gate;
+        creator_states[i].create_attempted_during_gate =
+            &create_attempted_during_gate;
+        creator_states[i].gate_epoch = gate_epoch;
+        creator_states[i].seed = 0x45d9f3bu + (unsigned int)i;
+        if (pthread_create(&creator_tids[i],
+                           NULL,
+                           gate_race_creator_main,
+                           &creator_states[i]) != 0) {
+            perror("pthread_create creator");
+            goto cleanup;
+        }
+        created_creators++;
+    }
+    start_gate_wait(&creator_ready_gate);
+
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue gate-race detach request\n");
+        goto cleanup;
+    }
+
+    drain_state.drain = controller_drain;
+    drain_state.timeout_ms = 12000;
+    drain_state.drained = FALSE;
+    if (pthread_create(&drain_thread, NULL, controller_drain_main, &drain_state) != 0) {
+        perror("pthread_create drain");
+        goto cleanup;
+    }
+
+    double gate_deadline = monotonic_seconds() + 2.0;
+    while (monotonic_seconds() < gate_deadline) {
+        if (gate_epoch() != 0) {
+            saw_gate = 1;
+            break;
+        }
+        usleep(1000);
+    }
+    if (!saw_gate) {
+        fprintf(stderr, "thread creation gate did not open during detach\n");
+        atomic_store_explicit(&unblock_backend_signal_requested,
+                              1,
+                              memory_order_release);
+        pthread_join(drain_thread, NULL);
+        goto cleanup;
+    }
+
+    release_gate_open(&creator_release_gate);
+
+    double waiter_deadline = monotonic_seconds() + 2.0;
+    while (monotonic_seconds() < waiter_deadline) {
+        gate_waiters = gate_waiter_count();
+        if (gate_waiters >= (size_t)creator_threads) {
+            break;
+        }
+        usleep(1000);
+    }
+    child_started_before_release =
+        atomic_load_explicit(&child_started, memory_order_acquire);
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          1,
+                          memory_order_release);
+    pthread_join(drain_thread, NULL);
+
+    if (!drain_state.drained) {
+        fprintf(stderr, "controller did not drain gate-race detach\n");
+        goto cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected hook detached after gate-race drain\n");
+        goto cleanup;
+    }
+    if (!trace_has_entry_byte_only_success_without_classify_failure(
+            trace_path,
+            "peak_detach_hot_target",
+            "detach")) {
+        goto cleanup;
+    }
+    if (gate_waiters < (size_t)creator_threads) {
+        fprintf(stderr,
+                "not all newborn threads waited on mutation gate: %zu of %ld\n",
+                gate_waiters,
+                creator_threads);
+        goto cleanup;
+    }
+    if (atomic_load_explicit(&create_attempted_during_gate,
+                             memory_order_acquire) != (int)creator_threads) {
+        fprintf(stderr,
+                "not all creators attempted pthread_create during mutation gate: %d of %ld\n",
+                atomic_load_explicit(&create_attempted_during_gate,
+                                     memory_order_relaxed),
+                creator_threads);
+        goto cleanup;
+    }
+    if (child_started_before_release != 0) {
+        fprintf(stderr,
+                "child started before mutation gate release: %d\n",
+                child_started_before_release);
+        goto cleanup;
+    }
+
+    for (long i = 0; i < created_creators; i++) {
+        pthread_join(creator_tids[i], NULL);
+        if (creator_states[i].create_status != 0 ||
+            creator_states[i].join_status != 0) {
+            fprintf(stderr,
+                    "creator %ld failed: create=%d join=%d\n",
+                    i,
+                    creator_states[i].create_status,
+                    creator_states[i].join_status);
+            goto cleanup;
+        }
+    }
+    created_creators = 0;
+    if (atomic_load_explicit(&child_started_while_gate,
+                             memory_order_acquire) != 0) {
+        fprintf(stderr,
+                "child user code started while mutation gate was active: %d\n",
+                atomic_load_explicit(&child_started_while_gate,
+                                     memory_order_relaxed));
+        goto cleanup;
+    }
+
+    if (!request_reattach(0)) {
+        fprintf(stderr, "failed to queue gate-race reattach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(12000)) {
+        fprintf(stderr, "controller did not drain gate-race reattach\n");
+        goto cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook attached after gate-race reattach\n");
+        goto cleanup;
+    }
+    if (!trace_has_entry_byte_only_success_without_classify_failure(
+            trace_path,
+            "peak_detach_hot_target",
+            "reattach")) {
+        goto cleanup;
+    }
+
+    ok = 1;
+
+cleanup:
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          1,
+                          memory_order_release);
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (worker_gate_initialized) {
+        start_gate_abort(&worker_gate);
+    }
+    if (creator_ready_gate_initialized) {
+        start_gate_abort(&creator_ready_gate);
+    }
+    if (created_creators > 0) {
+        release_gate_open(&creator_release_gate);
+    }
+    for (long i = 0; i < created_creators; i++) {
+        pthread_join(creator_tids[i], NULL);
+    }
+    for (long i = 0; i < created_threads; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    if (worker_gate_initialized) {
+        start_gate_destroy(&worker_gate);
+    }
+    if (creator_ready_gate_initialized) {
+        start_gate_destroy(&creator_ready_gate);
+    }
+    if (creator_release_gate_initialized) {
+        release_gate_destroy(&creator_release_gate);
+    }
+    free(tids);
+    free(states);
+    free(creator_tids);
+    free(creator_states);
+
+    if (!ok) {
+        return 2;
+    }
+
+    printf("pthread_gate_race_ok gate_waiters=%zu gate_waiters_ok=1 create_attempted_during_gate=%d child_started_before_release=%d child_started_while_gate=%d blocked_signal_threads=%lu detached=1 reattached=1\n",
+           gate_waiters,
+           atomic_load_explicit(&create_attempted_during_gate,
+                                memory_order_relaxed),
+           child_started_before_release,
+           atomic_load_explicit(&child_started_while_gate,
+                                memory_order_relaxed),
+           (unsigned long)atomic_load_explicit(&blocked_signal_thread_count,
+                                               memory_order_relaxed));
+    return 0;
+}
 #else
 static int
 run_controller_batch_retry_check(void)
@@ -1062,6 +2276,38 @@ run_controller_reattach_retry_check(int argc, char** argv)
     (void)argc;
     (void)argv;
     fprintf(stderr, "controller reattach retry check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+
+static int
+run_pthread_gate_race_check(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "pthread gate race check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+
+static int
+run_signal_blocked_delivery_check(int argc, char** argv)
+{
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "signal blocked delivery check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+
+static int
+run_signal_user_collision_check(void)
+{
+    fprintf(stderr, "signal user collision check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+}
+
+static int
+run_signal_bad_cookie_check(void)
+{
+    fprintf(stderr, "signal bad-cookie check requires PEAK_HAVE_GUM_PEAK_PC_API\n");
     return 77;
 }
 #endif
@@ -1125,12 +2371,26 @@ main(int argc, char** argv)
     if (has_flag_arg(argc, argv, "--controller-reattach-retry-check")) {
         return run_controller_reattach_retry_check(argc, argv);
     }
+    if (has_flag_arg(argc, argv, "--signal-blocked-delivery-check")) {
+        return run_signal_blocked_delivery_check(argc, argv);
+    }
+    if (has_flag_arg(argc, argv, "--signal-user-collision-check")) {
+        return run_signal_user_collision_check();
+    }
+    if (has_flag_arg(argc, argv, "--signal-bad-cookie-check")) {
+        return run_signal_bad_cookie_check();
+    }
+    if (has_flag_arg(argc, argv, "--pthread-gate-race-check")) {
+        return run_pthread_gate_race_check(argc, argv);
+    }
 
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
     long spawner_threads = parse_long_arg(argc, argv, "--spawner-threads", 2);
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
     int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
+    int block_backend_signal =
+        has_flag_arg(argc, argv, "--block-backend-signal");
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
     WorkerState* states = calloc((size_t)threads, sizeof(*states));
     pthread_t* spawner_tids = NULL;
@@ -1162,12 +2422,18 @@ main(int argc, char** argv)
     }
 
     atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          0,
+                          memory_order_release);
     atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
     atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
     for (long i = 0; i < threads; i++) {
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
         states[i].start_gate = &gate;
         states[i].paired_targets = paired_targets;
+        states[i].block_backend_signal = block_backend_signal;
+        states[i].wait_to_unblock_backend_signal = 0;
         if (pthread_create(&tids[i], NULL, worker_main, &states[i]) != 0) {
             perror("pthread_create");
             atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
@@ -1232,7 +2498,7 @@ main(int argc, char** argv)
         trace_has_physical_detach_success(getenv("PEAK_DETACH_TRACE_PATH"));
 #endif
 
-    printf("threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu spawned_threads=%lu trace_detach_success=%d\n",
+    printf("threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu spawned_threads=%lu blocked_signal_threads=%lu trace_detach_success=%d\n",
            threads,
            seconds,
            (unsigned long)calls,
@@ -1240,6 +2506,8 @@ main(int argc, char** argv)
            (double)calls / elapsed,
            (unsigned long)atomic_load_explicit(&side_effect, memory_order_relaxed),
            (unsigned long)atomic_load_explicit(&spawned_worker_count, memory_order_relaxed),
+           (unsigned long)atomic_load_explicit(&blocked_signal_thread_count,
+                                               memory_order_relaxed),
            trace_detach_success);
 
     start_gate_destroy(&gate);

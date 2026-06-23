@@ -1,6 +1,7 @@
 add_executable(test_detach_controller
   test_detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
+  ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
 )
 add_executable(test_detach_fake_helper test_detach_fake_helper.c)
 add_executable(test_detach_shutdown_preload test_detach_shutdown_preload.c)
@@ -10,6 +11,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
     ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
+    ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
     $<TARGET_OBJECTS:utils_c>
     $<TARGET_OBJECTS:utils_cxx>
   )
@@ -27,7 +29,9 @@ target_include_directories(test_detach_controller
 )
 
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
-  target_compile_definitions(test_detach_controller PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
+  target_compile_definitions(test_detach_controller PRIVATE
+    PEAK_HAVE_GUM_PEAK_PC_API=1
+    PEAK_ENABLE_TEST_HOOKS=1)
 endif()
 if(TARGET test_detach_listener_shutdown)
   target_include_directories(test_detach_listener_shutdown

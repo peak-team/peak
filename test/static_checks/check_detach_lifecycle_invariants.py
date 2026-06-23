@@ -214,12 +214,24 @@ def check_signal_backend_strict_invariants(repo_root):
     controller = (repo_root / "src/peak_detach_controller.c").read_text(
         encoding="utf-8"
     )
+    signal_policy = (repo_root / "src/peak_signal_policy.c").read_text(
+        encoding="utf-8"
+    )
+    signal_public_header = (
+        repo_root / "include/peak_signal_policy.h"
+    ).read_text(encoding="utf-8")
+    signal_internal_header = (
+        repo_root / "src/peak_signal_policy_internal.h"
+    ).read_text(encoding="utf-8")
     pthread_listener = (repo_root / "src/pthread_listener.c").read_text(
         encoding="utf-8"
     )
     tests = (repo_root / "test/CMakeLists.txt").read_text(encoding="utf-8")
-    controller_tests = (
+    controller_tests_cmake = (
         repo_root / "test/detach_controller/CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+    controller_tests = (
+        repo_root / "test/detach_controller/test_detach_controller.c"
     ).read_text(encoding="utf-8")
 
     signal_handler = extract_function(
@@ -249,7 +261,7 @@ def check_signal_backend_strict_invariants(repo_root):
     require("peak_detach_controller_signal_release_or_fatal" in controller,
             "signal cleanup failures must use release-or-fatal helper")
     for token in (
-        "signal stop tgkill failure",
+        "signal stop send failure",
         "signal stop timeout",
         "signal stop verification failure",
         "signal stop snapshot overflow",
@@ -264,6 +276,71 @@ def check_signal_backend_strict_invariants(repo_root):
             "pthread listener must be able to publish gate installation")
     require("pthread_create interception is not installed" in controller,
             "signal backend must fail closed when pthread_create gate is unavailable")
+    require("peak_signal_policy_choose_reserved_signal" in controller and
+            "peak_signal_policy_cookie_matches" in signal_handler and
+            "peak_signal_policy_send_thread_signal" in signal_stop and
+            "SYS_rt_tgsigqueueinfo" in signal_policy,
+            "signal backend must reserve a signal and authenticate stop delivery with rt_tgsigqueueinfo cookies")
+    require("peak_signal_policy_cookie_for" not in signal_public_header and
+            "peak_signal_policy_cookie_matches" not in signal_public_header and
+            "peak_signal_policy_send_thread_signal" not in signal_public_header and
+            "PEAK_SIGNAL_POLICY_INTERNAL" in signal_internal_header,
+            "signal stop cookie helpers must be internal, not public user-callable API")
+    require("peak_signal_policy_protective_handler" in signal_policy and
+            "peak_signal_policy_install_protective_handler" in signal_policy and
+            "peak_signal_policy_clear_reserved_signal" in signal_policy and
+            "peak_signal_policy_clear_reserved_signal" in controller,
+            "signal reservation must install a protective handler and clear dead leases on setup failure")
+    require("peak_detach_controller_signal_handler_is_installed" in controller and
+            "peak_signal_policy_unexpected_delivery_count" in controller,
+            "signal backend must revalidate handler ownership and contamination before strict stops")
+    require("signal-unexpected-delivery" in controller and
+            "signal-handler-not-installed" in controller,
+            "signal backend contamination and stolen-handler failures must have concrete trace reasons")
+    require("peak_detach_controller_signal_tid_blocks_reserved" in signal_stop and
+            "signal-reserved-blocked" in controller,
+            "signal backend must fail fast when the reserved signal is truly blocked")
+    for wrapper in (
+        "sigaction",
+        "signal",
+        "pthread_sigmask",
+        "sigprocmask",
+        "sigwait",
+        "sigwaitinfo",
+        "sigtimedwait",
+        "signalfd",
+        "timer_create",
+        "kill",
+        "pthread_kill",
+        "sigqueue",
+        "raise",
+        "sigsuspend",
+        "pselect",
+        "ppoll",
+    ):
+        require(f'__attribute__((visibility("default"))) int\n{wrapper}' in signal_policy or
+                f'__attribute__((visibility("default"))) void (*{wrapper}' in signal_policy,
+                f"signal policy must export {wrapper}")
+    require("sigev_notify == SIGEV_THREAD_ID" in signal_policy,
+            "timer_create wrapper must reject SIGEV_THREAD_ID reserved-signal timers")
+    require("peak_signal_policy_reject_reserved_set" in signal_policy and
+            "sigdelset" not in signal_policy,
+            "signal policy must fail explicit reserved-signal mask/wait collisions instead of silently sanitizing user sets")
+    require("real_symbols_once" in signal_policy and
+            "pthread_once(&real_symbols_once" in signal_policy and
+            "peak_signal_policy_ensure_real_symbols();\n    if (real_sigaction_fn == NULL)" in signal_policy,
+            "signal policy wrapper resolution must be one-time and thread-safe")
+    require("cookie_once" in signal_policy and
+            "pthread_once(&cookie_once" in signal_policy,
+            "signal policy cookie base must be initialized exactly once")
+    require("PEAK_REQUIRE_SAFE_DETACH" not in signal_policy and
+            "strcasecmp(backend, \"auto\") == 0" not in signal_policy and
+            "strcasecmp(backend, \"signal\") == 0" in signal_policy and
+            "strcasecmp(mode, \"signal\") == 0" in signal_policy and
+            "strcasecmp(mode, \"helper\") == 0" not in signal_policy,
+            "signal policy must not reserve a signal early for helper-only strict mode")
+    require('__attribute__((visibility("default"))) long\nsyscall' not in signal_policy,
+            "signal policy must not interpose process-wide syscall with unsafe varargs forwarding")
     require("peak_detach_controller_note_thread_creation_gate_installed(TRUE)" in pthread_listener,
             "pthread listener must publish successful pthread_create hook installation")
     require("peak_detach_controller_begin_thread_creation_gate" in controller,
@@ -272,6 +349,8 @@ def check_signal_backend_strict_invariants(repo_root):
             "controller must release the new-thread gate on finish/failure")
     require("peak_detach_controller_wait_for_mutation_window" in pthread_start,
             "pthread start wrapper must wait for strict mutation windows")
+    require("peak_signal_policy_unblock_reserved_for_current_thread" in pthread_start,
+            "pthread start wrapper must unblock PEAK reserved signal before user code")
     require(pthread_start.find("peak_detach_controller_wait_for_mutation_window") <
             pthread_start.find("ret = start_routine"),
             "pthread start wrapper must gate before entering user code")
@@ -291,25 +370,71 @@ def check_signal_backend_strict_invariants(repo_root):
     for test_name in (
         "test_detach_hotloop_signal_strict",
         "test_detach_hotloop_signal_thread_spawn_strict",
+        "test_detach_hotloop_signal_blocked_delivery_strict",
+        "test_detach_hotloop_signal_user_collision_strict",
+        "test_detach_hotloop_signal_bad_cookie_strict",
+        "test_detach_hotloop_signal_pthread_create_gate_strict",
         "test_detach_stale_threads_signal_strict",
         "test_detach_stale_threads_signal_unrelated_spin_strict",
     ):
         require(test_name in tests,
                 f"missing signal strict runtime test {test_name}")
-    require("test_detach_controller_signal_backend_blocked_thread" in controller_tests,
+    require("test_detach_controller_signal_backend_blocked_thread" in controller_tests_cmake,
             "missing blocked-signal fail-closed controller test")
-    require("test_detach_controller_signal_backend_missing_thread_gate" in controller_tests,
+    require("test_detach_controller_signal_backend_missing_thread_gate" in controller_tests_cmake,
             "missing signal backend missing-pthread-gate fail-closed controller test")
     require("PEAK_DETACH_TRACE_PATH" in tests and
             "signal-thread-spawn-trace" in tests and
             "trace_detach_success=1" in tests,
             "transient signal pthread test must prove trace-backed mutation evidence")
+    runtime_hotloop = (repo_root / "test/detach_runtime/test_detach_hotloop.c").read_text(encoding="utf-8")
+    require("--signal-blocked-delivery-check" in tests and
+            "signal_blocked_delivery_ok" in tests and
+            "--signal-user-collision-check" in tests and
+            "signal_user_collision_ok" in tests and
+            "--signal-bad-cookie-check" in tests and
+            "signal_bad_cookie_ok" in tests and
+            "--pthread-gate-race-check" in tests and
+            "pthread_gate_race_ok" in tests,
+            "missing signal runtime stress CTest runner coverage")
+    require("--signal-blocked-delivery-check" in runtime_hotloop and
+            "blocked_signal_threads" in runtime_hotloop and
+            "trace_has_detach_prepare_blocked_signal" in runtime_hotloop and
+            "signal-reserved-blocked" in runtime_hotloop,
+            "blocked-signal runtime stress must prove fast fail-closed prepare failure")
+    require("--signal-user-collision-check" in runtime_hotloop and
+            "reserved_steal_denied=1" in runtime_hotloop and
+            "mask_denied=1" in runtime_hotloop and
+            "wait_denied=1" in runtime_hotloop and
+            "signalfd_denied=1" in runtime_hotloop and
+            "timer_denied=1" in runtime_hotloop and
+            "send_denied=1" in runtime_hotloop and
+            "worker_calls" in runtime_hotloop,
+            "user signal collision runtime test must prove PEAK keeps working after denied collisions across libc signal surfaces")
+    require("--signal-bad-cookie-check" in runtime_hotloop and
+            "peak_signal_policy_test_send_bad_cookie_to_current_thread" in runtime_hotloop and
+            "trace_has_detach_prepare_unexpected_signal" in runtime_hotloop and
+            "signal-unexpected-delivery" in runtime_hotloop and
+            "contamination_seen=1" in runtime_hotloop and
+            "detach_blocked=1" in runtime_hotloop,
+            "bad-cookie runtime test must prove unauthenticated reserved-signal traffic blocks signal detach")
+    require("peak_detach_controller_test_thread_creation_gate_epoch" in runtime_hotloop and
+            "peak_detach_controller_test_gate_waiter_count" in runtime_hotloop and
+            "gate_waiters" in runtime_hotloop and
+            "create_attempted_during_gate" in runtime_hotloop and
+            "child_started_while_gate" in runtime_hotloop,
+            "pthread-create gate stress must prove blocked children and gate release ordering")
     benchmark_runner = (repo_root / "benchmarks/detach/run_detach_hotloop_stress.py").read_text(encoding="utf-8")
     require("--detach-backend" in benchmark_runner,
             "hotloop benchmark must support backend-pinned signal stress")
     require("PEAK_DETACH_BACKEND=helper" in tests and
-            "PEAK_DETACH_BACKEND=helper" in controller_tests,
+            "PEAK_DETACH_BACKEND=helper" in controller_tests_cmake,
             "fake-helper tests must force helper backend, not auto signal fallback")
+    require("${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c" in controller_tests_cmake and
+            "PEAK_ENABLE_TEST_HOOKS=1" in controller_tests_cmake and
+            "peak_signal_policy_test_block_reserved_for_current_thread() == 0" in controller_tests and
+            "signal-reserved-blocked" in controller_tests,
+            "controller tests must link signal policy and prove selected-signal blocked reason")
 
 
 def main():

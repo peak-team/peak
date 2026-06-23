@@ -103,6 +103,10 @@ build-*/
 _codeql_build_dir/
 _codeql_detected_source_root
 
+__pycache__/
+peak_statslog*.csv
+.codex-hpc.toml
+
 # dynamic_lib test build artifacts generated in the source test directory
 test/dynamic_lib/main_*
 test/dynamic_lib/dlopen_flags_test

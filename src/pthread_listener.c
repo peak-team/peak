@@ -1,5 +1,6 @@
 #include "pthread_listener.h"
 #include "peak_detach_controller.h"
+#include "peak_signal_policy_internal.h"
 
 #include <string.h>
 
@@ -68,6 +69,7 @@ peak_pthread_start(void* data)
         }
         g_mutex_unlock(&tid_mapping_mutex);
     }
+    (void)peak_signal_policy_unblock_reserved_for_current_thread();
 
     pthread_cleanup_push(peak_pthread_start_cleanup, context);
     peak_detach_controller_wait_for_mutation_window();

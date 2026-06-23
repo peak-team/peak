@@ -146,6 +146,45 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
                 TIMEOUT 60)
 
+        add_test(NAME test_detach_hotloop_signal_blocked_delivery_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-blocked-delivery-check
+                    --threads 4)
+        set_tests_properties(test_detach_hotloop_signal_blocked_delivery_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-blocked-delivery-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_blocked_delivery_ok.*blocked_signal_threads=4")
+
+        add_test(NAME test_detach_hotloop_signal_user_collision_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-user-collision-check)
+        set_tests_properties(test_detach_hotloop_signal_user_collision_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-user-collision-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_user_collision_ok.*detach_success=1.*reserved_steal_denied=1.*mask_denied=1.*wait_denied=1.*signalfd_denied=1.*timer_denied=1.*send_denied=1.*worker_calls=[1-9][0-9]*")
+
+        add_test(NAME test_detach_hotloop_signal_bad_cookie_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-bad-cookie-check)
+        set_tests_properties(test_detach_hotloop_signal_bad_cookie_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-bad-cookie-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_bad_cookie_ok.*contamination_seen=1.*detach_blocked=1")
+
+        add_test(NAME test_detach_hotloop_signal_pthread_create_gate_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --pthread-gate-race-check
+                    --threads 4
+                    --creator-threads 4)
+        set_tests_properties(test_detach_hotloop_signal_pthread_create_gate_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_ENABLE_STRICT_GATE_DELAY=1;PEAK_TEST_STRICT_GATE_DELAY_US=250000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-pthread-create-gate-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "pthread_gate_race_ok.*gate_waiters_ok=1.*create_attempted_during_gate=4.*child_started_while_gate=0")
+
         add_test(NAME test_detach_hotloop_batch_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
