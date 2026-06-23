@@ -20,7 +20,6 @@
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
-#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -979,7 +978,15 @@ peak_signal_policy_init_cookie_once(void)
 {
     uintptr_t seed = 0;
 
-    if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) != (ssize_t)sizeof(seed)) {
+#ifdef SYS_getrandom
+    const long random_bytes = syscall(SYS_getrandom,
+                                      &seed,
+                                      sizeof(seed),
+                                      0x0001u /* GRND_NONBLOCK */);
+#else
+    const long random_bytes = -1;
+#endif
+    if (random_bytes != (long)sizeof(seed)) {
         seed = (uintptr_t)&cookie_base ^
                ((uintptr_t)getpid() << 17) ^
                (uintptr_t)time(NULL) ^
