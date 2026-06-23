@@ -9,6 +9,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   add_executable(test_detach_listener_shutdown
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
+    ${PROJECT_SOURCE_DIR}/src/peak_jit_provider.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
     ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
     ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c

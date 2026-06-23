@@ -5,7 +5,7 @@
 PEAK's core advantage is physical detach: once a hot target is detached, the
 target application executes the original function entry path with no PEAK or Gum
 trampoline overhead. This controller keeps that property while closing the races
-around Gum detach, reattach, dynamic attach, and teardown.
+around Gum detach, reattach, dynamic attach, JIT metadata attach, and teardown.
 
 The key idea is to stop treating detach as a cooperative pthread operation. PEAK
 manufactures safe detach opportunities with debugger-grade thread control and
@@ -63,11 +63,12 @@ outside the code and state being mutated.
    operations. Target-function `gum_interceptor_attach`,
    `gum_interceptor_detach`, Gum transactions, listener allocation/free, and
    dynamic target attach publication are controller-owned. `dlopen` replace and
-   revert also go through the controller guard. Process-lifetime support hooks
-   are allowed to use direct Gum calls only when they cannot overlap the active
-   target-controller mutation window. Malloc detach is ordered after controller
-   stop and before `dlopen`/Gum teardown so the memory profiler does not observe
-   Gum teardown allocations.
+   revert also go through the controller guard. JIT metadata providers publish
+   only name/address/size candidates; the controller performs any resulting Gum
+   attach. Process-lifetime support hooks are allowed to use direct Gum calls
+   only when they cannot overlap the active target-controller mutation window.
+   Malloc detach is ordered after controller stop and before `dlopen`/Gum
+   teardown so the memory profiler does not observe Gum teardown allocations.
 
 2. Hot callbacks never call Gum lifecycle APIs. They may request detach or
    reattach by setting atomic state or enqueueing a controller request.
@@ -93,7 +94,7 @@ The controller is the only PEAK component allowed to mutate Gum hooks. It owns:
 - Gum transactions;
 - `array_listener`, `hook_address`, and demangled-name publication;
 - deferred listener destruction;
-- dynamic symbol attaches after `dlopen`;
+- dynamic symbol attaches after `dlopen` or JIT metadata arrival;
 - final shutdown order.
 
 Per-hook states:

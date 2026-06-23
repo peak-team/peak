@@ -114,6 +114,7 @@ if(BUILD_TESTING)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
     add_subdirectory(dlopen_controller)
+    add_subdirectory(jit)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        PEAK_GUM_PEAK_PC_API_AVAILABLE AND
        TARGET peak_detach_helper)

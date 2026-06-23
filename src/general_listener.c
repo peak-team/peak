@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
+#include "peak_general_listener_internal.h"
+#include "peak_jit_provider.h"
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
 #include <errno.h>
@@ -56,6 +58,8 @@ static pthread_mutex_t general_controller_wake_mutex = PTHREAD_MUTEX_INITIALIZER
 static pthread_cond_t general_controller_wake_cond = PTHREAD_COND_INITIALIZER;
 static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
+static pthread_t general_controller_owner_thread;
+static _Atomic gboolean general_controller_owner_known = FALSE;
 static gboolean gum_find_functions_matching_initialize = false;
 static GHashTable* gum_symbol_demangled_mapping;
 static GHashTable* gum_symbol_short_mapping;
@@ -843,6 +847,114 @@ PeakHookState peak_general_listener_hook_state(size_t hook_id)
     pthread_mutex_unlock(&lock);
 
     return state;
+}
+
+static gboolean
+peak_general_controller_is_current_thread(void)
+{
+    return atomic_load(&general_controller_owner_known) &&
+           pthread_equal(pthread_self(), general_controller_owner_thread);
+}
+
+gboolean
+peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
+                                            gpointer symbol_address,
+                                            gsize symbol_size,
+                                            const char* provider_name)
+{
+    (void)symbol_size;
+
+    if (symbol_name == NULL || symbol_name[0] == '\0' ||
+        symbol_address == NULL || peak_hook_address_count == 0) {
+        return FALSE;
+    }
+
+    if (!peak_general_controller_is_current_thread()) {
+        g_printerr("[peak] refusing JIT dynamic attach outside the general listener controller thread\n");
+        return FALSE;
+    }
+
+    gboolean attached = FALSE;
+
+    pthread_mutex_lock(&lock);
+    if (peak_hook_strings == NULL ||
+        hook_address == NULL ||
+        array_listener == NULL ||
+        peak_hook_states == NULL) {
+        pthread_mutex_unlock(&lock);
+        return FALSE;
+    }
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (peak_hook_strings[i] == NULL ||
+            strcmp(peak_hook_strings[i], symbol_name) != 0 ||
+            hook_address[i] != NULL ||
+            array_listener[i] != NULL ||
+            peak_hook_states[i] != PEAK_HOOK_UNRESOLVED) {
+            continue;
+        }
+
+        GumInvocationListener* new_listener =
+            g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+        PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
+
+        PeakDetachRequest mutation_request = {
+            .hook_id = i,
+            .symbol_name = peak_hook_strings[i],
+            .function_address = symbol_address,
+            .interceptor = interceptor,
+            .listener = new_listener,
+            .operation = PEAK_DETACH_OPERATION_ATTACH
+        };
+        PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+                                                          &detach_status)) {
+            g_printerr("[peak] skipping JIT attach for hook %lu (%s) from %s: %s\n",
+                       (unsigned long)i,
+                       symbol_name,
+                       provider_name != NULL ? provider_name : "<unknown>",
+                       peak_detach_controller_status_string(detach_status));
+            peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
+            g_object_unref(new_listener);
+            break;
+        }
+
+        gum_interceptor_begin_transaction(interceptor);
+        GumAttachReturn attach_status =
+            gum_interceptor_attach(interceptor, symbol_address, new_listener, NULL);
+        gum_interceptor_end_transaction(interceptor);
+
+        if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                         &detach_status)) {
+            peak_detach_controller_abort_after_failed_finish("JIT attach finish",
+                                                            detach_status);
+        }
+
+        if (attach_status == GUM_ATTACH_OK) {
+            hook_address[i] = symbol_address;
+            g_free(peak_demangled_strings[i]);
+            peak_demangled_strings[i] = g_strdup(symbol_name);
+            array_listener[i] = new_listener;
+            array_listener_gum_detached[i] = FALSE;
+            array_listener_gum_detach_flushed[i] = TRUE;
+            peak_general_controller_reset_retry_unlocked(i);
+            peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
+            attached = TRUE;
+        } else {
+            g_printerr("[peak] Gum JIT attach failed for hook %lu (%s) from %s, status=%d\n",
+                       (unsigned long)i,
+                       symbol_name,
+                       provider_name != NULL ? provider_name : "<unknown>",
+                       attach_status);
+            peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
+            g_object_unref(new_listener);
+        }
+        break;
+    }
+
+    pthread_mutex_unlock(&lock);
+    return attached;
 }
 
 static gboolean peak_general_controller_pause_called_threads(
@@ -1942,6 +2054,9 @@ peak_general_controller_thread_main(void* arg)
     int* pause_session_ids = g_new0(int, peak_max_num_threads);
     int* pause_status = g_new0(int, peak_max_num_threads);
 
+    general_controller_owner_thread = pthread_self();
+    atomic_store(&general_controller_owner_known, TRUE);
+
     gum_interceptor_ignore_current_thread(interceptor);
 
     for (;;) {
@@ -1951,6 +2066,7 @@ peak_general_controller_thread_main(void* arg)
         should_run = general_controller_running;
         pthread_mutex_unlock(&general_controller_wake_mutex);
         if (!should_run) {
+            peak_jit_provider_drain_pending();
             break;
         }
 
@@ -1963,6 +2079,7 @@ peak_general_controller_thread_main(void* arg)
         pthread_mutex_unlock(&lock);
 
         dlopen_interceptor_drain_dynamic_attach_queue();
+        peak_jit_provider_drain_pending();
 
         pthread_mutex_lock(&general_controller_wake_mutex);
         if (general_controller_running) {
@@ -1981,6 +2098,7 @@ peak_general_controller_thread_main(void* arg)
     }
 
     gum_interceptor_unignore_current_thread(interceptor);
+    atomic_store(&general_controller_owner_known, FALSE);
 
     g_free(pause_status);
     g_free(pause_session_ids);

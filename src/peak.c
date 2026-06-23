@@ -11,6 +11,7 @@
 #endif
 
 #include "general_listener.h"
+#include "peak_jit_provider.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"
@@ -159,6 +160,7 @@ void peak_init()
     }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     peak_detached = g_new0(gboolean, peak_hook_address_count);
+    peak_jit_provider_enable();
     peak_general_listener_attach();
     dlopen_interceptor_enable_dynamic_attach();
     if (heartbeat_time != 0) {
@@ -206,6 +208,7 @@ void peak_fini()
     peak_main_time = peak_second() - peak_main_time;
 
     peak_general_listener_controller_stop();
+    peak_jit_provider_disable();
     if (peak_memory_profile) {
         malloc_interceptor_detach();
     }

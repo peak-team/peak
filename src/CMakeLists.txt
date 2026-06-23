@@ -8,6 +8,7 @@ FILE(GLOB sources_peak
     pthread_listener.c
     peak_detach_controller.c
     peak_signal_policy.c
+    peak_jit_provider.c
     syscall_interceptor.c
     dlopen_interceptor.c
     malloc_interceptor.c
