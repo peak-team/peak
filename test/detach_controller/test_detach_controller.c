@@ -1,4 +1,5 @@
 #include "peak_detach_controller.h"
+#include "peak_signal_policy.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -276,6 +277,7 @@ run_strict(void)
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 static volatile int worker_running = 0;
+static volatile int signal_blocked_worker_ready = 0;
 static pthread_mutex_t stale_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stale_worker_cond = PTHREAD_COND_INITIALIZER;
 static int stale_worker_parked = 0;
@@ -371,12 +373,9 @@ strict_helper_stale_worker(void* arg)
 static void*
 strict_helper_signal_blocked_worker(void* arg)
 {
-    sigset_t blocked;
-
     (void)arg;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGRTMIN + 2);
-    (void)pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    signal_blocked_worker_ready =
+        peak_signal_policy_test_block_reserved_for_current_thread() == 0;
 
     worker_running = 1;
     while (worker_running) {
@@ -2446,6 +2445,7 @@ run_signal_backend_blocked_thread(void)
     gum_interceptor_flush(interceptor);
     peak_detach_controller_note_thread_creation_gate_installed(TRUE);
 
+    signal_blocked_worker_ready = 0;
     if (pthread_create(&worker, NULL, strict_helper_signal_blocked_worker, NULL) != 0) {
         perror("pthread_create");
         gum_interceptor_detach(interceptor, listener);
@@ -2458,6 +2458,8 @@ run_signal_backend_blocked_thread(void)
     while (!worker_running) {
         usleep(1000);
     }
+    check_true("signal backend blocked worker actually blocked reserved signal",
+               signal_blocked_worker_ready == 1);
 
     PeakDetachRequest request = {
         .hook_id = 127,
@@ -2468,10 +2470,16 @@ run_signal_backend_blocked_thread(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
-    check_prepare("signal backend blocked thread timeout",
+    check_prepare("signal backend blocked thread fast fail",
                   &request,
                   FALSE,
-                  PEAK_DETACH_STATUS_TIMEOUT);
+                  PEAK_DETACH_STATUS_UNSUPPORTED);
+    const PeakDetachFailureDetail* detail =
+        peak_detach_controller_last_failure_detail();
+    check_true("signal backend blocked thread reports reserved-signal reason",
+               detail != NULL &&
+               detail->reason != NULL &&
+               strcmp(detail->reason, "signal-reserved-blocked") == 0);
     check_true("signal backend blocked thread leaves no held mutation",
                peak_detach_controller_threads_are_held() == FALSE);
     check_true("signal backend blocked thread leaves no physical mutation",

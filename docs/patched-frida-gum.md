@@ -108,14 +108,15 @@ the PEAK API.
 
 ## Runtime Behavior
 
-This branch wires the selected Gum provider into PEAK's runtime capability
-checks. When `PEAK_REQUIRE_SAFE_DETACH=1` or
+PEAK wires the selected Gum provider into runtime capability checks. When
+`PEAK_REQUIRE_SAFE_DETACH=1` or
 `PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` / `signal` is set, PEAK
 refuses Gum mutation if the selected Gum headers do not expose the PEAK API.
 `PEAK_DETACH_BACKEND=helper` forces the external ptrace helper,
 `PEAK_DETACH_BACKEND=signal` forces the in-process strict signal backend, and
-plain `strict` uses `auto`: helper first, with signal fallback only when the
-helper path is denied by policy.
+plain `strict` uses `auto`: helper by default, with signal selected up front
+only when Linux `ptrace_scope` is detected as blocking helper attachment.
+Helper startup, protocol, timeout, or STOP failures remain helper failures.
 
 With stock Gum, strict mode still fails closed with `missing-gum-api`. With a
 patched devkit, PEAK uses a strict stop backend to hold every non-controller
@@ -127,15 +128,26 @@ intentionally deferred until after the strict backend releases threads, or until
 final shutdown, so PEAK restores the target entry without asking
 non-thread-safe Gum code to modify live patches in the dangerous window.
 
-The signal backend is intended for ptrace-restricted environments. It parks
-threads in an async-signal-safe atomic corridor, confirms each required PC
-rewrite before release, revalidates `/proc/self/task` immediately before byte
-writes, and holds PEAK's pthread-start gate until `finish_hook_mutation` releases
-the mutation window. Existing-hook mutations require Gum PC diagnostics; missing
+The signal backend is intended for ptrace-restricted environments. It reserves
+an available real-time signal for PEAK, installs a protective lease handler,
+guards that lease through the common dynamically linked libc signal APIs, and
+sends thread-directed stop requests with hidden `rt_tgsigqueueinfo` cookies so
+unrelated user signal traffic cannot satisfy a PEAK parked-thread slot. User
+attempts through those libc APIs to steal, block, wait on, signalfd-use,
+timer-generate, or send the reserved signal are rejected with `EINVAL`; denied
+collisions are recorded but do not poison signal detach. Direct raw syscalls or
+inline assembly are outside this wrapper boundary, but an actual delivered
+reserved signal without a valid PEAK cookie contaminates the signal backend and
+makes signal-backed mutation fail closed. The backend parks threads in an
+async-signal-safe atomic corridor, confirms each required PC rewrite before
+release, revalidates `/proc/self/task` immediately before byte writes, and
+holds PEAK's pthread-start gate until `finish_hook_mutation` releases the
+mutation window. Existing-hook mutations require Gum PC diagnostics; missing
 corridor metadata is a fail-closed classification error. Signal-backed physical
 mutation also requires the `pthread_create` wrapper to confirm that the thread
-creation gate is installed. A masked signal, missing arrival, unknown PC, failed
-rewrite, missing pthread gate, or failed release is fail-closed; after a physical
+creation gate is installed. A stolen handler, unexpected non-cookie delivery,
+truly blocked reserved signal, missing arrival, unknown PC, failed rewrite,
+missing pthread gate, or failed release is fail-closed; after a physical
 byte/register mutation starts, failed release is fatal.
 
 The helper is currently built on Linux x86_64 and Linux Arm64 and installed as

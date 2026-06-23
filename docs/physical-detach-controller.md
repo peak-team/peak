@@ -3,17 +3,17 @@
 ## Goal
 
 PEAK's core advantage is physical detach: once a hot target is detached, the
-target application should execute the original function entry path with no PEAK
-or Gum trampoline overhead. The design below keeps that property while removing
-the current races around Gum detach, reattach, dynamic attach, and teardown.
+target application executes the original function entry path with no PEAK or Gum
+trampoline overhead. This controller keeps that property while closing the races
+around Gum detach, reattach, dynamic attach, and teardown.
 
 The key idea is to stop treating detach as a cooperative pthread operation. PEAK
-should manufacture safe detach opportunities with debugger-grade thread control
-and Gum-defined safe regions.
+manufactures safe detach opportunities with debugger-grade thread control and
+Gum-defined safe regions.
 
 ## Implemented Split
 
-This branch keeps two explicit runtime modes:
+PEAK has two explicit runtime modes:
 
 - Compatibility mode, the default, preserves the existing physical detach
   behavior for stock Frida Gum. Gum mutations are serialized through the PEAK
@@ -24,8 +24,10 @@ This branch keeps two explicit runtime modes:
   `PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` / `signal`. Strict mode
   refuses target-function Gum attach, detach, reattach, and shutdown detach
   unless PEAK can use patched-Gum PC classification plus a strict stop backend.
-  The default `strict` backend tries the external helper first and can fall back
-  to the signal backend only on real permission denial; `helper`/`debugger` force
+  The default `strict` backend uses the external helper unless Linux
+  `ptrace_scope` is already known to block helper attachment, in which case it
+  selects the signal backend up front. Helper startup, protocol, timeout, or
+  STOP failures do not silently fall back to signal; `helper`/`debugger` force
   ptrace-helper behavior; `signal` forces the in-process signal backend. `dlopen`
   replace/revert is also guarded because it changes a process-wide Gum patch
   site. With stock Gum, startup target hooks are skipped, already-attached target
@@ -46,10 +48,10 @@ from `ucontext_t`, classifies those PCs with the patched Gum API, performs only
 audited PC rewrites and byte writes, and fails closed if any thread does not
 arrive or cannot be released safely.
 
-## Current Failure Mode
+## Original Failure Mode
 
-The existing implementation lets callbacks, heartbeat, `dlopen`, and shutdown
-all interact with shared Gum state:
+The pre-controller implementation let callbacks, heartbeat, `dlopen`, and
+shutdown all interact with shared Gum state:
 
 - callbacks may physically detach their own listener;
 - heartbeat may reattach from a background thread;
@@ -99,7 +101,7 @@ The controller is the only PEAK component allowed to mutate Gum hooks. It owns:
 - dynamic symbol attaches after `dlopen`;
 - final shutdown order.
 
-Suggested per-hook states:
+Per-hook states:
 
 ```c
 typedef enum {
@@ -135,17 +137,39 @@ The external helper provides thread control and PC classification:
    exit. Helper protocol writes suppress `SIGPIPE` so a closed controller
    socket cannot kill the helper before its held-thread cleanup path runs.
 
-The helper should not call Gum APIs directly. Gum mutation remains in-process so
-it can operate on Gum's live data structures.
+The helper does not call Gum APIs directly. Gum mutation remains in-process so it
+can operate on Gum's live data structures.
 
 ### Strict signal backend
 
 On systems where ptrace is denied, PEAK can use
 `PEAK_SAFE_DETACH_MODE=signal` or `PEAK_DETACH_BACKEND=signal`. This backend is
-not the legacy pause mitigation. The controller installs a real-time signal
-handler, enumerates `/proc/self/task`, sends the signal to every non-controller
-TID with `tgkill`, and requires every active slot to report arrival before any
-patch write. If a TID exits after enumeration but before signal-handler arrival,
+not the legacy pause mitigation. PEAK reserves a process-lifetime real-time
+signal, installs a protective lease handler immediately, protects that lease
+through exported signal-policy wrappers for common libc signal APIs, and
+replaces the lease handler with a cookie-authenticated `SA_SIGINFO` stop handler
+when the backend is activated. The controller enumerates `/proc/self/task`,
+sends each non-controller TID a queued thread-directed signal with
+`rt_tgsigqueueinfo`, and accepts arrival only when the handler sees the expected
+hidden epoch/TID cookie. Ordinary user `kill`, `pthread_kill`, timer,
+`sigqueue`, `sigwait`, `signalfd`, temporary-mask, or signal-mask traffic cannot
+satisfy a PEAK stop slot. Attempts through normal dynamically linked libc APIs
+to install a user handler for PEAK's reserved signal, block it, wait on it,
+consume it through `signalfd`, generate it through a timer, or send it are
+rejected with `EINVAL` and recorded as policy conflicts. Denied collisions do
+not poison the signal backend. Direct raw syscalls or inline assembly are
+outside this user-space wrapper boundary; if they actually deliver PEAK's
+reserved signal without a valid cookie, that delivery is treated as backend
+contamination and signal-backed mutation then fails closed with
+`signal-unexpected-delivery`, while helper-backed mutation remains independent.
+Before every signal-backed stop, PEAK revalidates that its handler still owns
+the reserved signal and that no unexpected non-cookie delivery has contaminated
+the backend.
+If a TID has the reserved signal truly blocked, strict signal mutation fails
+closed before any patch write. A short mask recheck distinguishes that condition
+from the kernel's tiny handler-unwind window where the delivered signal may
+still appear blocked immediately after PEAK's previous handler reports `done`.
+If a TID exits after enumeration but before signal-handler arrival,
 the controller deactivates that slot after verifying the TID no longer exists
 instead of waiting for a safe-region arrival that can never happen. If a TID
 appears in `/proc/self/task` during the initial stop verification but was not
@@ -190,8 +214,9 @@ pthread wrapper has confirmed that `pthread_create` interception is installed;
 without that confirmation, signal-backed physical mutation is `UNSUPPORTED`.
 This gate is held from immediately before STOP until `finish_hook_mutation`
 resumes the stopped or parked threads. Direct raw `clone(2)` users outside
-pthread are not covered by this user-space gate and remain a separate hardening
-surface.
+pthread are outside the user-space pthread gate; signal-mode STOP verification
+still re-scans `/proc/self/task` before mutation and fails closed if an unheld
+thread cannot be admitted and classified.
 
 The current code implements this Linux x86_64 and Linux Arm64 helper path behind
 the patched-Gum capability check. The default Linux x86_64 and Linux Arm64 CMake
@@ -330,7 +355,7 @@ Gum already has the key internal metadata:
 - `trampoline_usage_counter`;
 - pending destroy task queue.
 
-The PEAK-specific Gum API should turn that internal knowledge into reliable PC
+The PEAK-specific Gum API turns that internal knowledge into reliable PC
 classification and safe-point addresses.
 
 ## Evacuation Corridors
@@ -352,10 +377,9 @@ Evacuation code must be:
 
 The implemented helper can redirect a stopped thread's PC to the safe label
 returned by patched Gum. That redirection is only valid for Gum states whose
-safe PC was explicitly designed as an evacuation target. Future Gum patches may
-replace direct redirection with a temporary breakpoint/single-step corridor when
-the corridor needs to execute bounded instructions before reaching the safe
-label.
+safe PC was explicitly designed as an evacuation target. Reattach prologue
+evacuation uses a bounded single-step or temporary-breakpoint corridor before
+entry bytes are patched.
 
 The helper validates an entire instruction batch and revalidates stopped-thread
 coverage before applying it. If this pre-mutation validation fails, the helper
@@ -509,7 +533,7 @@ Rules:
 
 ## Dynamic `dlopen`
 
-`dlopen` must not attach directly from the replacement body. It should enqueue a
+`dlopen` must not attach directly from the replacement body. It enqueues a
 dynamic attach request:
 
 ```text
@@ -580,7 +604,7 @@ obvious C++ spelling such as `::`, `(`, `<`, or `operator`.
 
 ## Testing Strategy
 
-The implementation needs stress tests that are intentionally hostile:
+The test and benchmark suite includes intentionally hostile cases:
 
 - many threads hot-looping on one target while heartbeat repeatedly detaches;
 - many threads hot-looping while controller reattaches;
@@ -813,26 +837,15 @@ Completed in this branch:
     fails closed before entry bytes or Gum metadata are changed. Deterministic
     fake-helper coverage exercises both the accepted detach entry PC and the
     rejected detach/shutdown `function_address + 1` regression cases.
-
-Remaining work:
-
-1. Add CI coverage using the auto-patched Linux x86_64 devkit plus
-   `PEAK_DETACH_HELPER`.
-2. Promote the successful manual Vista ARM64 and Frontera x86_64 full-core
-   zero-transition stress shapes into easier-to-run HPC suites so they can be
-   repeated after each major controller change without hand-written session
-   commands.
-3. Add a true live-RIP unsafe-PC test that forces a stopped thread's actual
-   register state into each Gum trampoline/shared-thunk region, complementing
-   the deterministic classifier tests that exercise those PCs directly.
-4. Extend helper support to other architectures with the appropriate register
-   access and PC-write APIs.
-5. Add stress tests that explicitly force blocked signal delivery and
-   pthread-create races in runtime mode, complementing the controller-level
-   signal tests and the existing spawner hot-loop coverage.
-6. Add job-control/group-stop preservation tests and, if needed, a
-   `PTRACE_LISTEN` path for threads that were already group-stopped before the
-   helper interrupt.
-7. Reduce the strict stop window further so future attach/replace operations can
-   prebuild all Gum/GLib state before stopping target threads, leaving only
-   audited byte/register commits inside the debugger-held window.
+44. Hardened the strict signal backend with a real-time signal lease: PEAK now
+    reserves an available RT signal early for strict signal mode, installs a
+    protective handler during the lease window, rejects normal libc attempts to
+    steal, block, wait on, signalfd-consume, timer-generate, or send the
+    reserved signal, uses hidden
+    `rt_tgsigqueueinfo` cookies so application signal traffic cannot satisfy a
+    parked-thread slot, revalidates handler ownership before each signal STOP,
+    and fails fast when a target thread truly blocks the reserved signal or a
+    non-cookie delivery contaminates the backend. Runtime coverage now includes
+    forced blocked delivery, user signal-collision, and bad-cookie
+    contamination cases while requiring denied collisions to preserve successful
+    physical detach.
