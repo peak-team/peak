@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <signal.h>
 #include <sys/signalfd.h>
+#include <sys/syscall.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -51,36 +52,6 @@ user_collision_signal_handler(int signo)
     atomic_fetch_add_explicit(&user_signal_handler_count,
                               1,
                               memory_order_relaxed);
-}
-
-static int
-expect_errno_failure(const char* label, int rc, int expected_errno)
-{
-    if (rc == 0 || errno != expected_errno) {
-        fprintf(stderr,
-                "%s unexpectedly succeeded or returned wrong errno: rc=%d errno=%d expected=%d\n",
-                label,
-                rc,
-                errno,
-                expected_errno);
-        return 0;
-    }
-    return 1;
-}
-
-static int
-expect_error_code(const char* label, int rc, int expected)
-{
-    if (rc != expected) {
-        fprintf(stderr,
-                "%s returned wrong error code: rc=%d expected=%d errno=%d\n",
-                label,
-                rc,
-                expected,
-                errno);
-        return 0;
-    }
-    return 1;
 }
 
 __attribute__((noinline, noclone, used, externally_visible, visibility("default")))
@@ -458,8 +429,14 @@ typedef int (*PeakControllerGateEpochFn)(void);
 typedef size_t (*PeakControllerGateWaiterCountFn)(void);
 typedef int (*PeakSignalBackendSignumFn)(void);
 typedef int (*PeakSignalConflictCountFn)(void);
+typedef int (*PeakSignalMigrationCountFn)(void);
 typedef int (*PeakSignalUnexpectedDeliveryCountFn)(void);
 typedef int (*PeakSignalBadCookieFn)(void);
+typedef int (*PeakSignalTestBlockFn)(void);
+typedef int (*PeakSignalfd4Fn)(int fd,
+                               const sigset_t* mask,
+                               int sizemask,
+                               int flags);
 typedef gboolean (*PeakGumGetPcDiagnosticsFn)(
     GumInterceptor* interceptor,
     gpointer function_address,
@@ -1506,15 +1483,26 @@ run_signal_user_collision_check(void)
     PeakSignalConflictCountFn conflict_count =
         (PeakSignalConflictCountFn)required_symbol(
             "peak_signal_policy_conflict_count");
+    PeakSignalMigrationCountFn migration_count =
+        (PeakSignalMigrationCountFn)required_symbol(
+            "peak_signal_policy_migration_count");
     PeakSignalUnexpectedDeliveryCountFn unexpected_count =
         (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
             "peak_signal_policy_unexpected_delivery_count");
+    PeakSignalTestBlockFn block_reserved_signal =
+        (PeakSignalTestBlockFn)required_symbol(
+            "peak_signal_policy_test_block_reserved_for_current_thread");
+    PeakSignalfd4Fn signalfd4_fn =
+        (PeakSignalfd4Fn)dlsym(RTLD_DEFAULT, "signalfd4");
     const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
     int collision_signum = SIGRTMIN + 2;
     int reserved_signum;
+    int initial_reserved_signum;
+    int migrated_signum;
     int conflicts_before;
     int conflicts_after;
-    int expected_conflicts = 0;
+    int migrations_before;
+    int migrations_after;
     int unexpected_before;
     sigset_t set;
     sigset_t oldset;
@@ -1532,7 +1520,11 @@ run_signal_user_collision_check(void)
         hook_state == NULL ||
         selected_signal == NULL ||
         conflict_count == NULL ||
+        migration_count == NULL ||
         unexpected_count == NULL) {
+        return 2;
+    }
+    if (block_reserved_signal == NULL) {
         return 2;
     }
     if (trace_path == NULL || trace_path[0] == '\0') {
@@ -1575,199 +1567,352 @@ run_signal_user_collision_check(void)
         fprintf(stderr, "reserved signal collided with user-owned signal\n");
         return 2;
     }
+    initial_reserved_signum = reserved_signum;
 
     conflicts_before = conflict_count();
+    migrations_before = migration_count();
     unexpected_before = unexpected_count();
 
-    user_action.sa_handler = user_collision_signal_handler;
-    errno = 0;
-    if (!expect_errno_failure("sigaction reserved signal",
-                              sigaction(reserved_signum, &user_action, NULL),
-                              EINVAL)) {
+    struct sigaction query_action;
+    memset(&query_action, 0, sizeof(query_action));
+    if (sigaction(reserved_signum, NULL, &query_action) != 0) {
+        perror("sigaction query reserved signal");
         return 2;
     }
-    expected_conflicts++;
-
-    errno = 0;
-    if (signal(reserved_signum, user_collision_signal_handler) != SIG_ERR ||
-        errno != EINVAL) {
+    if (query_action.sa_handler != SIG_DFL) {
         fprintf(stderr,
-                "signal reserved signal unexpectedly succeeded: errno=%d\n",
-                errno);
+                "reserved signal query leaked non-default handler to user code\n");
         return 2;
     }
-    expected_conflicts++;
+    if (selected_signal() != reserved_signum) {
+        fprintf(stderr, "read-only reserved signal query unexpectedly migrated\n");
+        return 2;
+    }
 
+    struct sigaction previous_action;
+    memset(&previous_action, 0, sizeof(previous_action));
+    user_action.sa_handler = user_collision_signal_handler;
+    if (sigaction(reserved_signum, &user_action, &previous_action) != 0) {
+        perror("sigaction reserved signal migrated");
+        return 2;
+    }
+    if (previous_action.sa_handler != SIG_DFL) {
+        fprintf(stderr,
+                "reserved signal migration exposed PEAK handler as old action\n");
+        return 2;
+    }
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigaction collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
+    if (raise(reserved_signum) != 0) {
+        perror("raise migrated user signal");
+        return 2;
+    }
+    if (atomic_load_explicit(&user_signal_handler_count,
+                             memory_order_relaxed) != 2) {
+        fprintf(stderr, "migrated user signal handler did not run\n");
+        return 2;
+    }
+
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    if (pthread_sigmask(SIG_BLOCK, &set, &oldset) != 0) {
+        perror("pthread_sigmask reserved signal migrated");
+        return 2;
+    }
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "pthread_sigmask collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
+    sigset_t current_set;
+    if (pthread_sigmask(SIG_BLOCK, NULL, &current_set) != 0) {
+        perror("pthread_sigmask query after migration");
+        return 2;
+    }
+    if (sigismember(&current_set, reserved_signum) != 1 ||
+        sigismember(&current_set, migrated_signum) == 1) {
+        fprintf(stderr,
+                "mask migration did not preserve user mask while keeping PEAK signal unblocked\n");
+        return 2;
+    }
+    if (pthread_sigmask(SIG_UNBLOCK, &set, NULL) != 0) {
+        perror("pthread_sigmask unblock migrated user signal");
+        return 2;
+    }
+
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) {
+        perror("sigprocmask reserved signal migrated");
+        return 2;
+    }
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigprocmask collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
+    if (sigprocmask(SIG_UNBLOCK, &set, NULL) != 0) {
+        perror("sigprocmask unblock migrated user signal");
+        return 2;
+    }
+
+    reserved_signum = migrated_signum;
     sigemptyset(&set);
     sigaddset(&set, reserved_signum);
     errno = 0;
-    if (!expect_error_code("pthread_sigmask reserved signal",
-                           pthread_sigmask(SIG_BLOCK, &set, NULL),
-                           EINVAL)) {
+    if (sigtimedwait(&set, NULL, &zero_timeout) != -1 || errno != EAGAIN) {
+        fprintf(stderr,
+                "sigtimedwait migrated reserved signal returned unexpected result: errno=%d\n",
+                errno);
         return 2;
     }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_errno_failure("sigprocmask reserved signal",
-                              sigprocmask(SIG_BLOCK, &set, NULL),
-                              EINVAL)) {
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigtimedwait collision did not migrate PEAK reserved signal\n");
         return 2;
     }
-    expected_conflicts++;
 
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    if (block_reserved_signal() != 0) {
+        perror("block reserved signal for sigwait");
+        return 2;
+    }
+    if (syscall(SYS_tgkill,
+                getpid(),
+                syscall(SYS_gettid),
+                reserved_signum) != 0) {
+        perror("queue reserved signal for sigwait");
+        return 2;
+    }
     int waited_signal = 0;
-    errno = 0;
-    if (!expect_error_code("sigwait reserved signal",
-                           sigwait(&set, &waited_signal),
-                           EINVAL)) {
+    if (sigwait(&set, &waited_signal) != 0 ||
+        waited_signal != reserved_signum) {
+        fprintf(stderr,
+                "sigwait did not consume migrated reserved signal: got=%d expected=%d\n",
+                waited_signal,
+                reserved_signum);
         return 2;
     }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_errno_failure("sigwaitinfo reserved signal",
-                              sigwaitinfo(&set, NULL),
-                              EINVAL)) {
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigwait collision did not migrate PEAK reserved signal\n");
         return 2;
     }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_errno_failure("sigtimedwait reserved signal",
-                              sigtimedwait(&set, NULL, &zero_timeout),
-                              EINVAL)) {
+    if (pthread_sigmask(SIG_UNBLOCK, &set, NULL) != 0) {
+        perror("unblock migrated sigwait signal");
         return 2;
     }
-    expected_conflicts++;
 
-    errno = 0;
-    if (!expect_errno_failure("signalfd reserved signal",
-                              signalfd(-1, &set, 0),
-                              EINVAL)) {
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    if (block_reserved_signal() != 0) {
+        perror("block reserved signal for sigwaitinfo");
         return 2;
     }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_errno_failure("signalfd4 reserved signal",
-                              signalfd(-1, &set, SFD_CLOEXEC),
-                              EINVAL)) {
+    if (syscall(SYS_tgkill,
+                getpid(),
+                syscall(SYS_gettid),
+                reserved_signum) != 0) {
+        perror("queue reserved signal for sigwaitinfo");
         return 2;
     }
-    expected_conflicts++;
+    siginfo_t waited_info;
+    memset(&waited_info, 0, sizeof(waited_info));
+    if (sigwaitinfo(&set, &waited_info) != reserved_signum) {
+        perror("sigwaitinfo migrated reserved signal");
+        return 2;
+    }
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigwaitinfo collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
+    if (pthread_sigmask(SIG_UNBLOCK, &set, NULL) != 0) {
+        perror("unblock migrated sigwaitinfo signal");
+        return 2;
+    }
 
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    errno = 0;
+    int sfd = signalfd(-1, &set, 0);
+    if (sfd < 0) {
+        perror("signalfd reserved signal migrated");
+        return 2;
+    }
+    close(sfd);
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "signalfd collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
+
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    if (signalfd4_fn != NULL) {
+        errno = 0;
+        sfd = signalfd4_fn(-1, &set, (int)(_NSIG / 8), SFD_CLOEXEC);
+        if (sfd < 0) {
+            perror("signalfd4 reserved signal migrated");
+            return 2;
+        }
+        close(sfd);
+        migrated_signum = selected_signal();
+        if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+            fprintf(stderr,
+                    "signalfd4 collision did not migrate PEAK reserved signal\n");
+            return 2;
+        }
+    }
+
+    reserved_signum = migrated_signum;
     struct sigevent ev;
     timer_t timerid;
     memset(&ev, 0, sizeof(ev));
     ev.sigev_notify = SIGEV_SIGNAL;
     ev.sigev_signo = reserved_signum;
     errno = 0;
-    if (!expect_errno_failure("timer_create reserved SIGEV_SIGNAL",
-                              timer_create(CLOCK_MONOTONIC, &ev, &timerid),
-                              EINVAL)) {
+    if (timer_create(CLOCK_MONOTONIC, &ev, &timerid) != 0) {
+        perror("timer_create reserved SIGEV_SIGNAL migrated");
         return 2;
     }
-    expected_conflicts++;
+    timer_delete(timerid);
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "timer_create collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
 
 #ifdef SIGEV_THREAD_ID
+    reserved_signum = migrated_signum;
     memset(&ev, 0, sizeof(ev));
     ev.sigev_notify = SIGEV_THREAD_ID;
     ev.sigev_signo = reserved_signum;
-    ev._sigev_un._tid = getpid();
+    ev._sigev_un._tid = (int)syscall(SYS_gettid);
     errno = 0;
-    if (!expect_errno_failure("timer_create reserved SIGEV_THREAD_ID",
-                              timer_create(CLOCK_MONOTONIC, &ev, &timerid),
-                              EINVAL)) {
+    if (timer_create(CLOCK_MONOTONIC, &ev, &timerid) != 0) {
+        perror("timer_create reserved SIGEV_THREAD_ID migrated");
         return 2;
     }
-    expected_conflicts++;
+    timer_delete(timerid);
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "SIGEV_THREAD_ID collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
 #endif
 
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
     errno = 0;
-    if (!expect_errno_failure("sigsuspend reserved signal",
-                              sigsuspend(&set),
-                              EINVAL)) {
+    if (pselect(0, NULL, NULL, NULL, &zero_timeout, &set) != 0) {
+        perror("pselect reserved signal migrated");
         return 2;
     }
-    expected_conflicts++;
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "pselect collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
 
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
     errno = 0;
-    if (!expect_errno_failure("pselect reserved signal",
-                              pselect(0,
-                                      NULL,
-                                      NULL,
-                                      NULL,
-                                      &zero_timeout,
-                                      &set),
-                              EINVAL)) {
+    if (ppoll(NULL, 0, &zero_timeout, &set) != 0) {
+        perror("ppoll reserved signal migrated");
         return 2;
     }
-    expected_conflicts++;
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "ppoll collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
 
-    errno = 0;
-    if (!expect_errno_failure("ppoll reserved signal",
-                              ppoll(NULL, 0, &zero_timeout, &set),
-                              EINVAL)) {
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    sigset_t collision_set;
+    sigset_t collision_oldset;
+    sigemptyset(&collision_set);
+    sigaddset(&collision_set, collision_signum);
+    if (pthread_sigmask(SIG_BLOCK, &collision_set, &collision_oldset) != 0) {
+        perror("block collision signal for sigsuspend");
         return 2;
     }
-    expected_conflicts++;
+    if (raise(collision_signum) != 0) {
+        perror("queue collision signal for sigsuspend");
+        return 2;
+    }
+    errno = 0;
+    if (sigsuspend(&set) != -1 || errno != EINTR) {
+        fprintf(stderr,
+                "sigsuspend migrated reserved signal returned unexpected result: errno=%d\n",
+                errno);
+        return 2;
+    }
+    if (pthread_sigmask(SIG_SETMASK, &collision_oldset, NULL) != 0) {
+        perror("restore collision signal mask");
+        return 2;
+    }
+    migrated_signum = selected_signal();
+    if (migrated_signum <= 0 || migrated_signum == reserved_signum) {
+        fprintf(stderr,
+                "sigsuspend collision did not migrate PEAK reserved signal\n");
+        return 2;
+    }
 
     sigemptyset(&oldset);
     if (pthread_sigmask(SIG_BLOCK, NULL, &oldset) != 0) {
         perror("pthread_sigmask query");
         return 2;
     }
-    if (sigismember(&oldset, reserved_signum) == 1) {
-        fprintf(stderr, "reserved signal became blocked after denied policy calls\n");
+    if (sigismember(&oldset, migrated_signum) == 1) {
+        fprintf(stderr, "current PEAK signal became blocked after migration calls\n");
         return 2;
     }
-
-    errno = 0;
-    if (!expect_errno_failure("kill reserved signal",
-                              kill(getpid(), reserved_signum),
-                              EINVAL)) {
-        return 2;
-    }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_error_code("pthread_kill reserved signal",
-                           pthread_kill(pthread_self(), reserved_signum),
-                           EINVAL)) {
-        return 2;
-    }
-    expected_conflicts++;
-
-    union sigval value;
-    memset(&value, 0, sizeof(value));
-    errno = 0;
-    if (!expect_errno_failure("sigqueue reserved signal",
-                              sigqueue(getpid(), reserved_signum, value),
-                              EINVAL)) {
-        return 2;
-    }
-    expected_conflicts++;
-
-    errno = 0;
-    if (!expect_errno_failure("raise reserved signal",
-                              raise(reserved_signum),
-                              EINVAL)) {
-        return 2;
-    }
-    expected_conflicts++;
 
     if (unexpected_count() != unexpected_before) {
-        fprintf(stderr, "denied collision generated unexpected PEAK delivery\n");
+        fprintf(stderr, "migration collision generated unexpected PEAK delivery\n");
         return 2;
     }
     conflicts_after = conflict_count();
-    if (conflicts_after < conflicts_before + expected_conflicts) {
+    migrations_after = migration_count();
+    if (migrations_after <= migrations_before) {
         fprintf(stderr,
-                "expected at least %d recorded signal policy conflicts: before=%d after=%d\n",
-                expected_conflicts,
+                "expected signal policy migrations: before=%d after=%d\n",
+                migrations_before,
+                migrations_after);
+        return 2;
+    }
+    if (conflicts_after < conflicts_before + (migrations_after - migrations_before)) {
+        fprintf(stderr,
+                "expected conflicts to record migrations: before=%d after=%d migrations=%d\n",
                 conflicts_before,
-                conflicts_after);
+                conflicts_after,
+                migrations_after - migrations_before);
         return 2;
     }
 
@@ -1828,11 +1973,156 @@ collision_cleanup:
         return 2;
     }
 
-    printf("signal_user_collision_ok user_signal=%d reserved_signal=%d detach_success=1 reserved_steal_denied=1 mask_denied=1 wait_denied=1 signalfd_denied=1 timer_denied=1 send_denied=1 worker_calls=%lu conflicts=%d\n",
+    printf("signal_user_collision_ok user_signal=%d initial_reserved_signal=%d current_reserved_signal=%d detach_success=1 migration_count=%d handler_preserved=1 mask_preserved=1 wait_preserved=1 signalfd_preserved=1 timer_preserved=1 worker_calls=%lu conflicts=%d\n",
            collision_signum,
-           reserved_signum,
+           initial_reserved_signum,
+           selected_signal(),
+           migrations_after - migrations_before,
            (unsigned long)worker_state.calls,
            conflicts_after - conflicts_before);
+    return 0;
+}
+
+static int
+run_signal_forced_collision_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalConflictCountFn conflict_count =
+        (PeakSignalConflictCountFn)required_symbol(
+            "peak_signal_policy_conflict_count");
+    PeakSignalMigrationCountFn migration_count =
+        (PeakSignalMigrationCountFn)required_symbol(
+            "peak_signal_policy_migration_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    int reserved_signum;
+    int conflicts_before;
+    int migrations_before;
+    pthread_t worker;
+    WorkerState worker_state;
+    StartGate worker_gate;
+    int worker_started = 0;
+    int worker_gate_initialized = 0;
+    int ok = 0;
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        conflict_count == NULL ||
+        migration_count == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+
+    reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "forced signal backend did not reserve a signal\n");
+        return 2;
+    }
+    conflicts_before = conflict_count();
+    migrations_before = migration_count();
+
+    struct sigaction user_action;
+    memset(&user_action, 0, sizeof(user_action));
+    sigemptyset(&user_action.sa_mask);
+    user_action.sa_handler = user_collision_signal_handler;
+    errno = 0;
+    if (sigaction(reserved_signum, &user_action, NULL) == 0 ||
+        errno != EINVAL) {
+        fprintf(stderr,
+                "forced reserved signal collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+    if (selected_signal() != reserved_signum) {
+        fprintf(stderr, "forced signal collision unexpectedly migrated\n");
+        return 2;
+    }
+    if (migration_count() != migrations_before ||
+        conflict_count() <= conflicts_before) {
+        fprintf(stderr, "forced collision counters did not match fail-closed path\n");
+        return 2;
+    }
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
+    atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
+    if (start_gate_init(&worker_gate, 2) != 0) {
+        perror("start_gate_init forced collision worker");
+        return 2;
+    }
+    worker_gate_initialized = 1;
+    memset(&worker_state, 0, sizeof(worker_state));
+    worker_state.seed = 0x27182818u;
+    worker_state.start_gate = &worker_gate;
+    worker_state.paired_targets = 0;
+    worker_state.block_backend_signal = 0;
+    worker_state.wait_to_unblock_backend_signal = 0;
+    if (pthread_create(&worker, NULL, worker_main, &worker_state) != 0) {
+        perror("pthread_create forced collision worker");
+        goto forced_cleanup;
+    }
+    worker_started = 1;
+    start_gate_wait(&worker_gate);
+
+    unlink(trace_path);
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue forced collision detach request\n");
+        goto forced_cleanup;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr, "forced collision detach did not drain\n");
+        goto forced_cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "forced collision detach did not physically detach\n");
+        goto forced_cleanup;
+    }
+    if (!trace_has_physical_detach_success(trace_path)) {
+        fprintf(stderr,
+                "missing physical detach success trace after forced collision\n");
+        goto forced_cleanup;
+    }
+    ok = 1;
+
+forced_cleanup:
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (worker_gate_initialized) {
+        start_gate_abort(&worker_gate);
+    }
+    if (worker_started) {
+        pthread_join(worker, NULL);
+    }
+    if (worker_gate_initialized) {
+        start_gate_destroy(&worker_gate);
+    }
+    if (!ok) {
+        return 2;
+    }
+
+    printf("signal_forced_collision_ok forced_signal=%d detach_success=1 migration_count=0 denied=1 worker_calls=%lu conflicts=%d\n",
+           reserved_signum,
+           (unsigned long)worker_state.calls,
+           conflict_count() - conflicts_before);
     return 0;
 }
 
@@ -2376,6 +2666,9 @@ main(int argc, char** argv)
     }
     if (has_flag_arg(argc, argv, "--signal-user-collision-check")) {
         return run_signal_user_collision_check();
+    }
+    if (has_flag_arg(argc, argv, "--signal-forced-collision-check")) {
+        return run_signal_forced_collision_check();
     }
     if (has_flag_arg(argc, argv, "--signal-bad-cookie-check")) {
         return run_signal_bad_cookie_check();

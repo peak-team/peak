@@ -35,7 +35,7 @@ if(NOT output MATCHES "peak-shutdown-preload-main-ok")
           "preloaded program did not run target body\n${output}")
 endif()
 
-if(NOT output MATCHES "detach helper shutdown failed: error; leaving listener state alive")
+if(NOT output MATCHES "detach helper shutdown failed: .*; leaving listener state alive")
   message(FATAL_ERROR
           "expected idle helper SHUTDOWN failure to fail closed in peak_fini\n${output}")
 endif()

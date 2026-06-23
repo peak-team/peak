@@ -233,6 +233,16 @@ def check_signal_backend_strict_invariants(repo_root):
     controller_tests = (
         repo_root / "test/detach_controller/test_detach_controller.c"
     ).read_text(encoding="utf-8")
+    exported_syscall_wrapper = re.compile(
+        r"(?ms)^\s*(?:__attribute__\s*\(\([^;\n]*\)\)\s*)*"
+        r"(?:[A-Z_][A-Z0-9_]*\s+)*"
+        r"(?:long|int|ssize_t)\s+syscall\s*\([^;{}]*\)\s*\{"
+    )
+    for path in list((repo_root / "src").glob("**/*.[ch]")) + \
+            list((repo_root / "include").glob("**/*.[ch]")):
+        source = path.read_text(encoding="utf-8")
+        require(exported_syscall_wrapper.search(source) is None,
+                f"signal policy must not add a process-wide syscall interposer: {path}")
 
     signal_handler = extract_function(
         controller, "peak_detach_controller_signal_handler"
@@ -250,7 +260,12 @@ def check_signal_backend_strict_invariants(repo_root):
         controller, "peak_detach_controller_signal_evacuate"
     )
     pthread_start = extract_function(pthread_listener, "peak_pthread_start")
+    controller_mode = extract_function(controller, "peak_detach_controller_mode")
 
+    require("PEAK_SAFE_DETACH_MODE_STRICT" in controller_mode and
+            '"compatibility"' not in controller_mode and
+            '"legacy"' not in controller_mode,
+            "strict-auto must be the only runtime-selected detach mode")
     require("_Atomic int rewrite_status" in controller,
             "signal backend must keep observable per-thread rewrite status")
     require("peak_detach_controller_signal_wait_for_release" in signal_handler and
@@ -321,11 +336,19 @@ def check_signal_backend_strict_invariants(repo_root):
         require(f'__attribute__((visibility("default"))) int\n{wrapper}' in signal_policy or
                 f'__attribute__((visibility("default"))) void (*{wrapper}' in signal_policy,
                 f"signal policy must export {wrapper}")
-    require("sigev_notify == SIGEV_THREAD_ID" in signal_policy,
-            "timer_create wrapper must reject SIGEV_THREAD_ID reserved-signal timers")
-    require("peak_signal_policy_reject_reserved_set" in signal_policy and
+    require("peak_signal_policy_event_signal" in signal_policy and
+            '"timer_create"' in signal_policy and
+            "peak_signal_policy_prepare_reserved_signal_for_user(signum" in signal_policy and
+            "SIGEV_THREAD_ID" in signal_policy,
+            "timer_create wrapper must migrate explicit SIGEV_SIGNAL/SIGEV_THREAD_ID collisions")
+    require("peak_signal_policy_migrate_reserved_signal_locked" in signal_policy and
+            "peak_signal_policy_prepare_reserved_set_for_user" in signal_policy and
+            "peak_signal_policy_prepare_reserved_signal_for_user" in signal_policy and
+            "peak_signal_policy_migration_count" in signal_public_header and
+            "migration_candidate_signal" in signal_policy and
+            "migration_releasing_signal" in signal_policy and
             "sigdelset" not in signal_policy,
-            "signal policy must fail explicit reserved-signal mask/wait collisions instead of silently sanitizing user sets")
+            "signal policy must migrate away from explicit user collisions with transition guards instead of silently sanitizing user sets")
     require("real_symbols_once" in signal_policy and
             "pthread_once(&real_symbols_once" in signal_policy and
             "peak_signal_policy_ensure_real_symbols();\n    if (real_sigaction_fn == NULL)" in signal_policy,
@@ -334,19 +357,23 @@ def check_signal_backend_strict_invariants(repo_root):
             "pthread_once(&cookie_once" in signal_policy,
             "signal policy cookie base must be initialized exactly once")
     require("PEAK_REQUIRE_SAFE_DETACH" not in signal_policy and
-            "strcasecmp(backend, \"auto\") == 0" not in signal_policy and
+            "mode == NULL" in signal_policy and
+            "strcasecmp(mode, \"strict\") == 0" in signal_policy and
+            "strcasecmp(mode, \"auto\") == 0" in signal_policy and
             "strcasecmp(backend, \"signal\") == 0" in signal_policy and
-            "strcasecmp(mode, \"signal\") == 0" in signal_policy and
-            "strcasecmp(mode, \"helper\") == 0" not in signal_policy,
-            "signal policy must not reserve a signal early for helper-only strict mode")
-    require('__attribute__((visibility("default"))) long\nsyscall' not in signal_policy,
-            "signal policy must not interpose process-wide syscall with unsafe varargs forwarding")
+            "strcasecmp(mode, \"helper\") == 0" in signal_policy,
+            "signal policy must reserve early for strict-auto but not helper-only mode")
     require("peak_detach_controller_note_thread_creation_gate_installed(TRUE)" in pthread_listener,
             "pthread listener must publish successful pthread_create hook installation")
     require("peak_detach_controller_begin_thread_creation_gate" in controller,
             "controller must begin the new-thread gate before STOP")
     require("peak_detach_controller_end_thread_creation_gate" in controller,
             "controller must release the new-thread gate on finish/failure")
+    require("peak_signal_policy_push_migration_disabled" in controller and
+            "peak_signal_policy_pop_migration_disabled" in controller and
+            "peak_detach_controller_install_signal_backend_handler" in controller and
+            "peak_signal_policy_reserved_signal" in controller,
+            "controller must disable migration during mutation windows and resync migrated signal leases")
     require("peak_detach_controller_wait_for_mutation_window" in pthread_start,
             "pthread start wrapper must wait for strict mutation windows")
     require("peak_signal_policy_unblock_reserved_for_current_thread" in pthread_start,
@@ -403,14 +430,14 @@ def check_signal_backend_strict_invariants(repo_root):
             "signal-reserved-blocked" in runtime_hotloop,
             "blocked-signal runtime stress must prove fast fail-closed prepare failure")
     require("--signal-user-collision-check" in runtime_hotloop and
-            "reserved_steal_denied=1" in runtime_hotloop and
-            "mask_denied=1" in runtime_hotloop and
-            "wait_denied=1" in runtime_hotloop and
-            "signalfd_denied=1" in runtime_hotloop and
-            "timer_denied=1" in runtime_hotloop and
-            "send_denied=1" in runtime_hotloop and
+            "migration_count=" in runtime_hotloop and
+            "handler_preserved=1" in runtime_hotloop and
+            "mask_preserved=1" in runtime_hotloop and
+            "wait_preserved=1" in runtime_hotloop and
+            "signalfd_preserved=1" in runtime_hotloop and
+            "timer_preserved=1" in runtime_hotloop and
             "worker_calls" in runtime_hotloop,
-            "user signal collision runtime test must prove PEAK keeps working after denied collisions across libc signal surfaces")
+            "user signal collision runtime test must prove PEAK migrates and keeps working while preserving libc signal behavior")
     require("--signal-bad-cookie-check" in runtime_hotloop and
             "peak_signal_policy_test_send_bad_cookie_to_current_thread" in runtime_hotloop and
             "trace_has_detach_prepare_unexpected_signal" in runtime_hotloop and

@@ -30,5 +30,7 @@ PEAK_SIGNAL_POLICY_INTERNAL int peak_signal_policy_cookie_matches(const siginfo_
                                                                   pid_t tid);
 PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_note_unexpected_delivery(void);
 PEAK_SIGNAL_POLICY_INTERNAL int peak_signal_policy_unblock_reserved_for_current_thread(void);
+PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_push_migration_disabled(void);
+PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_pop_migration_disabled(void);
 
 #endif /* __PEAK_SIGNAL_POLICY_INTERNAL_H */

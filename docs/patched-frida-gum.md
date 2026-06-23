@@ -24,8 +24,9 @@ The downloaded Frida Gum 16.5.9 archives are pinned with SHA-256 hashes in
 
 If a caller supplies `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` while
 leaving `PEAK_FRIDA_GUM_PROVIDER=auto`, PEAK treats that as a caller-managed
-compatibility build. It validates the PEAK API only when
-`PEAK_REQUIRE_GUM_PEAK_API=ON` is also set. Selecting
+stock-Gum build. It validates the PEAK API only when
+`PEAK_REQUIRE_GUM_PEAK_API=ON` is also set; without the PEAK API, strict runtime
+mutation fails closed with `missing-gum-api`. Selecting
 `PEAK_FRIDA_GUM_PROVIDER=auto-patched-devkit` requires CMake to own the downloaded
 devkit so it can append the overlay.
 
@@ -108,15 +109,17 @@ the PEAK API.
 
 ## Runtime Behavior
 
-PEAK wires the selected Gum provider into runtime capability checks. When
-`PEAK_REQUIRE_SAFE_DETACH=1` or
-`PEAK_SAFE_DETACH_MODE=strict` / `helper` / `debugger` / `signal` is set, PEAK
-refuses Gum mutation if the selected Gum headers do not expose the PEAK API.
+PEAK wires the selected Gum provider into runtime capability checks. Strict
+mode is the default, so PEAK refuses target Gum mutation if the selected Gum
+headers do not expose the PEAK API.
 `PEAK_DETACH_BACKEND=helper` forces the external ptrace helper,
 `PEAK_DETACH_BACKEND=signal` forces the in-process strict signal backend, and
-plain `strict` uses `auto`: helper by default, with signal selected up front
-only when Linux `ptrace_scope` is detected as blocking helper attachment.
-Helper startup, protocol, timeout, or STOP failures remain helper failures.
+plain unset/`strict`/`auto` uses `auto`: helper by default, with signal selected
+up front when Linux `ptrace_scope` is detected as blocking helper attachment.
+Auto also falls back to signal when helper startup is unavailable or a
+structured helper STOP response reports permission denied, timeout, or
+unsupported. Helper protocol loss or no-response after STOP remains fail-stop
+because the controller cannot prove whether target threads were already stopped.
 
 With stock Gum, strict mode still fails closed with `missing-gum-api`. With a
 patched devkit, PEAK uses a strict stop backend to hold every non-controller
@@ -134,11 +137,14 @@ guards that lease through the common dynamically linked libc signal APIs, and
 sends thread-directed stop requests with hidden `rt_tgsigqueueinfo` cookies so
 unrelated user signal traffic cannot satisfy a PEAK parked-thread slot. User
 attempts through those libc APIs to steal, block, wait on, signalfd-use,
-timer-generate, or send the reserved signal are rejected with `EINVAL`; denied
-collisions are recorded but do not poison signal detach. Direct raw syscalls or
-inline assembly are outside this wrapper boundary, but an actual delivered
-reserved signal without a valid PEAK cookie contaminates the signal backend and
-makes signal-backed mutation fail closed. The backend parks threads in an
+timer-generate, or send the reserved signal cause PEAK to migrate its lease to
+another available unblocked RT signal before forwarding the user call. If PEAK
+cannot migrate because the signal was forced, no replacement is available, or a
+mutation window is active, the user call fails with `EINVAL` and signal-backed
+mutation remains fail-closed. Direct raw syscalls or inline assembly are outside
+this wrapper boundary, but an actual delivered reserved signal without a valid
+PEAK cookie contaminates the signal backend and makes signal-backed mutation
+fail closed. The backend parks threads in an
 async-signal-safe atomic corridor, confirms each required PC rewrite before
 release, revalidates `/proc/self/task` immediately before byte writes, and
 holds PEAK's pthread-start gate until `finish_hook_mutation` releases the

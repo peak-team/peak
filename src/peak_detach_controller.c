@@ -27,7 +27,7 @@ typedef enum {
 } PeakSafeDetachMode;
 
 static gsize mode_initialized = 0;
-static PeakSafeDetachMode configured_mode = PEAK_SAFE_DETACH_MODE_COMPATIBILITY;
+static PeakSafeDetachMode configured_mode = PEAK_SAFE_DETACH_MODE_STRICT;
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
 static gboolean warned_missing_gum_api = FALSE;
 #else
@@ -202,11 +202,13 @@ peak_detach_controller_lock_mutation_guard(void)
     (void)pthread_once(&mutation_guard_mutex_initialized,
                        peak_detach_controller_init_mutation_guard);
     (void)pthread_mutex_lock(&mutation_guard_mutex);
+    peak_signal_policy_push_migration_disabled();
 }
 
 static void
 peak_detach_controller_unlock_mutation_guard(void)
 {
+    peak_signal_policy_pop_migration_disabled();
     (void)pthread_mutex_unlock(&mutation_guard_mutex);
 }
 
@@ -370,7 +372,8 @@ peak_detach_controller_test_signal_backend_signum(void)
 {
     (void)pthread_once(&signal_backend_initialized,
                        peak_detach_controller_init_signal_backend_once);
-    return signal_backend_signum;
+    int reserved = peak_signal_policy_reserved_signal();
+    return reserved > 0 ? reserved : signal_backend_signum;
 }
 #endif
 
@@ -442,30 +445,22 @@ peak_detach_controller_reset_inherited_helper_if_needed(void)
 }
 #endif
 
-static gboolean
-peak_detach_controller_env_truthy(const char* value)
-{
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "1") == 0 ||
-            g_ascii_strcasecmp(value, "true") == 0 ||
-            g_ascii_strcasecmp(value, "yes") == 0 ||
-            g_ascii_strcasecmp(value, "on") == 0);
-}
-
 static PeakSafeDetachMode
 peak_detach_controller_mode(void)
 {
     if (g_once_init_enter(&mode_initialized)) {
-        const char* strict_env = g_getenv("PEAK_REQUIRE_SAFE_DETACH");
         const char* mode_env = g_getenv("PEAK_SAFE_DETACH_MODE");
-        PeakSafeDetachMode mode = PEAK_SAFE_DETACH_MODE_COMPATIBILITY;
+        PeakSafeDetachMode mode = PEAK_SAFE_DETACH_MODE_STRICT;
 
-        if (peak_detach_controller_env_truthy(strict_env) ||
-            (mode_env != NULL &&
-             (g_ascii_strcasecmp(mode_env, "strict") == 0 ||
-              g_ascii_strcasecmp(mode_env, "helper") == 0 ||
-              g_ascii_strcasecmp(mode_env, "debugger") == 0 ||
-              g_ascii_strcasecmp(mode_env, "signal") == 0))) {
+        if (mode_env == NULL || mode_env[0] == '\0' ||
+            g_ascii_strcasecmp(mode_env, "strict") == 0 ||
+            g_ascii_strcasecmp(mode_env, "auto") == 0 ||
+            g_ascii_strcasecmp(mode_env, "helper") == 0 ||
+            g_ascii_strcasecmp(mode_env, "debugger") == 0 ||
+            g_ascii_strcasecmp(mode_env, "ptrace") == 0 ||
+            g_ascii_strcasecmp(mode_env, "signal") == 0 ||
+            g_ascii_strcasecmp(mode_env, "signals") == 0 ||
+            g_ascii_strcasecmp(mode_env, "in-process") == 0) {
             mode = PEAK_SAFE_DETACH_MODE_STRICT;
         }
 
@@ -536,6 +531,14 @@ peak_detach_controller_auto_should_use_signal_backend(void)
     }
 #endif
     return FALSE;
+}
+
+static gboolean
+peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus status)
+{
+    return status == PEAK_DETACH_STATUS_PERMISSION_DENIED ||
+           status == PEAK_DETACH_STATUS_TIMEOUT ||
+           status == PEAK_DETACH_STATUS_UNSUPPORTED;
 }
 
 static size_t
@@ -740,6 +743,17 @@ peak_detach_controller_write_exact(int fd, const void* buffer, size_t size)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EPERM || errno == ENOTSOCK) {
+                n = write(fd, cursor + done, size - done);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    return FALSE;
+                }
+                done += (size_t)n;
+                continue;
+            }
             return FALSE;
         }
         done += (size_t)n;
@@ -817,7 +831,7 @@ peak_detach_controller_helper_status_to_detach_status(uint32_t helper_status)
     }
 }
 
-static void
+static void __attribute__((noreturn))
 peak_detach_controller_mark_helper_fatal(const char* reason,
                                          PeakDetachStatus status)
 {
@@ -1033,6 +1047,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     PeakDetachHelperResponse handshake;
 
     peak_detach_controller_reset_inherited_helper_if_needed();
+    memset(&handshake, 0, sizeof(handshake));
     if (helper_fd >= 0 && helper_pid > 0) {
         return TRUE;
     }
@@ -1062,6 +1077,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
 
     helper_env = peak_detach_controller_build_helper_env();
     if (helper_env == NULL) {
+        peak_detach_controller_note_failure_detail(
+            "helper-env-build",
+            0,
+            (uintptr_t)errno,
+            0);
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_ERROR;
         }
@@ -1069,7 +1089,12 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     }
 
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
-        free(helper_env);
+        peak_detach_controller_note_failure_detail(
+            "helper-socketpair",
+            0,
+            (uintptr_t)errno,
+            0);
+        peak_detach_controller_free_helper_env(helper_env);
         if (status_out != NULL) {
             *status_out = errno == EACCES || errno == EPERM ?
                 PEAK_DETACH_STATUS_PERMISSION_DENIED :
@@ -1081,6 +1106,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     snprintf(fd_arg, sizeof(fd_arg), "%d", PEAK_DETACH_HELPER_PROTOCOL_FD);
     pid = fork();
     if (pid < 0) {
+        peak_detach_controller_note_failure_detail(
+            "helper-fork",
+            0,
+            (uintptr_t)errno,
+            0);
         peak_detach_controller_free_helper_env(helper_env);
         close(sockets[0]);
         close(sockets[1]);
@@ -1111,13 +1141,16 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
 
 #ifdef PR_SET_PTRACER
     if (prctl(PR_SET_PTRACER, helper_pid, 0, 0, 0) != 0 &&
-        errno != EINVAL && errno != ENOSYS) {
-        PeakDetachStatus status = errno == EACCES || errno == EPERM ?
-            PEAK_DETACH_STATUS_PERMISSION_DENIED :
-            PEAK_DETACH_STATUS_ERROR;
+        errno != EINVAL && errno != ENOSYS &&
+        errno != EACCES && errno != EPERM) {
+        peak_detach_controller_note_failure_detail(
+            "helper-prctl",
+            0,
+            (uintptr_t)errno,
+            0);
         peak_detach_controller_close_helper();
         if (status_out != NULL) {
-            *status_out = status;
+            *status_out = PEAK_DETACH_STATUS_ERROR;
         }
         return FALSE;
     }
@@ -1130,6 +1163,18 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         handshake.version != PEAK_DETACH_HELPER_VERSION ||
         handshake.status != PEAK_DETACH_HELPER_STATUS_OK) {
         PeakDetachStatus status = peak_detach_controller_errno_status();
+        int child_status = 0;
+        uintptr_t child_detail = (uintptr_t)errno;
+        pid_t waited = helper_pid > 0 ?
+            waitpid(helper_pid, &child_status, WNOHANG) : -1;
+        if (waited == helper_pid) {
+            child_detail = (uintptr_t)child_status;
+        }
+        peak_detach_controller_note_failure_detail(
+            "helper-handshake",
+            0,
+            child_detail,
+            (uintptr_t)handshake.status);
         peak_detach_controller_close_helper();
         if (status_out != NULL) {
             *status_out = status;
@@ -1742,6 +1787,12 @@ peak_detach_controller_signal_trap_handler(int signo, siginfo_t* info, void* con
                                                          FALSE);
 }
 
+static gboolean
+peak_detach_controller_install_signal_backend_handler(int candidate);
+
+static gboolean
+peak_detach_controller_install_signal_trap_handler(int candidate);
+
 static void
 peak_detach_controller_init_signal_backend_once(void)
 {
@@ -1756,6 +1807,19 @@ peak_detach_controller_init_signal_backend_once(void)
         return;
     }
 
+    if (!peak_detach_controller_install_signal_backend_handler(candidate)) {
+        peak_signal_policy_clear_reserved_signal();
+        signal_backend_signum = 0;
+        return;
+    }
+    (void)peak_detach_controller_install_signal_trap_handler(candidate);
+
+    signal_backend_signum = candidate;
+}
+
+static gboolean
+peak_detach_controller_install_signal_backend_handler(int candidate)
+{
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     sigemptyset(&action.sa_mask);
@@ -1766,38 +1830,44 @@ peak_detach_controller_init_signal_backend_once(void)
     int install_rc = sigaction(candidate, &action, NULL);
     peak_signal_policy_leave_internal();
     if (install_rc != 0) {
-        peak_signal_policy_clear_reserved_signal();
-        signal_backend_signum = 0;
-        return;
+        return FALSE;
     }
     (void)peak_signal_policy_unblock_reserved_for_current_thread();
+    return TRUE;
+}
 
-    memset(&previous_trap_action, 0, sizeof(previous_trap_action));
+static gboolean
+peak_detach_controller_install_signal_trap_handler(int candidate)
+{
     signal_breakpoint_supported = FALSE;
-    signal_trap_handler_installed = 0;
-    peak_signal_policy_enter_internal();
-    int trap_query_rc = sigaction(SIGTRAP, NULL, &previous_trap_action);
-    peak_signal_policy_leave_internal();
-    if (trap_query_rc == 0) {
-        struct sigaction trap_action;
-
-        memset(&trap_action, 0, sizeof(trap_action));
-        sigemptyset(&trap_action.sa_mask);
-        sigaddset(&trap_action.sa_mask, SIGTRAP);
-        sigaddset(&trap_action.sa_mask, candidate);
-        trap_action.sa_sigaction = peak_detach_controller_signal_trap_handler;
-        trap_action.sa_flags = SA_SIGINFO | SA_RESTART;
+    if (!signal_trap_handler_installed) {
+        memset(&previous_trap_action, 0, sizeof(previous_trap_action));
         peak_signal_policy_enter_internal();
-        int trap_install_rc = sigaction(SIGTRAP, &trap_action, NULL);
+        int trap_query_rc = sigaction(SIGTRAP, NULL, &previous_trap_action);
         peak_signal_policy_leave_internal();
-        if (trap_install_rc == 0) {
-            signal_trap_handler_installed = 1;
-            signal_breakpoint_supported =
-                peak_detach_controller_signal_breakpoint_arch_supported();
+        if (trap_query_rc != 0) {
+            return FALSE;
         }
     }
 
-    signal_backend_signum = candidate;
+    struct sigaction trap_action;
+    memset(&trap_action, 0, sizeof(trap_action));
+    sigemptyset(&trap_action.sa_mask);
+    sigaddset(&trap_action.sa_mask, SIGTRAP);
+    sigaddset(&trap_action.sa_mask, candidate);
+    trap_action.sa_sigaction = peak_detach_controller_signal_trap_handler;
+    trap_action.sa_flags = SA_SIGINFO | SA_RESTART;
+    peak_signal_policy_enter_internal();
+    int trap_install_rc = sigaction(SIGTRAP, &trap_action, NULL);
+    peak_signal_policy_leave_internal();
+    if (trap_install_rc == 0) {
+        signal_trap_handler_installed = 1;
+        signal_breakpoint_supported =
+            peak_detach_controller_signal_breakpoint_arch_supported();
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 static gboolean
@@ -1811,6 +1881,30 @@ peak_detach_controller_ensure_signal_backend(PeakDetachStatus* status_out)
         }
         return FALSE;
     }
+
+    int reserved_signum = peak_signal_policy_reserved_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+        }
+        return FALSE;
+    }
+    if (reserved_signum != signal_backend_signum) {
+        if (!peak_detach_controller_install_signal_backend_handler(reserved_signum)) {
+            peak_detach_controller_note_failure_detail(
+                "signal-handler-not-installed",
+                0,
+                (uintptr_t)reserved_signum,
+                0);
+            if (status_out != NULL) {
+                *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+            }
+            return FALSE;
+        }
+        (void)peak_detach_controller_install_signal_trap_handler(reserved_signum);
+        signal_backend_signum = reserved_signum;
+    }
+
     gboolean handler_installed =
         peak_detach_controller_signal_handler_is_installed();
     int unexpected_deliveries =
@@ -3548,11 +3642,17 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         }
         stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
     } else if (!peak_detach_controller_ensure_helper(&status)) {
-        if (status_out != NULL) {
-            *status_out = status;
+        if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+            peak_detach_controller_status_allows_auto_signal_fallback(status) &&
+            peak_detach_controller_ensure_signal_backend(&status)) {
+            stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+        } else {
+            if (status_out != NULL) {
+                *status_out = status;
+            }
+            peak_detach_controller_unlock_mutation_guard();
+            return FALSE;
         }
-        peak_detach_controller_unlock_mutation_guard();
-        return FALSE;
     }
 
     if (!peak_detach_controller_capture_gum_snapshot(request,
@@ -3590,6 +3690,43 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         if (!peak_detach_controller_stop_threads(snapshots,
                                                  &snapshot_count,
                                                  &status)) {
+            if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+                peak_detach_controller_status_allows_auto_signal_fallback(status)) {
+                peak_detach_controller_close_helper();
+                if (peak_detach_controller_ensure_signal_backend(&status) &&
+                    peak_detach_controller_signal_stop_threads(snapshots,
+                                                               &snapshot_count,
+                                                               &status)) {
+                    stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+                } else {
+                    held_mutation_started_at = 0.0;
+                    if (creation_gate_active) {
+                        peak_detach_controller_end_thread_creation_gate();
+                        creation_gate_active = FALSE;
+                    }
+                    if (status_out != NULL) {
+                        *status_out = status;
+                    }
+                    peak_detach_controller_unlock_mutation_guard();
+                    return FALSE;
+                }
+            } else {
+                held_mutation_started_at = 0.0;
+                if (creation_gate_active) {
+                    peak_detach_controller_end_thread_creation_gate();
+                    creation_gate_active = FALSE;
+                }
+                if (status_out != NULL) {
+                    *status_out = status;
+                }
+                peak_detach_controller_unlock_mutation_guard();
+                return FALSE;
+            }
+        } else {
+            stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
+        }
+
+        if (stop_backend == PEAK_DETACH_HOLD_BACKEND_NONE) {
             held_mutation_started_at = 0.0;
             if (creation_gate_active) {
                 peak_detach_controller_end_thread_creation_gate();
@@ -3600,8 +3737,6 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
             }
             peak_detach_controller_unlock_mutation_guard();
             return FALSE;
-        } else {
-            stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
         }
     }
 
@@ -3654,6 +3789,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     held_mutation.instruction_count = 0;
     held_mutation.active = TRUE;
     held_mutation.backend = stop_backend;
+    peak_signal_policy_push_migration_disabled();
 
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -3849,16 +3985,20 @@ peak_detach_controller_prepare_hook_mutation_batch(
         goto fail_without_stop_locked;
     }
 
-    if (requested_backend != PEAK_DETACH_REQUESTED_BACKEND_SIGNAL &&
-        !auto_use_signal_backend &&
-        !peak_detach_controller_ensure_helper(&status)) {
-        goto fail_all_locked;
-    } else if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL ||
-               auto_use_signal_backend) {
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL ||
+        auto_use_signal_backend) {
         if (!peak_detach_controller_ensure_signal_backend(&status)) {
             goto fail_all_locked;
         }
         stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+    } else if (!peak_detach_controller_ensure_helper(&status)) {
+        if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+            peak_detach_controller_status_allows_auto_signal_fallback(status) &&
+            peak_detach_controller_ensure_signal_backend(&status)) {
+            stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+        } else {
+            goto fail_all_locked;
+        }
     }
 
     physical_patch_snapshot = malloc(sizeof(physical_patch_records));
@@ -3884,8 +4024,22 @@ peak_detach_controller_prepare_hook_mutation_batch(
     } else if (!peak_detach_controller_stop_threads(snapshots,
                                                     &snapshot_count,
                                                     &status)) {
-        held_mutation_started_at = 0.0;
-        goto fail_all_locked;
+        if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+            peak_detach_controller_status_allows_auto_signal_fallback(status)) {
+            peak_detach_controller_close_helper();
+            if (peak_detach_controller_ensure_signal_backend(&status) &&
+                peak_detach_controller_signal_stop_threads(snapshots,
+                                                           &snapshot_count,
+                                                           &status)) {
+                stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+            } else {
+                held_mutation_started_at = 0.0;
+                goto fail_all_locked;
+            }
+        } else {
+            held_mutation_started_at = 0.0;
+            goto fail_all_locked;
+        }
     } else {
         stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
     }
@@ -3999,6 +4153,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
     aggregate.operation = PEAK_DETACH_OPERATION_DETACH;
     aggregate.backend = stop_backend;
     held_mutation = aggregate;
+    peak_signal_policy_push_migration_disabled();
 
     for (size_t i = 0; i < usable_count; i++) {
         if (candidates[i].safe) {
@@ -4208,6 +4363,7 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
         held_mutation.operation = PEAK_DETACH_OPERATION_ATTACH;
         held_mutation.backend = PEAK_DETACH_HOLD_BACKEND_NONE;
         held_mutation.instruction_count = 0;
+        peak_signal_policy_pop_migration_disabled();
     }
 
     peak_detach_controller_unlock_mutation_guard();

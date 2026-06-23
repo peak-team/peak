@@ -85,14 +85,6 @@ if(TARGET peak_detach_helper)
   )
 endif()
 
-add_test(NAME test_detach_controller_compatibility
-  COMMAND test_detach_controller compatibility
-)
-set_tests_properties(test_detach_controller_compatibility
-  PROPERTIES
-    ENVIRONMENT "PEAK_REQUIRE_SAFE_DETACH=0;PEAK_SAFE_DETACH_MODE=compatibility"
-)
-
 add_test(NAME test_detach_controller_strict_mode
   COMMAND test_detach_controller strict
 )
@@ -259,7 +251,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
         SKIP_RETURN_CODE 77)
   endforeach()
 
-  foreach(_auto_fallback_scenario IN ITEMS stop-permission stop-timeout)
+  foreach(_auto_fallback_scenario IN ITEMS stop-permission stop-timeout stop-unsupported)
     add_test(NAME test_detach_controller_fake_helper_auto_fallback_${_auto_fallback_scenario}
       COMMAND test_detach_controller fake-helper-auto-fallback)
     set_tests_properties(test_detach_controller_fake_helper_auto_fallback_${_auto_fallback_scenario}
@@ -267,6 +259,20 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
         ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_auto_fallback_scenario}"
         SKIP_RETURN_CODE 77)
   endforeach()
+
+  add_fatal_safe_detach_test(
+    test_detach_controller_fake_helper_auto_stop_missing_response_fatal
+    fake-helper-fail-closed
+    stop-missing-response
+    -DDETACH_BACKEND=auto
+    -DEXPECTED_FATAL_DETAIL=stop.response.failure)
+
+  add_test(NAME test_detach_controller_auto_missing_helper_falls_back_signal
+    COMMAND test_detach_controller fake-helper-auto-fallback)
+  set_tests_properties(test_detach_controller_auto_missing_helper_falls_back_signal
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;FAKE_DETACH_HELPER_SCENARIO=stop-permission"
+      SKIP_RETURN_CODE 77)
 
   add_test(NAME test_detach_controller_auto_ptrace_scope_uses_signal
     COMMAND test_detach_controller fake-helper-auto-fallback)
@@ -322,6 +328,22 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_fake_helper_batch_detach
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
+  foreach(_auto_fallback_scenario IN ITEMS stop-permission stop-timeout stop-unsupported)
+    add_test(NAME test_detach_controller_fake_helper_batch_auto_fallback_${_auto_fallback_scenario}
+      COMMAND test_detach_controller fake-helper-batch-detach)
+    set_tests_properties(test_detach_controller_fake_helper_batch_auto_fallback_${_auto_fallback_scenario}
+      PROPERTIES
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=${_auto_fallback_scenario}"
+        SKIP_RETURN_CODE 77)
+  endforeach()
+
+  add_test(NAME test_detach_controller_fake_helper_batch_auto_missing_helper_falls_back_signal
+    COMMAND test_detach_controller fake-helper-batch-detach)
+  set_tests_properties(test_detach_controller_fake_helper_batch_auto_missing_helper_falls_back_signal
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;FAKE_DETACH_HELPER_SCENARIO=stop-permission"
+      SKIP_RETURN_CODE 77)
 
   add_fatal_safe_detach_test(
     test_detach_controller_fake_helper_batch_detach_resume-release-failed
@@ -387,5 +409,5 @@ add_test(NAME test_detach_controller_invalid_request
 )
 set_tests_properties(test_detach_controller_invalid_request
   PROPERTIES
-    ENVIRONMENT "PEAK_REQUIRE_SAFE_DETACH=0;PEAK_SAFE_DETACH_MODE=compatibility"
+    ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict"
 )
