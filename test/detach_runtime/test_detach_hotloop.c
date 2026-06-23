@@ -2,9 +2,12 @@
 #include "frida-gum.h"
 #include "general_listener.h"
 
+#include <aio.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <mqueue.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -448,6 +451,25 @@ typedef struct {
     unsigned int timeout_ms;
     gboolean drained;
 } ControllerDrainState;
+
+static int
+expect_signal_migrated(const char* label,
+                       PeakSignalBackendSignumFn selected_signal,
+                       int previous_signum,
+                       int* migrated_signum)
+{
+    int current = selected_signal();
+    if (current <= 0 || current == previous_signum) {
+        fprintf(stderr,
+                "%s collision did not migrate PEAK reserved signal: previous=%d current=%d\n",
+                label,
+                previous_signum,
+                current);
+        return 0;
+    }
+    *migrated_signum = current;
+    return 1;
+}
 
 static int
 set_pointer_env(const char* name, gpointer pointer)
@@ -1822,6 +1844,109 @@ run_signal_user_collision_check(void)
 #endif
 
     reserved_signum = migrated_signum;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = reserved_signum;
+    errno = 0;
+    (void)mq_notify((mqd_t)-1, &ev);
+    if (!expect_signal_migrated("mq_notify",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+
+#ifdef SYS_rt_sigprocmask
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    errno = 0;
+    (void)syscall(SYS_rt_sigprocmask,
+                  SIG_BLOCK,
+                  &set,
+                  NULL,
+                  sizeof(unsigned long));
+    if (!expect_signal_migrated("syscall:rt_sigprocmask",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+    if (pthread_sigmask(SIG_UNBLOCK, &set, NULL) != 0) {
+        perror("unblock raw rt_sigprocmask user signal");
+        return 2;
+    }
+#endif
+
+#ifdef SYS_rt_sigtimedwait
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    errno = 0;
+    (void)syscall(SYS_rt_sigtimedwait,
+                  &set,
+                  NULL,
+                  &zero_timeout,
+                  sizeof(unsigned long));
+    if (!expect_signal_migrated("syscall:rt_sigtimedwait",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+#endif
+
+#ifdef SYS_signalfd4
+    reserved_signum = migrated_signum;
+    sigemptyset(&set);
+    sigaddset(&set, reserved_signum);
+    errno = 0;
+    (void)syscall(SYS_signalfd4,
+                  -1,
+                  &set,
+                  sizeof(unsigned long),
+                  SFD_CLOEXEC);
+    if (!expect_signal_migrated("syscall:signalfd4",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+#endif
+
+#ifdef SYS_timer_create
+    reserved_signum = migrated_signum;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = reserved_signum;
+    errno = 0;
+    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &timerid) == 0) {
+        timer_delete(timerid);
+    }
+    if (!expect_signal_migrated("syscall:timer_create",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+#endif
+
+#ifdef SYS_mq_notify
+    reserved_signum = migrated_signum;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = reserved_signum;
+    errno = 0;
+    (void)syscall(SYS_mq_notify, (mqd_t)-1, &ev);
+    if (!expect_signal_migrated("syscall:mq_notify",
+                                selected_signal,
+                                reserved_signum,
+                                &migrated_signum)) {
+        return 2;
+    }
+#endif
+
+    reserved_signum = migrated_signum;
     sigemptyset(&set);
     sigaddset(&set, reserved_signum);
     errno = 0;
@@ -1973,7 +2098,7 @@ collision_cleanup:
         return 2;
     }
 
-    printf("signal_user_collision_ok user_signal=%d initial_reserved_signal=%d current_reserved_signal=%d detach_success=1 migration_count=%d handler_preserved=1 mask_preserved=1 wait_preserved=1 signalfd_preserved=1 timer_preserved=1 worker_calls=%lu conflicts=%d\n",
+    printf("signal_user_collision_ok user_signal=%d initial_reserved_signal=%d current_reserved_signal=%d detach_success=1 migration_count=%d handler_preserved=1 mask_preserved=1 wait_preserved=1 signalfd_preserved=1 timer_preserved=1 mq_migrated=1 syscall_migrated=1 worker_calls=%lu conflicts=%d\n",
            collision_signum,
            initial_reserved_signum,
            selected_signal(),
@@ -2010,6 +2135,7 @@ run_signal_forced_collision_check(void)
     pthread_t worker;
     WorkerState worker_state;
     StartGate worker_gate;
+    struct timespec zero_timeout = { 0, 0 };
     int worker_started = 0;
     int worker_gate_initialized = 0;
     int ok = 0;
@@ -2037,6 +2163,64 @@ run_signal_forced_collision_check(void)
         fprintf(stderr, "forced signal backend did not reserve a signal\n");
         return 2;
     }
+#ifdef SYS_rt_sigprocmask
+    errno = 0;
+    if (syscall(SYS_rt_sigprocmask,
+                SIG_BLOCK,
+                (void*)1,
+                NULL,
+                sizeof(unsigned long)) != -1) {
+        fprintf(stderr, "invalid raw rt_sigprocmask pointer was not rejected\n");
+        return 2;
+    }
+#endif
+#ifdef SYS_rt_sigtimedwait
+    errno = 0;
+    if (syscall(SYS_rt_sigtimedwait,
+                (void*)1,
+                NULL,
+                &zero_timeout,
+                sizeof(unsigned long)) != -1) {
+        fprintf(stderr, "invalid raw rt_sigtimedwait pointer was not rejected\n");
+        return 2;
+    }
+#endif
+#ifdef SYS_timer_create
+    timer_t invalid_timerid;
+    errno = 0;
+    if (syscall(SYS_timer_create,
+                CLOCK_MONOTONIC,
+                (void*)1,
+                &invalid_timerid) != -1) {
+        timer_delete(invalid_timerid);
+        fprintf(stderr, "invalid raw timer_create sigevent pointer was accepted\n");
+        return 2;
+    }
+#endif
+#ifdef SYS_mq_notify
+    errno = 0;
+    if (syscall(SYS_mq_notify, (mqd_t)-1, (void*)1) != -1) {
+        fprintf(stderr, "invalid raw mq_notify sigevent pointer was accepted\n");
+        return 2;
+    }
+#endif
+#ifdef SYS_pselect6
+    errno = 0;
+    if (syscall(SYS_pselect6,
+                0,
+                NULL,
+                NULL,
+                NULL,
+                &zero_timeout,
+                (void*)1) != -1) {
+        fprintf(stderr, "invalid raw pselect6 sigmask pointer was accepted\n");
+        return 2;
+    }
+#endif
+    if (selected_signal() != reserved_signum) {
+        fprintf(stderr, "invalid-pointer raw syscall probes migrated PEAK signal\n");
+        return 2;
+    }
     conflicts_before = conflict_count();
     migrations_before = migration_count();
 
@@ -2054,6 +2238,90 @@ run_signal_forced_collision_check(void)
     }
     if (selected_signal() != reserved_signum) {
         fprintf(stderr, "forced signal collision unexpectedly migrated\n");
+        return 2;
+    }
+    errno = 0;
+#ifdef SYS_tgkill
+    if (syscall(SYS_tgkill,
+                getpid(),
+                syscall(SYS_gettid),
+                reserved_signum) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr,
+                "forced raw tgkill collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+#endif
+#ifdef SYS_rt_tgsigqueueinfo
+    siginfo_t raw_info;
+    memset(&raw_info, 0, sizeof(raw_info));
+    raw_info.si_signo = reserved_signum;
+    raw_info.si_code = SI_QUEUE;
+    raw_info.si_pid = getpid();
+    raw_info.si_uid = getuid();
+    errno = 0;
+    if (syscall(SYS_rt_tgsigqueueinfo,
+                getpid(),
+                syscall(SYS_gettid),
+                reserved_signum,
+                &raw_info) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr,
+                "forced raw rt_tgsigqueueinfo collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+#endif
+    struct sigevent forced_ev;
+    memset(&forced_ev, 0, sizeof(forced_ev));
+    forced_ev.sigev_notify = SIGEV_SIGNAL;
+    forced_ev.sigev_signo = reserved_signum;
+    errno = 0;
+    if (mq_notify((mqd_t)-1, &forced_ev) != -1 || errno != EINVAL) {
+        fprintf(stderr,
+                "forced mq_notify collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+
+    struct aiocb forced_aiocb;
+    memset(&forced_aiocb, 0, sizeof(forced_aiocb));
+    forced_aiocb.aio_fildes = -1;
+    forced_aiocb.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+    forced_aiocb.aio_sigevent.sigev_signo = reserved_signum;
+    errno = 0;
+    if (aio_read(&forced_aiocb) != -1 || errno != EINVAL) {
+        fprintf(stderr,
+                "forced aio_read collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+    errno = 0;
+    if (aio_write(&forced_aiocb) != -1 || errno != EINVAL) {
+        fprintf(stderr,
+                "forced aio_write collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+    errno = 0;
+    if (aio_fsync(O_SYNC, &forced_aiocb) != -1 || errno != EINVAL) {
+        fprintf(stderr,
+                "forced aio_fsync collision was not denied: errno=%d\n",
+                errno);
+        return 2;
+    }
+    forced_aiocb.aio_lio_opcode = LIO_READ;
+    struct aiocb* forced_aiocb_list[1] = { &forced_aiocb };
+    errno = 0;
+    if (lio_listio(LIO_NOWAIT,
+                   forced_aiocb_list,
+                   1,
+                   &forced_ev) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr,
+                "forced lio_listio collision was not denied: errno=%d\n",
+                errno);
         return 2;
     }
     if (migration_count() != migrations_before ||
@@ -2119,7 +2387,7 @@ forced_cleanup:
         return 2;
     }
 
-    printf("signal_forced_collision_ok forced_signal=%d detach_success=1 migration_count=0 denied=1 worker_calls=%lu conflicts=%d\n",
+    printf("signal_forced_collision_ok forced_signal=%d detach_success=1 migration_count=0 denied=1 invalid_pointer_guard=1 mq_denied=1 aio_denied=1 syscall_denied=1 worker_calls=%lu conflicts=%d\n",
            reserved_signum,
            (unsigned long)worker_state.calls,
            conflict_count() - conflicts_before);

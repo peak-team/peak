@@ -233,17 +233,6 @@ def check_signal_backend_strict_invariants(repo_root):
     controller_tests = (
         repo_root / "test/detach_controller/test_detach_controller.c"
     ).read_text(encoding="utf-8")
-    exported_syscall_wrapper = re.compile(
-        r"(?ms)^\s*(?:__attribute__\s*\(\([^;\n]*\)\)\s*)*"
-        r"(?:[A-Z_][A-Z0-9_]*\s+)*"
-        r"(?:long|int|ssize_t)\s+syscall\s*\([^;{}]*\)\s*\{"
-    )
-    for path in list((repo_root / "src").glob("**/*.[ch]")) + \
-            list((repo_root / "include").glob("**/*.[ch]")):
-        source = path.read_text(encoding="utf-8")
-        require(exported_syscall_wrapper.search(source) is None,
-                f"signal policy must not add a process-wide syscall interposer: {path}")
-
     signal_handler = extract_function(
         controller, "peak_detach_controller_signal_handler"
     )
@@ -332,15 +321,40 @@ def check_signal_backend_strict_invariants(repo_root):
         "sigsuspend",
         "pselect",
         "ppoll",
+        "mq_notify",
+        "aio_read",
+        "aio_write",
+        "aio_fsync",
+        "lio_listio",
     ):
         require(f'__attribute__((visibility("default"))) int\n{wrapper}' in signal_policy or
                 f'__attribute__((visibility("default"))) void (*{wrapper}' in signal_policy,
                 f"signal policy must export {wrapper}")
+    require('__asm__("syscall")' in signal_policy and
+            "peak_signal_policy_syscall" in signal_policy and
+            "peak_signal_policy_safe_read" in signal_policy and
+            "SYS_process_vm_readv" in signal_policy and
+            "syscall:rt_sigprocmask" in signal_policy and
+            "syscall:rt_sigaction" in signal_policy and
+            "syscall:rt_sigtimedwait" in signal_policy and
+            "syscall:signalfd4" in signal_policy and
+            "syscall:timer_create" in signal_policy and
+            "syscall:mq_notify" in signal_policy and
+            "syscall:tgkill" in signal_policy and
+            "syscall:rt_tgsigqueueinfo" in signal_policy,
+            "signal policy must guard common raw syscall routes for reserved RT signal collisions")
     require("peak_signal_policy_event_signal" in signal_policy and
             '"timer_create"' in signal_policy and
-            "peak_signal_policy_prepare_reserved_signal_for_user(signum" in signal_policy and
+            "peak_signal_policy_prepare_event_for_user(evp" in signal_policy and
             "SIGEV_THREAD_ID" in signal_policy,
             "timer_create wrapper must migrate explicit SIGEV_SIGNAL/SIGEV_THREAD_ID collisions")
+    require('"mq_notify"' in signal_policy and
+            '"aio_read"' in signal_policy and
+            '"aio_write"' in signal_policy and
+            '"aio_fsync"' in signal_policy and
+            '"lio_listio"' in signal_policy and
+            "peak_signal_policy_collect_lio_event_signals" in signal_policy,
+            "signal policy must migrate POSIX mqueue/AIO sigevent collisions")
     require("peak_signal_policy_migrate_reserved_signal_locked" in signal_policy and
             "peak_signal_policy_prepare_reserved_set_for_user" in signal_policy and
             "peak_signal_policy_prepare_reserved_signal_for_user" in signal_policy and
@@ -436,8 +450,21 @@ def check_signal_backend_strict_invariants(repo_root):
             "wait_preserved=1" in runtime_hotloop and
             "signalfd_preserved=1" in runtime_hotloop and
             "timer_preserved=1" in runtime_hotloop and
+            "mq_migrated=1" in runtime_hotloop and
+            "syscall_migrated=1" in runtime_hotloop and
             "worker_calls" in runtime_hotloop,
-            "user signal collision runtime test must prove PEAK migrates and keeps working while preserving libc signal behavior")
+            "user signal collision runtime test must prove PEAK migrates and keeps working while preserving core libc signal behavior")
+    require("aio_denied=1" in runtime_hotloop and
+            "forced aio_read collision was not denied" in runtime_hotloop and
+            "forced aio_write collision was not denied" in runtime_hotloop and
+            "forced aio_fsync collision was not denied" in runtime_hotloop and
+            "forced lio_listio collision was not denied" in runtime_hotloop,
+            "forced signal collision runtime test must prove POSIX AIO collisions fail closed before libc AIO side effects")
+    require("invalid_pointer_guard=1" in runtime_hotloop and
+            "invalid raw rt_sigprocmask pointer was not rejected" in runtime_hotloop and
+            "invalid raw pselect6 sigmask pointer was accepted" in runtime_hotloop and
+            "invalid-pointer raw syscall probes migrated PEAK signal" in runtime_hotloop,
+            "raw syscall wrapper must forward unreadable user pointers instead of crashing or migrating")
     require("--signal-bad-cookie-check" in runtime_hotloop and
             "peak_signal_policy_test_send_bad_cookie_to_current_thread" in runtime_hotloop and
             "trace_has_detach_prepare_unexpected_signal" in runtime_hotloop and
