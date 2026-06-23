@@ -149,7 +149,7 @@ static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYS
 static double held_mutation_started_at = 0.0;
 static double last_stop_window_us = 0.0;
 static pthread_once_t signal_backend_initialized = PTHREAD_ONCE_INIT;
-static int signal_backend_signum = 0;
+static _Atomic int signal_backend_signum = 0;
 static int signal_trap_handler_installed = 0;
 static _Atomic int signal_epoch_counter = 1;
 static _Atomic int signal_hold_epoch = 0;
@@ -160,6 +160,18 @@ static _Atomic int strict_mutation_thread_gate_installed = 0;
 static PeakDetachSignalSlot signal_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static PeakDetachGateWaiterSlot gate_waiter_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static _Atomic uint32_t signal_slot_count = 0;
+
+static int
+peak_detach_controller_signal_backend_signum_load(void)
+{
+    return atomic_load_explicit(&signal_backend_signum, memory_order_acquire);
+}
+
+static void
+peak_detach_controller_signal_backend_signum_store(int signum)
+{
+    atomic_store_explicit(&signal_backend_signum, signum, memory_order_release);
+}
 #endif
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
@@ -373,7 +385,8 @@ peak_detach_controller_test_signal_backend_signum(void)
     (void)pthread_once(&signal_backend_initialized,
                        peak_detach_controller_init_signal_backend_once);
     int reserved = peak_signal_policy_reserved_signal();
-    return reserved > 0 ? reserved : signal_backend_signum;
+    return reserved > 0 ? reserved :
+           peak_detach_controller_signal_backend_signum_load();
 }
 #endif
 
@@ -1367,8 +1380,10 @@ static gboolean
 peak_detach_controller_signal_atomics_supported(void)
 {
     return atomic_is_lock_free(&signal_epoch_counter) &&
+           atomic_is_lock_free(&signal_backend_signum) &&
            atomic_is_lock_free(&signal_hold_epoch) &&
            atomic_is_lock_free(&signal_release_epoch) &&
+           atomic_is_lock_free(&signal_slot_count) &&
            atomic_is_lock_free(&signal_slots[0].active_epoch) &&
            atomic_is_lock_free(&signal_slots[0].arrived_epoch) &&
            atomic_is_lock_free(&signal_slots[0].done_epoch) &&
@@ -1378,9 +1393,11 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_slots[0].evacuate_started_epoch) &&
            atomic_is_lock_free(&signal_slots[0].evacuated_epoch) &&
            atomic_is_lock_free(&signal_slots[0].evacuate_status) &&
+           atomic_is_lock_free(&signal_slots[0].tid) &&
            atomic_is_lock_free(&signal_slots[0].pc) &&
            atomic_is_lock_free(&signal_slots[0].new_pc) &&
-           atomic_is_lock_free(&signal_slots[0].evacuate_breakpoint_pc);
+           atomic_is_lock_free(&signal_slots[0].evacuate_breakpoint_pc) &&
+           peak_signal_policy_atomics_lock_free();
 }
 
 static gboolean
@@ -1512,14 +1529,15 @@ peak_detach_controller_signal_instruction_range_contains(uint64_t address,
 static gboolean
 peak_detach_controller_signal_handler_is_installed(void)
 {
-    if (signal_backend_signum <= 0) {
+    int signum = peak_detach_controller_signal_backend_signum_load();
+    if (signum <= 0) {
         return FALSE;
     }
 
     struct sigaction current;
     memset(&current, 0, sizeof(current));
     peak_signal_policy_enter_internal();
-    int rc = sigaction(signal_backend_signum, NULL, &current);
+    int rc = sigaction(signum, NULL, &current);
     peak_signal_policy_leave_internal();
     return rc == 0 &&
            (current.sa_flags & SA_SIGINFO) != 0 &&
@@ -1567,7 +1585,8 @@ peak_detach_controller_signal_tid_is_gone(pid_t tid)
 static int
 peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid)
 {
-    if (signal_backend_signum <= 0) {
+    int signum = peak_detach_controller_signal_backend_signum_load();
+    if (signum <= 0) {
         return -1;
     }
 
@@ -1591,12 +1610,11 @@ peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid)
         }
         errno = 0;
         unsigned long long mask = strtoull(value, NULL, 16);
-        if (errno != 0 || signal_backend_signum <= 0 ||
-            signal_backend_signum > 64) {
+        if (errno != 0 || signum <= 0 || signum > 64) {
             blocked = -1;
         } else {
             unsigned long long bit =
-                1ull << (unsigned int)(signal_backend_signum - 1);
+                1ull << (unsigned int)(signum - 1);
             blocked = (mask & bit) != 0 ? 1 : 0;
         }
         break;
@@ -1688,14 +1706,16 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
 static void
 peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
 {
-    if (signo != signal_backend_signum) {
+    int backend_signum =
+        peak_detach_controller_signal_backend_signum_load();
+    if (signo != backend_signum) {
         return;
     }
 
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
     pid_t tid = (pid_t)syscall(SYS_gettid);
     if (epoch == 0 ||
-        !peak_signal_policy_cookie_matches(info, epoch, tid)) {
+        !peak_signal_policy_cookie_matches_async(info, epoch, tid)) {
         peak_signal_policy_note_unexpected_delivery();
         return;
     }
@@ -1797,24 +1817,24 @@ static void
 peak_detach_controller_init_signal_backend_once(void)
 {
     if (!peak_detach_controller_signal_backend_supported()) {
-        signal_backend_signum = 0;
+        peak_detach_controller_signal_backend_signum_store(0);
         return;
     }
 
     int candidate = peak_signal_policy_choose_reserved_signal();
     if (candidate <= 0 || candidate > SIGRTMAX) {
-        signal_backend_signum = 0;
+        peak_detach_controller_signal_backend_signum_store(0);
         return;
     }
 
     if (!peak_detach_controller_install_signal_backend_handler(candidate)) {
         peak_signal_policy_clear_reserved_signal();
-        signal_backend_signum = 0;
+        peak_detach_controller_signal_backend_signum_store(0);
         return;
     }
     (void)peak_detach_controller_install_signal_trap_handler(candidate);
 
-    signal_backend_signum = candidate;
+    peak_detach_controller_signal_backend_signum_store(candidate);
 }
 
 static gboolean
@@ -1875,7 +1895,9 @@ peak_detach_controller_ensure_signal_backend(PeakDetachStatus* status_out)
 {
     (void)pthread_once(&signal_backend_initialized,
                        peak_detach_controller_init_signal_backend_once);
-    if (signal_backend_signum == 0) {
+    int backend_signum =
+        peak_detach_controller_signal_backend_signum_load();
+    if (backend_signum == 0) {
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
         }
@@ -1889,7 +1911,7 @@ peak_detach_controller_ensure_signal_backend(PeakDetachStatus* status_out)
         }
         return FALSE;
     }
-    if (reserved_signum != signal_backend_signum) {
+    if (reserved_signum != backend_signum) {
         if (!peak_detach_controller_install_signal_backend_handler(reserved_signum)) {
             peak_detach_controller_note_failure_detail(
                 "signal-handler-not-installed",
@@ -1902,7 +1924,8 @@ peak_detach_controller_ensure_signal_backend(PeakDetachStatus* status_out)
             return FALSE;
         }
         (void)peak_detach_controller_install_signal_trap_handler(reserved_signum);
-        signal_backend_signum = reserved_signum;
+        peak_detach_controller_signal_backend_signum_store(reserved_signum);
+        backend_signum = reserved_signum;
     }
 
     gboolean handler_installed =
@@ -1914,7 +1937,7 @@ peak_detach_controller_ensure_signal_backend(PeakDetachStatus* status_out)
             unexpected_deliveries != 0 ? "signal-unexpected-delivery" :
                                          "signal-handler-not-installed",
             0,
-            (uintptr_t)signal_backend_signum,
+            (uintptr_t)backend_signum,
             unexpected_deliveries > 0 ? (uintptr_t)unexpected_deliveries : 0);
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
@@ -2007,13 +2030,15 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
         return TRUE;
     }
 
+    int backend_signum =
+        peak_detach_controller_signal_backend_signum_load();
     int blocked = peak_detach_controller_signal_tid_blocks_reserved(tid);
     if (blocked != 0) {
         peak_detach_controller_note_failure_detail(
             blocked > 0 ? "signal-reserved-blocked" :
                           "signal-reserved-mask-unknown",
             (long)tid,
-            (uintptr_t)signal_backend_signum,
+            (uintptr_t)backend_signum,
             (uintptr_t)epoch);
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
@@ -2023,7 +2048,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
 
     if (peak_signal_policy_send_thread_signal(
             tid,
-            signal_backend_signum,
+            backend_signum,
             peak_signal_policy_cookie_for(epoch, tid)) != 0) {
         if (errno == ESRCH) {
             atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
@@ -2260,6 +2285,8 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
     if (!peak_detach_controller_ensure_signal_backend(status_out)) {
         return FALSE;
     }
+    int backend_signum =
+        peak_detach_controller_signal_backend_signum_load();
 
     pid_t controller_tid = (pid_t)syscall(SYS_gettid);
     int epoch = atomic_fetch_add_explicit(&signal_epoch_counter,
@@ -2336,7 +2363,7 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
                 blocked > 0 ? "signal-reserved-blocked" :
                               "signal-reserved-mask-unknown",
                 (long)tid,
-                (uintptr_t)signal_backend_signum,
+                (uintptr_t)backend_signum,
                 (uintptr_t)epoch);
             peak_detach_controller_signal_clear_slots();
             if (status_out != NULL) {
@@ -2352,7 +2379,7 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
             (pid_t)atomic_load_explicit(&slot->tid, memory_order_acquire);
         if (peak_signal_policy_send_thread_signal(
                 tid,
-                signal_backend_signum,
+                backend_signum,
                 peak_signal_policy_cookie_for(epoch, tid)) != 0) {
             if (errno == ESRCH) {
                 atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);

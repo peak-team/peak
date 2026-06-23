@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <string.h>
@@ -1611,6 +1612,85 @@ run_signal_user_collision_check(void)
         return 2;
     }
 
+#ifdef SYS_rt_sigaction
+    int raw_query_protected = 0;
+    struct {
+        uintptr_t handler;
+        unsigned long flags;
+        uintptr_t restorer;
+        unsigned long mask;
+    } raw_query_action;
+    memset(&raw_query_action, 0xff, sizeof(raw_query_action));
+    errno = 0;
+    long raw_query_rc = syscall(SYS_rt_sigaction,
+                                reserved_signum,
+                                NULL,
+                                &raw_query_action,
+                                sizeof(unsigned long));
+    if (raw_query_rc == 0 &&
+        raw_query_action.handler != (uintptr_t)SIG_DFL) {
+        fprintf(stderr,
+                "raw rt_sigaction query leaked PEAK handler to user code\n");
+        return 2;
+    }
+    if (raw_query_rc == 0 &&
+        (raw_query_action.flags != 0 ||
+         raw_query_action.restorer != 0 ||
+         raw_query_action.mask != 0)) {
+        fprintf(stderr,
+                "raw rt_sigaction query leaked non-default PEAK action fields\n");
+        return 2;
+    }
+    if (raw_query_rc == 0 ||
+        (raw_query_rc != 0 &&
+         (errno == EFAULT || errno == EINVAL || errno == ENOSYS))) {
+        raw_query_protected = 1;
+    }
+    if (!raw_query_protected) {
+        perror("raw rt_sigaction query reserved signal");
+        return 2;
+    }
+    void* readonly_query_page =
+        mmap(NULL,
+             4096,
+             PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS,
+             -1,
+             0);
+    if (readonly_query_page == MAP_FAILED) {
+        perror("mmap raw rt_sigaction readonly query page");
+        return 2;
+    }
+    if (mprotect(readonly_query_page, 4096, PROT_READ) != 0) {
+        perror("mprotect raw rt_sigaction readonly query page");
+        munmap(readonly_query_page, 4096);
+        return 2;
+    }
+    errno = 0;
+    raw_query_rc = syscall(SYS_rt_sigaction,
+                           reserved_signum,
+                           NULL,
+                           readonly_query_page,
+                           sizeof(unsigned long));
+    if (raw_query_rc != -1 || errno != EFAULT) {
+        fprintf(stderr,
+                "raw rt_sigaction read-only query did not fail closed: rc=%ld errno=%d\n",
+                raw_query_rc,
+                errno);
+        munmap(readonly_query_page, 4096);
+        return 2;
+    }
+    if (munmap(readonly_query_page, 4096) != 0) {
+        perror("munmap raw rt_sigaction readonly query page");
+        return 2;
+    }
+    if (selected_signal() != reserved_signum) {
+        fprintf(stderr,
+                "raw read-only reserved signal query unexpectedly migrated\n");
+        return 2;
+    }
+#endif
+
     struct sigaction previous_action;
     memset(&previous_action, 0, sizeof(previous_action));
     user_action.sa_handler = user_collision_signal_handler;
@@ -2098,7 +2178,7 @@ collision_cleanup:
         return 2;
     }
 
-    printf("signal_user_collision_ok user_signal=%d initial_reserved_signal=%d current_reserved_signal=%d detach_success=1 migration_count=%d handler_preserved=1 mask_preserved=1 wait_preserved=1 signalfd_preserved=1 timer_preserved=1 mq_migrated=1 syscall_migrated=1 worker_calls=%lu conflicts=%d\n",
+    printf("signal_user_collision_ok user_signal=%d initial_reserved_signal=%d current_reserved_signal=%d detach_success=1 migration_count=%d handler_preserved=1 raw_query_protected=1 raw_query_readonly_failed=1 mask_preserved=1 wait_preserved=1 signalfd_preserved=1 timer_preserved=1 mq_migrated=1 syscall_migrated=1 worker_calls=%lu conflicts=%d\n",
            collision_signum,
            initial_reserved_signum,
            selected_signal(),

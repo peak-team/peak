@@ -13,6 +13,8 @@
 #include <string.h>
 #include <unistd.h>
 
+int peak_signal_policy_reserved_signal(void);
+
 static int failures = 0;
 
 static void
@@ -2802,12 +2804,30 @@ run_fake_helper_auto_fallback(void)
 #endif
 }
 
+static int
+run_signal_reserve_early_never(void)
+{
+    check_int("PEAK_SIGNAL_RESERVE_EARLY=never leaves signal unreserved",
+              peak_signal_policy_reserved_signal(),
+              0);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
+run_signal_reserve_helper_auto(void)
+{
+    check_int("helper backend with PEAK_DETACH_SIGNAL=auto leaves signal unreserved",
+              peak_signal_policy_reserved_signal(),
+              0);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int
 main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -2872,6 +2892,12 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "helper-backend-missing-thread-gate") == 0) {
         return run_helper_backend_missing_thread_gate();
+    }
+    if (strcmp(argv[1], "signal-reserve-early-never") == 0) {
+        return run_signal_reserve_early_never();
+    }
+    if (strcmp(argv[1], "signal-reserve-helper-auto") == 0) {
+        return run_signal_reserve_helper_auto();
     }
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return EXIT_FAILURE;

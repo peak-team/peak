@@ -101,6 +101,22 @@ set_tests_properties(test_detach_controller_helper_mode
     ENVIRONMENT "PEAK_SAFE_DETACH_MODE=helper;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
 )
 
+add_test(NAME test_detach_controller_signal_reserve_early_never
+  COMMAND test_detach_controller signal-reserve-early-never
+)
+set_tests_properties(test_detach_controller_signal_reserve_early_never
+  PROPERTIES
+    ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_SIGNAL_RESERVE_EARLY=never;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+)
+
+add_test(NAME test_detach_controller_signal_reserve_helper_auto
+  COMMAND test_detach_controller signal-reserve-helper-auto
+)
+set_tests_properties(test_detach_controller_signal_reserve_helper_auto
+  PROPERTIES
+    ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_SIGNAL=auto;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+)
+
 add_test(NAME test_detach_controller_require_env
   COMMAND test_detach_controller strict
 )
