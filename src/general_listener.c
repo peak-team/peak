@@ -15,6 +15,7 @@
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
+#define PEAK_TEXT_OUTPUT_ENV "PEAK_TEXT_OUTPUT"
 
 PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
@@ -95,6 +96,68 @@ peak_general_listener_parse_detach_count_override(gulong* count_out)
         *count_out = (gulong)parsed;
     }
     return TRUE;
+}
+
+static gboolean
+peak_env_value_truthy(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "1") == 0 ||
+            g_ascii_strcasecmp(value, "true") == 0 ||
+            g_ascii_strcasecmp(value, "yes") == 0 ||
+            g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static long
+peak_parse_long_env(const char* name)
+{
+    const char* value = getenv(name);
+    char* end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return -1;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || parsed < 0) {
+        return -1;
+    }
+
+    return parsed;
+}
+
+static long
+peak_mpi_env_size(void)
+{
+    static const char* names[] = {
+        "PMI_SIZE",
+        "PMIX_SIZE",
+        "OMPI_COMM_WORLD_SIZE",
+        "SLURM_NTASKS",
+        NULL
+    };
+
+    for (const char** name = names; *name != NULL; name++) {
+        long value = peak_parse_long_env(*name);
+        if (value > 0) {
+            return value;
+        }
+    }
+
+    return -1;
+}
+
+static gboolean
+peak_general_listener_should_print_text(gboolean rank_local_mpi_output)
+{
+    const char* value = getenv(PEAK_TEXT_OUTPUT_ENV);
+
+    if (value != NULL && value[0] != '\0') {
+        return peak_env_value_truthy(value);
+    }
+
+    return !rank_local_mpi_output;
 }
 
 typedef struct {
@@ -3402,7 +3465,9 @@ peak_general_listener_print_result(gulong* sum_num_calls,
             have_output = TRUE;
         }
     }
-    if (have_output) {
+    if (have_output &&
+        peak_general_listener_should_print_text(
+            rank_count <= 1 && peak_mpi_env_size() > 1)) {
         g_printerr("%.*s\n", row_width, row_separator);
         g_printerr("%*s PEAK Library\n", (row_width - 12) / 2, "");
         g_printerr("%.*s\n", row_width, row_separator);

@@ -53,6 +53,7 @@
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_JIT_ENABLE_ENV                    "PEAK_JIT_ENABLE"
+#define PEAK_PROFILE_INTERPRETERS_ENV          "PEAK_PROFILE_INTERPRETERS"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
@@ -450,10 +451,21 @@ peak_command_is_jit_runtime(const char* command)
 }
 
 static gboolean
-peak_should_wrap_main(const char* command)
+peak_should_wrap_main(int argc, char** argv)
 {
+    const char* command;
+
+    if (argv == NULL) {
+        return FALSE;
+    }
+
+    command = argv[0];
     if (command == NULL) {
         return FALSE;
+    }
+
+    if (check_interpreter_command(command)) {
+        return peak_env_truthy(getenv(PEAK_PROFILE_INTERPRETERS_ENV));
     }
 
     if (!check_command(command)) {
@@ -572,8 +584,8 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     // Store the original main function pointer
     real_main = main;
 
-    // Decide whether to use the main wrapper based on argv[0].
-    if (peak_should_wrap_main(argv[0])) {
+    // Decide whether to use the main wrapper based on argv.
+    if (peak_should_wrap_main(argc, argv)) {
         return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
     } else {
         return real___libc_start_main(main, argc, argv, init, fini, rtld_fini, stack_end);
