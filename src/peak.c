@@ -118,22 +118,6 @@ peak_env_value_truthy(const char* value)
 }
 
 static gboolean
-peak_strict_safe_detach_mode_is_enabled(void)
-{
-    const char* mode = getenv("PEAK_SAFE_DETACH_MODE");
-
-    return mode == NULL || mode[0] == '\0' ||
-           g_ascii_strcasecmp(mode, "strict") == 0 ||
-           g_ascii_strcasecmp(mode, "auto") == 0 ||
-           g_ascii_strcasecmp(mode, "helper") == 0 ||
-           g_ascii_strcasecmp(mode, "debugger") == 0 ||
-           g_ascii_strcasecmp(mode, "ptrace") == 0 ||
-           g_ascii_strcasecmp(mode, "signal") == 0 ||
-           g_ascii_strcasecmp(mode, "signals") == 0 ||
-           g_ascii_strcasecmp(mode, "in-process") == 0;
-}
-
-static gboolean
 peak_mpi_collective_output_enabled(void)
 {
     const char* value = getenv(PEAK_MPI_COLLECTIVE_OUTPUT_ENV);
@@ -142,7 +126,7 @@ peak_mpi_collective_output_enabled(void)
         return peak_env_value_truthy(value);
     }
 
-    return !peak_strict_safe_detach_mode_is_enabled();
+    return TRUE;
 }
 
 void peak_init()

@@ -921,8 +921,15 @@ run_controller_batch_retry_check(void)
         (GumInvocationListener***)required_symbol("array_listener");
     gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
     size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    PeakGumGetPcDiagnosticsFn get_pc_diagnostics =
+        (PeakGumGetPcDiagnosticsFn)required_symbol(
+            "gum_interceptor_peak_get_pc_diagnostics");
     const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
-    GumInvocationListener* original_listener = NULL;
+    const char* stop_pc_file = getenv("FAKE_DETACH_HELPER_STOP_PC_FILE");
+    char stop_pc_template[] = "/tmp/peak_hotloop_batch_retry_pc_XXXXXX";
+    int stop_pc_fd = -1;
+    GumPeakPcDiagnostics diagnostics;
+    gpointer patch_interior_pc = NULL;
     char retry_batch_id[32];
 
     if (request_detach == NULL ||
@@ -932,7 +939,8 @@ run_controller_batch_retry_check(void)
         interceptor_slot == NULL ||
         listeners_slot == NULL ||
         hook_addresses_slot == NULL ||
-        hook_count == NULL) {
+        hook_count == NULL ||
+        get_pc_diagnostics == NULL) {
         return 2;
     }
 
@@ -956,6 +964,13 @@ run_controller_batch_retry_check(void)
         fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
         return 2;
     }
+    if (!get_pc_diagnostics(*interceptor_slot,
+                            (*hook_addresses_slot)[0],
+                            (*listeners_slot)[0],
+                            &diagnostics)) {
+        fprintf(stderr, "Gum PC diagnostics unavailable for hotloop hook\n");
+        return 77;
+    }
     unlink(trace_path);
 
     controller_stop();
@@ -964,22 +979,39 @@ run_controller_batch_retry_check(void)
         return 2;
     }
 
-    original_listener = (*listeners_slot)[0];
-    (*listeners_slot)[0] = (*listeners_slot)[1];
-    if (controller_drain(0)) {
-        (*listeners_slot)[0] = original_listener;
-        fprintf(stderr, "first poisoned drain unexpectedly cleared all pending work\n");
-        return 2;
-    }
-    (*listeners_slot)[0] = original_listener;
-    if (hook_state(0) != PEAK_HOOK_DETACHED ||
-        hook_state(1) != PEAK_HOOK_DETACHED) {
-        if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED ||
-            hook_state(1) != PEAK_HOOK_DETACHED) {
-            fprintf(stderr,
-                    "expected poisoned hook pending and peer detached after first batch\n");
+    patch_interior_pc =
+        (gpointer)((uintptr_t)diagnostics.function_address + 1u);
+    if (stop_pc_file == NULL || stop_pc_file[0] == '\0') {
+        stop_pc_fd = mkstemp(stop_pc_template);
+        if (stop_pc_fd < 0) {
+            perror("mkstemp stop PC");
             return 2;
         }
+        close(stop_pc_fd);
+        stop_pc_file = stop_pc_template;
+        if (setenv("FAKE_DETACH_HELPER_SCENARIO",
+                   "synthetic-stop-file-once",
+                   1) != 0 ||
+            setenv("FAKE_DETACH_HELPER_STOP_PC_FILE", stop_pc_file, 1) != 0) {
+            perror("setenv synthetic stop file");
+            unlink_if_path(stop_pc_file);
+            return 2;
+        }
+    }
+    unlink_if_path(stop_pc_file);
+    if (write_pointer_file(stop_pc_file, patch_interior_pc) != 0) {
+        perror("write stop PC file");
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+
+    (void)controller_drain(0);
+    unlink_if_path(stop_pc_file);
+    if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED ||
+        hook_state(1) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr,
+                "expected patch-interior hook pending and peer detached after first batch\n");
+        return 2;
     }
     if (!controller_drain(1000)) {
         fprintf(stderr, "controller did not drain restored retry batch\n");
@@ -999,6 +1031,7 @@ run_controller_batch_retry_check(void)
     }
 
     printf("controller_batch_retry_ok batch_id=%s\n", retry_batch_id);
+    (void)stop_pc_fd;
     return 0;
 }
 
