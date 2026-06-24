@@ -111,6 +111,7 @@ if(BUILD_TESTING)
     configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)
     set(PEAK_TARGET_CONFIG_PATH ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf)
 
+    add_subdirectory(utils)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
     add_subdirectory(dlopen_controller)
@@ -490,6 +491,18 @@ if(BUILD_TESTING)
     set_tests_properties(test_sleep
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
+    )
+    add_test(NAME test_rank_local_mpi_env_suppresses_text COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
+    set_tests_properties(test_rank_local_mpi_env_suppresses_text
+        PROPERTIES
+            ENVIRONMENT "PMI_SIZE=4;PEAK_TARGET=my_sleep_func;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_rank_local_mpi_env_statslog;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            FAIL_REGULAR_EXPRESSION "PEAK Library|function statistics"
+    )
+    add_test(NAME test_rank_local_mpi_env_text_override COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
+    set_tests_properties(test_rank_local_mpi_env_text_override
+        PROPERTIES
+            ENVIRONMENT "PMI_SIZE=4;PEAK_TARGET=my_sleep_func;PEAK_TEXT_OUTPUT=1;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_rank_local_mpi_env_override_statslog;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "PEAK Library"
     )
     if(NOT PEAK_GUM_PEAK_API_AVAILABLE)
         add_test(NAME test_initial_attach_strict_stock_gum COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)

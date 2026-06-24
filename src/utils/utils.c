@@ -172,6 +172,11 @@ static const char *check_list[] = {
     "numactl",
     "sh",
     "bash", 
+    "lmod",
+    "ml",
+    "modulecmd",
+    "env",
+    "timeout",
     "awk",
     "sed",
     "grep",
@@ -226,6 +231,20 @@ static const char *check_list[] = {
     "bc",
     "which",
     "seq",
+    "stty",
+    "tty",
+    "tput",
+    "clear",
+    "basename",
+    "dirname",
+    "readlink",
+    "realpath",
+    "xargs",
+    "expr",
+    "test",
+    "[",
+    "true",
+    "false",
     NULL // Null terminator to mark the end of the list
 };
 
@@ -240,6 +259,58 @@ static const char *check_list[] = {
 static const char *get_base_name(const char *path) {
     const char *base = strrchr(path, '/');
     return (base != NULL) ? base + 1 : path;
+}
+
+static int
+starts_with(const char* str, const char* prefix)
+{
+    size_t prefix_len;
+
+    if (str == NULL || prefix == NULL) {
+        return 0;
+    }
+
+    prefix_len = strlen(prefix);
+    return strncmp(str, prefix, prefix_len) == 0;
+}
+
+static int
+is_versioned_command(const char* command, const char* prefix)
+{
+    const char* suffix;
+
+    if (!starts_with(command, prefix)) {
+        return 0;
+    }
+
+    suffix = command + strlen(prefix);
+    return *suffix == '\0' || (*suffix >= '0' && *suffix <= '9');
+}
+
+int
+check_interpreter_command(const char* command)
+{
+    const char* base_name = get_base_name(command);
+
+    if (command == NULL) {
+        return 0;
+    }
+
+    return is_versioned_command(base_name, "lua") ||
+           strcmp(base_name, "luajit") == 0 ||
+           is_versioned_command(base_name, "python") ||
+           is_versioned_command(base_name, "perl") ||
+           is_versioned_command(base_name, "tclsh");
+}
+
+static int
+arg_looks_like_module_helper(const char* arg)
+{
+    return arg != NULL &&
+           (strstr(arg, "lmod") != NULL ||
+            strstr(arg, "Lmod") != NULL ||
+            strstr(arg, "modulecmd") != NULL ||
+            strstr(arg, "/Modules/") != NULL);
 }
 
 int check_command(const char *str) {
@@ -257,4 +328,22 @@ int check_command(const char *str) {
     }
 
     return 0; // No match found
+}
+
+int check_module_helper_command(int argc, char *const argv[]) {
+    if (argc <= 0 || argv == NULL || argv[0] == NULL) {
+        return 0;
+    }
+
+    if (!check_interpreter_command(argv[0])) {
+        return 0;
+    }
+
+    for (int i = 0; i < argc && argv[i] != NULL; i++) {
+        if (arg_looks_like_module_helper(argv[i])) {
+            return 1;
+        }
+    }
+
+    return 0;
 }

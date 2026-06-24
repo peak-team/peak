@@ -94,4 +94,29 @@ double median_double(double* arr, size_t n);
  */
 int check_command(const char *str);
 
+/**
+ * @brief Checks whether a command is a language interpreter that should not
+ *        initialize PEAK unless interpreter profiling is explicitly requested.
+ *
+ * @param str The command to check. This can be a full path or bare command.
+ * @return 1 if the command is a recognized Python/Lua/Perl/Tcl interpreter,
+ *         0 otherwise.
+ */
+int check_interpreter_command(const char *str);
+
+/**
+ * @brief Checks whether argv describes an interpreter running module-system
+ *        helper code, such as Lmod's Lua entrypoint.
+ *
+ * Interpreter applications are valid profiling targets, so this intentionally
+ * uses argv context instead of filtering all python/lua/perl/tclsh processes by
+ * basename.
+ *
+ * @param argc Argument count from main.
+ * @param argv Argument vector from main.
+ * @return 1 if the process should be treated as module helper infrastructure,
+ *         0 otherwise.
+ */
+int check_module_helper_command(int argc, char *const argv[]);
+
 #endif /* __UTILS_H */
