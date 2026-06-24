@@ -29,6 +29,7 @@ def parse_args():
         "--mode",
         choices=[
             "no-finalize",
+            "no-finalize-collective-disabled",
             "finalize-nonzero",
             "subset-finalize-nonzero",
             "subset-finalize-clean",
@@ -55,7 +56,10 @@ def main():
     env["LD_PRELOAD"] = args.libpeak if not old_preload else args.libpeak + ":" + old_preload
 
     app_args = []
-    expected = "MPI collective output is disabled for strict teardown"
+    expected = "PMPI_Finalize was not observed on every rank"
+    if args.mode == "no-finalize-collective-disabled":
+        env["PEAK_MPI_COLLECTIVE_OUTPUT"] = "0"
+        expected = "MPI collective output is disabled for strict teardown"
     if args.mode == "finalize-nonzero":
         app_args.append("finalize-then-exit1")
         expected = "PMPI_Finalize was requested before nonzero exit status 1"
@@ -64,7 +68,6 @@ def main():
         expected = "PMPI_Finalize was requested before nonzero exit status 1"
     elif args.mode == "subset-finalize-clean":
         app_args.append("subset-finalize-then-exit0")
-        expected = "MPI collective output is disabled for strict teardown"
     elif args.mode == "subset-finalize-clean-collective":
         app_args.append("subset-finalize-then-exit0")
         expected = "PMPI_Finalize was not observed on every rank"

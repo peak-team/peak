@@ -580,21 +580,21 @@ hang or crash the MPI job.
 
 The MPI finalizer interposer therefore records whether the application attempted
 `PMPI_Finalize()`, but `peak_fini()` only enables MPI-reduced output and delayed
-real finalization when `PEAK_MPI_COLLECTIVE_OUTPUT=1`, the process exits
-cleanly, `MPI_Initialized()` is true, and `MPI_Finalized()` is false. Strict
-safe-detach mode leaves `PEAK_MPI_COLLECTIVE_OUTPUT` disabled by default so
-rank-local PEAK teardown decisions cannot mismatch across ranks and strand a
-subset of the job in a PEAK-owned collective. If the process exits with a
-nonzero status, collective output is disabled, or the MPI runtime is no longer
-collective-safe, PEAK writes rank-local output, skips MPI reductions, and
-reverts the interceptor without allowing a concurrent intercepted
+real finalization when collective output is enabled, the process exits cleanly,
+`MPI_Initialized()` is true, `MPI_Finalized()` is false, and every rank observed
+the application request `PMPI_Finalize()`. `PEAK_MPI_COLLECTIVE_OUTPUT` defaults
+to enabled so ordinary clean MPI jobs still get aggregate output; setting it to
+`0` forces rank-local output. If the process exits with a nonzero status,
+collective output is disabled, a subset of ranks reached finalization, or the
+MPI runtime is no longer collective-safe, PEAK writes rank-local output, skips
+MPI reductions, and reverts the interceptor without allowing a concurrent intercepted
 `PMPI_Finalize()` to call the real MPI finalizer.
 
-When collective output is explicitly enabled, PEAK first performs a small MPI
-handshake to verify that every participating rank observed the application's
-`PMPI_Finalize()` request. If any rank did not observe it, all ranks fall back
-to rank-local output instead of splitting between collective and non-collective
-teardown paths.
+When collective output is enabled and the clean-exit MPI preconditions hold,
+PEAK first performs a small MPI handshake to verify that every participating
+rank observed the application's `PMPI_Finalize()` request. If any rank did not
+observe it, all ranks fall back to rank-local output instead of splitting
+between collective and non-collective teardown paths.
 
 `peak_fini()` is process-single-entry: the first caller owns teardown and later
 callers wait for that teardown to finish without touching Gum, MPI, or
@@ -937,12 +937,13 @@ Completed in this branch:
     turning into Intel MPI finalization crashes or rank hangs. `peak_fini()` is
     single-entry per process and racing exit callers wait for the owner, so they
     cannot double-run or interrupt Gum/MPI teardown; the first intercepted exit
-    status wins. Aggregate MPI output is now explicit through
-    `PEAK_MPI_COLLECTIVE_OUTPUT=1` and uses an all-rank finalize-observed
-    handshake before PEAK reductions. Regression coverage exercises no-finalize
-    exit, finalize-then-nonzero-exit, subset-finalize nonzero exit, strict
-    default subset-finalize clean exit, aggregate-output opt-in subset-finalize
-    clean exit, and finalize-then-nonzero-return MPI lifecycles.
+    status wins. Aggregate MPI output defaults on and uses an all-rank
+    finalize-observed handshake before PEAK reductions; `PEAK_MPI_COLLECTIVE_OUTPUT=0`
+    explicitly keeps teardown rank-local. Regression coverage exercises
+    no-finalize exit, explicit collective-output disablement, finalize-then-nonzero-exit,
+    subset-finalize nonzero exit, default subset-finalize clean exit, explicit
+    aggregate-output subset-finalize clean exit, and finalize-then-nonzero-return
+    MPI lifecycles.
 47. Made Gum context lookup listener-canonical: if strict detach cannot find a
     Gum context under the request address but the listener is still attached,
     the patched Gum overlay scans active contexts for that listener and returns

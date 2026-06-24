@@ -221,7 +221,7 @@ if(BUILD_TESTING)
                         --controller-batch-retry-check)
             set_tests_properties(test_detach_hotloop_batch_retry_preserves_pending_strict
                 PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-pc.txt;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
                     TIMEOUT 30)
             add_test(NAME test_detach_hotloop_reattach_entry_byte_gum_pc_strict
@@ -542,6 +542,17 @@ if(BUILD_TESTING)
                     --mode no-finalize
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_exit_before_finalize_collective_disabled
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode no-finalize-collective-disabled
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_finalize_then_nonzero_exit
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -616,6 +627,10 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_exit_before_finalize_collective_disabled
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;PEAK_MPI_COLLECTIVE_OUTPUT=0;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_then_nonzero_exit
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
@@ -652,6 +667,10 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_exit_before_finalize_collective_disabled
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;PEAK_MPI_COLLECTIVE_OUTPUT=0;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_then_nonzero_exit
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
@@ -687,6 +706,11 @@ if(BUILD_TESTING)
         set_tests_properties(test_mpi_exit_before_finalize
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=no-finalize"
+                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                TIMEOUT 30)
+        set_tests_properties(test_mpi_exit_before_finalize_collective_disabled
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=no-finalize-collective-disabled"
                 FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_then_nonzero_exit
