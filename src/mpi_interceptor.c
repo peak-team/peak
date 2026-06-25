@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define PEAK_MPI_FINALIZE_POLICY_ENV "PEAK_MPI_FINALIZE_POLICY"
+
 static GumInterceptor* mpi_interceptor;
 
 typedef enum {
@@ -16,6 +18,7 @@ typedef enum {
 static int peak_finalize_state = PEAK_MPI_FINALIZE_NOT_REQUESTED;
 static int peak_finalize_result = 0;
 static int peak_real_finalize_allowed = 0;
+static int peak_finalize_path_active = 0;
 static gpointer hook_address;
 
 static int (*original_pmpi_finalize)(void);
@@ -51,6 +54,18 @@ mpi_interceptor_direct_finalize_enabled(void)
 
     return g_ascii_strcasecmp(value, "direct") == 0 ||
            mpi_interceptor_env_truthy(value);
+}
+
+static int
+mpi_interceptor_finalize_policy_defer(void)
+{
+    const char* value = getenv(PEAK_MPI_FINALIZE_POLICY_ENV);
+
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "defer") == 0 ||
+            g_ascii_strcasecmp(value, "deferred") == 0 ||
+            g_ascii_strcasecmp(value, "continue") == 0 ||
+            g_ascii_strcasecmp(value, "exit") == 0);
 }
 
 static int
@@ -167,9 +182,11 @@ mpi_interceptor_call_original_finalize_once(void)
  * @brief Custom implementation of `PMPI_Finalize` function
  *
  * This function is a custom implementation of the `PMPI_Finalize` function. It
- * records the application's finalization request, lets PEAK emit its final
- * output while MPI is still alive on the application's own finalize path, and
- * returns to the real MPI finalizer after all-rank proof. PEAK does not replay
+ * records the application's finalization request. The default policy lets PEAK
+ * emit final output while MPI is still alive on the application's own finalize
+ * path, then returns to the real MPI finalizer after all-rank proof.
+ * PEAK_MPI_FINALIZE_POLICY=defer calls the real finalizer immediately and
+ * leaves PEAK output for normal process teardown. PEAK does not replay
  * `PMPI_Finalize()` later from process teardown.
  *
  * @return The original `PMPI_Finalize()` result.
@@ -179,7 +196,13 @@ peak_pmpi_finalize(void)
 {
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     mpi_interceptor_mark_finalize_requested();
+    if (mpi_interceptor_finalize_policy_defer()) {
+        mpi_interceptor_set_real_finalize_allowed(1);
+        return mpi_interceptor_call_original_finalize_once();
+    }
+    __atomic_store_n(&peak_finalize_path_active, 1, __ATOMIC_RELEASE);
     peak_fini();
+    __atomic_store_n(&peak_finalize_path_active, 0, __ATOMIC_RELEASE);
     return mpi_interceptor_call_original_finalize_once();
 }
 
@@ -187,6 +210,11 @@ int mpi_interceptor_finalize_was_requested()
 {
     return __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE) !=
            PEAK_MPI_FINALIZE_NOT_REQUESTED;
+}
+
+int mpi_interceptor_finalize_path_active()
+{
+    return __atomic_load_n(&peak_finalize_path_active, __ATOMIC_ACQUIRE) != 0;
 }
 
 void

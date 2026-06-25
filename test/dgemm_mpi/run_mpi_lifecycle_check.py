@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import os
 import re
 import shlex
@@ -57,6 +58,7 @@ def parse_args():
             "finalize-clean-output-local",
             "finalize-clean-output-socket-bad-host",
             "finalize-clean-output-socket-token-mismatch",
+            "finalize-defer-post-work",
             "finalize-nonzero",
             "subset-finalize-nonzero",
             "subset-finalize-clean",
@@ -101,6 +103,7 @@ def main():
     expected = "PMPI_Finalize was not observed on every rank"
     expected_peak_tables = 0
     expected_stats_files = None
+    expected_min_target_count = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -145,6 +148,15 @@ def main():
         expected = "Socket aggregation received"
         expected_peak_tables = 0
         expected_stats_files = 0
+    elif args.mode == "finalize-defer-post-work":
+        env["PEAK_MPI_FINALIZE_POLICY"] = "defer"
+        env["PEAK_MPI_EXIT_LOOPS"] = "16"
+        env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
+        app_args.append("finalize-post-work-then-exit0")
+        expected = "MPI runtime is not in an output-safe state"
+        expected_peak_tables = 0
+        expected_stats_files = nprocs
+        expected_min_target_count = nprocs * (16 + 32)
     elif args.mode == "finalize-nonzero":
         app_args.append("finalize-then-exit1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -204,6 +216,10 @@ def main():
             path.read_text(encoding="utf-8", errors="replace")
             for path in stats_files
         )
+        stats_rows = []
+        for path in stats_files:
+            with path.open(newline="", encoding="utf-8", errors="replace") as handle:
+                stats_rows.extend(csv.DictReader(handle))
     output = proc.stdout
     sys.stdout.write(output)
 
@@ -244,6 +260,17 @@ def main():
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
+    if expected_min_target_count is not None:
+        observed_count = sum(
+            int(float(row.get("count", "0") or 0))
+            for row in stats_rows
+            if row.get("function") == "peak_mpi_exit_target"
+        )
+        if observed_count < expected_min_target_count:
+            raise AssertionError(
+                f"expected at least {expected_min_target_count} "
+                f"post-finalize target calls, got {observed_count}"
+            )
     if args.mode in (
         "finalize-clean",
         "finalize-clean-output-local",

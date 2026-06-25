@@ -329,7 +329,7 @@ peak_fini_impl(void)
 {
 #ifdef HAVE_MPI
     int mpi_finalize_path =
-        found_MPI && mpi_interceptor_finalize_was_requested();
+        found_MPI && mpi_interceptor_finalize_path_active();
     if (mpi_finalize_path) {
         peak_general_listener_suspend_callbacks();
     }
@@ -406,7 +406,11 @@ peak_fini_impl(void)
     int local_requested_mpi_finalize =
         mpi_interceptor_finalize_was_requested();
     int all_ranks_requested_mpi_finalize = 0;
-    if (mpi_runtime_can_collect &&
+    int need_mpi_finalize_proof =
+        mpi_finalize_path ||
+        aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI;
+    if (need_mpi_finalize_proof &&
+        mpi_runtime_can_collect &&
         !abnormal_exit) {
         all_ranks_requested_mpi_finalize =
             peak_mpi_all_ranks_requested_finalize(

@@ -14,22 +14,34 @@
 static volatile int peak_mpi_exit_sink;
 
 static int
-peak_mpi_exit_loop_count(void)
+peak_mpi_exit_parse_loop_count(const char* env_name, int default_value)
 {
-    const char* value = getenv("PEAK_MPI_EXIT_LOOPS");
+    const char* value = getenv(env_name);
     char* end = NULL;
     long parsed;
 
     if (value == NULL || value[0] == '\0') {
-        return 16;
+        return default_value;
     }
 
     parsed = strtol(value, &end, 10);
     if (end == value || parsed <= 0 || parsed > 10000000L) {
-        return 16;
+        return default_value;
     }
 
     return (int)parsed;
+}
+
+static int
+peak_mpi_exit_loop_count(void)
+{
+    return peak_mpi_exit_parse_loop_count("PEAK_MPI_EXIT_LOOPS", 16);
+}
+
+static int
+peak_mpi_exit_post_finalize_loop_count(void)
+{
+    return peak_mpi_exit_parse_loop_count("PEAK_MPI_EXIT_POST_LOOPS", 32);
 }
 
 void PEAK_EXPORT PEAK_NOINLINE
@@ -86,6 +98,15 @@ main(int argc, char** argv)
             setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", "peak-token-match", 1);
         }
         MPI_Finalize();
+        exit(0);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "finalize-post-work-then-exit0") == 0) {
+        MPI_Finalize();
+        int post_loops = peak_mpi_exit_post_finalize_loop_count();
+        for (int i = 0; i < post_loops; i++) {
+            peak_mpi_exit_target(rank);
+        }
         exit(0);
     }
 
