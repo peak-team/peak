@@ -616,9 +616,18 @@ real `PMPI_Finalize()` only after PEAK has proven every rank reached finalize.
 The finalize proof is timeout-bounded; if only a subset of ranks entered
 `PMPI_Finalize()` or the proof cannot complete, PEAK falls back to rank-local
 output and skips the real finalizer on that unsafe subset path instead of
-blocking indefinitely. Suspending callbacks before heartbeat stop, controller
-drain, and output prevents late hot-target samples from enqueueing new
-detach/reattach work while the finalizer path is already tearing down.
+blocking indefinitely. The proof is implemented with a nonblocking MPI
+collective plus bounded `MPI_Test()` polling. This is much safer than a blocking
+`MPI_Allreduce`, but it is still an MPI progress call and therefore a
+best-effort proof, not a hard guarantee against every broken MPI runtime state.
+If the proof times out, PEAK deliberately treats MPI as unusable for the rest of
+its teardown. It does not cancel or free the outstanding nonblocking collective
+request because MPI does not provide a portable cancellation path for active
+nonblocking collectives; instead, PEAK performs no further MPI calls and relies
+on process exit to reclaim MPI-owned state. Suspending callbacks before
+heartbeat stop, controller drain, and output prevents late hot-target samples
+from enqueueing new detach/reattach work while the finalizer path is already
+tearing down.
 `PEAK_MPI_REAL_FINALIZE=0` is a diagnostic opt-out that skips the real finalizer
 after output.
 
@@ -681,6 +690,12 @@ participating rank observed the application's `PMPI_Finalize()` request.
 If any rank did not observe it or the proof times out, ranks fall back to
 rank-local output instead of splitting between collective and non-collective
 teardown paths, and PEAK skips the real MPI finalizer from the subset-rank path.
+After the proof succeeds, the MPI reducer uses bounded nonblocking
+`MPI_Iallreduce`/`MPI_Ireduce` wrappers and falls back to rank-local output if a
+reducer collective fails or times out. Those wrappers still rely on `MPI_Test()`
+for progress, so this reducer is appropriate for ordinary all-rank clean
+shutdown, but not for environments where PEAK must avoid MPI progress entirely.
+Use socket output when final reporting must avoid MPI collectives.
 The socket payload reducer
 does not use MPI reductions for the profile payload itself: rank 0 accepts a
 bounded set of framed per-rank payloads, validates a Slurm/PMI-derived reducer
@@ -1042,8 +1057,12 @@ Completed in this branch:
     application's own finalizer path while MPI is still initialized enough to
     query rank/size, and returns to the real MPI finalizer only after bounded
     all-rank finalize proof. If that proof times out, PEAK falls back to
-    rank-local output and skips the real finalizer instead of blocking a subset
-    rank. `PEAK_MPI_FINALIZE_POLICY=defer` or explicit socket aggregation calls
+    rank-local output, marks PEAK's MPI path unusable, and skips the real
+    finalizer instead of blocking a subset rank. Timed-out nonblocking
+    collective proof requests are intentionally not cancelled/freed because MPI
+    provides no portable cancellation path for active nonblocking collectives;
+    PEAK fails closed and avoids all later MPI calls instead.
+    `PEAK_MPI_FINALIZE_POLICY=defer` or explicit socket aggregation calls
     the real finalizer immediately and leaves PEAK profiling/output until normal
     process teardown for applications where all ranks keep doing non-MPI work
     after `MPI_Finalize()`. `defer` is documented as all-rank early-finalize
@@ -1064,7 +1083,10 @@ Completed in this branch:
     callbacks pass-through, keeps target hooks pinned, restores support wrappers
     and the `PMPI_Finalize` replacement, and returns to the real finalizer after
     bounded all-rank proof unless `defer` policy is selected.
-    `peak_fini()` is
+    The MPI reducer uses timed nonblocking collective wrappers after proof
+    success, but still depends on `MPI_Test()` progress; socket output remains
+    the reducer for runs where final reporting must avoid MPI progress
+    entirely. `peak_fini()` is
     single-entry per process and racing exit callers wait for the owner, so they
     cannot double-run or interrupt Gum/MPI teardown; the first intercepted exit
     status wins. Default MPI collective output uses an all-rank

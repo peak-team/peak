@@ -47,7 +47,10 @@ int mpi_interceptor_finalize_path_active();
  * The real MPI finalizer is enabled by default, but only after PEAK has proven
  * that every rank reached the application finalizer. PEAK uses a short proof
  * timeout and fails closed if proof cannot be confirmed, so a subset-rank
- * finalizer does not block on collectives or re-enter MPI unexpectedly.
+ * finalizer does not block on collectives or re-enter MPI unexpectedly. A
+ * timed-out nonblocking collective proof is intentionally abandoned rather than
+ * cancelled or freed because active nonblocking collective cancellation is not
+ * portable; after that point PEAK must not use MPI again during teardown.
  */
 void mpi_interceptor_set_real_finalize_allowed(int allowed);
 

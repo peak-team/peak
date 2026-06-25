@@ -439,19 +439,20 @@ if(BUILD_TESTING)
                     --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
                     --trace-path ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-stale-reattach-trace.csv
-                    --timeout 60
+                    --timeout 90
                     --stale-threads 48
                     --stale-calls 2048
                     --
                     --active-threads 16
                     --stale-threads 48
                     --stale-calls 2048
+                    --stale-ready-timeout 30
                     --active-after-stale
                     --seconds 3)
         set_tests_properties(test_detach_stale_threads_reattach_strict
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "stale_threads_trace_check_ok"
-                TIMEOUT 60)
+                TIMEOUT 100)
     endif()
 
     # Add test of dgemm

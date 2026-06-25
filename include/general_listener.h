@@ -101,9 +101,9 @@ void peak_general_listener_attach();
  *
  * This function prints the results of the Peak General Listener for each function hook.
  *
- * @return void
+ * @return TRUE when MPI aggregation completed; FALSE for socket/local output or fallback.
  */
-void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
+gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
 
 /**
  * @brief Makes still-pinned listener callbacks pass through without accounting.
