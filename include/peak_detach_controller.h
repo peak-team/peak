@@ -102,7 +102,8 @@ gboolean peak_detach_controller_finish_hook_mutation(
 gboolean peak_detach_controller_finish_hook_mutation_batch(
     PeakDetachStatus* status_out);
 
-gboolean peak_detach_controller_shutdown_helper(PeakDetachStatus* status_out);
+PEAK_DETACH_CONTROLLER_TEST_API gboolean
+peak_detach_controller_shutdown_helper(PeakDetachStatus* status_out);
 
 void peak_detach_controller_abort_after_failed_finish(
     const char* context,

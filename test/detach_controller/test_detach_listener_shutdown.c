@@ -110,6 +110,19 @@ check_contains(const char* label, const char* haystack, const char* needle)
     }
 }
 
+static void
+check_string_equal(const char* label, const char* actual, const char* expected)
+{
+    if (actual == NULL || expected == NULL || strcmp(actual, expected) != 0) {
+        fprintf(stderr,
+                "FAIL: %s: expected '%s', got '%s'\n",
+                label,
+                expected != NULL ? expected : "<null>",
+                actual != NULL ? actual : "<null>");
+        failures++;
+    }
+}
+
 static gulong
 listener_call_count(void)
 {
@@ -418,12 +431,52 @@ run_idle_shutdown_io_fail_closed(void)
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+static int
+run_slurm_host_parser(void)
+{
+#ifndef HAVE_MPI
+    fprintf(stderr, "general-listener-slurm-host-parser-skipped\n");
+    return EXIT_SUCCESS;
+#else
+    char host[64];
+
+    check_true("plain comma hostlist parses",
+               peak_general_listener_test_first_slurm_host(
+                   "c125-044,c139-052,c172-001",
+                   host,
+                   sizeof(host)));
+    check_string_equal("plain comma hostlist first host", host, "c125-044");
+
+    check_true("tacc hyphenated bracket hostlist parses",
+               peak_general_listener_test_first_slurm_host(
+                   "c[125-044,139-052,172-001]",
+                   host,
+                   sizeof(host)));
+    check_string_equal("tacc bracket hostlist first host", host, "c125-044");
+
+    check_true("ascending numeric range parses",
+               peak_general_listener_test_first_slurm_host("c[001-004]",
+                                                           host,
+                                                           sizeof(host)));
+    check_string_equal("ascending numeric range first host", host, "c001");
+
+    check_true("single bracket token parses",
+               peak_general_listener_test_first_slurm_host("node[007,009]",
+                                                           host,
+                                                           sizeof(host)));
+    check_string_equal("single bracket token first host", host, "node007");
+
+    fprintf(stderr, "general-listener-slurm-host-parser-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
 int
 main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed\n",
+                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-slurm-host-parser\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -433,6 +486,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "general-listener-idle-shutdown-io-fail-closed") == 0) {
         return run_idle_shutdown_io_fail_closed();
+    }
+    if (strcmp(argv[1], "general-listener-slurm-host-parser") == 0) {
+        return run_slurm_host_parser();
     }
 
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);

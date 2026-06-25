@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "peak_signal_policy_internal.h"
+#include "utils/utils.h"
 
 #include <aio.h>
 #include <dirent.h>
@@ -169,6 +170,12 @@ peak_signal_policy_ensure_real_symbols(void)
 {
     (void)pthread_once(&real_symbols_once,
                        peak_signal_policy_resolve_real_symbols);
+}
+
+static int
+peak_signal_policy_enabled_for_process(void)
+{
+    return peak_process_profile_enabled();
 }
 
 static int
@@ -603,7 +610,8 @@ static int
 peak_signal_policy_prepare_reserved_set_for_user(const sigset_t* set,
                                                  const char* api)
 {
-    if (peak_signal_policy_is_internal()) {
+    if (!peak_signal_policy_enabled_for_process() ||
+        peak_signal_policy_is_internal()) {
         return 1;
     }
 
@@ -633,7 +641,8 @@ static int
 peak_signal_policy_prepare_reserved_signal_for_user(int signum,
                                                     const char* api)
 {
-    if (peak_signal_policy_is_internal() || signum <= 0) {
+    if (!peak_signal_policy_enabled_for_process() ||
+        peak_signal_policy_is_internal() || signum <= 0) {
         return 1;
     }
 
@@ -661,7 +670,8 @@ peak_signal_policy_prepare_reserved_signal_for_user(int signum,
 static int
 peak_signal_policy_should_hide_raw_sigaction_query(int signum)
 {
-    if (peak_signal_policy_is_internal()) {
+    if (!peak_signal_policy_enabled_for_process() ||
+        peak_signal_policy_is_internal()) {
         return 0;
     }
 
@@ -705,6 +715,10 @@ peak_signal_policy_prepare_event_for_user_excluding(
     const sigset_t* excluded_set,
     const char* api)
 {
+    if (!peak_signal_policy_enabled_for_process()) {
+        return 1;
+    }
+
     int signum = 0;
     if (!peak_signal_policy_event_signal(evp, &signum)) {
         return 1;
@@ -809,7 +823,8 @@ peak_signal_policy_prepare_reserved_raw_set_for_user(const void* set,
                                                      size_t set_size,
                                                      const char* api)
 {
-    if (peak_signal_policy_is_internal()) {
+    if (!peak_signal_policy_enabled_for_process() ||
+        peak_signal_policy_is_internal()) {
         return 1;
     }
 
@@ -1400,6 +1415,9 @@ sigaction(int signum, const struct sigaction* act, struct sigaction* oldact)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigaction_fn(signum, act, oldact);
+    }
     int reserved = atomic_load_explicit(&reserved_signal, memory_order_acquire);
     if (!peak_signal_policy_is_internal() && act == NULL && oldact != NULL &&
         signum > 0 &&
@@ -1425,6 +1443,9 @@ __attribute__((visibility("default"))) void (*signal(int signum, void (*handler)
         errno = ENOSYS;
         return SIG_ERR;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_signal_fn(signum, handler);
+    }
     if (!peak_signal_policy_prepare_reserved_signal_for_user(signum,
                                                             "signal")) {
         return SIG_ERR;
@@ -1439,6 +1460,9 @@ pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset)
     if (real_pthread_sigmask_fn == NULL) {
         errno = ENOSYS;
         return errno;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_pthread_sigmask_fn(how, set, oldset);
     }
     if (how == SIG_BLOCK || how == SIG_SETMASK) {
         if (!peak_signal_policy_prepare_reserved_set_for_user(
@@ -1458,6 +1482,9 @@ sigprocmask(int how, const sigset_t* set, sigset_t* oldset)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigprocmask_fn(how, set, oldset);
+    }
     if (how == SIG_BLOCK || how == SIG_SETMASK) {
         if (!peak_signal_policy_prepare_reserved_set_for_user(set,
                                                               "sigprocmask")) {
@@ -1475,6 +1502,9 @@ sigwait(const sigset_t* set, int* sig)
         errno = ENOSYS;
         return errno;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigwait_fn(set, sig);
+    }
     if (!peak_signal_policy_prepare_reserved_set_for_user(set, "sigwait")) {
         return EINVAL;
     }
@@ -1488,6 +1518,9 @@ sigwaitinfo(const sigset_t* set, siginfo_t* info)
     if (real_sigwaitinfo_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigwaitinfo_fn(set, info);
     }
     if (!peak_signal_policy_prepare_reserved_set_for_user(set,
                                                           "sigwaitinfo")) {
@@ -1506,6 +1539,9 @@ sigtimedwait(const sigset_t* set,
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigtimedwait_fn(set, info, timeout);
+    }
     if (!peak_signal_policy_prepare_reserved_set_for_user(set,
                                                           "sigtimedwait")) {
         return -1;
@@ -1521,6 +1557,9 @@ signalfd(int fd, const sigset_t* mask, int flags)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_signalfd_fn(fd, mask, flags);
+    }
     if (!peak_signal_policy_prepare_reserved_set_for_user(mask, "signalfd")) {
         return -1;
     }
@@ -1531,6 +1570,22 @@ __attribute__((visibility("default"))) int
 signalfd4(int fd, const sigset_t* mask, int sizemask, int flags)
 {
     peak_signal_policy_ensure_real_symbols();
+    if (!peak_signal_policy_enabled_for_process()) {
+        if (real_signalfd4_fn != NULL) {
+            return real_signalfd4_fn(fd, mask, sizemask, flags);
+        }
+#ifdef SYS_signalfd4
+        if (real_syscall_fn != NULL) {
+            return (int)real_syscall_fn(SYS_signalfd4,
+                                        fd,
+                                        mask,
+                                        sizemask,
+                                        flags);
+        }
+#endif
+        errno = ENOSYS;
+        return -1;
+    }
     if (!peak_signal_policy_prepare_reserved_set_for_user(mask, "signalfd4")) {
         return -1;
     }
@@ -1558,6 +1613,9 @@ timer_create(clockid_t clockid, struct sigevent* evp, timer_t* timerid)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_timer_create_fn(clockid, evp, timerid);
+    }
     if (!peak_signal_policy_prepare_event_for_user(evp, "timer_create")) {
         return -1;
     }
@@ -1572,6 +1630,9 @@ mq_notify(mqd_t mqdes, const struct sigevent* sevp)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_mq_notify_fn(mqdes, sevp);
+    }
     if (!peak_signal_policy_prepare_event_for_user(sevp, "mq_notify")) {
         return -1;
     }
@@ -1585,6 +1646,9 @@ aio_read(struct aiocb* aiocbp)
     if (real_aio_read_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_aio_read_fn(aiocbp);
     }
     struct aiocb aiocb_copy;
     if (peak_signal_policy_safe_read(&aiocb_copy,
@@ -1605,6 +1669,9 @@ aio_write(struct aiocb* aiocbp)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_aio_write_fn(aiocbp);
+    }
     struct aiocb aiocb_copy;
     if (peak_signal_policy_safe_read(&aiocb_copy,
                                      aiocbp,
@@ -1623,6 +1690,9 @@ aio_fsync(int op, struct aiocb* aiocbp)
     if (real_aio_fsync_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_aio_fsync_fn(op, aiocbp);
     }
     struct aiocb aiocb_copy;
     if (peak_signal_policy_safe_read(&aiocb_copy,
@@ -1645,6 +1715,9 @@ lio_listio(int mode,
     if (real_lio_listio_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_lio_listio_fn(mode, list, nent, sevp);
     }
 
     sigset_t excluded_set;
@@ -1691,6 +1764,9 @@ kill(pid_t pid, int sig)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_kill_fn(pid, sig);
+    }
     if (!peak_signal_policy_prepare_reserved_signal_for_user(sig, "kill")) {
         return -1;
     }
@@ -1704,6 +1780,9 @@ pthread_kill(pthread_t thread, int sig)
     if (real_pthread_kill_fn == NULL) {
         errno = ENOSYS;
         return errno;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_pthread_kill_fn(thread, sig);
     }
     if (!peak_signal_policy_prepare_reserved_signal_for_user(sig,
                                                              "pthread_kill")) {
@@ -1720,6 +1799,9 @@ sigqueue(pid_t pid, int sig, const union sigval value)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigqueue_fn(pid, sig, value);
+    }
     if (!peak_signal_policy_prepare_reserved_signal_for_user(sig, "sigqueue")) {
         return -1;
     }
@@ -1734,6 +1816,9 @@ raise(int sig)
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_raise_fn(sig);
+    }
     if (!peak_signal_policy_prepare_reserved_signal_for_user(sig, "raise")) {
         return -1;
     }
@@ -1747,6 +1832,9 @@ sigsuspend(const sigset_t* mask)
     if (real_sigsuspend_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_sigsuspend_fn(mask);
     }
     if (!peak_signal_policy_prepare_reserved_set_for_user(mask, "sigsuspend")) {
         return -1;
@@ -1767,6 +1855,14 @@ pselect(int nfds,
         errno = ENOSYS;
         return -1;
     }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_pselect_fn(nfds,
+                               readfds,
+                               writefds,
+                               exceptfds,
+                               timeout,
+                               sigmask);
+    }
     if (!peak_signal_policy_prepare_reserved_set_for_user(sigmask, "pselect")) {
         return -1;
     }
@@ -1783,6 +1879,9 @@ ppoll(struct pollfd* fds,
     if (real_ppoll_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return real_ppoll_fn(fds, nfds, timeout, sigmask);
     }
     if (!peak_signal_policy_prepare_reserved_set_for_user(sigmask, "ppoll")) {
         return -1;
@@ -1836,6 +1935,15 @@ peak_signal_policy_syscall(long number,
     if (real_syscall_fn == NULL) {
         errno = ENOSYS;
         return -1;
+    }
+    if (!peak_signal_policy_enabled_for_process()) {
+        return peak_signal_policy_forward_syscall(number,
+                                                  a1,
+                                                  a2,
+                                                  a3,
+                                                  a4,
+                                                  a5,
+                                                  a6);
     }
 
     switch (number) {
@@ -2034,7 +2142,8 @@ __attribute__((constructor))
 static void
 peak_signal_policy_constructor(void)
 {
-    if (peak_signal_policy_should_reserve_early()) {
+    if (peak_signal_policy_enabled_for_process() &&
+        peak_signal_policy_should_reserve_early()) {
         (void)peak_signal_policy_choose_reserved_signal();
         (void)peak_signal_policy_unblock_reserved_for_current_thread();
     }

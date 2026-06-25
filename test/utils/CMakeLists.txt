@@ -18,4 +18,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
             ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:peak>;PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0"
             PASS_REGULAR_EXPRESSION "interpreter_skip_ok"
             FAIL_REGULAR_EXPRESSION "PEAK Library|overhead calibration|Estimated overhead")
+
+    add_test(NAME test_preload_filtered_tool_inert
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/run_preload_filtered_tool_check.py
+                --libpeak $<TARGET_FILE:peak>)
+    set_tests_properties(test_preload_filtered_tool_inert
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "filtered_tool_preload_ok"
+            FAIL_REGULAR_EXPRESSION "PEAK Library|overhead calibration|Estimated overhead")
 endif()

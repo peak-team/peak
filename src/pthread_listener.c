@@ -145,6 +145,14 @@ pthread_listener_on_enter(GumInvocationListener* listener,
         thread_state->is_original = TRUE;
     }
 
+    /*
+     * Park the creator before the real pthread_create() call while a strict
+     * mutation window is active. Waiting only in the child wrapper leaves a
+     * kernel-visible newborn task that the helper backend may observe before
+     * it has reached PEAK's gate.
+     */
+    peak_detach_controller_wait_for_mutation_window();
+
     PeakPthreadStartContext* start_context = g_new0(PeakPthreadStartContext, 1);
     start_context->start_routine =
         (pthread_start_routine_t)gum_invocation_context_get_nth_argument(ic, 2);

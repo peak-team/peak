@@ -2,6 +2,7 @@ add_executable(test_detach_controller
   test_detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
+  $<TARGET_OBJECTS:utils_c>
 )
 add_executable(test_detach_fake_helper test_detach_fake_helper.c)
 add_executable(test_detach_shutdown_preload test_detach_shutdown_preload.c)
@@ -430,6 +431,12 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response"
       PASS_REGULAR_EXPRESSION "general-listener-idle-shutdown-io-fail-closed-ok")
+
+  add_test(NAME test_detach_controller_general_listener_slurm_host_parser
+    COMMAND test_detach_listener_shutdown general-listener-slurm-host-parser)
+  set_tests_properties(test_detach_controller_general_listener_slurm_host_parser
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "general-listener-slurm-host-parser-(ok|skipped)")
 
   add_test(NAME test_detach_controller_preload_idle_shutdown_io_fail_closed
     COMMAND ${CMAKE_COMMAND}

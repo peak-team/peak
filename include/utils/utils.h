@@ -119,4 +119,38 @@ int check_interpreter_command(const char *str);
  */
 int check_module_helper_command(int argc, char *const argv[]);
 
+/**
+ * @brief Determine whether PEAK should profile a process with the supplied
+ *        argv, applying the same command-filter rules used by LD_PRELOAD
+ *        startup.
+ *
+ * @param argc Argument count from main or /proc/self/cmdline.
+ * @param argv Argument vector.
+ * @return 1 if PEAK should initialize for this command, 0 if it should stay
+ *         inert.
+ */
+int peak_should_profile_command(int argc, char *const argv[]);
+
+/**
+ * @brief Override the cached current-process profiling decision.
+ *
+ * This lets the __libc_start_main wrapper publish the exact argv-based
+ * decision to constructors and interposed functions that run later.
+ *
+ * @param enabled Nonzero to enable PEAK behavior for this process, zero to
+ *        keep preload-side hooks inert.
+ */
+void peak_set_process_profile_enabled(int enabled);
+
+/**
+ * @brief Return whether PEAK behavior should be active in this process.
+ *
+ * If __libc_start_main has not published a decision yet, this consults
+ * /proc/self/cmdline so early constructors can still honor filtered wrapper
+ * commands such as timeout, env, ibrun, and MPI launch helpers.
+ *
+ * @return 1 if PEAK should be active for this process, 0 if it should be inert.
+ */
+int peak_process_profile_enabled(void);
+
 #endif /* __UTILS_H */

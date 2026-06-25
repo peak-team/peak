@@ -44,10 +44,10 @@ EXPECTED = {
         "replace_fast": 1,
     },
     ("support-shutdown-debt", "src/mpi_interceptor.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "flush": 1,
-        "revert": 1,
+        "begin_transaction": 2,
+        "end_transaction": 2,
+        "flush": 2,
+        "revert": 2,
     },
     ("support-init", "src/pthread_listener.c"): {
         "attach": 1,
@@ -120,6 +120,7 @@ FUNCTION_ANCHORS = {
     },
     "src/mpi_interceptor.c": {
         "mpi_interceptor_attach": "support-init",
+        "mpi_interceptor_restore_finalize_for_direct_call": "support-shutdown-debt",
         "mpi_interceptor_dettach": "support-shutdown-debt",
     },
     "src/syscall_interceptor.c": {

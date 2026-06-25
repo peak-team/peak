@@ -20,6 +20,8 @@
 #define PEAK_DETACH_HELPER_PROTOCOL_FD 3
 #define PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS \
     PEAK_DETACH_HELPER_MAX_BATCH_WRITES
+#define PEAK_STRICT_GATE_WAIT_TIMEOUT_MS_ENV "PEAK_STRICT_GATE_WAIT_TIMEOUT_MS"
+#define PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS 10000u
 
 typedef enum {
     PEAK_SAFE_DETACH_MODE_COMPATIBILITY = 0,
@@ -141,6 +143,7 @@ static gboolean warned_auto_helper_ptrace_scope = FALSE;
 static gboolean helper_state_fatal = FALSE;
 static gboolean warned_signal_gate_unavailable = FALSE;
 static gboolean warned_helper_gate_unavailable = FALSE;
+static gboolean warned_strict_gate_wait_timeout = FALSE;
 static gboolean signal_breakpoint_supported = FALSE;
 static struct sigaction previous_trap_action;
 static char resolved_helper_path[PATH_MAX];
@@ -160,6 +163,9 @@ static _Atomic int strict_mutation_thread_gate_installed = 0;
 static PeakDetachSignalSlot signal_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static PeakDetachGateWaiterSlot gate_waiter_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static _Atomic uint32_t signal_slot_count = 0;
+static gsize strict_gate_wait_timeout_initialized = 0;
+static double strict_gate_wait_timeout_s =
+    (double)PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS / 1000.0;
 
 static int
 peak_detach_controller_signal_backend_signum_load(void)
@@ -171,6 +177,49 @@ static void
 peak_detach_controller_signal_backend_signum_store(int signum)
 {
     atomic_store_explicit(&signal_backend_signum, signum, memory_order_release);
+}
+
+static unsigned int
+peak_detach_controller_parse_uint_env(const char* name,
+                                      unsigned int default_value)
+{
+    const char* value = g_getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
+        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        return default_value;
+    }
+
+    return (unsigned int)parsed;
+}
+
+static void
+peak_detach_controller_init_strict_gate_wait_timeout_once(void)
+{
+    unsigned int timeout_ms =
+        peak_detach_controller_parse_uint_env(
+            PEAK_STRICT_GATE_WAIT_TIMEOUT_MS_ENV,
+            PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS);
+
+    strict_gate_wait_timeout_s =
+        timeout_ms == 0 ? 0.0 : (double)timeout_ms / 1000.0;
+}
+
+static void
+peak_detach_controller_init_strict_gate_wait_timeout(void)
+{
+    if (g_once_init_enter(&strict_gate_wait_timeout_initialized)) {
+        peak_detach_controller_init_strict_gate_wait_timeout_once();
+        g_once_init_leave(&strict_gate_wait_timeout_initialized, 1);
+    }
 }
 #endif
 
@@ -4319,7 +4368,9 @@ peak_detach_controller_wait_for_mutation_window(void)
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
     pid_t tid = (pid_t)syscall(SYS_gettid);
     int published_epoch = 0;
+    double wait_started_at = peak_detach_controller_monotonic_second();
 
+    peak_detach_controller_init_strict_gate_wait_timeout();
     for (;;) {
         int gate_epoch = atomic_load_explicit(&strict_mutation_thread_gate,
                                               memory_order_acquire);
@@ -4332,6 +4383,16 @@ peak_detach_controller_wait_for_mutation_window(void)
             }
             peak_detach_controller_publish_gate_waiter(tid, gate_epoch);
             published_epoch = gate_epoch;
+        }
+        if (strict_gate_wait_timeout_s > 0.0 &&
+            peak_detach_controller_monotonic_second() - wait_started_at >=
+                strict_gate_wait_timeout_s) {
+            if (!warned_strict_gate_wait_timeout) {
+                warned_strict_gate_wait_timeout = TRUE;
+                g_printerr("[peak] Strict detach thread-creation gate waited %.3fs; allowing new thread to start to avoid process hang\n",
+                           strict_gate_wait_timeout_s);
+            }
+            break;
         }
         usleep(100);
     }
