@@ -323,12 +323,13 @@ is_versioned_command(const char* command, const char* prefix)
 int
 check_interpreter_command(const char* command)
 {
-    const char* base_name = get_base_name(command);
+    const char* base_name;
 
     if (command == NULL) {
         return 0;
     }
 
+    base_name = get_base_name(command);
     return is_versioned_command(base_name, "lua") ||
            strcmp(base_name, "luajit") == 0 ||
            is_versioned_command(base_name, "python") ||
