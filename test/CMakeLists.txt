@@ -883,75 +883,76 @@ if(BUILD_TESTING)
             PROPERTIES 
                 PASS_REGULAR_EXPRESSION "cblas_dgemm[*]*\\|[ \t]+200\\|"
         )
+        set(_PEAK_MPI_LIFECYCLE_FATAL_REGEX "Caught signal|Segmentation fault|SIGSEGV|signal 11|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc")
         set_tests_properties(test_mpi_exit_before_finalize
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=no-finalize"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_no_finalize_nonzero_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=no-finalize-nonzero"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_local
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-local"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_strict_detach
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 45)
         set_tests_properties(test_mpi_finalize_target_is_not_self_profiled
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc|unexpected stats row"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}|unexpected stats row"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_socket_bad_host
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-socket-bad-host"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 15)
         set_tests_properties(test_mpi_finalize_clean_exit_output_socket_token_mismatch
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-socket-token-mismatch"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 15)
         set_tests_properties(test_mpi_finalize_then_nonzero_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-nonzero"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_subset_finalize_then_nonzero_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=subset-finalize-nonzero"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_subset_finalize_clean_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=subset-finalize-clean"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_subset_finalize_clean_exit_output_mpi
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=subset-finalize-clean-collective"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_then_nonzero_return
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-return-nonzero"
-                FAIL_REGULAR_EXPRESSION "Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
             set_tests_properties(test_dgemm_mpi_strict

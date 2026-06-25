@@ -406,8 +406,7 @@ peak_fini_impl(void)
     int local_requested_mpi_finalize =
         mpi_interceptor_finalize_was_requested();
     int all_ranks_requested_mpi_finalize = 0;
-    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
-        mpi_runtime_can_collect &&
+    if (mpi_runtime_can_collect &&
         !abnormal_exit) {
         all_ranks_requested_mpi_finalize =
             peak_mpi_all_ranks_requested_finalize(
@@ -426,6 +425,11 @@ peak_fini_impl(void)
         use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
         use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
         PEAK_OUTPUT_AGGREGATION_LOCAL;
+    int allow_real_mpi_finalize =
+        mpi_finalize_path &&
+        mpi_runtime_can_collect &&
+        !abnormal_exit &&
+        all_ranks_requested_mpi_finalize;
     if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
         g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
@@ -446,10 +450,10 @@ peak_fini_impl(void)
         g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
     }
     if (found_MPI && mpi_finalize_path) {
-        mpi_interceptor_set_real_finalize_allowed(use_mpi_collective_output);
+        mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
         if (mpi_log_rank) {
-            if (use_mpi_collective_output) {
-                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize by default\n");
+            if (allow_real_mpi_finalize) {
+                g_printerr("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
             } else {
                 g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
             }
