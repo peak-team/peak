@@ -22,6 +22,7 @@
 #include "malloc_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
+#include "utils/utils.h"
 
 #define PEAK_TARGET_ENV                        "PEAK_TARGET"
 #define PEAK_TARGET_FILE_ENV                   "PEAK_TARGET_FILE"
@@ -52,8 +53,7 @@
 #define PEAK_MAX_NUM_THREADS_ENV               "PEAK_MAX_NUM_THREADS"
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
-#define PEAK_JIT_ENABLE_ENV                    "PEAK_JIT_ENABLE"
-#define PEAK_PROFILE_INTERPRETERS_ENV          "PEAK_PROFILE_INTERPRETERS"
+#define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
@@ -118,17 +118,79 @@ peak_env_value_truthy(const char* value)
             g_ascii_strcasecmp(value, "on") == 0);
 }
 
-static gboolean
-peak_mpi_collective_output_enabled(void)
+#ifdef HAVE_MPI
+static PeakOutputAggregationMode
+peak_output_aggregation_mode_from_value(const char* name,
+                                        const char* value,
+                                        gboolean legacy_collective)
 {
-    const char* value = getenv(PEAK_MPI_COLLECTIVE_OUTPUT_ENV);
-
-    if (value != NULL && value[0] != '\0') {
-        return peak_env_value_truthy(value);
+    if (value == NULL || value[0] == '\0') {
+        return PEAK_OUTPUT_AGGREGATION_MPI;
     }
 
-    return TRUE;
+    if (legacy_collective && peak_env_value_truthy(value)) {
+        return PEAK_OUTPUT_AGGREGATION_MPI;
+    }
+
+    if (g_ascii_strcasecmp(value, "mpi") == 0 ||
+        g_ascii_strcasecmp(value, "collective") == 0 ||
+        peak_env_value_truthy(value)) {
+        return PEAK_OUTPUT_AGGREGATION_MPI;
+    }
+
+    if (g_ascii_strcasecmp(value, "socket") == 0 ||
+        g_ascii_strcasecmp(value, "tcp") == 0 ||
+        g_ascii_strcasecmp(value, "interconnect") == 0) {
+        return PEAK_OUTPUT_AGGREGATION_SOCKET;
+    }
+
+    if (g_ascii_strcasecmp(value, "0") == 0 ||
+        g_ascii_strcasecmp(value, "false") == 0 ||
+        g_ascii_strcasecmp(value, "no") == 0 ||
+        g_ascii_strcasecmp(value, "off") == 0 ||
+        g_ascii_strcasecmp(value, "none") == 0 ||
+        g_ascii_strcasecmp(value, "local") == 0 ||
+        g_ascii_strcasecmp(value, "rank-local") == 0) {
+        return PEAK_OUTPUT_AGGREGATION_LOCAL;
+    }
+
+    g_printerr("[peak] Unknown %s=%s; disabling aggregate output\n",
+               name,
+               value);
+    return PEAK_OUTPUT_AGGREGATION_LOCAL;
 }
+
+static PeakOutputAggregationMode
+peak_output_aggregation_mode(void)
+{
+    const char* aggregation = getenv(PEAK_OUTPUT_AGGREGATION_ENV);
+    const char* value = getenv(PEAK_MPI_COLLECTIVE_OUTPUT_ENV);
+
+    if (aggregation != NULL && aggregation[0] != '\0') {
+        return peak_output_aggregation_mode_from_value(
+            PEAK_OUTPUT_AGGREGATION_ENV,
+            aggregation,
+            FALSE);
+    }
+
+    if (value != NULL && value[0] != '\0') {
+        return peak_output_aggregation_mode_from_value(
+            PEAK_MPI_COLLECTIVE_OUTPUT_ENV,
+            value,
+            TRUE);
+    }
+
+    return PEAK_OUTPUT_AGGREGATION_MPI;
+}
+
+static gboolean
+peak_output_aggregation_explicit(void)
+{
+    const char* aggregation = getenv(PEAK_OUTPUT_AGGREGATION_ENV);
+
+    return aggregation != NULL && aggregation[0] != '\0';
+}
+#endif
 
 void peak_init()
 {
@@ -265,6 +327,14 @@ peak_mpi_all_ranks_requested_finalize(int local_requested)
 static void
 peak_fini_impl(void)
 {
+#ifdef HAVE_MPI
+    int mpi_finalize_path =
+        found_MPI && mpi_interceptor_finalize_was_requested();
+    if (mpi_finalize_path) {
+        peak_general_listener_suspend_callbacks();
+    }
+#endif
+
     if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, false);
@@ -284,10 +354,20 @@ peak_fini_impl(void)
 
     peak_general_listener_controller_stop();
     peak_jit_provider_disable();
-    if (peak_memory_profile) {
+    if (
+#ifdef HAVE_MPI
+        !mpi_finalize_path &&
+#endif
+        peak_memory_profile) {
         malloc_interceptor_detach();
     }
-    gboolean dlopen_shutdown_flushed = dlopen_interceptor_dettach();
+    gboolean dlopen_shutdown_flushed = TRUE;
+#ifdef HAVE_MPI
+    if (!mpi_finalize_path)
+#endif
+    {
+        dlopen_shutdown_flushed = dlopen_interceptor_dettach();
+    }
     if (!dlopen_shutdown_flushed) {
     #ifdef HAVE_MPI
         if (flag_clean_fppid) {
@@ -307,45 +387,94 @@ peak_fini_impl(void)
         atomic_load_explicit(&peak_exit_status_value, memory_order_acquire);
     int abnormal_exit = exit_status_known == 2 && exit_status != 0;
     /*
-     * Error exits often happen while only a subset of ranks is unwinding.  Do
-     * not let PEAK introduce MPI collectives or delayed PMPI_Finalize there;
-     * rank-local output is the only safe profiler behavior.
+     * Error exits often happen while only a subset of ranks is unwinding. Do
+     * not let PEAK introduce MPI collectives there.
      */
-    int mpi_collective_output_enabled =
-        found_MPI && peak_mpi_collective_output_enabled();
+    PeakOutputAggregationMode aggregation_mode =
+        found_MPI ? peak_output_aggregation_mode()
+                  : PEAK_OUTPUT_AGGREGATION_LOCAL;
+    gboolean aggregation_explicit =
+        found_MPI && peak_output_aggregation_explicit();
     int mpi_runtime_can_collect =
         found_MPI && peak_mpi_runtime_allows_collectives();
+    int mpi_log_rank = 1;
+    if (mpi_runtime_can_collect) {
+        int mpi_rank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+        mpi_log_rank = mpi_rank == 0;
+    }
     int local_requested_mpi_finalize =
         mpi_interceptor_finalize_was_requested();
     int all_ranks_requested_mpi_finalize = 0;
-    if (mpi_collective_output_enabled && mpi_runtime_can_collect &&
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+        mpi_runtime_can_collect &&
         !abnormal_exit) {
         all_ranks_requested_mpi_finalize =
             peak_mpi_all_ranks_requested_finalize(
                 local_requested_mpi_finalize ? 1 : 0);
     }
-    int app_requested_mpi_finalize =
-        mpi_collective_output_enabled && mpi_runtime_can_collect &&
+    int use_mpi_collective_output =
+        aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+        mpi_runtime_can_collect &&
         !abnormal_exit && all_ranks_requested_mpi_finalize;
-    if (found_MPI && abnormal_exit && local_requested_mpi_finalize) {
-        g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; writing rank-local output and skipping PEAK-driven MPI_Finalize\n",
+    int use_socket_output =
+        aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
+        mpi_runtime_can_collect &&
+        !abnormal_exit &&
+        (!mpi_finalize_path || aggregation_explicit);
+    PeakOutputAggregationMode output_mode =
+        use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
+        use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
+        PEAK_OUTPUT_AGGREGATION_LOCAL;
+    if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
+        g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
-    } else if (found_MPI && !mpi_collective_output_enabled) {
-        g_printerr("[peak] MPI collective output is disabled for strict teardown; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
-    } else if (found_MPI && !mpi_runtime_can_collect) {
-        g_printerr("[peak] MPI runtime is not in a collective-safe state; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
-    } else if (found_MPI && !all_ranks_requested_mpi_finalize) {
-        g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
-    } else if (found_MPI && !app_requested_mpi_finalize) {
-        g_printerr("[peak] PMPI_Finalize was not observed; writing rank-local output and skipping PEAK-driven MPI_Finalize\n");
+    } else if (found_MPI && use_mpi_collective_output && mpi_log_rank) {
+        g_printerr("[peak] PMPI_Finalize was observed on every rank; writing MPI-reduced output before MPI finalization or process exit\n");
+    } else if (found_MPI && use_socket_output && mpi_log_rank) {
+        g_printerr("[peak] Writing PEAK-owned socket-reduced output before MPI finalization or process exit\n");
+    } else if (found_MPI && aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
+        g_printerr("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI finalization or process exit\n");
+    } else if (found_MPI && !mpi_runtime_can_collect && mpi_log_rank) {
+        g_printerr("[peak] MPI runtime is not in an output-safe state; writing rank-local output before process exit\n");
+    } else if (found_MPI &&
+               aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+               !all_ranks_requested_mpi_finalize &&
+               mpi_log_rank) {
+        g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output before process exit\n");
+    } else if (found_MPI && output_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
+        g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
     }
-    peak_general_listener_print(app_requested_mpi_finalize);
+    if (found_MPI && mpi_finalize_path) {
+        mpi_interceptor_set_real_finalize_allowed(use_mpi_collective_output);
+        if (mpi_log_rank) {
+            if (use_mpi_collective_output) {
+                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize by default\n");
+            } else {
+                g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
+            }
+        }
+    }
+    peak_general_listener_print(output_mode);
     #ifdef HAVE_CUDA
-        cuda_interceptor_print(app_requested_mpi_finalize);
-        cuda_interceptor_dettach();
+        cuda_interceptor_print(use_mpi_collective_output);
+        if (!mpi_finalize_path) {
+            cuda_interceptor_dettach();
+        }
     #endif
-    if (found_MPI)
-        mpi_interceptor_dettach(app_requested_mpi_finalize);
+    if (found_MPI && !mpi_finalize_path) {
+        mpi_interceptor_dettach(0);
+    }
+    if (found_MPI && mpi_finalize_path) {
+        if (mpi_log_rank) {
+            g_printerr("[peak] Leaving PEAK target hooks pinned and restoring support wrappers before application PMPI_Finalize\n");
+        }
+        syscall_interceptor_dettach();
+        if (!pthread_listener_dettach()) {
+            g_printerr("[peak] Leaving pthread listener bookkeeping allocated before application PMPI_Finalize\n");
+        }
+        return;
+    }
 #else
     peak_general_listener_print(0);
     #ifdef HAVE_CUDA
@@ -418,62 +547,9 @@ static main_fn real_main = NULL;
 static libc_start_main_fn real___libc_start_main = NULL;
 
 static gboolean
-peak_env_truthy(const char* value)
-{
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "1") == 0 ||
-            g_ascii_strcasecmp(value, "true") == 0 ||
-            g_ascii_strcasecmp(value, "yes") == 0 ||
-            g_ascii_strcasecmp(value, "on") == 0);
-}
-
-static const char*
-peak_command_base_name(const char* path)
-{
-    const char* base;
-
-    if (path == NULL) {
-        return NULL;
-    }
-
-    base = strrchr(path, '/');
-    return base != NULL ? base + 1 : path;
-}
-
-static gboolean
-peak_command_is_jit_runtime(const char* command)
-{
-    const char* base = peak_command_base_name(command);
-
-    return base != NULL &&
-           (strcmp(base, "node") == 0 ||
-            strcmp(base, "nodejs") == 0);
-}
-
-static gboolean
 peak_should_wrap_main(int argc, char** argv)
 {
-    const char* command;
-
-    if (argv == NULL) {
-        return FALSE;
-    }
-
-    command = argv[0];
-    if (command == NULL) {
-        return FALSE;
-    }
-
-    if (check_interpreter_command(command)) {
-        return peak_env_truthy(getenv(PEAK_PROFILE_INTERPRETERS_ENV));
-    }
-
-    if (!check_command(command)) {
-        return TRUE;
-    }
-
-    return peak_env_truthy(getenv(PEAK_JIT_ENABLE_ENV)) &&
-           peak_command_is_jit_runtime(command);
+    return peak_should_profile_command(argc, argv);
 }
 
 // Original function pointer for `exit`
@@ -585,7 +661,9 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     real_main = main;
 
     // Decide whether to use the main wrapper based on argv.
-    if (peak_should_wrap_main(argc, argv)) {
+    gboolean should_wrap = peak_should_wrap_main(argc, argv);
+    peak_set_process_profile_enabled(should_wrap);
+    if (should_wrap) {
         return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
     } else {
         return real___libc_start_main(main, argc, argv, init, fini, rtld_fini, stack_end);

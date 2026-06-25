@@ -49,6 +49,12 @@ typedef enum {
     PEAK_HOOK_SHUTDOWN
 } PeakHookState;
 
+typedef enum {
+    PEAK_OUTPUT_AGGREGATION_LOCAL = 0,
+    PEAK_OUTPUT_AGGREGATION_MPI = 1,
+    PEAK_OUTPUT_AGGREGATION_SOCKET = 2
+} PeakOutputAggregationMode;
+
 /**
  * @struct _PeakGeneralListener
  * @brief Struct representing the Peak General Listener
@@ -97,7 +103,24 @@ void peak_general_listener_attach();
  *
  * @return void
  */
-void peak_general_listener_print(int is_MPI);
+void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
+
+/**
+ * @brief Makes still-pinned listener callbacks pass through without accounting.
+ *
+ * PEAK uses this as soon as it enters the application PMPI_Finalize path.
+ * The target entry bytes and Gum listener objects may intentionally remain
+ * pinned until process exit, but callbacks must not mutate PEAK accounting,
+ * request detach, or keep heartbeat work alive while MPI/PEAK teardown is
+ * draining.
+ */
+void peak_general_listener_suspend_callbacks(void);
+
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(HAVE_MPI)
+gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
+                                                     char* out,
+                                                     size_t out_size);
+#endif
 
 /**
  * @brief Frees per-listener statistics arrays before releasing the GObject.

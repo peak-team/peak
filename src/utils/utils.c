@@ -1,5 +1,14 @@
 #include "utils.h"
 
+#include <errno.h>
+#include <strings.h>
+
+#define PEAK_JIT_ENABLE_ENV "PEAK_JIT_ENABLE"
+#define PEAK_PROFILE_INTERPRETERS_ENV "PEAK_PROFILE_INTERPRETERS"
+#define PEAK_PROFILE_DECISION_UNKNOWN (-1)
+
+static int peak_process_profile_enabled_cache = PEAK_PROFILE_DECISION_UNKNOWN;
+
 double peak_second()
 {
     struct timespec measure;
@@ -262,6 +271,30 @@ static const char *get_base_name(const char *path) {
 }
 
 static int
+peak_env_truthy(const char* value)
+{
+    return value != NULL &&
+           (strcasecmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0 ||
+            strcasecmp(value, "yes") == 0 ||
+            strcasecmp(value, "on") == 0);
+}
+
+static int
+peak_command_is_jit_runtime(const char* command)
+{
+    const char* base_name;
+
+    if (command == NULL) {
+        return 0;
+    }
+
+    base_name = get_base_name(command);
+    return strcmp(base_name, "node") == 0 ||
+           strcmp(base_name, "nodejs") == 0;
+}
+
+static int
 starts_with(const char* str, const char* prefix)
 {
     size_t prefix_len;
@@ -346,4 +379,130 @@ int check_module_helper_command(int argc, char *const argv[]) {
     }
 
     return 0;
+}
+
+int
+peak_should_profile_command(int argc, char *const argv[])
+{
+    const char* command;
+
+    if (argc <= 0 || argv == NULL || argv[0] == NULL) {
+        return 0;
+    }
+
+    command = argv[0];
+    if (check_interpreter_command(command)) {
+        return peak_env_truthy(getenv(PEAK_PROFILE_INTERPRETERS_ENV));
+    }
+
+    if (!check_command(command)) {
+        return 1;
+    }
+
+    return peak_env_truthy(getenv(PEAK_JIT_ENABLE_ENV)) &&
+           peak_command_is_jit_runtime(command);
+}
+
+void
+peak_set_process_profile_enabled(int enabled)
+{
+    __atomic_store_n(&peak_process_profile_enabled_cache,
+                     enabled ? 1 : 0,
+                     __ATOMIC_RELEASE);
+}
+
+static int
+peak_process_profile_from_proc_cmdline(void)
+{
+    char buffer[4096];
+    char* argv[128];
+    int argc = 0;
+    int open_flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
+    int fd = open("/proc/self/cmdline", open_flags);
+    if (fd < 0) {
+        return PEAK_PROFILE_DECISION_UNKNOWN;
+    }
+
+    ssize_t nread = read(fd, buffer, sizeof(buffer) - 1);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    if (nread <= 0) {
+        return PEAK_PROFILE_DECISION_UNKNOWN;
+    }
+    buffer[nread] = '\0';
+
+    for (ssize_t i = 0; i < nread && argc < (int)(sizeof(argv) / sizeof(argv[0])) - 1;) {
+        while (i < nread && buffer[i] == '\0') {
+            i++;
+        }
+        if (i >= nread) {
+            break;
+        }
+
+        argv[argc++] = &buffer[i];
+        while (i < nread && buffer[i] != '\0') {
+            i++;
+        }
+        if (i < nread) {
+            buffer[i++] = '\0';
+        }
+    }
+    argv[argc] = NULL;
+
+    if (argc <= 0) {
+        return PEAK_PROFILE_DECISION_UNKNOWN;
+    }
+
+    return peak_should_profile_command(argc, argv);
+}
+
+static int
+peak_process_profile_from_proc_exe(void)
+{
+    char exe[4096];
+    ssize_t nread = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (nread <= 0) {
+        return PEAK_PROFILE_DECISION_UNKNOWN;
+    }
+
+    exe[nread] = '\0';
+    char* argv[] = {
+        exe,
+        NULL
+    };
+    return peak_should_profile_command(1, argv);
+}
+
+int
+peak_process_profile_enabled(void)
+{
+    int cached = __atomic_load_n(&peak_process_profile_enabled_cache,
+                                 __ATOMIC_ACQUIRE);
+    if (cached != PEAK_PROFILE_DECISION_UNKNOWN) {
+        return cached;
+    }
+
+    int enabled = peak_process_profile_from_proc_cmdline();
+    if (enabled == PEAK_PROFILE_DECISION_UNKNOWN) {
+        enabled = peak_process_profile_from_proc_exe();
+    }
+    if (enabled == PEAK_PROFILE_DECISION_UNKNOWN) {
+        enabled = 1;
+    }
+
+    int expected = PEAK_PROFILE_DECISION_UNKNOWN;
+    if (!__atomic_compare_exchange_n(&peak_process_profile_enabled_cache,
+                                     &expected,
+                                     enabled,
+                                     0,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        enabled = expected;
+    }
+
+    return enabled;
 }

@@ -13,6 +13,25 @@
 
 static volatile int peak_mpi_exit_sink;
 
+static int
+peak_mpi_exit_loop_count(void)
+{
+    const char* value = getenv("PEAK_MPI_EXIT_LOOPS");
+    char* end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return 16;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || parsed <= 0 || parsed > 10000000L) {
+        return 16;
+    }
+
+    return (int)parsed;
+}
+
 void PEAK_EXPORT PEAK_NOINLINE
 peak_mpi_exit_target(int rank)
 {
@@ -27,13 +46,18 @@ main(int argc, char** argv)
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    for (int i = 0; i < 16; i++) {
+    int loops = peak_mpi_exit_loop_count();
+    for (int i = 0; i < loops; i++) {
         peak_mpi_exit_target(rank);
     }
 
     if (rank == 0) {
         fprintf(stderr, "mpi_exit_before_finalize_ready\n");
         fflush(stderr);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "no-finalize-then-exit1") == 0) {
+        exit(1);
     }
 
     if (argc > 1 && strcmp(argv[1], "subset-finalize-then-exit1") == 0) {
@@ -47,6 +71,11 @@ main(int argc, char** argv)
         if (rank == 0) {
             MPI_Finalize();
         }
+        exit(0);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "finalize-then-exit0") == 0) {
+        MPI_Finalize();
         exit(0);
     }
 

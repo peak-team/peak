@@ -50,6 +50,7 @@ def make_env(args, sample):
             "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
             "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
             "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
+            "PEAK_REATTACH_COOLDOWN_MS": args.reattach_cooldown_ms,
             "PEAK_HB_MIN_US": args.hb_min_us,
             "PEAK_HB_MAX_US": args.hb_max_us,
             "PEAK_REQUIRE_SAFE_DETACH": "1",
@@ -223,8 +224,8 @@ def trace_has_required_batch(args, sample, operation, required_size):
 def trace_transition_counts(args, sample):
     rows = read_trace_rows(args, sample)
     counts = {
-        "detach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
-        "reattach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0},
+        "detach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0, "success": 0},
+        "reattach": {"classify_failed": 0, "prepare_failed": 0, "gum_failed": 0, "success": 0},
     }
     if rows is None:
         return counts
@@ -246,6 +247,8 @@ def trace_transition_counts(args, sample):
             counts[operation]["prepare_failed"] += 1
         if fields[4] == "gum-failed":
             counts[operation]["gum_failed"] += 1
+        if fields[4] == "success":
+            counts[operation]["success"] += 1
 
     return counts
 
@@ -277,6 +280,7 @@ def trace_transition_limits_ok(args, sample):
         ("all", "classify_failed", args.max_classify_failed),
         ("detach", "classify_failed", args.max_detach_classify_failed),
         ("reattach", "classify_failed", args.max_reattach_classify_failed),
+        ("reattach", "success", args.max_reattach_success),
     )
     ok = True
 
@@ -418,6 +422,7 @@ def main():
     parser.add_argument("--stats-prefix", default="/tmp/peak-hotloop-trace-check")
     parser.add_argument("--heartbeat-interval", default="0.001")
     parser.add_argument("--hibernation-cycle", type=int, default=1)
+    parser.add_argument("--reattach-cooldown-ms", default="0")
     parser.add_argument("--overhead-ratio", default="0.000001")
     parser.add_argument("--peak-cost", default="0.000000000001")
     parser.add_argument("--detach-count", default="")
@@ -437,6 +442,7 @@ def main():
     parser.add_argument("--max-classify-failed", type=int, default=-1)
     parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
     parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
+    parser.add_argument("--max-reattach-success", type=int, default=-1)
     parser.add_argument("--require-trace-diagnostics", action="store_true")
     parser.add_argument("--detach-backend", choices=("helper", "signal"),
                         default="")

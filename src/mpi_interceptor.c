@@ -1,9 +1,11 @@
 #include "mpi_interceptor.h"
 
+#include <sched.h>
+#include <stdlib.h>
+#include <string.h>
+
 static GumInterceptor* mpi_interceptor;
 
-static int peak_is_done = 0;
-static int peak_delayed_finalize_allowed = 0;
 typedef enum {
     PEAK_MPI_FINALIZE_NOT_REQUESTED = 0,
     PEAK_MPI_FINALIZE_REQUESTED = 1,
@@ -12,9 +14,70 @@ typedef enum {
 } PeakMpiFinalizeState;
 
 static int peak_finalize_state = PEAK_MPI_FINALIZE_NOT_REQUESTED;
+static int peak_finalize_result = 0;
+static int peak_real_finalize_allowed = 0;
 static gpointer hook_address;
 
 static int (*original_pmpi_finalize)(void);
+extern void peak_fini(void);
+
+static int
+mpi_interceptor_env_truthy(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "1") == 0 ||
+            g_ascii_strcasecmp(value, "true") == 0 ||
+            g_ascii_strcasecmp(value, "yes") == 0 ||
+            g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static int
+mpi_interceptor_direct_finalize_enabled(void)
+{
+    const char* value = getenv("PEAK_MPI_FINALIZE_CALL");
+
+    if (value == NULL || value[0] == '\0') {
+        return 1;
+    }
+
+    if (g_ascii_strcasecmp(value, "trampoline") == 0 ||
+        g_ascii_strcasecmp(value, "gum") == 0 ||
+        g_ascii_strcasecmp(value, "0") == 0 ||
+        g_ascii_strcasecmp(value, "false") == 0 ||
+        g_ascii_strcasecmp(value, "no") == 0 ||
+        g_ascii_strcasecmp(value, "off") == 0) {
+        return 0;
+    }
+
+    return g_ascii_strcasecmp(value, "direct") == 0 ||
+           mpi_interceptor_env_truthy(value);
+}
+
+static int
+mpi_interceptor_real_finalize_enabled(void)
+{
+    const char* value = getenv("PEAK_MPI_REAL_FINALIZE");
+
+    return mpi_interceptor_env_truthy(value);
+}
+
+static int
+mpi_interceptor_restore_finalize_for_direct_call(void)
+{
+    if (mpi_interceptor == NULL || hook_address == NULL) {
+        return 0;
+    }
+
+    gum_interceptor_begin_transaction(mpi_interceptor);
+    gum_interceptor_revert(mpi_interceptor, hook_address);
+    gum_interceptor_end_transaction(mpi_interceptor);
+    if (!gum_interceptor_flush(mpi_interceptor)) {
+        g_printerr("[peak] MPI finalize direct-call restore did not flush; using replacement trampoline\n");
+        return 0;
+    }
+
+    return 1;
+}
 
 static void
 mpi_interceptor_mark_finalize_requested(void)
@@ -33,53 +96,101 @@ mpi_interceptor_mark_finalize_requested(void)
 static int
 mpi_interceptor_call_original_finalize_once(void)
 {
-    int expected = PEAK_MPI_FINALIZE_REQUESTED;
+    int direct_finalize = mpi_interceptor_direct_finalize_enabled();
 
-    if (original_pmpi_finalize == NULL) {
+    if (!mpi_interceptor_real_finalize_enabled() ||
+        !__atomic_load_n(&peak_real_finalize_allowed, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&peak_finalize_result, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&peak_finalize_state,
+                         PEAK_MPI_FINALIZE_DONE,
+                         __ATOMIC_RELEASE);
         return 0;
     }
 
-    if (!__atomic_compare_exchange_n(
-            &peak_finalize_state,
-            &expected,
-            PEAK_MPI_FINALIZE_IN_PROGRESS,
-            FALSE,
-            __ATOMIC_ACQ_REL,
-            __ATOMIC_ACQUIRE)) {
+    if (original_pmpi_finalize == NULL &&
+        (!direct_finalize || hook_address == NULL)) {
+        __atomic_store_n(&peak_finalize_state,
+                         PEAK_MPI_FINALIZE_DONE,
+                         __ATOMIC_RELEASE);
         return 0;
     }
 
-    int result = original_pmpi_finalize();
-    __atomic_store_n(&peak_finalize_state,
-                     PEAK_MPI_FINALIZE_DONE,
-                     __ATOMIC_RELEASE);
-    return result;
+    for (;;) {
+        int state = __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE);
+
+        if (state == PEAK_MPI_FINALIZE_DONE) {
+            return __atomic_load_n(&peak_finalize_result, __ATOMIC_ACQUIRE);
+        }
+
+        if (state == PEAK_MPI_FINALIZE_IN_PROGRESS) {
+            sched_yield();
+            continue;
+        }
+
+        if (state != PEAK_MPI_FINALIZE_REQUESTED) {
+            return 0;
+        }
+
+        int expected = PEAK_MPI_FINALIZE_REQUESTED;
+        if (!__atomic_compare_exchange_n(
+                &peak_finalize_state,
+                &expected,
+                PEAK_MPI_FINALIZE_IN_PROGRESS,
+                FALSE,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE)) {
+            continue;
+        }
+
+        int result = 0;
+        if (direct_finalize &&
+            hook_address != NULL &&
+            mpi_interceptor_restore_finalize_for_direct_call()) {
+            int (*direct_pmpi_finalize)(void) = (int (*)(void))hook_address;
+            result = direct_pmpi_finalize();
+        } else if (original_pmpi_finalize != NULL) {
+            result = original_pmpi_finalize();
+        }
+        __atomic_store_n(&peak_finalize_result, result, __ATOMIC_RELEASE);
+        __atomic_store_n(&peak_finalize_state,
+                         PEAK_MPI_FINALIZE_DONE,
+                         __ATOMIC_RELEASE);
+        return result;
+    }
 }
 
 /**
  * @brief Custom implementation of `PMPI_Finalize` function
  *
- * This function is a custom implementation of the `PMPI_Finalize` function that can be used to perform additional
- * actions before calling the original function. It checks the value of `peak_is_done` to determine whether to call
- * the original function or return immediately.
+ * This function is a custom implementation of the `PMPI_Finalize` function. It
+ * records the application's finalization request, lets PEAK emit its final
+ * output while MPI is still alive on the application's own finalize path, and
+ * skips the real MPI finalizer by default. PEAK does not replay
+ * `PMPI_Finalize()` later from process teardown.
  *
- * @return the return value of the original `PMPI_Finalize` function if `peak_is_done` is true, otherwise 0.
+ * @return The original `PMPI_Finalize()` result.
  */
 static int
 peak_pmpi_finalize(void)
 {
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     mpi_interceptor_mark_finalize_requested();
-    if (__atomic_load_n(&peak_is_done, __ATOMIC_ACQUIRE) &&
-        __atomic_load_n(&peak_delayed_finalize_allowed, __ATOMIC_ACQUIRE))
-        return mpi_interceptor_call_original_finalize_once();
-    return 0;
+    peak_fini();
+    return mpi_interceptor_call_original_finalize_once();
 }
 
 int mpi_interceptor_finalize_was_requested()
 {
     return __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE) !=
            PEAK_MPI_FINALIZE_NOT_REQUESTED;
+}
+
+void
+mpi_interceptor_set_real_finalize_allowed(int allowed)
+{
+    __atomic_store_n(&peak_real_finalize_allowed,
+                     allowed ? 1 : 0,
+                     __ATOMIC_RELEASE);
 }
 
 int mpi_interceptor_attach()
@@ -101,17 +212,23 @@ int mpi_interceptor_attach()
 
 void mpi_interceptor_dettach(int allow_delayed_finalize)
 {
+    (void)allow_delayed_finalize;
+
     if (mpi_interceptor == NULL || hook_address == NULL) {
         return;
     }
 
-    __atomic_store_n(&peak_delayed_finalize_allowed,
-                     allow_delayed_finalize ? 1 : 0,
-                     __ATOMIC_RELEASE);
-    __atomic_store_n(&peak_is_done, 1, __ATOMIC_RELEASE);
-    if (allow_delayed_finalize && mpi_interceptor_finalize_was_requested()) {
-        mpi_interceptor_call_original_finalize_once();
+    /*
+     * If we are already on the application's PMPI_Finalize path, keep the
+     * replacement pinned until process exit. Reverting/flushing the Gum
+     * replacement while executing that replacement leaves Intel MPI finalization
+     * in a fragile state on large Frontera jobs.
+     */
+    if (__atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE) !=
+        PEAK_MPI_FINALIZE_NOT_REQUESTED) {
+        return;
     }
+
     gum_interceptor_begin_transaction(mpi_interceptor);
     gum_interceptor_revert(mpi_interceptor, hook_address);
     gum_interceptor_end_transaction(mpi_interceptor);

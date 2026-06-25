@@ -14,8 +14,14 @@
  * @brief Attach MPI function interception
  *
  * This function attaches interception to the MPI library functions using the Gum library.
- * Specifically, it intercepts the `PMPI_Finalize` function and replaces it with a custom implementation,
- * `peak_pmpi_finalize`, which can be used to perform additional actions before calling the original function.
+ * Specifically, it intercepts the `PMPI_Finalize` function and replaces it with
+ * a custom implementation, `peak_pmpi_finalize`, which records the
+ * application's finalization request, lets PEAK write its final output while
+ * MPI is still alive on the application's own finalize path, and then skips the
+ * real `PMPI_Finalize()` by default. `PEAK_MPI_REAL_FINALIZE=1` may call it
+ * after all-rank proof for diagnostics. PEAK does not replay the real
+ * `PMPI_Finalize()` later from process teardown; doing so can re-enter MPI from
+ * an application state that has already logically finalized.
  *
  * @return 0 if the interception was successful, a negative number in the GumReplaceReturn otherwise.
  */
@@ -27,9 +33,20 @@ int mpi_interceptor_attach();
 int mpi_interceptor_finalize_was_requested();
 
 /**
+ * @brief Controls whether the intercepted finalizer may call real PMPI_Finalize.
+ *
+ * The real MPI finalizer is disabled by default and is only eligible to run
+ * after PEAK has proven that every rank reached the application finalizer.
+ * Otherwise a subset-rank finalizer can hang or be killed by the MPI runtime.
+ */
+void mpi_interceptor_set_real_finalize_allowed(int allowed);
+
+/**
  * @brief Detach MPI function interception
  *
- * This function detaches the previously attached MPI function interception and releases any resources used by the Gum library.
+ * This function detaches the previously attached MPI function interception and
+ * releases any resources used by the Gum library. The argument is retained for
+ * ABI compatibility and is ignored.
  *
  * @return void
  */

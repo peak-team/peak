@@ -589,7 +589,9 @@ main(int argc, char** argv)
             munmap(code, (size_t)sysconf(_SC_PAGESIZE));
             return rc;
         }
-        usleep(10000);
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
     }
     if (mode == PEAK_JIT_WITH_STALE_THEN_VALID) {
         void* second_code = NULL;
@@ -646,7 +648,9 @@ main(int argc, char** argv)
             munmap(code, (size_t)sysconf(_SC_PAGESIZE));
             return PEAK_JIT_SKIP;
         }
-        usleep(10000);
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
     }
 
     hot_fn = (PeakJitFn)code;

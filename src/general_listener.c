@@ -6,16 +6,31 @@
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
 #define PEAK_TEXT_OUTPUT_ENV "PEAK_TEXT_OUTPUT"
+#define PEAK_OUTPUT_AGGREGATION_HOST_ENV "PEAK_OUTPUT_AGGREGATION_HOST"
+#define PEAK_OUTPUT_AGGREGATION_PORT_ENV "PEAK_OUTPUT_AGGREGATION_PORT"
+#define PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"
+#define PEAK_OUTPUT_AGGREGATION_TOKEN_ENV "PEAK_OUTPUT_AGGREGATION_TOKEN"
+#define PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV "PEAK_CONTROLLER_MAX_PENDING_AGE_MS"
+#define PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV "PEAK_CONTROLLER_MAX_RETRY_COUNT"
+#define PEAK_REATTACH_COOLDOWN_MS_ENV "PEAK_REATTACH_COOLDOWN_MS"
 
 PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
@@ -23,6 +38,7 @@ static gboolean* array_listener_detached;
 static gboolean* array_listener_reattached;
 static gboolean* array_listener_gum_detached;
 static gboolean* array_listener_gum_detach_flushed;
+static double* peak_hook_last_detach_time;
 static PeakHookState* peak_hook_states;
 static double* peak_hook_next_retry_time;
 static double* peak_hook_pending_observed_time;
@@ -69,9 +85,18 @@ static const double peak_general_overhead_floor = 1e-9;
 static pthread_mutex_t detach_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
 static const double peak_controller_retry_base_delay = 0.001;
 static const double peak_controller_retry_max_delay = 0.050;
+static const unsigned int peak_controller_default_max_retry_count = 300;
+static const double peak_controller_default_max_pending_age_s = 30.0;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
+static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
+static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
+static gsize peak_controller_retry_limits_initialized = 0;
+static gsize peak_reattach_policy_initialized = 0;
+static unsigned int peak_controller_max_retry_count = 300;
+static double peak_controller_max_pending_age_s = 30.0;
+static double peak_reattach_cooldown_s = 60.0;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
 static gboolean
@@ -96,6 +121,46 @@ peak_general_listener_parse_detach_count_override(gulong* count_out)
         *count_out = (gulong)parsed;
     }
     return TRUE;
+}
+
+static unsigned int
+peak_general_listener_parse_uint_env_default(const char* name,
+                                             unsigned int default_value)
+{
+    const char* value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed > G_MAXUINT) {
+        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        return default_value;
+    }
+
+    return (unsigned int)parsed;
+}
+
+static void
+peak_general_listener_init_reattach_policy_once(void)
+{
+    unsigned int cooldown_ms =
+        peak_general_listener_parse_uint_env_default(
+            PEAK_REATTACH_COOLDOWN_MS_ENV,
+            peak_reattach_default_cooldown_ms);
+    peak_reattach_cooldown_s = (double)cooldown_ms / 1000.0;
+}
+
+static void
+peak_general_listener_init_reattach_policy(void)
+{
+    if (g_once_init_enter(&peak_reattach_policy_initialized)) {
+        peak_general_listener_init_reattach_policy_once();
+        g_once_init_leave(&peak_reattach_policy_initialized, 1);
+    }
 }
 
 static gboolean
@@ -267,6 +332,53 @@ peak_env_truthy_general(const char* value)
             g_ascii_strcasecmp(value, "true") == 0 ||
             g_ascii_strcasecmp(value, "yes") == 0 ||
             g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static unsigned int
+peak_general_controller_parse_uint_env(const char* name,
+                                       unsigned int default_value)
+{
+    const char* value = g_getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
+        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        return default_value;
+    }
+
+    return (unsigned int)parsed;
+}
+
+static void
+peak_general_controller_init_retry_limits_once(void)
+{
+    unsigned int max_pending_age_ms =
+        peak_general_controller_parse_uint_env(
+            PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV,
+            (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0));
+
+    peak_controller_max_pending_age_s =
+        max_pending_age_ms == 0 ? 0.0 : (double)max_pending_age_ms / 1000.0;
+    peak_controller_max_retry_count =
+        peak_general_controller_parse_uint_env(
+            PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV,
+            peak_controller_default_max_retry_count);
+}
+
+static void
+peak_general_controller_init_retry_limits(void)
+{
+    if (g_once_init_enter(&peak_controller_retry_limits_initialized)) {
+        peak_general_controller_init_retry_limits_once();
+        g_once_init_leave(&peak_controller_retry_limits_initialized, 1);
+    }
 }
 
 static gboolean
@@ -773,6 +885,47 @@ peak_general_controller_reset_retry_unlocked(size_t hook_id)
 }
 
 static void
+peak_general_controller_mark_pending_started_unlocked(size_t hook_id,
+                                                      double now)
+{
+    if (peak_hook_pending_observed_time == NULL ||
+        hook_id >= peak_hook_address_count ||
+        peak_hook_pending_observed_time[hook_id] > 0.0) {
+        return;
+    }
+
+    peak_hook_pending_observed_time[hook_id] = now;
+}
+
+static void
+peak_general_listener_note_detach_success_unlocked(size_t hook_id,
+                                                   double now)
+{
+    if (peak_hook_last_detach_time == NULL || hook_id >= peak_hook_address_count) {
+        return;
+    }
+
+    peak_hook_last_detach_time[hook_id] = now;
+}
+
+static gboolean
+peak_general_listener_reattach_cooldown_ready_unlocked(size_t hook_id,
+                                                       double now)
+{
+    peak_general_listener_init_reattach_policy();
+
+    if (peak_reattach_cooldown_s <= 0.0 ||
+        peak_hook_last_detach_time == NULL ||
+        hook_id >= peak_hook_address_count ||
+        peak_hook_last_detach_time[hook_id] <= 0.0) {
+        return TRUE;
+    }
+
+    return now - peak_hook_last_detach_time[hook_id] >=
+           peak_reattach_cooldown_s;
+}
+
+static void
 peak_general_controller_note_retry_unlocked(size_t hook_id,
                                             PeakDetachStatus status)
 {
@@ -797,6 +950,31 @@ peak_general_controller_note_retry_unlocked(size_t hook_id,
     if (peak_hook_last_retry_status != NULL) {
         peak_hook_last_retry_status[hook_id] = status;
     }
+}
+
+static gboolean
+peak_general_controller_retry_budget_exceeded_unlocked(size_t hook_id,
+                                                       double now)
+{
+    double pending_age_s;
+    unsigned int retry_count;
+
+    if (hook_id >= peak_hook_address_count) {
+        return FALSE;
+    }
+
+    peak_general_controller_init_retry_limits();
+
+    retry_count = peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0;
+    pending_age_s = peak_general_controller_pending_age_for_trace_unlocked(hook_id, now);
+
+    if (peak_controller_max_retry_count > 0 &&
+        retry_count >= peak_controller_max_retry_count) {
+        return TRUE;
+    }
+
+    return peak_controller_max_pending_age_s > 0.0 &&
+           pending_age_s >= peak_controller_max_pending_age_s;
 }
 
 static gboolean
@@ -835,6 +1013,8 @@ static gboolean peak_general_listener_request_detach_unlocked(size_t hook_id)
     switch (peak_hook_states[hook_id]) {
         case PEAK_HOOK_ATTACHED:
             peak_general_controller_reset_retry_unlocked(hook_id);
+            peak_general_controller_mark_pending_started_unlocked(hook_id,
+                                                                  peak_second());
             peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_DETACH_REQUESTED);
             return TRUE;
         case PEAK_HOOK_DETACH_REQUESTED:
@@ -860,6 +1040,8 @@ static gboolean peak_general_listener_request_reattach_unlocked(size_t hook_id)
                 return FALSE;
             }
             peak_general_controller_reset_retry_unlocked(hook_id);
+            peak_general_controller_mark_pending_started_unlocked(hook_id,
+                                                                  peak_second());
             peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_REATTACH_REQUESTED);
             return TRUE;
         case PEAK_HOOK_REATTACH_REQUESTED:
@@ -1049,6 +1231,8 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
         g_renew(gboolean, array_listener_gum_detached, new_count);
     array_listener_gum_detach_flushed =
         g_renew(gboolean, array_listener_gum_detach_flushed, new_count);
+    peak_hook_last_detach_time =
+        g_renew(double, peak_hook_last_detach_time, new_count);
     peak_hook_states = g_renew(PeakHookState, peak_hook_states, new_count);
     peak_hook_next_retry_time = g_renew(double, peak_hook_next_retry_time, new_count);
     peak_hook_pending_observed_time =
@@ -1071,6 +1255,7 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     array_listener_reattached[old_count] = FALSE;
     array_listener_gum_detached[old_count] = FALSE;
     array_listener_gum_detach_flushed[old_count] = TRUE;
+    peak_hook_last_detach_time[old_count] = 0.0;
     peak_hook_states[old_count] = PEAK_HOOK_UNRESOLVED;
     peak_hook_next_retry_time[old_count] = 0.0;
     peak_hook_pending_observed_time[old_count] = 0.0;
@@ -1375,8 +1560,53 @@ peak_general_controller_handle_prepare_failure_unlocked(size_t hook_id,
                                                         PeakDetachStatus status)
 {
     if (peak_general_controller_status_is_retryable(status)) {
+        PeakDetachStatus last_retry_status =
+            peak_hook_last_retry_status != NULL && hook_id < peak_hook_address_count
+                ? peak_hook_last_retry_status[hook_id]
+                : PEAK_DETACH_STATUS_SAFE;
+
         peak_general_controller_note_retry_unlocked(hook_id, status);
-        return TRUE;
+        if (!peak_general_controller_retry_budget_exceeded_unlocked(
+                hook_id,
+                peak_second())) {
+            return TRUE;
+        }
+
+        g_printerr("[peak] Abandoning %s for hook %lu (%s) after %u retries and %.3fs pending age; leaving hook %s\n",
+                   stable_state == PEAK_HOOK_ATTACHED ? "detach" : "reattach",
+                   (unsigned long)hook_id,
+                   hook_id < peak_hook_address_count &&
+                           peak_hook_strings != NULL &&
+                           peak_hook_strings[hook_id] != NULL
+                       ? peak_hook_strings[hook_id]
+                       : "<unknown>",
+                   hook_id < peak_hook_address_count && peak_hook_retry_count != NULL
+                       ? peak_hook_retry_count[hook_id]
+                       : 0,
+                   peak_general_controller_pending_age_for_trace_unlocked(
+                       hook_id,
+                       peak_second()),
+                   stable_state == PEAK_HOOK_ATTACHED ? "attached" : "detached");
+        peak_general_controller_trace_mutation_detail(
+            hook_id,
+            stable_state == PEAK_HOOK_ATTACHED ? PEAK_DETACH_OPERATION_DETACH
+                                               : PEAK_DETACH_OPERATION_REATTACH,
+            "retry-abandoned",
+            FALSE,
+            status,
+            hook_id < peak_hook_address_count && peak_hook_retry_count != NULL
+                ? peak_hook_retry_count[hook_id]
+                : 0,
+            peak_general_controller_pending_age_for_trace_unlocked(
+                hook_id,
+                peak_second()),
+            1,
+            peak_detach_controller_last_stop_window_us(),
+            0,
+            last_retry_status);
+        peak_general_controller_reset_retry_unlocked(hook_id);
+        peak_general_controller_set_state_unlocked(hook_id, stable_state);
+        return FALSE;
     }
 
     peak_general_controller_reset_retry_unlocked(hook_id);
@@ -1509,6 +1739,8 @@ static gboolean peak_general_controller_detach_if_requested_unlocked(
     }
 
     array_listener_detached[hook_id] = TRUE;
+    peak_general_listener_note_detach_success_unlocked(hook_id,
+                                                       peak_second());
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_DETACHED);
     if (peak_general_controller_trace_enabled()) {
         unsigned int retry_count =
@@ -1918,15 +2150,12 @@ static void
 peak_general_controller_observe_pending_for_trace_unlocked(size_t hook_id,
                                                            double now)
 {
-    if (!peak_general_controller_trace_enabled() ||
-        peak_hook_pending_observed_time == NULL ||
+    if (peak_hook_pending_observed_time == NULL ||
         hook_id >= peak_hook_address_count) {
         return;
     }
 
-    if (peak_hook_pending_observed_time[hook_id] <= 0.0) {
-        peak_hook_pending_observed_time[hook_id] = now;
-    }
+    peak_general_controller_mark_pending_started_unlocked(hook_id, now);
 }
 
 static double
@@ -2111,6 +2340,9 @@ peak_general_controller_process_pending_batch_unlocked(void)
             }
             if (candidates[i].operation == PEAK_DETACH_OPERATION_DETACH) {
                 array_listener_detached[candidates[i].hook_id] = TRUE;
+                peak_general_listener_note_detach_success_unlocked(
+                    candidates[i].hook_id,
+                    peak_second());
                 peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                            PEAK_HOOK_DETACHED);
                 peak_general_controller_trace_mutation_detail(
@@ -2651,7 +2883,9 @@ void* peak_heartbeat_monitor(void* arg) {
                     pthread_mutex_lock(&lock);
                     gboolean should_consider =
                         (hook_address[i] && array_listener[i] &&
-                         peak_detached[i] && !peak_need_detach[i]);
+                         peak_detached[i] && !peak_need_detach[i] &&
+                         peak_general_listener_reattach_cooldown_ready_unlocked(i,
+                                                                                now));
                     pthread_mutex_unlock(&lock);
                     if (!should_consider) continue;
 
@@ -2671,6 +2905,11 @@ void* peak_heartbeat_monitor(void* arg) {
                         if (!(hook_address[i] && array_listener[i])) continue;
                         if (!peak_detached[i]) continue;
                         if (peak_need_detach[i]) continue;
+                        if (!peak_general_listener_reattach_cooldown_ready_unlocked(
+                                i,
+                                now)) {
+                            continue;
+                        }
 
                         entries[detached_cnt].index = i;
                         entries[detached_cnt].ratio = ratio_snapshot[i];
@@ -2769,6 +3008,43 @@ void* peak_heartbeat_monitor(void* arg) {
     return NULL;
 }
 
+void
+peak_general_listener_suspend_callbacks(void)
+{
+    atomic_store_explicit(&peak_general_callbacks_suspended,
+                          TRUE,
+                          memory_order_release);
+}
+
+static void
+peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
+                                                 gboolean use_pause_guard)
+{
+    if (priv == NULL || !priv->initialized) {
+        return;
+    }
+
+    priv->initialized = FALSE;
+    if (thread_data.level == 0) {
+        return;
+    }
+
+    thread_data.level--;
+    if (thread_data.level == 0) {
+        void* tmp_ptr = thread_data.child_time;
+        thread_data.child_time = NULL;
+        if (use_pause_guard) {
+            pthread_pause_disable();
+        }
+        g_free(tmp_ptr);
+        if (use_pause_guard) {
+            pthread_pause_enable();
+        }
+    } else if (thread_data.child_time != NULL) {
+        thread_data.child_time[thread_data.level] = 0.0;
+    }
+}
+
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
@@ -2777,6 +3053,13 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             return;
     }
     gum_interceptor_ignore_current_thread(interceptor);
+    PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+    priv->initialized = FALSE;
+    if (atomic_load_explicit(&peak_general_callbacks_suspended,
+                             memory_order_acquire)) {
+        gum_interceptor_unignore_current_thread(interceptor);
+        return;
+    }
 
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     pthread_t my_tid = pthread_self();
@@ -2845,7 +3128,6 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         if (check_interval != 0) pthread_pause_enable();
         else pthread_pause_disable();
     }
-    PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
     priv->start_time = peak_second();
     priv->initialized = TRUE;
     gum_interceptor_unignore_current_thread(interceptor);
@@ -2871,6 +3153,12 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
         if (!priv->initialized) {
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
+        if (atomic_load_explicit(&peak_general_callbacks_suspended,
+                                 memory_order_acquire)) {
+            peak_general_listener_abandon_current_invocation(priv, FALSE);
             gum_interceptor_unignore_current_thread(interceptor);
             return;
         }
@@ -2918,6 +3206,12 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
         if (!priv->initialized) {
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
+        if (atomic_load_explicit(&peak_general_callbacks_suspended,
+                                 memory_order_acquire)) {
+            peak_general_listener_abandon_current_invocation(priv, TRUE);
             gum_interceptor_unignore_current_thread(interceptor);
             return;
         }
@@ -3158,6 +3452,7 @@ void peak_general_listener_attach()
     array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
     array_listener_gum_detached = g_new0(gboolean, peak_hook_address_count);
     array_listener_gum_detach_flushed = g_new0(gboolean, peak_hook_address_count);
+    peak_hook_last_detach_time = g_new0(double, peak_hook_address_count);
     peak_hook_states = g_new0(PeakHookState, peak_hook_address_count);
     peak_hook_next_retry_time = g_new0(double, peak_hook_address_count);
     peak_hook_pending_observed_time = g_new0(double, peak_hook_address_count);
@@ -3169,8 +3464,9 @@ void peak_general_listener_attach()
     // g_printerr ("peak_hook_address_count %lu peak_max_num_threads %lu\n",  peak_hook_address_count, peak_max_num_threads);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         // replace certain function we are capturing already.
-        if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0) {
-            hook_address[i] = gum_find_function("peak_pmpi_finalize");
+        if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
+            strcmp(peak_hook_strings[i], "PMPI_Finalize") == 0) {
+            hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "close") == 0) {
             hook_address[i] = gum_find_function("peak_close");
@@ -3601,6 +3897,74 @@ peak_general_listener_slot_identity_hash(size_t hook_id)
     return hash;
 }
 
+static void
+peak_socket_reduce_hash_text(uint64_t* hash,
+                             const char* label,
+                             const char* value)
+{
+    const unsigned char* text;
+
+    if (hash == NULL || value == NULL || value[0] == '\0') {
+        return;
+    }
+
+    for (text = (const unsigned char*)label; text != NULL && *text != '\0'; text++) {
+        *hash ^= (uint64_t)*text;
+        *hash *= 1099511628211ULL;
+    }
+    *hash ^= (uint64_t)'=';
+    *hash *= 1099511628211ULL;
+    for (text = (const unsigned char*)value; *text != '\0'; text++) {
+        *hash ^= (uint64_t)*text;
+        *hash *= 1099511628211ULL;
+    }
+    *hash ^= (uint64_t)';';
+    *hash *= 1099511628211ULL;
+}
+
+static uint64_t
+peak_socket_reduce_session_token(void)
+{
+    static const char* shared_env_names[] = {
+        "SLURM_JOB_ID",
+        "SLURM_STEP_ID",
+        "SLURM_STEPID",
+        "SLURM_JOB_UID",
+        "SLURM_CLUSTER_NAME",
+        "SLURM_NODELIST",
+        "SLURM_JOB_NODELIST",
+        "PMI_JOBID",
+        "PMI_KVS",
+        "PMI_NAMESPACE",
+        "PMIX_NAMESPACE",
+        "OMPI_COMM_WORLD_JOBID",
+        NULL,
+    };
+    const char* override = getenv(PEAK_OUTPUT_AGGREGATION_TOKEN_ENV);
+    uint64_t hash = 1469598103934665603ULL;
+    gboolean saw_shared_value = FALSE;
+
+    if (override != NULL && override[0] != '\0') {
+        peak_socket_reduce_hash_text(&hash,
+                                     PEAK_OUTPUT_AGGREGATION_TOKEN_ENV,
+                                     override);
+        return hash;
+    }
+
+    for (size_t i = 0; shared_env_names[i] != NULL; i++) {
+        const char* value = getenv(shared_env_names[i]);
+        if (value != NULL && value[0] != '\0') {
+            peak_socket_reduce_hash_text(&hash, shared_env_names[i], value);
+            saw_shared_value = TRUE;
+        }
+    }
+
+    if (!saw_shared_value) {
+        peak_socket_reduce_hash_text(&hash, "fallback", "single-launcher");
+    }
+    return hash;
+}
+
 static gboolean
 peak_general_listener_has_duplicate_slot_names(void)
 {
@@ -3629,6 +3993,1003 @@ peak_general_listener_has_duplicate_slot_names(void)
     }
 
     return FALSE;
+}
+
+typedef struct {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t rank;
+    uint64_t hook_count;
+    uint64_t session_token;
+} PeakSocketReduceHeader;
+
+typedef struct {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t rank;
+    uint64_t hook_count;
+    uint64_t session_token;
+    uint8_t ack;
+    uint8_t reserved[7];
+} PeakSocketReduceReleaseFrame;
+
+typedef struct {
+    uint64_t identity_hash;
+    uint64_t num_calls;
+    double total_time;
+    double max_total_time;
+    double min_total_time;
+    double exclusive_time;
+    float max_time;
+    float min_time;
+    uint64_t thread_count;
+    int detached;
+    int reattached;
+} PeakSocketReduceRecord;
+
+#define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
+#define PEAK_SOCKET_REDUCE_VERSION 2U
+#define PEAK_SOCKET_REDUCE_RELEASE_ACK 0x51U
+#define PEAK_SOCKET_REDUCE_DEFAULT_TIMEOUT_MS 60000
+#define PEAK_SOCKET_REDUCE_DEFAULT_PORT_BASE 42000
+#define PEAK_SOCKET_REDUCE_DEFAULT_PORT_SPAN 20000
+
+static int
+peak_socket_reduce_parse_positive_int_env(const char* name, int default_value)
+{
+    const char* value = getenv(name);
+    char* end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed <= 0 ||
+        parsed > INT_MAX) {
+        g_printerr("[peak] Ignoring invalid %s=%s\n", name, value);
+        return default_value;
+    }
+
+    return (int)parsed;
+}
+
+static int
+peak_socket_reduce_default_port(void)
+{
+    const char* job_id = getenv("SLURM_JOB_ID");
+    char* end = NULL;
+    long parsed = 0;
+
+    if (job_id != NULL && job_id[0] != '\0') {
+        errno = 0;
+        parsed = strtol(job_id, &end, 10);
+        if (errno != 0 || end == job_id) {
+            parsed = 0;
+        }
+    }
+
+    if (parsed < 0) {
+        parsed = -parsed;
+    }
+
+    return PEAK_SOCKET_REDUCE_DEFAULT_PORT_BASE +
+           (int)(parsed % PEAK_SOCKET_REDUCE_DEFAULT_PORT_SPAN);
+}
+
+static int
+peak_socket_reduce_port(void)
+{
+    int port = peak_socket_reduce_parse_positive_int_env(
+        PEAK_OUTPUT_AGGREGATION_PORT_ENV,
+        peak_socket_reduce_default_port());
+
+    if (port <= 0 || port > 65535) {
+        g_printerr("[peak] Ignoring out-of-range %s=%d\n",
+                   PEAK_OUTPUT_AGGREGATION_PORT_ENV,
+                   port);
+        return peak_socket_reduce_default_port();
+    }
+
+    return port;
+}
+
+static int64_t
+peak_socket_reduce_deadline_us(int timeout_ms)
+{
+    return g_get_monotonic_time() + (int64_t)timeout_ms * 1000;
+}
+
+static int
+peak_socket_reduce_remaining_ms(int64_t deadline_us)
+{
+    int64_t now = g_get_monotonic_time();
+    int64_t remaining = deadline_us - now;
+
+    if (remaining <= 0) {
+        return 0;
+    }
+
+    remaining = (remaining + 999) / 1000;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static gboolean
+peak_socket_reduce_poll_fd(int fd, short events, int64_t deadline_us)
+{
+    while (peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        struct pollfd pfd;
+        int result;
+
+        pfd.fd = fd;
+        pfd.events = events;
+        pfd.revents = 0;
+        result = poll(&pfd, 1, peak_socket_reduce_remaining_ms(deadline_us));
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return FALSE;
+        }
+        if (result == 0) {
+            return FALSE;
+        }
+        return (pfd.revents & events) != 0;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_socket_reduce_send_all(int fd,
+                            const void* data,
+                            size_t size,
+                            int64_t deadline_us)
+{
+    const char* cursor = (const char*)data;
+
+    while (size > 0 && peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        if (!peak_socket_reduce_poll_fd(fd, POLLOUT, deadline_us)) {
+            return FALSE;
+        }
+        ssize_t written = send(fd, cursor, size, MSG_NOSIGNAL);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return FALSE;
+        }
+        if (written == 0) {
+            return FALSE;
+        }
+        cursor += written;
+        size -= (size_t)written;
+    }
+
+    return size == 0;
+}
+
+static gboolean
+peak_socket_reduce_recv_all(int fd,
+                            void* data,
+                            size_t size,
+                            int64_t deadline_us)
+{
+    char* cursor = (char*)data;
+
+    while (size > 0 && peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        if (!peak_socket_reduce_poll_fd(fd, POLLIN, deadline_us)) {
+            return FALSE;
+        }
+        ssize_t read_count = recv(fd, cursor, size, MSG_WAITALL);
+        if (read_count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return FALSE;
+        }
+        if (read_count == 0) {
+            return FALSE;
+        }
+        cursor += read_count;
+        size -= (size_t)read_count;
+    }
+
+    return size == 0;
+}
+
+static void
+peak_socket_reduce_set_timeout(int fd, int timeout_ms)
+{
+    struct timeval tv;
+
+    if (timeout_ms <= 0) {
+        timeout_ms = 1;
+    }
+
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static gboolean
+peak_socket_reduce_hostlist_token_is_ascending_range(const char* token,
+                                                     size_t token_len,
+                                                     size_t* range_prefix_len)
+{
+    const char* dash = memchr(token, '-', token_len);
+    char* end = NULL;
+    long first;
+    long last;
+
+    if (range_prefix_len != NULL) {
+        *range_prefix_len = token_len;
+    }
+    if (dash == NULL || dash == token || dash + 1 >= token + token_len) {
+        return FALSE;
+    }
+    for (const char* cursor = token; cursor < token + token_len; cursor++) {
+        if (cursor == dash) {
+            continue;
+        }
+        if (!g_ascii_isdigit(*cursor)) {
+            return FALSE;
+        }
+    }
+
+    errno = 0;
+    first = strtol(token, &end, 10);
+    if (errno != 0 || end != dash) {
+        return FALSE;
+    }
+    errno = 0;
+    last = strtol(dash + 1, &end, 10);
+    if (errno != 0 || end != token + token_len || first > last) {
+        return FALSE;
+    }
+
+    if (range_prefix_len != NULL) {
+        *range_prefix_len = (size_t)(dash - token);
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_socket_reduce_first_host_from_slurm_nodelist(const char* nodelist,
+                                                 char* out,
+                                                 size_t out_size)
+{
+    const char* bracket;
+    const char* comma;
+    const char* dash;
+    size_t prefix_len;
+    size_t token_len;
+    size_t host_token_len;
+
+    if (out == NULL || out_size == 0) {
+        return FALSE;
+    }
+    out[0] = '\0';
+
+    if (nodelist == NULL || nodelist[0] == '\0') {
+        return FALSE;
+    }
+
+    bracket = strchr(nodelist, '[');
+    if (bracket == NULL) {
+        comma = strchr(nodelist, ',');
+        token_len = comma != NULL ? (size_t)(comma - nodelist) : strlen(nodelist);
+        if (token_len == 0 || token_len >= out_size) {
+            return FALSE;
+        }
+        memcpy(out, nodelist, token_len);
+        out[token_len] = '\0';
+        return TRUE;
+    }
+
+    prefix_len = (size_t)(bracket - nodelist);
+    comma = strchr(bracket + 1, ',');
+    dash = strchr(bracket + 1, ']');
+    if (dash == NULL) {
+        return FALSE;
+    }
+    if (comma != NULL && comma < dash) {
+        dash = comma;
+    }
+    token_len = (size_t)(dash - (bracket + 1));
+    host_token_len = token_len;
+    (void)peak_socket_reduce_hostlist_token_is_ascending_range(bracket + 1,
+                                                               token_len,
+                                                               &host_token_len);
+    if (prefix_len + host_token_len == 0 ||
+        prefix_len + host_token_len >= out_size) {
+        return FALSE;
+    }
+    memcpy(out, nodelist, prefix_len);
+    memcpy(out + prefix_len, bracket + 1, host_token_len);
+    out[prefix_len + host_token_len] = '\0';
+    return TRUE;
+}
+
+static gboolean
+peak_socket_reduce_first_slurm_host(char* out, size_t out_size)
+{
+    const char* nodelist = getenv("SLURM_NODELIST");
+
+    if (nodelist == NULL || nodelist[0] == '\0') {
+        nodelist = getenv("SLURM_JOB_NODELIST");
+    }
+
+    return peak_socket_reduce_first_host_from_slurm_nodelist(nodelist,
+                                                            out,
+                                                            out_size);
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+gboolean
+peak_general_listener_test_first_slurm_host(const char* nodelist,
+                                            char* out,
+                                            size_t out_size)
+{
+    return peak_socket_reduce_first_host_from_slurm_nodelist(nodelist,
+                                                            out,
+                                                            out_size);
+}
+#endif
+
+static gboolean
+peak_socket_reduce_root_host(char* out, size_t out_size)
+{
+    const char* override = getenv(PEAK_OUTPUT_AGGREGATION_HOST_ENV);
+
+    if (override != NULL && override[0] != '\0') {
+        g_strlcpy(out, override, out_size);
+        return TRUE;
+    }
+
+    if (peak_socket_reduce_first_slurm_host(out, out_size)) {
+        return TRUE;
+    }
+
+    g_strlcpy(out, "127.0.0.1", out_size);
+    return TRUE;
+}
+
+static PeakSocketReduceRecord*
+peak_socket_reduce_build_records(gulong* sum_num_calls,
+                                 gdouble* sum_total_time,
+                                 gdouble* max_total_time,
+                                 gdouble* min_total_time,
+                                 gdouble* sum_exclusive_time,
+                                 gfloat* sum_max_time,
+                                 gfloat* sum_min_time,
+                                 gulong* thread_count)
+{
+    PeakSocketReduceRecord* records =
+        g_new0(PeakSocketReduceRecord, peak_hook_address_count);
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        records[i].identity_hash =
+            peak_general_listener_slot_identity_hash(i);
+        records[i].num_calls = (uint64_t)sum_num_calls[i];
+        records[i].total_time = (double)sum_total_time[i];
+        records[i].max_total_time = (double)max_total_time[i];
+        records[i].min_total_time = (double)min_total_time[i];
+        records[i].exclusive_time = (double)sum_exclusive_time[i];
+        records[i].max_time = (float)sum_max_time[i];
+        records[i].min_time = (float)sum_min_time[i];
+        records[i].thread_count = (uint64_t)thread_count[i];
+        records[i].detached = array_listener_detached[i] ? 1 : 0;
+        records[i].reattached = array_listener_reattached[i] ? 1 : 0;
+    }
+
+    return records;
+}
+
+static int
+peak_socket_reduce_create_listener(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    struct sockaddr_in address;
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons((uint16_t)port);
+
+    if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0 ||
+        listen(fd, 4096) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static gboolean
+peak_socket_reduce_wait_connected(int fd, int64_t deadline_us)
+{
+    while (peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        struct pollfd pfd;
+        int poll_result;
+        int socket_error = 0;
+        socklen_t socket_error_size = sizeof(socket_error);
+
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        poll_result = poll(&pfd, 1, peak_socket_reduce_remaining_ms(deadline_us));
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return FALSE;
+        }
+        if (poll_result == 0) {
+            return FALSE;
+        }
+        if (getsockopt(fd,
+                       SOL_SOCKET,
+                       SO_ERROR,
+                       &socket_error,
+                       &socket_error_size) != 0 ||
+            socket_error != 0) {
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static int
+peak_socket_reduce_connect(const char* host, int port, int64_t deadline_us)
+{
+    char port_text[16];
+    char qualified_host[NI_MAXHOST];
+    struct addrinfo hints;
+    struct addrinfo* result = NULL;
+    struct addrinfo* entry;
+
+    snprintf(port_text, sizeof(port_text), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    qualified_host[0] = '\0';
+    if (host != NULL && strchr(host, '.') == NULL) {
+        char local_host[NI_MAXHOST];
+        if (gethostname(local_host, sizeof(local_host)) == 0) {
+            local_host[sizeof(local_host) - 1] = '\0';
+            char* domain = strchr(local_host, '.');
+            if (domain != NULL &&
+                strlen(host) + strlen(domain) < sizeof(qualified_host)) {
+                snprintf(qualified_host,
+                         sizeof(qualified_host),
+                         "%s%s",
+                         host,
+                         domain);
+            }
+        }
+    }
+
+    while (peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        const char* candidates[3] = {
+            host,
+            qualified_host[0] != '\0' ? qualified_host : NULL,
+            NULL,
+        };
+
+        for (size_t i = 0; candidates[i] != NULL; i++) {
+            int gai = getaddrinfo(candidates[i], port_text, &hints, &result);
+            if (gai == 0) {
+                for (entry = result; entry != NULL; entry = entry->ai_next) {
+                    int fd = socket(entry->ai_family,
+                                    entry->ai_socktype,
+                                    entry->ai_protocol);
+                    int flags;
+                    if (fd < 0) {
+                        continue;
+                    }
+                    flags = fcntl(fd, F_GETFL, 0);
+                    if (flags < 0 ||
+                        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+                        close(fd);
+                        continue;
+                    }
+                    if (connect(fd, entry->ai_addr, entry->ai_addrlen) == 0 ||
+                        (errno == EINPROGRESS &&
+                         peak_socket_reduce_wait_connected(fd, deadline_us))) {
+                        (void)fcntl(fd, F_SETFL, flags);
+                        peak_socket_reduce_set_timeout(
+                            fd,
+                            peak_socket_reduce_remaining_ms(deadline_us));
+                        freeaddrinfo(result);
+                        return fd;
+                    }
+                    close(fd);
+                }
+                freeaddrinfo(result);
+                result = NULL;
+            }
+        }
+        usleep(10000);
+    }
+
+    return -1;
+}
+
+static int
+peak_socket_reduce_release_port(int port)
+{
+    return port < 65535 ? port + 1 : port - 1;
+}
+
+static gboolean
+peak_socket_reduce_wait_for_release(const char* host,
+                                    int port,
+                                    const PeakSocketReduceHeader* header,
+                                    int timeout_ms)
+{
+    int64_t deadline_us = peak_socket_reduce_deadline_us(timeout_ms);
+    int fd = peak_socket_reduce_connect(host, port, deadline_us);
+    PeakSocketReduceReleaseFrame frame;
+    gboolean released;
+
+    if (fd < 0 || header == NULL) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return FALSE;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.magic = header->magic;
+    frame.version = header->version;
+    frame.rank = header->rank;
+    frame.hook_count = header->hook_count;
+    frame.session_token = header->session_token;
+    released = peak_socket_reduce_send_all(fd,
+                                           &frame,
+                                           sizeof(frame),
+                                           deadline_us) &&
+               peak_socket_reduce_recv_all(fd,
+                                           &frame,
+                                           sizeof(frame),
+                                           deadline_us) &&
+               frame.magic == header->magic &&
+               frame.version == header->version &&
+               frame.rank == header->rank &&
+               frame.hook_count == header->hook_count &&
+               frame.session_token == header->session_token &&
+               frame.ack == PEAK_SOCKET_REDUCE_RELEASE_ACK;
+    close(fd);
+    return released;
+}
+
+static gboolean
+peak_socket_reduce_release_peers(int port,
+                                 gboolean* release_targets,
+                                 int size,
+                                 uint64_t hook_count,
+                                 uint64_t session_token,
+                                 int timeout_ms)
+{
+    int listener;
+    int64_t deadline_us;
+    unsigned int peer_count = 0;
+    unsigned int released = 0;
+
+    if (release_targets == NULL || size <= 1) {
+        return TRUE;
+    }
+
+    for (int i = 1; i < size; i++) {
+        if (release_targets[i]) {
+            peer_count++;
+        }
+    }
+    if (peer_count == 0) {
+        return TRUE;
+    }
+
+    listener = peak_socket_reduce_create_listener(port);
+    if (listener < 0) {
+        g_printerr("[peak] Socket aggregation could not listen on release port %d; peer ranks may exit after timeout\n",
+                   port);
+        return FALSE;
+    }
+
+    deadline_us = peak_socket_reduce_deadline_us(timeout_ms);
+    while (released < peer_count &&
+           peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        struct pollfd pfd;
+        int poll_result;
+        int fd;
+        PeakSocketReduceReleaseFrame frame;
+        gboolean valid;
+
+        pfd.fd = listener;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        poll_result = poll(&pfd, 1, peak_socket_reduce_remaining_ms(deadline_us));
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (poll_result == 0) {
+            break;
+        }
+
+        fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        peak_socket_reduce_set_timeout(
+            fd,
+            peak_socket_reduce_remaining_ms(deadline_us));
+        memset(&frame, 0, sizeof(frame));
+        valid = peak_socket_reduce_recv_all(fd,
+                                            &frame,
+                                            sizeof(frame),
+                                            deadline_us) &&
+                frame.magic == PEAK_SOCKET_REDUCE_MAGIC &&
+                frame.version == PEAK_SOCKET_REDUCE_VERSION &&
+                frame.session_token == session_token &&
+                frame.hook_count == hook_count &&
+                frame.rank < (uint32_t)size &&
+                frame.rank > 0 &&
+                release_targets[frame.rank];
+        if (valid) {
+            frame.ack = PEAK_SOCKET_REDUCE_RELEASE_ACK;
+            valid = peak_socket_reduce_send_all(fd,
+                                                &frame,
+                                                sizeof(frame),
+                                                deadline_us);
+        }
+        close(fd);
+        if (valid) {
+            release_targets[frame.rank] = FALSE;
+            released++;
+        }
+    }
+
+    close(listener);
+    if (released != peer_count) {
+        g_printerr("[peak] Socket aggregation released %u/%u peer ranks before timeout\n",
+                   released,
+                   peer_count);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_socket_reduce_merge_records(PeakSocketReduceRecord* aggregate,
+                                 const PeakSocketReduceRecord* incoming)
+{
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (incoming[i].identity_hash != aggregate[i].identity_hash) {
+            return FALSE;
+        }
+
+        aggregate[i].num_calls += incoming[i].num_calls;
+        aggregate[i].total_time += incoming[i].total_time;
+        if (incoming[i].max_total_time > aggregate[i].max_total_time) {
+            aggregate[i].max_total_time = incoming[i].max_total_time;
+        }
+        if (incoming[i].min_total_time < aggregate[i].min_total_time) {
+            aggregate[i].min_total_time = incoming[i].min_total_time;
+        }
+        aggregate[i].exclusive_time += incoming[i].exclusive_time;
+        if (incoming[i].max_time > aggregate[i].max_time) {
+            aggregate[i].max_time = incoming[i].max_time;
+        }
+        if (incoming[i].min_time < aggregate[i].min_time) {
+            aggregate[i].min_time = incoming[i].min_time;
+        }
+        aggregate[i].thread_count += incoming[i].thread_count;
+        aggregate[i].detached = aggregate[i].detached || incoming[i].detached;
+        aggregate[i].reattached =
+            aggregate[i].reattached || incoming[i].reattached;
+    }
+
+    return TRUE;
+}
+
+static void
+peak_socket_reduce_records_to_arrays(PeakSocketReduceRecord* records,
+                                     gulong* sum_num_calls,
+                                     gdouble* sum_total_time,
+                                     gdouble* max_total_time,
+                                     gdouble* min_total_time,
+                                     gdouble* sum_exclusive_time,
+                                     gfloat* sum_max_time,
+                                     gfloat* sum_min_time,
+                                     gulong* thread_count,
+                                     gboolean* detached,
+                                     gboolean* reattached)
+{
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        sum_num_calls[i] = (gulong)records[i].num_calls;
+        sum_total_time[i] = (gdouble)records[i].total_time;
+        max_total_time[i] = (gdouble)records[i].max_total_time;
+        min_total_time[i] = (gdouble)records[i].min_total_time;
+        sum_exclusive_time[i] = (gdouble)records[i].exclusive_time;
+        sum_max_time[i] = (gfloat)records[i].max_time;
+        sum_min_time[i] = (gfloat)records[i].min_time;
+        thread_count[i] = (gulong)records[i].thread_count;
+        detached[i] = records[i].detached ? TRUE : FALSE;
+        reattached[i] = records[i].reattached ? TRUE : FALSE;
+    }
+}
+
+static gboolean
+peak_general_listener_socket_reduce_result(gulong* sum_num_calls,
+                                           gdouble* sum_total_time,
+                                           gdouble* max_total_time,
+                                           gdouble* min_total_time,
+                                           gdouble* sum_exclusive_time,
+                                           gfloat* sum_max_time,
+                                           gfloat* sum_min_time,
+                                           gulong* thread_count)
+{
+    int rank = 0;
+    int size = 1;
+    int port = peak_socket_reduce_port();
+    int release_port = peak_socket_reduce_release_port(port);
+    int timeout_ms = peak_socket_reduce_parse_positive_int_env(
+        PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
+        PEAK_SOCKET_REDUCE_DEFAULT_TIMEOUT_MS);
+    int64_t deadline_us = peak_socket_reduce_deadline_us(timeout_ms);
+    uint64_t session_token = peak_socket_reduce_session_token();
+    PeakSocketReduceRecord* local_records = NULL;
+    PeakSocketReduceHeader header;
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (peak_general_listener_has_duplicate_slot_names()) {
+        if (rank == 0) {
+            g_printerr("[peak] Socket aggregation contains duplicate hook names, likely from multiple JIT generations; skipping aggregate output\n");
+        }
+        return FALSE;
+    }
+
+    if (size <= 1) {
+        peak_general_listener_print_result(sum_num_calls,
+                                           sum_total_time,
+                                           max_total_time,
+                                           min_total_time,
+                                           sum_exclusive_time,
+                                           sum_max_time,
+                                           sum_min_time,
+                                           thread_count,
+                                           1);
+        return TRUE;
+    }
+
+    local_records = peak_socket_reduce_build_records(sum_num_calls,
+                                                     sum_total_time,
+                                                     max_total_time,
+                                                     min_total_time,
+                                                     sum_exclusive_time,
+                                                     sum_max_time,
+                                                     sum_min_time,
+                                                     thread_count);
+    header.magic = PEAK_SOCKET_REDUCE_MAGIC;
+    header.version = PEAK_SOCKET_REDUCE_VERSION;
+    header.rank = (uint32_t)rank;
+    header.hook_count = (uint64_t)peak_hook_address_count;
+    header.session_token = session_token;
+
+    if (rank != 0) {
+        char root_host[256];
+        int fd;
+        gboolean sent;
+        gboolean released;
+
+        if (!peak_socket_reduce_root_host(root_host, sizeof(root_host))) {
+            g_printerr("[peak] Socket aggregation could not determine root host; skipping aggregate output\n");
+            g_free(local_records);
+            return FALSE;
+        }
+
+        if (rank > 0) {
+            usleep((useconds_t)((rank % 1024) * 1000));
+        }
+        fd = peak_socket_reduce_connect(root_host, port, deadline_us);
+        if (fd < 0) {
+            g_printerr("[peak] Socket aggregation could not connect to %s:%d; skipping aggregate output\n",
+                       root_host,
+                       port);
+            g_free(local_records);
+            return FALSE;
+        }
+
+        sent = peak_socket_reduce_send_all(fd,
+                                           &header,
+                                           sizeof(header),
+                                           deadline_us) &&
+               peak_socket_reduce_send_all(fd,
+                                           local_records,
+                                           sizeof(PeakSocketReduceRecord) *
+                                               peak_hook_address_count,
+                                           deadline_us);
+        close(fd);
+        g_free(local_records);
+        if (!sent) {
+            g_printerr("[peak] Socket aggregation send failed; skipping aggregate output\n");
+            return FALSE;
+        }
+        released = peak_socket_reduce_wait_for_release(root_host,
+                                                       release_port,
+                                                       &header,
+                                                       timeout_ms);
+        if (!released) {
+            g_printerr("[peak] Socket aggregation release wait failed; skipping aggregate output\n");
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    int listener = peak_socket_reduce_create_listener(port);
+    if (listener < 0) {
+        g_printerr("[peak] Socket aggregation could not listen on port %d; skipping aggregate output\n",
+                   port);
+        g_free(local_records);
+        return FALSE;
+    }
+
+    gboolean* seen = g_new0(gboolean, size);
+    gboolean* release_targets = g_new0(gboolean, size);
+    PeakSocketReduceRecord* aggregate =
+        g_memdup2(local_records,
+                  sizeof(PeakSocketReduceRecord) * peak_hook_address_count);
+    unsigned int received = 0;
+    gboolean failed = FALSE;
+    seen[0] = TRUE;
+
+    while (received < (unsigned int)(size - 1) &&
+           peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+        struct pollfd pfd;
+        int poll_result;
+
+        pfd.fd = listener;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        poll_result = poll(&pfd, 1, peak_socket_reduce_remaining_ms(deadline_us));
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            failed = TRUE;
+            break;
+        }
+        if (poll_result == 0) {
+            break;
+        }
+
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            failed = TRUE;
+            break;
+        }
+        peak_socket_reduce_set_timeout(
+            fd,
+            peak_socket_reduce_remaining_ms(deadline_us));
+
+        PeakSocketReduceHeader incoming_header;
+        PeakSocketReduceRecord* incoming =
+            g_new0(PeakSocketReduceRecord, peak_hook_address_count);
+        gboolean ok =
+            peak_socket_reduce_recv_all(fd,
+                                        &incoming_header,
+                                        sizeof(incoming_header),
+                                        deadline_us) &&
+            incoming_header.magic == PEAK_SOCKET_REDUCE_MAGIC &&
+            incoming_header.version == PEAK_SOCKET_REDUCE_VERSION &&
+            incoming_header.session_token == session_token &&
+            incoming_header.hook_count == (uint64_t)peak_hook_address_count &&
+            incoming_header.rank < (uint32_t)size &&
+            incoming_header.rank > 0 &&
+            !seen[incoming_header.rank];
+        if (ok) {
+            release_targets[incoming_header.rank] = TRUE;
+        }
+        ok = ok &&
+            peak_socket_reduce_recv_all(
+                fd,
+                incoming,
+                sizeof(PeakSocketReduceRecord) * peak_hook_address_count,
+                deadline_us) &&
+            peak_socket_reduce_merge_records(aggregate, incoming);
+        close(fd);
+        g_free(incoming);
+
+        if (!ok) {
+            failed = TRUE;
+            break;
+        }
+
+        seen[incoming_header.rank] = TRUE;
+        received++;
+    }
+
+    close(listener);
+    g_free(local_records);
+    g_free(seen);
+
+    if (failed || received != (unsigned int)(size - 1)) {
+        g_printerr("[peak] Socket aggregation received %u/%d peer ranks; skipping aggregate output on root\n",
+                   received,
+                   size - 1);
+        (void)peak_socket_reduce_release_peers(release_port,
+                                               release_targets,
+                                               size,
+                                               (uint64_t)peak_hook_address_count,
+                                               session_token,
+                                               timeout_ms);
+        g_free(release_targets);
+        g_free(aggregate);
+        return FALSE;
+    }
+
+    gboolean* socket_array_listener_detached =
+        g_new0(gboolean, peak_hook_address_count);
+    gboolean* socket_array_listener_reattached =
+        g_new0(gboolean, peak_hook_address_count);
+    peak_socket_reduce_records_to_arrays(aggregate,
+                                         sum_num_calls,
+                                         sum_total_time,
+                                         max_total_time,
+                                         min_total_time,
+                                         sum_exclusive_time,
+                                         sum_max_time,
+                                         sum_min_time,
+                                         thread_count,
+                                         socket_array_listener_detached,
+                                         socket_array_listener_reattached);
+    g_free(aggregate);
+    g_free(array_listener_detached);
+    g_free(array_listener_reattached);
+    array_listener_detached = socket_array_listener_detached;
+    array_listener_reattached = socket_array_listener_reattached;
+
+    peak_general_listener_print_result(sum_num_calls,
+                                       sum_total_time,
+                                       max_total_time,
+                                       min_total_time,
+                                       sum_exclusive_time,
+                                       sum_max_time,
+                                       sum_min_time,
+                                       thread_count,
+                                       size);
+    (void)peak_socket_reduce_release_peers(release_port,
+                                           release_targets,
+                                           size,
+                                           (uint64_t)peak_hook_address_count,
+                                           session_token,
+                                           timeout_ms);
+    g_free(release_targets);
+    return TRUE;
 }
 
 static void
@@ -3796,8 +5157,12 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
 }
 #endif
 
-void peak_general_listener_print(int is_MPI)
+void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
 {
+    if (interceptor != NULL) {
+        gum_interceptor_ignore_current_thread(interceptor);
+    }
+
     gulong* sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* max_total_time = g_new0(gdouble, peak_hook_address_count);
@@ -3831,7 +5196,7 @@ void peak_general_listener_print(int is_MPI)
         }
     }
 #ifdef HAVE_MPI
-    if (is_MPI) {
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
         peak_general_listener_reduce_result(sum_num_calls,
                                             sum_total_time,
                                             max_total_time,
@@ -3840,6 +5205,15 @@ void peak_general_listener_print(int is_MPI)
                                             sum_max_time,
                                             sum_min_time,
                                             thread_count);
+    } else if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
+        peak_general_listener_socket_reduce_result(sum_num_calls,
+                                                   sum_total_time,
+                                                   max_total_time,
+                                                   min_total_time,
+                                                   sum_exclusive_time,
+                                                   sum_max_time,
+                                                   sum_min_time,
+                                                   thread_count);
     } else {
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
@@ -3868,6 +5242,10 @@ void peak_general_listener_print(int is_MPI)
     g_free(sum_max_time);
     g_free(sum_min_time);
     g_free(thread_count);
+
+    if (interceptor != NULL) {
+        gum_interceptor_unignore_current_thread(interceptor);
+    }
 }
 
 gboolean peak_general_listener_dettach()
@@ -3980,6 +5358,7 @@ gboolean peak_general_listener_dettach()
     g_free(array_listener_reattached);
     g_free(array_listener_gum_detached);
     g_free(array_listener_gum_detach_flushed);
+    g_free(peak_hook_last_detach_time);
     g_free(peak_hook_states);
     g_free(peak_hook_next_retry_time);
     g_free(peak_hook_pending_observed_time);
@@ -3993,6 +5372,7 @@ gboolean peak_general_listener_dettach()
     array_listener_reattached = NULL;
     array_listener_gum_detached = NULL;
     array_listener_gum_detach_flushed = NULL;
+    peak_hook_last_detach_time = NULL;
     peak_hook_states = NULL;
     peak_hook_next_retry_time = NULL;
     peak_hook_pending_observed_time = NULL;

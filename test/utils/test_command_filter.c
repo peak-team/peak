@@ -1,6 +1,7 @@
 #include "utils.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int
@@ -63,6 +64,24 @@ expect_not_interpreter(const char* command)
     return 1;
 }
 
+static int
+expect_profile_decision(int argc,
+                        char* const argv[],
+                        int expected,
+                        const char* label)
+{
+    int actual = peak_should_profile_command(argc, argv);
+    if (actual != expected) {
+        fprintf(stderr,
+                "unexpected profile decision for %s: got %d expected %d\n",
+                label,
+                actual,
+                expected);
+        return 0;
+    }
+    return 1;
+}
+
 int
 main(void)
 {
@@ -94,6 +113,34 @@ main(void)
     char* app_lua[] = {
         "/usr/bin/lua5.4",
         "simulate.lua",
+        NULL
+    };
+    char* timeout_wrapper[] = {
+        "timeout",
+        "50m",
+        "ibrun",
+        "./su3_rhmd_hisq.skx",
+        NULL
+    };
+    char* timeout_path_wrapper[] = {
+        "/usr/bin/timeout",
+        "50m",
+        "ibrun",
+        "./su3_rhmd_hisq.skx",
+        NULL
+    };
+    char* milc_app[] = {
+        "./su3_rhmd_hisq.skx",
+        NULL
+    };
+    char* python_app[] = {
+        "/usr/bin/python3",
+        "train.py",
+        NULL
+    };
+    char* node_app[] = {
+        "node",
+        "server.js",
         NULL
     };
 
@@ -129,6 +176,30 @@ main(void)
     ok &= expect_module_helper(4, modules_tcl);
     ok &= expect_not_module_helper(2, app_python);
     ok &= expect_not_module_helper(2, app_lua);
+
+    unsetenv("PEAK_PROFILE_INTERPRETERS");
+    unsetenv("PEAK_JIT_ENABLE");
+    setenv("PEAK_TARGET_FILE", "/tmp/peak-target-list", 1);
+    ok &= expect_profile_decision(4,
+                                  timeout_wrapper,
+                                  0,
+                                  "timeout wrapper with PEAK_TARGET_FILE");
+    ok &= expect_profile_decision(4,
+                                  timeout_path_wrapper,
+                                  0,
+                                  "/usr/bin/timeout wrapper");
+    ok &= expect_profile_decision(1, milc_app, 1, "MILC app");
+    ok &= expect_profile_decision(2, python_app, 0, "python default skip");
+    ok &= expect_profile_decision(2, node_app, 0, "node default skip");
+
+    setenv("PEAK_PROFILE_INTERPRETERS", "1", 1);
+    ok &= expect_profile_decision(2, python_app, 1, "python opt-in");
+    unsetenv("PEAK_PROFILE_INTERPRETERS");
+
+    setenv("PEAK_JIT_ENABLE", "1", 1);
+    ok &= expect_profile_decision(2, node_app, 1, "node jit opt-in");
+    unsetenv("PEAK_JIT_ENABLE");
+    unsetenv("PEAK_TARGET_FILE");
 
     if (!ok) {
         return 1;

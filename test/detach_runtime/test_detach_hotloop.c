@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "frida-gum.h"
 #include "general_listener.h"
+#include "peak_detach_controller.h"
 
 #include <aio.h>
 #include <dlfcn.h>
@@ -428,6 +429,7 @@ typedef gboolean (*PeakRequestDetachFn)(size_t hook_id);
 typedef gboolean (*PeakRequestReattachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
+typedef gboolean (*PeakControllerShutdownHelperFn)(PeakDetachStatus* status_out);
 typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
 typedef int (*PeakControllerGateEpochFn)(void);
 typedef size_t (*PeakControllerGateWaiterCountFn)(void);
@@ -1032,6 +1034,89 @@ run_controller_batch_retry_check(void)
 
     printf("controller_batch_retry_ok batch_id=%s\n", retry_batch_id);
     (void)stop_pc_fd;
+    return 0;
+}
+
+static int
+run_controller_no_trace_pending_age_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakControllerShutdownHelperFn shutdown_helper =
+        (PeakControllerShutdownHelperFn)required_symbol(
+            "peak_detach_controller_shutdown_helper");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    double start;
+    double elapsed;
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        shutdown_helper == NULL ||
+        hook_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    unsetenv("PEAK_DETACH_TRACE_PATH");
+    if (!shutdown_helper(NULL)) {
+        fprintf(stderr, "failed to close startup helper before no-trace retry check\n");
+        return 2;
+    }
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "stop-timeout", 1) != 0) {
+        perror("setenv FAKE_DETACH_HELPER_SCENARIO");
+        return 2;
+    }
+
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue no-trace pending-age detach request\n");
+        return 2;
+    }
+
+    usleep(50000);
+    start = monotonic_seconds();
+    if (!controller_drain(10)) {
+        fprintf(stderr, "controller did not abandon no-trace retry by age budget\n");
+        return 2;
+    }
+    elapsed = monotonic_seconds() - start;
+
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr,
+                "expected failed no-trace detach to leave hook attached, got state %d\n",
+                (int)hook_state(0));
+        return 2;
+    }
+
+    printf("controller_no_trace_pending_age_ok elapsed=%.6f\n", elapsed);
     return 0;
 }
 
@@ -3035,6 +3120,9 @@ main(int argc, char** argv)
 {
     if (has_flag_arg(argc, argv, "--controller-batch-retry-check")) {
         return run_controller_batch_retry_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-no-trace-pending-age-check")) {
+        return run_controller_no_trace_pending_age_check();
     }
     if (has_flag_arg(argc, argv, "--controller-unsupported-gum-pc-retry-check")) {
         return run_controller_unsupported_gum_pc_retry_check(argc, argv);
