@@ -5,6 +5,7 @@
 #include <string.h>
 
 #define PEAK_MPI_FINALIZE_POLICY_ENV "PEAK_MPI_FINALIZE_POLICY"
+#define PEAK_OUTPUT_AGGREGATION_ENV  "PEAK_OUTPUT_AGGREGATION"
 
 static GumInterceptor* mpi_interceptor;
 
@@ -57,9 +58,24 @@ mpi_interceptor_direct_finalize_enabled(void)
 }
 
 static int
+mpi_interceptor_socket_aggregation_selected(void)
+{
+    const char* value = getenv(PEAK_OUTPUT_AGGREGATION_ENV);
+
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "socket") == 0 ||
+            g_ascii_strcasecmp(value, "tcp") == 0 ||
+            g_ascii_strcasecmp(value, "interconnect") == 0);
+}
+
+static int
 mpi_interceptor_finalize_policy_defer(void)
 {
     const char* value = getenv(PEAK_MPI_FINALIZE_POLICY_ENV);
+
+    if (value == NULL || value[0] == '\0') {
+        return mpi_interceptor_socket_aggregation_selected();
+    }
 
     return value != NULL &&
            (g_ascii_strcasecmp(value, "defer") == 0 ||
@@ -185,8 +201,9 @@ mpi_interceptor_call_original_finalize_once(void)
  * records the application's finalization request. The default policy lets PEAK
  * emit final output while MPI is still alive on the application's own finalize
  * path, then returns to the real MPI finalizer after all-rank proof.
- * PEAK_MPI_FINALIZE_POLICY=defer calls the real finalizer immediately and
- * leaves PEAK output for normal process teardown. PEAK does not replay
+ * PEAK_MPI_FINALIZE_POLICY=defer, or explicitly selecting socket output
+ * without an explicit finalize policy, calls the real finalizer immediately
+ * and leaves PEAK output for normal process teardown. PEAK does not replay
  * `PMPI_Finalize()` later from process teardown.
  *
  * @return The original `PMPI_Finalize()` result.

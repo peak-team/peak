@@ -613,17 +613,31 @@ The MPI finalizer interposer therefore records whether the application attempted
 immediately makes target callbacks pass-through, runs PEAK output while MPI is
 still alive on that application-owned finalizer path, and then returns to the
 real `PMPI_Finalize()` only after PEAK has proven every rank reached finalize.
-Suspending callbacks before heartbeat stop, controller drain, and output
-prevents late hot-target samples from enqueueing new detach/reattach work while
-the finalizer path is already tearing down. `PEAK_MPI_REAL_FINALIZE=0` is a
-diagnostic opt-out that skips the real finalizer after output.
+The finalize proof is timeout-bounded; if only a subset of ranks entered
+`PMPI_Finalize()` or the proof cannot complete, PEAK falls back to rank-local
+output and skips the real finalizer on that unsafe subset path instead of
+blocking indefinitely. Suspending callbacks before heartbeat stop, controller
+drain, and output prevents late hot-target samples from enqueueing new
+detach/reattach work while the finalizer path is already tearing down.
+`PEAK_MPI_REAL_FINALIZE=0` is a diagnostic opt-out that skips the real finalizer
+after output.
 
-Applications that intentionally call `MPI_Finalize()` early and then continue
-substantial non-MPI work should use `PEAK_MPI_FINALIZE_POLICY=defer`. In that
-mode PEAK calls the real `PMPI_Finalize()` immediately from the application
-finalizer, keeps target profiling active, and emits PEAK output from normal
-process teardown. Because MPI is finalized by then, PEAK output cannot use MPI
-collectives in this mode and must use rank-local or non-MPI aggregation paths.
+Applications where every rank intentionally calls `MPI_Finalize()` early and
+then continues substantial non-MPI work should use
+`PEAK_MPI_FINALIZE_POLICY=defer`, or explicitly select
+`PEAK_OUTPUT_AGGREGATION=socket`. In that mode PEAK calls the real
+`PMPI_Finalize()` immediately from the application finalizer, keeps target
+profiling active, and emits PEAK output from normal process teardown. Because
+MPI is finalized by then, PEAK output cannot use MPI collectives in this mode;
+socket output uses launcher rank metadata, while local output writes one file per
+rank. `defer` is not a subset-rank failure-recovery mode: if only some ranks
+call the real MPI finalizer, the MPI runtime itself may still hang or abort.
+
+The practical choice is: use default `report` with the MPI reducer for ordinary
+MPI jobs that finalize at the end; use `socket` or `defer` for all-rank
+early-finalize programs that continue heavy non-MPI work; avoid subset-rank
+finalization as an application failure path because PEAK can only fail closed
+around its own reporting and cannot make a partial real MPI finalizer safe.
 
 PEAK does not replay the real `PMPI_Finalize()` later from process teardown,
 because large Intel MPI jobs can crash or hang if a profiler re-enters MPI
@@ -643,8 +657,11 @@ PEAK is producing final output.
 `PEAK_OUTPUT_AGGREGATION` defaults to `mpi`, which uses an MPI collective reducer
 after first proving that every rank observed the application's `PMPI_Finalize()`
 request. `mpi`, `collective`, or truthy values select this default reducer.
-`socket`, `tcp`, or `interconnect` explicitly select the experimental PEAK-owned
-TCP reducer over the job interconnect while MPI is still initialized. `local`,
+`socket`, `tcp`, or `interconnect` explicitly select the PEAK-owned TCP reducer
+over the job interconnect. By default, explicit socket output defers PEAK
+reporting until process exit, after the application-owned MPI finalizer has
+returned; the reducer then uses launcher rank metadata rather than MPI
+collectives. `local`,
 `rank-local`, `none`, or falsey values write rank-local output. The older
 boolean `PEAK_MPI_COLLECTIVE_OUTPUT=1` remains a compatibility alias for
 aggregate output and maps to the MPI reducer when `PEAK_OUTPUT_AGGREGATION` is
@@ -659,25 +676,29 @@ aggregate output and does not add MPI collectives or a PEAK-driven MPI
 finalizer.
 
 When MPI collective output is selected and the clean-exit MPI preconditions
-hold, PEAK first performs a small MPI handshake to verify that every
+hold, PEAK first performs a small bounded MPI handshake to verify that every
 participating rank observed the application's `PMPI_Finalize()` request.
-If any rank did not observe it, all ranks fall back to rank-local output instead
-of splitting between collective and non-collective teardown paths, and PEAK skips
-the real MPI finalizer from the subset-rank path. The socket payload reducer
+If any rank did not observe it or the proof times out, ranks fall back to
+rank-local output instead of splitting between collective and non-collective
+teardown paths, and PEAK skips the real MPI finalizer from the subset-rank path.
+The socket payload reducer
 does not use MPI reductions for the profile payload itself: rank 0 accepts a
 bounded set of framed per-rank payloads, validates a Slurm/PMI-derived reducer
 token plus the job's hook-slot identity, and writes one aggregate result only
-after every rank has arrived. Under the default `report` finalize policy,
-socket mode may still use the same one-integer MPI all-rank finalize handshake
-before socket output so PEAK can safely return to the real MPI finalizer. This
-handshake is skipped in `PEAK_MPI_FINALIZE_POLICY=defer`, where the real
-finalizer runs immediately and PEAK output happens later. After rank 0 writes
-the aggregate, it opens a PEAK-owned release port and acknowledges the peer ranks
-that delivered payloads; non-root ranks wait for that release before leaving
-process teardown. If the socket reducer cannot prove complete participation, it
-emits a bounded diagnostic, releases the peers it did receive, and skips the
-aggregate rather than fabricating a partial result, falling back to thousands of
-rank-local files, or creating a large filesystem fan-in.
+after every rank has arrived. With explicit socket output and no explicit
+`PEAK_MPI_FINALIZE_POLICY`, PEAK calls the real MPI finalizer immediately and
+runs the socket reducer from normal process teardown, so this path does not use
+MPI collectives or an MPI finalize proof. If `PEAK_MPI_FINALIZE_POLICY=report`
+is explicitly combined with socket output, PEAK may still report from the
+application finalizer path and use the bounded all-rank proof before returning to
+the real MPI finalizer. After rank 0 writes the aggregate, it opens a PEAK-owned
+release port and acknowledges the peer ranks that delivered payloads; non-root
+ranks wait for that release before leaving process teardown. If the socket
+reducer cannot prove complete participation, it
+emits a bounded diagnostic, releases the peers it did receive, and by default
+falls back to rank-local output CSV files. Set
+`PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK=0` (or `false`) to keep this from
+falling back and retain aggregate-disabled behavior instead.
 `PEAK_OUTPUT_AGGREGATION_TOKEN` can override the reducer token for controlled
 tests.
 
@@ -1019,15 +1040,21 @@ Completed in this branch:
     makes target callbacks pass-through before heartbeat/controller teardown can
     drain or enqueue more target mutations, writes PEAK output on the
     application's own finalizer path while MPI is still initialized enough to
-    query rank/size, and returns to the real MPI finalizer only after all-rank
-    finalize proof. `PEAK_MPI_FINALIZE_POLICY=defer` calls the real finalizer
-    immediately and leaves PEAK profiling/output until normal process teardown
-    for applications that keep doing non-MPI work after `MPI_Finalize()`. PEAK
-    does not replay the real MPI finalizer from teardown. The default MPI
-    reducer is guarded by all-rank finalize proof, and the optional socket
-    payload reducer releases non-root ranks only after rank 0 has completed
-    aggregate output; both paths avoid Intel MPI finalizer crashes and
-    early-rank-exit launcher kills. `PEAK_MPI_REAL_FINALIZE=0` remains a
+    query rank/size, and returns to the real MPI finalizer only after bounded
+    all-rank finalize proof. If that proof times out, PEAK falls back to
+    rank-local output and skips the real finalizer instead of blocking a subset
+    rank. `PEAK_MPI_FINALIZE_POLICY=defer` or explicit socket aggregation calls
+    the real finalizer immediately and leaves PEAK profiling/output until normal
+    process teardown for applications where all ranks keep doing non-MPI work
+    after `MPI_Finalize()`. `defer` is documented as all-rank early-finalize
+    semantics, not subset-rank failure recovery. PEAK does not replay the real
+    MPI finalizer from teardown. The default MPI reducer is guarded by all-rank
+    finalize proof, and the optional socket payload reducer uses launcher rank
+    metadata at process exit, releases non-root ranks only after rank 0 has
+    completed aggregate output or instructs peers to fall back to rank-local
+    output, and can fall back to per-rank CSV output on reducer failure; both
+    paths avoid Intel MPI finalizer crashes and early-rank-exit launcher kills.
+    `PEAK_MPI_REAL_FINALIZE=0` remains a
     diagnostic opt-out after PEAK output.
     Nonzero exit paths that reach process teardown before MPI finalization skip
     aggregate output and PEAK-driven MPI collectives/finalize, preventing
@@ -1036,7 +1063,7 @@ Completed in this branch:
     PEAK writes output before the later exit status is knowable, makes target
     callbacks pass-through, keeps target hooks pinned, restores support wrappers
     and the `PMPI_Finalize` replacement, and returns to the real finalizer after
-    all-rank proof unless `defer` policy is selected.
+    bounded all-rank proof unless `defer` policy is selected.
     `peak_fini()` is
     single-entry per process and racing exit callers wait for the owner, so they
     cannot double-run or interrupt Gum/MPI teardown; the first intercepted exit
@@ -1047,9 +1074,12 @@ Completed in this branch:
     rank-local and `PEAK_MPI_COLLECTIVE_OUTPUT=1` maps to MPI aggregation.
     Regression coverage exercises no-finalize exit, no-finalize nonzero exit,
     explicit local output, explicit MPI collective output, socket bad-host
-    failure, socket token mismatch failure, finalize-defer-post-work,
+    failure, socket token mismatch failure, socket late release-channel failure,
+    socket no-fallback opt-out, finalize-defer-post-work,
     finalize-then-nonzero-exit, subset-finalize nonzero exit, default
-    subset-finalize clean exit, and finalize-then-nonzero-return MPI lifecycles.
+    subset-finalize clean exit, subset-finalize handoff timeout, socket
+    post-finalize work aggregation, and finalize-then-nonzero return MPI
+    lifecycles.
 47. Made Gum context lookup listener-canonical: if strict detach cannot find a
     Gum context under the request address but the listener is still attached,
     the patched Gum overlay scans active contexts for that listener and returns

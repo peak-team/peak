@@ -19,8 +19,9 @@
  * application's finalization request. By default it lets PEAK write final
  * output while MPI is still alive on the application's own finalize path, and
  * then returns to the real `PMPI_Finalize()` after all-rank proof.
- * `PEAK_MPI_FINALIZE_POLICY=defer` instead calls the real finalizer immediately
- * and leaves PEAK profiling/output until process exit.
+ * `PEAK_MPI_FINALIZE_POLICY=defer`, or explicit socket output without an
+ * explicit finalize policy, instead calls the real finalizer immediately and
+ * leaves PEAK profiling/output until process exit.
  * `PEAK_MPI_REAL_FINALIZE=0` may skip the real finalizer for diagnostics. PEAK
  * does not replay the real `PMPI_Finalize()` later from process teardown; doing
  * so can re-enter MPI from an application state that has already logically
@@ -44,8 +45,9 @@ int mpi_interceptor_finalize_path_active();
  * @brief Controls whether the intercepted finalizer may call real PMPI_Finalize.
  *
  * The real MPI finalizer is enabled by default, but only after PEAK has proven
- * that every rank reached the application finalizer. Otherwise a subset-rank
- * finalizer can hang or be killed by the MPI runtime.
+ * that every rank reached the application finalizer. PEAK uses a short proof
+ * timeout and fails closed if proof cannot be confirmed, so a subset-rank
+ * finalizer does not block on collectives or re-enter MPI unexpectedly.
  */
 void mpi_interceptor_set_real_finalize_allowed(int allowed);
 
