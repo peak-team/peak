@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +31,9 @@
 #define PEAK_OUTPUT_AGGREGATION_TOKEN_ENV "PEAK_OUTPUT_AGGREGATION_TOKEN"
 #define PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV \
     "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"
+#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_ENV \
+    "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
+#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
 #define PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"
 #define PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV "PEAK_CONTROLLER_MAX_PENDING_AGE_MS"
@@ -5181,7 +5185,109 @@ peak_general_listener_socket_reduce_result(gulong* sum_num_calls,
     return TRUE;
 }
 
-static void
+static unsigned int
+peak_mpi_output_collective_timeout_ms(void)
+{
+    const char* value = getenv(PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_ENV);
+    if (value == NULL || value[0] == '\0') {
+        return PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT;
+    }
+
+    char* end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0 ||
+        parsed > UINT_MAX) {
+        return PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT;
+    }
+    return (unsigned int)parsed;
+}
+
+static gboolean
+peak_mpi_wait_collective_request(MPI_Request* request, const char* label)
+{
+    MPI_Status status;
+    int done = 0;
+    unsigned int timeout_ms = peak_mpi_output_collective_timeout_ms();
+    double deadline = peak_second() + (double)timeout_ms / 1000.0;
+
+    while (1) {
+        int mpi_result = MPI_Test(request, &done, &status);
+        if (mpi_result != MPI_SUCCESS) {
+            g_printerr("[peak] MPI_Test for %s failed; falling back to rank-local output without touching MPI again\n",
+                       label);
+            return FALSE;
+        }
+        if (done) {
+            return TRUE;
+        }
+        if (peak_second() >= deadline) {
+            /*
+             * As with the finalize proof, active nonblocking collectives do
+             * not have a portable cancel path. Leave the request owned by MPI,
+             * abandon PEAK's MPI reducer, and do not issue later MPI calls from
+             * this teardown path.
+             */
+            g_printerr("[peak] MPI %s timed out after %u ms; falling back to rank-local output without touching MPI again\n",
+                       label,
+                       timeout_ms);
+            return FALSE;
+        }
+        sched_yield();
+    }
+}
+
+static gboolean
+peak_mpi_allreduce_checked(const void* sendbuf,
+                           void* recvbuf,
+                           int count,
+                           MPI_Datatype datatype,
+                           MPI_Op op,
+                           const char* label)
+{
+    MPI_Request request = MPI_REQUEST_NULL;
+    int mpi_result = MPI_Iallreduce(sendbuf,
+                                    recvbuf,
+                                    count,
+                                    datatype,
+                                    op,
+                                    MPI_COMM_WORLD,
+                                    &request);
+    if (mpi_result != MPI_SUCCESS) {
+        g_printerr("[peak] MPI_Iallreduce for %s failed; falling back to rank-local output\n",
+                   label);
+        return FALSE;
+    }
+    return peak_mpi_wait_collective_request(&request, label);
+}
+
+static gboolean
+peak_mpi_reduce_checked(const void* sendbuf,
+                        void* recvbuf,
+                        int count,
+                        MPI_Datatype datatype,
+                        MPI_Op op,
+                        int root,
+                        const char* label)
+{
+    MPI_Request request = MPI_REQUEST_NULL;
+    int mpi_result = MPI_Ireduce(sendbuf,
+                                 recvbuf,
+                                 count,
+                                 datatype,
+                                 op,
+                                 root,
+                                 MPI_COMM_WORLD,
+                                 &request);
+    if (mpi_result != MPI_SUCCESS) {
+        g_printerr("[peak] MPI_Ireduce for %s failed; falling back to rank-local output\n",
+                   label);
+        return FALSE;
+    }
+    return peak_mpi_wait_collective_request(&request, label);
+}
+
+static gboolean
 peak_general_listener_reduce_result(gulong* sum_num_calls,
                                     gdouble* sum_total_time,
                                     gdouble* max_total_time,
@@ -5191,6 +5297,13 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                     gfloat* sum_min_time,
                                     gulong* thread_count)
 {
+    /*
+     * The MPI reducer only runs after peak.c has proven that every rank reached
+     * the finalizer path. Its collectives use bounded nonblocking wrappers so a
+     * failed reducer can fall back to local output, but MPI_Test is still an MPI
+     * progress call. For failure-prone teardown or jobs where MPI progress may
+     * be compromised, use PEAK_OUTPUT_AGGREGATION=socket.
+     */
     int rank, size;
     int init_flag;
     MPI_Initialized(&init_flag);
@@ -5201,27 +5314,33 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gulong local_hook_count = (gulong)peak_hook_address_count;
     gulong min_hook_count = 0;
     gulong max_hook_count = 0;
-    MPI_Allreduce(&local_hook_count,
-                  &min_hook_count,
-                  1,
-                  MPI_UNSIGNED_LONG,
-                  MPI_MIN,
-                  MPI_COMM_WORLD);
-    MPI_Allreduce(&local_hook_count,
-                  &max_hook_count,
-                  1,
-                  MPI_UNSIGNED_LONG,
-                  MPI_MAX,
-                  MPI_COMM_WORLD);
+    if (!peak_mpi_allreduce_checked(&local_hook_count,
+                                    &min_hook_count,
+                                    1,
+                                    MPI_UNSIGNED_LONG,
+                                    MPI_MIN,
+                                    "hook-count-min")) {
+        goto rank_local;
+    }
+    if (!peak_mpi_allreduce_checked(&local_hook_count,
+                                    &max_hook_count,
+                                    1,
+                                    MPI_UNSIGNED_LONG,
+                                    MPI_MAX,
+                                    "hook-count-max")) {
+        goto rank_local;
+    }
     int local_duplicate_names =
         peak_general_listener_has_duplicate_slot_names() ? 1 : 0;
     int any_duplicate_names = 0;
-    MPI_Allreduce(&local_duplicate_names,
-                  &any_duplicate_names,
-                  1,
-                  MPI_INT,
-                  MPI_MAX,
-                  MPI_COMM_WORLD);
+    if (!peak_mpi_allreduce_checked(&local_duplicate_names,
+                                    &any_duplicate_names,
+                                    1,
+                                    MPI_INT,
+                                    MPI_MAX,
+                                    "duplicate-hook-name-check")) {
+        goto rank_local;
+    }
     if (any_duplicate_names) {
         if (rank == 0) {
             g_printerr("[peak] MPI output contains duplicate hook names, "
@@ -5237,7 +5356,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                            sum_min_time,
                                            thread_count,
                                            1);
-        return;
+        return FALSE;
     }
     if (min_hook_count != max_hook_count) {
         if (rank == 0) {
@@ -5255,7 +5374,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                            sum_min_time,
                                            thread_count,
                                            1);
-        return;
+        return FALSE;
     }
     uint64_t* slot_hashes = g_new0(uint64_t, peak_hook_address_count);
     uint64_t* min_slot_hashes = g_new0(uint64_t, peak_hook_address_count);
@@ -5264,18 +5383,28 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         slot_hashes[i] = peak_general_listener_slot_identity_hash(i);
     }
-    MPI_Allreduce(slot_hashes,
-                  min_slot_hashes,
-                  peak_hook_address_count,
-                  MPI_UNSIGNED_LONG_LONG,
-                  MPI_MIN,
-                  MPI_COMM_WORLD);
-    MPI_Allreduce(slot_hashes,
-                  max_slot_hashes,
-                  peak_hook_address_count,
-                  MPI_UNSIGNED_LONG_LONG,
-                  MPI_MAX,
-                  MPI_COMM_WORLD);
+    if (!peak_mpi_allreduce_checked(slot_hashes,
+                                    min_slot_hashes,
+                                    peak_hook_address_count,
+                                    MPI_UNSIGNED_LONG_LONG,
+                                    MPI_MIN,
+                                    "hook-slot-min-hash")) {
+        g_free(max_slot_hashes);
+        g_free(min_slot_hashes);
+        g_free(slot_hashes);
+        goto rank_local;
+    }
+    if (!peak_mpi_allreduce_checked(slot_hashes,
+                                    max_slot_hashes,
+                                    peak_hook_address_count,
+                                    MPI_UNSIGNED_LONG_LONG,
+                                    MPI_MAX,
+                                    "hook-slot-max-hash")) {
+        g_free(max_slot_hashes);
+        g_free(min_slot_hashes);
+        g_free(slot_hashes);
+        goto rank_local;
+    }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (min_slot_hashes[i] != max_slot_hashes[i]) {
             slot_identity_mismatch = TRUE;
@@ -5299,7 +5428,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                            sum_min_time,
                                            thread_count,
                                            1);
-        return;
+        return FALSE;
     }
     gulong* mpi_sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
@@ -5311,16 +5440,28 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gulong* mpi_thread_count = g_new0(gulong, peak_hook_address_count);
     gboolean* mpi_array_listener_detached = g_new0(gboolean, peak_hook_address_count);
     gboolean* mpi_array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
-    MPI_Reduce(sum_num_calls, mpi_sum_num_calls, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(min_total_time, mpi_min_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(sum_exclusive_time, mpi_sum_exclusive_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(sum_max_time, mpi_sum_max_time, peak_hook_address_count, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(array_listener_reattached, mpi_array_listener_reattached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (!peak_mpi_reduce_checked(sum_num_calls, mpi_sum_num_calls, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, "sum-num-calls") ||
+        !peak_mpi_reduce_checked(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, "sum-total-time") ||
+        !peak_mpi_reduce_checked(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, "max-total-time") ||
+        !peak_mpi_reduce_checked(min_total_time, mpi_min_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MIN, 0, "min-total-time") ||
+        !peak_mpi_reduce_checked(sum_exclusive_time, mpi_sum_exclusive_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, "sum-exclusive-time") ||
+        !peak_mpi_reduce_checked(sum_max_time, mpi_sum_max_time, peak_hook_address_count, MPI_FLOAT, MPI_MAX, 0, "sum-max-time") ||
+        !peak_mpi_reduce_checked(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, "sum-min-time") ||
+        !peak_mpi_reduce_checked(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, "thread-count") ||
+        !peak_mpi_reduce_checked(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "detached-marker") ||
+        !peak_mpi_reduce_checked(array_listener_reattached, mpi_array_listener_reattached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "reattached-marker")) {
+        g_free(mpi_sum_num_calls);
+        g_free(mpi_sum_total_time);
+        g_free(mpi_max_total_time);
+        g_free(mpi_min_total_time);
+        g_free(mpi_sum_exclusive_time);
+        g_free(mpi_sum_max_time);
+        g_free(mpi_sum_min_time);
+        g_free(mpi_thread_count);
+        g_free(mpi_array_listener_detached);
+        g_free(mpi_array_listener_reattached);
+        goto rank_local;
+    }
     g_free(array_listener_detached);
     g_free(array_listener_reattached);
     array_listener_detached = mpi_array_listener_detached;
@@ -5343,11 +5484,26 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     g_free(mpi_sum_max_time);
     g_free(mpi_sum_min_time);
     g_free(mpi_thread_count);
+    return TRUE;
+
+rank_local:
+    peak_general_listener_print_result(sum_num_calls,
+                                       sum_total_time,
+                                       max_total_time,
+                                       min_total_time,
+                                       sum_exclusive_time,
+                                       sum_max_time,
+                                       sum_min_time,
+                                       thread_count,
+                                       1);
+    return FALSE;
 }
 #endif
 
-void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
+gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
 {
+    gboolean used_mpi_aggregation = FALSE;
+
     if (interceptor != NULL) {
         gum_interceptor_ignore_current_thread(interceptor);
     }
@@ -5386,14 +5542,15 @@ void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
     }
 #ifdef HAVE_MPI
     if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
-        peak_general_listener_reduce_result(sum_num_calls,
-                                           sum_total_time,
-                                           max_total_time,
-                                           min_total_time,
-                                           sum_exclusive_time,
-                                           sum_max_time,
-                                           sum_min_time,
-                                           thread_count);
+        used_mpi_aggregation =
+            peak_general_listener_reduce_result(sum_num_calls,
+                                                sum_total_time,
+                                                max_total_time,
+                                                min_total_time,
+                                                sum_exclusive_time,
+                                                sum_max_time,
+                                                sum_min_time,
+                                                thread_count);
     } else if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
         if (!peak_general_listener_socket_reduce_result(sum_num_calls,
                                                        sum_total_time,
@@ -5447,6 +5604,7 @@ void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
     if (interceptor != NULL) {
         gum_interceptor_unignore_current_thread(interceptor);
     }
+    return used_mpi_aggregation;
 }
 
 gboolean peak_general_listener_dettach()

@@ -123,6 +123,7 @@ def main():
     expected_stats_files = None
     expected_min_stats_files = None
     expected_min_target_count = None
+    expected_extra = []
     done_file = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
@@ -245,6 +246,7 @@ def main():
         env["PEAK_MPI_SUBSET_FINALIZE_DONE_FILE"] = done_file
         env["PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"] = "250"
         expected = "MPI finalize participation proof timed out"
+        expected_extra.append("PEAK MPI collective proof failed or timed out")
         expected_peak_tables = 0
         expected_stats_files = None
         expected_min_stats_files = 1
@@ -302,6 +304,9 @@ def main():
 
     if expected is not None and expected not in output:
         raise AssertionError(f"missing expected PEAK diagnostic: {expected}")
+    for extra in expected_extra:
+        if extra not in output:
+            raise AssertionError(f"missing expected PEAK diagnostic: {extra}")
     if args.require_pinned_finalize and "Leaving PEAK target hooks pinned" not in output:
         raise AssertionError("missing pinned-finalize diagnostic")
     for function_name in args.forbid_stats_function:
