@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #if defined(__GNUC__)
 #define PEAK_NOINLINE __attribute__((noinline))
@@ -36,6 +38,36 @@ static int
 peak_mpi_exit_loop_count(void)
 {
     return peak_mpi_exit_parse_loop_count("PEAK_MPI_EXIT_LOOPS", 16);
+}
+
+static void
+peak_mpi_exit_wait_for_file(const char* path, int timeout_ms)
+{
+    if (path == NULL || path[0] == '\0' || timeout_ms <= 0) {
+        return;
+    }
+
+    struct timespec delay = {0, 5 * 1000 * 1000};
+    struct timespec start;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return;
+    }
+    while (1) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return;
+        }
+        double elapsed_ms =
+            (double)(now.tv_sec - start.tv_sec) * 1000.0 +
+            (double)(now.tv_nsec - start.tv_nsec) / 1.0e6;
+        if (elapsed_ms >= (double)timeout_ms) {
+            return;
+        }
+        if (access(path, F_OK) == 0) {
+            return;
+        }
+        nanosleep(&delay, NULL);
+    }
 }
 
 static int
@@ -83,6 +115,24 @@ main(int argc, char** argv)
         if (rank == 0) {
             MPI_Finalize();
         }
+        exit(0);
+    }
+
+    if (argc > 1 &&
+        strcmp(argv[1], "subset-finalize-then-exit0-handoff") == 0) {
+        const char* done_file = getenv("PEAK_MPI_SUBSET_FINALIZE_DONE_FILE");
+        if (rank == 0) {
+            MPI_Finalize();
+            if (done_file != NULL) {
+                FILE* marker = fopen(done_file, "w");
+                if (marker != NULL) {
+                    fputs("done", marker);
+                    fclose(marker);
+                }
+            }
+            exit(0);
+        }
+        peak_mpi_exit_wait_for_file(done_file, 10000);
         exit(0);
     }
 

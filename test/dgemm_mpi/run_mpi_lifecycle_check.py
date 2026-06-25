@@ -28,11 +28,14 @@ OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
 EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "no-finalize",
     "no-finalize-nonzero",
-    "finalize-clean-output-socket-bad-host",
-    "finalize-clean-output-socket-token-mismatch",
     "subset-finalize-nonzero",
     "subset-finalize-clean",
     "subset-finalize-clean-collective",
+    "subset-finalize-handoff",
+}
+EXPECTED_NONZERO_RETURN_MODES = {
+    "finalize-nonzero",
+    "finalize-return-nonzero",
 }
 
 
@@ -57,12 +60,17 @@ def parse_args():
             "finalize-clean-output-mpi",
             "finalize-clean-output-local",
             "finalize-clean-output-socket-bad-host",
+            "finalize-clean-output-socket-bad-host-no-fallback",
+            "finalize-clean-output-socket-release-fail",
             "finalize-clean-output-socket-token-mismatch",
+            "finalize-clean-output-socket-token-mismatch-no-fallback",
+            "finalize-socket-post-work",
             "finalize-defer-post-work",
             "finalize-nonzero",
             "subset-finalize-nonzero",
             "subset-finalize-clean",
             "subset-finalize-clean-collective",
+            "subset-finalize-handoff",
             "finalize-return-nonzero",
         ],
         required=True,
@@ -81,6 +89,15 @@ def main():
     args = parse_args()
     nprocs = int(args.nprocs)
     if args.mode.startswith("subset-") and nprocs < 2:
+        print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
+        return 0
+    if (args.mode in {
+            "finalize-clean-output-socket-bad-host",
+            "finalize-clean-output-socket-bad-host-no-fallback",
+            "finalize-clean-output-socket-release-fail",
+            "finalize-clean-output-socket-token-mismatch",
+            "finalize-clean-output-socket-token-mismatch-no-fallback",
+        } and nprocs < 2):
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
 
@@ -102,8 +119,11 @@ def main():
     app_args = []
     expected = "PMPI_Finalize was not observed on every rank"
     expected_peak_tables = 0
+    expected_max_peak_tables = None
     expected_stats_files = None
+    expected_min_stats_files = None
     expected_min_target_count = None
+    done_file = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -135,19 +155,53 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
         env["PEAK_OUTPUT_AGGREGATION_HOST"] = "192.0.2.1"
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
-        env["PEAK_MPI_REAL_FINALIZE"] = "0"
+        app_args.append("finalize-then-exit0")
+        expected = "Socket aggregation"
+        expected_peak_tables = 0
+        expected_stats_files = nprocs
+    elif args.mode == "finalize-clean-output-socket-bad-host-no-fallback":
+        env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        env["PEAK_OUTPUT_AGGREGATION_HOST"] = "192.0.2.1"
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
+        env["PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"] = "0"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation"
         expected_peak_tables = 0
         expected_stats_files = 0
+    elif args.mode == "finalize-clean-output-socket-release-fail":
+        env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
+        env["PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"] = "1"
+        app_args.append("finalize-then-exit0")
+        expected = "Socket aggregation release failure requested by test hook"
+        expected_peak_tables = 0
+        expected_max_peak_tables = 0
+        expected_stats_files = nprocs
     elif args.mode == "finalize-clean-output-socket-token-mismatch":
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
-        env["PEAK_MPI_REAL_FINALIZE"] = "0"
+        app_args.append("finalize-token-mismatch-then-exit0")
+        expected = "Socket aggregation received"
+        expected_peak_tables = 0
+        expected_stats_files = nprocs
+    elif args.mode == "finalize-clean-output-socket-token-mismatch-no-fallback":
+        env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
+        env["PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"] = "0"
         app_args.append("finalize-token-mismatch-then-exit0")
         expected = "Socket aggregation received"
         expected_peak_tables = 0
         expected_stats_files = 0
+    elif args.mode == "finalize-socket-post-work":
+        env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
+        env["PEAK_MPI_EXIT_LOOPS"] = "16"
+        env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
+        app_args.append("finalize-post-work-then-exit0")
+        expected = "Writing PEAK-owned socket-reduced output"
+        expected_peak_tables = 1
+        expected_stats_files = 1
+        expected_min_target_count = nprocs * (16 + 32)
     elif args.mode == "finalize-defer-post-work":
         env["PEAK_MPI_FINALIZE_POLICY"] = "defer"
         env["PEAK_MPI_EXIT_LOOPS"] = "16"
@@ -169,15 +223,31 @@ def main():
         expected_stats_files = None
     elif args.mode == "subset-finalize-clean":
         app_args.append("subset-finalize-then-exit0")
-        expected = "PMPI_Finalize was not observed on every rank"
+        expected = None
         expected_peak_tables = 0
-        expected_stats_files = nprocs
+        expected_stats_files = None
     elif args.mode == "subset-finalize-clean-collective":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         app_args.append("subset-finalize-then-exit0")
-        expected = "PMPI_Finalize was not observed on every rank"
+        expected = None
         expected_peak_tables = 0
-        expected_stats_files = nprocs
+        expected_stats_files = None
+    elif args.mode == "subset-finalize-handoff":
+        app_args.append("subset-finalize-then-exit0-handoff")
+        done_file = os.path.join(
+            tempfile.gettempdir(),
+            f"peak-subset-finalize-handoff-{os.getpid()}.txt",
+        )
+        try:
+            os.unlink(done_file)
+        except OSError:
+            pass
+        env["PEAK_MPI_SUBSET_FINALIZE_DONE_FILE"] = done_file
+        env["PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"] = "250"
+        expected = "MPI finalize participation proof timed out"
+        expected_peak_tables = 0
+        expected_stats_files = None
+        expected_min_stats_files = 1
     elif args.mode == "finalize-return-nonzero":
         app_args.append("finalize-then-return1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -222,6 +292,13 @@ def main():
                 stats_rows.extend(csv.DictReader(handle))
     output = proc.stdout
     sys.stdout.write(output)
+    if done_file is not None:
+        try:
+            Path(done_file).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     if expected is not None and expected not in output:
         raise AssertionError(f"missing expected PEAK diagnostic: {expected}")
@@ -252,13 +329,26 @@ def main():
         trace_text = trace.read_text(encoding="utf-8", errors="replace")
         if ",detach,success," not in trace_text:
             raise AssertionError("detach trace does not contain a successful detach")
-    if output.count("PEAK Library") < expected_peak_tables:
+    peak_table_count = output.count("PEAK Library")
+    if peak_table_count < expected_peak_tables:
         raise AssertionError(
             f"expected at least {expected_peak_tables} PEAK output table(s)"
+        )
+    if (expected_max_peak_tables is not None and
+            peak_table_count > expected_max_peak_tables):
+        raise AssertionError(
+            f"expected at most {expected_max_peak_tables} PEAK output table(s), "
+            f"got {peak_table_count}"
         )
     if expected_stats_files is not None and len(stats_files) != expected_stats_files:
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
+        )
+    if (expected_min_stats_files is not None and
+            len(stats_files) < expected_min_stats_files):
+        raise AssertionError(
+            f"expected at least {expected_min_stats_files} PEAK stats file(s), "
+            f"got {len(stats_files)}"
         )
     if expected_min_target_count is not None:
         observed_count = sum(
@@ -271,10 +361,9 @@ def main():
                 f"expected at least {expected_min_target_count} "
                 f"post-finalize target calls, got {observed_count}"
             )
-    if args.mode in (
-        "finalize-clean",
-        "finalize-clean-output-local",
-    ) and proc.returncode != 0:
+    if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
+            args.mode not in EXPECTED_NONZERO_RETURN_MODES and
+            proc.returncode != 0):
         raise AssertionError(f"{args.mode} run returned {proc.returncode}")
 
     print(f"mpi_lifecycle_check_ok mode={args.mode} rc={proc.returncode}")

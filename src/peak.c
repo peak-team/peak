@@ -55,6 +55,8 @@
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
+#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
+#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
 
@@ -183,13 +185,6 @@ peak_output_aggregation_mode(void)
     return PEAK_OUTPUT_AGGREGATION_MPI;
 }
 
-static gboolean
-peak_output_aggregation_explicit(void)
-{
-    const char* aggregation = getenv(PEAK_OUTPUT_AGGREGATION_ENV);
-
-    return aggregation != NULL && aggregation[0] != '\0';
-}
 #endif
 
 void peak_init()
@@ -313,14 +308,46 @@ static int
 peak_mpi_all_ranks_requested_finalize(int local_requested)
 {
     int all_requested = 0;
+    MPI_Request request = MPI_REQUEST_NULL;
+    MPI_Status status;
+    int done = 0;
+    int mpi_result = MPI_Iallreduce(&local_requested,
+                                    &all_requested,
+                                    1,
+                                    MPI_INT,
+                                    MPI_MIN,
+                                    MPI_COMM_WORLD,
+                                    &request);
+    if (mpi_result != MPI_SUCCESS) {
+        g_printerr("[peak] MPI_Iallreduce for finalize participation proof failed; skipping MPI finalizer return path\n");
+        return 0;
+    }
 
-    MPI_Allreduce(&local_requested,
-                  &all_requested,
-                  1,
-                  MPI_INT,
-                  MPI_MIN,
-                  MPI_COMM_WORLD);
-    return all_requested != 0;
+    unsigned int timeout_ms =
+        parse_env_to_uint_default(PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS,
+                                  PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT);
+    if (timeout_ms == 0) {
+        timeout_ms = PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT;
+    }
+
+    double deadline = peak_second() + (double)timeout_ms / 1000.0;
+    while (1) {
+        mpi_result = MPI_Test(&request, &done, &status);
+        if (mpi_result != MPI_SUCCESS) {
+            g_printerr("[peak] MPI_Test for finalize participation proof failed; skipping MPI finalizer return path\n");
+            return 0;
+        }
+        if (done) {
+            return all_requested != 0;
+        }
+        if (peak_second() >= deadline) {
+            g_printerr("[peak] MPI finalize participation proof timed out after %u ms; "
+                       "assuming not all ranks reached finalizer\n",
+                       timeout_ms);
+            return 0;
+        }
+        sched_yield();
+    }
 }
 #endif
 
@@ -393,8 +420,6 @@ peak_fini_impl(void)
     PeakOutputAggregationMode aggregation_mode =
         found_MPI ? peak_output_aggregation_mode()
                   : PEAK_OUTPUT_AGGREGATION_LOCAL;
-    gboolean aggregation_explicit =
-        found_MPI && peak_output_aggregation_explicit();
     int mpi_runtime_can_collect =
         found_MPI && peak_mpi_runtime_allows_collectives();
     int mpi_log_rank = 1;
@@ -408,7 +433,8 @@ peak_fini_impl(void)
     int all_ranks_requested_mpi_finalize = 0;
     int need_mpi_finalize_proof =
         mpi_finalize_path ||
-        aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI;
+        (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+         local_requested_mpi_finalize);
     if (need_mpi_finalize_proof &&
         mpi_runtime_can_collect &&
         !abnormal_exit) {
@@ -422,9 +448,7 @@ peak_fini_impl(void)
         !abnormal_exit && all_ranks_requested_mpi_finalize;
     int use_socket_output =
         aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
-        mpi_runtime_can_collect &&
-        !abnormal_exit &&
-        (!mpi_finalize_path || aggregation_explicit);
+        !abnormal_exit;
     PeakOutputAggregationMode output_mode =
         use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
         use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :

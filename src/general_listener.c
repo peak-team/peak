@@ -28,6 +28,10 @@
 #define PEAK_OUTPUT_AGGREGATION_PORT_ENV "PEAK_OUTPUT_AGGREGATION_PORT"
 #define PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"
 #define PEAK_OUTPUT_AGGREGATION_TOKEN_ENV "PEAK_OUTPUT_AGGREGATION_TOKEN"
+#define PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV \
+    "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"
+#define PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV \
+    "PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"
 #define PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV "PEAK_CONTROLLER_MAX_PENDING_AGE_MS"
 #define PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV "PEAK_CONTROLLER_MAX_RETRY_COUNT"
 #define PEAK_REATTACH_COOLDOWN_MS_ENV "PEAK_REATTACH_COOLDOWN_MS"
@@ -173,6 +177,38 @@ peak_env_value_truthy(const char* value)
             g_ascii_strcasecmp(value, "on") == 0);
 }
 
+static gboolean
+peak_env_value_falsey(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "0") == 0 ||
+            g_ascii_strcasecmp(value, "false") == 0 ||
+            g_ascii_strcasecmp(value, "off") == 0 ||
+            g_ascii_strcasecmp(value, "no") == 0);
+}
+
+static gboolean
+peak_socket_reduce_fallback_enabled(void)
+{
+    const char* value =
+        getenv(PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV);
+
+    if (value == NULL || value[0] == '\0') {
+        return TRUE;
+    }
+    if (peak_env_value_falsey(value)) {
+        return FALSE;
+    }
+    if (peak_env_value_truthy(value)) {
+        return TRUE;
+    }
+
+    g_printerr("[peak] Ignoring invalid %s=%s; using fallback-to-local behavior\n",
+               PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV,
+               value);
+    return TRUE;
+}
+
 static long
 peak_parse_long_env(const char* name)
 {
@@ -206,6 +242,28 @@ peak_mpi_env_size(void)
     for (const char** name = names; *name != NULL; name++) {
         long value = peak_parse_long_env(*name);
         if (value > 0) {
+            return value;
+        }
+    }
+
+    return -1;
+}
+
+static long
+peak_mpi_env_rank(void)
+{
+    static const char* names[] = {
+        "PMI_RANK",
+        "PMIX_RANK",
+        "OMPI_COMM_WORLD_RANK",
+        "MV2_COMM_WORLD_RANK",
+        "SLURM_PROCID",
+        NULL
+    };
+
+    for (const char** name = names; *name != NULL; name++) {
+        long value = peak_parse_long_env(*name);
+        if (value >= 0) {
             return value;
         }
     }
@@ -3645,7 +3703,9 @@ void peak_general_listener_attach()
     peak_general_controller_start();
 }
 
-static FILE* peak_stats_csv_open(void) {
+static char*
+peak_stats_csv_path(void)
+{
     char base[256] = {0};
     char out_csv[512] = {0};
 
@@ -3661,12 +3721,27 @@ static FILE* peak_stats_csv_open(void) {
 
     int pid = (int) getpid();
     snprintf(out_csv, 512, "%s-p%d.csv", base, pid);
-    
+
+    return g_strdup(out_csv);
+}
+
+static void
+peak_stats_csv_unlink(void)
+{
+    char* out_csv = peak_stats_csv_path();
+    (void)unlink(out_csv);
+    g_free(out_csv);
+}
+
+static FILE* peak_stats_csv_open(void) {
+    char* out_csv = peak_stats_csv_path();
     FILE* fp = fopen(out_csv, "w");
     if (!fp) {
         g_printerr("[peak] failed to open stats csv '%s': %s\n", out_csv, strerror(errno));
+        g_free(out_csv);
         return NULL;
     }
+    g_free(out_csv);
 
     fprintf(fp,
             "function,"
@@ -3722,27 +3797,16 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
 }
 
 static void
-peak_general_listener_print_result(gulong* sum_num_calls,
-                                   gdouble* sum_total_time,
-                                   gdouble* max_total_time,
-                                   gdouble* min_total_time,
-                                   gdouble* sum_exclusive_time,
-                                   gfloat* sum_max_time,
-                                   gfloat* sum_min_time,
-                                   gulong* thread_count,
-                                   const int rank_count)
+peak_general_listener_print_text_result(gulong* sum_num_calls,
+                                        gdouble* sum_total_time,
+                                        gdouble* max_total_time,
+                                        gdouble* min_total_time,
+                                        gdouble* sum_exclusive_time,
+                                        gfloat* sum_max_time,
+                                        gfloat* sum_min_time,
+                                        gulong* thread_count,
+                                        const int rank_count)
 {
-    peak_general_listener_export_csv_result(sum_num_calls,
-                                            sum_total_time,
-                                            max_total_time,
-                                            min_total_time,
-                                            sum_exclusive_time,
-                                            sum_max_time,
-                                            sum_min_time,
-                                            thread_count,
-                                            rank_count
-    );
-
     guint max_function_width = 20;
     guint max_col_width = 10;
     guint row_width = max_function_width + max_col_width * 5 + 7;
@@ -3870,6 +3934,37 @@ peak_general_listener_print_result(gulong* sum_num_calls,
     g_free(peak_demangled_strings);
     free(argv_o);
     free(row_separator);
+}
+
+static void
+peak_general_listener_print_result(gulong* sum_num_calls,
+                                   gdouble* sum_total_time,
+                                   gdouble* max_total_time,
+                                   gdouble* min_total_time,
+                                   gdouble* sum_exclusive_time,
+                                   gfloat* sum_max_time,
+                                   gfloat* sum_min_time,
+                                   gulong* thread_count,
+                                   const int rank_count)
+{
+    peak_general_listener_export_csv_result(sum_num_calls,
+                                            sum_total_time,
+                                            max_total_time,
+                                            min_total_time,
+                                            sum_exclusive_time,
+                                            sum_max_time,
+                                            sum_min_time,
+                                            thread_count,
+                                            rank_count);
+    peak_general_listener_print_text_result(sum_num_calls,
+                                            sum_total_time,
+                                            max_total_time,
+                                            min_total_time,
+                                            sum_exclusive_time,
+                                            sum_max_time,
+                                            sum_min_time,
+                                            thread_count,
+                                            rank_count);
 }
 
 #ifdef HAVE_MPI
@@ -4030,6 +4125,7 @@ typedef struct {
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
 #define PEAK_SOCKET_REDUCE_VERSION 2U
 #define PEAK_SOCKET_REDUCE_RELEASE_ACK 0x51U
+#define PEAK_SOCKET_REDUCE_RELEASE_FALLBACK 0x52U
 #define PEAK_SOCKET_REDUCE_DEFAULT_TIMEOUT_MS 60000
 #define PEAK_SOCKET_REDUCE_DEFAULT_PORT_BASE 42000
 #define PEAK_SOCKET_REDUCE_DEFAULT_PORT_SPAN 20000
@@ -4582,7 +4678,8 @@ peak_socket_reduce_release_peers(int port,
                                  int size,
                                  uint64_t hook_count,
                                  uint64_t session_token,
-                                 int timeout_ms)
+                                 int timeout_ms,
+                                 uint8_t ack)
 {
     int listener;
     int64_t deadline_us;
@@ -4592,6 +4689,14 @@ peak_socket_reduce_release_peers(int port,
     if (release_targets == NULL || size <= 1) {
         return TRUE;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (ack == PEAK_SOCKET_REDUCE_RELEASE_ACK &&
+        peak_env_value_truthy(
+            getenv(PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV))) {
+        g_printerr("[peak] Socket aggregation release failure requested by test hook; peer ranks may fall back to local output\n");
+        return FALSE;
+    }
+#endif
 
     for (int i = 1; i < size; i++) {
         if (release_targets[i]) {
@@ -4655,7 +4760,7 @@ peak_socket_reduce_release_peers(int port,
                 frame.rank > 0 &&
                 release_targets[frame.rank];
         if (valid) {
-            frame.ack = PEAK_SOCKET_REDUCE_RELEASE_ACK;
+            frame.ack = ack;
             valid = peak_socket_reduce_send_all(fd,
                                                 &frame,
                                                 sizeof(frame),
@@ -4739,6 +4844,42 @@ peak_socket_reduce_records_to_arrays(PeakSocketReduceRecord* records,
 }
 
 static gboolean
+peak_socket_reduce_rank_size(int* rank_out, int* size_out)
+{
+#ifdef HAVE_MPI
+    int initialized = 0;
+    int finalized = 0;
+
+    MPI_Initialized(&initialized);
+    MPI_Finalized(&finalized);
+    if (initialized && !finalized) {
+        MPI_Comm_rank(MPI_COMM_WORLD, rank_out);
+        MPI_Comm_size(MPI_COMM_WORLD, size_out);
+        return TRUE;
+    }
+#endif
+
+    long env_size = peak_mpi_env_size();
+    long env_rank = peak_mpi_env_rank();
+    if (env_size > 1) {
+        if (env_rank >= 0 && env_rank < env_size) {
+            *rank_out = (int)env_rank;
+            *size_out = (int)env_size;
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    if (env_rank > 0) {
+        return FALSE;
+    }
+
+    *rank_out = 0;
+    *size_out = 1;
+    return TRUE;
+}
+
+static gboolean
 peak_general_listener_socket_reduce_result(gulong* sum_num_calls,
                                            gdouble* sum_total_time,
                                            gdouble* max_total_time,
@@ -4760,8 +4901,10 @@ peak_general_listener_socket_reduce_result(gulong* sum_num_calls,
     PeakSocketReduceRecord* local_records = NULL;
     PeakSocketReduceHeader header;
 
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (!peak_socket_reduce_rank_size(&rank, &size)) {
+        g_printerr("[peak] Socket aggregation could not determine MPI rank/size from MPI or launcher metadata; skipping aggregate output\n");
+        return FALSE;
+    }
 
     if (peak_general_listener_has_duplicate_slot_names()) {
         if (rank == 0) {
@@ -4946,48 +5089,94 @@ peak_general_listener_socket_reduce_result(gulong* sum_num_calls,
                                                size,
                                                (uint64_t)peak_hook_address_count,
                                                session_token,
-                                               timeout_ms);
+                                               timeout_ms,
+                                               PEAK_SOCKET_REDUCE_RELEASE_FALLBACK);
         g_free(release_targets);
         g_free(aggregate);
         return FALSE;
     }
 
+    gulong* socket_sum_num_calls = g_new0(gulong, peak_hook_address_count);
+    gdouble* socket_sum_total_time = g_new0(gdouble, peak_hook_address_count);
+    gdouble* socket_max_total_time = g_new0(gdouble, peak_hook_address_count);
+    gdouble* socket_min_total_time = g_new0(gdouble, peak_hook_address_count);
+    gdouble* socket_sum_exclusive_time = g_new0(gdouble, peak_hook_address_count);
+    gfloat* socket_sum_max_time = g_new0(gfloat, peak_hook_address_count);
+    gfloat* socket_sum_min_time = g_new0(gfloat, peak_hook_address_count);
+    gulong* socket_thread_count = g_new0(gulong, peak_hook_address_count);
     gboolean* socket_array_listener_detached =
         g_new0(gboolean, peak_hook_address_count);
     gboolean* socket_array_listener_reattached =
         g_new0(gboolean, peak_hook_address_count);
     peak_socket_reduce_records_to_arrays(aggregate,
-                                         sum_num_calls,
-                                         sum_total_time,
-                                         max_total_time,
-                                         min_total_time,
-                                         sum_exclusive_time,
-                                         sum_max_time,
-                                         sum_min_time,
-                                         thread_count,
+                                         socket_sum_num_calls,
+                                         socket_sum_total_time,
+                                         socket_max_total_time,
+                                         socket_min_total_time,
+                                         socket_sum_exclusive_time,
+                                         socket_sum_max_time,
+                                         socket_sum_min_time,
+                                         socket_thread_count,
                                          socket_array_listener_detached,
                                          socket_array_listener_reattached);
     g_free(aggregate);
-    g_free(array_listener_detached);
-    g_free(array_listener_reattached);
+
+    gboolean* previous_array_listener_detached = array_listener_detached;
+    gboolean* previous_array_listener_reattached = array_listener_reattached;
     array_listener_detached = socket_array_listener_detached;
     array_listener_reattached = socket_array_listener_reattached;
 
-    peak_general_listener_print_result(sum_num_calls,
-                                       sum_total_time,
-                                       max_total_time,
-                                       min_total_time,
-                                       sum_exclusive_time,
-                                       sum_max_time,
-                                       sum_min_time,
-                                       thread_count,
-                                       size);
-    (void)peak_socket_reduce_release_peers(release_port,
-                                           release_targets,
-                                           size,
-                                           (uint64_t)peak_hook_address_count,
-                                           session_token,
-                                           timeout_ms);
+    peak_general_listener_export_csv_result(socket_sum_num_calls,
+                                            socket_sum_total_time,
+                                            socket_max_total_time,
+                                            socket_min_total_time,
+                                            socket_sum_exclusive_time,
+                                            socket_sum_max_time,
+                                            socket_sum_min_time,
+                                            socket_thread_count,
+                                            size);
+    if (!peak_socket_reduce_release_peers(release_port,
+                                          release_targets,
+                                          size,
+                                          (uint64_t)peak_hook_address_count,
+                                          session_token,
+                                          timeout_ms,
+                                          PEAK_SOCKET_REDUCE_RELEASE_ACK)) {
+        peak_stats_csv_unlink();
+        array_listener_detached = previous_array_listener_detached;
+        array_listener_reattached = previous_array_listener_reattached;
+        g_free(socket_array_listener_detached);
+        g_free(socket_array_listener_reattached);
+        g_free(socket_sum_num_calls);
+        g_free(socket_sum_total_time);
+        g_free(socket_max_total_time);
+        g_free(socket_min_total_time);
+        g_free(socket_sum_exclusive_time);
+        g_free(socket_sum_max_time);
+        g_free(socket_sum_min_time);
+        g_free(socket_thread_count);
+        g_free(release_targets);
+        return FALSE;
+    }
+    peak_general_listener_print_text_result(socket_sum_num_calls,
+                                            socket_sum_total_time,
+                                            socket_max_total_time,
+                                            socket_min_total_time,
+                                            socket_sum_exclusive_time,
+                                            socket_sum_max_time,
+                                            socket_sum_min_time,
+                                            socket_thread_count,
+                                            size);
+    g_free(previous_array_listener_detached);
+    g_free(previous_array_listener_reattached);
+    g_free(socket_sum_num_calls);
+    g_free(socket_sum_total_time);
+    g_free(socket_max_total_time);
+    g_free(socket_min_total_time);
+    g_free(socket_sum_exclusive_time);
+    g_free(socket_sum_max_time);
+    g_free(socket_sum_min_time);
+    g_free(socket_thread_count);
     g_free(release_targets);
     return TRUE;
 }
@@ -5198,22 +5387,34 @@ void peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
 #ifdef HAVE_MPI
     if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
         peak_general_listener_reduce_result(sum_num_calls,
-                                            sum_total_time,
-                                            max_total_time,
-                                            min_total_time,
-                                            sum_exclusive_time,
-                                            sum_max_time,
-                                            sum_min_time,
-                                            thread_count);
+                                           sum_total_time,
+                                           max_total_time,
+                                           min_total_time,
+                                           sum_exclusive_time,
+                                           sum_max_time,
+                                           sum_min_time,
+                                           thread_count);
     } else if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
-        peak_general_listener_socket_reduce_result(sum_num_calls,
-                                                   sum_total_time,
-                                                   max_total_time,
-                                                   min_total_time,
-                                                   sum_exclusive_time,
-                                                   sum_max_time,
-                                                   sum_min_time,
-                                                   thread_count);
+        if (!peak_general_listener_socket_reduce_result(sum_num_calls,
+                                                       sum_total_time,
+                                                       max_total_time,
+                                                       min_total_time,
+                                                       sum_exclusive_time,
+                                                       sum_max_time,
+                                                       sum_min_time,
+                                                       thread_count) &&
+            peak_socket_reduce_fallback_enabled()) {
+            g_printerr("[peak] Socket aggregation failed; falling back to rank-local output\n");
+            peak_general_listener_print_result(sum_num_calls,
+                                              sum_total_time,
+                                              max_total_time,
+                                              min_total_time,
+                                              sum_exclusive_time,
+                                              sum_max_time,
+                                              sum_min_time,
+                                              thread_count,
+                                              1);
+        }
     } else {
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
