@@ -16,13 +16,15 @@
  * This function attaches interception to the MPI library functions using the Gum library.
  * Specifically, it intercepts the `PMPI_Finalize` function and replaces it with
  * a custom implementation, `peak_pmpi_finalize`, which records the
- * application's finalization request, lets PEAK write its final output while
- * MPI is still alive on the application's own finalize path, and then returns
- * to the real `PMPI_Finalize()` after all-rank proof.
- * `PEAK_MPI_REAL_FINALIZE=0` may skip it for diagnostics. PEAK does not replay
- * the real
- * `PMPI_Finalize()` later from process teardown; doing so can re-enter MPI from
- * an application state that has already logically finalized.
+ * application's finalization request. By default it lets PEAK write final
+ * output while MPI is still alive on the application's own finalize path, and
+ * then returns to the real `PMPI_Finalize()` after all-rank proof.
+ * `PEAK_MPI_FINALIZE_POLICY=defer` instead calls the real finalizer immediately
+ * and leaves PEAK profiling/output until process exit.
+ * `PEAK_MPI_REAL_FINALIZE=0` may skip the real finalizer for diagnostics. PEAK
+ * does not replay the real `PMPI_Finalize()` later from process teardown; doing
+ * so can re-enter MPI from an application state that has already logically
+ * finalized.
  *
  * @return 0 if the interception was successful, a negative number in the GumReplaceReturn otherwise.
  */
@@ -32,6 +34,11 @@ int mpi_interceptor_attach();
  * @brief Returns non-zero after the application has attempted PMPI_Finalize.
  */
 int mpi_interceptor_finalize_was_requested();
+
+/**
+ * @brief Returns non-zero only while PEAK is running from PMPI_Finalize.
+ */
+int mpi_interceptor_finalize_path_active();
 
 /**
  * @brief Controls whether the intercepted finalizer may call real PMPI_Finalize.
