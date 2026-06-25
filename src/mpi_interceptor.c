@@ -58,6 +58,10 @@ mpi_interceptor_real_finalize_enabled(void)
 {
     const char* value = getenv("PEAK_MPI_REAL_FINALIZE");
 
+    if (value == NULL || value[0] == '\0') {
+        return 1;
+    }
+
     return mpi_interceptor_env_truthy(value);
 }
 
@@ -165,7 +169,7 @@ mpi_interceptor_call_original_finalize_once(void)
  * This function is a custom implementation of the `PMPI_Finalize` function. It
  * records the application's finalization request, lets PEAK emit its final
  * output while MPI is still alive on the application's own finalize path, and
- * skips the real MPI finalizer by default. PEAK does not replay
+ * returns to the real MPI finalizer after all-rank proof. PEAK does not replay
  * `PMPI_Finalize()` later from process teardown.
  *
  * @return The original `PMPI_Finalize()` result.

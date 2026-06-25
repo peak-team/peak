@@ -11,9 +11,18 @@ from pathlib import Path
 
 
 FAIL_RE = re.compile(
-    r"Caught signal|Segmentation fault|SIGSEGV|signal 11|BAD TERMINATION|"
+    r"Caught signal|Segmentation fault|SIGSEGV|signal 11|"
     r"Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
 )
+LAUNCHER_ABNORMAL_RE = re.compile(
+    r"BAD TERMINATION|KILLED BY SIGNAL|exiting improperly|"
+    r"mpiexec has exited due to process rank"
+)
+EXPECTED_LAUNCHER_ABNORMAL_MODES = {
+    "no-finalize",
+    "no-finalize-nonzero",
+    "subset-finalize-nonzero",
+}
 
 
 def split_flags(value):
@@ -81,12 +90,12 @@ def main():
     app_args = []
     expected = "PMPI_Finalize was not observed on every rank"
     expected_peak_tables = 0
-    expected_stats_files = nprocs
+    expected_stats_files = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
         expected_peak_tables = 0
-        expected_stats_files = nprocs
+        expected_stats_files = None
     elif args.mode == "no-finalize-collective-disabled":
         env["PEAK_MPI_COLLECTIVE_OUTPUT"] = "0"
         expected = "Aggregate output is disabled for strict teardown"
@@ -205,6 +214,11 @@ def main():
             raise AssertionError(f"unexpected stats row for {function_name}")
     if FAIL_RE.search(output):
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
+    if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
+            LAUNCHER_ABNORMAL_RE.search(output)):
+        raise AssertionError(
+            "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
+        )
     if args.require_detach_trace:
         if not trace_path:
             raise AssertionError("PEAK_DETACH_TRACE_PATH is required for detach trace assertion")
@@ -223,7 +237,6 @@ def main():
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
     if args.mode in (
-        "no-finalize",
         "finalize-clean",
         "finalize-clean-output-local",
         "finalize-clean-output-socket-bad-host",

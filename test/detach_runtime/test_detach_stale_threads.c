@@ -55,8 +55,8 @@ void peak_detach_stale_target(uint64_t value)
 __attribute__((noinline))
 void peak_detach_stale_unrelated(uint64_t value)
 {
-    atomic_fetch_xor_explicit(&unrelated_effect,
-                              (value << 1) | 1u,
+    atomic_fetch_add_explicit(&unrelated_effect,
+                              value + 1u,
                               memory_order_relaxed);
     asm volatile("" ::: "memory");
 }
