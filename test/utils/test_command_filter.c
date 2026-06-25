@@ -170,6 +170,10 @@ main(void)
     ok &= expect_interpreter("/usr/bin/python3.11");
     ok &= expect_interpreter("/usr/bin/perl5.34");
     ok &= expect_interpreter("tclsh8.6");
+    if (check_interpreter_command(NULL)) {
+        fprintf(stderr, "expected NULL interpreter command to be ignored\n");
+        ok = 0;
+    }
     ok &= expect_not_interpreter("./su3_rhmd_hisq.skx");
     ok &= expect_module_helper(3, lmod_lua);
     ok &= expect_module_helper(3, lmod_python);

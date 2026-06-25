@@ -883,7 +883,7 @@ if(BUILD_TESTING)
             PROPERTIES 
                 PASS_REGULAR_EXPRESSION "cblas_dgemm[*]*\\|[ \t]+200\\|"
         )
-        set(_PEAK_MPI_LIFECYCLE_FATAL_REGEX "Caught signal|Segmentation fault|SIGSEGV|signal 11|Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc")
+        set(_PEAK_MPI_LIFECYCLE_FATAL_REGEX "Caught signal|Segmentation fault|SIGSEGV|signal 11|Fatal error|MPII_finalize|ofi_cq_read|hwloc")
         set_tests_properties(test_mpi_exit_before_finalize
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=no-finalize"

@@ -79,6 +79,16 @@ main(int argc, char** argv)
         exit(0);
     }
 
+    if (argc > 1 && strcmp(argv[1], "finalize-token-mismatch-then-exit0") == 0) {
+        if (rank == 1) {
+            setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", "peak-token-mismatch", 1);
+        } else {
+            setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", "peak-token-match", 1);
+        }
+        MPI_Finalize();
+        exit(0);
+    }
+
     if (argc > 1 && strcmp(argv[1], "finalize-then-return1") == 0) {
         MPI_Finalize();
         return 1;

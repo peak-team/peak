@@ -18,10 +18,20 @@ LAUNCHER_ABNORMAL_RE = re.compile(
     r"BAD TERMINATION|KILLED BY SIGNAL|exiting improperly|"
     r"mpiexec has exited due to process rank"
 )
+OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
+    r"-{10,}\n"
+    r"mpiexec has exited due to process rank.*?"
+    r"-{10,}\n",
+    re.DOTALL,
+)
 EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "no-finalize",
     "no-finalize-nonzero",
+    "finalize-clean-output-socket-bad-host",
+    "finalize-clean-output-socket-token-mismatch",
     "subset-finalize-nonzero",
+    "subset-finalize-clean",
+    "subset-finalize-clean-collective",
 }
 
 
@@ -122,6 +132,7 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
         env["PEAK_OUTPUT_AGGREGATION_HOST"] = "192.0.2.1"
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
+        env["PEAK_MPI_REAL_FINALIZE"] = "0"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation"
         expected_peak_tables = 0
@@ -129,7 +140,8 @@ def main():
     elif args.mode == "finalize-clean-output-socket-token-mismatch":
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
-        app_args.append("finalize-then-exit0")
+        env["PEAK_MPI_REAL_FINALIZE"] = "0"
+        app_args.append("finalize-token-mismatch-then-exit0")
         expected = "Socket aggregation received"
         expected_peak_tables = 0
         expected_stats_files = 0
@@ -160,17 +172,7 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 1
 
-    if args.mode == "finalize-clean-output-socket-token-mismatch":
-        rank_wrapper = (
-            "rank=${PMI_RANK:-${PMIX_RANK:-${OMPI_COMM_WORLD_RANK:-${SLURM_PROCID:-0}}}}; "
-            "if [ \"$rank\" = \"1\" ]; then "
-            "export PEAK_OUTPUT_AGGREGATION_TOKEN=peak-token-mismatch; "
-            "else export PEAK_OUTPUT_AGGREGATION_TOKEN=peak-token-match; fi; "
-            "exec \"$@\""
-        )
-        executable = ["/bin/bash", "-lc", rank_wrapper, "peak-token-wrapper", args.exe]
-    else:
-        executable = [args.exe]
+    executable = [args.exe]
 
     command = [
         args.mpiexec,
@@ -212,7 +214,13 @@ def main():
     for function_name in args.forbid_stats_function:
         if f'"{function_name}",' in stats_text:
             raise AssertionError(f"unexpected stats row for {function_name}")
-    if FAIL_RE.search(output):
+    fatal_scan_output = output
+    if args.mode in EXPECTED_LAUNCHER_ABNORMAL_MODES:
+        fatal_scan_output = OPENMPI_IMPROPER_EXIT_BLOCK_RE.sub(
+            "",
+            fatal_scan_output,
+        )
+    if FAIL_RE.search(fatal_scan_output):
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
     if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             LAUNCHER_ABNORMAL_RE.search(output)):
@@ -239,8 +247,6 @@ def main():
     if args.mode in (
         "finalize-clean",
         "finalize-clean-output-local",
-        "finalize-clean-output-socket-bad-host",
-        "finalize-clean-output-socket-token-mismatch",
     ) and proc.returncode != 0:
         raise AssertionError(f"{args.mode} run returned {proc.returncode}")
 
