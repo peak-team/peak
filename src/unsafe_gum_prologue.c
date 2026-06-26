@@ -180,6 +180,264 @@ peak_x86_immediate_contains_return_opcode(const guint8* immediate, gsize size)
 }
 
 static gboolean
+peak_x86_modrm_tail_size(const guint8* code,
+                         gsize available,
+                         gsize* size_out)
+{
+    guint8 modrm;
+    guint8 mod;
+    guint8 rm;
+    gsize size = 1;
+
+    if (available == 0) {
+        return FALSE;
+    }
+
+    modrm = code[0];
+    mod = modrm >> 6;
+    rm = modrm & 0x7u;
+
+    if (mod != 3 && rm == 4) {
+        guint8 sib;
+        guint8 base;
+
+        if (available < size + 1) {
+            return FALSE;
+        }
+        sib = code[size++];
+        base = sib & 0x7u;
+        if (mod == 0 && base == 5) {
+            size += 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        size += 4;
+    }
+
+    if (mod == 1) {
+        size += 1;
+    } else if (mod == 2) {
+        size += 4;
+    }
+
+    if (size > available) {
+        return FALSE;
+    }
+
+    *size_out = size;
+    return TRUE;
+}
+
+static gboolean
+peak_x86_decode_instruction_size(const guint8* code,
+                                 gsize available,
+                                 gsize* size_out,
+                                 gboolean* is_return_out)
+{
+    gsize offset = 0;
+    gboolean rex_w = FALSE;
+    gboolean operand16 = FALSE;
+    guint8 op;
+    gsize modrm_tail = 0;
+
+    *is_return_out = FALSE;
+
+    while (offset < available) {
+        guint8 prefix = code[offset];
+
+        if (prefix == 0x66) {
+            operand16 = TRUE;
+            offset++;
+        } else if (prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3 ||
+                   prefix == 0x2e || prefix == 0x36 || prefix == 0x3e ||
+                   prefix == 0x26 || prefix == 0x64 || prefix == 0x65 ||
+                   prefix == 0x67) {
+            offset++;
+        } else if (prefix >= 0x40 && prefix <= 0x4f) {
+            rex_w = (prefix & 0x08u) != 0;
+            offset++;
+        } else {
+            break;
+        }
+    }
+
+    if (offset >= available) {
+        return FALSE;
+    }
+
+    op = code[offset++];
+    if (op == 0xc3 || op == 0xcb) {
+        *size_out = offset;
+        *is_return_out = TRUE;
+        return TRUE;
+    }
+    if (op == 0xc2 || op == 0xca) {
+        if (available < offset + 2) {
+            return FALSE;
+        }
+        *size_out = offset + 2;
+        *is_return_out = TRUE;
+        return TRUE;
+    }
+
+    if (op >= 0xb8 && op <= 0xbf) {
+        gsize imm_size = rex_w ? 8 : (operand16 ? 2 : 4);
+        if (available < offset + imm_size) {
+            return FALSE;
+        }
+        *size_out = offset + imm_size;
+        return TRUE;
+    }
+
+    if (op == 0x68 || op == 0xe8 || op == 0xe9) {
+        if (available < offset + 4) {
+            return FALSE;
+        }
+        *size_out = offset + 4;
+        return TRUE;
+    }
+
+    if ((op & 0xfeu) == 0x04 || (op & 0xfeu) == 0x0cu ||
+        (op & 0xfeu) == 0x14 || (op & 0xfeu) == 0x1cu ||
+        (op & 0xfeu) == 0x24 || (op & 0xfeu) == 0x2cu ||
+        (op & 0xfeu) == 0x34 || (op & 0xfeu) == 0x3cu) {
+        gsize imm_size = (op & 0x01u) != 0 ? (operand16 ? 2 : 4) : 1;
+        if (available < offset + imm_size) {
+            return FALSE;
+        }
+        *size_out = offset + imm_size;
+        return TRUE;
+    }
+
+    if (op == 0x6a || op == 0xeb || (op >= 0x70 && op <= 0x7f)) {
+        if (available < offset + 1) {
+            return FALSE;
+        }
+        *size_out = offset + 1;
+        return TRUE;
+    }
+
+    if ((op >= 0x50 && op <= 0x5f) || op == 0x90 || op == 0x9c ||
+        op == 0x9d || op == 0xcc) {
+        *size_out = offset;
+        return TRUE;
+    }
+
+    if (op == 0x80 || op == 0x82 || op == 0x83 ||
+        op == 0xc0 || op == 0xc1 || op == 0xc6) {
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        if (available < offset + modrm_tail + 1) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail + 1;
+        return TRUE;
+    }
+
+    if (op == 0x81 || op == 0xc7) {
+        gsize imm_size = operand16 ? 2 : 4;
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        if (available < offset + modrm_tail + imm_size) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail + imm_size;
+        return TRUE;
+    }
+
+    if ((op <= 0x3b && (op & 0x07u) <= 0x03u) ||
+        op == 0x84 || op == 0x85 ||
+        (op >= 0x88 && op <= 0x8f) ||
+        op == 0xfe || op == 0xff) {
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail;
+        return TRUE;
+    }
+
+    if (op == 0x0f) {
+        if (available <= offset) {
+            return FALSE;
+        }
+        op = code[offset++];
+        if (op == 0x05 || op == 0x34) {
+            *size_out = offset;
+            return TRUE;
+        }
+        if (op >= 0x80 && op <= 0x8f) {
+            if (available < offset + 4) {
+                return FALSE;
+            }
+            *size_out = offset + 4;
+            return TRUE;
+        }
+        if ((op >= 0x90 && op <= 0x9f) ||
+            (op >= 0xb6 && op <= 0xbf)) {
+            if (!peak_x86_modrm_tail_size(&code[offset],
+                                          available - offset,
+                                          &modrm_tail)) {
+                return FALSE;
+            }
+            *size_out = offset + modrm_tail;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_has_early_return_in_relocated_prefix(const guint8* code,
+                                              gboolean* undecodable_out)
+{
+    const gsize guard_size = 32;
+    gsize offset = 0;
+    gsize endbr_size = 0;
+
+    if (undecodable_out != NULL) {
+        *undecodable_out = FALSE;
+    }
+
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    if (peak_x86_match_endbr(code, 4, &endbr_size)) {
+        offset = endbr_size;
+    }
+
+    while (offset < guard_size) {
+        gsize insn_size = 0;
+        gboolean is_return = FALSE;
+
+        if (!peak_x86_decode_instruction_size(&code[offset],
+                                              guard_size - offset,
+                                              &insn_size,
+                                              &is_return) ||
+            insn_size == 0) {
+            if (undecodable_out != NULL) {
+                *undecodable_out = TRUE;
+            }
+            return FALSE;
+        }
+        if (is_return) {
+            return TRUE;
+        }
+        offset += insn_size;
+    }
+
+    return FALSE;
+}
+
+static gboolean
 peak_x86_has_return_opcode_mov_immediate_at_entry(const guint8* code)
 {
     gsize endbr_size = 0;
@@ -419,12 +677,53 @@ peak_unsafe_gum_prologue_check(gpointer address,
         *reason_out = NULL;
     }
 
+    if (address == NULL) {
+        return FALSE;
+    }
+
     if (peak_has_default_unsafe_prologue(address, reason_out)) {
         return TRUE;
     }
 
     if (policy == PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE &&
         peak_has_conservative_unsafe_prologue(address, reason_out)) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+gboolean
+peak_unsafe_gum_support_prologue_check(gpointer address,
+                                       const char** reason_out)
+{
+    if (reason_out != NULL) {
+        *reason_out = NULL;
+    }
+
+    if (peak_has_default_unsafe_prologue(address, reason_out)) {
+        return TRUE;
+    }
+
+#if defined(__x86_64__) || defined(__amd64__)
+    gboolean undecodable = FALSE;
+
+    if (peak_x86_has_early_return_in_relocated_prefix((const guint8*)address,
+                                                      &undecodable)) {
+        if (reason_out != NULL) {
+            *reason_out = "x86-early-return-support";
+        }
+        return TRUE;
+    }
+    if (undecodable) {
+        if (reason_out != NULL) {
+            *reason_out = "x86-undecodable-support";
+        }
+        return TRUE;
+    }
+#endif
+
+    if (peak_has_conservative_unsafe_prologue(address, reason_out)) {
         return TRUE;
     }
 

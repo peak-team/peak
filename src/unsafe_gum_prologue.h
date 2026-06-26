@@ -23,4 +23,8 @@ peak_unsafe_gum_prologue_check(gpointer address,
                                PeakUnsafeGumProloguePolicy policy,
                                const char** reason_out);
 
+gboolean
+peak_unsafe_gum_support_prologue_check(gpointer address,
+                                       const char** reason_out);
+
 #endif

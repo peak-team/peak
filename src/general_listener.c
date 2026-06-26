@@ -260,6 +260,29 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
 }
 
 gboolean
+peak_general_listener_support_attach_target_is_supported(const char* symbol_name,
+                                                         gpointer address)
+{
+    const char* reason = NULL;
+
+    peak_general_listener_init_attach_policy();
+
+    if (peak_allow_unsafe_gum_prologue) {
+        return TRUE;
+    }
+
+    if (peak_unsafe_gum_support_prologue_check(address, &reason)) {
+        g_printerr("[peak] skipping PEAK support Gum attach for %s: target prologue is not safe for Gum relocation (reason=%s, policy=support); set %s=1 to override\n",
+                   symbol_name != NULL ? symbol_name : "<unknown>",
+                   reason != NULL ? reason : "unknown",
+                   PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+gboolean
 peak_general_listener_needs_dynamic_attach(void)
 {
     return peak_dynamic_attach_needed;
