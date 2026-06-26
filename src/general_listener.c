@@ -273,7 +273,8 @@ static gboolean
 peak_x86_match_first_indexed_load_after_zero(const guint8* code,
                                              gsize* size_out)
 {
-    if (code[0] == 0x8b && code[1] == 0x0c && code[2] == 0x07) {
+    if (code[0] == 0x8b && code[1] == 0x0c &&
+        (code[2] == 0x07 || code[2] == 0x38)) {
         *size_out = 3;
         return TRUE;
     }
@@ -632,7 +633,7 @@ peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(gpointer address)
 #endif
 }
 
-static gboolean
+static gboolean G_GNUC_UNUSED
 peak_general_listener_has_unsafe_x86_high_movabs_prologue(gpointer address)
 {
 #if defined(__x86_64__) || defined(__amd64__)
@@ -655,7 +656,7 @@ peak_general_listener_has_unsafe_x86_high_movabs_prologue(gpointer address)
 #endif
 }
 
-static gboolean
+static gboolean G_GNUC_UNUSED
 peak_general_listener_has_unsafe_x86_return_immediate_prologue(gpointer address)
 {
 #if defined(__x86_64__) || defined(__amd64__)
@@ -752,9 +753,14 @@ peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(gpointer address)
 static gboolean
 peak_general_listener_has_unsafe_gum_prologue(gpointer address)
 {
+    /*
+     * Keep the default skip policy intentionally narrow. The RDX/DL/EDX
+     * prefix family is the audited MILC f2d_4mat-style corruption pattern:
+     * Gum may clobber RDX after relocated bytes run, while the original body
+     * still depends on that value. Broader instruction-shape canaries are too
+     * prone to reject legitimate BLAS/library entry points.
+     */
     return peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(address) ||
-           peak_general_listener_has_unsafe_x86_high_movabs_prologue(address) ||
-           peak_general_listener_has_unsafe_x86_return_immediate_prologue(address) ||
            peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(address);
 }
 
@@ -1200,6 +1206,7 @@ typedef struct _PeakGeneralThreadState {
 
 typedef struct _PeakInvocationData {
     gdouble start_time;
+    gulong stack_level;
     gboolean initialized;
 } PeakInvocationData;
 
@@ -1213,6 +1220,8 @@ static _Atomic int global_session_counter = 0;
 static int pthread_pause_ack_pipe[2] = { -1, -1 };
 
 static gboolean peak_general_controller_flush_teardown(void);
+static gboolean peak_general_listener_pop_invocation(PeakInvocationData* priv,
+                                                     gdouble* child_duration_out);
 
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
 {
@@ -3709,12 +3718,9 @@ peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
         return;
     }
 
-    priv->initialized = FALSE;
-    if (thread_data.level == 0) {
+    if (!peak_general_listener_pop_invocation(priv, NULL)) {
         return;
     }
-
-    thread_data.level--;
     if (thread_data.level == 0) {
         void* tmp_ptr = thread_data.child_time;
         thread_data.child_time = NULL;
@@ -3730,6 +3736,52 @@ peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
     }
 }
 
+static gboolean
+peak_general_listener_pop_invocation(PeakInvocationData* priv,
+                                     gdouble* child_duration_out)
+{
+    if (child_duration_out != NULL) {
+        *child_duration_out = 0.0;
+    }
+
+    if (priv == NULL || !priv->initialized ||
+        thread_data.child_time == NULL ||
+        thread_data.level == 0 ||
+        priv->stack_level == 0 ||
+        thread_data.level < priv->stack_level) {
+        if (priv != NULL) {
+            priv->initialized = FALSE;
+            priv->stack_level = 0;
+        }
+        return FALSE;
+    }
+
+    while (thread_data.level > priv->stack_level) {
+        thread_data.level--;
+        thread_data.child_time[thread_data.level] = 0.0;
+    }
+
+    thread_data.level--;
+    if (child_duration_out != NULL) {
+        *child_duration_out = thread_data.child_time[thread_data.level];
+    }
+    thread_data.child_time[thread_data.level] = 0.0;
+    priv->initialized = FALSE;
+    priv->stack_level = 0;
+    return TRUE;
+}
+
+static gdouble
+peak_general_listener_exclusive_duration(gdouble total_duration,
+                                         gdouble child_duration)
+{
+    if (child_duration >= total_duration) {
+        return 0.0;
+    }
+
+    return total_duration - child_duration;
+}
+
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
@@ -3740,6 +3792,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     gum_interceptor_ignore_current_thread(interceptor);
     PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
     priv->initialized = FALSE;
+    priv->stack_level = 0;
     if (atomic_load_explicit(&peak_general_callbacks_suspended,
                              memory_order_acquire)) {
         gum_interceptor_unignore_current_thread(interceptor);
@@ -3814,6 +3867,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         else pthread_pause_disable();
     }
     priv->start_time = peak_second();
+    priv->stack_level = thread_data.level;
     priv->initialized = TRUE;
     gum_interceptor_unignore_current_thread(interceptor);
 }
@@ -3857,18 +3911,23 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         end_time = end_time - priv->start_time;
         size_t index = mapped_tid;
+        gdouble child_duration = 0.0;
+        if (!peak_general_listener_pop_invocation(priv, &child_duration)) {
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
         if (end_time < self->min_time[index] || self->num_calls[index] == 1)
             self->min_time[index] = end_time;
         self->total_time[index] += end_time;
         // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
-        thread_data.level--;
         if (thread_data.level > 0)
             thread_data.child_time[thread_data.level - 1] += end_time;
-        self->exclusive_time[index] += end_time - thread_data.child_time[thread_data.level];
-        thread_data.child_time[thread_data.level] = 0.0;
-        priv->initialized = FALSE;
+        self->exclusive_time[index] +=
+            peak_general_listener_exclusive_duration(
+                end_time,
+                child_duration);
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;
@@ -3910,18 +3969,23 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         end_time = end_time - priv->start_time;
         size_t index = mapped_tid;
+        gdouble child_duration = 0.0;
+        if (!peak_general_listener_pop_invocation(priv, &child_duration)) {
+            gum_interceptor_unignore_current_thread(interceptor);
+            return;
+        }
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
         if (end_time < self->min_time[index] || self->num_calls[index] == 1)
             self->min_time[index] = end_time;
         self->total_time[index] += end_time;
         // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
-        thread_data.level--;
         if (thread_data.level > 0)
             thread_data.child_time[thread_data.level - 1] += end_time;
-        self->exclusive_time[index] += end_time - thread_data.child_time[thread_data.level];
-        thread_data.child_time[thread_data.level] = 0.0;
-        priv->initialized = FALSE;
+        self->exclusive_time[index] +=
+            peak_general_listener_exclusive_duration(
+                end_time,
+                child_duration);
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;

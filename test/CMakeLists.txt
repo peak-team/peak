@@ -123,6 +123,7 @@ if(BUILD_TESTING)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             list(APPEND UNSAFE_GUM_PROLOGUE_GUARD_CASES
                 "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target"
+                "x86_dl_inc_rax_base|peak_unsafe_gum_x86_dl_inc_rax_base_target"
                 "x86_dl_add|peak_unsafe_gum_x86_dl_add_target"
                 "x86_edx_inc|peak_unsafe_gum_x86_edx_inc_target"
                 "x86_edx_add|peak_unsafe_gum_x86_edx_add_target"
@@ -132,13 +133,10 @@ if(BUILD_TESTING)
                 "x86_rdx_xor|peak_unsafe_gum_x86_rdx_xor_target"
                 "x86_edx_mov|peak_unsafe_gum_x86_edx_mov_target"
                 "x86_dl_dead|peak_unsafe_gum_x86_dl_dead_target"
-                "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target"
-                "x86_high_movabs|peak_unsafe_gum_x86_high_movabs_target"
-                "x86_ret_byte_immediate|peak_unsafe_gum_x86_ret_byte_immediate_target")
-            list(APPEND UNSAFE_GUM_PROLOGUE_ALLOWED_CASES
-                "x86_long_copy_safe|peak_unsafe_gum_x86_long_copy_safe_target")
+                "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_CORRUPTION_CASES
                 "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target|72"
+                "x86_dl_inc_rax_base|peak_unsafe_gum_x86_dl_inc_rax_base_target|72"
                 "x86_dl_add|peak_unsafe_gum_x86_dl_add_target|72"
                 "x86_edx_inc|peak_unsafe_gum_x86_edx_inc_target|72"
                 "x86_edx_add|peak_unsafe_gum_x86_edx_add_target|72"
@@ -212,8 +210,8 @@ if(BUILD_TESTING)
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 4 --seconds 2)
         set_tests_properties(test_detach_hotloop_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/hotloop-strict-trace.csv;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "trace_detach_success=1"
                 TIMEOUT 20)
         add_test(NAME test_detach_hotloop_signal_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 2)

@@ -68,6 +68,19 @@ peak_unsafe_gum_x86_dl_inc_target(const uint8_t* src, uint8_t* dst)
 
 __attribute__((naked, noinline, visibility("default")))
 void
+peak_unsafe_gum_x86_dl_inc_rax_base_target(const uint8_t* src, uint8_t* dst)
+{
+    __asm__ __volatile__(
+        "xor %dl, %dl\n\t"
+        "xor %eax, %eax\n\t"
+        "1:\n\t"
+        "mov (%rax,%rdi,1), %ecx\n\t"
+        "inc %dl\n\t"
+        X86_COPY72_REST("dl"));
+}
+
+__attribute__((naked, noinline, visibility("default")))
+void
 peak_unsafe_gum_x86_dl_add_target(const uint8_t* src, uint8_t* dst)
 {
     __asm__ __volatile__(
@@ -352,6 +365,8 @@ peak_unsafe_gum_x86_long_copy_safe_target(const uint8_t* src, uint8_t* dst)
 static const UnsafeCase unsafe_cases[] = {
     { "x86_dl_inc", "peak_unsafe_gum_x86_dl_inc_target",
       peak_unsafe_gum_x86_dl_inc_target, 288 },
+    { "x86_dl_inc_rax_base", "peak_unsafe_gum_x86_dl_inc_rax_base_target",
+      peak_unsafe_gum_x86_dl_inc_rax_base_target, 288 },
     { "x86_dl_add", "peak_unsafe_gum_x86_dl_add_target",
       peak_unsafe_gum_x86_dl_add_target, 288 },
     { "x86_edx_inc", "peak_unsafe_gum_x86_edx_inc_target",
