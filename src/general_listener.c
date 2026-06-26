@@ -523,7 +523,20 @@ peak_x86_has_high_movabs_in_relocated_prefix(const guint8* code)
 }
 
 static gboolean
-peak_x86_has_mov_immediate_in_relocated_prefix(const guint8* code)
+peak_x86_immediate_contains_return_opcode(const guint8* immediate, gsize size)
+{
+    for (gsize i = 0; i < size; i++) {
+        if (immediate[i] == 0xc2 || immediate[i] == 0xc3 ||
+            immediate[i] == 0xca || immediate[i] == 0xcb) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_has_return_opcode_mov_immediate_in_relocated_prefix(const guint8* code)
 {
     const gsize guard_size = 32;
     gsize offset = 0;
@@ -531,17 +544,39 @@ peak_x86_has_mov_immediate_in_relocated_prefix(const guint8* code)
     while (offset < guard_size) {
         gsize insn_size = 0;
         gsize prefix_size = 0;
+        gboolean operand16 = FALSE;
+        gboolean rex_w = FALSE;
         gboolean is_return = FALSE;
         guint8 op;
 
-        if (code[offset] >= 0x40 && code[offset] <= 0x4f) {
-            prefix_size = 1;
+        while (offset + prefix_size < guard_size) {
+            guint8 prefix = code[offset + prefix_size];
+            if (prefix == 0x66) {
+                operand16 = TRUE;
+                prefix_size++;
+            } else if (prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3 ||
+                       prefix == 0x2e || prefix == 0x36 || prefix == 0x3e ||
+                       prefix == 0x26 || prefix == 0x64 || prefix == 0x65 ||
+                       prefix == 0x67) {
+                prefix_size++;
+            } else if (prefix >= 0x40 && prefix <= 0x4f) {
+                rex_w = (prefix & 0x08u) != 0;
+                prefix_size++;
+            } else {
+                break;
+            }
         }
 
         if (offset + prefix_size < guard_size) {
             op = code[offset + prefix_size];
             if (op >= 0xb8 && op <= 0xbf) {
-                return TRUE;
+                gsize imm_size = rex_w ? 8 : (operand16 ? 2 : 4);
+                gsize imm_offset = offset + prefix_size + 1;
+                if (imm_offset + imm_size <= guard_size &&
+                    peak_x86_immediate_contains_return_opcode(&code[imm_offset],
+                                                              imm_size)) {
+                    return TRUE;
+                }
             }
         }
 
@@ -645,7 +680,7 @@ peak_general_listener_has_unsafe_x86_high_movabs_prologue(gpointer address)
 }
 
 static gboolean
-peak_general_listener_has_unsafe_x86_mov_immediate_prologue(gpointer address)
+peak_general_listener_has_unsafe_x86_return_immediate_prologue(gpointer address)
 {
 #if defined(__x86_64__) || defined(__amd64__)
     const guint8* code = (const guint8*)address;
@@ -655,11 +690,12 @@ peak_general_listener_has_unsafe_x86_mov_immediate_prologue(gpointer address)
     }
 
     /*
-     * Frontera Intel canaries show Gum can crash while attaching to early
-     * mov-immediate register prologues. Guard the decoded B8..BF form that is
-     * proven unsafe instead of raw-scanning arbitrary bytes.
+     * Frontera Intel canaries show Gum can crash when return opcodes appear
+     * inside an early mov-immediate register operand. Guard that decoded
+     * immediate shape, but do not reject ordinary mov-immediate prologues:
+     * real BLAS entry points commonly use them and must remain attachable.
      */
-    return peak_x86_has_mov_immediate_in_relocated_prefix(code);
+    return peak_x86_has_return_opcode_mov_immediate_in_relocated_prefix(code);
 #else
     (void)address;
     return FALSE;
@@ -743,7 +779,7 @@ peak_general_listener_has_unsafe_gum_prologue(gpointer address)
     return peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(address) ||
            peak_general_listener_has_unsafe_x86_early_return_prologue(address) ||
            peak_general_listener_has_unsafe_x86_high_movabs_prologue(address) ||
-           peak_general_listener_has_unsafe_x86_mov_immediate_prologue(address) ||
+           peak_general_listener_has_unsafe_x86_return_immediate_prologue(address) ||
            peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(address);
 }
 

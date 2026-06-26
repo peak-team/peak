@@ -809,10 +809,12 @@ showed Gum may also crash when a tiny function returns inside the early bytes Gu
 has to relocate; the Intel compiler placed the real return of one C copy canary
 at byte 17. PEAK therefore skips direct x86 returns reached by decoding the
 first 32 bytes of the function prologue. Additional Frontera canaries showed
-Gum can also crash while attaching to early `mov imm` register prologues,
-including high-register `movabs`, so PEAK skips that decoded instruction family
-without raw-scanning arbitrary prologue bytes. Unrelated longer copy prologues
-remain attachable. On Arm64, PEAK conservatively skips
+Gum can also crash while attaching to high-register `movabs` prologues and to
+early `mov imm` operands containing x86 return-opcode bytes, so PEAK skips those
+decoded immediate shapes without raw-scanning arbitrary prologue bytes. Ordinary
+`mov imm` setup prologues are not blocked by default because real BLAS entry
+points commonly use them and must remain attachable. Unrelated longer copy
+prologues remain attachable. On Arm64, PEAK conservatively skips
 prologues that define
 `x16`/`x17` (`ip0`/`ip1`) and consume that value in the following instructions,
 because those registers are the standard platform scratch registers used by

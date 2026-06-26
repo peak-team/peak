@@ -135,8 +135,7 @@ if(BUILD_TESTING)
                 "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target"
                 "x86_ret_in_prefix|peak_unsafe_gum_x86_ret_in_prefix_target"
                 "x86_high_movabs|peak_unsafe_gum_x86_high_movabs_target"
-                "x86_ret_byte_immediate|peak_unsafe_gum_x86_ret_byte_immediate_target"
-                "x86_plain_immediate|peak_unsafe_gum_x86_plain_immediate_target")
+                "x86_ret_byte_immediate|peak_unsafe_gum_x86_ret_byte_immediate_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_ALLOWED_CASES
                 "x86_long_copy_safe|peak_unsafe_gum_x86_long_copy_safe_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_CORRUPTION_CASES
