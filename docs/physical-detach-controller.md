@@ -799,25 +799,30 @@ obvious C++ spelling such as `::`, `(`, `<`, or `operator`.
 PEAK also refuses known or conservative trampoline-scratch prologue classes
 before static, dynamic `dlopen`, or JIT target attach. Tiny x86_64 leaf loops
 such as MILC's `f2d_4mat`/`d2f_4mat` initialize a `DL`/`EDX`/`RDX` value, zero
-`EAX`, and execute the first indexed load in relocated entry bytes. Gum 16.5.9
-may then clobber `RDX` before jumping back to the original function body,
-corrupting application data even when physical detach is disabled. GCC/local
-canaries reproduce the historical byte-72 corruption for live counter variants,
-while Frontera Intel canaries show the same prefix family can also crash for
-short variants where `RDX` is not consumed afterward. Additional Frontera
-canaries showed Gum can also crash while attaching to high-register `movabs`
-prologues and to early `mov imm` operands containing x86 return-opcode bytes, so
-PEAK skips those decoded immediate shapes without raw-scanning arbitrary prologue
-bytes. Tiny functions and ordinary `mov imm` setup prologues are not blocked by
-default because real dynamic-library and BLAS entry points commonly use them and
-must remain attachable. Unrelated longer copy prologues remain attachable. On
-Arm64, PEAK conservatively skips
-prologues that define
-`x16`/`x17` (`ip0`/`ip1`) and consume that value in the following instructions,
-because those registers are the standard platform scratch registers used by
-veneers and trampolines. Vista testing currently proves the Arm64 guard fires
-and preserves application output; it has not shown a reproducible Arm64
-override-corruption canary.
+`EAX`, execute the first indexed load in relocated entry bytes, and immediately
+update the `DL`/`EDX`/`RDX` counter used by the loop. Gum 16.5.9 may then
+clobber `RDX` before jumping back to the original function body, corrupting
+application data even when physical detach is disabled. GCC/local canaries
+reproduce the historical byte-72 corruption for these live counter variants.
+This audited live-counter family is the default PEAK-side skip policy; short
+dead-RDX probes that do not update or consume the counter after the first load
+remain attachable by default.
+
+Additional Frontera canaries showed Gum can also crash while attaching to a
+high-register `movabs` entry instruction whose immediate contains x86
+return-opcode bytes, and to a low-register entry `mov imm` operand with the
+same kind of immediate. Earlier PEAK matchers scanned too broadly and could
+reject ordinary dynamic-library or BLAS setup prologues. These canaries are now
+exact entry-instruction checks and are only enabled by
+`PEAK_UNSAFE_GUM_PROLOGUE_POLICY=conservative`.
+
+On Arm64, PEAK does not pre-skip single `x16`/`x17` (`ip0`/`ip1`) uses by
+default. Frida's Arm64 relocator selects a trampoline scratch register after
+checking whether `x16` or `x17` appears in the relocated operands, so the default
+policy defers to Gum's own attach result. The conservative PEAK policy can still
+skip prefixes that mention both IP registers, but this is a diagnostic
+fail-closed mode rather than a proven Arm64 corruption guard.
+
 `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1` is a diagnostic override, not a safety mode.
 
 ## Testing Strategy
@@ -901,18 +906,17 @@ hooks.
 
 A focused unsafe-prologue regression exports architecture-specific targets.
 On x86_64, default-mode tests require PEAK's skip diagnostic for the audited
-`DL`/`EDX`/`RDX` zero, `EAX` zero, first indexed-load prefix family,
-override-mode tests require either deterministic corruption or a signal crash
-for the locally reproducible live-counter cases, and an explicit direct-return
-canary proves a real return inside the guarded prologue is skipped by default.
-A high-register `movabs` canary and a low-register `mov imm` canary are also
-guarded because Frontera Intel tests show Gum can crash while attaching to that
-decoded instruction family. A default-allowed long-copy canary avoids those
-forms and places the real return after the guarded window, proving the x86 guard
-does not ban ordinary longer copy prologues. On Arm64, Vista tests
-require PEAK's skip diagnostic for `x16`/`x17` live-out prologues; override
-probes are kept diagnostic-only until a reproducible Arm64 corruption canary is
-observed.
+`DL`/`EDX`/`RDX` zero, `EAX` zero, first indexed-load, post-load counter-update
+family, while override-mode tests require either deterministic corruption or a
+signal crash for locally reproducible live-counter cases. Conservative-policy
+tests require PEAK's skip diagnostic for the exact high-register `movabs` and
+return-opcode immediate entry canaries without making them default skips.
+Default-allowed tests prove ordinary `mov imm` setup, unrelated longer copy
+prologues, and dead-RDX probes remain attachable. On Arm64, default tests
+require PEAK not to emit its unsafe-prologue skip for `x16`-only, `x17`-only, or
+both-IP-prefix canaries; the both-IP-prefix case may still be rejected by Gum
+itself. Conservative Arm64 tests cover the optional PEAK-side both-IP
+fail-closed guard.
 
 ## Implementation Status
 

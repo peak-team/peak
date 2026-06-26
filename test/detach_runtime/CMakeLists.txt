@@ -44,3 +44,22 @@ endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_unsafe_gum_prologue PRIVATE -Wl,--export-dynamic)
 endif()
+
+add_executable(test_unsafe_gum_prologue_policy
+  test_unsafe_gum_prologue_policy.c
+  ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
+)
+target_include_directories(test_unsafe_gum_prologue_policy
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${FRIDA_GUM_INCLUDE_DIRS}
+)
+target_link_libraries(test_unsafe_gum_prologue_policy
+  PRIVATE
+    ${FRIDA_GUM_LIBRARIES}
+    Threads::Threads
+    ${DL_LIBRARY}
+    ${RT_LIBRARY}
+    ${M_LIBRARY}
+)

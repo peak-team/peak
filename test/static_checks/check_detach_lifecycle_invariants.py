@@ -164,9 +164,13 @@ def check_stop_window_trace_gating(repo_root):
                 f"{label} must use cached trace configuration")
     require("PEAK_ALLOW_UNSAFE_GUM_PROLOGUE" in general_attach_policy_init,
             "general listener must snapshot unsafe Gum prologue override during init")
+    require("PEAK_UNSAFE_GUM_PROLOGUE_POLICY" in general_attach_policy_init,
+            "general listener must snapshot unsafe Gum prologue policy during init")
     require("getenv(" not in general_attach_supported and
             "g_getenv(" not in general_attach_supported,
             "Gum attach support predicate must use cached attach policy")
+    require("peak_unsafe_gum_prologue_check" in general_attach_supported,
+            "Gum attach support predicate must delegate prologue policy checks")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
 
