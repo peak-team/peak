@@ -128,6 +128,20 @@ gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
 void peak_general_listener_free(PeakGeneralListener* self);
 
 /**
+ * @brief Returns whether a target may be attached through Gum safely.
+ *
+ * This is a fail-closed PEAK-side guard for Gum relocation patterns that are
+ * known to change application semantics.
+ */
+gboolean peak_general_listener_attach_target_is_supported(const char* symbol_name,
+                                                          gpointer address);
+
+/**
+ * @brief Returns whether unresolved requested targets require dlopen rescans.
+ */
+gboolean peak_general_listener_needs_dynamic_attach(void);
+
+/**
  * @brief Detaches the Peak General Listener.
  *
  * This function detaches the Peak General Listener and frees the memory allocated for it.

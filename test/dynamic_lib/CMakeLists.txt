@@ -163,4 +163,15 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
       WORKING_DIRECTORY ${DL_DIR}
       ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
   )
+
+  add_test(NAME test_dynamic_lib_dlopen_target_no_crash
+    COMMAND ${DL_DIR}/dlopen_flags_test
+  )
+  set_tests_properties(test_dynamic_lib_dlopen_target_no_crash
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=dlopen;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+      FAIL_REGULAR_EXPRESSION "Segmentation fault|SIGSEGV|Caught signal|Fatal error"
+      TIMEOUT 20
+  )
 endif()

@@ -1,4 +1,5 @@
 #include "syscall_interceptor.h"
+#include "general_listener.h"
 
 static GumInterceptor* syscall_interceptor;
 
@@ -38,9 +39,14 @@ int syscall_interceptor_attach()
     gum_interceptor_begin_transaction(syscall_interceptor);
     hook_address = gum_find_function("close");
     if (hook_address) {
-        replace_check = gum_interceptor_replace_fast(syscall_interceptor, 
-                                     hook_address, (gpointer)&peak_close,
-                                     (gpointer*)(&original_close));
+        if (peak_general_listener_attach_target_is_supported("close",
+                                                             hook_address)) {
+            replace_check = gum_interceptor_replace_fast(syscall_interceptor,
+                                         hook_address, (gpointer)&peak_close,
+                                         (gpointer*)(&original_close));
+        } else {
+            hook_address = NULL;
+        }
     }
     gum_interceptor_end_transaction(syscall_interceptor);
     return replace_check;

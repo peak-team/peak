@@ -39,6 +39,7 @@
 #define PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV "PEAK_CONTROLLER_MAX_PENDING_AGE_MS"
 #define PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV "PEAK_CONTROLLER_MAX_RETRY_COUNT"
 #define PEAK_REATTACH_COOLDOWN_MS_ENV "PEAK_REATTACH_COOLDOWN_MS"
+#define PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"
 
 PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
@@ -105,6 +106,12 @@ static gsize peak_reattach_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static gsize peak_controller_trace_config_initialized = 0;
+static gchar* peak_controller_trace_path = NULL;
+static gboolean peak_controller_trace_enabled = FALSE;
+static gsize peak_attach_policy_initialized = 0;
+static gboolean peak_allow_unsafe_gum_prologue = FALSE;
+static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
 static gboolean
@@ -189,6 +196,581 @@ peak_env_value_falsey(const char* value)
             g_ascii_strcasecmp(value, "false") == 0 ||
             g_ascii_strcasecmp(value, "off") == 0 ||
             g_ascii_strcasecmp(value, "no") == 0);
+}
+
+static void
+peak_general_listener_init_attach_policy_once(void)
+{
+    peak_allow_unsafe_gum_prologue =
+        peak_env_value_truthy(g_getenv(PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV));
+}
+
+static void
+peak_general_listener_init_attach_policy(void)
+{
+    if (g_once_init_enter(&peak_attach_policy_initialized)) {
+        peak_general_listener_init_attach_policy_once();
+        g_once_init_leave(&peak_attach_policy_initialized, 1);
+    }
+}
+
+#if defined(__x86_64__) || defined(__amd64__)
+static gboolean
+peak_x86_match_zero_rdx(const guint8* code, gsize* size_out)
+{
+    if ((code[0] == 0x30 || code[0] == 0x32 ||
+         code[0] == 0x28 || code[0] == 0x2a ||
+         code[0] == 0x31 || code[0] == 0x33 ||
+         code[0] == 0x29 || code[0] == 0x2b) &&
+        code[1] == 0xd2) {
+        *size_out = 2;
+        return TRUE;
+    }
+
+    if (code[0] == 0x48 &&
+        (code[1] == 0x31 || code[1] == 0x33 ||
+         code[1] == 0x29 || code[1] == 0x2b) &&
+        code[2] == 0xd2) {
+        *size_out = 3;
+        return TRUE;
+    }
+
+    if (code[0] == 0xb2 && code[1] == 0x00) {
+        *size_out = 2;
+        return TRUE;
+    }
+
+    if (code[0] == 0xba &&
+        code[1] == 0x00 && code[2] == 0x00 &&
+        code[3] == 0x00 && code[4] == 0x00) {
+        *size_out = 5;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_match_zero_eax(const guint8* code)
+{
+    return (code[0] == 0x31 || code[0] == 0x33) && code[1] == 0xc0;
+}
+
+static gboolean
+peak_x86_match_first_indexed_load_after_zero(const guint8* code,
+                                             gsize* size_out)
+{
+    if (code[0] == 0x8b && code[1] == 0x0c && code[2] == 0x07) {
+        *size_out = 3;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_modrm_tail_size(const guint8* code,
+                         gsize available,
+                         gsize* size_out)
+{
+    guint8 modrm;
+    guint8 mod;
+    guint8 rm;
+    gsize size = 1;
+
+    if (available == 0) {
+        return FALSE;
+    }
+
+    modrm = code[0];
+    mod = modrm >> 6;
+    rm = modrm & 0x7u;
+
+    if (mod != 3 && rm == 4) {
+        guint8 sib;
+        guint8 base;
+        if (available < size + 1) {
+            return FALSE;
+        }
+        sib = code[size++];
+        base = sib & 0x7u;
+        if (mod == 0 && base == 5) {
+            size += 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        size += 4;
+    }
+
+    if (mod == 1) {
+        size += 1;
+    } else if (mod == 2) {
+        size += 4;
+    }
+
+    if (size > available) {
+        return FALSE;
+    }
+
+    *size_out = size;
+    return TRUE;
+}
+
+static gboolean
+peak_x86_decode_instruction_size(const guint8* code,
+                                 gsize available,
+                                 gsize* size_out,
+                                 gboolean* is_return_out)
+{
+    gsize offset = 0;
+    gboolean rex_w = FALSE;
+    gboolean operand16 = FALSE;
+    guint8 op;
+    gsize modrm_tail = 0;
+
+    *is_return_out = FALSE;
+
+    while (offset < available) {
+        guint8 prefix = code[offset];
+        if (prefix == 0x66) {
+            operand16 = TRUE;
+            offset++;
+        } else if (prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3 ||
+                   prefix == 0x2e || prefix == 0x36 || prefix == 0x3e ||
+                   prefix == 0x26 || prefix == 0x64 || prefix == 0x65 ||
+                   prefix == 0x67) {
+            offset++;
+        } else if (prefix >= 0x40 && prefix <= 0x4f) {
+            rex_w = (prefix & 0x08u) != 0;
+            offset++;
+        } else {
+            break;
+        }
+    }
+
+    if (offset >= available) {
+        return FALSE;
+    }
+
+    op = code[offset++];
+    if (op == 0xc3 || op == 0xcb) {
+        *size_out = offset;
+        *is_return_out = TRUE;
+        return TRUE;
+    }
+    if (op == 0xc2 || op == 0xca) {
+        if (available < offset + 2) {
+            return FALSE;
+        }
+        *size_out = offset + 2;
+        *is_return_out = TRUE;
+        return TRUE;
+    }
+
+    if (op >= 0xb8 && op <= 0xbf) {
+        gsize imm_size = rex_w ? 8 : (operand16 ? 2 : 4);
+        if (available < offset + imm_size) {
+            return FALSE;
+        }
+        *size_out = offset + imm_size;
+        return TRUE;
+    }
+
+    if (op == 0x68 || op == 0xe8 || op == 0xe9) {
+        if (available < offset + 4) {
+            return FALSE;
+        }
+        *size_out = offset + 4;
+        return TRUE;
+    }
+
+    if (op == 0x6a || op == 0xeb || (op >= 0x70 && op <= 0x7f)) {
+        if (available < offset + 1) {
+            return FALSE;
+        }
+        *size_out = offset + 1;
+        return TRUE;
+    }
+
+    if ((op >= 0x50 && op <= 0x5f) || op == 0x90 || op == 0x9c ||
+        op == 0x9d || op == 0xcc) {
+        *size_out = offset;
+        return TRUE;
+    }
+
+    if (op == 0x80 || op == 0x82 || op == 0x83 ||
+        op == 0xc0 || op == 0xc1 || op == 0xc6) {
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        if (available < offset + modrm_tail + 1) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail + 1;
+        return TRUE;
+    }
+
+    if (op == 0x81 || op == 0xc7) {
+        gsize imm_size = operand16 ? 2 : 4;
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        if (available < offset + modrm_tail + imm_size) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail + imm_size;
+        return TRUE;
+    }
+
+    if ((op <= 0x3b && (op & 0x07u) <= 0x03u) ||
+        op == 0x84 || op == 0x85 ||
+        (op >= 0x88 && op <= 0x8f) ||
+        op == 0xfe || op == 0xff) {
+        if (!peak_x86_modrm_tail_size(&code[offset],
+                                      available - offset,
+                                      &modrm_tail)) {
+            return FALSE;
+        }
+        *size_out = offset + modrm_tail;
+        return TRUE;
+    }
+
+    if (op == 0x0f) {
+        if (available <= offset) {
+            return FALSE;
+        }
+        op = code[offset++];
+        if (op >= 0x80 && op <= 0x8f) {
+            if (available < offset + 4) {
+                return FALSE;
+            }
+            *size_out = offset + 4;
+            return TRUE;
+        }
+        if ((op >= 0x90 && op <= 0x9f) ||
+            (op >= 0xb6 && op <= 0xbf)) {
+            if (!peak_x86_modrm_tail_size(&code[offset],
+                                          available - offset,
+                                          &modrm_tail)) {
+                return FALSE;
+            }
+            *size_out = offset + modrm_tail;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_has_early_return_in_relocated_prefix(const guint8* code)
+{
+    const gsize guard_size = 32;
+    gsize offset = 0;
+
+    while (offset < guard_size) {
+        gsize insn_size = 0;
+        gboolean is_return = FALSE;
+
+        if (!peak_x86_decode_instruction_size(&code[offset],
+                                              guard_size - offset,
+                                              &insn_size,
+                                              &is_return) ||
+            insn_size == 0) {
+            return FALSE;
+        }
+        if (is_return) {
+            return TRUE;
+        }
+        offset += insn_size;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_has_high_movabs_in_relocated_prefix(const guint8* code)
+{
+    const gsize guard_size = 32;
+    gsize offset = 0;
+
+    while (offset < guard_size) {
+        gsize insn_size = 0;
+        gboolean is_return = FALSE;
+
+        if (offset + 1 < guard_size &&
+            code[offset] >= 0x40 && code[offset] <= 0x4f &&
+            (code[offset] & 0x08u) != 0 &&
+            (code[offset] & 0x01u) != 0 &&
+            code[offset + 1] >= 0xb8 && code[offset + 1] <= 0xbf) {
+            return TRUE;
+        }
+
+        if (!peak_x86_decode_instruction_size(&code[offset],
+                                              guard_size - offset,
+                                              &insn_size,
+                                              &is_return) ||
+            insn_size == 0) {
+            return FALSE;
+        }
+        offset += insn_size;
+    }
+
+    return FALSE;
+}
+
+static gboolean
+peak_x86_has_mov_immediate_in_relocated_prefix(const guint8* code)
+{
+    const gsize guard_size = 32;
+    gsize offset = 0;
+
+    while (offset < guard_size) {
+        gsize insn_size = 0;
+        gsize prefix_size = 0;
+        gboolean is_return = FALSE;
+        guint8 op;
+
+        if (code[offset] >= 0x40 && code[offset] <= 0x4f) {
+            prefix_size = 1;
+        }
+
+        if (offset + prefix_size < guard_size) {
+            op = code[offset + prefix_size];
+            if (op >= 0xb8 && op <= 0xbf) {
+                return TRUE;
+            }
+        }
+
+        if (!peak_x86_decode_instruction_size(&code[offset],
+                                              guard_size - offset,
+                                              &insn_size,
+                                              &is_return) ||
+            insn_size == 0) {
+            return FALSE;
+        }
+        offset += insn_size;
+    }
+
+    return FALSE;
+}
+#endif
+
+static gboolean
+peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(gpointer address)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    const guint8* code = (const guint8*)address;
+    gsize zero_size = 0;
+    gsize first_load_size = 0;
+    const gsize zero_eax_size = 2;
+
+    if (code == NULL || !peak_x86_match_zero_rdx(code, &zero_size)) {
+        return FALSE;
+    }
+
+    /*
+     * Frida Gum 16.5.9's x86 invoke trampoline may use RDX after executing
+     * relocated prologue instructions but before returning to the original
+     * function body. Tiny leaf loops such as MILC's f2d_4mat initialize a
+     * DL/EDX/RDX value, zero EAX, and execute the first indexed load in
+     * relocated bytes. GCC/local canaries prove live counter variants corrupt
+     * application data when Gum clobbers RDX at jump-back, and Frontera Intel
+     * canaries show even the short same-prefix variants can crash when Gum
+     * attaches. Guard only this audited prefix family by default; unrelated
+     * small copy prologues remain attachable.
+     */
+    if (!peak_x86_match_zero_eax(&code[zero_size]) ||
+        !peak_x86_match_first_indexed_load_after_zero(
+            &code[zero_size + zero_eax_size],
+            &first_load_size)) {
+        return FALSE;
+    }
+
+    return TRUE;
+#else
+    (void)address;
+    return FALSE;
+#endif
+}
+
+static gboolean
+peak_general_listener_has_unsafe_x86_early_return_prologue(gpointer address)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    const guint8* code = (const guint8*)address;
+
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    /*
+     * Frontera Intel canaries show Gum attach may crash when a tiny leaf
+     * function returns inside the early bytes Gum has to relocate. Keep this
+     * deliberately narrow: direct x86 returns only, and only inside the first
+     * 32 bytes. Normal small functions whose body continues past the relocated
+     * prefix remain attachable.
+     */
+    return peak_x86_has_early_return_in_relocated_prefix(code);
+#else
+    (void)address;
+    return FALSE;
+#endif
+}
+
+static gboolean
+peak_general_listener_has_unsafe_x86_high_movabs_prologue(gpointer address)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    const guint8* code = (const guint8*)address;
+
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    /*
+     * Frontera Intel canaries also show Gum attach can crash while relocating
+     * a high-register movabs in the early target prologue. Keep the guard at
+     * decoded instruction starts so immediate bytes in other instructions do
+     * not cause false positives.
+     */
+    return peak_x86_has_high_movabs_in_relocated_prefix(code);
+#else
+    (void)address;
+    return FALSE;
+#endif
+}
+
+static gboolean
+peak_general_listener_has_unsafe_x86_mov_immediate_prologue(gpointer address)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    const guint8* code = (const guint8*)address;
+
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    /*
+     * Frontera Intel canaries show Gum can crash while attaching to early
+     * mov-immediate register prologues. Guard the decoded B8..BF form that is
+     * proven unsafe instead of raw-scanning arbitrary bytes.
+     */
+    return peak_x86_has_mov_immediate_in_relocated_prefix(code);
+#else
+    (void)address;
+    return FALSE;
+#endif
+}
+
+static gboolean
+peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(gpointer address)
+{
+#if defined(__aarch64__)
+    const guint8* code = (const guint8*)address;
+
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    for (gsize i = 0; i < 4; i++) {
+        guint32 reg = 0;
+        guint32 insn;
+        guint32 rd;
+        guint32 rn;
+        guint32 rm;
+        guint32 imm16;
+        guint32 hw;
+
+        memcpy(&insn, code + (i * 4), sizeof(insn));
+        rd = insn & 0x1fu;
+        rn = (insn >> 5) & 0x1fu;
+        rm = (insn >> 16) & 0x1fu;
+        imm16 = (insn >> 5) & 0xffffu;
+        hw = (insn >> 21) & 0x3u;
+
+        if (!(rd == 16 || rd == 17)) {
+            continue;
+        }
+
+        if ((insn & 0x7f800000u) == 0x52800000u && hw == 0 && imm16 <= 64) {
+            reg = rd;
+        } else if ((insn & 0x7fe0ffe0u) == 0x2a0003e0u && rm <= 3) {
+            reg = rd;
+        } else if ((insn & 0x1f000000u) == 0x11000000u &&
+                   (rn <= 3 || rn == 16 || rn == 17)) {
+            reg = rd;
+        } else if ((insn & 0x1f000000u) == 0x10000000u) {
+            reg = rd;
+        } else {
+            continue;
+        }
+
+        /*
+         * AArch64 trampolines and veneers commonly use IP0/IP1 (x16/x17) as
+         * scratch registers. If a relocated prologue defines one of these
+         * registers and the original body consumes it after Gum's jump-back,
+         * PEAK cannot prove the target semantics are preserved.
+         */
+        for (gsize j = i + 1; j < 8; j++) {
+            guint32 next;
+            guint32 rt;
+            memcpy(&next, code + (j * 4), sizeof(next));
+            rt = next & 0x1fu;
+            rn = (next >> 5) & 0x1fu;
+            rm = (next >> 16) & 0x1fu;
+            if (((next & 0x7e000000u) == 0x34000000u && rt == reg) ||
+                rn == reg ||
+                rm == reg) {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+#else
+    (void)address;
+    return FALSE;
+#endif
+}
+
+static gboolean
+peak_general_listener_has_unsafe_gum_prologue(gpointer address)
+{
+    return peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(address) ||
+           peak_general_listener_has_unsafe_x86_early_return_prologue(address) ||
+           peak_general_listener_has_unsafe_x86_high_movabs_prologue(address) ||
+           peak_general_listener_has_unsafe_x86_mov_immediate_prologue(address) ||
+           peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(address);
+}
+
+gboolean
+peak_general_listener_attach_target_is_supported(const char* symbol_name,
+                                                 gpointer address)
+{
+    peak_general_listener_init_attach_policy();
+
+    if (peak_allow_unsafe_gum_prologue) {
+        return TRUE;
+    }
+
+    if (peak_general_listener_has_unsafe_gum_prologue(address)) {
+        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is not safe for Gum relocation; set %s=1 to override\n",
+                   symbol_name != NULL ? symbol_name : "<unknown>",
+                   PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+gboolean
+peak_general_listener_needs_dynamic_attach(void)
+{
+    return peak_dynamic_attach_needed;
 }
 
 static gboolean
@@ -443,11 +1025,32 @@ peak_general_controller_init_retry_limits(void)
     }
 }
 
+static void
+peak_general_controller_init_trace_config_once(void)
+{
+    const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
+
+    if (path != NULL && path[0] != '\0') {
+        peak_controller_trace_path = g_strdup(path);
+        peak_controller_trace_enabled = TRUE;
+    }
+    peak_detach_controller_configure_trace_diagnostics(
+        peak_controller_trace_enabled);
+}
+
+static void
+peak_general_controller_init_trace_config(void)
+{
+    if (g_once_init_enter(&peak_controller_trace_config_initialized)) {
+        peak_general_controller_init_trace_config_once();
+        g_once_init_leave(&peak_controller_trace_config_initialized, 1);
+    }
+}
+
 static gboolean
 peak_general_controller_trace_enabled(void)
 {
-    const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
-    return path != NULL && path[0] != '\0';
+    return peak_controller_trace_enabled;
 }
 
 static void
@@ -463,7 +1066,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                                               unsigned int batch_id,
                                               PeakDetachStatus last_retry_status)
 {
-    const char* path = g_getenv("PEAK_DETACH_TRACE_PATH");
+    const char* path = peak_controller_trace_path;
     const PeakDetachFailureDetail* failure_detail =
         peak_detach_controller_last_failure_detail();
     const char* failure_reason =
@@ -1416,6 +2019,15 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
     if (!duplicate_address && selected_hook_id != (size_t)-1) {
         size_t i = selected_hook_id;
+        if (!peak_general_listener_attach_target_is_supported(symbol_name,
+                                                              symbol_address)) {
+            g_printerr("[peak] skipping JIT attach for hook %lu (%s) from %s: unsafe Gum prologue\n",
+                       (unsigned long)i,
+                       symbol_name,
+                       provider_name != NULL ? provider_name : "<unknown>");
+            pthread_mutex_unlock(&lock);
+            return PEAK_DYNAMIC_ATTACH_FAILED;
+        }
         GumInvocationListener* new_listener =
             g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
         PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
@@ -3507,6 +4119,8 @@ static void peak_build_symbol_map_once(void) {
 
 void peak_general_listener_attach()
 {
+    peak_general_controller_init_trace_config();
+    peak_general_listener_init_attach_policy();
     pthread_pause_enable();
     interceptor = gum_interceptor_obtain();
     array_listener = (GumInvocationListener**)g_new0(gpointer, peak_hook_address_count);
@@ -3573,7 +4187,8 @@ void peak_general_listener_attach()
             hook_address[i] = gum_find_function("peak_cu_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
-            hook_address[i] = gum_find_function("peak_dlopen");
+            g_printerr("[peak] skipping target dlopen: PEAK owns the dlopen wrapper used for dynamic attach\n");
+            hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
             gpointer ptr = gum_find_function(peak_hook_strings[i]);
@@ -3623,11 +4238,22 @@ void peak_general_listener_attach()
                         }
                     }
                 }
+                if (hook_address[i] == NULL) {
+                    peak_dynamic_attach_needed = TRUE;
+                }
             }
         }
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
             gpointer resolved_hook_address = hook_address[i];
+            if (!peak_general_listener_attach_target_is_supported(
+                    peak_hook_strings[i],
+                    resolved_hook_address)) {
+                hook_address[i] = NULL;
+                g_free(peak_demangled_strings[i]);
+                peak_demangled_strings[i] = NULL;
+                continue;
+            }
             GumInvocationListener* new_listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
             PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
             hook_address[i] = NULL;
@@ -3690,9 +4316,17 @@ void peak_general_listener_attach()
         gum_find_functions_matching_initialize = false;
     }
     if (peak_hook_address_count) {
-        peak_general_overhead_bootstrapping();
         peak_detach_count_overridden =
             peak_general_listener_parse_detach_count_override(&peak_detach_count);
+        gboolean need_overhead_calibration =
+            peak_detach_cost > 0 ||
+            heartbeat_time != 0 ||
+            peak_detach_count_overridden;
+        if (need_overhead_calibration) {
+            peak_general_overhead_bootstrapping();
+        } else {
+            peak_general_overhead = 0.0;
+        }
         if (!peak_detach_count_overridden && peak_detach_cost > 0) {
             if (peak_general_overhead > 0.0) {
                 peak_detach_count =

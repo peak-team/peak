@@ -233,12 +233,10 @@ void peak_init()
     }
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
-   
+
     //gum_init_embedded();
 
     pthread_listener_attach();
-    syscall_interceptor_attach();
-    dlopen_interceptor_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -263,7 +261,13 @@ void peak_init()
     peak_detached = g_new0(gboolean, peak_hook_address_count);
     peak_jit_provider_enable();
     peak_general_listener_attach();
-    dlopen_interceptor_enable_dynamic_attach();
+    syscall_interceptor_attach();
+    gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
+    if (need_dynamic_attach) {
+        if (dlopen_interceptor_attach() == 0) {
+            dlopen_interceptor_enable_dynamic_attach();
+        }
+    }
     if (heartbeat_time != 0) {
         heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);

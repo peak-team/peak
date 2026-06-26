@@ -151,6 +151,7 @@ static PeakDetachHeldMutation held_mutation = { 0 };
 static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS];
 static double held_mutation_started_at = 0.0;
 static double last_stop_window_us = 0.0;
+static _Atomic int trace_diagnostics_enabled = 0;
 static pthread_once_t signal_backend_initialized = PTHREAD_ONCE_INIT;
 static _Atomic int signal_backend_signum = 0;
 static int signal_trap_handler_installed = 0;
@@ -166,6 +167,14 @@ static _Atomic uint32_t signal_slot_count = 0;
 static gsize strict_gate_wait_timeout_initialized = 0;
 static double strict_gate_wait_timeout_s =
     (double)PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS / 1000.0;
+
+static void
+peak_detach_controller_raw_close(int fd)
+{
+    if (fd >= 0) {
+        (void)syscall(SYS_close, fd);
+    }
+}
 
 static int
 peak_detach_controller_signal_backend_signum_load(void)
@@ -462,7 +471,7 @@ static void
 peak_detach_controller_atfork_child(void)
 {
     if (helper_fd >= 0) {
-        close(helper_fd);
+        peak_detach_controller_raw_close(helper_fd);
     }
     helper_fd = -1;
     helper_pid = -1;
@@ -495,7 +504,7 @@ peak_detach_controller_reset_inherited_helper_if_needed(void)
 
     if (helper_owner_pid > 0 && helper_owner_pid != current_pid) {
         if (helper_fd >= 0) {
-            close(helper_fd);
+            peak_detach_controller_raw_close(helper_fd);
         }
         helper_fd = -1;
         helper_pid = -1;
@@ -1045,7 +1054,7 @@ peak_detach_controller_child_close_inherited_fds(int protocol_fd)
         if (dup2(protocol_fd, PEAK_DETACH_HELPER_PROTOCOL_FD) < 0) {
             _exit(127);
         }
-        close(protocol_fd);
+        peak_detach_controller_raw_close(protocol_fd);
         protocol_fd = PEAK_DETACH_HELPER_PROTOCOL_FD;
     }
 
@@ -1065,7 +1074,7 @@ peak_detach_controller_close_helper(void)
     pid_t pid = helper_pid;
 
     if (helper_fd >= 0) {
-        close(helper_fd);
+        peak_detach_controller_raw_close(helper_fd);
         helper_fd = -1;
     }
     helper_owner_pid = -1;
@@ -1174,8 +1183,8 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
             (uintptr_t)errno,
             0);
         peak_detach_controller_free_helper_env(helper_env);
-        close(sockets[0]);
-        close(sockets[1]);
+        peak_detach_controller_raw_close(sockets[0]);
+        peak_detach_controller_raw_close(sockets[1]);
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_ERROR;
         }
@@ -1184,14 +1193,14 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
 
     if (pid == 0) {
         char* const helper_argv[] = { (char*)path, fd_arg, NULL };
-        close(sockets[0]);
+        peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_child_close_inherited_fds(sockets[1]);
         execve(path, helper_argv, helper_env);
         _exit(127);
     }
 
     peak_detach_controller_free_helper_env(helper_env);
-    close(sockets[1]);
+    peak_detach_controller_raw_close(sockets[1]);
     helper_fd = sockets[0];
     helper_pid = pid;
     helper_owner_pid = getpid();
@@ -2890,11 +2899,23 @@ peak_detach_controller_monotonic_second(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+void
+peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    (void)enabled;
+#else
+    atomic_store_explicit(&trace_diagnostics_enabled,
+                          enabled ? 1 : 0,
+                          memory_order_release);
+#endif
+}
+
 static gboolean
 peak_detach_controller_trace_diagnostics_enabled(void)
 {
-    const char* path = getenv("PEAK_DETACH_TRACE_PATH");
-    return path != NULL && path[0] != '\0';
+    return atomic_load_explicit(&trace_diagnostics_enabled,
+                                memory_order_acquire) != 0;
 }
 
 static void
