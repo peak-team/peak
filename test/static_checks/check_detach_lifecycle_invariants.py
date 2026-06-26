@@ -174,6 +174,32 @@ def check_stop_window_trace_gating(repo_root):
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
 
+    support_attach_supported = extract_function(
+        general, "peak_general_listener_support_attach_target_is_supported"
+    )
+    syscall = (repo_root / "src/syscall_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    dlopen_attach = extract_function(dlopen, "dlopen_interceptor_attach")
+    dlopen_dynamic = extract_function(
+        dlopen, "dlopen_interceptor_attach_from_request"
+    )
+    require("peak_unsafe_gum_support_prologue_check" in support_attach_supported,
+            "support attach predicate must use the stricter support prologue policy")
+    require("peak_general_listener_support_attach_target_is_supported" in syscall,
+            "close support replacement must use support prologue policy")
+    require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
+            "dlopen replacement must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
+    require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
+            "dlopen replacement must not use support-only prologue policy")
+    require("peak_general_listener_attach_target_is_supported" in dlopen_dynamic,
+            "dynamic dlopen user targets must use normal target prologue policy")
+    require("peak_general_listener_support_attach_target_is_supported" not in dlopen_dynamic,
+            "dynamic dlopen user targets must not use support prologue policy")
+
 
 def check_general_controller_dlopen_drain_order(repo_root):
     source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")

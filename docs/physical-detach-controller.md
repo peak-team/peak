@@ -823,6 +823,16 @@ policy defers to Gum's own attach result. The conservative PEAK policy can still
 skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
+Some PEAK-owned support replacements may use a separate stricter
+support-prologue guard when skipping that support hook does not remove core
+profiling coverage. The `close` support hook uses this path to avoid relocating
+early-return x86 libc wrapper prologues during shutdown-sensitive runs. The
+support guard intentionally scans a conservative 32-byte x86 prefix and fails
+closed if that small decoder cannot prove the prefix is free of early-return
+control flow. The top-level `dlopen` replacement and dynamic `dlopen` user
+targets remain governed by the default or `conservative` user-target policy so
+dynamic attach is not disabled by support-only early-return checks.
+
 `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1` is a diagnostic override, not a safety mode.
 
 ## Testing Strategy

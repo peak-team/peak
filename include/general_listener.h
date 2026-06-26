@@ -135,6 +135,9 @@ void peak_general_listener_free(PeakGeneralListener* self);
  */
 gboolean peak_general_listener_attach_target_is_supported(const char* symbol_name,
                                                           gpointer address);
+gboolean peak_general_listener_support_attach_target_is_supported(
+    const char* symbol_name,
+    gpointer address);
 
 /**
  * @brief Returns whether unresolved requested targets require dlopen rescans.

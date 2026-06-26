@@ -27,6 +27,28 @@ expect_policy(const char* name,
     return 0;
 }
 
+static int
+expect_support_policy(const char* name,
+                      const guint8* code,
+                      gboolean expected)
+{
+    const char* reason = NULL;
+    gboolean actual =
+        peak_unsafe_gum_support_prologue_check((gpointer)code, &reason);
+
+    if (actual != expected) {
+        fprintf(stderr,
+                "support policy mismatch name=%s expected=%d actual=%d reason=%s\n",
+                name,
+                expected,
+                actual,
+                reason != NULL ? reason : "<none>");
+        return 1;
+    }
+
+    return 0;
+}
+
 int
 main(void)
 {
@@ -94,6 +116,34 @@ main(void)
         0xb8, 0x44, 0x43, 0x42, 0x41,
         0xc3
     };
+    static const guint8 milc_f2d_prefix[] = {
+        0x32, 0xd2,                   /* xor dl, dl */
+        0x33, 0xc0,                   /* xor eax, eax */
+        0x8b, 0x0c, 0x38,             /* mov (%rax,%rdi,1), %ecx */
+        0xfe, 0xc2,                   /* inc %dl */
+        0x89, 0x0c, 0x30              /* mov %ecx, (%rax,%rsi,1) */
+    };
+    static const guint8 close_fastpath[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,       /* endbr64 */
+        0x64, 0x8b, 0x04, 0x25,
+        0x18, 0x00, 0x00, 0x00,       /* mov %fs:0x18, %eax */
+        0x85, 0xc0,                   /* test %eax, %eax */
+        0x75, 0x10,                   /* jne */
+        0xb8, 0x03, 0x00, 0x00, 0x00, /* mov $3, %eax */
+        0x0f, 0x05,                   /* syscall */
+        0x48, 0x3d, 0x00, 0xf0,
+        0xff, 0xff,                   /* cmp $-4096, %rax */
+        0x77, 0x41,                   /* ja */
+        0xc3                          /* ret */
+    };
+    static const guint8 tiny_return[] = {
+        0x33, 0xc0,                   /* xor %eax, %eax */
+        0xc3                          /* ret */
+    };
+    static const guint8 unsupported_before_return[] = {
+        0x0f, 0x1f, 0x00,             /* nopl (%rax) */
+        0xc3                          /* ret */
+    };
 
     if (expect_policy("rdx-prefix-default", rdx_prefix,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, TRUE) ||
@@ -134,7 +184,32 @@ main(void)
                       ret_immediate_after_safe,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
         expect_policy("plain-immediate-conservative", plain_immediate,
-                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE)) {
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
+        expect_policy("milc-f2d-default", milc_f2d_prefix,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, TRUE) ||
+        expect_policy("milc-f2d-conservative", milc_f2d_prefix,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, TRUE) ||
+        expect_policy("close-fastpath-default", close_fastpath,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, FALSE) ||
+        expect_policy("close-fastpath-conservative", close_fastpath,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
+        expect_policy("tiny-return-default", tiny_return,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, FALSE) ||
+        expect_policy("tiny-return-conservative", tiny_return,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
+        expect_policy("unsupported-before-return-default",
+                      unsupported_before_return,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, FALSE) ||
+        expect_policy("unsupported-before-return-conservative",
+                      unsupported_before_return,
+                      PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
+        expect_support_policy("milc-f2d-support", milc_f2d_prefix, TRUE) ||
+        expect_support_policy("close-fastpath-support", close_fastpath, TRUE) ||
+        expect_support_policy("tiny-return-support", tiny_return, TRUE) ||
+        expect_support_policy("unsupported-before-return-support",
+                              unsupported_before_return, TRUE) ||
+        expect_support_policy("plain-immediate-support", plain_immediate,
+                              TRUE)) {
         return 1;
     }
 #elif defined(__aarch64__)
