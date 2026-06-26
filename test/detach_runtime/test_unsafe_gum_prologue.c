@@ -57,8 +57,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_dl_inc_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %dl, %dl\n\t"
         "xor %eax, %eax\n\t"
@@ -72,8 +70,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_dl_add_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %dl, %dl\n\t"
         "xor %eax, %eax\n\t"
@@ -87,8 +83,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_edx_inc_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %edx, %edx\n\t"
         "xor %eax, %eax\n\t"
@@ -102,8 +96,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_edx_add_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %edx, %edx\n\t"
         "xor %eax, %eax\n\t"
@@ -117,8 +109,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_dl_sub_zero_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         ".byte 0x28, 0xd2\n\t"
         "xor %eax, %eax\n\t"
@@ -132,8 +122,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_edx_sub_zero_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         ".byte 0x29, 0xd2\n\t"
         "xor %eax, %eax\n\t"
@@ -147,8 +135,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_dl_mov_zero_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         ".byte 0xb2, 0x00\n\t"
         "xor %eax, %eax\n\t"
@@ -162,8 +148,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_rdx_xor_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %rdx, %rdx\n\t"
         "xor %eax, %eax\n\t"
@@ -177,8 +161,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_edx_mov_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "mov $0, %edx\n\t"
         "xor %eax, %eax\n\t"
@@ -192,8 +174,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_dl_dead_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %dl, %dl\n\t"
         "xor %eax, %eax\n\t"
@@ -206,8 +186,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_rdx_dead_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "xor %rdx, %rdx\n\t"
         "xor %eax, %eax\n\t"
@@ -220,8 +198,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_ret_in_prefix_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "mov (%rdi), %ecx\n\t"
         "mov %ecx, (%rsi)\n\t"
@@ -252,8 +228,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_high_movabs_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "movabs $0xcacbc2c341424344, %r8\n\t"
         "mov (%rdi), %ecx\n\t"
@@ -274,8 +248,6 @@ void
 peak_unsafe_gum_x86_ret_byte_immediate_target(const uint8_t* src,
                                               uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "mov $0xcacbc2c3, %eax\n\t"
         "mov (%rdi), %ecx\n\t"
@@ -300,8 +272,6 @@ void
 peak_unsafe_gum_x86_plain_immediate_target(const uint8_t* src,
                                            uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "mov $0x41424344, %eax\n\t"
         "mov (%rdi), %ecx\n\t"
@@ -343,8 +313,6 @@ __attribute__((naked, noinline, visibility("default")))
 void
 peak_unsafe_gum_x86_long_copy_safe_target(const uint8_t* src, uint8_t* dst)
 {
-    (void)src;
-    (void)dst;
     __asm__ __volatile__(
         "mov (%rdi), %ecx\n\t"
         "mov %ecx, (%rsi)\n\t"
