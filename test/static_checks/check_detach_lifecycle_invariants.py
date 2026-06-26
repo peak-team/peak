@@ -200,6 +200,35 @@ def check_general_controller_dlopen_drain_order(repo_root):
                 "draining dynamic dlopen attach work")
 
 
+def check_exclusive_time_nonnegative(repo_root):
+    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    helper = extract_function(
+        source, "peak_general_listener_exclusive_duration"
+    )
+    pop = extract_function(source, "peak_general_listener_pop_invocation")
+    enter = extract_function(source, "peak_general_listener_on_enter")
+    leave = extract_function(source, "peak_general_listener_on_leave")
+
+    require("gulong stack_level" in source,
+            "invocation data must remember its callback stack level")
+    require("priv->stack_level = thread_data.level" in enter,
+            "on_enter must snapshot the invocation stack level")
+    require("thread_data.level < priv->stack_level" in pop and
+            "thread_data.level > priv->stack_level" in pop,
+            "pop helper must detect/collapse non-LIFO callback stack state")
+    require("child_duration >= total_duration" in helper,
+            "exclusive duration helper must clamp child-over-parent timing")
+    require("return 0.0;" in helper,
+            "exclusive duration helper must return zero for underflow")
+    require("total_duration - child_duration" in helper,
+            "exclusive duration helper must preserve positive self time")
+    require(leave.count("peak_general_listener_exclusive_duration") >= 2,
+            "on_leave must use the exclusive duration clamp in both fast and "
+            "strict/detach paths")
+    require("end_time - thread_data.child_time[thread_data.level]" not in leave,
+            "on_leave must not accumulate open-coded negative exclusive time")
+
+
 def check_dlopen_test_hook_visibility(repo_root):
     header = (repo_root / "include/dlopen_interceptor.h").read_text(
         encoding="utf-8"
@@ -581,6 +610,7 @@ def main():
     check_dlopen_revert_transactions(repo_root)
     check_stop_window_trace_gating(repo_root)
     check_general_controller_dlopen_drain_order(repo_root)
+    check_exclusive_time_nonnegative(repo_root)
     check_dlopen_test_hook_visibility(repo_root)
     check_shutdown_fail_closed_docs(repo_root)
     check_signal_backend_strict_invariants(repo_root)
