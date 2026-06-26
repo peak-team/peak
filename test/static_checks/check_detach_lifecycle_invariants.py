@@ -101,6 +101,9 @@ def check_stop_window_trace_gating(repo_root):
     source = (repo_root / "src/peak_detach_controller.c").read_text(
         encoding="utf-8"
     )
+    general = (repo_root / "src/general_listener.c").read_text(
+        encoding="utf-8"
+    )
     gate = extract_function(
         source, "peak_detach_controller_trace_diagnostics_enabled"
     )
@@ -113,9 +116,34 @@ def check_stop_window_trace_gating(repo_root):
     last_window = extract_function(
         source, "peak_detach_controller_last_stop_window_us"
     )
+    controller_trace_configure = extract_function(
+        source, "peak_detach_controller_configure_trace_diagnostics"
+    )
+    general_trace_enabled = extract_function(
+        general, "peak_general_controller_trace_enabled"
+    )
+    general_trace_detail = extract_function(
+        general, "peak_general_controller_trace_mutation_detail"
+    )
+    general_trace_init = extract_function(
+        general, "peak_general_controller_init_trace_config_once"
+    )
+    general_attach_supported = extract_function(
+        general, "peak_general_listener_attach_target_is_supported"
+    )
+    general_attach_policy_init = extract_function(
+        general, "peak_general_listener_init_attach_policy_once"
+    )
 
-    require("PEAK_DETACH_TRACE_PATH" in gate,
-            "STOP-window diagnostics must be gated by PEAK_DETACH_TRACE_PATH")
+    require("trace_diagnostics_enabled" in gate,
+            "STOP-window diagnostics must be gated by cached trace diagnostics")
+    require("getenv(" not in gate and "g_getenv(" not in gate,
+            "STOP-window diagnostics must not read environment in mutation path")
+    require("getenv(" not in controller_trace_configure and
+            "g_getenv(" not in controller_trace_configure,
+            "detach controller trace configuration must not read environment")
+    require("atomic_store_explicit(&trace_diagnostics_enabled" in source,
+            "detach controller trace configuration must cache explicit state")
     for label, body in (("start", started), ("finish", finished)):
         require("peak_detach_controller_trace_diagnostics_enabled()" in body,
                 f"STOP-window {label} helper must check trace diagnostics")
@@ -126,6 +154,21 @@ def check_stop_window_trace_gating(repo_root):
     require(last_window.find("return 0.0;") <
             last_window.find("peak_detach_controller_lock_mutation_guard"),
             "last_stop_window_us must gate before reading stored timing")
+    require("PEAK_DETACH_TRACE_PATH" in general_trace_init,
+            "general listener must snapshot PEAK_DETACH_TRACE_PATH during init")
+    require("peak_detach_controller_configure_trace_diagnostics" in general_trace_init,
+            "general listener must configure detach-controller trace diagnostics")
+    for label, body in (("general trace gate", general_trace_enabled),
+                        ("general trace detail", general_trace_detail)):
+        require("getenv(" not in body and "g_getenv(" not in body,
+                f"{label} must use cached trace configuration")
+    require("PEAK_ALLOW_UNSAFE_GUM_PROLOGUE" in general_attach_policy_init,
+            "general listener must snapshot unsafe Gum prologue override during init")
+    require("getenv(" not in general_attach_supported and
+            "g_getenv(" not in general_attach_supported,
+            "Gum attach support predicate must use cached attach policy")
+    require("peak_general_listener_init_attach_policy();" in general,
+            "general listener attach must initialize cached attach policy")
 
 
 def check_general_controller_dlopen_drain_order(repo_root):

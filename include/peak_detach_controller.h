@@ -84,6 +84,8 @@ void peak_detach_controller_wait_for_mutation_window(void);
 void peak_detach_controller_note_thread_creation_gate_installed(
     gboolean installed);
 
+void peak_detach_controller_configure_trace_diagnostics(gboolean enabled);
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_thread_creation_gate_epoch(void);

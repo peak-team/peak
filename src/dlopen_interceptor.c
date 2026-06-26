@@ -858,6 +858,14 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         }
 
         gpointer dynamic_hook_address = (gpointer)dynamic_link_func;
+        if (!peak_general_listener_attach_target_is_supported(
+                peak_hook_strings[i],
+                dynamic_hook_address)) {
+            g_printerr("[peak] skipping dynamic Gum attach for hook %lu (%s): unsafe Gum prologue\n",
+                       (unsigned long)i,
+                       peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>");
+            continue;
+        }
         char* demangled = cxa_demangle(peak_hook_strings[i]);
         char* demangled_copy =
             g_strdup(demangled != NULL ? demangled : peak_hook_strings[i]);
@@ -1105,6 +1113,14 @@ int dlopen_interceptor_attach()
     dlopen_hook_address = gum_find_function("dlopen");
 
     if (dlopen_hook_address == NULL) {
+        return replace_check;
+    }
+    if (!peak_general_listener_attach_target_is_supported("dlopen",
+                                                          dlopen_hook_address)) {
+        g_printerr("[peak] skipping dlopen Gum replace: unsupported target prologue\n");
+        g_object_unref(dlopen_interceptor);
+        dlopen_interceptor = NULL;
+        dlopen_hook_address = NULL;
         return replace_check;
     }
 
