@@ -216,6 +216,19 @@ peak_general_listener_init_attach_policy(void)
 
 #if defined(__x86_64__) || defined(__amd64__)
 static gboolean
+peak_x86_match_endbr(const guint8* code, gsize available, gsize* size_out)
+{
+    if (available >= 4 &&
+        code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e &&
+        (code[3] == 0xfa || code[3] == 0xfb)) {
+        *size_out = 4;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static gboolean
 peak_x86_match_zero_rdx(const guint8* code, gsize* size_out)
 {
     if ((code[0] == 0x30 || code[0] == 0x32 ||
@@ -328,6 +341,10 @@ peak_x86_decode_instruction_size(const guint8* code,
     gsize modrm_tail = 0;
 
     *is_return_out = FALSE;
+
+    if (peak_x86_match_endbr(code, available, size_out)) {
+        return TRUE;
+    }
 
     while (offset < available) {
         guint8 prefix = code[offset];
@@ -466,32 +483,6 @@ peak_x86_decode_instruction_size(const guint8* code,
 }
 
 static gboolean
-peak_x86_has_early_return_in_relocated_prefix(const guint8* code)
-{
-    const gsize guard_size = 32;
-    gsize offset = 0;
-
-    while (offset < guard_size) {
-        gsize insn_size = 0;
-        gboolean is_return = FALSE;
-
-        if (!peak_x86_decode_instruction_size(&code[offset],
-                                              guard_size - offset,
-                                              &insn_size,
-                                              &is_return) ||
-            insn_size == 0) {
-            return FALSE;
-        }
-        if (is_return) {
-            return TRUE;
-        }
-        offset += insn_size;
-    }
-
-    return FALSE;
-}
-
-static gboolean
 peak_x86_has_high_movabs_in_relocated_prefix(const guint8* code)
 {
     const gsize guard_size = 32;
@@ -599,11 +590,20 @@ peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(gpointer address)
 {
 #if defined(__x86_64__) || defined(__amd64__)
     const guint8* code = (const guint8*)address;
+    gsize endbr_size = 0;
     gsize zero_size = 0;
     gsize first_load_size = 0;
     const gsize zero_eax_size = 2;
 
-    if (code == NULL || !peak_x86_match_zero_rdx(code, &zero_size)) {
+    if (code == NULL) {
+        return FALSE;
+    }
+
+    if (peak_x86_match_endbr(code, 4, &endbr_size)) {
+        code += endbr_size;
+    }
+
+    if (!peak_x86_match_zero_rdx(code, &zero_size)) {
         return FALSE;
     }
 
@@ -626,30 +626,6 @@ peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(gpointer address)
     }
 
     return TRUE;
-#else
-    (void)address;
-    return FALSE;
-#endif
-}
-
-static gboolean
-peak_general_listener_has_unsafe_x86_early_return_prologue(gpointer address)
-{
-#if defined(__x86_64__) || defined(__amd64__)
-    const guint8* code = (const guint8*)address;
-
-    if (code == NULL) {
-        return FALSE;
-    }
-
-    /*
-     * Frontera Intel canaries show Gum attach may crash when a tiny leaf
-     * function returns inside the early bytes Gum has to relocate. Keep this
-     * deliberately narrow: direct x86 returns only, and only inside the first
-     * 32 bytes. Normal small functions whose body continues past the relocated
-     * prefix remain attachable.
-     */
-    return peak_x86_has_early_return_in_relocated_prefix(code);
 #else
     (void)address;
     return FALSE;
@@ -777,7 +753,6 @@ static gboolean
 peak_general_listener_has_unsafe_gum_prologue(gpointer address)
 {
     return peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(address) ||
-           peak_general_listener_has_unsafe_x86_early_return_prologue(address) ||
            peak_general_listener_has_unsafe_x86_high_movabs_prologue(address) ||
            peak_general_listener_has_unsafe_x86_return_immediate_prologue(address) ||
            peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(address);
