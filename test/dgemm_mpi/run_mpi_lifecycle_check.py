@@ -256,6 +256,15 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 1
 
+    if args.require_detach_trace:
+        # The strict-detach lifecycle variant intentionally uses an extremely
+        # low detach threshold. A correct run may physically detach before any
+        # sampled calls remain for the human-readable table, so the trace and
+        # stats file are scheduler-dependent; the trace is the stable
+        # mutation assertion for this mode.
+        expected_peak_tables = 0
+        expected_stats_files = None
+
     executable = [args.exe]
 
     command = [
