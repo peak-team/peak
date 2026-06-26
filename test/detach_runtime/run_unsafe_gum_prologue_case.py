@@ -6,11 +6,26 @@ import subprocess
 import sys
 
 
-def line_mentions_skip_for_target(stderr, target):
+def line_mentions_peak_policy_skip_for_target(stderr, target):
     for line in stderr.splitlines():
         if "skipping Gum attach" in line and target in line:
             return True
-        if "Gum initial attach failed" in line and target in line:
+    return False
+
+
+def line_mentions_gum_attach_failure_for_target(stderr, target):
+    for line in stderr.splitlines():
+        if (("Gum initial attach failed" in line or
+             "skipping initial Gum attach" in line or
+             "skipping dynamic Gum attach" in line or
+             "skipping JIT attach" in line) and target in line):
+            return True
+    return False
+
+
+def line_mentions_profile_row_for_target(output, target):
+    for line in output.splitlines():
+        if line.startswith("|") and target in line:
             return True
     return False
 
@@ -49,7 +64,8 @@ def run_case(args):
                 f"guarded run for {args.case} did not print {expected_ok!r}\n"
                 f"{combined}"
             )
-        if not line_mentions_skip_for_target(proc.stderr, args.target):
+        if not line_mentions_peak_policy_skip_for_target(proc.stderr,
+                                                         args.target):
             raise AssertionError(
                 f"guarded run for {args.case} did not prove PEAK skipped {args.target}\n"
                 f"{combined}"
@@ -57,25 +73,34 @@ def run_case(args):
         print(f"unsafe_gum_prologue_guard_check_ok case={args.case}")
         return 0
 
-    if args.mode == "default-allows":
+    if args.mode == "default-allows" or args.mode == "no-policy-skip":
         expected_ok = f"unsafe_gum_prologue_guard_ok:{args.case}"
         if proc.returncode != 0:
             raise AssertionError(
-                f"default run for {args.case} exited {proc.returncode}\n{combined}"
+                f"{args.mode} run for {args.case} exited {proc.returncode}\n"
+                f"{combined}"
             )
         if expected_ok not in proc.stdout:
             raise AssertionError(
-                f"default run for {args.case} did not print {expected_ok!r}\n"
+                f"{args.mode} run for {args.case} did not print {expected_ok!r}\n"
                 f"{combined}"
             )
-        if line_mentions_skip_for_target(proc.stderr, args.target):
+        if line_mentions_peak_policy_skip_for_target(proc.stderr, args.target):
             raise AssertionError(
-                f"default run for {args.case} unexpectedly skipped {args.target}\n"
+                f"{args.mode} run for {args.case} unexpectedly skipped {args.target}\n"
                 f"{combined}"
             )
-        if args.target not in combined:
+        if args.mode == "no-policy-skip":
+            print(f"unsafe_gum_prologue_no_policy_skip_ok case={args.case}")
+            return 0
+        if line_mentions_gum_attach_failure_for_target(proc.stderr, args.target):
             raise AssertionError(
-                f"default run for {args.case} did not prove PEAK saw {args.target}\n"
+                f"default run for {args.case} did not attach {args.target}\n"
+                f"{combined}"
+            )
+        if not line_mentions_profile_row_for_target(combined, args.target):
+            raise AssertionError(
+                f"default run for {args.case} did not prove PEAK profiled {args.target}\n"
                 f"{combined}"
             )
         print(f"unsafe_gum_prologue_default_allows_ok case={args.case}")
@@ -83,19 +108,6 @@ def run_case(args):
 
     expected_mismatch = f"unsafe_prologue_mismatch case={args.case}"
     if proc.returncode == 0:
-        endbr_marker = f"unsafe_gum_prologue_endbr_prefix:{args.case}"
-        if endbr_marker in proc.stdout:
-            print(
-                f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
-                "endbr-preserved=1"
-            )
-            return 0
-        if args.target in combined:
-            print(
-                f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
-                "override-attached-preserved=1"
-            )
-            return 0
         raise AssertionError(
             f"override run for {args.case} unexpectedly preserved semantics\n"
             f"{combined}"
@@ -133,7 +145,8 @@ def main():
     parser.add_argument("--target", required=True)
     parser.add_argument(
         "--mode",
-        choices=("guard", "default-allows", "override-corrupts"),
+        choices=("guard", "default-allows", "no-policy-skip",
+                 "override-corrupts"),
         required=True,
     )
     parser.add_argument("--expected-byte", type=int)

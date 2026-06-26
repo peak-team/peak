@@ -5,6 +5,7 @@
 #include "peak_jit_provider.h"
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
+#include "unsafe_gum_prologue.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -39,7 +40,6 @@
 #define PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV "PEAK_CONTROLLER_MAX_PENDING_AGE_MS"
 #define PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV "PEAK_CONTROLLER_MAX_RETRY_COUNT"
 #define PEAK_REATTACH_COOLDOWN_MS_ENV "PEAK_REATTACH_COOLDOWN_MS"
-#define PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"
 
 PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
@@ -111,6 +111,8 @@ static gchar* peak_controller_trace_path = NULL;
 static gboolean peak_controller_trace_enabled = FALSE;
 static gsize peak_attach_policy_initialized = 0;
 static gboolean peak_allow_unsafe_gum_prologue = FALSE;
+static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
+    PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT;
 static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
@@ -201,8 +203,24 @@ peak_env_value_falsey(const char* value)
 static void
 peak_general_listener_init_attach_policy_once(void)
 {
+    gboolean policy_valid = FALSE;
+
     peak_allow_unsafe_gum_prologue =
         peak_env_value_truthy(g_getenv(PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV));
+
+    peak_unsafe_gum_prologue_policy =
+        peak_unsafe_gum_prologue_policy_from_env(
+            g_getenv(PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV),
+            &policy_valid);
+    if (!policy_valid) {
+        g_printerr("[peak] ignoring invalid %s=%s; using %s policy\n",
+                   PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV,
+                   g_getenv(PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV),
+                   peak_unsafe_gum_prologue_policy_name(
+                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT));
+        peak_unsafe_gum_prologue_policy =
+            PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT;
+    }
 }
 
 static void
@@ -214,569 +232,26 @@ peak_general_listener_init_attach_policy(void)
     }
 }
 
-#if defined(__x86_64__) || defined(__amd64__)
-static gboolean
-peak_x86_match_endbr(const guint8* code, gsize available, gsize* size_out)
-{
-    if (available >= 4 &&
-        code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e &&
-        (code[3] == 0xfa || code[3] == 0xfb)) {
-        *size_out = 4;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_match_zero_rdx(const guint8* code, gsize* size_out)
-{
-    if ((code[0] == 0x30 || code[0] == 0x32 ||
-         code[0] == 0x28 || code[0] == 0x2a ||
-         code[0] == 0x31 || code[0] == 0x33 ||
-         code[0] == 0x29 || code[0] == 0x2b) &&
-        code[1] == 0xd2) {
-        *size_out = 2;
-        return TRUE;
-    }
-
-    if (code[0] == 0x48 &&
-        (code[1] == 0x31 || code[1] == 0x33 ||
-         code[1] == 0x29 || code[1] == 0x2b) &&
-        code[2] == 0xd2) {
-        *size_out = 3;
-        return TRUE;
-    }
-
-    if (code[0] == 0xb2 && code[1] == 0x00) {
-        *size_out = 2;
-        return TRUE;
-    }
-
-    if (code[0] == 0xba &&
-        code[1] == 0x00 && code[2] == 0x00 &&
-        code[3] == 0x00 && code[4] == 0x00) {
-        *size_out = 5;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_match_zero_eax(const guint8* code)
-{
-    return (code[0] == 0x31 || code[0] == 0x33) && code[1] == 0xc0;
-}
-
-static gboolean
-peak_x86_match_first_indexed_load_after_zero(const guint8* code,
-                                             gsize* size_out)
-{
-    if (code[0] == 0x8b && code[1] == 0x0c &&
-        (code[2] == 0x07 || code[2] == 0x38)) {
-        *size_out = 3;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_modrm_tail_size(const guint8* code,
-                         gsize available,
-                         gsize* size_out)
-{
-    guint8 modrm;
-    guint8 mod;
-    guint8 rm;
-    gsize size = 1;
-
-    if (available == 0) {
-        return FALSE;
-    }
-
-    modrm = code[0];
-    mod = modrm >> 6;
-    rm = modrm & 0x7u;
-
-    if (mod != 3 && rm == 4) {
-        guint8 sib;
-        guint8 base;
-        if (available < size + 1) {
-            return FALSE;
-        }
-        sib = code[size++];
-        base = sib & 0x7u;
-        if (mod == 0 && base == 5) {
-            size += 4;
-        }
-    } else if (mod == 0 && rm == 5) {
-        size += 4;
-    }
-
-    if (mod == 1) {
-        size += 1;
-    } else if (mod == 2) {
-        size += 4;
-    }
-
-    if (size > available) {
-        return FALSE;
-    }
-
-    *size_out = size;
-    return TRUE;
-}
-
-static gboolean
-peak_x86_decode_instruction_size(const guint8* code,
-                                 gsize available,
-                                 gsize* size_out,
-                                 gboolean* is_return_out)
-{
-    gsize offset = 0;
-    gboolean rex_w = FALSE;
-    gboolean operand16 = FALSE;
-    guint8 op;
-    gsize modrm_tail = 0;
-
-    *is_return_out = FALSE;
-
-    if (peak_x86_match_endbr(code, available, size_out)) {
-        return TRUE;
-    }
-
-    while (offset < available) {
-        guint8 prefix = code[offset];
-        if (prefix == 0x66) {
-            operand16 = TRUE;
-            offset++;
-        } else if (prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3 ||
-                   prefix == 0x2e || prefix == 0x36 || prefix == 0x3e ||
-                   prefix == 0x26 || prefix == 0x64 || prefix == 0x65 ||
-                   prefix == 0x67) {
-            offset++;
-        } else if (prefix >= 0x40 && prefix <= 0x4f) {
-            rex_w = (prefix & 0x08u) != 0;
-            offset++;
-        } else {
-            break;
-        }
-    }
-
-    if (offset >= available) {
-        return FALSE;
-    }
-
-    op = code[offset++];
-    if (op == 0xc3 || op == 0xcb) {
-        *size_out = offset;
-        *is_return_out = TRUE;
-        return TRUE;
-    }
-    if (op == 0xc2 || op == 0xca) {
-        if (available < offset + 2) {
-            return FALSE;
-        }
-        *size_out = offset + 2;
-        *is_return_out = TRUE;
-        return TRUE;
-    }
-
-    if (op >= 0xb8 && op <= 0xbf) {
-        gsize imm_size = rex_w ? 8 : (operand16 ? 2 : 4);
-        if (available < offset + imm_size) {
-            return FALSE;
-        }
-        *size_out = offset + imm_size;
-        return TRUE;
-    }
-
-    if (op == 0x68 || op == 0xe8 || op == 0xe9) {
-        if (available < offset + 4) {
-            return FALSE;
-        }
-        *size_out = offset + 4;
-        return TRUE;
-    }
-
-    if (op == 0x6a || op == 0xeb || (op >= 0x70 && op <= 0x7f)) {
-        if (available < offset + 1) {
-            return FALSE;
-        }
-        *size_out = offset + 1;
-        return TRUE;
-    }
-
-    if ((op >= 0x50 && op <= 0x5f) || op == 0x90 || op == 0x9c ||
-        op == 0x9d || op == 0xcc) {
-        *size_out = offset;
-        return TRUE;
-    }
-
-    if (op == 0x80 || op == 0x82 || op == 0x83 ||
-        op == 0xc0 || op == 0xc1 || op == 0xc6) {
-        if (!peak_x86_modrm_tail_size(&code[offset],
-                                      available - offset,
-                                      &modrm_tail)) {
-            return FALSE;
-        }
-        if (available < offset + modrm_tail + 1) {
-            return FALSE;
-        }
-        *size_out = offset + modrm_tail + 1;
-        return TRUE;
-    }
-
-    if (op == 0x81 || op == 0xc7) {
-        gsize imm_size = operand16 ? 2 : 4;
-        if (!peak_x86_modrm_tail_size(&code[offset],
-                                      available - offset,
-                                      &modrm_tail)) {
-            return FALSE;
-        }
-        if (available < offset + modrm_tail + imm_size) {
-            return FALSE;
-        }
-        *size_out = offset + modrm_tail + imm_size;
-        return TRUE;
-    }
-
-    if ((op <= 0x3b && (op & 0x07u) <= 0x03u) ||
-        op == 0x84 || op == 0x85 ||
-        (op >= 0x88 && op <= 0x8f) ||
-        op == 0xfe || op == 0xff) {
-        if (!peak_x86_modrm_tail_size(&code[offset],
-                                      available - offset,
-                                      &modrm_tail)) {
-            return FALSE;
-        }
-        *size_out = offset + modrm_tail;
-        return TRUE;
-    }
-
-    if (op == 0x0f) {
-        if (available <= offset) {
-            return FALSE;
-        }
-        op = code[offset++];
-        if (op >= 0x80 && op <= 0x8f) {
-            if (available < offset + 4) {
-                return FALSE;
-            }
-            *size_out = offset + 4;
-            return TRUE;
-        }
-        if ((op >= 0x90 && op <= 0x9f) ||
-            (op >= 0xb6 && op <= 0xbf)) {
-            if (!peak_x86_modrm_tail_size(&code[offset],
-                                          available - offset,
-                                          &modrm_tail)) {
-                return FALSE;
-            }
-            *size_out = offset + modrm_tail;
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_has_high_movabs_in_relocated_prefix(const guint8* code)
-{
-    const gsize guard_size = 32;
-    gsize offset = 0;
-
-    while (offset < guard_size) {
-        gsize insn_size = 0;
-        gboolean is_return = FALSE;
-
-        if (offset + 1 < guard_size &&
-            code[offset] >= 0x40 && code[offset] <= 0x4f &&
-            (code[offset] & 0x08u) != 0 &&
-            (code[offset] & 0x01u) != 0 &&
-            code[offset + 1] >= 0xb8 && code[offset + 1] <= 0xbf) {
-            return TRUE;
-        }
-
-        if (!peak_x86_decode_instruction_size(&code[offset],
-                                              guard_size - offset,
-                                              &insn_size,
-                                              &is_return) ||
-            insn_size == 0) {
-            return FALSE;
-        }
-        offset += insn_size;
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_immediate_contains_return_opcode(const guint8* immediate, gsize size)
-{
-    for (gsize i = 0; i < size; i++) {
-        if (immediate[i] == 0xc2 || immediate[i] == 0xc3 ||
-            immediate[i] == 0xca || immediate[i] == 0xcb) {
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_x86_has_return_opcode_mov_immediate_in_relocated_prefix(const guint8* code)
-{
-    const gsize guard_size = 32;
-    gsize offset = 0;
-
-    while (offset < guard_size) {
-        gsize insn_size = 0;
-        gsize prefix_size = 0;
-        gboolean operand16 = FALSE;
-        gboolean rex_w = FALSE;
-        gboolean is_return = FALSE;
-        guint8 op;
-
-        while (offset + prefix_size < guard_size) {
-            guint8 prefix = code[offset + prefix_size];
-            if (prefix == 0x66) {
-                operand16 = TRUE;
-                prefix_size++;
-            } else if (prefix == 0xf0 || prefix == 0xf2 || prefix == 0xf3 ||
-                       prefix == 0x2e || prefix == 0x36 || prefix == 0x3e ||
-                       prefix == 0x26 || prefix == 0x64 || prefix == 0x65 ||
-                       prefix == 0x67) {
-                prefix_size++;
-            } else if (prefix >= 0x40 && prefix <= 0x4f) {
-                rex_w = (prefix & 0x08u) != 0;
-                prefix_size++;
-            } else {
-                break;
-            }
-        }
-
-        if (offset + prefix_size < guard_size) {
-            op = code[offset + prefix_size];
-            if (op >= 0xb8 && op <= 0xbf) {
-                gsize imm_size = rex_w ? 8 : (operand16 ? 2 : 4);
-                gsize imm_offset = offset + prefix_size + 1;
-                if (imm_offset + imm_size <= guard_size &&
-                    peak_x86_immediate_contains_return_opcode(&code[imm_offset],
-                                                              imm_size)) {
-                    return TRUE;
-                }
-            }
-        }
-
-        if (!peak_x86_decode_instruction_size(&code[offset],
-                                              guard_size - offset,
-                                              &insn_size,
-                                              &is_return) ||
-            insn_size == 0) {
-            return FALSE;
-        }
-        offset += insn_size;
-    }
-
-    return FALSE;
-}
-#endif
-
-static gboolean
-peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(gpointer address)
-{
-#if defined(__x86_64__) || defined(__amd64__)
-    const guint8* code = (const guint8*)address;
-    gsize endbr_size = 0;
-    gsize zero_size = 0;
-    gsize first_load_size = 0;
-    const gsize zero_eax_size = 2;
-
-    if (code == NULL) {
-        return FALSE;
-    }
-
-    if (peak_x86_match_endbr(code, 4, &endbr_size)) {
-        code += endbr_size;
-    }
-
-    if (!peak_x86_match_zero_rdx(code, &zero_size)) {
-        return FALSE;
-    }
-
-    /*
-     * Frida Gum 16.5.9's x86 invoke trampoline may use RDX after executing
-     * relocated prologue instructions but before returning to the original
-     * function body. Tiny leaf loops such as MILC's f2d_4mat initialize a
-     * DL/EDX/RDX value, zero EAX, and execute the first indexed load in
-     * relocated bytes. GCC/local canaries prove live counter variants corrupt
-     * application data when Gum clobbers RDX at jump-back, and Frontera Intel
-     * canaries show even the short same-prefix variants can crash when Gum
-     * attaches. Guard only this audited prefix family by default; unrelated
-     * small copy prologues remain attachable.
-     */
-    if (!peak_x86_match_zero_eax(&code[zero_size]) ||
-        !peak_x86_match_first_indexed_load_after_zero(
-            &code[zero_size + zero_eax_size],
-            &first_load_size)) {
-        return FALSE;
-    }
-
-    return TRUE;
-#else
-    (void)address;
-    return FALSE;
-#endif
-}
-
-static gboolean G_GNUC_UNUSED
-peak_general_listener_has_unsafe_x86_high_movabs_prologue(gpointer address)
-{
-#if defined(__x86_64__) || defined(__amd64__)
-    const guint8* code = (const guint8*)address;
-
-    if (code == NULL) {
-        return FALSE;
-    }
-
-    /*
-     * Frontera Intel canaries also show Gum attach can crash while relocating
-     * a high-register movabs in the early target prologue. Keep the guard at
-     * decoded instruction starts so immediate bytes in other instructions do
-     * not cause false positives.
-     */
-    return peak_x86_has_high_movabs_in_relocated_prefix(code);
-#else
-    (void)address;
-    return FALSE;
-#endif
-}
-
-static gboolean G_GNUC_UNUSED
-peak_general_listener_has_unsafe_x86_return_immediate_prologue(gpointer address)
-{
-#if defined(__x86_64__) || defined(__amd64__)
-    const guint8* code = (const guint8*)address;
-
-    if (code == NULL) {
-        return FALSE;
-    }
-
-    /*
-     * Frontera Intel canaries show Gum can crash when return opcodes appear
-     * inside an early mov-immediate register operand. Guard that decoded
-     * immediate shape, but do not reject ordinary mov-immediate prologues:
-     * real BLAS entry points commonly use them and must remain attachable.
-     */
-    return peak_x86_has_return_opcode_mov_immediate_in_relocated_prefix(code);
-#else
-    (void)address;
-    return FALSE;
-#endif
-}
-
-static gboolean
-peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(gpointer address)
-{
-#if defined(__aarch64__)
-    const guint8* code = (const guint8*)address;
-
-    if (code == NULL) {
-        return FALSE;
-    }
-
-    for (gsize i = 0; i < 4; i++) {
-        guint32 reg = 0;
-        guint32 insn;
-        guint32 rd;
-        guint32 rn;
-        guint32 rm;
-        guint32 imm16;
-        guint32 hw;
-
-        memcpy(&insn, code + (i * 4), sizeof(insn));
-        rd = insn & 0x1fu;
-        rn = (insn >> 5) & 0x1fu;
-        rm = (insn >> 16) & 0x1fu;
-        imm16 = (insn >> 5) & 0xffffu;
-        hw = (insn >> 21) & 0x3u;
-
-        if (!(rd == 16 || rd == 17)) {
-            continue;
-        }
-
-        if ((insn & 0x7f800000u) == 0x52800000u && hw == 0 && imm16 <= 64) {
-            reg = rd;
-        } else if ((insn & 0x7fe0ffe0u) == 0x2a0003e0u && rm <= 3) {
-            reg = rd;
-        } else if ((insn & 0x1f000000u) == 0x11000000u &&
-                   (rn <= 3 || rn == 16 || rn == 17)) {
-            reg = rd;
-        } else if ((insn & 0x1f000000u) == 0x10000000u) {
-            reg = rd;
-        } else {
-            continue;
-        }
-
-        /*
-         * AArch64 trampolines and veneers commonly use IP0/IP1 (x16/x17) as
-         * scratch registers. If a relocated prologue defines one of these
-         * registers and the original body consumes it after Gum's jump-back,
-         * PEAK cannot prove the target semantics are preserved.
-         */
-        for (gsize j = i + 1; j < 8; j++) {
-            guint32 next;
-            guint32 rt;
-            memcpy(&next, code + (j * 4), sizeof(next));
-            rt = next & 0x1fu;
-            rn = (next >> 5) & 0x1fu;
-            rm = (next >> 16) & 0x1fu;
-            if (((next & 0x7e000000u) == 0x34000000u && rt == reg) ||
-                rn == reg ||
-                rm == reg) {
-                return TRUE;
-            }
-        }
-    }
-
-    return FALSE;
-#else
-    (void)address;
-    return FALSE;
-#endif
-}
-
-static gboolean
-peak_general_listener_has_unsafe_gum_prologue(gpointer address)
-{
-    /*
-     * Keep the default skip policy intentionally narrow. The RDX/DL/EDX
-     * prefix family is the audited MILC f2d_4mat-style corruption pattern:
-     * Gum may clobber RDX after relocated bytes run, while the original body
-     * still depends on that value. Broader instruction-shape canaries are too
-     * prone to reject legitimate BLAS/library entry points.
-     */
-    return peak_general_listener_has_unsafe_x86_rdx_prefix_prologue(address) ||
-           peak_general_listener_has_unsafe_arm64_ip_liveout_prologue(address);
-}
-
 gboolean
 peak_general_listener_attach_target_is_supported(const char* symbol_name,
                                                  gpointer address)
 {
+    const char* reason = NULL;
+
     peak_general_listener_init_attach_policy();
 
     if (peak_allow_unsafe_gum_prologue) {
         return TRUE;
     }
 
-    if (peak_general_listener_has_unsafe_gum_prologue(address)) {
-        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is not safe for Gum relocation; set %s=1 to override\n",
+    if (peak_unsafe_gum_prologue_check(address,
+                                       peak_unsafe_gum_prologue_policy,
+                                       &reason)) {
+        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is not safe for Gum relocation (reason=%s, policy=%s); set %s=1 to override\n",
                    symbol_name != NULL ? symbol_name : "<unknown>",
+                   reason != NULL ? reason : "unknown",
+                   peak_unsafe_gum_prologue_policy_name(
+                       peak_unsafe_gum_prologue_policy),
                    PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
         return FALSE;
     }

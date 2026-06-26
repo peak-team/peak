@@ -258,6 +258,26 @@ peak_unsafe_gum_x86_high_movabs_target(const uint8_t* src, uint8_t* dst)
 
 __attribute__((naked, noinline, visibility("default")))
 void
+peak_unsafe_gum_x86_high_movabs_benign_target(const uint8_t* src,
+                                              uint8_t* dst)
+{
+    __asm__ __volatile__(
+        "movabs $0x4142434445464748, %r8\n\t"
+        "mov (%rdi), %ecx\n\t"
+        "mov %ecx, (%rsi)\n\t"
+        "mov 0x4(%rdi), %ecx\n\t"
+        "mov %ecx, 0x4(%rsi)\n\t"
+        "mov 0x8(%rdi), %ecx\n\t"
+        "mov %ecx, 0x8(%rsi)\n\t"
+        "mov 0xc(%rdi), %ecx\n\t"
+        "mov %ecx, 0xc(%rsi)\n\t"
+        "mov 0x10(%rdi), %ecx\n\t"
+        "mov %ecx, 0x10(%rsi)\n\t"
+        "ret\n\t");
+}
+
+__attribute__((naked, noinline, visibility("default")))
+void
 peak_unsafe_gum_x86_ret_byte_immediate_target(const uint8_t* src,
                                               uint8_t* dst)
 {
@@ -393,6 +413,8 @@ static const UnsafeCase unsafe_cases[] = {
       peak_unsafe_gum_x86_safe_c_target, 32 },
     { "x86_high_movabs", "peak_unsafe_gum_x86_high_movabs_target",
       peak_unsafe_gum_x86_high_movabs_target, 20 },
+    { "x86_high_movabs_benign", "peak_unsafe_gum_x86_high_movabs_benign_target",
+      peak_unsafe_gum_x86_high_movabs_benign_target, 20 },
     { "x86_ret_byte_immediate", "peak_unsafe_gum_x86_ret_byte_immediate_target",
       peak_unsafe_gum_x86_ret_byte_immediate_target, 28 },
     { "x86_plain_immediate", "peak_unsafe_gum_x86_plain_immediate_target",
@@ -402,11 +424,15 @@ static const UnsafeCase unsafe_cases[] = {
 };
 #elif defined(__aarch64__)
 void peak_unsafe_gum_arm64_ip_counter_target(const uint8_t* src, uint8_t* dst);
+void peak_unsafe_gum_arm64_ip_x17_counter_target(const uint8_t* src,
+                                                 uint8_t* dst);
 void peak_unsafe_gum_arm64_ip_cursor_target(const uint8_t* src, uint8_t* dst);
 
 static const UnsafeCase unsafe_cases[] = {
     { "arm64_ip_counter", "peak_unsafe_gum_arm64_ip_counter_target",
       peak_unsafe_gum_arm64_ip_counter_target, 256 },
+    { "arm64_ip_x17_counter", "peak_unsafe_gum_arm64_ip_x17_counter_target",
+      peak_unsafe_gum_arm64_ip_x17_counter_target, 256 },
     { "arm64_ip_cursor", "peak_unsafe_gum_arm64_ip_cursor_target",
       peak_unsafe_gum_arm64_ip_cursor_target, 256 },
 };
