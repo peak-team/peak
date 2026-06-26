@@ -804,17 +804,14 @@ may then clobber `RDX` before jumping back to the original function body,
 corrupting application data even when physical detach is disabled. GCC/local
 canaries reproduce the historical byte-72 corruption for live counter variants,
 while Frontera Intel canaries show the same prefix family can also crash for
-short variants where `RDX` is not consumed afterward. A second Frontera canary
-showed Gum may also crash when a tiny function returns inside the early bytes Gum
-has to relocate; the Intel compiler placed the real return of one C copy canary
-at byte 17. PEAK therefore skips direct x86 returns reached by decoding the
-first 32 bytes of the function prologue. Additional Frontera canaries showed
-Gum can also crash while attaching to high-register `movabs` prologues and to
-early `mov imm` operands containing x86 return-opcode bytes, so PEAK skips those
-decoded immediate shapes without raw-scanning arbitrary prologue bytes. Ordinary
-`mov imm` setup prologues are not blocked by default because real BLAS entry
-points commonly use them and must remain attachable. Unrelated longer copy
-prologues remain attachable. On Arm64, PEAK conservatively skips
+short variants where `RDX` is not consumed afterward. Additional Frontera
+canaries showed Gum can also crash while attaching to high-register `movabs`
+prologues and to early `mov imm` operands containing x86 return-opcode bytes, so
+PEAK skips those decoded immediate shapes without raw-scanning arbitrary prologue
+bytes. Tiny functions and ordinary `mov imm` setup prologues are not blocked by
+default because real dynamic-library and BLAS entry points commonly use them and
+must remain attachable. Unrelated longer copy prologues remain attachable. On
+Arm64, PEAK conservatively skips
 prologues that define
 `x16`/`x17` (`ip0`/`ip1`) and consume that value in the following instructions,
 because those registers are the standard platform scratch registers used by

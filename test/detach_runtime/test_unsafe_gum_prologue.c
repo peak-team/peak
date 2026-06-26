@@ -416,10 +416,28 @@ find_case(const char* name)
 }
 
 static int
+case_has_endbr_prefix(const UnsafeCase* test_case)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    const uint8_t* code = (const uint8_t*)(const void*)test_case->fn;
+
+    return code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e &&
+           (code[3] == 0xfa || code[3] == 0xfb);
+#else
+    (void)test_case;
+    return 0;
+#endif
+}
+
+static int
 run_case(const UnsafeCase* test_case)
 {
     uint8_t src[288];
     uint8_t dst[288];
+
+    if (case_has_endbr_prefix(test_case)) {
+        printf("unsafe_gum_prologue_endbr_prefix:%s\n", test_case->name);
+    }
 
     for (int iter = 0; iter < 1000; iter++) {
         for (int i = 0; i < (int)sizeof(src); i++) {

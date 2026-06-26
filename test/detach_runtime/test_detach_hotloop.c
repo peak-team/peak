@@ -3146,6 +3146,8 @@ main(int argc, char** argv)
         return run_pthread_gate_race_check(argc, argv);
     }
 
+    unlink_if_path(getenv("PEAK_DETACH_TRACE_PATH"));
+
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
     long spawner_threads = parse_long_arg(argc, argv, "--spawner-threads", 2);

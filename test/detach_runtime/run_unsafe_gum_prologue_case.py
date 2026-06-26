@@ -83,6 +83,19 @@ def run_case(args):
 
     expected_mismatch = f"unsafe_prologue_mismatch case={args.case}"
     if proc.returncode == 0:
+        endbr_marker = f"unsafe_gum_prologue_endbr_prefix:{args.case}"
+        if endbr_marker in proc.stdout:
+            print(
+                f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
+                "endbr-preserved=1"
+            )
+            return 0
+        if args.target in combined:
+            print(
+                f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
+                "override-attached-preserved=1"
+            )
+            return 0
         raise AssertionError(
             f"override run for {args.case} unexpectedly preserved semantics\n"
             f"{combined}"

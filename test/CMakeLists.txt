@@ -133,7 +133,6 @@ if(BUILD_TESTING)
                 "x86_edx_mov|peak_unsafe_gum_x86_edx_mov_target"
                 "x86_dl_dead|peak_unsafe_gum_x86_dl_dead_target"
                 "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target"
-                "x86_ret_in_prefix|peak_unsafe_gum_x86_ret_in_prefix_target"
                 "x86_high_movabs|peak_unsafe_gum_x86_high_movabs_target"
                 "x86_ret_byte_immediate|peak_unsafe_gum_x86_ret_byte_immediate_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_ALLOWED_CASES
@@ -220,8 +219,8 @@ if(BUILD_TESTING)
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 2)
         set_tests_properties(test_detach_hotloop_signal_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "peak_detach_hot_target[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/signal-hotloop-trace.csv;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "trace_detach_success=1"
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
                 TIMEOUT 45)
 
