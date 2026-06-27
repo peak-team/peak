@@ -116,6 +116,15 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
  */
 void peak_general_listener_suspend_callbacks(void);
 
+/**
+ * @brief Records that the application has requested MPI finalization.
+ *
+ * After this point PEAK may continue to count already-pinned callbacks until
+ * process exit, but it must not start helper-backed target hook mutations that
+ * can fork after MPI/libfabric teardown has begun.
+ */
+void peak_general_listener_note_mpi_finalize_requested(void);
+
 #if defined(PEAK_ENABLE_TEST_HOOKS) && defined(HAVE_MPI)
 gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                      char* out,

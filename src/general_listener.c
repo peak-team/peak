@@ -6,9 +6,6 @@
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
 #include "unsafe_gum_prologue.h"
-#ifdef HAVE_MPI
-#include "mpi_interceptor.h"
-#endif
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -121,6 +118,7 @@ static const unsigned int peak_controller_default_max_retry_count = 300;
 static const double peak_controller_default_max_pending_age_s = 30.0;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
+static _Atomic gboolean peak_general_mpi_finalize_requested = FALSE;
 static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
@@ -1346,11 +1344,8 @@ static void peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookS
 static gboolean
 peak_general_controller_mpi_finalize_requested(void)
 {
-#ifdef HAVE_MPI
-    return mpi_interceptor_finalize_was_requested() != 0;
-#else
-    return FALSE;
-#endif
+    return atomic_load_explicit(&peak_general_mpi_finalize_requested,
+                                memory_order_acquire);
 }
 
 void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
@@ -3541,6 +3536,14 @@ void
 peak_general_listener_suspend_callbacks(void)
 {
     atomic_store_explicit(&peak_general_callbacks_suspended,
+                          TRUE,
+                          memory_order_release);
+}
+
+void
+peak_general_listener_note_mpi_finalize_requested(void)
+{
+    atomic_store_explicit(&peak_general_mpi_finalize_requested,
                           TRUE,
                           memory_order_release);
 }

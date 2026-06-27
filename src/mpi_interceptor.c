@@ -1,4 +1,5 @@
 #include "mpi_interceptor.h"
+#include "general_listener.h"
 
 #include <sched.h>
 #include <stdlib.h>
@@ -119,6 +120,7 @@ mpi_interceptor_mark_finalize_requested(void)
 {
     int expected = PEAK_MPI_FINALIZE_NOT_REQUESTED;
 
+    peak_general_listener_note_mpi_finalize_requested();
     (void)__atomic_compare_exchange_n(
         &peak_finalize_state,
         &expected,
