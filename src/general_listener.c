@@ -6,6 +6,9 @@
 #include "peak_detach_controller.h"
 #include "pthread_listener.h"
 #include "unsafe_gum_prologue.h"
+#ifdef HAVE_MPI
+#include "mpi_interceptor.h"
+#endif
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -1340,6 +1343,16 @@ static void peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookS
     peak_general_listener_publish_legacy_flags_unlocked(hook_id);
 }
 
+static gboolean
+peak_general_controller_mpi_finalize_requested(void)
+{
+#ifdef HAVE_MPI
+    return mpi_interceptor_finalize_was_requested() != 0;
+#else
+    return FALSE;
+#endif
+}
+
 void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
 {
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
@@ -1355,6 +1368,10 @@ peak_general_listener_request_detach_with_context_unlocked(
     double total_time,
     double rate)
 {
+    if (peak_general_controller_mpi_finalize_requested()) {
+        return FALSE;
+    }
+
     if (!peak_general_hook_is_published_unlocked(hook_id)) {
         return FALSE;
     }
@@ -1405,6 +1422,10 @@ peak_general_listener_request_reattach_with_context_unlocked(
     double total_time,
     double rate)
 {
+    if (peak_general_controller_mpi_finalize_requested()) {
+        return FALSE;
+    }
+
     if (!peak_general_hook_is_published_unlocked(hook_id)) {
         return FALSE;
     }
@@ -2875,6 +2896,10 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
     gboolean did_work = FALSE;
     double now = peak_second();
 
+    if (peak_general_controller_mpi_finalize_requested()) {
+        return FALSE;
+    }
+
     if (peak_detach_controller_strict_batch_supported()) {
         (void)controller_tid;
         (void)tid_keys;
@@ -2937,6 +2962,10 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     if (interceptor == NULL ||
         peak_hook_states == NULL ||
         peak_hook_address_count == 0) {
+        return TRUE;
+    }
+
+    if (peak_general_controller_mpi_finalize_requested()) {
         return TRUE;
     }
 
