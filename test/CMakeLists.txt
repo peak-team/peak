@@ -128,7 +128,7 @@ if(BUILD_TESTING)
         set(UNSAFE_GUM_PROLOGUE_ALLOWED_CASES)
         set(UNSAFE_GUM_PROLOGUE_CONSERVATIVE_ALLOWED_CASES)
         set(UNSAFE_GUM_PROLOGUE_NO_POLICY_SKIP_CASES)
-        set(UNSAFE_GUM_PROLOGUE_CORRUPTION_CASES)
+        set(UNSAFE_GUM_PROLOGUE_OVERRIDE_CASES)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             list(APPEND UNSAFE_GUM_PROLOGUE_GUARD_CASES
                 "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target"
@@ -156,7 +156,7 @@ if(BUILD_TESTING)
                 "x86_long_copy_safe|peak_unsafe_gum_x86_long_copy_safe_target"
                 "x86_dl_dead|peak_unsafe_gum_x86_dl_dead_target"
                 "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target")
-            list(APPEND UNSAFE_GUM_PROLOGUE_CORRUPTION_CASES
+            list(APPEND UNSAFE_GUM_PROLOGUE_OVERRIDE_CASES
                 "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target|72"
                 "x86_dl_inc_rax_base|peak_unsafe_gum_x86_dl_inc_rax_base_target|72"
                 "x86_dl_add|peak_unsafe_gum_x86_dl_add_target|72"
@@ -270,23 +270,23 @@ if(BUILD_TESTING)
                     PASS_REGULAR_EXPRESSION "unsafe_gum_prologue_default_allows_ok")
         endforeach()
 
-        foreach(_unsafe_case IN LISTS UNSAFE_GUM_PROLOGUE_CORRUPTION_CASES)
+        foreach(_unsafe_case IN LISTS UNSAFE_GUM_PROLOGUE_OVERRIDE_CASES)
             string(REPLACE "|" ";" _unsafe_parts "${_unsafe_case}")
             list(GET _unsafe_parts 0 _unsafe_name)
             list(GET _unsafe_parts 1 _unsafe_target)
             list(GET _unsafe_parts 2 _unsafe_expected_byte)
-            add_test(NAME test_unsafe_gum_prologue_override_corrupts_${_unsafe_name}
+            add_test(NAME test_unsafe_gum_prologue_override_exercises_${_unsafe_name}
                 COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_unsafe_gum_prologue_case.py
                     --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_unsafe_gum_prologue
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
                     --case ${_unsafe_name}
                     --target ${_unsafe_target}
-                    --mode override-corrupts
+                    --mode override-exercises
                     --expected-byte ${_unsafe_expected_byte})
-            set_tests_properties(test_unsafe_gum_prologue_override_corrupts_${_unsafe_name}
+            set_tests_properties(test_unsafe_gum_prologue_override_exercises_${_unsafe_name}
                 PROPERTIES
-                    PASS_REGULAR_EXPRESSION "unsafe_gum_prologue_override_corrupts_ok")
+                    PASS_REGULAR_EXPRESSION "unsafe_gum_prologue_override_exercises_ok")
         endforeach()
     endif()
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND

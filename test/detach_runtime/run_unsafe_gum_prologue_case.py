@@ -38,7 +38,7 @@ def run_case(args):
     env["PEAK_ENABLE_GLOBAL_HEARTBEAT"] = "0"
     env["PEAK_HEARTBEAT_INTERVAL"] = "0"
 
-    if args.mode == "override-corrupts":
+    if args.mode == "override-exercises":
         env["PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"] = "1"
     else:
         env.pop("PEAK_ALLOW_UNSAFE_GUM_PROLOGUE", None)
@@ -108,13 +108,35 @@ def run_case(args):
 
     expected_mismatch = f"unsafe_prologue_mismatch case={args.case}"
     if proc.returncode == 0:
-        raise AssertionError(
-            f"override run for {args.case} unexpectedly preserved semantics\n"
-            f"{combined}"
+        expected_ok = f"unsafe_gum_prologue_guard_ok:{args.case}"
+        if expected_ok not in proc.stdout:
+            raise AssertionError(
+                f"override run for {args.case} preserved semantics without "
+                f"printing {expected_ok!r}\n{combined}"
+            )
+        if line_mentions_peak_policy_skip_for_target(proc.stderr, args.target):
+            raise AssertionError(
+                f"override run for {args.case} unexpectedly policy-skipped "
+                f"{args.target}\n{combined}"
+            )
+        if line_mentions_gum_attach_failure_for_target(proc.stderr, args.target):
+            raise AssertionError(
+                f"override run for {args.case} did not attach {args.target}\n"
+                f"{combined}"
+            )
+        if not line_mentions_profile_row_for_target(combined, args.target):
+            raise AssertionError(
+                f"override run for {args.case} preserved semantics but did not "
+                f"prove PEAK profiled {args.target}\n{combined}"
+            )
+        print(
+            f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
+            "preserved=1"
         )
+        return 0
     if proc.returncode < 0:
         print(
-            f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
+            f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
             f"signal={-proc.returncode}"
         )
         return 0
@@ -131,7 +153,7 @@ def run_case(args):
             f"{combined}"
         )
     print(
-        f"unsafe_gum_prologue_override_corrupts_ok case={args.case} "
+        f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
         f"rc={proc.returncode}"
     )
     return 0
@@ -146,7 +168,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=("guard", "default-allows", "no-policy-skip",
-                 "override-corrupts"),
+                 "override-exercises"),
         required=True,
     )
     parser.add_argument("--expected-byte", type=int)
