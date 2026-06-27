@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
+#include "peak_logging.h"
 
 /*=========================
   Types
@@ -218,14 +219,14 @@ static void peak_memlog_grow_if_needed(size_t want_index) {
     size_t new_bytes  = g_memlog.header_bytes + new_events * sizeof(PeakMemEvent);
 
     if (ftruncate(g_memlog.fd, (off_t) new_bytes) != 0) {
-        fprintf(stderr, "[peak] memlog: ftruncate grow failed: %s\n", strerror(errno));
+        peak_log_warn("[peak] memlog: ftruncate grow failed: %s\n", strerror(errno));
         pthread_mutex_unlock(&g_memlog.resize_mutex);
         return;
     }
 
     void *new_map = mremap(g_memlog.map, old_bytes, new_bytes, MREMAP_MAYMOVE);
     if (new_map == MAP_FAILED) {
-        fprintf(stderr, "[peak] memlog: mremap failed: %s (keeping old cap)\n", strerror(errno));
+        peak_log_warn("[peak] memlog: mremap failed: %s (keeping old cap)\n", strerror(errno));
         pthread_mutex_unlock(&g_memlog.resize_mutex);
         return;
     }
@@ -269,7 +270,7 @@ static void peak_memlog_open(void) {
 
     int fd = open(g_memlog.tmp_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
     if (fd < 0) {
-        fprintf(stderr, "[peak] memlog: open(%s) failed: %s\n", g_memlog.tmp_path, strerror(errno));
+        peak_log_warn("[peak] memlog: open(%s) failed: %s\n", g_memlog.tmp_path, strerror(errno));
         g_memlog.initialized = 1;
         return;
     }
@@ -279,7 +280,7 @@ static void peak_memlog_open(void) {
     size_t init_bytes   = header_bytes + init_events * sizeof(PeakMemEvent);
 
     if (ftruncate(fd, (off_t) init_bytes) != 0) {
-        fprintf(stderr, "[peak] memlog: ftruncate init failed: %s\n", strerror(errno));
+        peak_log_warn("[peak] memlog: ftruncate init failed: %s\n", strerror(errno));
         close(fd);
         g_memlog.initialized = 1;
         return;
@@ -287,7 +288,7 @@ static void peak_memlog_open(void) {
 
     void *base = mmap(NULL, init_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) {
-        fprintf(stderr, "[peak] memlog: mmap init failed: %s\n", strerror(errno));
+        peak_log_warn("[peak] memlog: mmap init failed: %s\n", strerror(errno));
         close(fd);
         g_memlog.initialized = 1;
         return;
@@ -353,7 +354,7 @@ static void peak_memlog_finalize(void) {
     /* 2) CSV export (exactly as before) */
     int fd_csv = open(g_memlog.csv_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
     if (fd_csv < 0) {
-        fprintf(stderr, "[peak] memlog: open CSV %s failed: %s\n", g_memlog.csv_path, strerror(errno));
+        peak_log_warn("[peak] memlog: open CSV %s failed: %s\n", g_memlog.csv_path, strerror(errno));
     } else {
         dprintf(fd_csv, "ts_ns,delta,current,tid,op\n");
 
@@ -364,7 +365,7 @@ static void peak_memlog_finalize(void) {
         }
         close(fd_csv);
     }
-    fprintf(stderr, "[peak] memlog CSV written: %s (events=%zu)\n", g_memlog.csv_path, events);
+    peak_log_report("[peak] memlog CSV written: %s (events=%zu)\n", g_memlog.csv_path, events);
 
     munmap(g_memlog.map, g_memlog.map_bytes);
     (void) ftruncate(g_memlog.fd, (off_t) used_bytes);
@@ -434,11 +435,11 @@ static void init_table(void) {
     track_table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
     memory_caller_target_table = gum_metal_hash_table_new(g_str_hash, str_equal_function);
     if (!track_table) {
-        fprintf(stderr, "Failed to initialize tracking table\n");
+        peak_log_warn("[peak] Failed to initialize tracking table\n");
         exit(1);
     }
     if (!memory_caller_target_table) {
-        fprintf(stderr, "Failed to initialize memory caller target table\n");
+        peak_log_warn("[peak] Failed to initialize memory caller target table\n");
         exit(1);
     }
     
@@ -629,8 +630,8 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 =========================*/
 
 static void memory_usage_log_print(void) {
-    fprintf(stderr, "Memory allocation interceptors detached and resources cleaned up\n");
-    fprintf(stderr, "Max usage (bytes): %lu\n", max_memory);
+    peak_log_info("[peak] Memory allocation interceptors detached and resources cleaned up\n");
+    peak_log_report("Max usage (bytes): %lu\n", max_memory);
 }
 
 /*=========================
@@ -644,7 +645,7 @@ static void memory_usage_log_print(void) {
                                                               _addr, _hook,               \
                                                               (gpointer*)(&_orig));       \
             if (r != GUM_REPLACE_OK)                                                      \
-                fprintf(stderr, "Failed to replace " _name ": %d\n", r);                  \
+                peak_log_warn("[peak] Failed to replace " _name ": %d\n", r);             \
         }                                                                                 \
     } while (0)
 
@@ -671,7 +672,7 @@ int malloc_interceptor_attach(void) {
     init_table();
     peak_memlog_open();
 
-    fprintf(stderr, "Memory allocation functions intercepted successfully\n");
+    peak_log_info("[peak] Memory allocation functions intercepted successfully\n");
     return 0;
 }
 
@@ -689,7 +690,7 @@ void malloc_interceptor_detach(void) {
 
     if (!gum_interceptor_flush(malloc_interceptor) ||
         !malloc_interceptor_wait_for_quiescence()) {
-        fprintf(stderr,
+        peak_log_warn(
                 "Memory allocation interceptor teardown did not quiesce; leaving profiler state alive\n");
         return;
     }

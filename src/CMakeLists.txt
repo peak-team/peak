@@ -5,6 +5,7 @@ add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 FILE(GLOB sources_peak
     peak.c
     general_listener.c
+    peak_logging.c
     pthread_listener.c
     peak_detach_controller.c
     peak_signal_policy.c

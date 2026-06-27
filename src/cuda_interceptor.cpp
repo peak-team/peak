@@ -1,4 +1,5 @@
 #include "cuda_interceptor.h"
+#include "peak_logging.h"
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -40,13 +41,13 @@ static cudaError_t (*original_cuda_launch_kernel_exc)(
     const void* func, void** args);
 
 static CUresult (*original_cu_launch_kernel)(
-    CUfunction func, 
+    CUfunction func,
     unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra);
 
 static CUresult (*original_cu_launch_cooperative_kernel)(
-    CUfunction func, 
+    CUfunction func,
     unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams);
@@ -56,13 +57,13 @@ static CUresult (*original_cu_launch_cooperative_kernel_multiple_device)(
     unsigned int numDevices, unsigned int flags);
 
 static CUresult (*original_cu_launch_kernel_ex)(
-    const CUlaunchConfig* config, CUfunction func, 
+    const CUlaunchConfig* config, CUfunction func,
     void** kernelParams, void** extra);
 
 static cudaError_t (*original_cuda_graph_launch)(
     cudaGraphExec_t graphExec, cudaStream_t stream);
 
-static CUresult (*original_cu_graph_launch)( 
+static CUresult (*original_cu_graph_launch)(
     CUgraphExec hGraphExec, CUstream hStream);
 
 typedef struct {
@@ -158,7 +159,7 @@ char* cu_demangle(char* mangled_name) {
     size_t size = sizeof(char) * 1000;
     // Fixme: size might be wrong
     char* demangled_name = (char*)malloc(size);
-    
+
     __cu_demangle(mangled_name, demangled_name, &size, &status);
     if (status == 0) {
         return demangled_name;
@@ -476,7 +477,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel(
     peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel(func, gridDim, blockDim, args, sharedMem, stream);
     peak_cuda_record_event(end, stream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -512,7 +513,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel_multipl
     peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_cooperative_kernel_multiple_device(launchParamsList, numDevices, flags);
     peak_cuda_record_event(end, stream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -539,7 +540,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel_exc(
 
     gchar* kernel_name = gum_symbol_name_from_address((gpointer)func);
     const gchar* kernel_label = (kernel_name != NULL) ? kernel_name : "<unknown-cuda-kernel>";
-    
+
 
     gulong total_threads = (gridDim.x * blockDim.x) * (gridDim.y * blockDim.y) * (gridDim.z * blockDim.z);
     gulong grid_size = gridDim.x * gridDim.y * gridDim.z;
@@ -550,7 +551,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel_exc(
     peak_cuda_record_event(start, stream);
     cudaError_t result = original_cuda_launch_kernel_exc(config, func, args);
     peak_cuda_record_event(end, stream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -588,7 +589,7 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel(
                                                 blockDimX, blockDimY, blockDimZ,
                                                 sharedMemBytes, hStream, kernelParams, extra);
     peak_cuda_record_event(end, (cudaStream_t)hStream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -625,7 +626,7 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel(
                                                 sharedMemBytes, hStream, kernelParams);
 
     peak_cuda_record_event(end, (cudaStream_t)hStream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -682,7 +683,7 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel_multiple_dev
 }
 
 PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
-    const CUlaunchConfig* config, CUfunction func, 
+    const CUlaunchConfig* config, CUfunction func,
     void** kernelParams, void** extra)
 {
     PeakCudaInflightGuard in_flight;
@@ -705,7 +706,7 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
     peak_cuda_record_event(start, (cudaStream_t)hStream);
     CUresult result = original_cu_launch_kernel_ex(config, func, kernelParams, extra);
     peak_cuda_record_event(end, (cudaStream_t)hStream);
-    
+
     KernelLaunchInfo info = {
         .kernel_name = g_strdup(kernel_label),
         .total_threads = total_threads,
@@ -729,7 +730,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_graph_launch(
     peak_cuda_record_event(start, (cudaStream_t)stream);
     cudaError_t result = original_cuda_graph_launch(graphExec, stream);
     peak_cuda_record_event(end, (cudaStream_t)stream);
-    
+
     GraphLaunchInfo info = {
         .graph = graphExec,
         .start_event = start,
@@ -806,7 +807,7 @@ extern "C" int cuda_interceptor_attach()
             hook_cuda_launch = NULL;
         }
     }
-    
+
     hook_cuda_launch_cooperative = (gpointer*) gum_find_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
         hook_replace_check = gum_interceptor_replace_fast(
@@ -932,7 +933,7 @@ extern "C" int cuda_interceptor_attach()
             hook_cu_graph_launch = NULL;
         }
     }
-    
+
     gum_interceptor_end_transaction(cuda_interceptor);
     peak_cuda_accepting_events.store(true, std::memory_order_release);
 
@@ -982,7 +983,7 @@ extern "C" void cuda_interceptor_dettach()
         gum_interceptor_end_transaction(cuda_interceptor);
 
         if (!gum_interceptor_flush(cuda_interceptor)) {
-            g_printerr("[peak] CUDA interceptor teardown did not flush; leaving CUDA interceptor state alive\n");
+            peak_log_warn("[peak] CUDA interceptor teardown did not flush; leaving CUDA interceptor state alive\n");
             return;
         }
 
@@ -992,7 +993,7 @@ extern "C" void cuda_interceptor_dettach()
 
     unsigned int active_cuda_wrappers = peak_cuda_in_flight.load(std::memory_order_acquire);
     if (active_cuda_wrappers != 0) {
-        g_printerr("[peak] CUDA interceptor teardown observed %u active wrapper(s); keeping Gum trampoline state alive\n",
+        peak_log_warn("[peak] CUDA interceptor teardown observed %u active wrapper(s); keeping Gum trampoline state alive\n",
                    active_cuda_wrappers);
     }
 
@@ -1051,39 +1052,39 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
         const guint row_width = 100;
         const guint max_function_width = 40;
         const guint max_col_width = 9;
-    
+
         char* space_separator = (char *) malloc(row_width + 1);
         char* row_separator = (char *)  malloc(row_width + 1);
         memset(space_separator, ' ', row_width);
         memset(row_separator, '-', row_width);
         space_separator[row_width] = '\0';
         row_separator[row_width] = '\0';
-    
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sGPU STATISTICS (Kernel)%*s\n", 
-            (row_width - 15) / 2, "", 
+
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sGPU STATISTICS (Kernel)%*s\n",
+            (row_width - 15) / 2, "",
             (row_width - 15 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         // Section: Kernel call count & time
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sKERNEL STATISTICS (GPU)%*s\n", 
-            (row_width - 26) / 2, "", 
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sKERNEL STATISTICS (GPU)%*s\n",
+            (row_width - 26) / 2, "",
             (row_width - 26 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-        g_printerr("| %-*s | %*s | %*s | %*s | %*s |\n",
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("| %-*s | %*s | %*s | %*s | %*s |\n",
             max_function_width, "Kernel",
             max_col_width, "Calls",
             max_col_width, "Total(s)",
             max_col_width, "Max(s)",
             max_col_width, "Min(s)");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             char* truncated_name = truncate_string((const char *)key, max_function_width);
-            g_printerr("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
+            peak_log_report("| %-*s | %*lu | %*.6f | %*.6f | %*.6f |\n",
                 max_function_width, truncated_name,
                 max_col_width, dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->total_time,
@@ -1091,59 +1092,59 @@ static void cuda_interceptor_print_kernel_result(GHashTable* hashTable)
                 max_col_width, dim_info->min_time);
             free(truncated_name);
         }
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         // Section: Kernel block & thread size
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sKERNEL BLOCK SIZE%*s\n", 
-            (row_width - 20) / 2, "", 
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sKERNEL BLOCK SIZE%*s\n",
+            (row_width - 20) / 2, "",
             (row_width - 20 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-        g_printerr("| %-*s | %*s | %*s | %*s |\n",
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("| %-*s | %*s | %*s | %*s |\n",
             max_function_width, "Kernel",
             max_col_width, "AvgBlk",
             max_col_width, "MaxBlk",
             max_col_width, "MinBlk");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             char* truncated_name = truncate_string((const char *)key, max_function_width);
-            g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
+            peak_log_report("| %-*s | %*.2f | %*lu | %*lu |\n",
                 max_function_width, truncated_name,
                 max_col_width, (double)dim_info->total_block_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_block_size,
                 max_col_width, dim_info->min_block_size);
             free(truncated_name);
         }
-        g_printerr("%s\n", row_separator);
+        peak_log_report("%s\n", row_separator);
 
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sKERNEL GRID SIZE%*s\n", 
-            (row_width - 21) / 2, "", 
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sKERNEL GRID SIZE%*s\n",
+            (row_width - 21) / 2, "",
             (row_width - 21 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-        g_printerr("| %-*s | %*s | %*s | %*s |\n",
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("| %-*s | %*s | %*s | %*s |\n",
             max_function_width, "Kernel",
             max_col_width, "AvgGrid",
             max_col_width, "MaxGrid",
             max_col_width, "MinGrid");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             KernelDimInfo* dim_info = (KernelDimInfo*) value;
             char* truncated_name = truncate_string((const char *)key, max_function_width);
-            g_printerr("| %-*s | %*.2f | %*lu | %*lu |\n",
+            peak_log_report("| %-*s | %*.2f | %*lu | %*lu |\n",
                 max_function_width, truncated_name,
                 max_col_width, (double)dim_info->total_grid_size / dim_info->total_kernel_call_cnt,
                 max_col_width, dim_info->max_grid_size,
                 max_col_width, dim_info->min_grid_size);
             free(truncated_name);
         }
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         free(space_separator);
         free(row_separator);
     }
@@ -1167,45 +1168,45 @@ static void cuda_interceptor_print_graph_result(GHashTable* hashTable)
     if (have_output) {
         const guint row_width = 100;
         const guint max_col_width = 9;
-    
+
         char* space_separator = (char *) malloc(row_width + 1);
         char* row_separator = (char *)  malloc(row_width + 1);
         memset(space_separator, ' ', row_width);
         memset(row_separator, '-', row_width);
         space_separator[row_width] = '\0';
         row_separator[row_width] = '\0';
-    
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sGPU STATISTICS (Graph)%*s\n", 
-            (row_width - 15) / 2, "", 
+
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sGPU STATISTICS (Graph)%*s\n",
+            (row_width - 15) / 2, "",
             (row_width - 15 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         // Section: Graph call count & time
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sGRAPH STATISTICS (GPU)%*s\n", 
-            (row_width - 26) / 2, "", 
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sGRAPH STATISTICS (GPU)%*s\n",
+            (row_width - 26) / 2, "",
             (row_width - 26 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-        g_printerr("| %*s | %*s | %*s | %*s | %*s |\n",
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("| %*s | %*s | %*s | %*s | %*s |\n",
             max_col_width, "Graph",
             max_col_width, "Calls",
             max_col_width, "Total(s)",
             max_col_width, "Max(s)",
             max_col_width, "Min(s)");
-        g_printerr("%s\n", row_separator);
-    
+        peak_log_report("%s\n", row_separator);
+
         g_hash_table_iter_init(&iter, hashTable);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
             GraphRecordInfo* graph_info = (GraphRecordInfo*) value;
-            g_printerr("| %p | %*lu | %*.6f | %*.6f | %*.6f |\n",
+            peak_log_report("| %p | %*lu | %*.6f | %*.6f | %*.6f |\n",
                 key,
                 max_col_width, graph_info->total_graph_call_cnt,
                 max_col_width, graph_info->total_time,
                 max_col_width, graph_info->max_time,
                 max_col_width, graph_info->min_time);
         }
-        g_printerr("%s\n", row_separator);
+        peak_log_report("%s\n", row_separator);
 
         free(space_separator);
         free(row_separator);
@@ -1233,25 +1234,25 @@ static void cuda_interceptor_print_graph_mpi_result(const gint* ranks,
         memset(row_separator, '-', row_width);
         row_separator[row_width] = '\0';
 
-        g_printerr("\n%s\n", row_separator);
-        g_printerr("%*sGRAPH STATISTICS (GPU, MPI)%*s\n",
+        peak_log_report("\n%s\n", row_separator);
+        peak_log_report("%*sGRAPH STATISTICS (GPU, MPI)%*s\n",
             (row_width - 27) / 2, "",
             (row_width - 27 + 1) / 2, "");
-        g_printerr("%s\n", row_separator);
-        g_printerr("| %*s | %*s | %*s | %*s | %*s | %*s |\n",
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("| %*s | %*s | %*s | %*s | %*s | %*s |\n",
             max_col_width, "Rank",
             18, "Graph",
             max_col_width, "Calls",
             max_col_width, "Total(s)",
             max_col_width, "Max(s)",
             max_col_width, "Min(s)");
-        g_printerr("%s\n", row_separator);
+        peak_log_report("%s\n", row_separator);
 
         for (gint i = 0; i < count; i++) {
             if (values[i].total_graph_call_cnt == 0) {
                 continue;
             }
-            g_printerr("| %*d | %18p | %*lu | %*.6f | %*.6f | %*.6f |\n",
+            peak_log_report("| %*d | %18p | %*lu | %*.6f | %*.6f | %*.6f |\n",
                 max_col_width, ranks[i],
                 graphs[i],
                 max_col_width, values[i].total_graph_call_cnt,
@@ -1259,7 +1260,7 @@ static void cuda_interceptor_print_graph_mpi_result(const gint* ranks,
                 max_col_width, values[i].max_time,
                 max_col_width, values[i].min_time);
         }
-        g_printerr("%s\n", row_separator);
+        peak_log_report("%s\n", row_separator);
 
         free(row_separator);
     }
@@ -1324,7 +1325,7 @@ cuda_interceptor_reduce_kernel_result()
     MPI_Gather(&local_kernel_count, 1, MPI_INT, kernel_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_keys_buffer_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
+
     gchar *global_keys_string = NULL;
     gint *keys_offset_array = NULL;
     gint *values_offset_array = NULL;
@@ -1341,7 +1342,7 @@ cuda_interceptor_reduce_kernel_result()
         global_keys_string = g_new(gchar, global_keys_length_sum == 0 ? 1 : global_keys_length_sum);
         if (global_keys_length_sum > 0) {
             memset(global_keys_string, '\0', global_keys_length_sum - 1); // allocate string, pre-fill with \0
-            global_keys_string[global_keys_length_sum - 1] = '\0'; 
+            global_keys_string[global_keys_length_sum - 1] = '\0';
         } else {
             global_keys_string[0] = '\0';
         }
@@ -1355,7 +1356,7 @@ cuda_interceptor_reduce_kernel_result()
         }
     }
 
-    MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);  
+    MPI_Gatherv(local_keys_buffer, local_keys_buffer_size, MPI_CHAR, global_keys_string, keys_buffer_array, keys_offset_array, MPI_CHAR, 0, MPI_COMM_WORLD);
     MPI_Gatherv(values, local_kernel_count * sizeof(KernelDimInfo), MPI_BYTE, global_values_array, values_buffer_array, values_offset_array, MPI_BYTE, 0, MPI_COMM_WORLD);
 
     if (world_rank == 0) {
@@ -1424,7 +1425,7 @@ static void
 cuda_interceptor_reduce_graph_result()
 {
     // FIXME: consider not using CUgraphExec_st* to determine unique graph, as it may not work across MPI ranks
-    
+
     int world_rank, world_size;
     int init_flag;
     MPI_Initialized(&init_flag);
@@ -1464,13 +1465,13 @@ cuda_interceptor_reduce_graph_result()
     MPI_Gather(&local_graph_count, 1, MPI_INT, graph_count_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_key_size, 1, MPI_INT, keys_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Gather(&local_values_size, 1, MPI_INT, values_buffer_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
+
     gint *keys_offset_array = NULL;
     gint *values_offset_array = NULL;
     CUgraphExec_st** global_keys_array = NULL;
     GraphRecordInfo* global_values_array = NULL;
     gint* global_rank_array = NULL;
-    
+
     if (world_rank == 0) {
         // Key
         global_keys_array = g_new(CUgraphExec_st*, global_graph_count);
@@ -1513,7 +1514,7 @@ cuda_interceptor_reduce_graph_result()
         g_free(global_keys_array);
         g_free(global_values_array);
     }
-    
+
     g_free(keys);
     g_free(values);
     if (world_rank == 0) {

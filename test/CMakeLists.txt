@@ -798,6 +798,16 @@ if(BUILD_TESTING)
             ENVIRONMENT "PMI_SIZE=4;PEAK_TARGET=my_sleep_func;PEAK_TEXT_OUTPUT=1;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_rank_local_mpi_env_override_statslog;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
             PASS_REGULAR_EXPRESSION "PEAK Library"
     )
+    add_test(NAME test_verbosity_quiet_keeps_report COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
+    set_tests_properties(test_verbosity_quiet_keeps_report
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=my_sleep_func;PEAK_VERBOSITY=quiet;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "PEAK Library")
+    add_test(NAME test_verbosity_silent_suppresses_report COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
+    set_tests_properties(test_verbosity_silent_suppresses_report
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=my_sleep_func;PEAK_VERBOSITY=silent;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            FAIL_REGULAR_EXPRESSION "PEAK Library|function statistics|Estimated overhead")
     if(NOT PEAK_GUM_PEAK_API_AVAILABLE)
         add_test(NAME test_initial_attach_strict_stock_gum COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
         set_tests_properties(test_initial_attach_strict_stock_gum

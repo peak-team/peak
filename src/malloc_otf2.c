@@ -1,4 +1,5 @@
 #include "malloc_otf2.h"
+#include "peak_logging.h"
 
 typedef struct {
     uint32_t tid;
@@ -88,7 +89,7 @@ static OTF2_FlushCallbacks peak_flush_callbacks = {
 static void peak_otf2_log_err(const char* where, OTF2_ErrorCode ec) {
     const char* name = OTF2_Error_GetName(ec);
     const char* desc = OTF2_Error_GetDescription(ec);
-    fprintf(stderr,
+    peak_log_warn(
             "[peak][memlog][otf2] %s failed: code=%d name=%s desc=%s\n",
             where,
             (int)ec,
@@ -124,7 +125,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
         if (t < min_ts) min_ts = t;
         if (t > max_ts) max_ts = t;
         if (tid_map_get_or_add(&tid_map, e->tid) == (OTF2_LocationRef)UINT64_MAX) {
-            fprintf(stderr, "[peak][memlog][otf2] tid_map alloc failed\n");
+            peak_log_warn("[peak][memlog][otf2] tid_map alloc failed\n");
             tid_map_free(&tid_map);
             return;
         }
@@ -144,7 +145,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
         OTF2_COMPRESSION_NONE
     );
     if (!archive) {
-        fprintf(stderr,
+        peak_log_warn(
                 "[peak][memlog][otf2] failed to open archive at %s/%s\n",
                 out_dir, filename);
         tid_map_free(&tid_map);
@@ -156,7 +157,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
 
     OTF2_GlobalDefWriter* def = OTF2_Archive_GetGlobalDefWriter(archive);
     if (!def) {
-        fprintf(stderr, "[peak][memlog][otf2] failed to get def writer\n");
+        peak_log_warn("[peak][memlog][otf2] failed to get def writer\n");
         OTF2_Archive_Close(archive);
         tid_map_free(&tid_map);
         return;
@@ -304,7 +305,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
     OTF2_EvtWriter** writers =
         (OTF2_EvtWriter**)calloc(tid_map.size, sizeof(OTF2_EvtWriter*));
     if (!writers) {
-        fprintf(stderr, "[peak][memlog][otf2] failed to alloc evt writers\n");
+        peak_log_warn("[peak][memlog][otf2] failed to alloc evt writers\n");
         OTF2_Archive_Close(archive);
         tid_map_free(&tid_map);
         return;
@@ -314,7 +315,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
         writers[i] =
             OTF2_Archive_GetEvtWriter(archive, tid_map.data[i].loc_ref);
         if (!writers[i]) {
-            fprintf(stderr,
+            peak_log_warn(
                     "[peak][memlog][otf2] failed to get evt writer for loc=%" PRIu64 "\n",
                     (uint64_t)tid_map.data[i].loc_ref);
         }
@@ -369,7 +370,7 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
 
     tid_map_free(&tid_map);
 
-    fprintf(stderr,
+    peak_log_report(
             "[peak] memlog OTF2 written: %s/%s (events=%zu)\n",
             out_dir, filename, events);
 }

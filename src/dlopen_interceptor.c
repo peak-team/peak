@@ -4,6 +4,7 @@
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 #include "peak_detach_controller.h"
+#include "peak_logging.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -17,6 +18,9 @@ typedef void (*fn_void)(void);
 #define PEAK_DLOPEN_ENTRY_GUARD_BYTES 256U
 #define PEAK_DLOPEN_PREPARE_RETRY_ATTEMPTS 50U
 #define PEAK_DLOPEN_PREPARE_RETRY_SLEEP_NS 1000000L
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 static GumInterceptor* dlopen_interceptor;
 extern GumInterceptor* interceptor;
@@ -215,7 +219,7 @@ dlopen_interceptor_trace_counters(const char* event)
     }
 
     if (debug) {
-        g_printerr("[peak] dlopen dynamic attach diagnostics event=%s enqueued=%llu drained=%llu requeued=%llu dropped_full=%llu dropped_closed=%llu dropped_noload=%llu dropped_requeue=%llu partial_success=%llu retained_handles=%llu max_depth=%lu queue_length=%lu capacity=%u drain_budget=%u\n",
+        peak_log_debug("[peak] dlopen dynamic attach diagnostics event=%s enqueued=%llu drained=%llu requeued=%llu dropped_full=%llu dropped_closed=%llu dropped_noload=%llu dropped_requeue=%llu partial_success=%llu retained_handles=%llu max_depth=%lu queue_length=%lu capacity=%u drain_budget=%u\n",
                    event != NULL ? event : "snapshot",
                    enqueued,
                    drained,
@@ -890,7 +894,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                     detach_status)) {
                 retry_later = TRUE;
             }
-            g_printerr("[peak] %s dynamic Gum attach for hook %lu (%s): %s\n",
+            peak_log_debug("[peak] %s dynamic Gum attach for hook %lu (%s): %s\n",
                        retry_later ? "retrying" : "skipping",
                        (unsigned long)i,
                        peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>",

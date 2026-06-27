@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "peak_detach_controller.h"
 #include "peak_detach_helper_protocol.h"
+#include "peak_logging.h"
 #include "peak_signal_policy_internal.h"
 
 #include <dirent.h>
@@ -22,6 +23,9 @@
     PEAK_DETACH_HELPER_MAX_BATCH_WRITES
 #define PEAK_STRICT_GATE_WAIT_TIMEOUT_MS_ENV "PEAK_STRICT_GATE_WAIT_TIMEOUT_MS"
 #define PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS 10000u
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 typedef enum {
     PEAK_SAFE_DETACH_MODE_COMPATIBILITY = 0,
@@ -206,7 +210,7 @@ peak_detach_controller_parse_uint_env(const char* name,
     errno = 0;
     parsed = strtoul(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
-        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
         return default_value;
     }
 
@@ -598,7 +602,7 @@ peak_detach_controller_auto_should_use_signal_backend(void)
     if (errno == 0 && end != value && scope >= 2) {
         if (!warned_auto_helper_ptrace_scope) {
             warned_auto_helper_ptrace_scope = TRUE;
-            g_printerr("[peak] auto safe detach using signal backend because ptrace_scope=%ld blocks helper attachment\n",
+            peak_log_info("[peak] auto safe detach using signal backend because ptrace_scope=%ld blocks helper attachment\n",
                        scope);
         }
         return TRUE;

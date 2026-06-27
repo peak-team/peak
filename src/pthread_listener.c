@@ -1,8 +1,12 @@
 #include "pthread_listener.h"
 #include "peak_detach_controller.h"
+#include "peak_logging.h"
 #include "peak_signal_policy_internal.h"
 
 #include <string.h>
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 static GumInterceptor* pthread_create_interceptor;
 static GumInvocationListener* pthread_create_listener;

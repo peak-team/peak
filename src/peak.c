@@ -17,6 +17,7 @@
 #include "general_listener.h"
 #include "peak_detach_controller.h"
 #include "peak_jit_provider.h"
+#include "peak_logging.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"
@@ -61,6 +62,9 @@
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 
 gboolean* peak_need_detach;
@@ -569,11 +573,11 @@ peak_fini_impl(void)
         g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
     } else if (found_MPI && use_mpi_collective_output && mpi_log_rank) {
-        g_printerr("[peak] PMPI_Finalize was observed on every rank; writing MPI-reduced output before MPI finalization or process exit\n");
+        peak_log_info("[peak] PMPI_Finalize was observed on every rank; writing MPI-reduced output before MPI finalization or process exit\n");
     } else if (found_MPI && use_socket_output && mpi_log_rank) {
-        g_printerr("[peak] Writing PEAK-owned socket-reduced output before MPI finalization or process exit\n");
+        peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI finalization or process exit\n");
     } else if (found_MPI && aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
-        g_printerr("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI finalization or process exit\n");
+        peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI finalization or process exit\n");
     } else if (found_MPI && !mpi_runtime_can_collect && mpi_log_rank) {
         g_printerr("[peak] MPI runtime is not in an output-safe state; writing rank-local output before process exit\n");
     } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
@@ -590,7 +594,7 @@ peak_fini_impl(void)
         mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
         if (mpi_log_rank) {
             if (allow_real_mpi_finalize) {
-                g_printerr("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
+                peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
             } else if (!real_mpi_finalize_default_allowed) {
                 g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize for this MPI runtime unless PEAK_MPI_REAL_FINALIZE=1 is set\n");
             } else {
@@ -614,9 +618,9 @@ peak_fini_impl(void)
     if (found_MPI && (mpi_finalize_path || local_requested_mpi_finalize)) {
         if (mpi_log_rank) {
             if (mpi_finalize_path) {
-                g_printerr("[peak] Leaving PEAK target hooks pinned and restoring support wrappers before application PMPI_Finalize\n");
+                peak_log_info("[peak] Leaving PEAK target hooks pinned and restoring support wrappers before application PMPI_Finalize\n");
             } else {
-                g_printerr("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
+                peak_log_info("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
             }
         }
         syscall_interceptor_dettach();
@@ -802,7 +806,7 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     if (!real___libc_start_main) {
         real___libc_start_main = (libc_start_main_fn)dlsym(RTLD_NEXT, "__libc_start_main");
         if (!real___libc_start_main) {
-            fprintf(stderr, "Error: dlsym failed to find __libc_start_main\n");
+            peak_log_warn("[peak] Error: dlsym failed to find __libc_start_main\n");
             _exit(1);
         }
     }
