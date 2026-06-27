@@ -4,6 +4,7 @@
 #include "peak_general_listener_internal.h"
 #include "peak_jit_provider.h"
 #include "peak_detach_controller.h"
+#include "peak_logging.h"
 #include "pthread_listener.h"
 #include "unsafe_gum_prologue.h"
 #include <errno.h>
@@ -23,6 +24,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 #define PEAK_HEARTBEAT_MIN_OBSERVATION_US 10000U
 
@@ -151,7 +155,7 @@ peak_general_listener_parse_detach_count_override(gulong* count_out)
     unsigned long parsed = strtoul(value, &end, 10);
 
     if (errno == ERANGE || end == value || *end != '\0' || parsed == 0) {
-        g_printerr("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
+        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
         return FALSE;
     }
 
@@ -175,7 +179,7 @@ peak_general_listener_parse_uint_env_default(const char* name,
     unsigned long parsed = strtoul(value, &end, 10);
     if (errno == ERANGE || end == value || *end != '\0' ||
         parsed > G_MAXUINT) {
-        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
         return default_value;
     }
 
@@ -234,7 +238,7 @@ peak_general_listener_init_attach_policy_once(void)
             g_getenv(PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV),
             &policy_valid);
     if (!policy_valid) {
-        g_printerr("[peak] ignoring invalid %s=%s; using %s policy\n",
+        peak_log_info("[peak] ignoring invalid %s=%s; using %s policy\n",
                    PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV,
                    g_getenv(PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV),
                    peak_unsafe_gum_prologue_policy_name(
@@ -348,7 +352,7 @@ peak_socket_reduce_fallback_enabled(void)
         return TRUE;
     }
 
-    g_printerr("[peak] Ignoring invalid %s=%s; using fallback-to-local behavior\n",
+    peak_log_info("[peak] Ignoring invalid %s=%s; using fallback-to-local behavior\n",
                PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV,
                value);
     return TRUE;
@@ -552,7 +556,7 @@ peak_general_controller_parse_uint_env(const char* name,
     errno = 0;
     parsed = strtoul(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
-        g_printerr("[peak] ignoring invalid %s=%s\n", name, value);
+        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
         return default_value;
     }
 
@@ -1818,7 +1822,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             result = peak_general_controller_status_is_retryable(detach_status) ?
                          PEAK_DYNAMIC_ATTACH_RETRY :
                          PEAK_DYNAMIC_ATTACH_FAILED;
-            g_printerr("[peak] %s JIT attach for hook %lu (%s) from %s: %s\n",
+            peak_log_debug("[peak] %s JIT attach for hook %lu (%s) from %s: %s\n",
                        result == PEAK_DYNAMIC_ATTACH_RETRY ? "retrying" : "skipping",
                        (unsigned long)i,
                        symbol_name,
@@ -3914,7 +3918,7 @@ peak_general_overhead_bootstrapping()
 
     if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
-        g_printerr("[peak] skipping overhead calibration Gum attach: %s\n",
+        peak_log_debug("[peak] skipping overhead calibration Gum attach: %s\n",
                    peak_detach_controller_status_string(detach_status));
         peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
         g_object_unref(listener_bootstrapping);
@@ -4123,7 +4127,7 @@ void peak_general_listener_attach()
             hook_address[i] = gum_find_function("peak_cu_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
-            g_printerr("[peak] skipping target dlopen: PEAK owns the dlopen wrapper used for dynamic attach\n");
+            peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen wrapper used for dynamic attach\n");
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
@@ -4404,29 +4408,29 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     if (have_output &&
         peak_general_listener_should_print_text(
             rank_count <= 1 && peak_mpi_env_size() > 1)) {
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("%*s PEAK Library\n", (row_width - 12) / 2, "");
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("Time: %f\n", peak_main_time);
-        g_printerr("PEAK done with: %s\n", argv_o);
-        g_printerr("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
+        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("%*s PEAK Library\n", (row_width - 12) / 2, "");
+        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("Time: %f\n", peak_main_time);
+        peak_log_report("PEAK done with: %s\n", argv_o);
+        peak_log_report("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
 
-        g_printerr("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
-        g_printerr(" individual call counts and time (in seconds)\n");
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
+        peak_log_report("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
+        peak_log_report(" individual call counts and time (in seconds)\n");
+        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
                    max_col_width, "count",
                    max_col_width, "per thread",
                    max_col_width, "per rank",
                    max_col_width, "max",
                    max_col_width, "min");
-        g_printerr("%.*s\n", row_width, row_separator);
+        peak_log_report("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
                 if (!array_listener_detached[i])
-                    g_printerr("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                    peak_log_report("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
                                max_function_width, truncated_name,
                                max_col_width, sum_num_calls[i],
                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
@@ -4435,7 +4439,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                max_col_width, sum_min_time[i]);
                 else {
                     if (!array_listener_reattached[i])
-                        g_printerr("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                        peak_log_report("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
@@ -4443,7 +4447,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                 max_col_width, sum_max_time[i],
                                 max_col_width, sum_min_time[i]);
                     else
-                        g_printerr("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                        peak_log_report("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_num_calls[i],
                                 max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
@@ -4454,24 +4458,24 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                 free(truncated_name);
             }
         }
-        g_printerr("%.*s\n", row_width, row_separator);
+        peak_log_report("%.*s\n", row_width, row_separator);
 
-        g_printerr("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
-        g_printerr(" thread aggregated time (in seconds)\n");
-        g_printerr("%.*s\n", row_width, row_separator);
-        g_printerr("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
+        peak_log_report("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
+        peak_log_report(" thread aggregated time (in seconds)\n");
+        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
                    max_col_width, "total",
                    max_col_width, "exclusive",
                    max_col_width, "max",
                    max_col_width, "min",
                    max_col_width, "overhead");
-        g_printerr("%.*s\n", row_width, row_separator);
+        peak_log_report("%.*s\n", row_width, row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
                 if (!array_listener_detached[i]) {
-                    g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                    peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                max_function_width, truncated_name,
                                max_col_width, sum_total_time[i],
                                max_col_width, sum_exclusive_time[i],
@@ -4481,7 +4485,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                               * peak_general_overhead);
                 } else {
                     if (!array_listener_reattached[i])
-                        g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                     max_function_width, truncated_name,
                                     max_col_width, sum_total_time[i],
                                     max_col_width, sum_exclusive_time[i],
@@ -4490,7 +4494,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                     max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
                                                     * peak_general_overhead);
                     else
-                        g_printerr("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
@@ -4502,7 +4506,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                 free(truncated_name);
             }
         }
-        g_printerr("%.*s\n", row_width, row_separator);
+        peak_log_report("%.*s\n", row_width, row_separator);
     }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         g_free(peak_demangled_strings[i]);
@@ -4738,7 +4742,7 @@ peak_socket_reduce_parse_positive_int_env(const char* name, int default_value)
     parsed = strtol(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || parsed <= 0 ||
         parsed > INT_MAX) {
-        g_printerr("[peak] Ignoring invalid %s=%s\n", name, value);
+        peak_log_info("[peak] Ignoring invalid %s=%s\n", name, value);
         return default_value;
     }
 
@@ -4776,7 +4780,7 @@ peak_socket_reduce_port(void)
         peak_socket_reduce_default_port());
 
     if (port <= 0 || port > 65535) {
-        g_printerr("[peak] Ignoring out-of-range %s=%d\n",
+        peak_log_info("[peak] Ignoring out-of-range %s=%d\n",
                    PEAK_OUTPUT_AGGREGATION_PORT_ENV,
                    port);
         return peak_socket_reduce_default_port();
@@ -5368,7 +5372,7 @@ peak_socket_reduce_release_peers(int port,
 
     close(listener);
     if (released != peer_count) {
-        g_printerr("[peak] Socket aggregation released %u/%u peer ranks before timeout\n",
+        peak_log_info("[peak] Socket aggregation released %u/%u peer ranks before timeout\n",
                    released,
                    peer_count);
         return FALSE;

@@ -1,6 +1,7 @@
 add_executable(test_detach_controller
   test_detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
+  ${PROJECT_SOURCE_DIR}/src/peak_logging.c
   ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
   $<TARGET_OBJECTS:utils_c>
 )
@@ -11,6 +12,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
     ${PROJECT_SOURCE_DIR}/src/peak_jit_provider.c
+    ${PROJECT_SOURCE_DIR}/src/peak_logging.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
     ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
@@ -297,7 +299,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     COMMAND test_detach_controller fake-helper-auto-fallback)
   set_tests_properties(test_detach_controller_auto_ptrace_scope_uses_signal
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_TEST_PTRACE_SCOPE=2;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;FAKE_DETACH_HELPER_SCENARIO=stop-permission"
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_VERBOSITY=info;PEAK_TEST_PTRACE_SCOPE=2;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;FAKE_DETACH_HELPER_SCENARIO=stop-permission"
       PASS_REGULAR_EXPRESSION "auto safe detach using signal backend because ptrace_scope=2"
       SKIP_RETURN_CODE 77)
 

@@ -1,5 +1,6 @@
 #include "mpi_interceptor.h"
 #include "general_listener.h"
+#include "peak_logging.h"
 
 #include <sched.h>
 #include <stdlib.h>
@@ -7,6 +8,9 @@
 
 #define PEAK_MPI_FINALIZE_POLICY_ENV "PEAK_MPI_FINALIZE_POLICY"
 #define PEAK_OUTPUT_AGGREGATION_ENV  "PEAK_OUTPUT_AGGREGATION"
+
+#undef g_printerr
+#define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 static GumInterceptor* mpi_interceptor;
 

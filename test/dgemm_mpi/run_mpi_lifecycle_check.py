@@ -166,6 +166,7 @@ def main():
         return 0
 
     env = os.environ.copy()
+    env.setdefault("PEAK_VERBOSITY", "info")
     old_preload = env.get("LD_PRELOAD")
     env["LD_PRELOAD"] = args.libpeak if not old_preload else args.libpeak + ":" + old_preload
     if args.include_finalize_target:
