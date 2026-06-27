@@ -12,8 +12,10 @@
 /**
  * @brief Checks if MPI is being used.
  *
- * This function checks if the PMI_RANK, MV2_COMM_WORLD_RANK, or OMPI_COMM_WORLD_RANK environment
- * variable is set, which indicates that MPI is being used.
+ * This function checks for explicit MPI rank environment variables from PMI,
+ * PMIx, MVAPICH, Open MPI, and Intel MPI. Size-only variables and Slurm task
+ * variables are intentionally ignored because they can be present in launcher
+ * or wrapper processes that are not MPI ranks.
  *
  * @return 1 if MPI is being used, otherwise 0.
  */

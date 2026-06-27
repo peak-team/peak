@@ -399,6 +399,8 @@ test_retryable_prepare_statuses(void)
 int
 main(void)
 {
+    gum_init_embedded();
+
     test_queue_capacity_and_full_drop();
     test_closed_queue_drop();
     test_bounded_drain_budget();
@@ -410,10 +412,13 @@ main(void)
     test_retryable_prepare_statuses();
     restore_dynamic_attach_automatic();
 
+    int result = failures == 0 ? 0 : 1;
+    gum_deinit_embedded();
+
     if (failures != 0) {
-        return 1;
+        return result;
     }
 
     printf("dlopen_controller_diagnostics_ok\n");
-    return 0;
+    return result;
 }

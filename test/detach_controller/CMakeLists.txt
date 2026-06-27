@@ -164,7 +164,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
   )
   set_tests_properties(test_detach_controller_signal_backend_empty
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
   )
 
   add_test(NAME test_detach_controller_signal_backend_stale_caller
@@ -172,7 +172,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
   )
   set_tests_properties(test_detach_controller_signal_backend_stale_caller
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
   )
 
   add_test(NAME test_detach_controller_signal_backend_blocked_thread
@@ -180,7 +180,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
   )
   set_tests_properties(test_detach_controller_signal_backend_blocked_thread
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
       TIMEOUT 15
   )
 
@@ -189,7 +189,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
   )
   set_tests_properties(test_detach_controller_signal_backend_missing_thread_gate
     PROPERTIES
-      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
   )
 
   add_test(NAME test_detach_controller_helper_backend_missing_thread_gate

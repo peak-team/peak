@@ -112,6 +112,7 @@ static int flag_clean_fppid = 0;
 
 static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
+static _Atomic int peak_runtime_active = 0;
 typedef enum {
     PEAK_FINI_NOT_STARTED = 0,
     PEAK_FINI_IN_PROGRESS = 1,
@@ -128,6 +129,15 @@ peak_env_value_truthy(const char* value)
             g_ascii_strcasecmp(value, "true") == 0 ||
             g_ascii_strcasecmp(value, "yes") == 0 ||
             g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static gboolean
+peak_has_requested_work(void)
+{
+    return peak_hook_address_count > 0 ||
+           peak_gpu_hook_address_count > 0 ||
+           peak_gpu_monitor_all ||
+           peak_memory_profile;
 }
 
 #ifdef HAVE_MPI
@@ -284,6 +294,13 @@ void peak_init()
     }
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
+
+    gboolean has_requested_work = peak_has_requested_work();
+    peak_set_process_requests_work(has_requested_work);
+    if (!has_requested_work) {
+        return;
+    }
+    atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
 
     //gum_init_embedded();
 
@@ -667,6 +684,10 @@ void peak_fini()
 {
     int expected = PEAK_FINI_NOT_STARTED;
 
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+        return;
+    }
+
     if (atomic_compare_exchange_strong_explicit(
             &peak_fini_state,
             &expected,
@@ -715,6 +736,11 @@ void exit_interceptor_detach();
 static void
 peak_exit(int status) {
     //g_printerr("Custom exit called with status: %d\n", status);
+
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+        original_exit(status);
+        return;
+    }
 
     int expected = 0;
     if (atomic_compare_exchange_strong_explicit(&peak_exit_status_known,
@@ -815,9 +841,11 @@ int __libc_start_main(main_fn main, int argc, char** argv,
     // Store the original main function pointer
     real_main = main;
 
-    // Decide whether to use the main wrapper based on argv.
-    gboolean should_wrap = peak_should_wrap_main(argc, argv);
+    // Decide whether to use the main wrapper based on argv and requested work.
+    int requested_work = peak_process_requests_work();
+    gboolean should_wrap = peak_should_wrap_main(argc, argv) && requested_work;
     peak_set_process_profile_enabled(should_wrap);
+    peak_set_process_requests_work(requested_work);
     if (should_wrap) {
         return real___libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
     } else {
