@@ -608,12 +608,16 @@ peak_fini_impl(void)
     #else
         (void)used_mpi_aggregation;
     #endif
-    if (found_MPI && !mpi_finalize_path) {
+    if (found_MPI && !mpi_finalize_path && !local_requested_mpi_finalize) {
         mpi_interceptor_dettach(0);
     }
-    if (found_MPI && mpi_finalize_path) {
+    if (found_MPI && (mpi_finalize_path || local_requested_mpi_finalize)) {
         if (mpi_log_rank) {
-            g_printerr("[peak] Leaving PEAK target hooks pinned and restoring support wrappers before application PMPI_Finalize\n");
+            if (mpi_finalize_path) {
+                g_printerr("[peak] Leaving PEAK target hooks pinned and restoring support wrappers before application PMPI_Finalize\n");
+            } else {
+                g_printerr("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
+            }
         }
         syscall_interceptor_dettach();
         if (!pthread_listener_dettach()) {
