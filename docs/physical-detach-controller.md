@@ -561,7 +561,11 @@ batching extends each row with `retry_count`, `pending_age_s`, `batch_size`,
 `stop_window_us`, `batch_id`, and `last_retry_status`. Current diagnostics also
 append `failure_reason`, `failure_tid`, `failure_pc`, and `failure_aux` so
 collapsed statuses such as `prepare-failed,classify-failed` can be traced back
-to a concrete verifier or PC-classifier branch. The first seven fields are
+to a concrete verifier or PC-classifier branch. Heartbeat provenance appends
+`request_source`, `request_calls`, `request_ratio`,
+`request_global_overhead`, `request_total_time`, and `request_rate` so a final
+report marker can be joined back to the decision that requested the physical
+transition. The first seven fields are
 stable; parsers should treat every tail field as optional diagnostics and accept
 older rows that stop after `batch_id`. `last_retry_status` records the most
 recent retryable controller status for the hook, so a successful after-retry row
@@ -629,7 +633,11 @@ heartbeat stop, controller drain, and output prevents late hot-target samples
 from enqueueing new detach/reattach work while the finalizer path is already
 tearing down.
 `PEAK_MPI_REAL_FINALIZE=0` is a diagnostic opt-out that skips the real finalizer
-after output.
+after output. Intel MPI is treated as a runtime-specific fail-closed exception:
+unless `PEAK_MPI_REAL_FINALIZE=1` is set, PEAK skips the real finalizer after a
+successful report because Intel MPI 2019 has crashed in bundled `hwloc` teardown
+after PEAK output on large Frontera runs. OpenMPI and MPICH keep the normal
+real-finalizer default.
 
 Applications where every rank intentionally calls `MPI_Finalize()` early and
 then continues substantial non-MPI work should use
@@ -653,10 +661,11 @@ because large Intel MPI jobs can crash or hang if a profiler re-enters MPI
 finalization after the application has already logically finalized. In
 `report` mode PEAK keeps target profiling hooks and listener bookkeeping pinned
 for process exit cleanup, restores support wrappers such as
-`pthread_create`/`pthread_join` and `close`, and restores the `PMPI_Finalize`
-replacement. Reverting the broader target hook set from inside the MPI
-finalization call path is treated as unsafe. Process exit then reclaims the
-still-pinned target interceptor state.
+`pthread_create`/`pthread_join` and `close`, and keeps the `PMPI_Finalize`
+replacement pinned while returning through Gum's original-call trampoline.
+Reverting the broader target hook set from inside the MPI finalization call path
+is treated as unsafe. Process exit then reclaims the still-pinned target
+interceptor state.
 
 Because PEAK owns the finalizer wrapper, `MPI_Finalize` and `PMPI_Finalize`
 targets are skipped rather than mapped to `peak_pmpi_finalize()`. Profiling the
@@ -1134,9 +1143,10 @@ Completed in this branch:
     MILC-style setup termination from turning into Intel MPI finalization
     crashes or rank hangs. Once the application has entered `PMPI_Finalize()`,
     PEAK writes output before the later exit status is knowable, makes target
-    callbacks pass-through, keeps target hooks pinned, restores support wrappers
-    and the `PMPI_Finalize` replacement, and returns to the real finalizer after
-    bounded all-rank proof unless `defer` policy is selected.
+    callbacks pass-through, keeps target hooks pinned, restores support
+    wrappers, keeps the `PMPI_Finalize` replacement pinned, and returns to the
+    real finalizer through Gum's original-call trampoline after bounded
+    all-rank proof unless `defer` policy is selected.
     The MPI reducer uses timed nonblocking collective wrappers after proof
     success, but still depends on `MPI_Test()` progress; socket output remains
     the reducer for runs where final reporting must avoid MPI progress

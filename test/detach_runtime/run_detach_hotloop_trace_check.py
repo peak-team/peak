@@ -30,6 +30,15 @@ TRANSITION_SKIP_RE = re.compile(
 )
 TARGET_SYMBOL = "peak_detach_hot_target"
 PAIRED_TARGET_SYMBOL = "peak_detach_hot_target_two"
+COLD_TARGET_SYMBOL = "peak_detach_cold_target"
+TRACE_REQUEST_SOURCE_INDEX = 17
+TRACE_REQUEST_CALLS_INDEX = 18
+COLD_MARKED_RE = re.compile(
+    r"(?m)^\|\s*peak_detach_cold_target\*+\s*\|\s*1\s*\|"
+)
+COLD_UNMARKED_RE = re.compile(
+    r"(?m)^\|\s*peak_detach_cold_target\s*\|\s*1\s*\|"
+)
 
 
 def make_env(args, sample):
@@ -38,16 +47,25 @@ def make_env(args, sample):
     peak_target = TARGET_SYMBOL
     if args.paired_targets:
         peak_target = f"{TARGET_SYMBOL},{PAIRED_TARGET_SYMBOL}"
+    if args.cold_one_shot_target:
+        peak_target = f"{peak_target},{COLD_TARGET_SYMBOL}"
     env.update(
         {
             "LD_PRELOAD": args.libpeak,
             "PEAK_TARGET": peak_target,
             "PEAK_MAX_NUM_THREADS": str(max_threads),
-            "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
-            "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
+            "PEAK_ENABLE_PER_TARGET_HEARTBEAT": (
+                "1" if args.enable_per_target_heartbeat else "0"
+            ),
+            "PEAK_ENABLE_GLOBAL_HEARTBEAT": (
+                "1" if args.enable_global_heartbeat else "0"
+            ),
             "PEAK_ENABLE_REATTACH": "1" if args.enable_reattach else "0",
             "PEAK_COST": args.peak_cost,
             "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
+            "PEAK_GLOBAL_OVERHEAD_RATIO": args.global_overhead_ratio,
+            "PEAK_GLOBAL_DETACH_FACTOR": args.global_detach_factor,
+            "PEAK_GLOBAL_REATTACH_FACTOR": args.global_reattach_factor,
             "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
             "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
             "PEAK_REATTACH_COOLDOWN_MS": args.reattach_cooldown_ms,
@@ -221,6 +239,43 @@ def trace_has_required_batch(args, sample, operation, required_size):
     return False
 
 
+def trace_has_required_request_source(args, sample):
+    if not args.require_detach_source:
+        return True
+
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False
+
+    tracked_symbols = {TARGET_SYMBOL}
+    if args.paired_targets:
+        tracked_symbols.add(PAIRED_TARGET_SYMBOL)
+
+    for fields in rows:
+        if (len(fields) <= TRACE_REQUEST_CALLS_INDEX or
+                fields[2] not in tracked_symbols or
+                fields[3] != "detach" or
+                fields[4] != "success" or
+                fields[5] != "1" or
+                fields[6] != "safe"):
+            continue
+        if fields[TRACE_REQUEST_SOURCE_INDEX] != args.require_detach_source:
+            continue
+        try:
+            request_calls = int(fields[TRACE_REQUEST_CALLS_INDEX])
+        except ValueError:
+            continue
+        if request_calls >= args.min_detach_request_calls:
+            return True
+
+    print(
+        f"missing detach trace source={args.require_detach_source} "
+        f"min_request_calls={args.min_detach_request_calls}",
+        file=sys.stderr,
+    )
+    return False
+
+
 def trace_transition_counts(args, sample):
     rows = read_trace_rows(args, sample)
     counts = {
@@ -316,6 +371,8 @@ def run_sample(args, sample):
     ]
     if args.paired_targets:
         cmd.append("--paired-targets")
+    if args.cold_one_shot_target:
+        cmd.append("--cold-one-shot-target")
     if args.spawn_transient_threads:
         cmd.extend([
             "--spawn-transient-threads",
@@ -344,10 +401,23 @@ def run_sample(args, sample):
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
         args, sample, "reattach", args.require_reattach_batch_size)
+    trace_source_ok = trace_has_required_request_source(args, sample)
     trace_transition_ok = trace_transition_limits_ok(args, sample)
     helper_retry_ok = helper_retry_was_exercised(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
+    cold_marked = COLD_MARKED_RE.search(output) is not None
+    cold_unmarked = COLD_UNMARKED_RE.search(output) is not None
+    cold_trace_transition = False
+    if args.cold_one_shot_target:
+        rows = read_trace_rows(args, sample)
+        if rows is not None:
+            cold_trace_transition = any(
+                len(fields) >= 4 and
+                fields[2] == COLD_TARGET_SYMBOL and
+                fields[3] in {"detach", "reattach"}
+                for fields in rows
+            )
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
     spawned_threads = int(spawned_match.group(1)) if spawned_match else 0
 
@@ -359,10 +429,13 @@ def run_sample(args, sample):
         not trace_detached or
         not trace_detach_batched or
         not trace_reattach_batched or
+        not trace_source_ok or
         not trace_transition_ok or
         not helper_retry_ok or
         (args.require_reattach and not trace_reattached) or
         (args.spawn_transient_threads and spawned_threads <= 0) or
+        (args.cold_one_shot_target and
+         (cold_marked or not cold_unmarked or cold_trace_transition)) or
         bad_output or
         (args.fail_on_transition_skips and transition_skip)
     )
@@ -387,6 +460,8 @@ def run_sample(args, sample):
             print("missing required batched detach trace evidence", file=sys.stderr)
         if not trace_reattach_batched:
             print("missing required batched reattach trace evidence", file=sys.stderr)
+        if not trace_source_ok:
+            print("missing required detach request source evidence", file=sys.stderr)
         if not trace_transition_ok:
             print("trace transition limits failed", file=sys.stderr)
         if not helper_retry_ok:
@@ -395,6 +470,12 @@ def run_sample(args, sample):
             print("missing trace reattach success", file=sys.stderr)
         if args.spawn_transient_threads and spawned_threads <= 0:
             print("transient thread spawners did not create workers", file=sys.stderr)
+        if args.cold_one_shot_target and cold_marked:
+            print("cold one-shot target was marked detached/reattached in output", file=sys.stderr)
+        if args.cold_one_shot_target and not cold_unmarked:
+            print("cold one-shot target was not reported as exactly one unmarked call", file=sys.stderr)
+        if args.cold_one_shot_target and cold_trace_transition:
+            print("cold one-shot target has a physical detach/reattach trace row", file=sys.stderr)
         if bad_output:
             print(f"matched bad output: {bad_output.group(0)}", file=sys.stderr)
         if args.fail_on_transition_skips and transition_skip:
@@ -433,7 +514,14 @@ def main():
     parser.add_argument("--require-reattach", action="store_true")
     parser.add_argument("--disable-reattach", action="store_false",
                         dest="enable_reattach")
+    parser.add_argument("--disable-per-target-heartbeat", action="store_false",
+                        dest="enable_per_target_heartbeat")
+    parser.add_argument("--enable-global-heartbeat", action="store_true")
+    parser.add_argument("--global-overhead-ratio", default="0.000001")
+    parser.add_argument("--global-detach-factor", default="1.0")
+    parser.add_argument("--global-reattach-factor", default="1.0")
     parser.add_argument("--paired-targets", action="store_true")
+    parser.add_argument("--cold-one-shot-target", action="store_true")
     parser.add_argument("--spawn-transient-threads", action="store_true")
     parser.add_argument("--spawner-threads", type=int, default=2)
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
@@ -444,13 +532,15 @@ def main():
     parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
     parser.add_argument("--max-reattach-success", type=int, default=-1)
     parser.add_argument("--require-trace-diagnostics", action="store_true")
+    parser.add_argument("--require-detach-source", default="")
+    parser.add_argument("--min-detach-request-calls", type=int, default=1)
     parser.add_argument("--detach-backend", choices=("helper", "signal"),
                         default="")
     parser.add_argument("--detach-helper", default="")
     parser.add_argument("--helper-retry-log-prefix", default="")
     parser.add_argument("--skip-helper-unavailable", action="store_true")
     parser.add_argument("--trace-prefix", default="")
-    parser.set_defaults(enable_reattach=True)
+    parser.set_defaults(enable_reattach=True, enable_per_target_heartbeat=True)
     args = parser.parse_args()
 
     if (args.threads <= 0 or args.seconds <= 0 or args.samples <= 0 or

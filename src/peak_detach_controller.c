@@ -136,6 +136,9 @@ static pthread_once_t atfork_initialized = PTHREAD_ONCE_INIT;
 static int helper_fd = -1;
 static pid_t helper_pid = -1;
 static pid_t helper_owner_pid = -1;
+static gboolean helper_warmup_active = FALSE;
+static gboolean helper_warmup_failed = FALSE;
+static PeakDetachStatus helper_warmup_status = PEAK_DETACH_STATUS_SAFE;
 static gboolean warned_helper_unavailable = FALSE;
 static gboolean warned_helper_resume_failed = FALSE;
 static gboolean warned_helper_fatal = FALSE;
@@ -1121,6 +1124,12 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     memset(&handshake, 0, sizeof(handshake));
     if (helper_fd >= 0 && helper_pid > 0) {
         return TRUE;
+    }
+    if (helper_warmup_failed && !helper_warmup_active) {
+        if (status_out != NULL) {
+            *status_out = helper_warmup_status;
+        }
+        return FALSE;
     }
 
     if (!peak_detach_controller_thread_creation_gate_installed()) {
@@ -3927,6 +3936,43 @@ peak_detach_controller_strict_batch_supported(void)
     return TRUE;
 #else
     return FALSE;
+#endif
+}
+
+void
+peak_detach_controller_warmup_backend(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    return;
+#else
+    if (peak_detach_controller_mode() == PEAK_SAFE_DETACH_MODE_COMPATIBILITY) {
+        return;
+    }
+
+    PeakDetachRequestedBackend requested_backend =
+        peak_detach_controller_requested_backend();
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL) {
+        return;
+    }
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+        peak_detach_controller_auto_should_use_signal_backend()) {
+        return;
+    }
+
+    peak_detach_controller_init_atfork_once();
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    helper_warmup_active = TRUE;
+    if (peak_detach_controller_ensure_helper(&status)) {
+        helper_warmup_failed = FALSE;
+        helper_warmup_status = PEAK_DETACH_STATUS_SAFE;
+    } else {
+        helper_warmup_failed = TRUE;
+        helper_warmup_status =
+            peak_detach_controller_status_allows_auto_signal_fallback(status)
+                ? status
+                : PEAK_DETACH_STATUS_UNSUPPORTED;
+    }
+    helper_warmup_active = FALSE;
 #endif
 }
 

@@ -63,6 +63,8 @@ gboolean peak_detach_controller_prepare_hook_mutation(
 
 gboolean peak_detach_controller_strict_batch_supported(void);
 
+void peak_detach_controller_warmup_backend(void);
+
 gboolean peak_detach_controller_prepare_hook_mutation_batch(
     const PeakDetachRequest* requests,
     size_t request_count,

@@ -73,6 +73,13 @@ void peak_detach_hot_target_two(uint64_t value)
     asm volatile(PEAK_DETACH_HOT_NOP_SLED ::: "memory");
 }
 
+__attribute__((noinline, noclone, used, externally_visible, visibility("default")))
+void peak_detach_cold_target(uint64_t value)
+{
+    (void)value;
+    asm volatile(PEAK_DETACH_HOT_NOP_SLED ::: "memory");
+}
+
 typedef struct {
     uint64_t calls;
     unsigned int seed;
@@ -650,6 +657,122 @@ helper_log_count_is(const char* path, const char* entry, int expected)
         return 0;
     }
     return 1;
+}
+
+static int
+run_helper_warmup_check(void)
+{
+    const char* helper_log_path = getenv("FAKE_DETACH_HELPER_LOG");
+    PeakControllerShutdownHelperFn shutdown_helper =
+        (PeakControllerShutdownHelperFn)required_symbol(
+            "peak_detach_controller_shutdown_helper");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+
+    if (helper_log_path == NULL || helper_log_path[0] == '\0') {
+        fprintf(stderr, "FAKE_DETACH_HELPER_LOG is required\n");
+        return 2;
+    }
+    if (shutdown_helper == NULL || hook_count == NULL) {
+        return 2;
+    }
+    if (*hook_count == 0) {
+        fprintf(stderr, "helper warmup check requires at least one configured hook\n");
+        return 2;
+    }
+
+    if (!helper_log_count_is(helper_log_path, "START", 1) ||
+        !helper_log_count_is(helper_log_path, "EVACUATE", 0)) {
+        return 2;
+    }
+
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    if (!shutdown_helper(&status) || status != PEAK_DETACH_STATUS_SAFE) {
+        fprintf(stderr, "helper warmup shutdown failed: %d\n", (int)status);
+        return 2;
+    }
+    if (!helper_log_count_is(helper_log_path, "SHUTDOWN", 1)) {
+        return 2;
+    }
+
+    printf("helper_warmup_ok\n");
+    return 0;
+}
+
+static int
+run_helper_warmup_failure_latch_check(void)
+{
+    const char* helper_log_path = getenv("FAKE_DETACH_HELPER_LOG");
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    int start_count;
+    int final_start_count;
+
+    if (helper_log_path == NULL || helper_log_path[0] == '\0') {
+        fprintf(stderr, "FAKE_DETACH_HELPER_LOG is required\n");
+        return 2;
+    }
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+    if (*hook_count == 0) {
+        fprintf(stderr, "helper warmup failure latch requires a configured hook\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr,
+                "expected hook 0 to start attached, got state %d\n",
+                (int)hook_state(0));
+        return 2;
+    }
+
+    start_count = count_helper_log_entry(helper_log_path, "START");
+    if (start_count < 1) {
+        fprintf(stderr,
+                "expected failed helper warmup START in %s, got %d\n",
+                helper_log_path,
+                start_count);
+        return 2;
+    }
+
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue detach after helper warmup failure\n");
+        return 2;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr,
+                "controller did not drain after helper warmup failure fallback\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr,
+                "expected signal fallback to detach hook after helper warmup failure, got state %d\n",
+                (int)hook_state(0));
+        return 2;
+    }
+
+    final_start_count = count_helper_log_entry(helper_log_path, "START");
+    if (final_start_count != start_count) {
+        fprintf(stderr,
+                "helper was started again after warmup failure: before=%d after=%d\n",
+                start_count,
+                final_start_count);
+        return 2;
+    }
+
+    controller_stop();
+    printf("helper_warmup_failure_latch_ok\n");
+    return 0;
 }
 
 static int
@@ -3124,6 +3247,12 @@ main(int argc, char** argv)
     if (has_flag_arg(argc, argv, "--controller-no-trace-pending-age-check")) {
         return run_controller_no_trace_pending_age_check();
     }
+    if (has_flag_arg(argc, argv, "--helper-warmup-check")) {
+        return run_helper_warmup_check();
+    }
+    if (has_flag_arg(argc, argv, "--helper-warmup-failure-latch-check")) {
+        return run_helper_warmup_failure_latch_check();
+    }
     if (has_flag_arg(argc, argv, "--controller-unsupported-gum-pc-retry-check")) {
         return run_controller_unsupported_gum_pc_retry_check(argc, argv);
     }
@@ -3152,6 +3281,7 @@ main(int argc, char** argv)
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
     long spawner_threads = parse_long_arg(argc, argv, "--spawner-threads", 2);
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
+    int cold_one_shot_target = has_flag_arg(argc, argv, "--cold-one-shot-target");
     int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
     int block_backend_signal =
         has_flag_arg(argc, argv, "--block-backend-signal");
@@ -3192,6 +3322,9 @@ main(int argc, char** argv)
     atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
     atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
     atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
+    if (cold_one_shot_target) {
+        peak_detach_cold_target(0xc01d);
+    }
     for (long i = 0; i < threads; i++) {
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
         states[i].start_gate = &gate;

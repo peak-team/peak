@@ -147,6 +147,8 @@ main(void)
     ok &= expect_filtered("/opt/apps/lmod/lmod/libexec/modulecmd");
     ok &= expect_filtered("/usr/bin/env");
     ok &= expect_filtered("timeout");
+    ok &= expect_filtered("/usr/bin/time");
+    ok &= expect_filtered("tee");
     ok &= expect_filtered("/bin/stty");
     ok &= expect_filtered("tty");
     ok &= expect_filtered("tput");

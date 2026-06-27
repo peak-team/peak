@@ -58,6 +58,8 @@ def parse_args():
             "no-finalize-collective-disabled",
             "finalize-clean",
             "finalize-clean-output-mpi",
+            "finalize-clean-output-mpi-intel-default",
+            "finalize-clean-output-mpi-intel-real-finalize",
             "finalize-clean-output-local",
             "finalize-clean-output-socket-bad-host",
             "finalize-clean-output-socket-bad-host-no-fallback",
@@ -145,6 +147,23 @@ def main():
         app_args.append("finalize-then-exit0")
         expected = "PMPI_Finalize was observed on every rank"
         expected_peak_tables = 1
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-intel-default":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
+        app_args.append("finalize-then-exit0")
+        expected = "skipping real PMPI_Finalize for this MPI runtime"
+        expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_peak_tables = 0
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-intel-real-finalize":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
+        env["PEAK_MPI_REAL_FINALIZE"] = "1"
+        app_args.append("finalize-then-exit0")
+        expected = "PEAK output is complete; returning to real PMPI_Finalize"
+        expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_peak_tables = 0
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-local":
         env["PEAK_OUTPUT_AGGREGATION"] = "rank-local"
