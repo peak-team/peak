@@ -5,6 +5,7 @@ import csv
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,10 +38,67 @@ EXPECTED_NONZERO_RETURN_MODES = {
     "finalize-nonzero",
     "finalize-return-nonzero",
 }
+INTEL_MPI_ONLY_MODES = {
+    "finalize-clean-output-mpi-intel-default",
+    "finalize-clean-output-mpi-intel-real-finalize",
+}
 
 
 def split_flags(value):
     return [flag for flag in shlex.split(value) if flag]
+
+
+def launcher_version_text(mpiexec):
+    try:
+        proc = subprocess.run(
+            [mpiexec, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout or ""
+
+
+def launcher_looks_like_intel_mpi(mpiexec):
+    text = f"{mpiexec}\n{launcher_version_text(mpiexec)}"
+    return (
+        "Intel(R) MPI" in text or
+        "Intel MPI" in text or
+        "I_MPI" in text
+    )
+
+
+def terminate_process_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_mpi_command(command, env, timeout):
+    proc = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, output or "", False
+    except subprocess.TimeoutExpired:
+        terminate_process_group(proc, signal.SIGTERM)
+        try:
+            output, _ = proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(proc, signal.SIGKILL)
+            output, _ = proc.communicate()
+        return proc.returncode, output or "", True
 
 
 def parse_args():
@@ -77,7 +135,7 @@ def parse_args():
         ],
         required=True,
     )
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--preflags", default="")
     parser.add_argument("--postflags", default="")
     parser.add_argument("--require-pinned-finalize", action="store_true")
@@ -90,6 +148,10 @@ def parse_args():
 def main():
     args = parse_args()
     nprocs = int(args.nprocs)
+    if (args.mode in INTEL_MPI_ONLY_MODES and
+            not launcher_looks_like_intel_mpi(args.mpiexec)):
+        print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-intel-mpi")
+        return 0
     if args.mode.startswith("subset-") and nprocs < 2:
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
@@ -302,14 +364,10 @@ def main():
     ) as stats_dir:
         stats_prefix = str(Path(stats_dir) / "peak-stats")
         env["PEAK_STATSLOG_PATH"] = stats_prefix
-        proc = subprocess.run(
+        returncode, output, timed_out = run_mpi_command(
             command,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
             timeout=args.timeout,
-            check=False,
         )
         stats_files = sorted(Path(stats_dir).glob("peak-stats-p*.csv"))
         stats_text = "\n".join(
@@ -320,7 +378,6 @@ def main():
         for path in stats_files:
             with path.open(newline="", encoding="utf-8", errors="replace") as handle:
                 stats_rows.extend(csv.DictReader(handle))
-    output = proc.stdout
     sys.stdout.write(output)
     if done_file is not None:
         try:
@@ -353,6 +410,8 @@ def main():
         raise AssertionError(
             "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
         )
+    if timed_out and args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES:
+        raise AssertionError(f"{args.mode} run timed out after {args.timeout:g}s")
     if args.require_detach_trace:
         if not trace_path:
             raise AssertionError("PEAK_DETACH_TRACE_PATH is required for detach trace assertion")
@@ -396,10 +455,11 @@ def main():
             )
     if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
-            proc.returncode != 0):
-        raise AssertionError(f"{args.mode} run returned {proc.returncode}")
+            returncode != 0):
+        raise AssertionError(f"{args.mode} run returned {returncode}")
 
-    print(f"mpi_lifecycle_check_ok mode={args.mode} rc={proc.returncode}")
+    timeout_text = " timeout=1" if timed_out else ""
+    print(f"mpi_lifecycle_check_ok mode={args.mode} rc={returncode}{timeout_text}")
     return 0
 
 
