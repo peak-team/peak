@@ -175,7 +175,7 @@ peak_signal_policy_ensure_real_symbols(void)
 static int
 peak_signal_policy_enabled_for_process(void)
 {
-    return peak_process_profile_enabled();
+    return peak_process_profile_enabled() && peak_process_requests_work();
 }
 
 static int

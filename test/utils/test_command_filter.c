@@ -1,3 +1,4 @@
+#include "mpi_utils.h"
 #include "utils.h"
 
 #include <stdio.h>
@@ -77,6 +78,69 @@ expect_profile_decision(int argc,
                 label,
                 actual,
                 expected);
+        return 0;
+    }
+    return 1;
+}
+
+static void
+clear_mpi_env(void)
+{
+    static const char* names[] = {
+        "PMI_RANK",
+        "PMIX_RANK",
+        "MV2_COMM_WORLD_RANK",
+        "OMPI_COMM_WORLD_RANK",
+        "I_MPI_RANK",
+        "PMI_SIZE",
+        "PMIX_SIZE",
+        "MV2_COMM_WORLD_SIZE",
+        "OMPI_COMM_WORLD_SIZE",
+        "I_MPI_SIZE",
+        "SLURM_PROCID",
+        "SLURM_NTASKS",
+        NULL
+    };
+
+    for (const char** name = names; *name != NULL; name++) {
+        unsetenv(*name);
+    }
+}
+
+static int
+expect_mpi_detected_by(const char* name)
+{
+    clear_mpi_env();
+    setenv(name, "1", 1);
+    if (!check_MPI()) {
+        fprintf(stderr, "expected MPI rank env to be detected: %s\n", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int
+expect_mpi_not_detected_by(const char* name)
+{
+    clear_mpi_env();
+    setenv(name, "1", 1);
+    if (check_MPI()) {
+        fprintf(stderr, "expected non-rank MPI env to be ignored: %s\n", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int
+expect_requested_work_override(int enabled)
+{
+    peak_set_process_requests_work(enabled);
+    int actual = peak_process_requests_work();
+    if (actual != enabled) {
+        fprintf(stderr,
+                "unexpected requested-work override: got %d expected %d\n",
+                actual,
+                enabled);
         return 0;
     }
     return 1;
@@ -206,6 +270,28 @@ main(void)
     ok &= expect_profile_decision(2, node_app, 1, "node jit opt-in");
     unsetenv("PEAK_JIT_ENABLE");
     unsetenv("PEAK_TARGET_FILE");
+
+    ok &= expect_requested_work_override(0);
+    ok &= expect_requested_work_override(1);
+
+    clear_mpi_env();
+    if (check_MPI()) {
+        fprintf(stderr, "expected no MPI rank env to stay non-MPI\n");
+        ok = 0;
+    }
+    ok &= expect_mpi_detected_by("PMI_RANK");
+    ok &= expect_mpi_detected_by("PMIX_RANK");
+    ok &= expect_mpi_detected_by("MV2_COMM_WORLD_RANK");
+    ok &= expect_mpi_detected_by("OMPI_COMM_WORLD_RANK");
+    ok &= expect_mpi_detected_by("I_MPI_RANK");
+    ok &= expect_mpi_not_detected_by("PMI_SIZE");
+    ok &= expect_mpi_not_detected_by("PMIX_SIZE");
+    ok &= expect_mpi_not_detected_by("MV2_COMM_WORLD_SIZE");
+    ok &= expect_mpi_not_detected_by("OMPI_COMM_WORLD_SIZE");
+    ok &= expect_mpi_not_detected_by("I_MPI_SIZE");
+    ok &= expect_mpi_not_detected_by("SLURM_PROCID");
+    ok &= expect_mpi_not_detected_by("SLURM_NTASKS");
+    clear_mpi_env();
 
     if (!ok) {
         return 1;

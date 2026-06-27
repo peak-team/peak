@@ -5,9 +5,17 @@
 
 #define PEAK_JIT_ENABLE_ENV "PEAK_JIT_ENABLE"
 #define PEAK_PROFILE_INTERPRETERS_ENV "PEAK_PROFILE_INTERPRETERS"
+#define PEAK_TARGET_ENV "PEAK_TARGET"
+#define PEAK_TARGET_FILE_ENV "PEAK_TARGET_FILE"
+#define PEAK_TARGET_GROUP_ENV "PEAK_TARGET_GROUP"
+#define PEAK_GPU_TARGET_ENV "PEAK_GPU_TARGET"
+#define PEAK_GPU_TARGET_FILE_ENV "PEAK_GPU_TARGET_FILE"
+#define PEAK_GPU_MONITOR_ALL_ENV "PEAK_GPU_MONITOR_ALL"
+#define PEAK_MEMORY_PROFILE_ENV "PEAK_MEMORY_PROFILE"
 #define PEAK_PROFILE_DECISION_UNKNOWN (-1)
 
 static int peak_process_profile_enabled_cache = PEAK_PROFILE_DECISION_UNKNOWN;
+static int peak_process_requests_work_cache = PEAK_PROFILE_DECISION_UNKNOWN;
 
 double peak_second()
 {
@@ -280,6 +288,52 @@ peak_env_truthy(const char* value)
             strcasecmp(value, "true") == 0 ||
             strcasecmp(value, "yes") == 0 ||
             strcasecmp(value, "on") == 0);
+}
+
+static int
+peak_env_nonempty(const char* name)
+{
+    const char* value = getenv(name);
+    return value != NULL && value[0] != '\0';
+}
+
+void
+peak_set_process_requests_work(int enabled)
+{
+    __atomic_store_n(&peak_process_requests_work_cache,
+                     enabled ? 1 : 0,
+                     __ATOMIC_RELEASE);
+}
+
+int
+peak_process_requests_work(void)
+{
+    int cached = __atomic_load_n(&peak_process_requests_work_cache,
+                                 __ATOMIC_ACQUIRE);
+    if (cached != PEAK_PROFILE_DECISION_UNKNOWN) {
+        return cached;
+    }
+
+    int requested =
+        peak_env_nonempty(PEAK_TARGET_ENV) ||
+        peak_env_nonempty(PEAK_TARGET_FILE_ENV) ||
+        peak_env_nonempty(PEAK_TARGET_GROUP_ENV) ||
+        peak_env_nonempty(PEAK_GPU_TARGET_ENV) ||
+        peak_env_nonempty(PEAK_GPU_TARGET_FILE_ENV) ||
+        peak_env_truthy(getenv(PEAK_GPU_MONITOR_ALL_ENV)) ||
+        peak_env_truthy(getenv(PEAK_MEMORY_PROFILE_ENV));
+
+    int expected = PEAK_PROFILE_DECISION_UNKNOWN;
+    if (!__atomic_compare_exchange_n(&peak_process_requests_work_cache,
+                                     &expected,
+                                     requested,
+                                     0,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        requested = expected;
+    }
+
+    return requested;
 }
 
 static int

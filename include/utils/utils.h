@@ -143,6 +143,30 @@ int peak_should_profile_command(int argc, char *const argv[]);
 void peak_set_process_profile_enabled(int enabled);
 
 /**
+ * @brief Override whether the current process requested any PEAK work.
+ *
+ * This is separate from the command-profile decision: a process may be a valid
+ * profiling target, but an LD_PRELOAD with no target, GPU monitor, or memory
+ * profiling request should remain inert.
+ *
+ * @param enabled Nonzero when the process has at least one requested PEAK
+ *        activity, zero to keep preload-side support hooks inert.
+ */
+void peak_set_process_requests_work(int enabled);
+
+/**
+ * @brief Return whether the current environment requests PEAK activity.
+ *
+ * This checks target, GPU monitor, and memory profiling controls, intentionally
+ * ignoring generic tuning variables that have no effect without a requested
+ * target.
+ *
+ * @return 1 if PEAK should perform runtime work, 0 if preload should stay
+ *         inert.
+ */
+int peak_process_requests_work(void);
+
+/**
  * @brief Return whether PEAK behavior should be active in this process.
  *
  * If __libc_start_main has not published a decision yet, this consults
