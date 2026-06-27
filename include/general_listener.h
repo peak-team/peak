@@ -135,6 +135,12 @@ void peak_general_listener_free(PeakGeneralListener* self);
  */
 gboolean peak_general_listener_attach_target_is_supported(const char* symbol_name,
                                                           gpointer address);
+/**
+ * @brief Returns whether an internal PEAK support replacement should proceed.
+ *
+ * Support hooks preserve PEAK runtime hygiene and are not profiling targets;
+ * Gum's own replacement result is the authority for these wrappers.
+ */
 gboolean peak_general_listener_support_attach_target_is_supported(
     const char* symbol_name,
     gpointer address);

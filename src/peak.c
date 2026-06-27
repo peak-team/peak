@@ -15,6 +15,7 @@
 #endif
 
 #include "general_listener.h"
+#include "peak_detach_controller.h"
 #include "peak_jit_provider.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
@@ -55,6 +56,8 @@
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
+#define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
+#define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
 #define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
@@ -165,6 +168,50 @@ peak_output_aggregation_mode_from_value(const char* name,
     return PEAK_OUTPUT_AGGREGATION_LOCAL;
 }
 
+static gboolean
+peak_mpi_runtime_matches_intel_mpi(void)
+{
+    const char* test_version = getenv(PEAK_TEST_MPI_LIBRARY_VERSION_ENV);
+    char version[MPI_MAX_LIBRARY_VERSION_STRING] = { 0 };
+    int version_len = 0;
+    const char* text = test_version;
+
+    if (text == NULL || text[0] == '\0') {
+        if (MPI_Get_library_version(version, &version_len) != MPI_SUCCESS) {
+            return FALSE;
+        }
+        if (version_len < 0) {
+            version_len = 0;
+        }
+        if (version_len >= (int)sizeof(version)) {
+            version_len = (int)sizeof(version) - 1;
+        }
+        version[version_len] = '\0';
+        text = version;
+    }
+
+    return strstr(text, "Intel(R) MPI") != NULL ||
+           strstr(text, "Intel MPI") != NULL;
+}
+
+static gboolean
+peak_mpi_real_finalize_default_allowed(void)
+{
+    const char* value = getenv(PEAK_MPI_REAL_FINALIZE_ENV);
+
+    if (value != NULL && value[0] != '\0') {
+        return peak_env_value_truthy(value);
+    }
+
+    /*
+     * Frontera's Intel MPI 2019 finalizer has repeatedly crashed in hwloc
+     * teardown after PEAK has already produced its all-rank report. Keep the
+     * normal real-finalize default for OpenMPI/MPICH, but fail closed for
+     * Intel MPI unless the user explicitly opts back in.
+     */
+    return !peak_mpi_runtime_matches_intel_mpi();
+}
+
 static PeakOutputAggregationMode
 peak_output_aggregation_mode(void)
 {
@@ -236,16 +283,33 @@ void peak_init()
 
     //gum_init_embedded();
 
-    pthread_listener_attach();
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
         int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
         if (is_parent_MPI > 0) {
             found_MPI = 0;
-        } else if (mpi_interceptor_attach() != 0) {
-            found_MPI = 0;
         }
+    }
+#endif
+    pthread_listener_attach();
+    /*
+     * Do not fork/exec the helper before MPI runtime initialization. Large
+     * Intel MPI jobs initialize OFI/UCX/libnuma after PEAK startup; adding one
+     * helper child per rank before PMPI_Init_thread perturbs that fragile
+     * phase at scale. Auto mode still tries the helper first when the first
+     * mutation needs a backend; this only removes eager pre-MPI warmup.
+     */
+    if (peak_hook_address_count > 0
+#ifdef HAVE_MPI
+        && !found_MPI
+#endif
+    ) {
+        peak_detach_controller_warmup_backend();
+    }
+#ifdef HAVE_MPI
+    if (found_MPI && mpi_interceptor_attach() != 0) {
+        found_MPI = 0;
     }
 #endif
 #ifdef HAVE_CUDA
@@ -268,6 +332,7 @@ void peak_init()
             dlopen_interceptor_enable_dynamic_attach();
         }
     }
+    peak_main_time = peak_second();
     if (heartbeat_time != 0) {
         heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);
@@ -291,9 +356,6 @@ void peak_init()
             exit(EXIT_FAILURE);
         }
     }
-    
-    peak_main_time = peak_second();
-    
     if (peak_memory_profile) {
         malloc_interceptor_attach();
     }
@@ -491,12 +553,18 @@ peak_fini_impl(void)
         use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
         use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
         PEAK_OUTPUT_AGGREGATION_LOCAL;
-    int allow_real_mpi_finalize =
+    int base_real_mpi_finalize_allowed =
         mpi_finalize_path &&
         mpi_runtime_can_collect &&
         !abnormal_exit &&
         !mpi_collectives_failed_closed &&
         all_ranks_requested_mpi_finalize;
+    int real_mpi_finalize_default_allowed =
+        base_real_mpi_finalize_allowed ?
+            peak_mpi_real_finalize_default_allowed() : 0;
+    int allow_real_mpi_finalize =
+        base_real_mpi_finalize_allowed &&
+        real_mpi_finalize_default_allowed;
     if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
         g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
@@ -523,6 +591,8 @@ peak_fini_impl(void)
         if (mpi_log_rank) {
             if (allow_real_mpi_finalize) {
                 g_printerr("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
+            } else if (!real_mpi_finalize_default_allowed) {
+                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize for this MPI runtime unless PEAK_MPI_REAL_FINALIZE=1 is set\n");
             } else {
                 g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
             }

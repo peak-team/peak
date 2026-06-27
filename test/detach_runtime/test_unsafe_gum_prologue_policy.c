@@ -203,13 +203,13 @@ main(void)
         expect_policy("unsupported-before-return-conservative",
                       unsupported_before_return,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE) ||
-        expect_support_policy("milc-f2d-support", milc_f2d_prefix, TRUE) ||
-        expect_support_policy("close-fastpath-support", close_fastpath, TRUE) ||
-        expect_support_policy("tiny-return-support", tiny_return, TRUE) ||
+        expect_support_policy("milc-f2d-support", milc_f2d_prefix, FALSE) ||
+        expect_support_policy("close-fastpath-support", close_fastpath, FALSE) ||
+        expect_support_policy("tiny-return-support", tiny_return, FALSE) ||
         expect_support_policy("unsupported-before-return-support",
-                              unsupported_before_return, TRUE) ||
+                              unsupported_before_return, FALSE) ||
         expect_support_policy("plain-immediate-support", plain_immediate,
-                              TRUE)) {
+                              FALSE)) {
         return 1;
     }
 #elif defined(__aarch64__)

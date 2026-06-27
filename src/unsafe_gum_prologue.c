@@ -395,10 +395,10 @@ peak_x86_decode_instruction_size(const guint8* code,
 }
 
 static gboolean
-peak_x86_has_early_return_in_relocated_prefix(const guint8* code,
-                                              gboolean* undecodable_out)
+peak_x86_has_return_before_entry_patch(const guint8* code,
+                                       gboolean* undecodable_out)
 {
-    const gsize guard_size = 32;
+    const gsize min_patch_size = 5;
     gsize offset = 0;
     gsize endbr_size = 0;
 
@@ -414,12 +414,12 @@ peak_x86_has_early_return_in_relocated_prefix(const guint8* code,
         offset = endbr_size;
     }
 
-    while (offset < guard_size) {
+    while (offset < min_patch_size) {
         gsize insn_size = 0;
         gboolean is_return = FALSE;
 
         if (!peak_x86_decode_instruction_size(&code[offset],
-                                              guard_size - offset,
+                                              min_patch_size - offset,
                                               &insn_size,
                                               &is_return) ||
             insn_size == 0) {
@@ -694,6 +694,33 @@ peak_unsafe_gum_prologue_check(gpointer address,
 }
 
 gboolean
+peak_gum_prologue_too_short_for_attach(gpointer address,
+                                       const char** reason_out)
+{
+    if (reason_out != NULL) {
+        *reason_out = NULL;
+    }
+
+    if (address == NULL) {
+        return FALSE;
+    }
+
+#if defined(__x86_64__) || defined(__amd64__)
+    if (peak_x86_has_return_before_entry_patch((const guint8*)address,
+                                               NULL)) {
+        if (reason_out != NULL) {
+            *reason_out = "x86-return-before-entry-patch";
+        }
+        return TRUE;
+    }
+#else
+    (void)address;
+#endif
+
+    return FALSE;
+}
+
+gboolean
 peak_unsafe_gum_support_prologue_check(gpointer address,
                                        const char** reason_out)
 {
@@ -701,31 +728,6 @@ peak_unsafe_gum_support_prologue_check(gpointer address,
         *reason_out = NULL;
     }
 
-    if (peak_has_default_unsafe_prologue(address, reason_out)) {
-        return TRUE;
-    }
-
-#if defined(__x86_64__) || defined(__amd64__)
-    gboolean undecodable = FALSE;
-
-    if (peak_x86_has_early_return_in_relocated_prefix((const guint8*)address,
-                                                      &undecodable)) {
-        if (reason_out != NULL) {
-            *reason_out = "x86-early-return-support";
-        }
-        return TRUE;
-    }
-    if (undecodable) {
-        if (reason_out != NULL) {
-            *reason_out = "x86-undecodable-support";
-        }
-        return TRUE;
-    }
-#endif
-
-    if (peak_has_conservative_unsafe_prologue(address, reason_out)) {
-        return TRUE;
-    }
-
+    (void)address;
     return FALSE;
 }

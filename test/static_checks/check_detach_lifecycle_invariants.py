@@ -97,6 +97,47 @@ def check_dlopen_revert_transactions(repo_root):
                 "dlopen revert is missing nearby end_transaction")
 
 
+def check_peak_init_heartbeat_order(repo_root):
+    source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    body = extract_function(source, "peak_init")
+
+    main_time_position = body.find("peak_main_time = peak_second();")
+    heartbeat_position = body.find("pthread_create(&heartbeat_thread")
+    require(main_time_position != -1,
+            "peak_init must initialize peak_main_time")
+    require(heartbeat_position != -1,
+            "peak_init must create the heartbeat thread explicitly")
+    require(main_time_position < heartbeat_position,
+            "peak_main_time must be initialized before heartbeat thread startup")
+
+
+def check_mpi_finalize_trampoline_default(repo_root):
+    source = (repo_root / "src/mpi_interceptor.c").read_text(encoding="utf-8")
+    body = extract_function(source, "mpi_interceptor_direct_finalize_enabled")
+
+    empty_env = body.find("value == NULL || value[0] == '\\0'")
+    default_trampoline = body.find("return 0;", empty_env)
+    default_direct = body.find("return 1;", empty_env)
+    require(empty_env != -1 and default_trampoline != -1,
+            "PMPI_Finalize default must use the Gum original trampoline")
+    require(default_direct == -1 or default_trampoline < default_direct,
+            "PMPI_Finalize must not restore the replacement by default")
+
+    peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    guard = extract_function(peak_source, "peak_mpi_real_finalize_default_allowed")
+    require("PEAK_MPI_REAL_FINALIZE_ENV" in guard and
+            "peak_env_value_truthy(value)" in guard,
+            "real MPI finalizer policy must preserve explicit env override")
+    require("peak_mpi_runtime_matches_intel_mpi" in guard and
+            "return !peak_mpi_runtime_matches_intel_mpi();" in guard,
+            "Intel MPI must fail closed by default after PEAK output")
+    vendor = extract_function(peak_source, "peak_mpi_runtime_matches_intel_mpi")
+    require("MPI_Get_library_version" in vendor and
+            "Intel(R) MPI" in vendor and
+            "Intel MPI" in vendor,
+            "Intel MPI finalize guard must inspect MPI library version")
+
+
 def check_stop_window_trace_gating(repo_root):
     source = (repo_root / "src/peak_detach_controller.c").read_text(
         encoding="utf-8"
@@ -130,6 +171,12 @@ def check_stop_window_trace_gating(repo_root):
     )
     general_attach_supported = extract_function(
         general, "peak_general_listener_attach_target_is_supported"
+    )
+    general_listener_attach = extract_function(
+        general, "peak_general_listener_attach"
+    )
+    startup_skip = extract_function(
+        general, "peak_general_listener_startup_attach_can_skip_stop"
     )
     general_attach_policy_init = extract_function(
         general, "peak_general_listener_init_attach_policy_once"
@@ -173,6 +220,13 @@ def check_stop_window_trace_gating(repo_root):
             "Gum attach support predicate must delegate prologue policy checks")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
+    require('opendir("/proc/self/task")' in startup_skip and
+            "task_count > 1" in startup_skip and
+            "return task_count == 1;" in startup_skip,
+            "startup attach stop-skip must be proven by single-thread /proc task count")
+    require("startup_attach_can_skip_stop" in general_listener_attach and
+            "!startup_attach_can_skip_stop &&" in general_listener_attach,
+            "initial attach must skip the stop backend only after a single-thread proof")
 
     support_attach_supported = extract_function(
         general, "peak_general_listener_support_attach_target_is_supported"
@@ -187,10 +241,12 @@ def check_stop_window_trace_gating(repo_root):
     dlopen_dynamic = extract_function(
         dlopen, "dlopen_interceptor_attach_from_request"
     )
-    require("peak_unsafe_gum_support_prologue_check" in support_attach_supported,
-            "support attach predicate must use the stricter support prologue policy")
+    require("peak_unsafe_gum_prologue_check" not in support_attach_supported and
+            "peak_unsafe_gum_support_prologue_check" not in support_attach_supported and
+            "peak_gum_prologue_too_short_for_attach" not in support_attach_supported,
+            "support replacements must not apply user-target prologue guards")
     require("peak_general_listener_support_attach_target_is_supported" in syscall,
-            "close support replacement must use support prologue policy")
+            "close support replacement must call the support attach predicate")
     require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
             "dlopen replacement must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
@@ -199,6 +255,63 @@ def check_stop_window_trace_gating(repo_root):
             "dynamic dlopen user targets must use normal target prologue policy")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_dynamic,
             "dynamic dlopen user targets must not use support prologue policy")
+
+
+def check_mpi_startup_helper_warmup(repo_root):
+    source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    body = extract_function(source, "peak_init")
+
+    check_mpi_position = body.find("found_MPI = check_MPI();")
+    warmup_position = body.find("peak_detach_controller_warmup_backend();")
+    require(check_mpi_position != -1 and warmup_position != -1,
+            "peak_init must keep explicit MPI detection and helper warmup")
+    require(check_mpi_position < warmup_position,
+            "helper warmup must not run before MPI detection")
+    warmup_context = body[max(0, warmup_position - 180):warmup_position + 80]
+    require("!found_MPI" in warmup_context,
+            "helper warmup must be suppressed for MPI-linked programs before PMPI_Init")
+
+
+def check_global_detach_overhead_selection(repo_root):
+    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    heartbeat = extract_function(source, "peak_heartbeat_monitor")
+    comparator = extract_function(source, "compare_ratio_de")
+    wait_helper = extract_function(source, "peak_heartbeat_wait_us")
+
+    global_detach_marker = "// 2) Global DETACH"
+    reattach_marker = "// 3) Reattach"
+    start = heartbeat.find(global_detach_marker)
+    end = heartbeat.find(reattach_marker, start)
+    require(start != -1 and end != -1,
+            "heartbeat must keep explicit global detach and reattach sections")
+    global_detach = heartbeat[start:end]
+
+    require("compare_rate_de" not in source,
+            "global detach must not sort by transient overhead rate")
+    require("compare_ratio_de" in global_detach,
+            "global detach must sort candidates by actual overhead ratio")
+    require("ratio_snapshot[i] <= target_profile_ratio" in global_detach and
+            "continue;" in global_detach,
+            "global detach must not enqueue below-threshold one-shot/cold targets")
+    require("entries[k].ratio <= target_profile_ratio" in global_detach and
+            "break;" in global_detach,
+            "global detach loop must fail closed if a below-threshold candidate appears")
+    require(comparator.find("x->ratio") < comparator.find("x->rate"),
+            "global detach comparator must prioritize ratio before rate")
+    initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")
+    loop_start = heartbeat.find("while (atomic_load(&heartbeat_running))")
+    require("pthread_cond_timedwait" in wait_helper,
+            "heartbeat wait helper must use the existing condition wait")
+    require(initial_wait != -1 and loop_start != -1 and initial_wait < loop_start,
+            "heartbeat must wait one interval before the first detach decision")
+    require("PEAK_HEARTBEAT_MIN_OBSERVATION_US" in source and
+            "min_detach_observation_time" in heartbeat and
+            "detach_observation_ready" in heartbeat and
+            "total_execution_time >= min_detach_observation_time" in heartbeat,
+            "heartbeat detach must require a minimum observation window")
+    require("detach_observation_ready && enable_per_target_heartbeat" in heartbeat and
+            "detach_observation_ready && enable_global_heartbeat" in heartbeat,
+            "heartbeat detach gates must use the minimum observation window")
 
 
 def check_general_controller_dlopen_drain_order(repo_root):
@@ -238,6 +351,10 @@ def check_exclusive_time_nonnegative(repo_root):
     pop = extract_function(source, "peak_general_listener_pop_invocation")
     enter = extract_function(source, "peak_general_listener_on_enter")
     leave = extract_function(source, "peak_general_listener_on_leave")
+    output = extract_function(source, "peak_general_listener_print_result")
+    sanitize = extract_function(
+        source, "peak_general_listener_sanitize_output_times"
+    )
 
     require("gulong stack_level" in source,
             "invocation data must remember its callback stack level")
@@ -257,6 +374,15 @@ def check_exclusive_time_nonnegative(repo_root):
             "strict/detach paths")
     require("end_time - thread_data.child_time[thread_data.level]" not in leave,
             "on_leave must not accumulate open-coded negative exclusive time")
+    require("sum_exclusive_time[i] < 0.0" in sanitize and
+            "sum_exclusive_time[i] = 0.0" in sanitize,
+            "output must clamp negative exclusive times after aggregation")
+    require("sum_exclusive_time[i] > sum_total_time[i]" in sanitize,
+            "output must clamp exclusive time to total time after aggregation")
+    require("peak_general_listener_sanitize_output_times" in output and
+            output.find("peak_general_listener_sanitize_output_times") <
+            output.find("peak_general_listener_export_csv_result"),
+            "output time sanitization must run before CSV/text printing")
 
 
 def check_dlopen_test_hook_visibility(repo_root):
@@ -638,7 +764,11 @@ def main():
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
     check_dlopen_revert_transactions(repo_root)
+    check_peak_init_heartbeat_order(repo_root)
+    check_mpi_finalize_trampoline_default(repo_root)
     check_stop_window_trace_gating(repo_root)
+    check_mpi_startup_helper_warmup(repo_root)
+    check_global_detach_overhead_selection(repo_root)
     check_general_controller_dlopen_drain_order(repo_root)
     check_exclusive_time_nonnegative(repo_root)
     check_dlopen_test_hook_visibility(repo_root)

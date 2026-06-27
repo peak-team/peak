@@ -7,6 +7,7 @@
 #include "pthread_listener.h"
 #include "unsafe_gum_prologue.h"
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
@@ -22,6 +23,8 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#define PEAK_HEARTBEAT_MIN_OBSERVATION_US 10000U
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
@@ -51,8 +54,25 @@ static double* peak_hook_last_detach_time;
 static PeakHookState* peak_hook_states;
 static double* peak_hook_next_retry_time;
 static double* peak_hook_pending_observed_time;
+typedef enum {
+    PEAK_HOOK_REQUEST_SOURCE_NONE = 0,
+    PEAK_HOOK_REQUEST_SOURCE_API,
+    PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
+    PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
+    PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT
+} PeakHookRequestSource;
+static PeakHookRequestSource* peak_hook_pending_request_source;
+static gulong* peak_hook_pending_request_calls;
+static double* peak_hook_pending_request_ratio;
+static double* peak_hook_pending_request_global_overhead;
+static double* peak_hook_pending_request_total_time;
+static double* peak_hook_pending_request_rate;
 static unsigned int* peak_hook_retry_count;
 static PeakDetachStatus* peak_hook_last_retry_status;
+static const char*
+peak_hook_request_source_string(PeakHookRequestSource source);
+static gboolean
+peak_general_listener_startup_attach_can_skip_stop(void);
 extern gboolean* peak_need_detach;
 extern gboolean* peak_detached;
 extern gdouble* heartbeat_overhead;
@@ -244,6 +264,13 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
         return TRUE;
     }
 
+    if (peak_gum_prologue_too_short_for_attach(address, &reason)) {
+        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is too small for Gum entry patch (reason=%s); target will remain unprofiled\n",
+                   symbol_name != NULL ? symbol_name : "<unknown>",
+                   reason != NULL ? reason : "unknown");
+        return FALSE;
+    }
+
     if (peak_unsafe_gum_prologue_check(address,
                                        peak_unsafe_gum_prologue_policy,
                                        &reason)) {
@@ -263,23 +290,39 @@ gboolean
 peak_general_listener_support_attach_target_is_supported(const char* symbol_name,
                                                          gpointer address)
 {
-    const char* reason = NULL;
-
     peak_general_listener_init_attach_policy();
 
-    if (peak_allow_unsafe_gum_prologue) {
-        return TRUE;
-    }
+    (void)symbol_name;
+    (void)address;
+    return TRUE;
+}
 
-    if (peak_unsafe_gum_support_prologue_check(address, &reason)) {
-        g_printerr("[peak] skipping PEAK support Gum attach for %s: target prologue is not safe for Gum relocation (reason=%s, policy=support); set %s=1 to override\n",
-                   symbol_name != NULL ? symbol_name : "<unknown>",
-                   reason != NULL ? reason : "unknown",
-                   PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
+static gboolean
+peak_general_listener_startup_attach_can_skip_stop(void)
+{
+    DIR* dir = opendir("/proc/self/task");
+    struct dirent* entry;
+    unsigned int task_count = 0;
+
+    if (dir == NULL) {
         return FALSE;
     }
 
-    return TRUE;
+    while ((entry = readdir(dir)) != NULL) {
+        const char* name = entry->d_name;
+
+        if (name[0] == '.') {
+            continue;
+        }
+        task_count++;
+        if (task_count > 1) {
+            closedir(dir);
+            return FALSE;
+        }
+    }
+
+    closedir(dir);
+    return task_count == 1;
 }
 
 gboolean
@@ -588,17 +631,45 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
         failure_detail != NULL && failure_detail->reason != NULL
             ? failure_detail->reason
             : "none";
+    PeakHookRequestSource request_source = PEAK_HOOK_REQUEST_SOURCE_NONE;
+    gulong request_calls = 0;
+    double request_ratio = 0.0;
+    double request_global_overhead = 0.0;
+    double request_total_time = 0.0;
+    double request_rate = 0.0;
     FILE* fp;
 
     if (path == NULL || path[0] == '\0') {
         return;
     }
 
+    if (hook_id < peak_hook_address_count) {
+        if (peak_hook_pending_request_source != NULL) {
+            request_source = peak_hook_pending_request_source[hook_id];
+        }
+        if (peak_hook_pending_request_calls != NULL) {
+            request_calls = peak_hook_pending_request_calls[hook_id];
+        }
+        if (peak_hook_pending_request_ratio != NULL) {
+            request_ratio = peak_hook_pending_request_ratio[hook_id];
+        }
+        if (peak_hook_pending_request_global_overhead != NULL) {
+            request_global_overhead =
+                peak_hook_pending_request_global_overhead[hook_id];
+        }
+        if (peak_hook_pending_request_total_time != NULL) {
+            request_total_time = peak_hook_pending_request_total_time[hook_id];
+        }
+        if (peak_hook_pending_request_rate != NULL) {
+            request_rate = peak_hook_pending_request_rate[hook_id];
+        }
+    }
+
     pthread_mutex_lock(&detach_trace_mutex);
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx\n",
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.9f,%.9f,%.9f,%.9f\n",
                 peak_second(),
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
@@ -618,7 +689,13 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 failure_reason,
                 failure_detail != NULL ? failure_detail->tid : 0,
                 (unsigned long long)(failure_detail != NULL ? failure_detail->pc : 0),
-                (unsigned long long)(failure_detail != NULL ? failure_detail->aux : 0));
+                (unsigned long long)(failure_detail != NULL ? failure_detail->aux : 0),
+                peak_hook_request_source_string(request_source),
+                request_calls,
+                request_ratio,
+                request_global_overhead,
+                request_total_time,
+                request_rate);
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
@@ -1048,6 +1125,86 @@ peak_general_controller_status_is_retryable(PeakDetachStatus status)
     }
 }
 
+static const char*
+peak_hook_request_source_string(PeakHookRequestSource source)
+{
+    switch (source) {
+        case PEAK_HOOK_REQUEST_SOURCE_API:
+            return "api";
+        case PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT:
+            return "detach-count";
+        case PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT:
+            return "per-target-heartbeat";
+        case PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT:
+            return "global-heartbeat";
+        case PEAK_HOOK_REQUEST_SOURCE_NONE:
+        default:
+            return "none";
+    }
+}
+
+static void
+peak_general_controller_clear_pending_request_context_unlocked(size_t hook_id)
+{
+    if (hook_id >= peak_hook_address_count) {
+        return;
+    }
+
+    if (peak_hook_pending_request_source != NULL) {
+        peak_hook_pending_request_source[hook_id] =
+            PEAK_HOOK_REQUEST_SOURCE_NONE;
+    }
+    if (peak_hook_pending_request_calls != NULL) {
+        peak_hook_pending_request_calls[hook_id] = 0;
+    }
+    if (peak_hook_pending_request_ratio != NULL) {
+        peak_hook_pending_request_ratio[hook_id] = 0.0;
+    }
+    if (peak_hook_pending_request_global_overhead != NULL) {
+        peak_hook_pending_request_global_overhead[hook_id] = 0.0;
+    }
+    if (peak_hook_pending_request_total_time != NULL) {
+        peak_hook_pending_request_total_time[hook_id] = 0.0;
+    }
+    if (peak_hook_pending_request_rate != NULL) {
+        peak_hook_pending_request_rate[hook_id] = 0.0;
+    }
+}
+
+static void
+peak_general_controller_set_pending_request_context_unlocked(
+    size_t hook_id,
+    PeakHookRequestSource source,
+    gulong calls,
+    double ratio,
+    double global_overhead,
+    double total_time,
+    double rate)
+{
+    if (hook_id >= peak_hook_address_count) {
+        return;
+    }
+
+    if (peak_hook_pending_request_source != NULL) {
+        peak_hook_pending_request_source[hook_id] = source;
+    }
+    if (peak_hook_pending_request_calls != NULL) {
+        peak_hook_pending_request_calls[hook_id] = calls;
+    }
+    if (peak_hook_pending_request_ratio != NULL) {
+        peak_hook_pending_request_ratio[hook_id] = ratio;
+    }
+    if (peak_hook_pending_request_global_overhead != NULL) {
+        peak_hook_pending_request_global_overhead[hook_id] = global_overhead;
+    }
+    if (peak_hook_pending_request_total_time != NULL) {
+        peak_hook_pending_request_total_time[hook_id] = total_time;
+    }
+    if (peak_hook_pending_request_rate != NULL) {
+        peak_hook_pending_request_rate[hook_id] = rate;
+    }
+}
+
 static void
 peak_general_controller_reset_retry_unlocked(size_t hook_id)
 {
@@ -1065,6 +1222,7 @@ peak_general_controller_reset_retry_unlocked(size_t hook_id)
     if (peak_hook_pending_observed_time != NULL) {
         peak_hook_pending_observed_time[hook_id] = 0.0;
     }
+    peak_general_controller_clear_pending_request_context_unlocked(hook_id);
 }
 
 static void
@@ -1187,7 +1345,15 @@ void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
 }
 
-static gboolean peak_general_listener_request_detach_unlocked(size_t hook_id)
+static gboolean
+peak_general_listener_request_detach_with_context_unlocked(
+    size_t hook_id,
+    PeakHookRequestSource source,
+    gulong calls,
+    double ratio,
+    double global_overhead,
+    double total_time,
+    double rate)
 {
     if (!peak_general_hook_is_published_unlocked(hook_id)) {
         return FALSE;
@@ -1198,6 +1364,14 @@ static gboolean peak_general_listener_request_detach_unlocked(size_t hook_id)
             peak_general_controller_reset_retry_unlocked(hook_id);
             peak_general_controller_mark_pending_started_unlocked(hook_id,
                                                                   peak_second());
+            peak_general_controller_set_pending_request_context_unlocked(
+                hook_id,
+                source,
+                calls,
+                ratio,
+                global_overhead,
+                total_time,
+                rate);
             peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_DETACH_REQUESTED);
             return TRUE;
         case PEAK_HOOK_DETACH_REQUESTED:
@@ -1208,7 +1382,28 @@ static gboolean peak_general_listener_request_detach_unlocked(size_t hook_id)
     }
 }
 
-static gboolean peak_general_listener_request_reattach_unlocked(size_t hook_id)
+static gboolean
+peak_general_listener_request_detach_unlocked(size_t hook_id)
+{
+    return peak_general_listener_request_detach_with_context_unlocked(
+        hook_id,
+        PEAK_HOOK_REQUEST_SOURCE_API,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0.0);
+}
+
+static gboolean
+peak_general_listener_request_reattach_with_context_unlocked(
+    size_t hook_id,
+    PeakHookRequestSource source,
+    gulong calls,
+    double ratio,
+    double global_overhead,
+    double total_time,
+    double rate)
 {
     if (!peak_general_hook_is_published_unlocked(hook_id)) {
         return FALSE;
@@ -1225,6 +1420,14 @@ static gboolean peak_general_listener_request_reattach_unlocked(size_t hook_id)
             peak_general_controller_reset_retry_unlocked(hook_id);
             peak_general_controller_mark_pending_started_unlocked(hook_id,
                                                                   peak_second());
+            peak_general_controller_set_pending_request_context_unlocked(
+                hook_id,
+                source,
+                calls,
+                ratio,
+                global_overhead,
+                total_time,
+                rate);
             peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_REATTACH_REQUESTED);
             return TRUE;
         case PEAK_HOOK_REATTACH_REQUESTED:
@@ -1233,6 +1436,19 @@ static gboolean peak_general_listener_request_reattach_unlocked(size_t hook_id)
         default:
             return FALSE;
     }
+}
+
+static gboolean
+peak_general_listener_request_reattach_unlocked(size_t hook_id)
+{
+    return peak_general_listener_request_reattach_with_context_unlocked(
+        hook_id,
+        PEAK_HOOK_REQUEST_SOURCE_API,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0.0);
 }
 
 gboolean peak_general_listener_request_detach(size_t hook_id)
@@ -1420,6 +1636,20 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_next_retry_time = g_renew(double, peak_hook_next_retry_time, new_count);
     peak_hook_pending_observed_time =
         g_renew(double, peak_hook_pending_observed_time, new_count);
+    peak_hook_pending_request_source =
+        g_renew(PeakHookRequestSource,
+                peak_hook_pending_request_source,
+                new_count);
+    peak_hook_pending_request_calls =
+        g_renew(gulong, peak_hook_pending_request_calls, new_count);
+    peak_hook_pending_request_ratio =
+        g_renew(double, peak_hook_pending_request_ratio, new_count);
+    peak_hook_pending_request_global_overhead =
+        g_renew(double, peak_hook_pending_request_global_overhead, new_count);
+    peak_hook_pending_request_total_time =
+        g_renew(double, peak_hook_pending_request_total_time, new_count);
+    peak_hook_pending_request_rate =
+        g_renew(double, peak_hook_pending_request_rate, new_count);
     peak_hook_retry_count =
         g_renew(unsigned int, peak_hook_retry_count, new_count);
     peak_hook_last_retry_status =
@@ -1442,6 +1672,13 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_states[old_count] = PEAK_HOOK_UNRESOLVED;
     peak_hook_next_retry_time[old_count] = 0.0;
     peak_hook_pending_observed_time[old_count] = 0.0;
+    peak_hook_pending_request_source[old_count] =
+        PEAK_HOOK_REQUEST_SOURCE_NONE;
+    peak_hook_pending_request_calls[old_count] = 0;
+    peak_hook_pending_request_ratio[old_count] = 0.0;
+    peak_hook_pending_request_global_overhead[old_count] = 0.0;
+    peak_hook_pending_request_total_time[old_count] = 0.0;
+    peak_hook_pending_request_rate[old_count] = 0.0;
     peak_hook_retry_count[old_count] = 0;
     peak_hook_last_retry_status[old_count] = PEAK_DETACH_STATUS_SAFE;
     hook_address[old_count] = NULL;
@@ -2872,20 +3109,20 @@ peak_general_listener_controller_stop(void)
 typedef struct {
     size_t index;
     double ratio;  // hard-gate ratio
-    double rate;   // for global ordering only
+    double rate;   // diagnostic trend, and reattach tie-breaking
 } OverheadEntry;
 
-// rate descending (global detach)
-static int compare_rate_de(const void* a, const void* b) {
+// ratio descending (global detach)
+static int compare_ratio_de(const void* a, const void* b) {
     const OverheadEntry* x = (const OverheadEntry*)a;
     const OverheadEntry* y = (const OverheadEntry*)b;
 
-    if (x->rate < y->rate) return 1;
-    if (x->rate > y->rate) return -1;
-
-    // tie-break: larger ratio first
     if (x->ratio < y->ratio) return 1;
     if (x->ratio > y->ratio) return -1;
+
+    // tie-break: faster-growing overhead first
+    if (x->rate < y->rate) return 1;
+    if (x->rate > y->rate) return -1;
     return 0;
 }
 
@@ -2909,6 +3146,30 @@ static inline double clipd(double x, double lo, double hi) {
     return x;
 }
 
+static gboolean
+peak_heartbeat_wait_us(unsigned int sleep_us)
+{
+    pthread_mutex_lock(&heartbeat_mutex);
+    if (!atomic_load(&heartbeat_running)) {
+        pthread_mutex_unlock(&heartbeat_mutex);
+        return FALSE;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += sleep_us / 1000000U;
+    ts.tv_nsec += (long)(sleep_us % 1000000U) * 1000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    (void)pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
+    gboolean keep_running = atomic_load(&heartbeat_running);
+    pthread_mutex_unlock(&heartbeat_mutex);
+    return keep_running;
+}
+
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
     unsigned int heartbeat_time = heartbeat_args->heartbeat_time;   // base sleep (us)
@@ -2924,6 +3185,7 @@ void* peak_heartbeat_monitor(void* arg) {
 
     OverheadEntry* entries = g_new0(OverheadEntry, peak_hook_address_count);
 
+    gulong* calls_snapshot = g_new0(gulong, peak_hook_address_count);
     double* ratio_snapshot = g_new0(double, peak_hook_address_count);
     double* rate_snapshot  = g_new0(double, peak_hook_address_count);
     double* prev_ratio     = g_new0(double, peak_hook_address_count);
@@ -2931,6 +3193,7 @@ void* peak_heartbeat_monitor(void* arg) {
 
     double now0 = peak_second();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
+        calls_snapshot[i] = 0;
         ratio_snapshot[i] = 0.0;
         rate_snapshot[i]  = 0.0;
         prev_ratio[i]     = 0.0;
@@ -2944,6 +3207,19 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
     size_t heartbeat_capacity = peak_hook_address_count;
+    double min_detach_observation_time =
+        (double)MAX(MAX(heartbeat_time, hb_min_us),
+                    PEAK_HEARTBEAT_MIN_OBSERVATION_US) / 1e6;
+
+    if (heartbeat_time > 0) {
+        unsigned int initial_sleep_us =
+            (unsigned int)clipd((double)heartbeat_time,
+                                (double)hb_min_us,
+                                (double)hb_max_us);
+        if (!peak_heartbeat_wait_us(initial_sleep_us)) {
+            goto cleanup;
+        }
+    }
 
     while (atomic_load(&heartbeat_running)) {
         gboolean wake_controller = FALSE;
@@ -2956,11 +3232,13 @@ void* peak_heartbeat_monitor(void* arg) {
         if (current_hook_count > heartbeat_capacity) {
             size_t old_capacity = heartbeat_capacity;
             entries = g_renew(OverheadEntry, entries, current_hook_count);
+            calls_snapshot = g_renew(gulong, calls_snapshot, current_hook_count);
             ratio_snapshot = g_renew(double, ratio_snapshot, current_hook_count);
             rate_snapshot = g_renew(double, rate_snapshot, current_hook_count);
             prev_ratio = g_renew(double, prev_ratio, current_hook_count);
             prev_time = g_renew(double, prev_time, current_hook_count);
             for (size_t i = old_capacity; i < current_hook_count; i++) {
+                calls_snapshot[i] = 0;
                 ratio_snapshot[i] = 0.0;
                 rate_snapshot[i] = 0.0;
                 prev_ratio[i] = 0.0;
@@ -2971,12 +3249,15 @@ void* peak_heartbeat_monitor(void* arg) {
 
         double total_execution_time = now - peak_main_time;
         if (total_execution_time <= 0.0) total_execution_time = 1e-12;
+        gboolean detach_observation_ready =
+            total_execution_time >= min_detach_observation_time;
 
         double global_overhead = 0.0;
 
         pthread_mutex_lock(&lock);
         for (size_t i = 0; i < heartbeat_capacity; i++) {
             if (!(hook_address[i] && array_listener[i])) {
+                calls_snapshot[i] = 0;
                 ratio_snapshot[i] = 0.0;
                 rate_snapshot[i]  = 0.0;
                 prev_ratio[i]     = 0.0;
@@ -2991,6 +3272,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 total_num_calls += pg_listener->num_calls[j];
             }
 
+            calls_snapshot[i] = total_num_calls;
             double ratio =
                 (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
 
@@ -3015,14 +3297,22 @@ void* peak_heartbeat_monitor(void* arg) {
         // ------------------------------------------------------------
         // 1) Per-target DETACH
         // ------------------------------------------------------------
-        if (enable_per_target_heartbeat) {
+        if (detach_observation_ready && enable_per_target_heartbeat) {
             pthread_mutex_lock(&lock);
             for (size_t i = 0; i < heartbeat_capacity; i++) {
                 if (!(hook_address[i] && array_listener[i])) continue;
                 if (peak_detached[i]) continue;
 
                 if (ratio_snapshot[i] > target_profile_ratio) {
-                    wake_controller |= peak_general_listener_request_detach_unlocked(i);
+                    wake_controller |=
+                        peak_general_listener_request_detach_with_context_unlocked(
+                            i,
+                            PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
+                            calls_snapshot[i],
+                            ratio_snapshot[i],
+                            global_overhead,
+                            total_execution_time,
+                            rate_snapshot[i]);
                 }
             }
              pthread_mutex_unlock(&lock);
@@ -3031,13 +3321,14 @@ void* peak_heartbeat_monitor(void* arg) {
         // ------------------------------------------------------------
         // 2) Global DETACH
         // ------------------------------------------------------------
-        if (enable_global_heartbeat) {
+        if (detach_observation_ready && enable_global_heartbeat) {
             if (global_overhead > global_target_ratio * peak_global_detach_factor) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
                     if (!(hook_address[i] && array_listener[i])) continue;
                     if (peak_detached[i]) continue;
+                    if (ratio_snapshot[i] <= target_profile_ratio) continue;
 
                     entries[n_attached].index = i;
                     entries[n_attached].ratio = ratio_snapshot[i];
@@ -3046,7 +3337,10 @@ void* peak_heartbeat_monitor(void* arg) {
                 }
 
                 if (n_attached > 1) {
-                    qsort(entries, n_attached, sizeof(OverheadEntry), compare_rate_de);
+                    qsort(entries,
+                          n_attached,
+                          sizeof(OverheadEntry),
+                          compare_ratio_de);
                 }
 
                 double reduced = global_overhead;
@@ -3055,9 +3349,18 @@ void* peak_heartbeat_monitor(void* arg) {
 
                     if (!(hook_address[idx] && array_listener[idx])) continue;
                     if (peak_detached[idx]) continue;
+                    if (entries[k].ratio <= target_profile_ratio) break;
 
                     reduced -= entries[k].ratio;
-                    wake_controller |= peak_general_listener_request_detach_unlocked(idx);
+                    wake_controller |=
+                        peak_general_listener_request_detach_with_context_unlocked(
+                            idx,
+                            PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT,
+                            calls_snapshot[idx],
+                            ratio_snapshot[idx],
+                            global_overhead,
+                            total_execution_time,
+                            rate_snapshot[idx]);
                 }
                 pthread_mutex_unlock(&lock);
             }
@@ -3066,7 +3369,8 @@ void* peak_heartbeat_monitor(void* arg) {
         // ------------------------------------------------------------
         // 3) Reattach
         // ------------------------------------------------------------
-        if (enable_reattach &&
+        if (detach_observation_ready &&
+            enable_reattach &&
             check_interval != 0 &&
             (heartbeat_counter % check_interval) == 0) {
             // Per-target REATTACH
@@ -3083,7 +3387,15 @@ void* peak_heartbeat_monitor(void* arg) {
 
                     if (ratio_snapshot[i] <= target_profile_ratio) {
                         pthread_mutex_lock(&lock);
-                        wake_controller |= peak_general_listener_request_reattach_unlocked(i);
+                        wake_controller |=
+                            peak_general_listener_request_reattach_with_context_unlocked(
+                                i,
+                                PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
+                                calls_snapshot[i],
+                                ratio_snapshot[i],
+                                global_overhead,
+                                total_execution_time,
+                                rate_snapshot[i]);
                         pthread_mutex_unlock(&lock);
                     }
                 }
@@ -3129,7 +3441,15 @@ void* peak_heartbeat_monitor(void* arg) {
                         }
 
                         pthread_mutex_lock(&lock);
-                        wake_controller |= peak_general_listener_request_reattach_unlocked(i);
+                        wake_controller |=
+                            peak_general_listener_request_reattach_with_context_unlocked(
+                                i,
+                                PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT,
+                                calls_snapshot[i],
+                                ratio_snapshot[i],
+                                global_overhead,
+                                total_execution_time,
+                                rate_snapshot[i]);
                         pthread_mutex_unlock(&lock);
                         global_overhead += entries[k].ratio;
 
@@ -3171,29 +3491,17 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
-        pthread_mutex_lock(&heartbeat_mutex);
-        if (!atomic_load(&heartbeat_running)) {
-            pthread_mutex_unlock(&heartbeat_mutex);
+        if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
             break;
         }
-
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += sleep_us / 1000000U;
-        ts.tv_nsec += (long)(sleep_us % 1000000U) * 1000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000L;
-        }
-
-        (void)pthread_cond_timedwait(&heartbeat_cond, &heartbeat_mutex, &ts);
-        pthread_mutex_unlock(&heartbeat_mutex);
     }
 
+cleanup:
     g_free(prev_time);
     g_free(prev_ratio);
     g_free(rate_snapshot);
     g_free(ratio_snapshot);
+    g_free(calls_snapshot);
     g_free(entries);
 
     gum_interceptor_unignore_current_thread(interceptor);
@@ -3352,7 +3660,19 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 
         pthread_mutex_lock(&lock);
         if (self->num_calls[index] >= peak_detach_count) {
-            detach_requested = peak_general_listener_request_detach_unlocked(hook_id);
+            gulong total_num_calls = 0;
+            for (size_t j = 0; j < peak_max_num_threads; j++) {
+                total_num_calls += self->num_calls[j];
+            }
+            detach_requested =
+                peak_general_listener_request_detach_with_context_unlocked(
+                    hook_id,
+                    PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
+                    total_num_calls,
+                    0.0,
+                    0.0,
+                    peak_second() - peak_main_time,
+                    0.0);
         }
         pthread_mutex_unlock(&lock);
         if (detach_requested) {
@@ -3705,11 +4025,22 @@ void peak_general_listener_attach()
     peak_hook_states = g_new0(PeakHookState, peak_hook_address_count);
     peak_hook_next_retry_time = g_new0(double, peak_hook_address_count);
     peak_hook_pending_observed_time = g_new0(double, peak_hook_address_count);
+    peak_hook_pending_request_source =
+        g_new0(PeakHookRequestSource, peak_hook_address_count);
+    peak_hook_pending_request_calls = g_new0(gulong, peak_hook_address_count);
+    peak_hook_pending_request_ratio = g_new0(double, peak_hook_address_count);
+    peak_hook_pending_request_global_overhead =
+        g_new0(double, peak_hook_address_count);
+    peak_hook_pending_request_total_time =
+        g_new0(double, peak_hook_address_count);
+    peak_hook_pending_request_rate = g_new0(double, peak_hook_address_count);
     peak_hook_retry_count = g_new0(unsigned int, peak_hook_address_count);
     peak_hook_last_retry_status = g_new0(PeakDetachStatus, peak_hook_address_count);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     peak_demangled_strings = g_new0(char*, peak_hook_address_count);
+    gboolean startup_attach_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
     // g_printerr ("peak_hook_address_count %lu peak_max_num_threads %lu\n",  peak_hook_address_count, peak_max_num_threads);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         // replace certain function we are capturing already.
@@ -3839,7 +4170,8 @@ void peak_general_listener_attach()
                 .operation = PEAK_DETACH_OPERATION_ATTACH
             };
             PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
-            if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+            if (!startup_attach_can_skip_stop &&
+                !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                               &detach_status)) {
                 g_printerr("[peak] skipping initial Gum attach for hook %lu (%s): %s\n",
                            (unsigned long)i,
@@ -3858,7 +4190,8 @@ void peak_general_listener_attach()
                                        new_listener,
                                        NULL);
             gum_interceptor_end_transaction(interceptor);
-            if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+            if (!startup_attach_can_skip_stop &&
+                !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                              &detach_status)) {
                 peak_detach_controller_abort_after_failed_finish("initial attach finish",
                                                                 detach_status);
@@ -4148,6 +4481,21 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
 }
 
 static void
+peak_general_listener_sanitize_output_times(gdouble* sum_total_time,
+                                            gdouble* sum_exclusive_time)
+{
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (sum_exclusive_time[i] < 0.0) {
+            sum_exclusive_time[i] = 0.0;
+        }
+        if (sum_total_time[i] >= 0.0 &&
+            sum_exclusive_time[i] > sum_total_time[i]) {
+            sum_exclusive_time[i] = sum_total_time[i];
+        }
+    }
+}
+
+static void
 peak_general_listener_print_result(gulong* sum_num_calls,
                                    gdouble* sum_total_time,
                                    gdouble* max_total_time,
@@ -4158,6 +4506,8 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                    gulong* thread_count,
                                    const int rank_count)
 {
+    peak_general_listener_sanitize_output_times(sum_total_time,
+                                                sum_exclusive_time);
     peak_general_listener_export_csv_result(sum_num_calls,
                                             sum_total_time,
                                             max_total_time,
@@ -5928,6 +6278,12 @@ gboolean peak_general_listener_dettach()
     g_free(peak_hook_states);
     g_free(peak_hook_next_retry_time);
     g_free(peak_hook_pending_observed_time);
+    g_free(peak_hook_pending_request_source);
+    g_free(peak_hook_pending_request_calls);
+    g_free(peak_hook_pending_request_ratio);
+    g_free(peak_hook_pending_request_global_overhead);
+    g_free(peak_hook_pending_request_total_time);
+    g_free(peak_hook_pending_request_rate);
     g_free(peak_hook_retry_count);
     g_free(peak_hook_last_retry_status);
     g_free(array_listener);
@@ -5942,6 +6298,12 @@ gboolean peak_general_listener_dettach()
     peak_hook_states = NULL;
     peak_hook_next_retry_time = NULL;
     peak_hook_pending_observed_time = NULL;
+    peak_hook_pending_request_source = NULL;
+    peak_hook_pending_request_calls = NULL;
+    peak_hook_pending_request_ratio = NULL;
+    peak_hook_pending_request_global_overhead = NULL;
+    peak_hook_pending_request_total_time = NULL;
+    peak_hook_pending_request_rate = NULL;
     peak_hook_retry_count = NULL;
     peak_hook_last_retry_status = NULL;
     array_listener = NULL;

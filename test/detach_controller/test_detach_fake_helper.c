@@ -92,13 +92,19 @@ static void
 log_command(const char* command)
 {
     const char* path = getenv("FAKE_DETACH_HELPER_LOG");
+    const char* mode = "a";
     FILE* fp;
 
     if (path == NULL || path[0] == '\0') {
         return;
     }
 
-    fp = fopen(path, "a");
+    if (strcmp(command, "START") == 0 &&
+        getenv("FAKE_DETACH_HELPER_TRUNCATE_LOG_ON_START") != NULL) {
+        mode = "w";
+    }
+
+    fp = fopen(path, mode);
     if (fp == NULL) {
         return;
     }
@@ -510,6 +516,11 @@ main(int argc, char** argv)
                             PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR,
                             EPERM,
                             0);
+        return 1;
+    }
+
+    if (strcmp(scenario, "handshake-fail") == 0) {
+        log_command("START");
         return 1;
     }
 

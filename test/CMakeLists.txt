@@ -383,9 +383,80 @@ if(BUILD_TESTING)
                     --peak-cost 0
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-trace
                     --require-trace-diagnostics
+                    --require-detach-source per-target-heartbeat
+                    --min-detach-request-calls 1
                     --require-detach-batch-size 2
                     --fail-on-transition-skips)
         set_tests_properties(test_detach_hotloop_batch_strict
+            PROPERTIES
+                TIMEOUT 45
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_global_source_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 30
+                    --disable-reattach
+                    --disable-per-target-heartbeat
+                    --enable-global-heartbeat
+                    --peak-cost 0
+                    --global-overhead-ratio 0.000001
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-global-source-trace
+                    --require-trace-diagnostics
+                    --require-detach-source global-heartbeat
+                    --min-detach-request-calls 1
+                    --fail-on-transition-skips)
+        set_tests_properties(test_detach_hotloop_global_source_strict
+            PROPERTIES
+                TIMEOUT 45
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_global_ignores_cold_one_shot_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 30
+                    --disable-reattach
+                    --disable-per-target-heartbeat
+                    --enable-global-heartbeat
+                    --cold-one-shot-target
+                    --peak-cost 0
+                    --overhead-ratio 0.005
+                    --global-overhead-ratio 0.000001
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-global-cold-trace
+                    --require-trace-diagnostics
+                    --require-detach-source global-heartbeat
+                    --min-detach-request-calls 1
+                    --fail-on-transition-skips)
+        set_tests_properties(test_detach_hotloop_global_ignores_cold_one_shot_strict
+            PROPERTIES
+                TIMEOUT 45
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_cold_one_shot_policy_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 30
+                    --enable-global-heartbeat
+                    --cold-one-shot-target
+                    --peak-cost 0
+                    --overhead-ratio 0.005
+                    --global-overhead-ratio 0.000001
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-cold-policy-trace
+                    --require-trace-diagnostics
+                    --fail-on-transition-skips)
+        set_tests_properties(test_detach_hotloop_cold_one_shot_policy_strict
             PROPERTIES
                 TIMEOUT 45
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
@@ -405,6 +476,22 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_CONTROLLER_MAX_PENDING_AGE_MS=20;PEAK_CONTROLLER_MAX_RETRY_COUNT=0;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_no_trace_pending_age_ok"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_helper_warmup_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --helper-warmup-check)
+            set_tests_properties(test_detach_helper_warmup_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-helper-warmup.log;FAKE_DETACH_HELPER_TRUNCATE_LOG_ON_START=1;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "helper_warmup_ok"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_helper_warmup_failure_latch_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --helper-warmup-failure-latch-check)
+            set_tests_properties(test_detach_helper_warmup_failure_latch_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=handshake-fail;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-helper-warmup-failure.log;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "helper_warmup_failure_latch_ok"
                     TIMEOUT 30)
             add_test(NAME test_detach_hotloop_reattach_entry_byte_gum_pc_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
@@ -806,6 +893,28 @@ if(BUILD_TESTING)
                     --mode finalize-clean-output-mpi
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_intel_default
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode finalize-clean-output-mpi-intel-default
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode finalize-clean-output-mpi-intel-real-finalize
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_finalize_clean_exit_output_mpi_strict_detach
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -1018,6 +1127,14 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_strict_detach
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;PEAK_MPI_EXIT_LOOPS=200000;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/dgemm_mpi/mpi-finalize-strict-trace.csv"
@@ -1107,6 +1224,14 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
@@ -1206,6 +1331,16 @@ if(BUILD_TESTING)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 30)
+        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-intel-default"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 30)
+        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-intel-real-finalize"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_strict_detach

@@ -41,7 +41,7 @@ mpi_interceptor_direct_finalize_enabled(void)
     const char* value = getenv("PEAK_MPI_FINALIZE_CALL");
 
     if (value == NULL || value[0] == '\0') {
-        return 1;
+        return 0;
     }
 
     if (g_ascii_strcasecmp(value, "trampoline") == 0 ||
