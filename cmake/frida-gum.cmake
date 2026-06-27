@@ -62,12 +62,52 @@ function(_peak_can_auto_patch_frida_gum _out_var)
     endif()
 endfunction()
 
+function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "Linux")
+        return()
+    endif()
+
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_processor)
+    if(NOT _peak_processor MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+        return()
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+    set(_patch_command
+        "${Python3_EXECUTABLE}"
+        "${_source_dir}/peak-gum/patch_frida_gum_elf_module.py"
+        --library "${_output_dir}/libfrida-gum.a"
+        --ar "${CMAKE_AR}"
+        --work-dir "${_output_dir}/frida-gum-elf-module-patch"
+    )
+    if(CMAKE_RANLIB)
+        list(APPEND _patch_command --ranlib "${CMAKE_RANLIB}")
+    endif()
+
+    execute_process(
+        COMMAND ${_patch_command}
+        RESULT_VARIABLE _patch_result
+        OUTPUT_VARIABLE _patch_stdout
+        ERROR_VARIABLE _patch_stderr)
+    if(NOT _patch_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to patch Frida Gum ELF module header guard:\n${_patch_stdout}\n${_patch_stderr}")
+    endif()
+    string(STRIP "${_patch_stdout}" _patch_stdout_stripped)
+    if(_patch_stdout_stripped)
+        message(STATUS "${_patch_stdout_stripped}")
+    endif()
+endfunction()
+
 function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     file(MAKE_DIRECTORY "${_output_dir}")
     configure_file("${_input_dir}/libfrida-gum.a"
                    "${_output_dir}/libfrida-gum.a" COPYONLY)
     configure_file("${_input_dir}/frida-gum.h"
                    "${_output_dir}/frida-gum.h" COPYONLY)
+
+    _peak_patch_frida_gum_elf_module("${_source_dir}" "${_output_dir}")
 
     file(READ "${_source_dir}/peak-gum/frida-gum-peak-api.h" _peak_gum_api_header)
     file(APPEND "${_output_dir}/frida-gum.h"
@@ -200,10 +240,10 @@ function(_peak_validate_frida_gum_peak_api)
 #if !defined(GUM_PEAK_PC_API_VERSION) || GUM_PEAK_PC_API_VERSION != 1
 #error Unsupported PEAK Gum PC API version
 #endif
-#if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64)
+#if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64)
 #error Missing PEAK Gum x86_64 private-layout ABI fingerprint
 #endif
-#if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64)
+#if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64)
 #error Missing PEAK Gum arm64 private-layout ABI fingerprint
 #endif
 
@@ -243,8 +283,8 @@ int main(void)
         gum_interceptor_peak_get_pc_diagnostics;
 
     (void) GUM_PEAK_PC_API_VERSION;
-    (void) GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64;
-    (void) GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64;
+    (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64;
+    (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64;
     (void) sizeof(GumPeakFunctionContext *);
     (void) sizeof(GumPeakPcState);
     (void) sizeof(GumPeakPcDiagnostics);
@@ -257,19 +297,19 @@ int main(void)
     (void) GUM_PEAK_PC_UNKNOWN;
 #if defined(__x86_64__) || defined(__amd64__)
     if (abi_fingerprint() !=
-        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64) {
+        GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64) {
         return 1;
     }
 #elif defined(__aarch64__)
     if (abi_fingerprint() !=
-        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64) {
+        GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64) {
         return 1;
     }
 #else
     if (abi_fingerprint() !=
-        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64 &&
+        GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64 &&
         abi_fingerprint() !=
-        GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64) {
+        GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64) {
         return 1;
     }
 #endif

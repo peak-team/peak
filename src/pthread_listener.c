@@ -1,4 +1,5 @@
 #include "pthread_listener.h"
+#include "general_listener.h"
 #include "peak_detach_controller.h"
 #include "peak_logging.h"
 #include "peak_signal_policy_internal.h"
@@ -11,6 +12,9 @@
 static GumInterceptor* pthread_create_interceptor;
 static GumInvocationListener* pthread_create_listener;
 static PthreadState pthread_create_state;
+static GumAttachOptions pthread_create_attach_options = {
+    .listener_function_data = &pthread_create_state
+};
 GHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static gboolean tid_mapping_initialized = FALSE;
@@ -234,23 +238,26 @@ void pthread_listener_attach()
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 
     gum_interceptor_begin_transaction(pthread_create_interceptor);
-    pthread_create_hook_address = gum_find_function("pthread_create");
+    pthread_create_hook_address =
+        peak_general_listener_find_function("pthread_create");
     if (pthread_create_hook_address) {
         // g_print ("pthread_create found at %p\n",  hook_address);
         GumAttachReturn attach_status =
             gum_interceptor_attach(pthread_create_interceptor,
                                    pthread_create_hook_address,
                                    pthread_create_listener,
-                                   &pthread_create_state);
+                                   &pthread_create_attach_options);
         if (attach_status == GUM_ATTACH_OK) {
             peak_detach_controller_note_thread_creation_gate_installed(TRUE);
         }
     }
-    pthread_join_hook_address = gum_find_function("pthread_join");
+    pthread_join_hook_address =
+        peak_general_listener_find_function("pthread_join");
     if (pthread_join_hook_address) {
         gum_interceptor_replace_fast(pthread_create_interceptor,
                                     pthread_join_hook_address, &peak_pthread_join,
-                                    (gpointer*)(&original_pthread_join));
+                                    (gpointer*)(&original_pthread_join),
+                                    NULL);
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }

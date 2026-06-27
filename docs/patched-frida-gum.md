@@ -4,9 +4,9 @@ PEAK can build with either the stock prebuilt Frida Gum devkit or a PEAK-patched
 devkit exposing the PC classification and safe-point hooks described in
 `docs/physical-detach-controller.md`. On Linux x86_64 and Linux Arm64 the
 default `auto` provider now downloads the Frida Gum devkit, copies it to a
-PEAK-patched devkit directory, and appends PEAK's Gum PC API implementation to
-the archive. Other platforms keep using the stock prebuilt devkit unless a
-patched devkit is selected explicitly.
+PEAK-patched devkit directory, guards Gum's online in-memory ELF fallback, and
+appends PEAK's Gum PC API implementation to the archive. Other platforms keep
+using the stock prebuilt devkit unless a patched devkit is selected explicitly.
 
 ## Default Provider
 
@@ -19,8 +19,22 @@ cmake -S . -B build
 On Linux x86_64 and Linux Arm64 this produces
 `frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the
 linked headers and archive expose the architecture-specific PEAK ABI.
-The downloaded Frida Gum 16.5.9 archives are pinned with SHA-256 hashes in
+The downloaded Frida Gum 17.15.3 archives are pinned with SHA-256 hashes in
 `cmake/frida-gum-download.cmake`.
+
+The Linux patched devkit also edits Frida's `gumelfmodule.c.o` archive member.
+Frida Gum 17.x can continue symbol scanning by treating a module base address as
+an online in-memory ELF source when the module path cannot be opened. PEAK keeps
+that newer fallback path, but guards the inlined ELF-header load before Gum
+parses a memory-fallback source. Normal online modules whose path was opened
+successfully keep Gum's original live-memory parsing path. When Gum is using the
+module base address itself as `file_data`, the patch first performs a bounded
+self-read of the first 64 bytes, then verifies ELF magic, class, native
+little-endian data encoding, identity version, `e_version`, ELF header size,
+program/section header entry sizes for non-empty tables, table offset lower
+bounds, and offset-plus-table-size overflow. Invalid memory sources return Gum's
+normal invalid-header error so the caller can skip that module instead of
+crashing while interpreting arbitrary loader memory as ELF metadata.
 
 If a caller supplies `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` while
 leaving `PEAK_FRIDA_GUM_PROVIDER=auto`, PEAK treats that as a caller-managed

@@ -28,9 +28,9 @@ def main():
             "top-level CMake must enable the detach helper on Linux arm64/aarch64")
     require("aarch64" in frida_cmake and "arm64" in frida_cmake,
             "Frida Gum auto-patch selection must include Linux arm64/aarch64")
-    require("GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64" in peak_api,
+    require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in peak_api,
             "PEAK Gum API header must expose an Arm64 ABI fingerprint")
-    require("GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64" in frida_cmake,
+    require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in frida_cmake,
             "CMake PEAK Gum validation must accept the Arm64 ABI fingerprint")
 
     for token in [
@@ -49,16 +49,16 @@ def main():
 
     for token in [
         "__aarch64__",
-        "GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64",
+        "GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64",
         "GumArm64Writer",
-        "PeakGumArm64Relocator16",
-        "gpointer thunks",
+        "PeakGumArm64Relocator17",
+        "thunks_by_scratch_reg",
         "gum_query_page_size",
         "PEAK_GUM_PC_ABI_FINGERPRINT",
     ]:
         require(token in gum_overlay, f"Gum overlay missing Arm64 token: {token}")
-    require(re.search(r"backend->thunks[\s\S]{0,240}gum_query_page_size", gum_overlay),
-            "Arm64 shared thunk classification must conservatively cover the thunk page")
+    require(re.search(r"thunks_by_scratch_reg[\s\S]{0,360}gum_query_page_size", gum_overlay),
+            "Arm64 shared thunk classification must conservatively cover the selected thunk page")
 
     for rel in [
         "test/detach_controller/test_detach_controller.c",

@@ -755,11 +755,12 @@ int exit_interceptor_attach() {
     exit_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(exit_interceptor);
-    exit_address = gum_find_function("exit");
+    exit_address = peak_general_listener_find_function("exit");
     if (exit_address) {
         replace_check = gum_interceptor_replace_fast(exit_interceptor,
                                       exit_address, (gpointer)&peak_exit,
-                                      (gpointer*)(&original_exit));
+                                      (gpointer*)(&original_exit),
+                                      NULL);
     }
     gum_interceptor_end_transaction(exit_interceptor);
     return replace_check;

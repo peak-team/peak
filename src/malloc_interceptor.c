@@ -643,7 +643,8 @@ static void memory_usage_log_print(void) {
         if (_addr) {                                                                      \
             GumReplaceReturn r = gum_interceptor_replace_fast(malloc_interceptor,         \
                                                               _addr, _hook,               \
-                                                              (gpointer*)(&_orig));       \
+                                                              (gpointer*)(&_orig),        \
+                                                              NULL);                      \
             if (r != GUM_REPLACE_OK)                                                      \
                 peak_log_warn("[peak] Failed to replace " _name ": %d\n", r);             \
         }                                                                                 \

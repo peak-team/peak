@@ -41,13 +41,14 @@ int syscall_interceptor_attach()
     syscall_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(syscall_interceptor);
-    hook_address = gum_find_function("close");
+    hook_address = peak_general_listener_find_function("close");
     if (hook_address) {
         if (peak_general_listener_support_attach_target_is_supported(
                 "close", hook_address)) {
             replace_check = gum_interceptor_replace_fast(syscall_interceptor,
                                          hook_address, (gpointer)&peak_close,
-                                         (gpointer*)(&original_close));
+                                         (gpointer*)(&original_close),
+                                         NULL);
         } else {
             hook_address = NULL;
         }

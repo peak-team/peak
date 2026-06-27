@@ -3,6 +3,8 @@
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
 
+extern "C" gpointer peak_general_listener_find_function(const char* symbol);
+
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
 static GMutex cuda_kernel_local_dim_mapping_mutex;
@@ -794,12 +796,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cuda_launch = (gpointer*) gum_find_function("cudaLaunchKernel");
+    hook_cuda_launch =
+        (gpointer*) peak_general_listener_find_function("cudaLaunchKernel");
     if (hook_cuda_launch) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch,
             (gpointer)&peak_cuda_launch_kernel,
-            (gpointer*)&original_cuda_launch_kernel);
+            (gpointer*)&original_cuda_launch_kernel,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -808,12 +812,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cuda_launch_cooperative = (gpointer*) gum_find_function("cudaLaunchCooperativeKernel");
+    hook_cuda_launch_cooperative =
+        (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative,
             (gpointer)&peak_cuda_launch_cooperative_kernel,
-            (gpointer*)&original_cuda_launch_cooperative_kernel);
+            (gpointer*)&original_cuda_launch_cooperative_kernel,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -822,12 +828,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cuda_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cudaLaunchCooperativeKernelMultiDevice");
+    hook_cuda_launch_cooperative_multiple_device =
+        (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernelMultiDevice");
     if (hook_cuda_launch_cooperative_multiple_device) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_cooperative_multiple_device,
             (gpointer)&peak_cuda_launch_cooperative_kernel_multiple_device,
-            (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device);
+            (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -836,12 +844,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cuda_launch_exc = (gpointer*) gum_find_function("cudaLaunchKernelExC");
+    hook_cuda_launch_exc =
+        (gpointer*) peak_general_listener_find_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_launch_exc,
             (gpointer)&peak_cuda_launch_kernel_exc,
-            (gpointer*)&original_cuda_launch_kernel_exc);
+            (gpointer*)&original_cuda_launch_kernel_exc,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -850,12 +860,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cu_launch = (gpointer*) gum_find_function("cuLaunchKernel");
+    hook_cu_launch =
+        (gpointer*) peak_general_listener_find_function("cuLaunchKernel");
     if (hook_cu_launch) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch,
             (gpointer)&peak_cu_launch_kernel,
-            (gpointer*)&original_cu_launch_kernel);
+            (gpointer*)&original_cu_launch_kernel,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -864,12 +876,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cu_launch_cooperative = (gpointer*) gum_find_function("cuLaunchCooperativeKernel");
+    hook_cu_launch_cooperative =
+        (gpointer*) peak_general_listener_find_function("cuLaunchCooperativeKernel");
     if (hook_cu_launch_cooperative) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative,
             (gpointer)&peak_cu_launch_cooperative_kernel,
-            (gpointer*)&original_cu_launch_cooperative_kernel);
+            (gpointer*)&original_cu_launch_cooperative_kernel,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -878,12 +892,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cu_launch_cooperative_multiple_device = (gpointer*) gum_find_function("cuLaunchCooperativeKernelMultiDevice");
+    hook_cu_launch_cooperative_multiple_device =
+        (gpointer*) peak_general_listener_find_function("cuLaunchCooperativeKernelMultiDevice");
     if (hook_cu_launch_cooperative_multiple_device) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_cooperative_multiple_device,
             (gpointer)&peak_cu_launch_cooperative_kernel_multiple_device,
-            (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device);
+            (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -892,12 +908,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cu_launch_ex = (gpointer*) gum_find_function("cuLaunchKernelEx");
+    hook_cu_launch_ex =
+        (gpointer*) peak_general_listener_find_function("cuLaunchKernelEx");
     if (hook_cu_launch_ex) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_launch_ex,
             (gpointer)&peak_cu_launch_kernel_ex,
-            (gpointer*)&original_cu_launch_kernel_ex);
+            (gpointer*)&original_cu_launch_kernel_ex,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -906,12 +924,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cuda_graph_launch = (gpointer*) gum_find_function("cudaGraphLaunch");
+    hook_cuda_graph_launch =
+        (gpointer*) peak_general_listener_find_function("cudaGraphLaunch");
     if (hook_cuda_graph_launch) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cuda_graph_launch,
             (gpointer)&peak_cuda_graph_launch,
-            (gpointer*)&original_cuda_graph_launch);
+            (gpointer*)&original_cuda_graph_launch,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -920,12 +940,14 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
-    hook_cu_graph_launch = (gpointer*) gum_find_function("cuGraphLaunch");
+    hook_cu_graph_launch =
+        (gpointer*) peak_general_listener_find_function("cuGraphLaunch");
     if (hook_cu_graph_launch) {
         hook_replace_check = gum_interceptor_replace_fast(
             cuda_interceptor, hook_cu_graph_launch,
             (gpointer)&peak_cu_graph_launch,
-            (gpointer*)&original_cu_graph_launch);
+            (gpointer*)&original_cu_graph_launch,
+            NULL);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;

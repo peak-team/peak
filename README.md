@@ -459,7 +459,7 @@ request, explicit detach count, per-target heartbeat, or global heartbeat.
 Controls PEAK's fail-closed Gum prologue guard. Default: `default`. The default
 user-target policy only skips the audited x86_64 `DL`/`EDX`/`RDX` zero, `EAX`
 zero, first indexed-load, immediate post-load `DL`/`EDX`/`RDX`
-counter-update family that Gum 16.5.9 corrupts or crashes in tests.
+counter-update family that Gum 17.15.3 corrupts or crashes in tests.
 
 `conservative` additionally skips exact entry-instruction high-register
 `movabs` immediates containing x86 return-opcode bytes, exact entry `mov imm`

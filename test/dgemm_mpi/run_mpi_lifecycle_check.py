@@ -22,7 +22,7 @@ LAUNCHER_ABNORMAL_RE = re.compile(
 )
 OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
     r"-{10,}\n"
-    r"mpiexec has exited due to process rank.*?"
+    r"(?:mpiexec|prterun) has exited due to process rank.*?"
     r"-{10,}\n",
     re.DOTALL,
 )

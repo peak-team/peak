@@ -314,17 +314,18 @@ before the active patch bytes are written.
 
 The current CMake downloads a prebuilt Frida Gum devkit. On Linux x86_64 and
 Linux Arm64 the default `auto` provider copies that devkit to a PEAK-patched
-devkit directory, appends the PEAK PC API implementation object to
-`libfrida-gum.a`, and appends the public API declarations to `frida-gum.h`. A
-caller may also provide a patched devkit explicitly with
+devkit directory, patches `gumelfmodule.c.o` with the online-memory ELF fallback
+guard, appends the PEAK PC API implementation object to `libfrida-gum.a`, and
+appends the public API declarations to `frida-gum.h`. A caller may also provide
+a patched devkit explicitly with
 `PEAK_FRIDA_GUM_PROVIDER=patched-devkit`.
 
 The selected devkit must expose:
 
 ```c
 #define GUM_PEAK_PC_API_VERSION 1
-#define GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_X86_64 0x01060509u
-#define GUM_PEAK_PC_ABI_FRIDA_GUM_16_5_9_LINUX_ARM64 0x02060509u
+#define GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64 0x01171503u
+#define GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64 0x02171503u
 
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
@@ -805,11 +806,24 @@ demangled-symbol scan. Dynamic C symbols are instead resolved by the queued
 to restore the legacy broad scan for short C++ target names that do not include
 obvious C++ spelling such as `::`, `(`, `<`, or `operator`.
 
+PEAK resolves ordinary user targets and PEAK support-hook target addresses
+through Gum's `gum_find_function()` dynamic-binary lookup in both normal and
+MPI-launched processes. The PEAK-patched Frida Gum devkit keeps Gum's newer
+online in-memory ELF fallback, but guards the inlined ELF-header load before Gum
+parses a module base address as fallback ELF metadata. Normal online modules
+whose file path was opened successfully keep Gum's original live-memory parsing
+path. Invalid or unreadable memory-fallback sources fail with Gum's normal
+invalid-header error so the caller can skip that module without changing PEAK's
+resolver semantics. The guard validates the ELF ident, native little-endian
+encoding, `e_version`, class-specific ELF header size, non-empty program and
+section table entry sizes, table offset lower bounds, and offset-plus-table-size
+overflow before letting Gum parse fallback module memory.
+
 PEAK also refuses known or conservative trampoline-scratch prologue classes
 before static, dynamic `dlopen`, or JIT target attach. Tiny x86_64 leaf loops
 such as MILC's `f2d_4mat`/`d2f_4mat` initialize a `DL`/`EDX`/`RDX` value, zero
 `EAX`, execute the first indexed load in relocated entry bytes, and immediately
-update the `DL`/`EDX`/`RDX` counter used by the loop. Gum 16.5.9 may then
+update the `DL`/`EDX`/`RDX` counter used by the loop. Gum 17.15.3 may then
 clobber `RDX` before jumping back to the original function body, corrupting
 application data even when physical detach is disabled. GCC/local canaries
 reproduce the historical byte-72 corruption for these live counter variants.
