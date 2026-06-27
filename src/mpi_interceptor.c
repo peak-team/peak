@@ -254,12 +254,13 @@ int mpi_interceptor_attach()
     mpi_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(mpi_interceptor);
-    hook_address = gum_find_function("PMPI_Finalize");
+    hook_address = peak_general_listener_find_function("PMPI_Finalize");
     // g_printerr ("PMPI_Finalize found at %p\n",  hook_address);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
                                                      hook_address, &peak_pmpi_finalize,
-                                                     (gpointer*)(&original_pmpi_finalize));
+                                                     (gpointer*)(&original_pmpi_finalize),
+                                                     NULL);
     }
     gum_interceptor_end_transaction(mpi_interceptor);
     return replace_check;

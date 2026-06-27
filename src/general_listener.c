@@ -764,6 +764,16 @@ peak_symbol_should_use_cpp_map(const char* symbol)
             strstr(symbol, "operator") != NULL);
 }
 
+gpointer
+peak_general_listener_find_function(const char* symbol)
+{
+    if (symbol == NULL) {
+        return NULL;
+    }
+
+    return gum_find_function(symbol);
+}
+
 static void peak_general_listener_iface_init(gpointer g_iface, gpointer iface_data);
 
 G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
@@ -4002,9 +4012,18 @@ peak_general_overhead_bootstrapping()
     g_free(time);
 }
 
-static void peak_build_symbol_map_once(void) {
+static void
+peak_symbol_map_add_target(GHashTable* table, const char* symbol)
+{
+    if (symbol == NULL || g_hash_table_contains(table, symbol)) {
+        return;
+    }
+
+    g_hash_table_insert(table, g_strdup(symbol), g_ptr_array_new());
+}
+
+static void peak_build_symbol_map_once(size_t first_target_index) {
     gum_find_functions_matching_initialize = true;
-    GArray* addresses = gum_find_functions_matching("_Z*");
     gum_symbol_demangled_mapping = g_hash_table_new_full(g_str_hash,
                                                          str_equal_function_general,
                                                          g_free,
@@ -4014,6 +4033,23 @@ static void peak_build_symbol_map_once(void) {
                                                      g_free,
                                                      (GDestroyNotify) g_ptr_array_unref);
 
+    for (size_t i = first_target_index; i < peak_hook_address_count; i++) {
+        const char* symbol = peak_hook_strings[i];
+        if (!peak_symbol_should_use_cpp_map(symbol) ||
+            cxa_demangle_status(symbol) == 0) {
+            continue;
+        }
+
+        peak_symbol_map_add_target(gum_symbol_demangled_mapping, symbol);
+        peak_symbol_map_add_target(gum_symbol_short_mapping, symbol);
+    }
+
+    if (g_hash_table_size(gum_symbol_demangled_mapping) == 0 &&
+        g_hash_table_size(gum_symbol_short_mapping) == 0) {
+        return;
+    }
+
+    GArray* addresses = gum_find_functions_matching("_Z*");
     for (gsize j = 0; j < addresses->len; j++) {
         gpointer addr = g_array_index(addresses, gpointer, j);
         if (!addr) continue;
@@ -4024,20 +4060,18 @@ static void peak_build_symbol_map_once(void) {
         g_free(mangled);
         if (!demangled) continue;
 
-        GPtrArray* demangled_candidates = g_hash_table_lookup(gum_symbol_demangled_mapping, demangled);
-        if (!demangled_candidates) {
-            demangled_candidates = g_ptr_array_new();
-            g_hash_table_insert(gum_symbol_demangled_mapping, g_strdup(demangled), demangled_candidates);
+        GPtrArray* demangled_candidates =
+            g_hash_table_lookup(gum_symbol_demangled_mapping, demangled);
+        if (demangled_candidates) {
+            g_ptr_array_add(demangled_candidates, addr);
         }
-        g_ptr_array_add(demangled_candidates, addr);
 
         char* function_name = extract_function_name(demangled);
-        GPtrArray* short_candidates = g_hash_table_lookup(gum_symbol_short_mapping, function_name);
-        if (!short_candidates) {
-            short_candidates = g_ptr_array_new();
-            g_hash_table_insert(gum_symbol_short_mapping, g_strdup(function_name), short_candidates);
+        GPtrArray* short_candidates =
+            g_hash_table_lookup(gum_symbol_short_mapping, function_name);
+        if (short_candidates) {
+            g_ptr_array_add(short_candidates, addr);
         }
-        g_ptr_array_add(short_candidates, addr);
 
         free(function_name);
         free(demangled);
@@ -4085,53 +4119,64 @@ void peak_general_listener_attach()
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "close") == 0) {
-            hook_address[i] = gum_find_function("peak_close");
+            hook_address[i] = peak_general_listener_find_function("peak_close");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
-            hook_address[i] = gum_find_function("peak_exit");
+            hook_address[i] = peak_general_listener_find_function("peak_exit");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "main") == 0) {
             hook_address[i] = NULL;
         } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernel") == 0) {
-            hook_address[i] = gum_find_function("peak_cuda_launch_kernel");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_launch_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernel") == 0) {
-            hook_address[i] = gum_find_function("peak_cuda_launch_cooperative_kernel");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernelMultiDevice") == 0) {
-            hook_address[i] = gum_find_function("peak_cuda_launch_cooperative_kernel_multiple_device");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel_multiple_device");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelEx") == 0) {
             // C++ API template versions, also use cudaLaunchKernelExC internal
-            hook_address[i] = gum_find_function("peak_cuda_launch_kernel_exc");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelExC") == 0) {
-            hook_address[i] = gum_find_function("peak_cuda_launch_kernel_exc");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cuLaunchKernel") == 0) {
-            hook_address[i] = gum_find_function("peak_cu_launch_kernel");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cu_launch_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernel") == 0) {
-            hook_address[i] = gum_find_function("peak_cu_launch_cooperative_kernel");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cu_launch_cooperative_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernelMultiDevice") == 0) {
-            hook_address[i] = gum_find_function("peak_cu_launch_cooperative_kernel_multiple_device");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cu_launch_cooperative_kernel_multiple_device");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cuLaunchKernelEx") == 0) {
-            hook_address[i] = gum_find_function("peak_cu_launch_kernel_ex");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cu_launch_kernel_ex");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cudaGraphLaunch") == 0) {
-            hook_address[i] = gum_find_function("peak_cuda_graph_launch");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cuda_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "cuGraphLaunch") == 0) {
-            hook_address[i] = gum_find_function("peak_cu_graph_launch");
+            hook_address[i] =
+                peak_general_listener_find_function("peak_cu_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
             peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen wrapper used for dynamic attach\n");
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
-            gpointer ptr = gum_find_function(peak_hook_strings[i]);
+            gpointer ptr = peak_general_listener_find_function(peak_hook_strings[i]);
             if (ptr) {
                 hook_address[i] = ptr;
                 char* demangled = cxa_demangle(peak_hook_strings[i]);
@@ -4140,7 +4185,7 @@ void peak_general_listener_attach()
             } else {
                 if (peak_symbol_should_use_cpp_map(peak_hook_strings[i])) {
                     if (!gum_find_functions_matching_initialize) {
-                        peak_build_symbol_map_once();
+                        peak_build_symbol_map_once(i);
                     }
 
                     if (cxa_demangle_status(peak_hook_strings[i]) != 0) {

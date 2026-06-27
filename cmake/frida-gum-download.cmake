@@ -19,11 +19,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     if(FRIDA_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
        FRIDA_SYSTEM_PROCESSOR STREQUAL "amd64")
         set(FRIDA_ARCH_VAR "linux-x86_64")
-        set(FRIDA_HASH_VAR "de155a58493e1bdbc04aff098e8861c848624a58e06998dcb2d9e04f16b8d188")
+        set(FRIDA_HASH_VAR "f827b75f432c5f90ae57c71979e90e1c93edfa3aa3ac252b0d547f3087306f01")
     elseif(FRIDA_SYSTEM_PROCESSOR STREQUAL "arm64" OR
            FRIDA_SYSTEM_PROCESSOR STREQUAL "aarch64")
         set(FRIDA_ARCH_VAR "linux-arm64")
-        set(FRIDA_HASH_VAR "fe2f87f2e52b9ea7dfff0098a52dab9648929e02cd4e7497905465efe1ce2961")
+        set(FRIDA_HASH_VAR "b7b9f914ccb2f70c0663bfa20614d4b58fa8fc5f9e0a7786d3fb1c22113b8c61")
     else()
         message (FATAL_ERROR "Platform not supported")
     endif()
@@ -32,18 +32,18 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
     if(FRIDA_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
        FRIDA_SYSTEM_PROCESSOR STREQUAL "amd64")
         set(FRIDA_ARCH_VAR "macos-x86_64")
-        set(FRIDA_HASH_VAR "5250a804a7c496989930a97f3d47e9cff35a5fb50eaa23f226397cdf8ab6347f")
+        set(FRIDA_HASH_VAR "7378f605d351a0cfd53b46c3b608f4bde383eff30b1c4c886e11006dbf08f54f")
     elseif(FRIDA_SYSTEM_PROCESSOR STREQUAL "arm64" OR
            FRIDA_SYSTEM_PROCESSOR STREQUAL "aarch64")
         set(FRIDA_ARCH_VAR "macos-arm64")
-        set(FRIDA_HASH_VAR "a7e42d304782210afad1a22a52f13f6cd95f27f556b7839be57de6e832071294")
+        set(FRIDA_HASH_VAR "1904bc3559e27da517289f940abd37ab9cde4cca82a78e229b386acfa5beb487")
     else()
         message (FATAL_ERROR "Platform not supported")
     endif()
 endif()
 if(NOT FRIDA_HASH_VAR)
     message(FATAL_ERROR
-        "No verified hash is configured for frida-gum-devkit-16.5.9-${FRIDA_ARCH_VAR}.tar.xz")
+        "No verified hash is configured for frida-gum-devkit-17.15.3-${FRIDA_ARCH_VAR}.tar.xz")
 endif()
 message (STATUS "FRIDA_ARCH_VAR   = ${FRIDA_ARCH_VAR}")
 message (STATUS "FRIDA_HASH_VAR   = ${FRIDA_HASH_VAR}")
@@ -52,7 +52,7 @@ ExternalProject_Add(
   frida-gum
   SOURCE_DIR "@FRIDA_GUM_DOWNLOAD_ROOT@/frida-gum-src"
   URL
-    https://github.com/frida/frida/releases/download/16.5.9/frida-gum-devkit-16.5.9-${FRIDA_ARCH_VAR}.tar.xz
+    https://github.com/frida/frida/releases/download/17.15.3/frida-gum-devkit-17.15.3-${FRIDA_ARCH_VAR}.tar.xz
   URL_HASH
     SHA256=${FRIDA_HASH_VAR}
   CONFIGURE_COMMAND ""

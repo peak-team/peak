@@ -1114,7 +1114,7 @@ int dlopen_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
     dlopen_interceptor = gum_interceptor_obtain();
-    dlopen_hook_address = gum_find_function("dlopen");
+    dlopen_hook_address = peak_general_listener_find_function("dlopen");
 
     if (dlopen_hook_address == NULL) {
         return replace_check;
@@ -1152,7 +1152,8 @@ int dlopen_interceptor_attach()
     replace_check = gum_interceptor_replace_fast(dlopen_interceptor,
                                                  dlopen_hook_address,
                                                  (gpointer)&peak_dlopen,
-                                                 (gpointer*)(&original_dlopen));
+                                                 (gpointer*)(&original_dlopen),
+                                                 NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {

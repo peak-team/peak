@@ -500,7 +500,7 @@ peak_x86_has_rdx_prefix_prologue(gpointer address)
     }
 
     /*
-     * Frida Gum 16.5.9's x86 invoke trampoline may use RDX after executing
+     * Frida Gum 17.15.3's x86 invoke trampoline may use RDX after executing
      * relocated prologue instructions but before returning to the original
      * function body. Tiny leaf loops such as MILC's f2d_4mat initialize a
      * DL/EDX/RDX value, zero EAX, and execute the first indexed load in

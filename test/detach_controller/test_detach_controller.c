@@ -244,7 +244,9 @@ run_strict(void)
         PEAK_DETACH_OPERATION_REPLACE,
         PEAK_DETACH_OPERATION_REVERT
     };
+    int result;
 
+    gum_init_embedded();
     check_string_tables();
     for (size_t i = 0; i < sizeof(operations) / sizeof(operations[0]); i++) {
         PeakDetachRequest request = valid_request(operations[i]);
@@ -257,9 +259,10 @@ run_strict(void)
                       expected_status);
     }
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    result = failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    gum_deinit_embedded();
+    return result;
 }
-
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 static volatile int worker_running = 0;
@@ -2138,6 +2141,9 @@ run_batch_guards(void)
     PeakDetachStatus finish_status = PEAK_DETACH_STATUS_ERROR;
     size_t prepared_count = 99;
     PeakDetachBatchResult results[4];
+    int result;
+
+    gum_init_embedded();
 
     PeakDetachRequest unsupported_requests[4] = {
         {
@@ -2336,7 +2342,9 @@ run_batch_guards(void)
     check_true("missing reattach record leaves no physical mutation",
                peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
 
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    result = failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    gum_deinit_embedded();
+    return result;
 #endif
 }
 
