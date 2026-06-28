@@ -183,12 +183,44 @@ peak_output_aggregation_mode_from_value(const char* name,
 }
 
 static gboolean
+peak_env_is_nonempty(const char* name)
+{
+    const char* value = getenv(name);
+
+    return value != NULL && value[0] != '\0';
+}
+
+static gboolean
+peak_env_looks_like_intel_mpi(void)
+{
+    static const char* names[] = {
+        "I_MPI_ROOT",
+        "I_MPI_FABRICS",
+        "I_MPI_HYDRA_BOOTSTRAP",
+        "I_MPI_PMI_LIBRARY",
+        NULL
+    };
+
+    for (const char** name = names; *name != NULL; name++) {
+        if (peak_env_is_nonempty(*name)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static gboolean
 peak_mpi_runtime_matches_intel_mpi(void)
 {
     const char* test_version = getenv(PEAK_TEST_MPI_LIBRARY_VERSION_ENV);
     char version[MPI_MAX_LIBRARY_VERSION_STRING] = { 0 };
     int version_len = 0;
     const char* text = test_version;
+
+    if (peak_env_looks_like_intel_mpi()) {
+        return TRUE;
+    }
 
     if (text == NULL || text[0] == '\0') {
         if (MPI_Get_library_version(version, &version_len) != MPI_SUCCESS) {
