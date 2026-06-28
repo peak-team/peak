@@ -702,10 +702,18 @@ rank-local output instead of splitting between collective and non-collective
 teardown paths, and PEAK skips the real MPI finalizer from the subset-rank path.
 After the proof succeeds, the MPI reducer uses bounded nonblocking
 `MPI_Iallreduce`/`MPI_Ireduce` wrappers and falls back to rank-local output if a
-reducer collective fails or times out. Those wrappers still rely on `MPI_Test()`
-for progress, so this reducer is appropriate for ordinary all-rank clean
-shutdown, but not for environments where PEAK must avoid MPI progress entirely.
+reducer collective fails or times out. A reducer failure is treated as
+fail-closed: PEAK leaves the active nonblocking collective owned by MPI, avoids
+later MPI teardown calls, skips the real `PMPI_Finalize()` return path, and
+tries the PEAK-owned socket reducer using launcher rank metadata before falling
+back to rank-local output. Those wrappers still rely on `MPI_Test()` for
+progress, so this reducer is appropriate for ordinary all-rank clean shutdown,
+but not for environments where PEAK must avoid MPI progress entirely.
 Use socket output when final reporting must avoid MPI collectives.
+`PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` controls only the initial finalize
+participation proof and defaults to 250 ms. `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS`
+controls each MPI payload reducer collective and defaults to 5000 ms, because
+large-rank payload reductions can be slower than the small fail-fast proof.
 The socket payload reducer
 does not use MPI reductions for the profile payload itself: rank 0 accepts a
 bounded set of framed per-rank payloads, validates a Slurm/PMI-derived reducer

@@ -106,6 +106,15 @@ void peak_general_listener_attach();
 gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
 
 /**
+ * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
+ *
+ * A TRUE result means an MPI output reducer collective failed or timed out after
+ * PEAK had started MPI payload aggregation. The caller must not issue later MPI
+ * calls from teardown, including returning to the real PMPI_Finalize path.
+ */
+gboolean peak_general_listener_mpi_reducer_failed_closed(void);
+
+/**
  * @brief Makes still-pinned listener callbacks pass through without accounting.
  *
  * PEAK uses this as soon as it enters the application PMPI_Finalize path.
