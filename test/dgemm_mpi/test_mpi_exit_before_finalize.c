@@ -1,4 +1,5 @@
 #include <mpi.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,6 +134,45 @@ main(int argc, char** argv)
             exit(0);
         }
         peak_mpi_exit_wait_for_file(done_file, 10000);
+        exit(0);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "exec-failure-rank0") == 0) {
+        if (rank == 0) {
+            char* const bad_argv[] = {(char*)"/definitely/not/found", NULL};
+            errno = 0;
+            int result = execv("/definitely/not/found", bad_argv);
+            int saved_errno = errno;
+            if (result != -1 || saved_errno != ENOENT) {
+                fprintf(stderr,
+                        "mpi_exec_failure_rank0_bad_result result=%d errno=%d\n",
+                        result,
+                        saved_errno);
+                MPI_Abort(MPI_COMM_WORLD, 3);
+            }
+            fprintf(stderr,
+                    "mpi_exec_failure_rank0_errno=%d\n",
+                    saved_errno);
+            fflush(stderr);
+        }
+        MPI_Finalize();
+        exit(0);
+    }
+
+    if (argc > 1 && strcmp(argv[1], "exec-success-rank0") == 0) {
+        if (rank == 0) {
+            const char* child =
+                getenv("PEAK_MPI_EXEC_SUCCESS_CHILD") != NULL ?
+                    getenv("PEAK_MPI_EXEC_SUCCESS_CHILD") :
+                    "/bin/true";
+            char* const child_argv[] = {(char*)child, NULL};
+            execv(child, child_argv);
+            fprintf(stderr,
+                    "mpi_exec_success_rank0_failed errno=%d\n",
+                    errno);
+            fflush(stderr);
+            _exit(4);
+        }
         exit(0);
     }
 

@@ -106,6 +106,24 @@ void peak_general_listener_attach();
 gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
 
 /**
+ * @brief Writes a rank-local, non-destructive CSV snapshot for an exec handoff.
+ *
+ * This snapshots the current per-process CPU listener counters without MPI
+ * collectives, Gum detach, controller shutdown, heartbeat changes, or runtime
+ * teardown. The checkpoint writer streams rows without GLib allocation/stdio
+ * and listener locks are taken in nonblocking mode, so forked children fail the
+ * checkpoint rather than waiting indefinitely on inherited runtime state. The
+ * normal final output path remains responsible for freeing runtime-owned
+ * listener state.
+ *
+ * @param checkpoint_index Monotonic per-process exec checkpoint index.
+ * @return TRUE when a checkpoint CSV was written, FALSE otherwise.
+ */
+gboolean peak_general_listener_checkpoint_for_exec(
+    unsigned long long checkpoint_index,
+    gboolean try_only);
+
+/**
  * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
  *
  * A TRUE result means an MPI output reducer collective failed or timed out after
@@ -243,6 +261,21 @@ void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id);
  * @return TRUE if the request is accepted or already pending.
  */
 PEAK_API gboolean peak_general_listener_request_detach(size_t hook_id);
+
+/**
+ * @brief Requests controller-owned physical detach for several hooks atomically.
+ *
+ * This queues all accepted requests while holding the listener controller lock,
+ * then wakes the controller once. It is primarily used by lifecycle tests that
+ * need deterministic multi-hook batching.
+ *
+ * @param hook_ids Hook indices to request.
+ * @param hook_count Number of hook indices.
+ * @return Number of requests accepted or already pending.
+ */
+PEAK_API size_t peak_general_listener_request_detach_batch(
+    const size_t* hook_ids,
+    size_t hook_count);
 
 /**
  * @brief Requests controller-owned reattach for a detached hooked function.

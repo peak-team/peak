@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "mpi_interceptor.h"
 #include "general_listener.h"
 #include "peak_logging.h"
@@ -25,10 +26,60 @@ static int peak_finalize_state = PEAK_MPI_FINALIZE_NOT_REQUESTED;
 static int peak_finalize_result = 0;
 static int peak_real_finalize_allowed = 0;
 static int peak_finalize_path_active = 0;
-static gpointer hook_address;
 
-static int (*original_pmpi_finalize)(void);
+typedef struct {
+    const char* symbol;
+    gpointer hook_address;
+    int (*original_finalize)(void);
+    int active;
+} PeakMpiFinalizeHook;
+
+static PeakMpiFinalizeHook finalize_hooks[] = {
+    { "MPI_Finalize", NULL, NULL, 0 },
+    { "PMPI_Finalize", NULL, NULL, 0 },
+};
+static __thread int active_finalize_hook = -1;
+static __thread int calling_original_finalize_depth = 0;
 extern void peak_fini(void);
+
+static size_t
+mpi_interceptor_finalize_hook_count(void)
+{
+    return sizeof(finalize_hooks) / sizeof(finalize_hooks[0]);
+}
+
+static PeakMpiFinalizeHook*
+mpi_interceptor_current_finalize_hook(void)
+{
+    if (active_finalize_hook >= 0 &&
+        active_finalize_hook < (int)mpi_interceptor_finalize_hook_count() &&
+        finalize_hooks[active_finalize_hook].active) {
+        return &finalize_hooks[active_finalize_hook];
+    }
+
+    for (size_t i = 0; i < mpi_interceptor_finalize_hook_count(); i++) {
+        if (finalize_hooks[i].active) {
+            return &finalize_hooks[i];
+        }
+    }
+    return NULL;
+}
+
+static int
+mpi_interceptor_call_reentered_original(int hook_index)
+{
+    if (hook_index < 0 ||
+        hook_index >= (int)mpi_interceptor_finalize_hook_count()) {
+        return 0;
+    }
+
+    PeakMpiFinalizeHook* hook = &finalize_hooks[hook_index];
+    if (!hook->active || hook->original_finalize == NULL) {
+        return 0;
+    }
+
+    return hook->original_finalize();
+}
 
 static int
 mpi_interceptor_env_truthy(const char* value)
@@ -104,12 +155,19 @@ mpi_interceptor_real_finalize_enabled(void)
 static int
 mpi_interceptor_restore_finalize_for_direct_call(void)
 {
-    if (mpi_interceptor == NULL || hook_address == NULL) {
+    PeakMpiFinalizeHook* current = mpi_interceptor_current_finalize_hook();
+
+    if (mpi_interceptor == NULL || current == NULL) {
         return 0;
     }
 
     gum_interceptor_begin_transaction(mpi_interceptor);
-    gum_interceptor_revert(mpi_interceptor, hook_address);
+    for (size_t i = 0; i < mpi_interceptor_finalize_hook_count(); i++) {
+        if (finalize_hooks[i].active && finalize_hooks[i].hook_address != NULL) {
+            gum_interceptor_revert(mpi_interceptor,
+                                   finalize_hooks[i].hook_address);
+        }
+    }
     gum_interceptor_end_transaction(mpi_interceptor);
     if (!gum_interceptor_flush(mpi_interceptor)) {
         g_printerr("[peak] MPI finalize direct-call restore did not flush; using replacement trampoline\n");
@@ -138,6 +196,7 @@ static int
 mpi_interceptor_call_original_finalize_once(void)
 {
     int direct_finalize = mpi_interceptor_direct_finalize_enabled();
+    PeakMpiFinalizeHook* current = mpi_interceptor_current_finalize_hook();
 
     if (!mpi_interceptor_real_finalize_enabled() ||
         !__atomic_load_n(&peak_real_finalize_allowed, __ATOMIC_ACQUIRE)) {
@@ -148,8 +207,9 @@ mpi_interceptor_call_original_finalize_once(void)
         return 0;
     }
 
-    if (original_pmpi_finalize == NULL &&
-        (!direct_finalize || hook_address == NULL)) {
+    if (current == NULL ||
+        (current->original_finalize == NULL &&
+         (!direct_finalize || current->hook_address == NULL))) {
         __atomic_store_n(&peak_finalize_state,
                          PEAK_MPI_FINALIZE_DONE,
                          __ATOMIC_RELEASE);
@@ -185,12 +245,17 @@ mpi_interceptor_call_original_finalize_once(void)
 
         int result = 0;
         if (direct_finalize &&
-            hook_address != NULL &&
+            current->hook_address != NULL &&
             mpi_interceptor_restore_finalize_for_direct_call()) {
-            int (*direct_pmpi_finalize)(void) = (int (*)(void))hook_address;
-            result = direct_pmpi_finalize();
-        } else if (original_pmpi_finalize != NULL) {
-            result = original_pmpi_finalize();
+            int (*direct_finalize_fn)(void) =
+                (int (*)(void))current->hook_address;
+            calling_original_finalize_depth++;
+            result = direct_finalize_fn();
+            calling_original_finalize_depth--;
+        } else if (current->original_finalize != NULL) {
+            calling_original_finalize_depth++;
+            result = current->original_finalize();
+            calling_original_finalize_depth--;
         }
         __atomic_store_n(&peak_finalize_result, result, __ATOMIC_RELEASE);
         __atomic_store_n(&peak_finalize_state,
@@ -215,18 +280,43 @@ mpi_interceptor_call_original_finalize_once(void)
  * @return The original `PMPI_Finalize()` result.
  */
 static int
-peak_pmpi_finalize(void)
+peak_mpi_finalize_common(int hook_index)
 {
+    int previous_hook = active_finalize_hook;
+
+    if (calling_original_finalize_depth > 0) {
+        return mpi_interceptor_call_reentered_original(hook_index);
+    }
+
+    active_finalize_hook = hook_index;
     // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     mpi_interceptor_mark_finalize_requested();
     if (mpi_interceptor_finalize_policy_defer()) {
+        int result;
+
         mpi_interceptor_set_real_finalize_allowed(1);
-        return mpi_interceptor_call_original_finalize_once();
+        result = mpi_interceptor_call_original_finalize_once();
+        active_finalize_hook = previous_hook;
+        return result;
     }
     __atomic_store_n(&peak_finalize_path_active, 1, __ATOMIC_RELEASE);
     peak_fini();
     __atomic_store_n(&peak_finalize_path_active, 0, __ATOMIC_RELEASE);
-    return mpi_interceptor_call_original_finalize_once();
+    int result = mpi_interceptor_call_original_finalize_once();
+    active_finalize_hook = previous_hook;
+    return result;
+}
+
+static int
+peak_mpi_finalize(void)
+{
+    return peak_mpi_finalize_common(0);
+}
+
+static int
+peak_pmpi_finalize(void)
+{
+    return peak_mpi_finalize_common(1);
 }
 
 int mpi_interceptor_finalize_was_requested()
@@ -250,27 +340,66 @@ mpi_interceptor_set_real_finalize_allowed(int allowed)
 
 int mpi_interceptor_attach()
 {
-    GumReplaceReturn replace_check = -1;
+    int attached = 0;
+
     mpi_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(mpi_interceptor);
-    hook_address = peak_general_listener_find_function("PMPI_Finalize");
-    // g_printerr ("PMPI_Finalize found at %p\n",  hook_address);
-    if (hook_address) {
-        replace_check = gum_interceptor_replace_fast(mpi_interceptor,
-                                                     hook_address, &peak_pmpi_finalize,
-                                                     (gpointer*)(&original_pmpi_finalize),
-                                                     NULL);
+    for (size_t i = 0; i < mpi_interceptor_finalize_hook_count(); i++) {
+        gpointer candidate = NULL;
+        if (strcmp(finalize_hooks[i].symbol, "MPI_Finalize") == 0) {
+            candidate = peak_general_listener_find_function("MPI_Finalize");
+        } else if (strcmp(finalize_hooks[i].symbol, "PMPI_Finalize") == 0) {
+            candidate = peak_general_listener_find_function("PMPI_Finalize");
+        }
+        if (candidate == NULL) {
+            continue;
+        }
+
+        int duplicate = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (finalize_hooks[j].active &&
+                finalize_hooks[j].hook_address == candidate) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) {
+            finalize_hooks[i].hook_address = candidate;
+            finalize_hooks[i].active = 1;
+            attached++;
+            continue;
+        }
+
+        gpointer replacement =
+            (i == 0) ? (gpointer)&peak_mpi_finalize
+                     : (gpointer)&peak_pmpi_finalize;
+        GumReplaceReturn replace_check =
+            gum_interceptor_replace_fast(
+                mpi_interceptor,
+                candidate,
+                replacement,
+                (gpointer*)(&finalize_hooks[i].original_finalize),
+                NULL);
+        if (replace_check == GUM_REPLACE_OK) {
+            finalize_hooks[i].hook_address = candidate;
+            finalize_hooks[i].active = 1;
+            attached++;
+        } else {
+            finalize_hooks[i].hook_address = NULL;
+            finalize_hooks[i].original_finalize = NULL;
+            finalize_hooks[i].active = 0;
+        }
     }
     gum_interceptor_end_transaction(mpi_interceptor);
-    return replace_check;
+    return attached > 0 ? 0 : -1;
 }
 
 void mpi_interceptor_dettach(int allow_delayed_finalize)
 {
     (void)allow_delayed_finalize;
 
-    if (mpi_interceptor == NULL || hook_address == NULL) {
+    if (mpi_interceptor == NULL) {
         return;
     }
 
@@ -286,11 +415,22 @@ void mpi_interceptor_dettach(int allow_delayed_finalize)
     }
 
     gum_interceptor_begin_transaction(mpi_interceptor);
-    gum_interceptor_revert(mpi_interceptor, hook_address);
+    for (size_t i = 0; i < mpi_interceptor_finalize_hook_count(); i++) {
+        if (finalize_hooks[i].active &&
+            finalize_hooks[i].hook_address != NULL &&
+            finalize_hooks[i].original_finalize != NULL) {
+            gum_interceptor_revert(mpi_interceptor,
+                                   finalize_hooks[i].hook_address);
+        }
+    }
     gum_interceptor_end_transaction(mpi_interceptor);
     if (!gum_interceptor_flush(mpi_interceptor)) {
         g_printerr("[peak] MPI interceptor teardown did not flush; leaving MPI interceptor state alive\n");
         return;
     }
-    hook_address = NULL;
+    for (size_t i = 0; i < mpi_interceptor_finalize_hook_count(); i++) {
+        finalize_hooks[i].hook_address = NULL;
+        finalize_hooks[i].original_finalize = NULL;
+        finalize_hooks[i].active = 0;
+    }
 }

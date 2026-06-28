@@ -68,7 +68,6 @@ def make_env(args, sample):
             "PEAK_GLOBAL_REATTACH_FACTOR": args.global_reattach_factor,
             "PEAK_HEARTBEAT_INTERVAL": args.heartbeat_interval,
             "PEAK_HIBERNATION_CYCLE": str(args.hibernation_cycle),
-            "PEAK_REATTACH_COOLDOWN_MS": args.reattach_cooldown_ms,
             "PEAK_HB_MIN_US": args.hb_min_us,
             "PEAK_HB_MAX_US": args.hb_max_us,
             "PEAK_REQUIRE_SAFE_DETACH": "1",
@@ -78,6 +77,8 @@ def make_env(args, sample):
     )
     if args.detach_count:
         env["PEAK_DETACH_COUNT"] = args.detach_count
+    if args.reattach_cooldown_ms:
+        env["PEAK_REATTACH_COOLDOWN_MS"] = args.reattach_cooldown_ms
     if args.detach_backend:
         env["PEAK_DETACH_BACKEND"] = args.detach_backend
         if args.detach_backend == "signal":
@@ -379,6 +380,10 @@ def run_sample(args, sample):
             "--spawner-threads",
             str(args.spawner_threads),
         ])
+    if args.request_detach_after_start:
+        cmd.append("--request-detach-after-start")
+    if args.wait_for_hook_before_start:
+        cmd.append("--wait-for-hook-before-start")
     reset_trace(args, sample)
     completed = subprocess.run(
         cmd,
@@ -503,7 +508,7 @@ def main():
     parser.add_argument("--stats-prefix", default="/tmp/peak-hotloop-trace-check")
     parser.add_argument("--heartbeat-interval", default="0.001")
     parser.add_argument("--hibernation-cycle", type=int, default=1)
-    parser.add_argument("--reattach-cooldown-ms", default="0")
+    parser.add_argument("--reattach-cooldown-ms", default="")
     parser.add_argument("--overhead-ratio", default="0.000001")
     parser.add_argument("--peak-cost", default="0.000000000001")
     parser.add_argument("--detach-count", default="")
@@ -512,6 +517,8 @@ def main():
     parser.add_argument("--peak-max-threads", type=int, default=0)
     parser.add_argument("--thread-slack", type=int, default=16)
     parser.add_argument("--require-reattach", action="store_true")
+    parser.add_argument("--request-detach-after-start", action="store_true")
+    parser.add_argument("--wait-for-hook-before-start", action="store_true")
     parser.add_argument("--disable-reattach", action="store_false",
                         dest="enable_reattach")
     parser.add_argument("--disable-per-target-heartbeat", action="store_false",

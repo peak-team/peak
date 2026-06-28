@@ -239,6 +239,9 @@ def check_stop_window_trace_gating(repo_root):
     syscall = (repo_root / "src/syscall_interceptor.c").read_text(
         encoding="utf-8"
     )
+    syscall_policy = (repo_root / "src/syscall_interceptor_policy.h").read_text(
+        encoding="utf-8"
+    )
     dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
         encoding="utf-8"
     )
@@ -252,6 +255,13 @@ def check_stop_window_trace_gating(repo_root):
             "support replacements must not apply user-target prologue guards")
     require("peak_general_listener_support_attach_target_is_supported" in syscall,
             "close support replacement must call the support attach predicate")
+    require("peak_syscall_interceptor_has_inline_close_syscall_bytes" in syscall and
+            "PEAK_CLOSE_PATCH_HAZARD_SCAN_BYTES" in syscall and
+            "PEAK_CLOSE_PATCH_HAZARD_PREFIX_BYTES" in syscall_policy and
+            "SYS_close" in syscall_policy and
+            "0x0f" in syscall_policy and
+            "0x05" in syscall_policy,
+            "close support replacement must skip inline SYS_close syscall stubs")
     require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
             "dlopen replacement must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
@@ -295,10 +305,14 @@ def check_global_detach_overhead_selection(repo_root):
             "global detach must not sort by transient overhead rate")
     require("compare_ratio_de" in global_detach,
             "global detach must sort candidates by actual overhead ratio")
-    require("ratio_snapshot[i] <= target_profile_ratio" in global_detach and
+    require("PEAK_GLOBAL_DETACH_MIN_CALLS" in source and
+            "calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS" in global_detach and
             "continue;" in global_detach,
-            "global detach must not enqueue below-threshold one-shot/cold targets")
-    require("entries[k].ratio <= target_profile_ratio" in global_detach and
+            "global detach must not enqueue one-shot/cold targets")
+    require("ratio_snapshot[i] <= global_target_ratio" in global_detach and
+            "continue;" in global_detach,
+            "global detach must not enqueue below-global-threshold targets")
+    require("entries[k].ratio <= global_target_ratio" in global_detach and
             "break;" in global_detach,
             "global detach loop must fail closed if a below-threshold candidate appears")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
@@ -582,7 +596,8 @@ def check_signal_backend_strict_invariants(repo_root):
     require('__asm__("syscall")' in signal_policy and
             "peak_signal_policy_syscall" in signal_policy and
             "peak_signal_policy_safe_read" in signal_policy and
-            "/proc/self/maps" not in signal_policy and
+            "peak_signal_policy_range_is_writable" in signal_policy and
+            'fopen("/proc/self/maps", "r")' in signal_policy and
             "SYS_pread64" in signal_policy and
             "SYS_process_vm_readv" in signal_policy and
             "syscall:rt_sigprocmask" in signal_policy and
@@ -607,6 +622,9 @@ def check_signal_backend_strict_invariants(repo_root):
             "peak_signal_policy_prepare_event_for_user(evp" in signal_policy and
             "SIGEV_THREAD_ID" in signal_policy,
             "timer_create wrapper must migrate explicit SIGEV_SIGNAL/SIGEV_THREAD_ID collisions")
+    require("peak_signal_policy_resolve_timer_create" in signal_policy and
+            "dlvsym(RTLD_NEXT, \"timer_create\", \"GLIBC_2.3.3\")" in signal_policy,
+            "timer_create interposer must preserve glibc's user-facing timer_t ABI")
     require('"mq_notify"' in signal_policy and
             '"aio_read"' in signal_policy and
             '"aio_write"' in signal_policy and
@@ -730,9 +748,12 @@ def check_signal_backend_strict_invariants(repo_root):
             "forced signal collision runtime test must prove POSIX AIO collisions fail closed before libc AIO side effects")
     require("invalid_pointer_guard=1" in runtime_hotloop and
             "invalid raw rt_sigprocmask pointer was not rejected" in runtime_hotloop and
+            "invalid raw timer_create sigevent pointer was accepted" in runtime_hotloop and
             "invalid raw pselect6 sigmask pointer was accepted" in runtime_hotloop and
-            "invalid-pointer raw syscall probes migrated PEAK signal" in runtime_hotloop,
-            "raw syscall wrapper must forward unreadable user pointers instead of crashing or migrating")
+            "invalid pthread_sigmask pointer returned unexpected error" in runtime_hotloop and
+            "read-only sigaction query returned unexpected errno" in runtime_hotloop and
+            "invalid-pointer probes migrated PEAK signal" in runtime_hotloop,
+            "signal policy must fail closed on unreadable raw/public pointers instead of crashing or migrating")
     require("--signal-bad-cookie-check" in runtime_hotloop and
             "peak_signal_policy_test_send_bad_cookie_to_current_thread" in runtime_hotloop and
             "trace_has_detach_prepare_unexpected_signal" in runtime_hotloop and
@@ -747,8 +768,19 @@ def check_signal_backend_strict_invariants(repo_root):
             "child_started_while_gate" in runtime_hotloop,
             "pthread-create gate stress must prove blocked children and gate release ordering")
     benchmark_runner = (repo_root / "benchmarks/detach/run_detach_hotloop_stress.py").read_text(encoding="utf-8")
+    benchmark_wrapper = (repo_root / "benchmarks/detach/hpc_extreme_detach_bench.sh").read_text(encoding="utf-8")
+    hpc_config_path = repo_root / ".codex-hpc.toml"
     require("--detach-backend" in benchmark_runner,
             "hotloop benchmark must support backend-pinned signal stress")
+    require("if args.require_reattach:" not in benchmark_runner or
+            "PEAK_REATTACH_COOLDOWN_MS" not in benchmark_runner,
+            "short reattach stress runs must not hide the runtime cooldown")
+    require("PEAK_HPC_REATTACH_COOLDOWN_MS" not in benchmark_wrapper,
+            "HPC smoke wrapper must not hide the runtime reattach cooldown")
+    if hpc_config_path.exists():
+        hpc_config = hpc_config_path.read_text(encoding="utf-8")
+        require("PEAK_HPC_REATTACH_COOLDOWN_MS" not in hpc_config,
+                "HPC suite config must not hide the runtime reattach cooldown")
     require("PEAK_DETACH_BACKEND=helper" in tests and
             "PEAK_DETACH_BACKEND=helper" in controller_tests_cmake,
             "fake-helper tests must force helper backend, not auto signal fallback")
@@ -757,6 +789,60 @@ def check_signal_backend_strict_invariants(repo_root):
             "peak_signal_policy_test_block_reserved_for_current_thread() == 0" in controller_tests and
             "signal-reserved-blocked" in controller_tests,
             "controller tests must link signal policy and prove selected-signal blocked reason")
+
+
+def check_exec_chain_syscall_bridge_invariants(repo_root):
+    exec_interceptor = (repo_root / "src/exec_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    general_listener = (repo_root / "src/general_listener.c").read_text(
+        encoding="utf-8"
+    )
+    run_exec_checks = (
+        repo_root / "test/exec_chain/run_exec_chain_check.py"
+    ).read_text(encoding="utf-8")
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    syscall_bridge = extract_function(exec_interceptor, "peak_exec_handle_syscall")
+
+    require("peak_exec_raw_syscall_depth" not in exec_interceptor,
+            "raw clone syscall bridge must not mutate shared TLS recursion guards")
+    clone_start = exec_interceptor.find("clone(int (*fn)(void*)")
+    clone_end = exec_interceptor.find("static peak_execvpe_fn", clone_start)
+    require(clone_start >= 0 and clone_end > clone_start,
+            "missing clone wrapper")
+    clone_body = exec_interceptor[clone_start:clone_end]
+    constructor_body = extract_function(exec_interceptor, "peak_exec_register_atfork")
+    require("peak_real_clone()" in constructor_body,
+            "clone symbol must be resolved before possible multithreaded fork")
+    require("in_fork_like_child" in clone_body and
+            "stack_start" in clone_body and
+            clone_body.find("in_fork_like_child") < clone_body.find("malloc("),
+            "fork-like child clone wrapper must avoid heap allocation before exec")
+    require("number == SYS_vfork" in syscall_bridge and
+            "return 0;" in syscall_bridge[
+                syscall_bridge.find("number == SYS_vfork"):
+                syscall_bridge.find("number == SYS_execveat")
+            ],
+            "raw SYS_vfork must be passed through instead of emulated")
+    readme_flat = " ".join(readme.split())
+    require("syscall(SYS_vfork)" in readme_flat and
+            "not part of PEAK's exec-chain support surface" in readme_flat,
+            "README must document the raw SYS_vfork unsupported boundary")
+    require("posix_spawn_preflight_unavailable_injection" in run_exec_checks and
+            "PEAK_TEST_EXEC_PREFLIGHT_UNAVAILABLE" in run_exec_checks and
+            "posix_spawn_bad_env_failure_non_destructive" in run_exec_checks,
+            "posix_spawn tests must cover preflight fallback injection and conclusive bad-env failure")
+    checkpoint_body = extract_function(
+        general_listener, "peak_general_listener_stream_exec_checkpoint"
+    )
+    write_all_body = extract_function(general_listener, "peak_checkpoint_write_all")
+    require("peak_checkpoint_open_exclusive" in checkpoint_body and
+            "peak_checkpoint_close_fd" in checkpoint_body and
+            "peak_checkpoint_unlink_path" in checkpoint_body and
+            "peak_checkpoint_raw_syscall6(SYS_write" in write_all_body,
+            "exec checkpoint file I/O must use raw syscall helpers on Linux")
+    require("exec_checkpoint_write_target_no_reentry" in run_exec_checks,
+            "exec-chain tests must cover checkpointing while profiling write")
 
 
 def main():
@@ -779,6 +865,7 @@ def main():
     check_dlopen_test_hook_visibility(repo_root)
     check_shutdown_fail_closed_docs(repo_root)
     check_signal_backend_strict_invariants(repo_root)
+    check_exec_chain_syscall_bridge_invariants(repo_root)
     print("detach_lifecycle_invariants_ok")
     return 0
 

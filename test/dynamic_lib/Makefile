@@ -90,16 +90,16 @@ libA.a: $(LIBA_O)
 # Executables: all four combinations
 # --------------------------------------------------------------------
 main_dynA_dynB: $(MAIN_O) libA_dynB.so libB.so
-	$(CC) -o $@ $(MAIN_O) -L. -lA_dynB $(RPATH)
+	$(CC) -o $@ $(MAIN_O) -L. -lA_dynB $(RPATH) -ldl
 
 main_dynA_staB: $(MAIN_O) libA_staB.so
-	$(CC) -o $@ $(MAIN_O) -L. -lA_staB $(RPATH)
+	$(CC) -o $@ $(MAIN_O) -L. -lA_staB $(RPATH) -ldl
 
 main_staA_dynB: $(MAIN_O) libA.a libB.so
-	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -Wl,-Bdynamic -L. -lB $(RPATH)
+	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -Wl,-Bdynamic -L. -lB $(RPATH) -ldl
 
 main_staA_staB: $(MAIN_O) libA.a libB.a
-	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -lB -Wl,-Bdynamic $(RPATH)
+	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -lB -Wl,-Bdynamic $(RPATH) -ldl
 
 dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl

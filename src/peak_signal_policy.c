@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <features.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mqueue.h>
@@ -73,6 +74,16 @@ static int (*real_ppoll_fn)(struct pollfd*,
 static long (*real_syscall_fn)(long, ...);
 static pthread_once_t real_symbols_once = PTHREAD_ONCE_INIT;
 
+extern int peak_exec_handle_syscall(long number,
+                                    long a1,
+                                    long a2,
+                                    long a3,
+                                    long a4,
+                                    long a5,
+                                    long a6,
+                                    long* result_out)
+    __attribute__((weak));
+
 static int peak_signal_policy_parse_signal_env(const char* value, int* out);
 static int peak_signal_policy_signal_is_available(int signum);
 static void peak_signal_policy_init_cookie(void);
@@ -87,11 +98,31 @@ static int peak_signal_policy_safe_read(void* dst,
 static int peak_signal_policy_safe_write(void* dst,
                                          const void* src,
                                          size_t size);
+static int peak_signal_policy_range_is_writable(const void* ptr, size_t size);
 
 static void*
 peak_signal_policy_resolve(const char* name)
 {
     return dlsym(RTLD_NEXT, name);
+}
+
+static void*
+peak_signal_policy_resolve_timer_create(void)
+{
+#ifdef __GLIBC__
+    /*
+     * Older glibc exports timer_create@GLIBC_2.2.5 with the raw kernel
+     * timer-id ABI and timer_create@@GLIBC_2.3.3 with the user-facing
+     * pointer timer_t ABI.  dlsym(RTLD_NEXT, ...) may pick the compat ABI
+     * from an unversioned interposer, which corrupts timer_t for callers that
+     * later use the default timer_delete ABI.
+     */
+    void* symbol = dlvsym(RTLD_NEXT, "timer_create", "GLIBC_2.3.3");
+    if (symbol != NULL) {
+        return symbol;
+    }
+#endif
+    return peak_signal_policy_resolve("timer_create");
 }
 
 static void
@@ -125,7 +156,7 @@ peak_signal_policy_resolve_real_symbols(void)
             peak_signal_policy_resolve("signalfd4");
     real_timer_create_fn =
         (int (*)(clockid_t, struct sigevent*, timer_t*))
-            peak_signal_policy_resolve("timer_create");
+            peak_signal_policy_resolve_timer_create();
     real_mq_notify_fn =
         (int (*)(mqd_t, const struct sigevent*))
             peak_signal_policy_resolve("mq_notify");
@@ -293,6 +324,55 @@ peak_signal_policy_safe_write(void* dst, const void* src, size_t size)
 }
 
 static int
+peak_signal_policy_range_is_writable(const void* ptr, size_t size)
+{
+    if (size == 0) {
+        return 1;
+    }
+    if (ptr == NULL) {
+        return 0;
+    }
+
+    uintptr_t start = (uintptr_t)ptr;
+    uintptr_t end = start + size;
+    if (end < start) {
+        return 0;
+    }
+
+    peak_signal_policy_enter_internal();
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (fp == NULL) {
+        peak_signal_policy_leave_internal();
+        return 0;
+    }
+
+    char line[512];
+    int writable = 0;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        unsigned long long map_start = 0;
+        unsigned long long map_end = 0;
+        char perms[5] = { 0 };
+
+        if (sscanf(line,
+                   "%llx-%llx %4s",
+                   &map_start,
+                   &map_end,
+                   perms) != 3) {
+            continue;
+        }
+        if (start >= (uintptr_t)map_start &&
+            end <= (uintptr_t)map_end) {
+            writable = perms[1] == 'w';
+            break;
+        }
+    }
+
+    fclose(fp);
+    peak_signal_policy_leave_internal();
+    return writable;
+}
+
+static int
 peak_signal_policy_should_reserve_early(void)
 {
     const char* mode = getenv("PEAK_SAFE_DETACH_MODE");
@@ -392,70 +472,6 @@ peak_signal_policy_env_forces_signal(void)
 }
 
 static int
-peak_signal_policy_tid_blocks_signal(pid_t tid, int signum)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/self/task/%ld/status", (long)tid);
-
-    FILE* fp = fopen(path, "r");
-    if (fp == NULL) {
-        return errno == ENOENT || errno == ESRCH ? 0 : -1;
-    }
-
-    char line[256];
-    int blocked = -1;
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strncmp(line, "SigBlk:", 7) != 0) {
-            continue;
-        }
-
-        char* value = line + 7;
-        while (*value == ' ' || *value == '\t') {
-            value++;
-        }
-
-        errno = 0;
-        unsigned long long mask = strtoull(value, NULL, 16);
-        if (errno == 0 && signum > 0 && signum <= 64) {
-            unsigned long long bit = 1ull << (unsigned int)(signum - 1);
-            blocked = (mask & bit) != 0 ? 1 : 0;
-        }
-        break;
-    }
-    fclose(fp);
-    return blocked;
-}
-
-static int
-peak_signal_policy_signal_unblocked_in_all_threads(int signum)
-{
-    DIR* dir = opendir("/proc/self/task");
-    if (dir == NULL) {
-        return 0;
-    }
-
-    int ok = 1;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        char* end = NULL;
-        errno = 0;
-        long tid = strtol(entry->d_name, &end, 10);
-        if (errno != 0 || end == entry->d_name || *end != '\0' || tid <= 0) {
-            continue;
-        }
-
-        int blocked = peak_signal_policy_tid_blocks_signal((pid_t)tid, signum);
-        if (blocked != 0) {
-            ok = 0;
-            break;
-        }
-    }
-
-    closedir(dir);
-    return ok;
-}
-
-static int
 peak_signal_policy_signal_is_migration_candidate(int signum,
                                                  int old_signum,
                                                  const sigset_t* excluded_set)
@@ -464,8 +480,7 @@ peak_signal_policy_signal_is_migration_candidate(int signum,
            signum != SIGRTMIN &&
            signum != SIGRTMIN + 1 &&
            (excluded_set == NULL || sigismember(excluded_set, signum) != 1) &&
-           peak_signal_policy_signal_is_available(signum) &&
-           peak_signal_policy_signal_unblocked_in_all_threads(signum);
+           peak_signal_policy_signal_is_available(signum);
 }
 
 static int
@@ -614,6 +629,15 @@ peak_signal_policy_prepare_reserved_set_for_user(const sigset_t* set,
         peak_signal_policy_is_internal()) {
         return 1;
     }
+    if (set == NULL) {
+        return 1;
+    }
+
+    sigset_t set_copy;
+    if (!peak_signal_policy_safe_read(&set_copy, set, sizeof(set_copy))) {
+        errno = EFAULT;
+        return 0;
+    }
 
     if (pthread_mutex_lock(&migration_mutex) != 0) {
         errno = EINVAL;
@@ -622,12 +646,14 @@ peak_signal_policy_prepare_reserved_set_for_user(const sigset_t* set,
 
     int signum = atomic_load_explicit(&reserved_signal,
                                       memory_order_acquire);
-    if (signum <= 0 || set == NULL || sigismember(set, signum) != 1) {
+    if (signum <= 0 || sigismember(&set_copy, signum) != 1) {
         pthread_mutex_unlock(&migration_mutex);
         return 1;
     }
 
-    if (peak_signal_policy_migrate_reserved_signal_locked(signum, set, api)) {
+    if (peak_signal_policy_migrate_reserved_signal_locked(signum,
+                                                          &set_copy,
+                                                          api)) {
         pthread_mutex_unlock(&migration_mutex);
         return 1;
     }
@@ -719,15 +745,15 @@ peak_signal_policy_prepare_event_for_user_excluding(
         return 1;
     }
 
+    if (peak_signal_policy_is_internal()) {
+        return 1;
+    }
+
     int signum = 0;
     if (!peak_signal_policy_event_signal(evp, &signum)) {
         return 1;
     }
     if (signum <= 0) {
-        return 1;
-    }
-
-    if (peak_signal_policy_is_internal()) {
         return 1;
     }
 
@@ -1423,6 +1449,10 @@ sigaction(int signum, const struct sigaction* act, struct sigaction* oldact)
         signum > 0 &&
         (signum == reserved ||
          peak_signal_policy_signal_is_transitioning(signum))) {
+        if (!peak_signal_policy_range_is_writable(oldact, sizeof(*oldact))) {
+            errno = EFAULT;
+            return -1;
+        }
         memset(oldact, 0, sizeof(*oldact));
         sigemptyset(&oldact->sa_mask);
         oldact->sa_handler = SIG_DFL;
@@ -1468,7 +1498,7 @@ pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset)
         if (!peak_signal_policy_prepare_reserved_set_for_user(
                 set,
                 "pthread_sigmask")) {
-            return EINVAL;
+            return errno != 0 ? errno : EINVAL;
         }
     }
     return real_pthread_sigmask_fn(how, set, oldset);
@@ -1506,7 +1536,7 @@ sigwait(const sigset_t* set, int* sig)
         return real_sigwait_fn(set, sig);
     }
     if (!peak_signal_policy_prepare_reserved_set_for_user(set, "sigwait")) {
-        return EINVAL;
+        return errno != 0 ? errno : EINVAL;
     }
     return real_sigwait_fn(set, sig);
 }
@@ -1619,7 +1649,12 @@ timer_create(clockid_t clockid, struct sigevent* evp, timer_t* timerid)
     if (!peak_signal_policy_prepare_event_for_user(evp, "timer_create")) {
         return -1;
     }
-    return real_timer_create_fn(clockid, evp, timerid);
+    peak_signal_policy_enter_internal();
+    int rc = real_timer_create_fn(clockid, evp, timerid);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1636,7 +1671,12 @@ mq_notify(mqd_t mqdes, const struct sigevent* sevp)
     if (!peak_signal_policy_prepare_event_for_user(sevp, "mq_notify")) {
         return -1;
     }
-    return real_mq_notify_fn(mqdes, sevp);
+    peak_signal_policy_enter_internal();
+    int rc = real_mq_notify_fn(mqdes, sevp);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1658,7 +1698,12 @@ aio_read(struct aiocb* aiocbp)
                                                    "aio_read")) {
         return -1;
     }
-    return real_aio_read_fn(aiocbp);
+    peak_signal_policy_enter_internal();
+    int rc = real_aio_read_fn(aiocbp);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1680,7 +1725,12 @@ aio_write(struct aiocb* aiocbp)
                                                    "aio_write")) {
         return -1;
     }
-    return real_aio_write_fn(aiocbp);
+    peak_signal_policy_enter_internal();
+    int rc = real_aio_write_fn(aiocbp);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1702,7 +1752,12 @@ aio_fsync(int op, struct aiocb* aiocbp)
                                                    "aio_fsync")) {
         return -1;
     }
-    return real_aio_fsync_fn(op, aiocbp);
+    peak_signal_policy_enter_internal();
+    int rc = real_aio_fsync_fn(op, aiocbp);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1753,7 +1808,12 @@ lio_listio(int mode,
             return -1;
         }
     }
-    return real_lio_listio_fn(mode, list, nent, sevp);
+    peak_signal_policy_enter_internal();
+    int rc = real_lio_listio_fn(mode, list, nent, sevp);
+    int saved_errno = errno;
+    peak_signal_policy_leave_internal();
+    errno = saved_errno;
+    return rc;
 }
 
 __attribute__((visibility("default"))) int
@@ -1931,6 +1991,20 @@ peak_signal_policy_syscall(long number,
                            long a5,
                            long a6)
 {
+    long exec_result = -1;
+
+    if (peak_exec_handle_syscall != NULL &&
+        peak_exec_handle_syscall(number,
+                                 a1,
+                                 a2,
+                                 a3,
+                                 a4,
+                                 a5,
+                                 a6,
+                                 &exec_result)) {
+        return exec_result;
+    }
+
     peak_signal_policy_ensure_real_symbols();
     if (real_syscall_fn == NULL) {
         errno = ENOSYS;

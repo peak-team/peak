@@ -26,6 +26,9 @@ add_executable(benchmark_detach_stale_threads
   ${PROJECT_SOURCE_DIR}/test/detach_runtime/test_detach_stale_threads.c
 )
 target_link_libraries(benchmark_detach_stale_threads PRIVATE Threads::Threads)
+if(DL_LIBRARY)
+  target_link_libraries(benchmark_detach_stale_threads PRIVATE ${DL_LIBRARY})
+endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
   target_link_options(benchmark_detach_stale_threads PRIVATE -Wl,--export-dynamic)
 endif()

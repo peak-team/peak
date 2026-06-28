@@ -13,6 +13,7 @@ FILE(GLOB sources_peak
     peak_jit_provider.c
     syscall_interceptor.c
     dlopen_interceptor.c
+    exec_interceptor.c
     malloc_interceptor.c
     malloc_otf2.c
 )

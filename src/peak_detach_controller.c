@@ -179,8 +179,68 @@ static void
 peak_detach_controller_raw_close(int fd)
 {
     if (fd >= 0) {
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_close)
+        long result;
+        __asm__ volatile("syscall"
+                         : "=a"(result)
+                         : "a"((long)SYS_close),
+                           "D"((long)fd)
+                         : "rcx", "r11", "memory");
+        (void)result;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_close)
+        register long x0 __asm__("x0") = (long)fd;
+        register long x8 __asm__("x8") = SYS_close;
+        __asm__ volatile("svc #0"
+                         : "+r"(x0)
+                         : "r"(x8)
+                         : "memory");
+#else
         (void)syscall(SYS_close, fd);
+#endif
     }
+}
+
+static void
+peak_detach_controller_raw_close_range(unsigned int first,
+                                       unsigned int last,
+                                       unsigned int flags)
+{
+#ifdef SYS_close_range
+#if defined(__linux__) && defined(__x86_64__)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_close_range),
+                       "D"((long)first),
+                       "S"((long)last),
+                       "d"((long)flags),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    (void)result;
+#elif defined(__linux__) && defined(__aarch64__)
+    register long x0 __asm__("x0") = (long)first;
+    register long x1 __asm__("x1") = (long)last;
+    register long x2 __asm__("x2") = (long)flags;
+    register long x8 __asm__("x8") = SYS_close_range;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+#else
+    (void)syscall(SYS_close_range, first, last, flags);
+#endif
+#else
+    (void)first;
+    (void)last;
+    (void)flags;
+#endif
 }
 
 static int
@@ -1065,15 +1125,60 @@ peak_detach_controller_child_close_inherited_fds(int protocol_fd)
         protocol_fd = PEAK_DETACH_HELPER_PROTOCOL_FD;
     }
 
-#ifdef SYS_close_range
-    (void)syscall(SYS_close_range,
-                  (unsigned int)(PEAK_DETACH_HELPER_PROTOCOL_FD + 1),
-                  ~0U,
-                  0);
-#endif
+    peak_detach_controller_raw_close_range(
+        (unsigned int)(PEAK_DETACH_HELPER_PROTOCOL_FD + 1),
+        ~0U,
+        0);
     (void)protocol_fd;
 }
 #endif
+
+static void
+peak_detach_controller_child_raw_execve(const char* path,
+                                        char* const helper_argv[],
+                                        char* const helper_env[])
+{
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_execve)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_execve),
+                       "D"((long)path),
+                       "S"((long)helper_argv),
+                       "d"((long)helper_env),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    (void)result;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_execve)
+    register long x0 __asm__("x0") = (long)path;
+    register long x1 __asm__("x1") = (long)helper_argv;
+    register long x2 __asm__("x2") = (long)helper_env;
+    register long x8 __asm__("x8") = SYS_execve;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+#elif defined(SYS_execve)
+    (void)syscall(SYS_execve, path, helper_argv, helper_env);
+#else
+    execve(path, helper_argv, helper_env);
+#endif
+}
+
+static void
+peak_detach_controller_child_exec_helper(const char* path,
+                                         char* const helper_argv[],
+                                         char* const helper_env[])
+{
+    peak_detach_controller_child_raw_execve(path, helper_argv, helper_env);
+}
 
 static void
 peak_detach_controller_close_helper(void)
@@ -1208,7 +1313,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         char* const helper_argv[] = { (char*)path, fd_arg, NULL };
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_child_close_inherited_fds(sockets[1]);
-        execve(path, helper_argv, helper_env);
+        peak_detach_controller_child_exec_helper(path, helper_argv, helper_env);
         _exit(127);
     }
 

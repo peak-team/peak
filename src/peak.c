@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"
+#include "exec_interceptor.h"
 #include "malloc_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
@@ -61,7 +63,6 @@
 #define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
-#define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -107,7 +108,6 @@ gboolean peak_memory_profile = false;
 gboolean peak_memory_track_all = false;
 #ifdef HAVE_MPI
 static int found_MPI;
-static int flag_clean_fppid = 0;
 #endif
 
 static _Atomic int peak_exit_status_known = 0;
@@ -120,6 +120,7 @@ typedef enum {
 } PeakFiniState;
 
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
+static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 
 static gboolean
 peak_env_value_truthy(const char* value)
@@ -338,12 +339,6 @@ void peak_init()
 
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
-    if (found_MPI) {
-        int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
-        if (is_parent_MPI > 0) {
-            found_MPI = 0;
-        }
-    }
 #endif
     pthread_listener_attach();
     /*
@@ -545,18 +540,10 @@ peak_fini_impl(void)
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
     if (!dlopen_shutdown_flushed) {
-    #ifdef HAVE_MPI
-        if (flag_clean_fppid) {
-            remove_ppid_file(PPID_FILE_NAME);
-        }
-    #endif
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen replacement teardown was not proven safe\n");
         return;
     }
 #ifdef HAVE_MPI
-    if (flag_clean_fppid) {
-        remove_ppid_file(PPID_FILE_NAME);
-    }
     int exit_status_known =
         atomic_load_explicit(&peak_exit_status_known, memory_order_acquire);
     int exit_status =
@@ -760,6 +747,61 @@ void peak_fini()
     }
 }
 
+PEAK_EXEC_API int
+peak_runtime_is_active_for_checkpoint(void)
+{
+    return atomic_load_explicit(&peak_runtime_active,
+                                memory_order_acquire) != 0 &&
+           atomic_load_explicit(&peak_fini_state,
+                                memory_order_acquire) == PEAK_FINI_NOT_STARTED;
+}
+
+static int
+peak_checkpoint_for_exec_impl(const char* path,
+                              char* const argv[],
+                              gboolean try_only)
+{
+    int saved_errno = errno;
+    unsigned long long checkpoint_index;
+    gboolean wrote;
+
+    (void)path;
+    (void)argv;
+
+    if (!peak_runtime_is_active_for_checkpoint()) {
+        errno = saved_errno;
+        return -1;
+    }
+
+    checkpoint_index =
+        atomic_fetch_add_explicit(&peak_exec_checkpoint_counter,
+                                  1,
+                                  memory_order_acq_rel) + 1;
+    wrote = peak_general_listener_checkpoint_for_exec(checkpoint_index,
+                                                      try_only);
+    if (wrote) {
+        errno = saved_errno;
+        return 0;
+    }
+
+    if (errno == 0 || errno == saved_errno) {
+        errno = EIO;
+    }
+    return -1;
+}
+
+PEAK_EXEC_API int
+peak_checkpoint_for_exec(const char* path, char* const argv[])
+{
+    return peak_checkpoint_for_exec_impl(path, argv, FALSE);
+}
+
+PEAK_EXEC_API int
+peak_checkpoint_for_exec_trylock(const char* path, char* const argv[])
+{
+    return peak_checkpoint_for_exec_impl(path, argv, TRUE);
+}
+
 #if defined(__APPLE__)
 __attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_init;
 __attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
@@ -869,8 +911,12 @@ void exit_interceptor_detach() {
 static int main_wrapper(int argc, char** argv, char** envp) {
     // Call peak_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
-    if (!exit_interceptor_attach()) {
-        peak_init();
+    if (exit_interceptor_attach() != 0) {
+        peak_log_warn("[peak] exit interceptor attach failed; using atexit fallback for PEAK finalization\n");
+    }
+    peak_init();
+    if (atexit(peak_fini) != 0) {
+        peak_log_warn("[peak] failed to register atexit fallback for PEAK finalization\n");
     }
 
     int ret = real_main(argc, argv, envp);

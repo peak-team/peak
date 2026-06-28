@@ -4,7 +4,11 @@ cmake_minimum_required(VERSION 3.16)
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
 
 # ----- find Python interpreter and development config used by the Makefile -----
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development)
+if(NOT Python3_Interpreter_FOUND OR NOT Python3_Development_FOUND)
+  message(STATUS "Skipping dynamic_lib tests because Python3 development files were not found")
+  return()
+endif()
 
 set(_PY_INCLUDE_FLAGS)
 foreach(_py_include_dir IN LISTS Python3_INCLUDE_DIRS)

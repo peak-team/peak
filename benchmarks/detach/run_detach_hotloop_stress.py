@@ -303,6 +303,7 @@ def run_sample(args, sample):
     trace_transition_ok = trace_transition_limits_ok(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
+    transition_skip_seen = transition_skip is not None
     calls_per_sec = float(calls_match.group(1)) if calls_match else 0.0
 
     if (completed.returncode != 0 or
@@ -315,7 +316,7 @@ def run_sample(args, sample):
             not trace_transition_ok or
             (args.require_reattach and not trace_reattached) or
             bad_output or
-            (args.fail_on_transition_skips and transition_skip)):
+            (args.fail_on_transition_skips and transition_skip_seen)):
         print(f"stress sample {sample} failed rc={completed.returncode}",
               file=sys.stderr)
         if calls_match is None:
@@ -339,7 +340,7 @@ def run_sample(args, sample):
             print("missing trace reattach success", file=sys.stderr)
         if bad_output:
             print(f"matched bad output: {bad_output.group(0)}", file=sys.stderr)
-        if args.fail_on_transition_skips and transition_skip:
+        if args.fail_on_transition_skips and transition_skip_seen:
             print(f"matched transition skip: {transition_skip.group(0)}", file=sys.stderr)
         print(output, file=sys.stderr)
         raise SystemExit(1)
@@ -347,7 +348,8 @@ def run_sample(args, sample):
     print(
         f"stress sample={sample} threads={args.threads} "
         f"calls_per_sec={calls_per_sec:.3f} detached_marker={detached} "
-        f"reattached_marker={REATTACHED_MARKER_RE.search(output) is not None}"
+        f"reattached_marker={REATTACHED_MARKER_RE.search(output) is not None} "
+        f"transition_skip={transition_skip_seen}"
     )
     return calls_per_sec
 
@@ -376,7 +378,10 @@ def main():
     parser.add_argument("--paired-targets", action="store_true")
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
-    parser.add_argument("--fail-on-transition-skips", action="store_true")
+    parser.add_argument("--fail-on-transition-skips", action="store_true",
+                        default=True)
+    parser.add_argument("--allow-transition-skips", action="store_false",
+                        dest="fail_on_transition_skips")
     parser.add_argument("--max-classify-failed", type=int, default=-1)
     parser.add_argument("--max-prepare-failed", type=int, default=-1)
     parser.add_argument("--max-gum-failed", type=int, default=-1)
