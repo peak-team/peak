@@ -136,6 +136,11 @@ def check_mpi_finalize_trampoline_default(repo_root):
             "Intel(R) MPI" in vendor and
             "Intel MPI" in vendor,
             "Intel MPI finalize guard must inspect MPI library version")
+    env_guard = extract_function(peak_source, "peak_env_looks_like_intel_mpi")
+    require("I_MPI_ROOT" in env_guard and
+            "I_MPI_FABRICS" in env_guard and
+            "I_MPI_HYDRA_BOOTSTRAP" in env_guard,
+            "Intel MPI finalize guard must inspect Intel MPI environment markers")
 
 
 def check_stop_window_trace_gating(repo_root):
