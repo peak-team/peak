@@ -243,8 +243,10 @@ Controls final MPI job output aggregation. Default: `mpi`.
   first proves every rank reached `PMPI_Finalize()` before reducing final output
   on the application-owned finalizer path. The proof is bounded and fail-closed,
   but still uses MPI progress. After proof success, the MPI reducer uses bounded
-  nonblocking collective wrappers and falls back to rank-local output if they
-  fail or time out.
+  nonblocking collective wrappers. If a payload reducer collective fails or
+  times out, PEAK treats MPI as poisoned for teardown, skips the real
+  `PMPI_Finalize()` return path, and tries the PEAK-owned socket reducer without
+  further MPI calls before falling back to rank-local output.
 - `socket`, `tcp`, or `interconnect` select the PEAK-owned TCP payload reducer.
   Unless `PEAK_MPI_FINALIZE_POLICY=report` is also set, PEAK lets the real MPI
   finalizer run immediately and performs socket aggregation later from process
@@ -265,6 +267,17 @@ diagnostics on other MPI runtimes.
 
 The old boolean `PEAK_MPI_COLLECTIVE_OUTPUT=1` is treated as aggregate-output
 enabled and maps to the MPI reducer unless `PEAK_OUTPUT_AGGREGATION` is set.
+
+**MPI aggregation controls**
+
+- `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS`: timeout for the small all-rank
+  `PMPI_Finalize()` participation proof. Default: `250`.
+- `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS`: timeout for each MPI payload reducer
+  collective after the participation proof succeeds. Default: `5000`.
+
+The payload timeout is intentionally separate from the finalize-proof timeout:
+large jobs may need longer for the final hook-stat reductions even when the
+initial all-rank proof should fail quickly on subset-rank teardown.
 
 **Socket aggregation controls**
 

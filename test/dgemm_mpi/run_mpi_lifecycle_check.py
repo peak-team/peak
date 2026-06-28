@@ -33,6 +33,10 @@ EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "subset-finalize-clean",
     "subset-finalize-clean-collective",
     "subset-finalize-handoff",
+    "finalize-clean-output-mpi-reducer-fail",
+}
+EXPECTED_TIMEOUT_MODES = EXPECTED_LAUNCHER_ABNORMAL_MODES - {
+    "finalize-clean-output-mpi-reducer-fail",
 }
 EXPECTED_NONZERO_RETURN_MODES = {
     "finalize-nonzero",
@@ -116,6 +120,7 @@ def parse_args():
             "no-finalize-collective-disabled",
             "finalize-clean",
             "finalize-clean-output-mpi",
+            "finalize-clean-output-mpi-reducer-fail",
             "finalize-clean-output-mpi-intel-default",
             "finalize-clean-output-mpi-intel-real-finalize",
             "finalize-clean-output-local",
@@ -189,6 +194,7 @@ def main():
     expected_min_stats_files = None
     expected_min_target_count = None
     expected_extra = []
+    forbidden_output = []
     done_file = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
@@ -209,6 +215,19 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         app_args.append("finalize-then-exit0")
         expected = "PMPI_Finalize was observed on every rank"
+        expected_peak_tables = 1
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-reducer-fail":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_MPI_REAL_FINALIZE"] = "1"
+        env["PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
+        env["PEAK_TEST_MPI_REDUCER_FAIL_LABEL"] = "hook-count-min"
+        app_args.append("finalize-then-exit0")
+        expected = "MPI reducer test hook forced failure for hook-count-min"
+        expected_extra.append("MPI reducer failed; trying PEAK-owned socket aggregation fallback")
+        expected_extra.append("MPI output reducer failed or timed out")
+        expected_extra.append("PEAK output reducer did not complete cleanly")
+        forbidden_output.append("PEAK output is complete; returning to real PMPI_Finalize")
         expected_peak_tables = 1
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-intel-default":
@@ -393,6 +412,9 @@ def main():
     for extra in expected_extra:
         if extra not in output:
             raise AssertionError(f"missing expected PEAK diagnostic: {extra}")
+    for forbidden in forbidden_output:
+        if forbidden in output:
+            raise AssertionError(f"unexpected PEAK diagnostic: {forbidden}")
     if args.require_pinned_finalize and "Leaving PEAK target hooks pinned" not in output:
         raise AssertionError("missing pinned-finalize diagnostic")
     for function_name in args.forbid_stats_function:
@@ -411,7 +433,7 @@ def main():
         raise AssertionError(
             "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
         )
-    if timed_out and args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES:
+    if timed_out and args.mode not in EXPECTED_TIMEOUT_MODES:
         raise AssertionError(f"{args.mode} run timed out after {args.timeout:g}s")
     if args.require_detach_trace:
         if not trace_path:

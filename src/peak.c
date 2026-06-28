@@ -607,22 +607,43 @@ peak_fini_impl(void)
     } else if (found_MPI && output_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
         g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
     }
+    gboolean used_mpi_aggregation = peak_general_listener_print(output_mode);
+    /*
+     * Keep this check adjacent to PEAK output. If the payload reducer started
+     * a nonblocking collective and then failed or timed out, the request has no
+     * portable cancellation path. From this point onward PEAK must not return
+     * to the real finalizer or issue any other MPI teardown calls.
+     */
+    int mpi_reducer_failed_closed =
+        found_MPI && peak_general_listener_mpi_reducer_failed_closed();
+    if (mpi_reducer_failed_closed) {
+        peak_mpi_mark_collectives_fail_closed();
+        use_mpi_collective_output = 0;
+        allow_real_mpi_finalize = 0;
+        if (mpi_log_rank) {
+            g_printerr("[peak] MPI output reducer failed or timed out; skipping real PMPI_Finalize and avoiding further MPI teardown calls\n");
+        }
+    }
     if (found_MPI && mpi_finalize_path) {
         mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
         if (mpi_log_rank) {
             if (allow_real_mpi_finalize) {
                 peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
+            } else if (mpi_reducer_failed_closed) {
+                g_printerr("[peak] PEAK output reducer did not complete cleanly; skipping real PMPI_Finalize\n");
+            } else if (!base_real_mpi_finalize_allowed) {
+                g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
             } else if (!real_mpi_finalize_default_allowed) {
                 g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize for this MPI runtime unless PEAK_MPI_REAL_FINALIZE=1 is set\n");
             } else {
-                g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
+                g_printerr("[peak] Real PMPI_Finalize is disabled by policy; skipping real MPI finalizer\n");
             }
         }
     }
-    gboolean used_mpi_aggregation = peak_general_listener_print(output_mode);
     #ifdef HAVE_CUDA
         cuda_interceptor_print(use_mpi_collective_output &&
-                               used_mpi_aggregation);
+                               used_mpi_aggregation &&
+                               !mpi_reducer_failed_closed);
         if (!mpi_finalize_path) {
             cuda_interceptor_dettach();
         }
