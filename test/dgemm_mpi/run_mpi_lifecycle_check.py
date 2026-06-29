@@ -33,9 +33,11 @@ EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "subset-finalize-clean",
     "subset-finalize-clean-collective",
     "subset-finalize-handoff",
+    "exec-success-rank0",
     "finalize-clean-output-mpi-reducer-fail",
 }
 EXPECTED_TIMEOUT_MODES = EXPECTED_LAUNCHER_ABNORMAL_MODES - {
+    "exec-success-rank0",
     "finalize-clean-output-mpi-reducer-fail",
 }
 EXPECTED_NONZERO_RETURN_MODES = {

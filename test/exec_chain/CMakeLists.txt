@@ -128,6 +128,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         clone_vfork_parent_exec_after_child
         clone_vm_execve_custom_env_injection
         clone_vm_exec_failure_trace
+        clone_private_exec_failure_trace
         clone_private_child_work_exec_checkpoint
         execvp_path_search
         execvp_empty_path_component

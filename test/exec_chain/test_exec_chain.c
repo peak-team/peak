@@ -2108,6 +2108,25 @@ clone_exec_failure_child(void* arg)
 }
 
 static int
+clone_private_exec_failure_child(void* arg)
+{
+    (void)arg;
+    char* const argv[] = {(char*)"/definitely/not/found", NULL};
+
+    call_hot_target(5);
+    errno = 0;
+    int result = execv("/definitely/not/found", argv);
+    int saved_errno = errno;
+    if (result != -1 || saved_errno != ENOENT) {
+        _exit(216);
+    }
+    call_hot_target(4);
+    printf("clone_private_exec_failure_errno=2 continued sink=%lu\n",
+           peak_exec_chain_sink);
+    exit(0);
+}
+
+static int
 clone_vm_exec_failure_child(void* arg)
 {
     (void)arg;
@@ -2329,6 +2348,34 @@ run_clone_vfork_exec_failure_trace(void)
         perror("clone-exec-failure-trace");
         free(stack);
         return 185;
+    }
+
+    result = wait_for_spawned_child(pid);
+    free(stack);
+    return result;
+}
+
+static int
+run_clone_private_exec_failure_trace(void)
+{
+    enum { STACK_SIZE = 1024 * 1024 };
+    void* stack = malloc(STACK_SIZE);
+    void* stack_top;
+    pid_t pid;
+    int result;
+
+    if (stack == NULL) {
+        perror("malloc");
+        return 216;
+    }
+
+    call_hot_target(2);
+    stack_top = (char*)stack + STACK_SIZE;
+    pid = clone(clone_private_exec_failure_child, stack_top, SIGCHLD, NULL);
+    if (pid < 0) {
+        perror("clone-private-exec-failure-trace");
+        free(stack);
+        return 217;
     }
 
     result = wait_for_spawned_child(pid);
@@ -3206,6 +3253,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "clone-vfork-exec-failure-trace") == 0) {
         return run_clone_vfork_exec_failure_trace();
+    }
+    if (strcmp(argv[1], "clone-private-exec-failure-trace") == 0) {
+        return run_clone_private_exec_failure_trace();
     }
     if (strcmp(argv[1], "clone-vm-exec-failure-trace") == 0) {
         return run_clone_vm_exec_failure_trace();

@@ -6,6 +6,7 @@ import errno
 import fcntl
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -125,6 +126,7 @@ MODE_TO_APP_ARG = {
     "clone_vfork_large_peak_target_file_env_injection": "clone-vfork-large-peak-env",
     "clone_vfork_huge_peak_env_injection": "clone-vfork-huge-peak-env",
     "clone_vfork_overflow_peak_env_injection": "clone-vfork-overflow-peak-env",
+    "clone_private_exec_failure_trace": "clone-private-exec-failure-trace",
     "clone_vm_exec_failure_trace": "clone-vm-exec-failure-trace",
     "clone_vfork_exec_failure_trace": "clone-vfork-exec-failure-trace",
     "clone_vfork_exec_trace_fifo_path_nonblocking": (
@@ -320,6 +322,7 @@ FAILED_EXEC_MODES = {
     "vfork_exec_trace_fifo_path_nonblocking",
     "vfork_exec_trace_locked_path_nonblocking",
     "clone_vm_exec_failure_trace",
+    "clone_private_exec_failure_trace",
     "clone_vfork_exec_failure_trace",
     "clone_vfork_exec_trace_fifo_path_nonblocking",
     "clone_vfork_exec_trace_locked_path_nonblocking",
@@ -343,6 +346,7 @@ FAILED_EXEC_ENOENT_MODES = {
     "vfork_exec_trace_fifo_path_nonblocking",
     "vfork_exec_trace_locked_path_nonblocking",
     "clone_vm_exec_failure_trace",
+    "clone_private_exec_failure_trace",
     "clone_vfork_exec_failure_trace",
     "clone_vfork_exec_trace_fifo_path_nonblocking",
     "clone_vfork_exec_trace_locked_path_nonblocking",
@@ -492,6 +496,13 @@ def parse_args():
 
 def merge_preload(libpeak, old):
     return libpeak if not old else f"{libpeak}:{old}"
+
+
+def terminate_process_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
 
 
 def run_fixture(args, tmpdir):
@@ -645,16 +656,43 @@ def run_fixture(args, tmpdir):
         env["PEAK_EXEC_TRACE_PATH"] = str(locked_trace_path)
 
     try:
-        proc = subprocess.run(
-            [args.exe, MODE_TO_APP_ARG[args.mode]],
+        command = [args.exe, MODE_TO_APP_ARG[args.mode]]
+        proc = subprocess.Popen(
+            command,
             cwd=tmpdir,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=fixture_timeout,
-            check=False,
+            start_new_session=True,
         )
+        try:
+            output, _ = proc.communicate(timeout=fixture_timeout)
+            result = subprocess.CompletedProcess(
+                command,
+                proc.returncode,
+                stdout=output or "",
+                stderr=None,
+            )
+            result.timed_out = False
+            result.timeout = fixture_timeout
+            return result
+        except subprocess.TimeoutExpired:
+            terminate_process_group(proc, signal.SIGTERM)
+            try:
+                output, _ = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                terminate_process_group(proc, signal.SIGKILL)
+                output, _ = proc.communicate()
+            result = subprocess.CompletedProcess(
+                command,
+                proc.returncode,
+                stdout=output or "",
+                stderr=None,
+            )
+            result.timed_out = True
+            result.timeout = fixture_timeout
+            return result
     finally:
         if locked_trace is not None:
             fcntl.flock(locked_trace.fileno(), fcntl.LOCK_UN)
@@ -791,6 +829,11 @@ def dump_failure_artifacts(tmpdir):
 
 def check_mode(args, proc, tmpdir):
     output = proc.stdout
+    if getattr(proc, "timed_out", False):
+        raise AssertionError(
+            f"fixture timed out after {proc.timeout:g}s\n{output}"
+        )
+
     if args.mode == "execvp_enoexec_fallback":
         require(proc.returncode == 37,
                 f"ENOEXEC shell fallback returned {proc.returncode}\n{output}")
@@ -956,6 +999,17 @@ def check_mode(args, proc, tmpdir):
         require(exec_files, "missing syscall-clone failed-exec checkpoint CSV")
         require(target_count(exec_files) >= 5,
                 "syscall-clone failed-exec checkpoint missed target calls")
+
+    if args.mode == "clone_private_exec_failure_trace":
+        require("clone_private_exec_failure_errno=2" in output,
+                f"missing private-clone exec failure marker\n{output}")
+        require(exec_files, "missing private-clone failed-exec checkpoint CSV")
+        require(target_count(exec_files) >= 7,
+                "private-clone failed-exec checkpoint missed target calls")
+        require(final_files,
+                "missing private-clone final CSV after failed exec")
+        require(target_count(final_files) >= 4,
+                "private-clone final CSV missed calls after failed exec")
 
     if args.mode in {"vfork_exec_failure_trace",
                      "vfork_exec_trace_fifo_path_nonblocking",
