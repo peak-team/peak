@@ -1993,7 +1993,8 @@ peak_signal_policy_syscall(long number,
 {
     long exec_result = -1;
 
-    if (peak_exec_handle_syscall != NULL &&
+    if (peak_signal_policy_enabled_for_process() &&
+        peak_exec_handle_syscall != NULL &&
         peak_exec_handle_syscall(number,
                                  a1,
                                  a2,
