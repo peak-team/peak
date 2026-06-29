@@ -309,12 +309,12 @@ def check_global_detach_overhead_selection(repo_root):
             "calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS" in global_detach and
             "continue;" in global_detach,
             "global detach must not enqueue one-shot/cold targets")
-    require("ratio_snapshot[i] <= global_target_ratio" in global_detach and
+    require("ratio_snapshot[i] <= target_profile_ratio" in global_detach and
             "continue;" in global_detach,
-            "global detach must not enqueue below-global-threshold targets")
-    require("entries[k].ratio <= global_target_ratio" in global_detach and
+            "global detach candidates must satisfy the per-target threshold")
+    require("entries[k].ratio <= target_profile_ratio" in global_detach and
             "break;" in global_detach,
-            "global detach loop must fail closed if a below-threshold candidate appears")
+            "global detach loop must fail closed if a below-per-target-threshold candidate appears")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
             "global detach comparator must prioritize ratio before rate")
     initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")

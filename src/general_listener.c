@@ -3464,7 +3464,7 @@ void* peak_heartbeat_monitor(void* arg) {
                     if (!(hook_address[i] && array_listener[i])) continue;
                     if (peak_detached[i]) continue;
                     if (calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS) continue;
-                    if (ratio_snapshot[i] <= global_target_ratio) continue;
+                    if (ratio_snapshot[i] <= target_profile_ratio) continue;
 
                     entries[n_attached].index = i;
                     entries[n_attached].ratio = ratio_snapshot[i];
@@ -3485,7 +3485,7 @@ void* peak_heartbeat_monitor(void* arg) {
 
                     if (!(hook_address[idx] && array_listener[idx])) continue;
                     if (peak_detached[idx]) continue;
-                    if (entries[k].ratio <= global_target_ratio) break;
+                    if (entries[k].ratio <= target_profile_ratio) break;
 
                     reduced -= entries[k].ratio;
                     wake_controller |=
