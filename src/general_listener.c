@@ -115,6 +115,7 @@ _Atomic gboolean heartbeat_running = true;
 static pthread_t general_controller_thread;
 static pthread_mutex_t general_controller_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t general_controller_wake_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t general_listener_atfork_once = PTHREAD_ONCE_INIT;
 static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
 static pthread_t general_controller_owner_thread;
@@ -151,6 +152,31 @@ static gboolean peak_dynamic_attach_needed = FALSE;
 static char peak_exec_checkpoint_base[PATH_MAX] = "./peak_statslog";
 static gboolean peak_exec_checkpoint_base_overlong = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
+
+void
+peak_general_listener_after_fork_child(void)
+{
+    /*
+     * A fork child inherits only the calling thread. Reset controller locks and
+     * thread bookkeeping so a failed exec can continue to profile and finalize
+     * without joining or waiting on vanished parent threads.
+     */
+    pthread_mutex_init(&lock, NULL);
+    pthread_mutex_init(&general_controller_wake_mutex, NULL);
+    pthread_cond_init(&general_controller_wake_cond, NULL);
+    general_controller_running = FALSE;
+    general_controller_thread_started = FALSE;
+    atomic_store(&general_controller_owner_known, FALSE);
+    atomic_store(&peak_general_callbacks_suspended, FALSE);
+    atomic_store(&peak_general_mpi_finalize_requested, FALSE);
+    pthread_listener_atfork_child();
+}
+
+static void
+peak_general_listener_register_atfork(void)
+{
+    (void)pthread_atfork(NULL, NULL, peak_general_listener_after_fork_child);
+}
 
 static gboolean
 peak_general_listener_parse_detach_count_override(gulong* count_out)
@@ -4133,6 +4159,8 @@ static void peak_build_symbol_map_once(size_t first_target_index) {
 
 void peak_general_listener_attach()
 {
+    (void)pthread_once(&general_listener_atfork_once,
+                       peak_general_listener_register_atfork);
     const char* statslog_path = getenv("PEAK_STATSLOG_PATH");
     const char* checkpoint_base =
         (statslog_path != NULL && statslog_path[0] != '\0') ?
@@ -7119,7 +7147,6 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
         gum_interceptor_unignore_current_thread(interceptor);
     }
 
-    peak_general_listener_free_demangled_strings();
     return used_mpi_aggregation;
 }
 
@@ -7227,6 +7254,7 @@ gboolean peak_general_listener_dettach()
             g_object_unref(array_listener[i]);
         }
     }
+    peak_general_listener_free_demangled_strings();
     g_object_unref(interceptor);
     g_free(hook_address);
     g_free(array_listener_detached);

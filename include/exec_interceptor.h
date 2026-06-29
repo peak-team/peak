@@ -44,6 +44,16 @@ PEAK_EXEC_API int peak_checkpoint_for_exec_trylock(const char* path,
                                                    char* const argv[]);
 
 /**
+ * @brief Internal hook for raw fork/clone syscall children.
+ *
+ * libc fork() runs pthread_atfork handlers, but user code can call raw fork or
+ * clone syscalls through PEAK's syscall bridge. The bridge calls this helper in
+ * the child so failed exec recovery does not inherit stale parent threads,
+ * controller state, or locked checkpoint mutexes.
+ */
+void peak_runtime_after_fork_child(void);
+
+/**
  * @brief Internal raw-syscall bridge shared by exec and checkpoint paths.
  *
  * This bypasses PEAK's syscall interposer when a platform-specific fallback is

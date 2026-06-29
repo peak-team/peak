@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -121,6 +122,38 @@ typedef enum {
 
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
+static pthread_once_t peak_runtime_atfork_once = PTHREAD_ONCE_INIT;
+
+static void
+peak_runtime_atfork_child(void)
+{
+    if (atomic_load_explicit(&peak_fini_state, memory_order_acquire) ==
+        PEAK_FINI_IN_PROGRESS) {
+        atomic_store_explicit(&peak_fini_state,
+                              PEAK_FINI_NOT_STARTED,
+                              memory_order_release);
+    }
+
+    /*
+     * The heartbeat thread does not survive fork. Disable heartbeat teardown in
+     * the child so a failed exec can keep running and later exit cleanly.
+     */
+    heartbeat_time = 0;
+    atomic_store_explicit(&heartbeat_running, false, memory_order_release);
+}
+
+void
+peak_runtime_after_fork_child(void)
+{
+    peak_runtime_atfork_child();
+    peak_general_listener_after_fork_child();
+}
+
+static void
+peak_runtime_register_atfork(void)
+{
+    (void)pthread_atfork(NULL, NULL, peak_runtime_atfork_child);
+}
 
 static gboolean
 peak_env_value_truthy(const char* value)
@@ -333,6 +366,8 @@ void peak_init()
     if (!has_requested_work) {
         return;
     }
+    (void)pthread_once(&peak_runtime_atfork_once,
+                       peak_runtime_register_atfork);
     atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
 
     //gum_init_embedded();

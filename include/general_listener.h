@@ -124,6 +124,11 @@ gboolean peak_general_listener_checkpoint_for_exec(
     gboolean try_only);
 
 /**
+ * @brief Reset general-listener process-local state after fork in a child.
+ */
+void peak_general_listener_after_fork_child(void);
+
+/**
  * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
  *
  * A TRUE result means an MPI output reducer collective failed or timed out after

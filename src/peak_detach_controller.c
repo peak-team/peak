@@ -244,6 +244,81 @@ peak_detach_controller_raw_close_range(unsigned int first,
 }
 
 static int
+peak_detach_controller_raw_open_devnull(void)
+{
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_openat)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_openat),
+                       "D"((long)AT_FDCWD),
+                       "S"((long)"/dev/null"),
+                       "d"((long)O_RDWR),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    return result >= 0 ? (int)result : -1;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_openat)
+    register long x0 __asm__("x0") = (long)AT_FDCWD;
+    register long x1 __asm__("x1") = (long)"/dev/null";
+    register long x2 __asm__("x2") = (long)O_RDWR;
+    register long x3 __asm__("x3") = 0;
+    register long x8 __asm__("x8") = SYS_openat;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                     : "memory");
+    return x0 >= 0 ? (int)x0 : -1;
+#else
+    return open("/dev/null", O_RDWR);
+#endif
+}
+
+static void
+peak_detach_controller_raw_dup2_or_exit(int oldfd, int newfd)
+{
+    if (oldfd == newfd) {
+        return;
+    }
+
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_dup2)
+    long result;
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_dup2),
+                       "D"((long)oldfd),
+                       "S"((long)newfd)
+                     : "rcx", "r11", "memory");
+    if (result < 0) {
+        _exit(127);
+    }
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_dup3)
+    register long x0 __asm__("x0") = (long)oldfd;
+    register long x1 __asm__("x1") = (long)newfd;
+    register long x2 __asm__("x2") = 0;
+    register long x8 __asm__("x8") = SYS_dup3;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+    if (x0 < 0) {
+        _exit(127);
+    }
+#else
+    if (dup2(oldfd, newfd) < 0) {
+        _exit(127);
+    }
+#endif
+}
+
+static int
 peak_detach_controller_signal_backend_signum_load(void)
 {
     return atomic_load_explicit(&signal_backend_signum, memory_order_acquire);
@@ -1118,11 +1193,26 @@ static void
 peak_detach_controller_child_close_inherited_fds(int protocol_fd)
 {
     if (protocol_fd != PEAK_DETACH_HELPER_PROTOCOL_FD) {
-        if (dup2(protocol_fd, PEAK_DETACH_HELPER_PROTOCOL_FD) < 0) {
-            _exit(127);
-        }
+        peak_detach_controller_raw_dup2_or_exit(
+            protocol_fd,
+            PEAK_DETACH_HELPER_PROTOCOL_FD);
         peak_detach_controller_raw_close(protocol_fd);
         protocol_fd = PEAK_DETACH_HELPER_PROTOCOL_FD;
+    }
+
+    int devnull_fd = peak_detach_controller_raw_open_devnull();
+    if (devnull_fd >= 0) {
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDIN_FILENO);
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDOUT_FILENO);
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDERR_FILENO);
+        if (devnull_fd > STDERR_FILENO &&
+            devnull_fd != PEAK_DETACH_HELPER_PROTOCOL_FD) {
+            peak_detach_controller_raw_close(devnull_fd);
+        }
+    } else {
+        peak_detach_controller_raw_close(STDIN_FILENO);
+        peak_detach_controller_raw_close(STDOUT_FILENO);
+        peak_detach_controller_raw_close(STDERR_FILENO);
     }
 
     peak_detach_controller_raw_close_range(

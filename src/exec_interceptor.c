@@ -1766,6 +1766,13 @@ peak_exec_mark_after_fork_child(void)
     peak_exec_safe_child_pid = getpid();
 }
 
+static void
+peak_exec_note_syscall_fork_child(void)
+{
+    peak_exec_mark_after_fork_child();
+    peak_runtime_after_fork_child();
+}
+
 static int
 peak_exec_in_fork_like_child(void)
 {
@@ -2388,7 +2395,7 @@ peak_clone_start_trampoline(void* arg)
     int (*fn)(void*) = start->fn;
     void* user_arg = start->arg;
 
-    peak_exec_mark_after_fork_child();
+    peak_exec_note_syscall_fork_child();
     return fn(user_arg);
 }
 
@@ -2750,10 +2757,11 @@ peak_exec_env_to_use(PeakExecEnv* built_env, char* const original_envp[])
 }
 
 static int
-peak_execve_prepared(const char* path,
-                     char* const argv[],
-                     char* const envp[],
-                     const char* trace_path)
+peak_execve_prepared_checked(const char* path,
+                             char* const argv[],
+                             char* const envp[],
+                             const char* trace_path,
+                             int args_prevalidated)
 {
     PeakExecEnv built_env;
     PeakExecAttempt attempt;
@@ -2765,7 +2773,8 @@ peak_execve_prepared(const char* path,
     if (use_wrapper_depth && peak_exec_wrapper_depth > 0) {
         return peak_call_execve_raw(path, argv, envp);
     }
-    if (peak_exec_syscall_args_readable(path, argv, envp) != 0) {
+    if (!args_prevalidated &&
+        peak_exec_syscall_args_readable(path, argv, envp) != 0) {
 #if defined(__linux__) && defined(SYS_execve)
         saved_errno = errno;
         if (peak_exec_preflight_error_is_conclusive(saved_errno)) {
@@ -2828,6 +2837,15 @@ peak_execve_prepared(const char* path,
     }
     errno = saved_errno;
     return -1;
+}
+
+static int
+peak_execve_prepared(const char* path,
+                     char* const argv[],
+                     char* const envp[],
+                     const char* trace_path)
+{
+    return peak_execve_prepared_checked(path, argv, envp, trace_path, 0);
 }
 
 static char**
@@ -3812,12 +3830,14 @@ peak_real_execveat(void)
     return fn;
 }
 
-__attribute__((visibility("default"))) int
-execveat(int dirfd,
-         const char* pathname,
-         char* const argv[],
-         char* const envp[],
-         int flags)
+static int
+peak_execveat_prepared_checked(int dirfd,
+                               const char* pathname,
+                               char* const argv[],
+                               char* const envp[],
+                               int flags,
+                               const char* trace_path,
+                               int args_prevalidated)
 {
     peak_execveat_fn fn;
     PeakExecEnv built_env;
@@ -3847,7 +3867,8 @@ execveat(int dirfd,
         return -1;
 #endif
     }
-    if (peak_exec_syscall_args_readable(pathname, argv, envp) != 0) {
+    if (!args_prevalidated &&
+        peak_exec_syscall_args_readable(pathname, argv, envp) != 0) {
         int preflight_errno = errno;
 #if defined(SYS_execveat)
         if (peak_exec_preflight_error_is_conclusive(preflight_errno)) {
@@ -3895,7 +3916,7 @@ execveat(int dirfd,
         peak_exec_wrapper_depth++;
     }
     fn = use_wrapper_depth ? peak_real_execveat() : NULL;
-    if (peak_exec_prepare_checked(pathname,
+    if (peak_exec_prepare_checked(trace_path,
                                   argv,
                                   envp,
                                   &built_env,
@@ -3937,6 +3958,22 @@ execveat(int dirfd,
     }
     errno = saved_errno;
     return -1;
+}
+
+__attribute__((visibility("default"))) int
+execveat(int dirfd,
+         const char* pathname,
+         char* const argv[],
+         char* const envp[],
+         int flags)
+{
+    return peak_execveat_prepared_checked(dirfd,
+                                          pathname,
+                                          argv,
+                                          envp,
+                                          flags,
+                                          pathname,
+                                          0);
 }
 #endif
 
@@ -3986,10 +4023,12 @@ peak_exec_handle_syscall(long number,
                     errno = saved_errno;
                 }
             } else {
-                *result_out = (long)peak_execve_prepared((const char*)a1,
-                                                         (char* const*)a2,
-                                                         (char* const*)a3,
-                                                         (const char*)a1);
+                *result_out = (long)peak_execve_prepared_checked(
+                    (const char*)a1,
+                    (char* const*)a2,
+                    (char* const*)a3,
+                    (const char*)a1,
+                    1);
             }
         }
         return 1;
@@ -4007,7 +4046,7 @@ peak_exec_handle_syscall(long number,
                                                  0,
                                                  0);
             if (result == 0) {
-                peak_exec_mark_after_fork_child();
+                peak_exec_note_syscall_fork_child();
             }
             *result_out = result;
         }
@@ -4028,11 +4067,11 @@ peak_exec_handle_syscall(long number,
                                                  0);
 #if defined(CLONE_VM)
             if (result == 0 && (flags & CLONE_VM) == 0) {
-                peak_exec_mark_after_fork_child();
+                peak_exec_note_syscall_fork_child();
             }
 #else
             if (result == 0) {
-                peak_exec_mark_after_fork_child();
+                peak_exec_note_syscall_fork_child();
             }
 #endif
             *result_out = result;
@@ -4057,11 +4096,11 @@ peak_exec_handle_syscall(long number,
             if (result == 0) {
 #if defined(CLONE_VM)
                 if (flags_known && (flags & CLONE_VM) == 0) {
-                    peak_exec_mark_after_fork_child();
+                    peak_exec_note_syscall_fork_child();
                 }
 #else
                 if (flags_known) {
-                    peak_exec_mark_after_fork_child();
+                    peak_exec_note_syscall_fork_child();
                 }
 #endif
             }
@@ -4116,11 +4155,14 @@ peak_exec_handle_syscall(long number,
                     errno = saved_errno;
                 }
             } else {
-                *result_out = (long)execveat((int)a1,
-                                             (const char*)a2,
-                                             (char* const*)a3,
-                                             (char* const*)a4,
-                                             (int)a5);
+                *result_out = (long)peak_execveat_prepared_checked(
+                    (int)a1,
+                    (const char*)a2,
+                    (char* const*)a3,
+                    (char* const*)a4,
+                    (int)a5,
+                    (const char*)a2,
+                    1);
             }
         }
         return 1;
