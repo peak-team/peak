@@ -4096,10 +4096,13 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                  held_mutation.instruction_count,
                                                  held_mutation.instructions,
                                                  &status)) {
-        if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-            peak_detach_controller_signal_release_or_fatal("signal evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("evacuate abort",
+                                                     resume_status);
         }
+        peak_detach_controller_note_stop_window_finished();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4535,10 +4538,13 @@ peak_detach_controller_prepare_hook_mutation_batch(
                                                  aggregate.instruction_count,
                                                  aggregate.instructions,
                                                  &status)) {
-        if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-            peak_detach_controller_signal_release_or_fatal("signal batch evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("batch evacuate abort",
+                                                     resume_status);
         }
+        peak_detach_controller_note_stop_window_finished();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
