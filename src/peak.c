@@ -149,6 +149,13 @@ peak_runtime_after_fork_child(void)
     peak_general_listener_after_fork_child();
 }
 
+void
+peak_runtime_after_raw_fork_child(void)
+{
+    peak_runtime_atfork_child();
+    peak_general_listener_after_raw_fork_child();
+}
+
 static void
 peak_runtime_register_atfork(void)
 {

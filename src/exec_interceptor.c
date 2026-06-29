@@ -161,6 +161,11 @@ static int peak_exec_peak_name_is_priority(const char* name);
 static peak_clone_fn peak_real_clone(void);
 static peak_posix_spawn_fn peak_real_posix_spawn(void);
 static peak_posix_spawnp_fn peak_real_posix_spawnp(void);
+static void peak_exec_trace_noalloc(const char* event,
+                                    const char* path,
+                                    const PeakExecAttempt* attempt,
+                                    const char* exec_result,
+                                    int exec_errno);
 
 #if defined(PEAK_EXEC_USE_LIBC_RAW_SYSCALL)
 static peak_syscall_fn
@@ -1770,7 +1775,9 @@ static void
 peak_exec_note_syscall_fork_child(void)
 {
     peak_exec_mark_after_fork_child();
-    peak_runtime_after_fork_child();
+    peak_exec_trace_noalloc("fork-child", "syscall", NULL, "", 0);
+    peak_runtime_after_raw_fork_child();
+    peak_exec_trace_noalloc("fork-child-reset", "syscall", NULL, "", 0);
 }
 
 static int

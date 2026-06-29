@@ -129,6 +129,16 @@ gboolean peak_general_listener_checkpoint_for_exec(
 void peak_general_listener_after_fork_child(void);
 
 /**
+ * @brief Minimal reset for raw fork/clone syscall children.
+ *
+ * Raw fork-like syscalls bypass pthread_atfork() ordering and may return while
+ * libc, GLib, or Gum locks inherited from vanished parent threads are in an
+ * unknown state. This marks callbacks as fork-child-minimal without touching
+ * pthread/GLib synchronization primitives.
+ */
+void peak_general_listener_after_raw_fork_child(void);
+
+/**
  * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
  *
  * A TRUE result means an MPI output reducer collective failed or timed out after

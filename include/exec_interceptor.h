@@ -54,6 +54,15 @@ PEAK_EXEC_API int peak_checkpoint_for_exec_trylock(const char* path,
 void peak_runtime_after_fork_child(void);
 
 /**
+ * @brief Minimal runtime reset for raw fork/clone syscall children.
+ *
+ * Raw syscall children do not run pthread_atfork handlers. This path avoids
+ * pthread/GLib reinitialization and only marks PEAK state so exec wrappers and
+ * callbacks use their fork-child-safe paths.
+ */
+void peak_runtime_after_raw_fork_child(void);
+
+/**
  * @brief Internal raw-syscall bridge shared by exec and checkpoint paths.
  *
  * This bypasses PEAK's syscall interposer when a platform-specific fallback is

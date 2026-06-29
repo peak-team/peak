@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -505,6 +506,26 @@ def terminate_process_group(proc, sig):
         pass
 
 
+def process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_process_group_exit(pgid, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        if not process_group_exists(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
 def run_fixture(args, tmpdir):
     env = os.environ.copy()
     env["LD_PRELOAD"] = merge_preload(args.libpeak, env.get("LD_PRELOAD"))
@@ -657,42 +678,56 @@ def run_fixture(args, tmpdir):
 
     try:
         command = [args.exe, MODE_TO_APP_ARG[args.mode]]
-        proc = subprocess.Popen(
-            command,
-            cwd=tmpdir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        try:
-            output, _ = proc.communicate(timeout=fixture_timeout)
-            result = subprocess.CompletedProcess(
+        output_path = tmpdir / "fixture-output.log"
+        with output_path.open("w", encoding="utf-8") as output_handle:
+            proc = subprocess.Popen(
                 command,
-                proc.returncode,
-                stdout=output or "",
-                stderr=None,
+                cwd=tmpdir,
+                env=env,
+                stdout=output_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
             )
-            result.timed_out = False
-            result.timeout = fixture_timeout
-            return result
-        except subprocess.TimeoutExpired:
-            terminate_process_group(proc, signal.SIGTERM)
             try:
-                output, _ = proc.communicate(timeout=2.0)
+                proc.wait(timeout=fixture_timeout)
+                result = subprocess.CompletedProcess(
+                    command,
+                    proc.returncode,
+                    stdout="",
+                    stderr=None,
+                )
+                result.timed_out = False
+                result.process_group_leaked = False
+                result.timeout = fixture_timeout
+                if not wait_process_group_exit(proc.pid, 0.25):
+                    terminate_process_group(proc, signal.SIGTERM)
+                    if not wait_process_group_exit(proc.pid, 2.0):
+                        terminate_process_group(proc, signal.SIGKILL)
+                        wait_process_group_exit(proc.pid, 1.0)
+                    result.process_group_leaked = True
             except subprocess.TimeoutExpired:
-                terminate_process_group(proc, signal.SIGKILL)
-                output, _ = proc.communicate()
-            result = subprocess.CompletedProcess(
-                command,
-                proc.returncode,
-                stdout=output or "",
-                stderr=None,
-            )
-            result.timed_out = True
-            result.timeout = fixture_timeout
-            return result
+                terminate_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    terminate_process_group(proc, signal.SIGKILL)
+                    proc.wait()
+                if process_group_exists(proc.pid):
+                    terminate_process_group(proc, signal.SIGKILL)
+                    wait_process_group_exit(proc.pid, 1.0)
+                result = subprocess.CompletedProcess(
+                    command,
+                    proc.returncode,
+                    stdout="",
+                    stderr=None,
+                )
+                result.timed_out = True
+                result.process_group_leaked = False
+                result.timeout = fixture_timeout
+        result.stdout = output_path.read_text(encoding="utf-8",
+                                              errors="replace")
+        return result
     finally:
         if locked_trace is not None:
             fcntl.flock(locked_trace.fileno(), fcntl.LOCK_UN)
@@ -832,6 +867,10 @@ def check_mode(args, proc, tmpdir):
     if getattr(proc, "timed_out", False):
         raise AssertionError(
             f"fixture timed out after {proc.timeout:g}s\n{output}"
+        )
+    if getattr(proc, "process_group_leaked", False):
+        raise AssertionError(
+            f"fixture process group remained alive after leader exit\n{output}"
         )
 
     if args.mode == "execvp_enoexec_fallback":

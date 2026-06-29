@@ -120,6 +120,7 @@ static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
 static pthread_t general_controller_owner_thread;
 static _Atomic gboolean general_controller_owner_known = FALSE;
+static _Atomic gboolean general_listener_fork_child_minimal_callbacks = FALSE;
 static gboolean gum_find_functions_matching_initialize = false;
 static GHashTable* gum_symbol_demangled_mapping;
 static GHashTable* gum_symbol_short_mapping;
@@ -166,10 +167,29 @@ peak_general_listener_after_fork_child(void)
     pthread_cond_init(&general_controller_wake_cond, NULL);
     general_controller_running = FALSE;
     general_controller_thread_started = FALSE;
+    atomic_store(&general_listener_fork_child_minimal_callbacks, TRUE);
     atomic_store(&general_controller_owner_known, FALSE);
     atomic_store(&peak_general_callbacks_suspended, FALSE);
     atomic_store(&peak_general_mpi_finalize_requested, FALSE);
     pthread_listener_atfork_child();
+}
+
+void
+peak_general_listener_after_raw_fork_child(void)
+{
+    /*
+     * Raw SYS_fork/SYS_clone children bypass pthread_atfork() and may resume
+     * from PEAK's syscall interposer while inherited pthread/GLib/Gum state is
+     * not safe to reinitialize. Keep this path to atomics and plain stores.
+     * The exec wrappers will use try-lock checkpointing, and callbacks will use
+     * the minimal fork-child accounting path.
+     */
+    general_controller_running = FALSE;
+    general_controller_thread_started = FALSE;
+    atomic_store(&general_listener_fork_child_minimal_callbacks, TRUE);
+    atomic_store(&general_controller_owner_known, FALSE);
+    atomic_store(&peak_general_callbacks_suspended, FALSE);
+    atomic_store(&peak_general_mpi_finalize_requested, FALSE);
 }
 
 static void
@@ -853,6 +873,7 @@ typedef struct _PeakInvocationData {
 } PeakInvocationData;
 
 static __thread PeakGeneralThreadState thread_data;
+static __thread int general_listener_fork_child_callback_depth;
 
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -3712,9 +3733,80 @@ peak_general_listener_exclusive_duration(gdouble total_duration,
 }
 
 static void
+peak_general_listener_on_enter_fork_child(GumInvocationListener* listener,
+                                          GumInvocationContext* ic)
+{
+    PeakInvocationData* priv =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+
+    priv->initialized = FALSE;
+    priv->stack_level = 0;
+    if (listener == NULL ||
+        atomic_load_explicit(&peak_general_callbacks_suspended,
+                             memory_order_acquire) ||
+        general_listener_fork_child_callback_depth > 0) {
+        return;
+    }
+
+    general_listener_fork_child_callback_depth++;
+    PeakGeneralListener* self = (PeakGeneralListener*)listener;
+    if (self->num_calls == NULL) {
+        general_listener_fork_child_callback_depth--;
+        return;
+    }
+    self->num_calls[0]++;
+    priv->start_time = peak_second();
+    priv->stack_level = 1;
+    priv->initialized = TRUE;
+}
+
+static void
+peak_general_listener_on_leave_fork_child(GumInvocationListener* listener,
+                                          GumInvocationContext* ic)
+{
+    PeakInvocationData* priv =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+
+    if (listener == NULL || priv == NULL || !priv->initialized) {
+        return;
+    }
+
+    double duration = peak_second() - priv->start_time;
+    PeakGeneralListener* self = (PeakGeneralListener*)listener;
+    if (self->total_time == NULL || self->exclusive_time == NULL ||
+        self->max_time == NULL || self->min_time == NULL) {
+        priv->initialized = FALSE;
+        priv->stack_level = 0;
+        if (general_listener_fork_child_callback_depth > 0) {
+            general_listener_fork_child_callback_depth--;
+        }
+        return;
+    }
+    if (duration > self->max_time[0]) {
+        self->max_time[0] = duration;
+    }
+    if (duration < self->min_time[0] || self->num_calls[0] == 1) {
+        self->min_time[0] = duration;
+    }
+    self->total_time[0] += duration;
+    self->exclusive_time[0] += duration;
+    priv->initialized = FALSE;
+    priv->stack_level = 0;
+    if (general_listener_fork_child_callback_depth > 0) {
+        general_listener_fork_child_callback_depth--;
+    }
+}
+
+static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
+    if (atomic_load_explicit(&general_listener_fork_child_minimal_callbacks,
+                             memory_order_acquire)) {
+        peak_general_listener_on_enter_fork_child(listener, ic);
+        return;
+    }
+
     if (!listener || g_object_is_floating(listener)) {
             return;
     }
@@ -3817,6 +3909,12 @@ static void
 peak_general_listener_on_leave(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
+    if (atomic_load_explicit(&general_listener_fork_child_minimal_callbacks,
+                             memory_order_acquire)) {
+        peak_general_listener_on_leave_fork_child(listener, ic);
+        return;
+    }
+
     double end_time = peak_second();
     gum_interceptor_ignore_current_thread(interceptor);
     if (peak_detach_cost == 0 && heartbeat_time == 0 &&
