@@ -179,8 +179,143 @@ static void
 peak_detach_controller_raw_close(int fd)
 {
     if (fd >= 0) {
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_close)
+        long result;
+        __asm__ volatile("syscall"
+                         : "=a"(result)
+                         : "a"((long)SYS_close),
+                           "D"((long)fd)
+                         : "rcx", "r11", "memory");
+        (void)result;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_close)
+        register long x0 __asm__("x0") = (long)fd;
+        register long x8 __asm__("x8") = SYS_close;
+        __asm__ volatile("svc #0"
+                         : "+r"(x0)
+                         : "r"(x8)
+                         : "memory");
+#else
         (void)syscall(SYS_close, fd);
+#endif
     }
+}
+
+static void
+peak_detach_controller_raw_close_range(unsigned int first,
+                                       unsigned int last,
+                                       unsigned int flags)
+{
+#ifdef SYS_close_range
+#if defined(__linux__) && defined(__x86_64__)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_close_range),
+                       "D"((long)first),
+                       "S"((long)last),
+                       "d"((long)flags),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    (void)result;
+#elif defined(__linux__) && defined(__aarch64__)
+    register long x0 __asm__("x0") = (long)first;
+    register long x1 __asm__("x1") = (long)last;
+    register long x2 __asm__("x2") = (long)flags;
+    register long x8 __asm__("x8") = SYS_close_range;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+#else
+    (void)syscall(SYS_close_range, first, last, flags);
+#endif
+#else
+    (void)first;
+    (void)last;
+    (void)flags;
+#endif
+}
+
+static int
+peak_detach_controller_raw_open_devnull(void)
+{
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_openat)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_openat),
+                       "D"((long)AT_FDCWD),
+                       "S"((long)"/dev/null"),
+                       "d"((long)O_RDWR),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    return result >= 0 ? (int)result : -1;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_openat)
+    register long x0 __asm__("x0") = (long)AT_FDCWD;
+    register long x1 __asm__("x1") = (long)"/dev/null";
+    register long x2 __asm__("x2") = (long)O_RDWR;
+    register long x3 __asm__("x3") = 0;
+    register long x8 __asm__("x8") = SYS_openat;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                     : "memory");
+    return x0 >= 0 ? (int)x0 : -1;
+#else
+    return open("/dev/null", O_RDWR);
+#endif
+}
+
+static void
+peak_detach_controller_raw_dup2_or_exit(int oldfd, int newfd)
+{
+    if (oldfd == newfd) {
+        return;
+    }
+
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_dup2)
+    long result;
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_dup2),
+                       "D"((long)oldfd),
+                       "S"((long)newfd)
+                     : "rcx", "r11", "memory");
+    if (result < 0) {
+        _exit(127);
+    }
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_dup3)
+    register long x0 __asm__("x0") = (long)oldfd;
+    register long x1 __asm__("x1") = (long)newfd;
+    register long x2 __asm__("x2") = 0;
+    register long x8 __asm__("x8") = SYS_dup3;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+    if (x0 < 0) {
+        _exit(127);
+    }
+#else
+    if (dup2(oldfd, newfd) < 0) {
+        _exit(127);
+    }
+#endif
 }
 
 static int
@@ -1058,22 +1193,82 @@ static void
 peak_detach_controller_child_close_inherited_fds(int protocol_fd)
 {
     if (protocol_fd != PEAK_DETACH_HELPER_PROTOCOL_FD) {
-        if (dup2(protocol_fd, PEAK_DETACH_HELPER_PROTOCOL_FD) < 0) {
-            _exit(127);
-        }
+        peak_detach_controller_raw_dup2_or_exit(
+            protocol_fd,
+            PEAK_DETACH_HELPER_PROTOCOL_FD);
         peak_detach_controller_raw_close(protocol_fd);
         protocol_fd = PEAK_DETACH_HELPER_PROTOCOL_FD;
     }
 
-#ifdef SYS_close_range
-    (void)syscall(SYS_close_range,
-                  (unsigned int)(PEAK_DETACH_HELPER_PROTOCOL_FD + 1),
-                  ~0U,
-                  0);
-#endif
+    int devnull_fd = peak_detach_controller_raw_open_devnull();
+    if (devnull_fd >= 0) {
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDIN_FILENO);
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDOUT_FILENO);
+        peak_detach_controller_raw_dup2_or_exit(devnull_fd, STDERR_FILENO);
+        if (devnull_fd > STDERR_FILENO &&
+            devnull_fd != PEAK_DETACH_HELPER_PROTOCOL_FD) {
+            peak_detach_controller_raw_close(devnull_fd);
+        }
+    } else {
+        peak_detach_controller_raw_close(STDIN_FILENO);
+        peak_detach_controller_raw_close(STDOUT_FILENO);
+        peak_detach_controller_raw_close(STDERR_FILENO);
+    }
+
+    peak_detach_controller_raw_close_range(
+        (unsigned int)(PEAK_DETACH_HELPER_PROTOCOL_FD + 1),
+        ~0U,
+        0);
     (void)protocol_fd;
 }
 #endif
+
+static void
+peak_detach_controller_child_raw_execve(const char* path,
+                                        char* const helper_argv[],
+                                        char* const helper_env[])
+{
+#if defined(__linux__) && defined(__x86_64__) && defined(SYS_execve)
+    long result;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    register long r9 __asm__("r9") = 0;
+
+    __asm__ volatile("syscall"
+                     : "=a"(result)
+                     : "a"((long)SYS_execve),
+                       "D"((long)path),
+                       "S"((long)helper_argv),
+                       "d"((long)helper_env),
+                       "r"(r10),
+                       "r"(r8),
+                       "r"(r9)
+                     : "rcx", "r11", "memory");
+    (void)result;
+#elif defined(__linux__) && defined(__aarch64__) && defined(SYS_execve)
+    register long x0 __asm__("x0") = (long)path;
+    register long x1 __asm__("x1") = (long)helper_argv;
+    register long x2 __asm__("x2") = (long)helper_env;
+    register long x8 __asm__("x8") = SYS_execve;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+#elif defined(SYS_execve)
+    (void)syscall(SYS_execve, path, helper_argv, helper_env);
+#else
+    execve(path, helper_argv, helper_env);
+#endif
+}
+
+static void
+peak_detach_controller_child_exec_helper(const char* path,
+                                         char* const helper_argv[],
+                                         char* const helper_env[])
+{
+    peak_detach_controller_child_raw_execve(path, helper_argv, helper_env);
+}
 
 static void
 peak_detach_controller_close_helper(void)
@@ -1208,7 +1403,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         char* const helper_argv[] = { (char*)path, fd_arg, NULL };
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_child_close_inherited_fds(sockets[1]);
-        execve(path, helper_argv, helper_env);
+        peak_detach_controller_child_exec_helper(path, helper_argv, helper_env);
         _exit(127);
     }
 
@@ -3901,10 +4096,13 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                  held_mutation.instruction_count,
                                                  held_mutation.instructions,
                                                  &status)) {
-        if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-            peak_detach_controller_signal_release_or_fatal("signal evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("evacuate abort",
+                                                     resume_status);
         }
+        peak_detach_controller_note_stop_window_finished();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4340,10 +4538,13 @@ peak_detach_controller_prepare_hook_mutation_batch(
                                                  aggregate.instruction_count,
                                                  aggregate.instructions,
                                                  &status)) {
-        if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-            peak_detach_controller_signal_release_or_fatal("signal batch evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("batch evacuate abort",
+                                                     resume_status);
         }
+        peak_detach_controller_note_stop_window_finished();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;

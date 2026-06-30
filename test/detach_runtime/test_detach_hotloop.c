@@ -420,6 +420,34 @@ required_symbol(const char* name)
     return symbol;
 }
 
+static int
+wait_for_peak_hook_count(size_t required_hooks, unsigned int timeout_ms)
+{
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    double deadline = monotonic_seconds() + ((double)timeout_ms / 1000.0);
+
+    if (hook_count == NULL) {
+        return -1;
+    }
+
+    while (monotonic_seconds() < deadline) {
+        if (*hook_count >= required_hooks) {
+            return 0;
+        }
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+
+    fprintf(stderr,
+            "timed out waiting for %zu PEAK hook(s) before starting workers "
+            "(observed=%zu)\n",
+            required_hooks,
+            *hook_count);
+    return -1;
+}
+
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 static const char*
 parse_string_arg(int argc, char** argv, const char* name)
@@ -433,6 +461,8 @@ parse_string_arg(int argc, char** argv, const char* name)
 }
 
 typedef gboolean (*PeakRequestDetachFn)(size_t hook_id);
+typedef size_t (*PeakRequestDetachBatchFn)(const size_t* hook_ids,
+                                           size_t hook_count);
 typedef gboolean (*PeakRequestReattachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
@@ -957,6 +987,46 @@ trace_has_physical_detach_success(const char* trace_path)
 
     fclose(fp);
     return 0;
+}
+
+static int
+drain_peak_detach_controller_for_trace(unsigned int timeout_ms)
+{
+    typedef int (*PeakControllerDrainFn)(unsigned int);
+    PeakControllerDrainFn drain =
+        (PeakControllerDrainFn)dlsym(RTLD_DEFAULT,
+                                     "peak_general_listener_controller_drain");
+
+    if (drain != NULL) {
+        return drain(timeout_ms);
+    }
+    return 1;
+}
+
+static void
+wait_for_peak_detach_trace_while_running(const char* trace_path,
+                                         unsigned int timeout_ms)
+{
+    double deadline = monotonic_seconds() + ((double)timeout_ms / 1000.0);
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        (void)drain_peak_detach_controller_for_trace(timeout_ms);
+        return;
+    }
+
+    while (monotonic_seconds() < deadline) {
+        (void)drain_peak_detach_controller_for_trace(50);
+        if (trace_has_physical_detach_success(trace_path)) {
+            return;
+        }
+
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+
+    (void)drain_peak_detach_controller_for_trace(250);
 }
 
 static int
@@ -2236,14 +2306,25 @@ run_signal_user_collision_check(void)
 #endif
 
 #ifdef SYS_timer_create
+    int kernel_timerid = -1;
     reserved_signum = migrated_signum;
     memset(&ev, 0, sizeof(ev));
     ev.sigev_notify = SIGEV_SIGNAL;
     ev.sigev_signo = reserved_signum;
     errno = 0;
-    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &timerid) == 0) {
-        timer_delete(timerid);
+    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &kernel_timerid) != 0) {
+        perror("syscall timer_create reserved signal migrated");
+        return 2;
     }
+#ifdef SYS_timer_delete
+    if (syscall(SYS_timer_delete, kernel_timerid) != 0) {
+        perror("syscall timer_delete after migration probe");
+        return 2;
+    }
+#else
+    fprintf(stderr, "SYS_timer_delete unavailable after raw timer_create\n");
+    return 2;
+#endif
     if (!expect_signal_migrated("syscall:timer_create",
                                 selected_signal,
                                 reserved_signum,
@@ -2258,7 +2339,16 @@ run_signal_user_collision_check(void)
     ev.sigev_notify = SIGEV_SIGNAL;
     ev.sigev_signo = reserved_signum;
     errno = 0;
-    (void)syscall(SYS_mq_notify, (mqd_t)-1, &ev);
+    long raw_mq_rc = syscall(SYS_mq_notify, (mqd_t)-1, &ev);
+    int raw_mq_errno = errno;
+    if (raw_mq_rc != -1 || raw_mq_errno != EBADF) {
+        fprintf(stderr,
+                "syscall mq_notify migration probe returned unexpected "
+                "result: rc=%ld errno=%d\n",
+                raw_mq_rc,
+                raw_mq_errno);
+        return 2;
+    }
     if (!expect_signal_migrated("syscall:mq_notify",
                                 selected_signal,
                                 reserved_signum,
@@ -2507,13 +2597,15 @@ run_signal_forced_collision_check(void)
     }
 #endif
 #ifdef SYS_timer_create
-    timer_t invalid_timerid;
+    int invalid_kernel_timerid = -1;
     errno = 0;
     if (syscall(SYS_timer_create,
                 CLOCK_MONOTONIC,
                 (void*)1,
-                &invalid_timerid) != -1) {
-        timer_delete(invalid_timerid);
+                &invalid_kernel_timerid) != -1) {
+#ifdef SYS_timer_delete
+        (void)syscall(SYS_timer_delete, invalid_kernel_timerid);
+#endif
         fprintf(stderr, "invalid raw timer_create sigevent pointer was accepted\n");
         return 2;
     }
@@ -2538,8 +2630,76 @@ run_signal_forced_collision_check(void)
         return 2;
     }
 #endif
+    int pthread_mask_rc =
+        pthread_sigmask(SIG_BLOCK, (const sigset_t*)1, NULL);
+    if (pthread_mask_rc != EFAULT) {
+        fprintf(stderr,
+                "invalid pthread_sigmask pointer returned unexpected error: %d\n",
+                pthread_mask_rc);
+        return 2;
+    }
+    errno = 0;
+    if (sigprocmask(SIG_BLOCK, (const sigset_t*)1, NULL) != -1 ||
+        errno != EFAULT) {
+        fprintf(stderr,
+                "invalid sigprocmask pointer returned unexpected errno=%d\n",
+                errno);
+        return 2;
+    }
+    errno = 0;
+    if (pselect(0,
+                NULL,
+                NULL,
+                NULL,
+                &zero_timeout,
+                (const sigset_t*)1) != -1 ||
+        errno != EFAULT) {
+        fprintf(stderr,
+                "invalid pselect sigmask pointer returned unexpected errno=%d\n",
+                errno);
+        return 2;
+    }
+    errno = 0;
+    if (ppoll(NULL, 0, &zero_timeout, (const sigset_t*)1) != -1 ||
+        errno != EFAULT) {
+        fprintf(stderr,
+                "invalid ppoll sigmask pointer returned unexpected errno=%d\n",
+                errno);
+        return 2;
+    }
+    void* readonly_action_page =
+        mmap(NULL,
+             4096,
+             PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS,
+             -1,
+             0);
+    if (readonly_action_page == MAP_FAILED) {
+        perror("mmap readonly sigaction query page");
+        return 2;
+    }
+    if (mprotect(readonly_action_page, 4096, PROT_READ) != 0) {
+        perror("mprotect readonly sigaction query page");
+        munmap(readonly_action_page, 4096);
+        return 2;
+    }
+    errno = 0;
+    if (sigaction(reserved_signum,
+                  NULL,
+                  (struct sigaction*)readonly_action_page) != -1 ||
+        errno != EFAULT) {
+        fprintf(stderr,
+                "read-only sigaction query returned unexpected errno=%d\n",
+                errno);
+        munmap(readonly_action_page, 4096);
+        return 2;
+    }
+    if (munmap(readonly_action_page, 4096) != 0) {
+        perror("munmap readonly sigaction query page");
+        return 2;
+    }
     if (selected_signal() != reserved_signum) {
-        fprintf(stderr, "invalid-pointer raw syscall probes migrated PEAK signal\n");
+        fprintf(stderr, "invalid-pointer probes migrated PEAK signal\n");
         return 2;
     }
     conflicts_before = conflict_count();
@@ -2598,6 +2758,50 @@ run_signal_forced_collision_check(void)
     memset(&forced_ev, 0, sizeof(forced_ev));
     forced_ev.sigev_notify = SIGEV_SIGNAL;
     forced_ev.sigev_signo = reserved_signum;
+    timer_t forced_timerid;
+    unsigned char forced_timerid_before[sizeof(forced_timerid)];
+    memset(&forced_timerid, 0x5a, sizeof(forced_timerid));
+    memcpy(forced_timerid_before, &forced_timerid, sizeof(forced_timerid));
+    errno = 0;
+    int forced_timer_rc =
+        timer_create(CLOCK_MONOTONIC, &forced_ev, &forced_timerid);
+    if (forced_timer_rc != -1 || errno != EINVAL ||
+        memcmp(&forced_timerid,
+               forced_timerid_before,
+               sizeof(forced_timerid)) != 0) {
+        if (forced_timer_rc == 0) {
+            timer_delete(forced_timerid);
+        }
+        fprintf(stderr,
+                "forced timer_create collision was not denied without "
+                "touching timerid: rc=%d errno=%d\n",
+                forced_timer_rc,
+                errno);
+        return 2;
+    }
+#ifdef SYS_timer_create
+    int forced_kernel_timerid = 0x5a5a5a5a;
+    errno = 0;
+    long forced_raw_timer_rc = syscall(SYS_timer_create,
+                                       CLOCK_MONOTONIC,
+                                       &forced_ev,
+                                       &forced_kernel_timerid);
+    if (forced_raw_timer_rc != -1 || errno != EINVAL ||
+        forced_kernel_timerid != 0x5a5a5a5a) {
+#ifdef SYS_timer_delete
+        if (forced_raw_timer_rc == 0) {
+            (void)syscall(SYS_timer_delete, forced_kernel_timerid);
+        }
+#endif
+        fprintf(stderr,
+                "forced raw timer_create collision was not denied without "
+                "touching timerid: rc=%ld errno=%d timerid=%d\n",
+                forced_raw_timer_rc,
+                errno,
+                forced_kernel_timerid);
+        return 2;
+    }
+#endif
     errno = 0;
     if (mq_notify((mqd_t)-1, &forced_ev) != -1 || errno != EINVAL) {
         fprintf(stderr,
@@ -3283,6 +3487,10 @@ main(int argc, char** argv)
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
     int cold_one_shot_target = has_flag_arg(argc, argv, "--cold-one-shot-target");
     int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
+    int request_detach_after_start =
+        has_flag_arg(argc, argv, "--request-detach-after-start");
+    int wait_for_hook_before_start =
+        has_flag_arg(argc, argv, "--wait-for-hook-before-start");
     int block_backend_signal =
         has_flag_arg(argc, argv, "--block-backend-signal");
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
@@ -3324,6 +3532,20 @@ main(int argc, char** argv)
     atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
     if (cold_one_shot_target) {
         peak_detach_cold_target(0xc01d);
+    }
+    if (wait_for_hook_before_start) {
+        size_t required_hooks = paired_targets ? 2 : 1;
+        if (cold_one_shot_target) {
+            required_hooks++;
+        }
+        if (wait_for_peak_hook_count(required_hooks, 5000) != 0) {
+            start_gate_destroy(&gate);
+            free(tids);
+            free(states);
+            free(spawner_tids);
+            free(spawner_states);
+            return 2;
+        }
     }
     for (long i = 0; i < threads; i++) {
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
@@ -3374,9 +3596,152 @@ main(int argc, char** argv)
             created_spawners++;
         }
     }
+    if (request_detach_after_start) {
+        PeakRequestDetachFn request_detach =
+            (PeakRequestDetachFn)required_symbol(
+                "peak_general_listener_request_detach");
+        PeakRequestDetachBatchFn request_detach_batch =
+            (PeakRequestDetachBatchFn)required_symbol(
+                "peak_general_listener_request_detach_batch");
+        PeakHookStateFn hook_state =
+            (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+        size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+        const size_t required_requests = paired_targets ? 2 : 1;
+        const size_t requested_hook_ids[2] = {0, 1};
+        int detach_observed = 0;
+        int request_attempted = 0;
+        size_t last_attached = 0;
+        size_t last_requested = 0;
+        size_t last_detaching = 0;
+        size_t last_detached = 0;
+        size_t last_other = 0;
+        double request_deadline = monotonic_seconds() + 5.0;
+        const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+
+        while (request_detach != NULL && hook_state != NULL &&
+               request_detach_batch != NULL && hook_count != NULL &&
+               monotonic_seconds() < request_deadline) {
+            if (trace_has_physical_detach_success(trace_path)) {
+                detach_observed = 1;
+                break;
+            }
+            if (*hook_count < required_requests) {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = 20 * 1000 * 1000;
+                nanosleep(&ts, NULL);
+                continue;
+            }
+
+            size_t attached = 0;
+            size_t requested = 0;
+            size_t detaching = 0;
+            size_t detached = 0;
+            size_t other = 0;
+            for (size_t hook_id = 0; hook_id < required_requests; hook_id++) {
+                PeakHookState state = hook_state(hook_id);
+
+                switch (state) {
+                    case PEAK_HOOK_ATTACHED:
+                        attached++;
+                        break;
+                    case PEAK_HOOK_DETACH_REQUESTED:
+                        requested++;
+                        break;
+                    case PEAK_HOOK_DETACHING:
+                        detaching++;
+                        break;
+                    case PEAK_HOOK_DETACHED:
+                        detached++;
+                        break;
+                    default:
+                        other++;
+                        break;
+                }
+            }
+            last_attached = attached;
+            last_requested = requested;
+            last_detaching = detaching;
+            last_detached = detached;
+            last_other = other;
+
+            if ((trace_path == NULL || trace_path[0] == '\0') &&
+                detached >= required_requests) {
+                detach_observed = 1;
+                break;
+            }
+
+            if (other != 0) {
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = 20 * 1000 * 1000;
+                nanosleep(&ts, NULL);
+                continue;
+            }
+
+            if (attached + requested > 0) {
+                size_t accepted =
+                    paired_targets
+                        ? request_detach_batch(requested_hook_ids,
+                                               required_requests)
+                        : (request_detach(0) ? 1 : 0);
+                if (accepted > 0) {
+                    request_attempted = 1;
+                }
+            }
+
+            (void)drain_peak_detach_controller_for_trace(50);
+            if (trace_has_physical_detach_success(trace_path)) {
+                detach_observed = 1;
+                break;
+            }
+            if ((trace_path == NULL || trace_path[0] == '\0') &&
+                detached >= required_requests) {
+                detach_observed = 1;
+                break;
+            }
+
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 20 * 1000 * 1000;
+            nanosleep(&ts, NULL);
+        }
+
+        if (!detach_observed) {
+            fprintf(stderr,
+                    "failed to observe physical detach after workers started "
+                    "(attempted=%d hook_count=%zu required=%zu attached=%zu "
+                    "requested=%zu detaching=%zu detached=%zu other=%zu)\n",
+                    request_attempted,
+                    hook_count != NULL ? *hook_count : 0,
+                    required_requests,
+                    last_attached,
+                    last_requested,
+                    last_detaching,
+                    last_detached,
+                    last_other);
+            atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+            for (long j = 0; j < created_spawners; j++) {
+                pthread_join(spawner_tids[j], NULL);
+            }
+            for (long j = 0; j < created_threads; j++) {
+                pthread_join(tids[j], NULL);
+            }
+            start_gate_destroy(&gate);
+            free(tids);
+            free(states);
+            free(spawner_tids);
+            free(spawner_states);
+            return 2;
+        }
+    }
 
     double start = monotonic_seconds();
     sleep_for_seconds(seconds);
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    wait_for_peak_detach_trace_while_running(getenv("PEAK_DETACH_TRACE_PATH"),
+                                             5000);
+#endif
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
 
     for (long i = 0; i < created_spawners; i++) {

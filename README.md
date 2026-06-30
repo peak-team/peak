@@ -197,6 +197,78 @@ Python, Lua, Perl, and Tcl to initialize PEAK. By default PEAK skips these
 processes under `LD_PRELOAD` so module-system helpers and small launcher scripts
 do not accidentally initialize Gum/PEAK before the target application starts.
 
+### Exec Chain Profiling
+
+PEAK intercepts successful `exec` handoffs and writes a non-destructive,
+rank-local checkpoint before the old process image is replaced. The checkpoint
+uses the same CSV schema as normal output and a distinct file name:
+`<PEAK_STATSLOG_PATH>-p<PID>-exec<N>.csv`, or
+`./peak_statslog-p<PID>-exec<N>.csv` when `PEAK_STATSLOG_PATH` is unset. Normal
+final output from the new image remains `<prefix>-p<PID>.csv`. If the process
+execs before any target has been called, the checkpoint is still written as a
+header-only CSV artifact.
+
+PEAK also tries to keep profiling active across `exec` calls that supply a
+custom `envp`: when safe, it ensures `LD_PRELOAD` contains the current
+`libpeak` path and copies missing `PEAK_*` variables from the current
+environment without overwriting explicit child values. This includes the normal
+libc exec family and dynamically linked `syscall(SYS_execve, ...)` /
+`syscall(SYS_execveat, ...)` calls. Inline assembly syscalls, static binaries,
+or deliberate calls around the interposed libc symbols bypass `LD_PRELOAD`
+interposition and cannot be chained by this mechanism. PEAK does not inject
+`LD_PRELOAD` in Linux secure-execution mode (`AT_SECURE`).
+`posix_spawn()` and `posix_spawnp()` use the same environment injection path,
+but they do not write an exec checkpoint because the parent image is not
+replaced. Private-memory `fork()` and `clone()` children can write a
+best-effort exec checkpoint; the checkpoint writer streams rows without GLib
+allocation or stdio and uses nonblocking listener locks, so a forked child
+fails the checkpoint rather than waiting indefinitely on state inherited from
+another thread.
+Shared-VM children, including native `vfork()` and `CLONE_VM` children that
+later call an interposed exec function, skip the pre-exec checkpoint; child
+environment propagation still runs through a bounded no-malloc path backed by
+PEAK-owned scratch storage, so it does not allocate or map memory in a
+shared-VM child. PEAK does not export a libc `vfork()` wrapper. `clone()`
+children are marked when PEAK sees the libc wrapper or the syscall bridge, and
+otherwise are classified when they call an interposed exec function.
+Dynamically linked `syscall(SYS_fork)`, ordinary `syscall(SYS_clone, ...)`,
+and `syscall(SYS_clone3, ...)` calls are handled in PEAK's syscall bridge so
+private-memory children are marked as checkpoint-safe. Dynamically linked
+`syscall(SYS_vfork)` is not rewritten as `fork()` and is not part of PEAK's
+exec-chain support surface; use libc `vfork()` or `clone(CLONE_VM|CLONE_VFORK)`
+when relying on PEAK's shared-VM exec handling. Native libc `vfork()` is not
+routed through this syscall bridge. `vfork()` and `CLONE_VM` children use the
+bounded no-malloc exec path and skip checkpoints when they later call an
+interposed exec wrapper. Direct inline assembly syscalls and static binaries
+bypass the bridge.
+
+**`PEAK_EXEC_CHAIN`**
+
+Default: enabled. Set to `0`, `false`, `no`, or `off` to disable `LD_PRELOAD`
+and `PEAK_*` injection into exec child environments. Pre-exec checkpoints remain
+controlled separately by `PEAK_EXEC_CHECKPOINT`.
+
+**`PEAK_EXEC_CHECKPOINT`**
+
+Default: enabled. Set to `0`, `false`, `no`, or `off` to disable the
+non-destructive pre-exec CSV checkpoint. This path does not call `peak_fini()`,
+detach Gum hooks, stop PEAK controller or heartbeat threads, or use MPI
+collectives.
+
+**`PEAK_EXEC_PROPAGATE_PEAK_ENV`**
+
+Default: enabled. Set to `0`, `false`, `no`, or `off` to prevent PEAK from
+copying missing `PEAK_*` variables into custom exec environments. Explicit
+values already present in the child `envp` are preserved.
+
+**`PEAK_EXEC_TRACE_PATH`**
+
+Optional CSV diagnostics for exec wrapper decisions. Rows include
+`time,event,path,pid,checkpoint_enabled,checkpoint_result,chain_enabled,ld_preload_action,exec_result,errno`
+with events such as `exec-before`, `exec-checkpoint-ok`,
+`exec-checkpoint-failed`, `exec-env-injected`, `exec-env-unchanged`,
+`posix-spawn-ok`, `posix-spawn-failed`, and `exec-failed`.
+
 ### Reports and Output
 
 **`PEAK_STATSLOG_PATH`**

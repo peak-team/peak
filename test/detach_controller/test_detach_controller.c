@@ -1380,7 +1380,7 @@ run_fake_helper_batch_abort_rolls_back_records(void)
     check_helper_log_count(log_template, "START", 1);
     check_helper_log_count(log_template, "STOP", 1);
     check_helper_log_count(log_template, "EVACUATE", 1);
-    check_helper_log_count(log_template, "RESUME", 0);
+    check_helper_log_count(log_template, "RESUME", 1);
     check_helper_log_count(log_template, "SHUTDOWN", 1);
 
     g_object_unref(listener_one);
@@ -3008,14 +3008,27 @@ run_fake_helper_fail_closed(void)
     fprintf(stderr, "fake-helper-fail-closed requires PEAK_HAVE_GUM_PEAK_PC_API\n");
     return 77;
 #else
+    char log_template[] = "/tmp/peak_fake_helper_fail_closed_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
     const char* scenario = getenv("FAKE_DETACH_HELPER_SCENARIO");
     PeakDetachStatus expected = PEAK_DETACH_STATUS_ERROR;
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
 
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+
     if (scenario == NULL) {
         scenario = "stop-permission";
+    }
+    if (set_fake_helper_env_default(scenario, log_template) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
     }
 
     if (strcmp(scenario, "stop-permission") == 0) {
@@ -3037,6 +3050,7 @@ run_fake_helper_fail_closed(void)
         expected = PEAK_DETACH_STATUS_ERROR;
     } else {
         fprintf(stderr, "unknown fake helper scenario: %s\n", scenario);
+        unlink(log_template);
         return EXIT_FAILURE;
     }
 
@@ -3053,6 +3067,7 @@ run_fake_helper_fail_closed(void)
         g_object_unref(listener);
         g_object_unref(interceptor);
         gum_deinit_embedded();
+        unlink(log_template);
         return EXIT_FAILURE;
     }
     gum_interceptor_flush(interceptor);
@@ -3067,6 +3082,7 @@ run_fake_helper_fail_closed(void)
         g_object_unref(listener);
         g_object_unref(interceptor);
         gum_deinit_embedded();
+        unlink(log_template);
         return EXIT_FAILURE;
     }
 
@@ -3093,11 +3109,20 @@ run_fake_helper_fail_closed(void)
                shutdown_status == PEAK_DETACH_STATUS_SAFE ||
                shutdown_status == PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED);
 
+    if (strcmp(scenario, "evacuate-error") == 0) {
+        check_helper_log_count(log_template, "START", 1);
+        check_helper_log_count(log_template, "STOP", 1);
+        check_helper_log_count(log_template, "EVACUATE", 1);
+        check_helper_log_count(log_template, "RESUME", 1);
+        check_helper_log_count(log_template, "SHUTDOWN", 1);
+    }
+
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
     g_object_unref(listener);
     g_object_unref(interceptor);
     gum_deinit_embedded();
+    unlink(log_template);
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 #endif

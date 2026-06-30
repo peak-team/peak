@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +45,8 @@ typedef struct {
     StartGate* start_gate;
     Blocker* blocker;
 } WorkerState;
+
+typedef int (*PeakRequestDetachFn)(size_t hook_id);
 
 __attribute__((noinline))
 void peak_detach_stale_target(uint64_t value)
@@ -93,6 +96,46 @@ has_flag_arg(int argc, char** argv, const char* name)
             return 1;
         }
     }
+    return 0;
+}
+
+static void*
+optional_symbol(const char* name)
+{
+    dlerror();
+    void* symbol = dlsym(RTLD_DEFAULT, name);
+    const char* error = dlerror();
+    if (error != NULL) {
+        return NULL;
+    }
+    return symbol;
+}
+
+static int
+request_detach_after_workers_start(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)optional_symbol(
+            "peak_general_listener_request_detach");
+    double deadline = monotonic_seconds() + 5.0;
+
+    if (request_detach == NULL) {
+        fprintf(stderr, "peak_general_listener_request_detach is unavailable\n");
+        return 0;
+    }
+
+    while (monotonic_seconds() < deadline) {
+        if (request_detach(0)) {
+            return 1;
+        }
+
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+
+    fprintf(stderr, "failed to request stale-thread detach after workers started\n");
     return 0;
 }
 
@@ -262,6 +305,8 @@ main(int argc, char** argv)
     long stale_ready_timeout =
         parse_long_arg(argc, argv, "--stale-ready-timeout", 5);
     int active_after_stale = has_flag_arg(argc, argv, "--active-after-stale");
+    int request_detach_after_start =
+        has_flag_arg(argc, argv, "--request-detach-after-start");
     const char* stale_mode_name =
         parse_string_arg(argc, argv, "--stale-mode", "parked");
     StaleMode stale_mode;
@@ -361,6 +406,20 @@ main(int argc, char** argv)
     active_start_open = 1;
     pthread_cond_broadcast(&blocker.cond);
     pthread_mutex_unlock(&blocker.mutex);
+
+    if (request_detach_after_start &&
+        !request_detach_after_workers_start()) {
+        atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+        blocker_release(&blocker);
+        for (long i = 0; i < created_threads; i++) {
+            pthread_join(tids[i], NULL);
+        }
+        start_gate_destroy(&gate);
+        blocker_destroy(&blocker);
+        free(tids);
+        free(states);
+        return 2;
+    }
 
     double start = monotonic_seconds();
     usleep((useconds_t)seconds * 1000000u);

@@ -4,6 +4,8 @@ target_include_directories(test_command_filter PRIVATE
     ${PROJECT_SOURCE_DIR}/include/utils)
 target_link_libraries(test_command_filter PRIVATE $<TARGET_OBJECTS:utils_c>)
 
+add_executable(test_filtered_raw_syscall_exec test_filtered_raw_syscall_exec.c)
+
 add_test(NAME test_command_filter
     COMMAND test_command_filter)
 set_tests_properties(test_command_filter
@@ -35,4 +37,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         PROPERTIES
             PASS_REGULAR_EXPRESSION "filtered_tool_preload_ok"
             FAIL_REGULAR_EXPRESSION "PEAK Library|overhead calibration|Estimated overhead")
+
+    add_test(NAME test_preload_filtered_raw_syscall_exec_inert
+        COMMAND $<TARGET_FILE:test_filtered_raw_syscall_exec>)
+    set_tests_properties(test_preload_filtered_raw_syscall_exec_inert
+        PROPERTIES
+            ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:peak>;PEAK_TARGET=peak_missing_filtered_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_EXEC_CHAIN=1"
+            PASS_REGULAR_EXPRESSION "filtered_raw_syscall_exec_ok"
+            FAIL_REGULAR_EXPRESSION "PEAK Library|overhead calibration|Estimated overhead|PEAK .* leaked")
 endif()

@@ -33,9 +33,11 @@ EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "subset-finalize-clean",
     "subset-finalize-clean-collective",
     "subset-finalize-handoff",
+    "exec-success-rank0",
     "finalize-clean-output-mpi-reducer-fail",
 }
 EXPECTED_TIMEOUT_MODES = EXPECTED_LAUNCHER_ABNORMAL_MODES - {
+    "exec-success-rank0",
     "finalize-clean-output-mpi-reducer-fail",
 }
 EXPECTED_NONZERO_RETURN_MODES = {
@@ -136,6 +138,8 @@ def parse_args():
             "subset-finalize-clean",
             "subset-finalize-clean-collective",
             "subset-finalize-handoff",
+            "exec-failure-rank0",
+            "exec-success-rank0",
             "finalize-return-nonzero",
         ],
         required=True,
@@ -192,6 +196,7 @@ def main():
     expected_max_peak_tables = None
     expected_stats_files = None
     expected_min_stats_files = None
+    expected_exec_checkpoint = False
     expected_min_target_count = None
     expected_extra = []
     forbidden_output = []
@@ -351,6 +356,21 @@ def main():
         expected_peak_tables = 0
         expected_stats_files = None
         expected_min_stats_files = 1
+    elif args.mode == "exec-failure-rank0":
+        app_args.append("exec-failure-rank0")
+        expected = "PMPI_Finalize was observed on every rank"
+        expected_extra.append("mpi_exec_failure_rank0_errno=2")
+        expected_peak_tables = 1
+        expected_stats_files = None
+        expected_min_stats_files = 2
+        expected_exec_checkpoint = True
+    elif args.mode == "exec-success-rank0":
+        app_args.append("exec-success-rank0")
+        expected = None
+        expected_peak_tables = 0
+        expected_stats_files = None
+        expected_min_stats_files = 1
+        expected_exec_checkpoint = True
     elif args.mode == "finalize-return-nonzero":
         app_args.append("finalize-then-return1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -395,9 +415,13 @@ def main():
             for path in stats_files
         )
         stats_rows = []
+        exec_checkpoint_rows = []
         for path in stats_files:
             with path.open(newline="", encoding="utf-8", errors="replace") as handle:
-                stats_rows.extend(csv.DictReader(handle))
+                rows = list(csv.DictReader(handle))
+            stats_rows.extend(rows)
+            if re.search(r"-exec[0-9]+\.csv$", path.name):
+                exec_checkpoint_rows.extend(rows)
     sys.stdout.write(output)
     if done_file is not None:
         try:
@@ -465,6 +489,27 @@ def main():
             f"expected at least {expected_min_stats_files} PEAK stats file(s), "
             f"got {len(stats_files)}"
         )
+    if expected_exec_checkpoint:
+        exec_checkpoint_files = [
+            path for path in stats_files
+            if re.search(r"-exec[0-9]+\.csv$", path.name)
+        ]
+        if not exec_checkpoint_files:
+            observed = ", ".join(path.name for path in stats_files)
+            raise AssertionError(
+                "expected a rank-local exec checkpoint stats file with "
+                f"'-exec<N>.csv' suffix, got: {observed}"
+            )
+        checkpoint_target_count = sum(
+            int(float(row.get("count", "0") or 0))
+            for row in exec_checkpoint_rows
+            if row.get("function") == "peak_mpi_exit_target"
+        )
+        if checkpoint_target_count < 16:
+            raise AssertionError(
+                "exec checkpoint did not contain the expected rank-local "
+                f"peak_mpi_exit_target calls; observed {checkpoint_target_count}"
+            )
     if expected_min_target_count is not None:
         observed_count = sum(
             int(float(row.get("count", "0") or 0))

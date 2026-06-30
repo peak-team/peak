@@ -106,6 +106,39 @@ void peak_general_listener_attach();
 gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
 
 /**
+ * @brief Writes a rank-local, non-destructive CSV snapshot for an exec handoff.
+ *
+ * This snapshots the current per-process CPU listener counters without MPI
+ * collectives, Gum detach, controller shutdown, heartbeat changes, or runtime
+ * teardown. The checkpoint writer streams rows without GLib allocation/stdio
+ * and listener locks are taken in nonblocking mode, so forked children fail the
+ * checkpoint rather than waiting indefinitely on inherited runtime state. The
+ * normal final output path remains responsible for freeing runtime-owned
+ * listener state.
+ *
+ * @param checkpoint_index Monotonic per-process exec checkpoint index.
+ * @return TRUE when a checkpoint CSV was written, FALSE otherwise.
+ */
+gboolean peak_general_listener_checkpoint_for_exec(
+    unsigned long long checkpoint_index,
+    gboolean try_only);
+
+/**
+ * @brief Reset general-listener process-local state after fork in a child.
+ */
+void peak_general_listener_after_fork_child(void);
+
+/**
+ * @brief Minimal reset for raw fork/clone syscall children.
+ *
+ * Raw fork-like syscalls bypass pthread_atfork() ordering and may return while
+ * libc, GLib, or Gum locks inherited from vanished parent threads are in an
+ * unknown state. This marks callbacks as fork-child-minimal without touching
+ * pthread/GLib synchronization primitives.
+ */
+void peak_general_listener_after_raw_fork_child(void);
+
+/**
  * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
  *
  * A TRUE result means an MPI output reducer collective failed or timed out after
@@ -124,6 +157,11 @@ gboolean peak_general_listener_mpi_reducer_failed_closed(void);
  * draining.
  */
 void peak_general_listener_suspend_callbacks(void);
+
+/**
+ * @brief Resumes target listener callbacks suspended by PEAK runtime control.
+ */
+void peak_general_listener_resume_callbacks(void);
 
 /**
  * @brief Records that the application has requested MPI finalization.
@@ -227,6 +265,46 @@ void peak_general_listener_controller_unlock(void);
 void peak_general_listener_controller_wake(void);
 
 /**
+ * @brief Starts the general listener controller if current settings need it.
+ */
+void peak_general_listener_controller_start_if_needed(void);
+
+/**
+ * @brief Starts the general listener controller when restoring prior runtime state.
+ */
+void peak_general_listener_controller_start_for_restore(void);
+
+/**
+ * @brief Returns TRUE when the calling thread is the controller worker.
+ */
+gboolean peak_general_listener_controller_current_thread(void);
+
+/**
+ * @brief Returns TRUE while the current thread is running controller work.
+ */
+gboolean peak_general_listener_controller_current_path(void);
+
+/**
+ * @brief Returns TRUE when the controller worker has been started.
+ */
+gboolean peak_general_listener_controller_thread_started(void);
+
+/**
+ * @brief Defers controller starts while PEAK quiesces around fork.
+ */
+void peak_general_listener_controller_block_start(void);
+
+/**
+ * @brief Re-enables controller starts and returns TRUE if one was deferred.
+ */
+gboolean peak_general_listener_controller_unblock_start(void);
+
+/**
+ * @brief Returns TRUE when the general listener can be quiesced around fork.
+ */
+gboolean peak_general_listener_fork_quiesce_ready(void);
+
+/**
  * @brief Marks a dynamically published hook attached.
  *
  * The caller must hold the general listener controller lock.
@@ -243,6 +321,21 @@ void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id);
  * @return TRUE if the request is accepted or already pending.
  */
 PEAK_API gboolean peak_general_listener_request_detach(size_t hook_id);
+
+/**
+ * @brief Requests controller-owned physical detach for several hooks atomically.
+ *
+ * This queues all accepted requests while holding the listener controller lock,
+ * then wakes the controller once. It is primarily used by lifecycle tests that
+ * need deterministic multi-hook batching.
+ *
+ * @param hook_ids Hook indices to request.
+ * @param hook_count Number of hook indices.
+ * @return Number of requests accepted or already pending.
+ */
+PEAK_API size_t peak_general_listener_request_detach_batch(
+    const size_t* hook_ids,
+    size_t hook_count);
 
 /**
  * @brief Requests controller-owned reattach for a detached hooked function.

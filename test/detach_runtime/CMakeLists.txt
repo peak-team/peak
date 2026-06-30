@@ -31,9 +31,14 @@ if(TARGET peak_detach_helper)
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)
-target_link_libraries(test_detach_stale_threads PRIVATE Threads::Threads)
+target_link_libraries(test_detach_stale_threads PRIVATE Threads::Threads ${DL_LIBRARY})
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_detach_stale_threads PRIVATE -Wl,--export-dynamic)
+endif()
+
+add_executable(test_signal_timer_abi test_signal_timer_abi.c)
+if(RT_LIBRARY)
+  target_link_libraries(test_signal_timer_abi PRIVATE ${RT_LIBRARY})
 endif()
 
 add_executable(test_unsafe_gum_prologue test_unsafe_gum_prologue.c)
@@ -62,4 +67,12 @@ target_link_libraries(test_unsafe_gum_prologue_policy
     ${DL_LIBRARY}
     ${RT_LIBRARY}
     ${M_LIBRARY}
+)
+
+add_executable(test_syscall_interceptor_policy
+  test_syscall_interceptor_policy.c
+)
+target_include_directories(test_syscall_interceptor_policy
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
 )

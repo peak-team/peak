@@ -295,7 +295,6 @@ EOF_SPEC
     if [ -n "${PEAK_HPC_MAX_REATTACH_GUM_FAILED:-}" ]; then
         transition_args+=(--max-reattach-gum-failed "${PEAK_HPC_MAX_REATTACH_GUM_FAILED}")
     fi
-
     local -a cmd=(
         "$PYTHON_BIN" "$RUNNER"
         --exe "$EXE"

@@ -18,6 +18,7 @@ static GumAttachOptions pthread_create_attach_options = {
 GHashTable* peak_tid_mapping;
 static GMutex tid_mapping_mutex;
 static gboolean tid_mapping_initialized = FALSE;
+static gboolean tid_mapping_child_reset_pending = FALSE;
 static size_t current_tid = 0;
 static GQueue reusable_tid_ids = G_QUEUE_INIT;
 static gpointer pthread_create_hook_address;
@@ -26,6 +27,9 @@ extern pthread_t heartbeat_thread;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 static void pthread_listener_insert_thread_unlocked(pthread_t tid);
+static void pthread_listener_rebuild_child_mapping_unlocked(void);
+static guint pthread_tid_hash(gconstpointer value);
+static gboolean pthread_tid_equal(gconstpointer a, gconstpointer b);
 
 typedef void* (*pthread_start_routine_t)(void*);
 
@@ -39,6 +43,7 @@ static void
 pthread_listener_remove_thread(pthread_t tid)
 {
     g_mutex_lock(&tid_mapping_mutex);
+    pthread_listener_rebuild_child_mapping_unlocked();
     if (tid_mapping_initialized && peak_tid_mapping != NULL) {
         size_t* mapped_id = g_hash_table_lookup(peak_tid_mapping, &tid);
         if (mapped_id != NULL) {
@@ -72,6 +77,7 @@ peak_pthread_start(void* data)
 
     if (!context->skip_tracking) {
         g_mutex_lock(&tid_mapping_mutex);
+        pthread_listener_rebuild_child_mapping_unlocked();
         if (tid_mapping_initialized && peak_tid_mapping != NULL) {
             pthread_listener_insert_thread_unlocked(pthread_self());
         }
@@ -104,6 +110,24 @@ static gboolean
 pthread_tid_equal(gconstpointer a, gconstpointer b)
 {
     return memcmp(a, b, sizeof(pthread_t)) == 0;
+}
+
+static void
+pthread_listener_rebuild_child_mapping_unlocked(void)
+{
+    if (!tid_mapping_child_reset_pending) {
+        return;
+    }
+
+    peak_tid_mapping = g_hash_table_new_full(pthread_tid_hash,
+                                             pthread_tid_equal,
+                                             g_free,
+                                             g_free);
+    g_queue_clear(&reusable_tid_ids);
+    current_tid = 0;
+    tid_mapping_initialized = TRUE;
+    tid_mapping_child_reset_pending = FALSE;
+    pthread_listener_insert_thread_unlocked(pthread_self());
 }
 
 static void
@@ -160,6 +184,10 @@ pthread_listener_on_enter(GumInvocationListener* listener,
      * it has reached PEAK's gate.
      */
     peak_detach_controller_wait_for_mutation_window();
+
+    g_mutex_lock(&tid_mapping_mutex);
+    pthread_listener_rebuild_child_mapping_unlocked();
+    g_mutex_unlock(&tid_mapping_mutex);
 
     PeakPthreadStartContext* start_context = g_new0(PeakPthreadStartContext, 1);
     start_context->start_routine =
@@ -261,6 +289,21 @@ void pthread_listener_attach()
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }
+
+void pthread_listener_atfork_child()
+{
+    /*
+     * Avoid heap work in the atfork child handler. The inherited hash table may
+     * contain vanished parent threads, so drop the pointer and rebuild lazily
+     * if exec fails and PEAK code runs in the child.
+     */
+    g_mutex_init(&tid_mapping_mutex);
+    peak_tid_mapping = NULL;
+    g_queue_init(&reusable_tid_ids);
+    current_tid = 0;
+    tid_mapping_initialized = FALSE;
+    tid_mapping_child_reset_pending = TRUE;
+}
 // gboolean print_key_value_pair(gpointer key, gpointer value, gpointer user_data)
 // {
 //     g_print("Key: %lu, Value: %lu\n", *((unsigned long *)(key)), value);
@@ -335,6 +378,7 @@ size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found)
     gboolean mapped_found = FALSE;
 
     g_mutex_lock(&tid_mapping_mutex);
+    pthread_listener_rebuild_child_mapping_unlocked();
     if (tid_mapping_initialized && peak_tid_mapping != NULL) {
         value = g_hash_table_lookup(peak_tid_mapping, &thread);
         if (value != NULL) {
@@ -367,6 +411,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
 
     if (tids == NULL || mapped == NULL || capacity == 0) {
         g_mutex_lock(&tid_mapping_mutex);
+        pthread_listener_rebuild_child_mapping_unlocked();
         if (tid_mapping_initialized &&
             peak_tid_mapping != NULL &&
             g_hash_table_size(peak_tid_mapping) > 0) {
@@ -380,6 +425,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
     }
 
     g_mutex_lock(&tid_mapping_mutex);
+    pthread_listener_rebuild_child_mapping_unlocked();
     if (tid_mapping_initialized && peak_tid_mapping != NULL) {
         g_hash_table_iter_init(&it, peak_tid_mapping);
         while (g_hash_table_iter_next(&it, &tid_key, &mapped_id)) {

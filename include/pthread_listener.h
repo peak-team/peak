@@ -75,6 +75,14 @@ gboolean pthread_listener_dettach();
 extern GHashTable* peak_tid_mapping;
 
 /**
+ * @brief Reset inherited pthread-listener bookkeeping in a fork child.
+ *
+ * The child keeps only the calling thread after fork. This hook avoids using
+ * stale parent thread mappings if exec fails and the child continues running.
+ */
+void pthread_listener_atfork_child();
+
+/**
  * @brief Thread-safe lookup from pthread_t to mapped thread id.
  *
  * @param thread pthread identifier to query.
