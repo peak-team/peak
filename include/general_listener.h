@@ -159,6 +159,11 @@ gboolean peak_general_listener_mpi_reducer_failed_closed(void);
 void peak_general_listener_suspend_callbacks(void);
 
 /**
+ * @brief Resumes target listener callbacks suspended by PEAK runtime control.
+ */
+void peak_general_listener_resume_callbacks(void);
+
+/**
  * @brief Records that the application has requested MPI finalization.
  *
  * After this point PEAK may continue to count already-pinned callbacks until
@@ -258,6 +263,46 @@ void peak_general_listener_controller_unlock(void);
  * controller thread process pending Gum lifecycle work outside the callback.
  */
 void peak_general_listener_controller_wake(void);
+
+/**
+ * @brief Starts the general listener controller if current settings need it.
+ */
+void peak_general_listener_controller_start_if_needed(void);
+
+/**
+ * @brief Starts the general listener controller when restoring prior runtime state.
+ */
+void peak_general_listener_controller_start_for_restore(void);
+
+/**
+ * @brief Returns TRUE when the calling thread is the controller worker.
+ */
+gboolean peak_general_listener_controller_current_thread(void);
+
+/**
+ * @brief Returns TRUE while the current thread is running controller work.
+ */
+gboolean peak_general_listener_controller_current_path(void);
+
+/**
+ * @brief Returns TRUE when the controller worker has been started.
+ */
+gboolean peak_general_listener_controller_thread_started(void);
+
+/**
+ * @brief Defers controller starts while PEAK quiesces around fork.
+ */
+void peak_general_listener_controller_block_start(void);
+
+/**
+ * @brief Re-enables controller starts and returns TRUE if one was deferred.
+ */
+gboolean peak_general_listener_controller_unblock_start(void);
+
+/**
+ * @brief Returns TRUE when the general listener can be quiesced around fork.
+ */
+gboolean peak_general_listener_fork_quiesce_ready(void);
 
 /**
  * @brief Marks a dynamically published hook attached.

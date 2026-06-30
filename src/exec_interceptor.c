@@ -158,6 +158,8 @@ static int peak_exec_in_fork_like_child(void);
 static int peak_exec_in_shared_vm_child(void);
 static int peak_exec_env_entry_matches(const char* entry, const char* name);
 static int peak_exec_peak_name_is_priority(const char* name);
+static peak_execve_fn peak_real_execve(void);
+static peak_fork_fn peak_real_fork(void);
 static peak_clone_fn peak_real_clone(void);
 static peak_posix_spawn_fn peak_real_posix_spawn(void);
 static peak_posix_spawnp_fn peak_real_posix_spawnp(void);
@@ -1845,6 +1847,8 @@ peak_exec_register_atfork(void)
     }
     (void)peak_real_posix_spawn();
     (void)peak_real_posix_spawnp();
+    (void)peak_real_execve();
+    (void)peak_real_fork();
     (void)peak_real_clone();
     (void)pthread_atfork(NULL, NULL, peak_exec_mark_after_fork_child);
 }
@@ -2320,8 +2324,10 @@ static peak_execve_fn
 peak_real_execve(void)
 {
     static peak_execve_fn fn;
-    if (fn == NULL) {
+    static int looked_up;
+    if (!looked_up) {
         fn = (peak_execve_fn)dlsym(RTLD_NEXT, "execve");
+        looked_up = 1;
     }
     return fn;
 }
@@ -2330,8 +2336,10 @@ static peak_fork_fn
 peak_real_fork(void)
 {
     static peak_fork_fn fn;
-    if (fn == NULL) {
+    static int looked_up;
+    if (!looked_up) {
         fn = (peak_fork_fn)dlsym(RTLD_NEXT, "fork");
+        looked_up = 1;
     }
     return fn;
 }
@@ -2430,13 +2438,19 @@ peak_call_clone_forward(peak_clone_fn fn,
 }
 
 static pid_t
-peak_call_fork_raw(void)
+peak_call_fork_raw(int* used_raw_syscall)
 {
     peak_fork_fn fn = peak_real_fork();
+    if (used_raw_syscall != NULL) {
+        *used_raw_syscall = 0;
+    }
     if (fn != NULL) {
         return fn();
     }
 #if defined(__linux__) && defined(SYS_fork)
+    if (used_raw_syscall != NULL) {
+        *used_raw_syscall = 1;
+    }
     return (pid_t)peak_exec_call_raw_syscall6(SYS_fork, 0, 0, 0, 0, 0, 0);
 #else
     errno = ENOSYS;
@@ -2479,10 +2493,22 @@ peak_call_execve_raw(const char* path, char* const argv[], char* const envp[])
 __attribute__((visibility("default"))) pid_t
 fork(void)
 {
-    pid_t result = peak_call_fork_raw();
+    int used_raw_syscall = 0;
+    int fork_token = peak_exec_in_fork_like_child() ?
+                         0 : peak_runtime_before_fork();
+    pid_t result = peak_call_fork_raw(&used_raw_syscall);
+    int saved_errno = errno;
     if (result == 0) {
-        peak_exec_mark_after_fork_child();
+        if (used_raw_syscall) {
+            peak_exec_note_syscall_fork_child();
+        } else {
+            peak_exec_mark_after_fork_child();
+            peak_exec_trace_noalloc("fork-child", "libc", NULL, "", 0);
+        }
+    } else {
+        peak_runtime_after_fork_parent(fork_token);
     }
+    errno = saved_errno;
     return result;
 }
 
@@ -2570,17 +2596,12 @@ clone(int (*fn)(void*), void* child_stack, int flags, void* arg, ...)
                                        optional_count);
     }
 
+    int fork_token = peak_runtime_before_fork();
     start = malloc(sizeof(*start));
     if (start == NULL) {
-        return peak_call_clone_forward(real_clone,
-                                       fn,
-                                       child_stack,
-                                       flags,
-                                       arg,
-                                       parent_tid,
-                                       tls,
-                                       child_tid,
-                                       optional_count);
+        peak_runtime_after_fork_parent(fork_token);
+        errno = ENOMEM;
+        return -1;
     }
     start->fn = fn;
     start->arg = arg;
@@ -2594,6 +2615,9 @@ clone(int (*fn)(void*), void* child_stack, int flags, void* arg, ...)
                                      child_tid,
                                      optional_count);
     saved_errno = errno;
+    if (result != 0) {
+        peak_runtime_after_fork_parent(fork_token);
+    }
     if (result != 0) {
         free(start);
     }
@@ -4045,6 +4069,8 @@ peak_exec_handle_syscall(long number,
 #if defined(SYS_fork)
     if (number == SYS_fork) {
         if (result_out != NULL) {
+            int fork_token = peak_exec_in_fork_like_child() ?
+                                 0 : peak_runtime_before_fork();
             long result = peak_exec_call_raw_syscall6(SYS_fork,
                                                  0,
                                                  0,
@@ -4052,9 +4078,13 @@ peak_exec_handle_syscall(long number,
                                                  0,
                                                  0,
                                                  0);
+            int saved_errno = errno;
             if (result == 0) {
                 peak_exec_note_syscall_fork_child();
+            } else {
+                peak_runtime_after_fork_parent(fork_token);
             }
+            errno = saved_errno;
             *result_out = result;
         }
         return 1;
@@ -4065,6 +4095,15 @@ peak_exec_handle_syscall(long number,
     if (number == SYS_clone) {
         if (result_out != NULL) {
             long flags = a1;
+            int fork_token = 0;
+            int is_fork_like_clone = !peak_exec_in_fork_like_child();
+#if defined(CLONE_VM)
+            is_fork_like_clone = is_fork_like_clone &&
+                                 (flags & CLONE_VM) == 0;
+#endif
+            if (is_fork_like_clone) {
+                fork_token = peak_runtime_before_fork();
+            }
             long result = peak_exec_call_raw_syscall6(SYS_clone,
                                                  a1,
                                                  a2,
@@ -4072,15 +4111,20 @@ peak_exec_handle_syscall(long number,
                                                  a4,
                                                  a5,
                                                  0);
-#if defined(CLONE_VM)
-            if (result == 0 && (flags & CLONE_VM) == 0) {
-                peak_exec_note_syscall_fork_child();
-            }
-#else
+            int saved_errno = errno;
             if (result == 0) {
+#if defined(CLONE_VM)
+                if ((flags & CLONE_VM) == 0) {
+                    peak_exec_note_syscall_fork_child();
+                }
+#else
                 peak_exec_note_syscall_fork_child();
-            }
 #endif
+            }
+            if (result != 0) {
+                peak_runtime_after_fork_parent(fork_token);
+            }
+            errno = saved_errno;
             *result_out = result;
         }
         return 1;
@@ -4093,6 +4137,16 @@ peak_exec_handle_syscall(long number,
             uint64_t flags = 0;
             int flags_known =
                 peak_exec_clone3_flags_safe((const void*)a1, &flags) == 0;
+            int fork_token = 0;
+            int is_fork_like_clone3 =
+                flags_known && !peak_exec_in_fork_like_child();
+#if defined(CLONE_VM)
+            is_fork_like_clone3 = is_fork_like_clone3 &&
+                                  (flags & CLONE_VM) == 0;
+#endif
+            if (is_fork_like_clone3) {
+                fork_token = peak_runtime_before_fork();
+            }
             long result = peak_exec_call_raw_syscall6(SYS_clone3,
                                                  a1,
                                                  a2,
@@ -4100,6 +4154,7 @@ peak_exec_handle_syscall(long number,
                                                  0,
                                                  0,
                                                  0);
+            int saved_errno = errno;
             if (result == 0) {
 #if defined(CLONE_VM)
                 if (flags_known && (flags & CLONE_VM) == 0) {
@@ -4111,6 +4166,10 @@ peak_exec_handle_syscall(long number,
                 }
 #endif
             }
+            if (result != 0) {
+                peak_runtime_after_fork_parent(fork_token);
+            }
+            errno = saved_errno;
             *result_out = result;
         }
         return 1;

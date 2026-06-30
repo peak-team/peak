@@ -100,15 +100,18 @@ def check_dlopen_revert_transactions(repo_root):
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
+    heartbeat_start = extract_function(source, "peak_runtime_start_heartbeat_thread")
 
     main_time_position = body.find("peak_main_time = peak_second();")
-    heartbeat_position = body.find("pthread_create(&heartbeat_thread")
+    heartbeat_position = body.find("peak_runtime_start_heartbeat_thread()")
     require(main_time_position != -1,
             "peak_init must initialize peak_main_time")
     require(heartbeat_position != -1,
-            "peak_init must create the heartbeat thread explicitly")
+            "peak_init must start the heartbeat thread explicitly")
     require(main_time_position < heartbeat_position,
             "peak_main_time must be initialized before heartbeat thread startup")
+    require("pthread_create(&heartbeat_thread" in heartbeat_start,
+            "heartbeat startup helper must create the heartbeat thread")
 
 
 def check_mpi_finalize_trampoline_default(repo_root):

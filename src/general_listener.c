@@ -118,6 +118,8 @@ static pthread_cond_t general_controller_wake_cond = PTHREAD_COND_INITIALIZER;
 static pthread_once_t general_listener_atfork_once = PTHREAD_ONCE_INIT;
 static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
+static gboolean general_controller_start_blocked = FALSE;
+static gboolean general_controller_start_deferred = FALSE;
 static pthread_t general_controller_owner_thread;
 static _Atomic gboolean general_controller_owner_known = FALSE;
 static _Atomic gboolean general_listener_fork_child_minimal_callbacks = FALSE;
@@ -132,8 +134,10 @@ static const unsigned int peak_controller_default_max_retry_count = 300;
 static const double peak_controller_default_max_pending_age_s = 30.0;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
+static _Atomic unsigned int peak_general_callbacks_suspend_depth = 0;
 static _Atomic gboolean peak_general_mpi_finalize_requested = FALSE;
 static _Atomic gboolean peak_general_mpi_reducer_failed_closed = FALSE;
+static __thread unsigned int general_controller_path_depth;
 static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
@@ -154,6 +158,8 @@ static char peak_exec_checkpoint_base[PATH_MAX] = "./peak_statslog";
 static gboolean peak_exec_checkpoint_base_overlong = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
+static void peak_general_controller_start(void);
+
 void
 peak_general_listener_after_fork_child(void)
 {
@@ -167,8 +173,11 @@ peak_general_listener_after_fork_child(void)
     pthread_cond_init(&general_controller_wake_cond, NULL);
     general_controller_running = FALSE;
     general_controller_thread_started = FALSE;
+    general_controller_start_blocked = FALSE;
+    general_controller_start_deferred = FALSE;
     atomic_store(&general_listener_fork_child_minimal_callbacks, TRUE);
     atomic_store(&general_controller_owner_known, FALSE);
+    atomic_store(&peak_general_callbacks_suspend_depth, 0);
     atomic_store(&peak_general_callbacks_suspended, FALSE);
     atomic_store(&peak_general_mpi_finalize_requested, FALSE);
     pthread_listener_atfork_child();
@@ -186,8 +195,11 @@ peak_general_listener_after_raw_fork_child(void)
      */
     general_controller_running = FALSE;
     general_controller_thread_started = FALSE;
+    general_controller_start_blocked = FALSE;
+    general_controller_start_deferred = FALSE;
     atomic_store(&general_listener_fork_child_minimal_callbacks, TRUE);
     atomic_store(&general_controller_owner_known, FALSE);
+    atomic_store(&peak_general_callbacks_suspend_depth, 0);
     atomic_store(&peak_general_callbacks_suspended, FALSE);
     atomic_store(&peak_general_mpi_finalize_requested, FALSE);
 }
@@ -1563,6 +1575,7 @@ gboolean peak_general_listener_request_detach(size_t hook_id)
     pthread_mutex_unlock(&lock);
 
     if (accepted) {
+        peak_general_controller_start();
         peak_general_listener_controller_wake();
     }
 
@@ -1587,6 +1600,7 @@ size_t peak_general_listener_request_detach_batch(const size_t* hook_ids,
     pthread_mutex_unlock(&lock);
 
     if (accepted > 0) {
+        peak_general_controller_start();
         peak_general_listener_controller_wake();
     }
 
@@ -1602,6 +1616,7 @@ gboolean peak_general_listener_request_reattach(size_t hook_id)
     pthread_mutex_unlock(&lock);
 
     if (accepted) {
+        peak_general_controller_start();
         peak_general_listener_controller_wake();
     }
 
@@ -3083,6 +3098,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     double deadline = peak_second() + ((double)timeout_ms / 1000.0);
     gboolean drained = FALSE;
 
+    general_controller_path_depth++;
     gum_interceptor_ignore_current_thread(interceptor);
 
     for (;;) {
@@ -3115,6 +3131,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     g_free(tid_keys);
 
     gum_interceptor_unignore_current_thread(interceptor);
+    general_controller_path_depth--;
 
     return drained;
 }
@@ -3132,6 +3149,7 @@ peak_general_controller_thread_main(void* arg)
 
     general_controller_owner_thread = pthread_self();
     atomic_store(&general_controller_owner_known, TRUE);
+    general_controller_path_depth++;
 
     gum_interceptor_ignore_current_thread(interceptor);
 
@@ -3183,6 +3201,7 @@ peak_general_controller_thread_main(void* arg)
     }
 
     gum_interceptor_unignore_current_thread(interceptor);
+    general_controller_path_depth--;
     atomic_store(&general_controller_owner_known, FALSE);
 
     g_free(pause_status);
@@ -3197,6 +3216,11 @@ static void
 peak_general_controller_start(void)
 {
     pthread_mutex_lock(&general_controller_wake_mutex);
+    if (general_controller_start_blocked) {
+        general_controller_start_deferred = TRUE;
+        pthread_mutex_unlock(&general_controller_wake_mutex);
+        return;
+    }
     if (!general_controller_thread_started) {
         general_controller_running = TRUE;
         if (pthread_create(&general_controller_thread,
@@ -3210,6 +3234,91 @@ peak_general_controller_start(void)
         }
     }
     pthread_mutex_unlock(&general_controller_wake_mutex);
+}
+
+void
+peak_general_listener_controller_block_start(void)
+{
+    pthread_mutex_lock(&general_controller_wake_mutex);
+    general_controller_start_blocked = TRUE;
+    general_controller_start_deferred = FALSE;
+    pthread_mutex_unlock(&general_controller_wake_mutex);
+}
+
+gboolean
+peak_general_listener_controller_unblock_start(void)
+{
+    gboolean deferred;
+
+    pthread_mutex_lock(&general_controller_wake_mutex);
+    deferred = general_controller_start_deferred;
+    general_controller_start_blocked = FALSE;
+    general_controller_start_deferred = FALSE;
+    pthread_mutex_unlock(&general_controller_wake_mutex);
+
+    return deferred;
+}
+
+static gboolean
+peak_general_controller_needed(void)
+{
+    return peak_dynamic_attach_needed ||
+           peak_jit_provider_is_enabled() ||
+           peak_detach_count_overridden ||
+           peak_detach_cost > 0.0f ||
+           heartbeat_time != 0;
+}
+
+void
+peak_general_listener_controller_start_if_needed(void)
+{
+    if (interceptor == NULL) {
+        return;
+    }
+    if (peak_general_controller_needed()) {
+        peak_general_controller_start();
+    }
+}
+
+void
+peak_general_listener_controller_start_for_restore(void)
+{
+    if (interceptor == NULL) {
+        return;
+    }
+    peak_general_controller_start();
+}
+
+gboolean
+peak_general_listener_controller_current_thread(void)
+{
+    return atomic_load_explicit(&general_controller_owner_known,
+                                memory_order_acquire) &&
+           pthread_equal(general_controller_owner_thread, pthread_self());
+}
+
+gboolean
+peak_general_listener_controller_current_path(void)
+{
+    return general_controller_path_depth > 0 ||
+           peak_general_listener_controller_current_thread();
+}
+
+gboolean
+peak_general_listener_controller_thread_started(void)
+{
+    gboolean started;
+
+    pthread_mutex_lock(&general_controller_wake_mutex);
+    started = general_controller_thread_started;
+    pthread_mutex_unlock(&general_controller_wake_mutex);
+    return started;
+}
+
+gboolean
+peak_general_listener_fork_quiesce_ready(void)
+{
+    return interceptor != NULL && array_listener != NULL;
 }
 
 void
@@ -3647,9 +3756,36 @@ cleanup:
 void
 peak_general_listener_suspend_callbacks(void)
 {
+    atomic_fetch_add_explicit(&peak_general_callbacks_suspend_depth,
+                              1,
+                              memory_order_acq_rel);
     atomic_store_explicit(&peak_general_callbacks_suspended,
                           TRUE,
                           memory_order_release);
+}
+
+void
+peak_general_listener_resume_callbacks(void)
+{
+    unsigned int depth =
+        atomic_load_explicit(&peak_general_callbacks_suspend_depth,
+                             memory_order_acquire);
+
+    while (depth != 0) {
+        if (atomic_compare_exchange_weak_explicit(
+                &peak_general_callbacks_suspend_depth,
+                &depth,
+                depth - 1,
+                memory_order_acq_rel,
+                memory_order_acquire)) {
+            if (depth == 1) {
+                atomic_store_explicit(&peak_general_callbacks_suspended,
+                                      FALSE,
+                                      memory_order_release);
+            }
+            return;
+        }
+    }
 }
 
 void
@@ -3736,11 +3872,7 @@ static void
 peak_general_listener_on_enter_fork_child(GumInvocationListener* listener,
                                           GumInvocationContext* ic)
 {
-    PeakInvocationData* priv =
-        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
-
-    priv->initialized = FALSE;
-    priv->stack_level = 0;
+    (void)ic;
     if (listener == NULL ||
         atomic_load_explicit(&peak_general_callbacks_suspended,
                              memory_order_acquire) ||
@@ -3755,46 +3887,15 @@ peak_general_listener_on_enter_fork_child(GumInvocationListener* listener,
         return;
     }
     self->num_calls[0]++;
-    priv->start_time = peak_second();
-    priv->stack_level = 1;
-    priv->initialized = TRUE;
+    general_listener_fork_child_callback_depth--;
 }
 
 static void
 peak_general_listener_on_leave_fork_child(GumInvocationListener* listener,
                                           GumInvocationContext* ic)
 {
-    PeakInvocationData* priv =
-        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
-
-    if (listener == NULL || priv == NULL || !priv->initialized) {
-        return;
-    }
-
-    double duration = peak_second() - priv->start_time;
-    PeakGeneralListener* self = (PeakGeneralListener*)listener;
-    if (self->total_time == NULL || self->exclusive_time == NULL ||
-        self->max_time == NULL || self->min_time == NULL) {
-        priv->initialized = FALSE;
-        priv->stack_level = 0;
-        if (general_listener_fork_child_callback_depth > 0) {
-            general_listener_fork_child_callback_depth--;
-        }
-        return;
-    }
-    if (duration > self->max_time[0]) {
-        self->max_time[0] = duration;
-    }
-    if (duration < self->min_time[0] || self->num_calls[0] == 1) {
-        self->min_time[0] = duration;
-    }
-    self->total_time[0] += duration;
-    self->exclusive_time[0] += duration;
-    priv->initialized = FALSE;
-    priv->stack_level = 0;
-    if (general_listener_fork_child_callback_depth > 0) {
-        general_listener_fork_child_callback_depth--;
-    }
+    (void)listener;
+    (void)ic;
 }
 
 static void
@@ -4515,7 +4616,7 @@ void peak_general_listener_attach()
         }
         peak_need_detach[0] = false;
     }
-    peak_general_controller_start();
+    peak_general_listener_controller_start_if_needed();
 }
 
 static char*

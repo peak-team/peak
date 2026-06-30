@@ -63,6 +63,20 @@ void peak_runtime_after_fork_child(void);
 void peak_runtime_after_raw_fork_child(void);
 
 /**
+ * @brief Quiesces PEAK-owned background work before a fork-like operation.
+ *
+ * This is a normal interposer path, not a signal-handler-safe API. The returned
+ * token must be passed to peak_runtime_after_fork_parent() in the parent when
+ * fork/clone fails or returns to the parent.
+ */
+int peak_runtime_before_fork(void);
+
+/**
+ * @brief Restores PEAK-owned background work in the parent after fork.
+ */
+void peak_runtime_after_fork_parent(int token);
+
+/**
  * @brief Internal raw-syscall bridge shared by exec and checkpoint paths.
  *
  * This bypasses PEAK's syscall interposer when a platform-specific fallback is

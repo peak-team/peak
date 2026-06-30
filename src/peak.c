@@ -123,6 +123,59 @@ typedef enum {
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static pthread_once_t peak_runtime_atfork_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t peak_runtime_fork_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int peak_heartbeat_thread_started = 0;
+static int peak_runtime_fork_stopped_heartbeat = 0;
+static int peak_runtime_fork_stopped_controller = 0;
+#define PEAK_RUNTIME_FORK_TOKEN_BLOCKED_CONTROLLER 0x1
+#define PEAK_RUNTIME_FORK_TOKEN_SUSPENDED_CALLBACKS 0x2
+
+static int
+peak_runtime_start_heartbeat_thread(void)
+{
+    if (heartbeat_time == 0 || args == NULL ||
+        atomic_load_explicit(&peak_heartbeat_thread_started,
+                             memory_order_acquire)) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&heartbeat_mutex);
+    atomic_store(&heartbeat_running, true);
+    pthread_mutex_unlock(&heartbeat_mutex);
+    if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
+        perror("Failed to create heartbeat thread");
+        pthread_mutex_lock(&heartbeat_mutex);
+        atomic_store(&heartbeat_running, false);
+        pthread_mutex_unlock(&heartbeat_mutex);
+        return -1;
+    }
+    atomic_store_explicit(&peak_heartbeat_thread_started,
+                          1,
+                          memory_order_release);
+    return 0;
+}
+
+static int
+peak_runtime_stop_heartbeat_thread_for_fork(void)
+{
+    if (!atomic_load_explicit(&peak_heartbeat_thread_started,
+                              memory_order_acquire)) {
+        return 0;
+    }
+    if (pthread_equal(heartbeat_thread, pthread_self())) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&heartbeat_mutex);
+    atomic_store(&heartbeat_running, false);
+    pthread_cond_signal(&heartbeat_cond);
+    pthread_mutex_unlock(&heartbeat_mutex);
+    pthread_join(heartbeat_thread, NULL);
+    atomic_store_explicit(&peak_heartbeat_thread_started,
+                          0,
+                          memory_order_release);
+    return 1;
+}
 
 static void
 peak_runtime_atfork_child(void)
@@ -140,6 +193,12 @@ peak_runtime_atfork_child(void)
      */
     heartbeat_time = 0;
     atomic_store_explicit(&heartbeat_running, false, memory_order_release);
+    atomic_store_explicit(&peak_heartbeat_thread_started,
+                          0,
+                          memory_order_release);
+    pthread_mutex_init(&peak_runtime_fork_mutex, NULL);
+    peak_runtime_fork_stopped_heartbeat = 0;
+    peak_runtime_fork_stopped_controller = 0;
 }
 
 void
@@ -154,6 +213,89 @@ peak_runtime_after_raw_fork_child(void)
 {
     peak_runtime_atfork_child();
     peak_general_listener_after_raw_fork_child();
+}
+
+int
+peak_runtime_before_fork(void)
+{
+    int heartbeat_started;
+    int controller_started;
+    int token = 0;
+
+    if (!atomic_load_explicit(&peak_runtime_active, memory_order_acquire)) {
+        return 0;
+    }
+    if (peak_general_listener_controller_current_path()) {
+        return 0;
+    }
+    heartbeat_started = atomic_load_explicit(&peak_heartbeat_thread_started,
+                                             memory_order_acquire);
+    controller_started = peak_general_listener_controller_thread_started();
+    if (!heartbeat_started && !controller_started &&
+        !peak_general_listener_fork_quiesce_ready()) {
+        return 0;
+    }
+    if (heartbeat_started && pthread_equal(heartbeat_thread, pthread_self())) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&peak_runtime_fork_mutex);
+    peak_general_listener_controller_block_start();
+    token |= PEAK_RUNTIME_FORK_TOKEN_BLOCKED_CONTROLLER;
+    heartbeat_started = atomic_load_explicit(&peak_heartbeat_thread_started,
+                                             memory_order_acquire);
+    controller_started = peak_general_listener_controller_thread_started();
+    if (!heartbeat_started && !controller_started) {
+        if (peak_general_listener_fork_quiesce_ready()) {
+            return token;
+        }
+        (void)peak_general_listener_controller_unblock_start();
+        pthread_mutex_unlock(&peak_runtime_fork_mutex);
+        return 0;
+    }
+    peak_runtime_fork_stopped_heartbeat = 0;
+    peak_runtime_fork_stopped_controller = controller_started;
+    peak_general_listener_suspend_callbacks();
+    token |= PEAK_RUNTIME_FORK_TOKEN_SUSPENDED_CALLBACKS;
+    peak_runtime_fork_stopped_heartbeat =
+        peak_runtime_stop_heartbeat_thread_for_fork();
+    if (controller_started) {
+        peak_general_listener_controller_stop();
+    }
+    return token;
+}
+
+void
+peak_runtime_after_fork_parent(int token)
+{
+    int saved_errno = errno;
+    gboolean deferred_controller_start = FALSE;
+
+    if (!token) {
+        return;
+    }
+
+    if ((token & PEAK_RUNTIME_FORK_TOKEN_SUSPENDED_CALLBACKS) &&
+        peak_runtime_fork_stopped_heartbeat &&
+        peak_runtime_start_heartbeat_thread() != 0) {
+        peak_runtime_fork_stopped_heartbeat = 0;
+    }
+    if (token & PEAK_RUNTIME_FORK_TOKEN_BLOCKED_CONTROLLER) {
+        deferred_controller_start =
+            peak_general_listener_controller_unblock_start();
+    }
+    if (peak_runtime_fork_stopped_controller || deferred_controller_start) {
+        peak_general_listener_controller_start_for_restore();
+    } else if (token & PEAK_RUNTIME_FORK_TOKEN_SUSPENDED_CALLBACKS) {
+        peak_general_listener_controller_start_if_needed();
+    }
+    if (token & PEAK_RUNTIME_FORK_TOKEN_SUSPENDED_CALLBACKS) {
+        peak_general_listener_resume_callbacks();
+    }
+    peak_runtime_fork_stopped_heartbeat = 0;
+    peak_runtime_fork_stopped_controller = 0;
+    pthread_mutex_unlock(&peak_runtime_fork_mutex);
+    errno = saved_errno;
 }
 
 static void
@@ -433,12 +575,7 @@ void peak_init()
         args->hb_k_err = hb_k_err;
         args->hb_k_rate = hb_k_rate;
         args->hb_ema_a = hb_ema_a;
-        pthread_mutex_lock(&heartbeat_mutex);
-        atomic_store(&heartbeat_running, true);
-        pthread_mutex_unlock(&heartbeat_mutex);
-        // create heartbeat thread
-        if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
-            perror("Failed to create heartbeat thread");
+        if (peak_runtime_start_heartbeat_thread() != 0) {
             g_free(args);
             args = NULL;
             g_free(heartbeat_overhead);
@@ -553,7 +690,11 @@ peak_fini_impl(void)
         atomic_store(&heartbeat_running, false);
         pthread_cond_signal(&heartbeat_cond);
         pthread_mutex_unlock(&heartbeat_mutex);
-        pthread_join(heartbeat_thread, NULL);
+        if (atomic_exchange_explicit(&peak_heartbeat_thread_started,
+                                     0,
+                                     memory_order_acq_rel)) {
+            pthread_join(heartbeat_thread, NULL);
+        }
         if (heartbeat_overhead) {
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
