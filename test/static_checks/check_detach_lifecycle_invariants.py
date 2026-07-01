@@ -153,9 +153,6 @@ def check_stop_window_trace_gating(repo_root):
     general = (repo_root / "src/general_listener.c").read_text(
         encoding="utf-8"
     )
-    gate = extract_function(
-        source, "peak_detach_controller_trace_diagnostics_enabled"
-    )
     started = extract_function(
         source, "peak_detach_controller_note_stop_window_started"
     )
@@ -190,25 +187,26 @@ def check_stop_window_trace_gating(repo_root):
         general, "peak_general_listener_init_attach_policy_once"
     )
 
-    require("trace_diagnostics_enabled" in gate,
-            "STOP-window diagnostics must be gated by cached trace diagnostics")
-    require("getenv(" not in gate and "g_getenv(" not in gate,
-            "STOP-window diagnostics must not read environment in mutation path")
     require("getenv(" not in controller_trace_configure and
             "g_getenv(" not in controller_trace_configure,
             "detach controller trace configuration must not read environment")
     require("atomic_store_explicit(&trace_diagnostics_enabled" in source,
             "detach controller trace configuration must cache explicit state")
     for label, body in (("start", started), ("finish", finished)):
-        require("peak_detach_controller_trace_diagnostics_enabled()" in body,
-                f"STOP-window {label} helper must check trace diagnostics")
-        require("last_stop_window_us = 0.0" in body,
-                f"STOP-window {label} helper must clear timing when disabled")
-    require("return 0.0;" in last_window,
-            "last_stop_window_us must return zero when diagnostics are disabled")
-    require(last_window.find("return 0.0;") <
-            last_window.find("peak_detach_controller_lock_mutation_guard"),
-            "last_stop_window_us must gate before reading stored timing")
+        require("getenv(" not in body and "g_getenv(" not in body,
+                f"STOP-window {label} helper must not read environment")
+    require("peak_detach_controller_monotonic_second()" in started,
+            "STOP-window start helper must always capture policy timing")
+    require("last_stop_window_us" in finished and
+            "peak_detach_controller_monotonic_second()" in finished,
+            "STOP-window finish helper must always publish policy timing")
+    require("peak_detach_controller_lock_mutation_guard" in last_window and
+            "return value;" in last_window,
+            "last_stop_window_us must return stored timing for policy accounting")
+    require("trace_diagnostics_enabled" not in started and
+            "trace_diagnostics_enabled" not in finished and
+            "trace_diagnostics_enabled" not in last_window,
+            "STOP-window timing must not be trace-gated")
     require("PEAK_DETACH_TRACE_PATH" in general_trace_init,
             "general listener must snapshot PEAK_DETACH_TRACE_PATH during init")
     require("peak_detach_controller_configure_trace_diagnostics" in general_trace_init,
@@ -293,7 +291,7 @@ def check_mpi_startup_helper_warmup(repo_root):
 def check_global_detach_overhead_selection(repo_root):
     source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
-    comparator = extract_function(source, "compare_ratio_de")
+    comparator = extract_function(source, "compare_rate_de")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
 
     global_detach_marker = "// 2) Global DETACH"
@@ -304,22 +302,31 @@ def check_global_detach_overhead_selection(repo_root):
             "heartbeat must keep explicit global detach and reattach sections")
     global_detach = heartbeat[start:end]
 
-    require("compare_rate_de" not in source,
-            "global detach must not sort by transient overhead rate")
-    require("compare_ratio_de" in global_detach,
-            "global detach must sort candidates by actual overhead ratio")
+    require("compare_rate_de" in global_detach,
+            "global detach must sort candidates by current overhead growth rate")
     require("PEAK_GLOBAL_DETACH_MIN_CALLS" in source and
             "calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS" in global_detach and
             "continue;" in global_detach,
             "global detach must not enqueue one-shot/cold targets")
-    require("ratio_snapshot[i] <= target_profile_ratio" in global_detach and
-            "continue;" in global_detach,
-            "global detach candidates must satisfy the per-target threshold")
-    require("entries[k].ratio <= target_profile_ratio" in global_detach and
-            "break;" in global_detach,
-            "global detach loop must fail closed if a below-per-target-threshold candidate appears")
-    require(comparator.find("x->ratio") < comparator.find("x->rate"),
-            "global detach comparator must prioritize ratio before rate")
+    require("ratio_snapshot[i] <= target_profile_ratio" not in global_detach,
+            "global detach must not require candidates to exceed the per-target threshold")
+    require("entries[k].ratio <= target_profile_ratio" not in global_detach,
+            "global detach loop must not stop at the per-target threshold")
+    require("attached_global_overhead >" in global_detach and
+            "effective_global_overhead >" not in global_detach[
+                global_detach.find("if (detach_observation_ready"):
+                global_detach.find("size_t n_attached")
+            ],
+            "global detach must be driven by currently attached callback overhead, not lifetime or transition debt")
+    require("peak_general_listener_heartbeat_mutation_budget_allows" in global_detach,
+            "global detach must respect the heartbeat transition stop-window budget")
+    require("hard_transition_budget" in global_detach and
+            "projected_transition_after > hard_transition_budget" in global_detach,
+            "global detach must hard-cap projected transition stop-window overhead")
+    require("entries[k].ratio > marginal_transition_cost_ratio" in global_detach,
+            "global detach must only exceed the soft transition budget for candidates that reduce projected effective overhead")
+    require(comparator.find("x->rate") < comparator.find("x->ratio"),
+            "global detach comparator must prioritize current growth rate before lifetime ratio")
     initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")
     loop_start = heartbeat.find("while (atomic_load(&heartbeat_running))")
     require("pthread_cond_timedwait" in wait_helper,
@@ -777,13 +784,13 @@ def check_signal_backend_strict_invariants(repo_root):
             "hotloop benchmark must support backend-pinned signal stress")
     require("if args.require_reattach:" not in benchmark_runner or
             "PEAK_REATTACH_COOLDOWN_MS" not in benchmark_runner,
-            "short reattach stress runs must not hide the runtime cooldown")
+            "short reattach stress runs must not depend on deprecated reattach cooldown")
     require("PEAK_HPC_REATTACH_COOLDOWN_MS" not in benchmark_wrapper,
-            "HPC smoke wrapper must not hide the runtime reattach cooldown")
+            "HPC smoke wrapper must not depend on deprecated reattach cooldown")
     if hpc_config_path.exists():
         hpc_config = hpc_config_path.read_text(encoding="utf-8")
         require("PEAK_HPC_REATTACH_COOLDOWN_MS" not in hpc_config,
-                "HPC suite config must not hide the runtime reattach cooldown")
+                "HPC suite config must not depend on deprecated reattach cooldown")
     require("PEAK_DETACH_BACKEND=helper" in tests and
             "PEAK_DETACH_BACKEND=helper" in controller_tests_cmake,
             "fake-helper tests must force helper backend, not auto signal fallback")

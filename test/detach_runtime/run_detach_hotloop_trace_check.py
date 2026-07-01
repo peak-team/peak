@@ -77,8 +77,6 @@ def make_env(args, sample):
     )
     if args.detach_count:
         env["PEAK_DETACH_COUNT"] = args.detach_count
-    if args.reattach_cooldown_ms:
-        env["PEAK_REATTACH_COOLDOWN_MS"] = args.reattach_cooldown_ms
     if args.detach_backend:
         env["PEAK_DETACH_BACKEND"] = args.detach_backend
         if args.detach_backend == "signal":
@@ -508,7 +506,6 @@ def main():
     parser.add_argument("--stats-prefix", default="/tmp/peak-hotloop-trace-check")
     parser.add_argument("--heartbeat-interval", default="0.001")
     parser.add_argument("--hibernation-cycle", type=int, default=1)
-    parser.add_argument("--reattach-cooldown-ms", default="")
     parser.add_argument("--overhead-ratio", default="0.000001")
     parser.add_argument("--peak-cost", default="0.000000000001")
     parser.add_argument("--detach-count", default="")

@@ -46,6 +46,7 @@ typedef enum {
 typedef struct {
     void* handle;
     char* filename;
+    int flags;
 } PeakDlopenDynamicAttachRequest;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -430,16 +431,32 @@ dlopen_interceptor_retain_dynamic_handle(void* handle)
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
 
+#ifdef RTLD_NOLOAD
+static int
+dlopen_interceptor_noload_flags(int flags)
+{
+    int binding_flags = flags & RTLD_BINDING_MASK;
+
+    if (binding_flags == 0) {
+        binding_flags = RTLD_LAZY;
+    }
+
+    return RTLD_NOLOAD | binding_flags;
+}
+#endif
+
 static void*
-dlopen_interceptor_duplicate_dynamic_handle_reference(const char* filename)
+dlopen_interceptor_duplicate_dynamic_handle_reference(const char* filename,
+                                                      int flags)
 {
 #ifdef RTLD_NOLOAD
     if (filename == NULL || original_dlopen == NULL) {
         return NULL;
     }
-    return original_dlopen(filename, RTLD_NOW | RTLD_NOLOAD);
+    return original_dlopen(filename, dlopen_interceptor_noload_flags(flags));
 #else
     (void)filename;
+    (void)flags;
     return NULL;
 #endif
 }
@@ -529,6 +546,7 @@ dlopen_interceptor_pop_dynamic_attach_request(PeakDlopenDynamicAttachRequest* re
     *request = dynamic_attach_queue[dynamic_attach_queue_head];
     dynamic_attach_queue[dynamic_attach_queue_head].handle = NULL;
     dynamic_attach_queue[dynamic_attach_queue_head].filename = NULL;
+    dynamic_attach_queue[dynamic_attach_queue_head].flags = 0;
     dynamic_attach_queue_head =
         (dynamic_attach_queue_head + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
     dynamic_attach_queue_length--;
@@ -559,6 +577,7 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
         pthread_cond_signal(&dynamic_attach_gate_cond);
         request->handle = NULL;
         request->filename = NULL;
+        request->flags = 0;
         requeued = TRUE;
     } else {
         dynamic_attach_drop_requeue_count++;
@@ -584,7 +603,7 @@ dlopen_interceptor_discard_dynamic_attach_queue(void)
 static gboolean
 dlopen_interceptor_enqueue_dynamic_attach_request(
     const char* filename,
-    int binding_flags)
+    int flags)
 {
 #ifdef RTLD_NOLOAD
     gboolean can_accept;
@@ -607,7 +626,8 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
         return FALSE;
     }
 
-    retained_handle = original_dlopen(filename, binding_flags | RTLD_NOLOAD);
+    retained_handle = original_dlopen(filename,
+                                      dlopen_interceptor_noload_flags(flags));
     if (retained_handle == NULL) {
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
         dynamic_attach_drop_noload_count++;
@@ -633,6 +653,7 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
 
     dynamic_attach_queue[dynamic_attach_queue_tail].handle = retained_handle;
     dynamic_attach_queue[dynamic_attach_queue_tail].filename = filename_copy;
+    dynamic_attach_queue[dynamic_attach_queue_tail].flags = flags;
     dynamic_attach_queue_tail =
         (dynamic_attach_queue_tail + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
     dynamic_attach_queue_length++;
@@ -648,7 +669,7 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
     return TRUE;
 #else
     (void)filename;
-    (void)binding_flags;
+    (void)flags;
     return FALSE;
 #endif
 }
@@ -715,6 +736,7 @@ dlopen_interceptor_test_enqueue_dynamic_attach(
     if (dlopen_interceptor_queue_can_accept_unlocked()) {
         dynamic_attach_queue[dynamic_attach_queue_tail].handle = handle;
         dynamic_attach_queue[dynamic_attach_queue_tail].filename = filename_copy;
+        dynamic_attach_queue[dynamic_attach_queue_tail].flags = RTLD_LAZY;
         filename_copy = NULL;
         dynamic_attach_queue_tail =
             (dynamic_attach_queue_tail + 1) %
@@ -937,7 +959,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         dynamic_attach_partial_success_count++;
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
         void* hook_lifetime_handle =
-            dlopen_interceptor_duplicate_dynamic_handle_reference(request->filename);
+            dlopen_interceptor_duplicate_dynamic_handle_reference(request->filename,
+                                                                  request->flags);
         if (hook_lifetime_handle != NULL) {
             dlopen_interceptor_retain_dynamic_handle(hook_lifetime_handle);
         } else {
@@ -1076,20 +1099,17 @@ dlopen_interceptor_release_retained_dynamic_handles(void)
 
 static void*
 peak_dlopen(const char *filename, int flags) {
-    // Force eager symbol resolution to ensure target symbols are available
-    // during the hooking phase while preserving non-binding dlopen flags.
-    int binding_flags = (flags & ~RTLD_BINDING_MASK) | RTLD_NOW;
     void *handle;
 
     dlopen_interceptor_begin_replacement_call();
-    handle = original_dlopen(filename, binding_flags);
+    handle = original_dlopen(filename, flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
         dlopen_interceptor_end_replacement_call();
         return handle;
     }
 
-    if (!dlopen_interceptor_enqueue_dynamic_attach_request(filename, binding_flags)) {
+    if (!dlopen_interceptor_enqueue_dynamic_attach_request(filename, flags)) {
         gboolean should_report_overflow = FALSE;
 
         pthread_mutex_lock(&dynamic_attach_gate_mutex);

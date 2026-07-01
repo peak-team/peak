@@ -62,7 +62,6 @@ def main():
             "PEAK_OVERHEAD_RATIO": "0.01",
             "PEAK_HEARTBEAT_INTERVAL": "0.001",
             "PEAK_HIBERNATION_CYCLE": "1",
-            "PEAK_REATTACH_COOLDOWN_MS": "100",
             "PEAK_REQUIRE_SAFE_DETACH": "1",
             "PEAK_SAFE_DETACH_MODE": "strict",
             "PEAK_DETACH_TRACE_PATH": args.trace_path,

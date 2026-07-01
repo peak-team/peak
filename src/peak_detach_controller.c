@@ -3119,22 +3119,9 @@ peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
 #endif
 }
 
-static gboolean
-peak_detach_controller_trace_diagnostics_enabled(void)
-{
-    return atomic_load_explicit(&trace_diagnostics_enabled,
-                                memory_order_acquire) != 0;
-}
-
 static void
 peak_detach_controller_note_stop_window_started(void)
 {
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        held_mutation_started_at = 0.0;
-        last_stop_window_us = 0.0;
-        return;
-    }
-
     held_mutation_started_at = peak_detach_controller_monotonic_second();
     last_stop_window_us = 0.0;
 }
@@ -3142,12 +3129,6 @@ peak_detach_controller_note_stop_window_started(void)
 static void
 peak_detach_controller_note_stop_window_finished(void)
 {
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        held_mutation_started_at = 0.0;
-        last_stop_window_us = 0.0;
-        return;
-    }
-
     if (held_mutation_started_at > 0.0) {
         last_stop_window_us =
             (peak_detach_controller_monotonic_second() -
@@ -4720,10 +4701,6 @@ peak_detach_controller_last_stop_window_us(void)
     double value = 0.0;
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        return 0.0;
-    }
-
     peak_detach_controller_init_atfork_once();
     peak_detach_controller_lock_mutation_guard();
     value = last_stop_window_us;

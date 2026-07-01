@@ -496,7 +496,7 @@ void peak_init()
         (enable_reattach_env == NULL) || parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
     sig_stop_ack_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
     sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
-    hb_min_us = parse_env_to_uint_default(PEAK_HB_MIN_US_ENV, 10000);
+    hb_min_us = parse_env_to_uint_default(PEAK_HB_MIN_US_ENV, 1000);
     hb_max_us = parse_env_to_uint_default(PEAK_HB_MAX_US_ENV, 500000);
     hb_k_err = parse_env_to_double_default(PEAK_HB_K_ERR_ENV, 3.0);
     hb_k_rate = parse_env_to_double_default(PEAK_HB_K_RATE_ENV, 0.8);

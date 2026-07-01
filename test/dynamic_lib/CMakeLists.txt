@@ -3,6 +3,39 @@ cmake_minimum_required(VERSION 3.16)
 # ----- find 'make' to run your Makefile -----
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
 
+# Keep generated shared libraries, executables, objects, and Python extensions
+# in the build tree so stale source-tree artifacts cannot affect test results.
+set(DL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+set(DL_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+  add_library(lazy_undefined_fixture SHARED lazy_undefined_lib.c)
+  set_target_properties(lazy_undefined_fixture
+    PROPERTIES
+      OUTPUT_NAME lazy_undefined
+      LIBRARY_OUTPUT_DIRECTORY ${DL_DIR}
+  )
+
+  add_executable(dlopen_lazy_undefined_test dlopen_lazy_undefined_test.c)
+  set_target_properties(dlopen_lazy_undefined_test
+    PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${DL_DIR}
+  )
+  add_dependencies(dlopen_lazy_undefined_test lazy_undefined_fixture)
+
+  add_test(NAME test_dynamic_lib_lazy_dlopen_preserves_binding
+    COMMAND $<TARGET_FILE:dlopen_lazy_undefined_test>
+  )
+  set_tests_properties(test_dynamic_lib_lazy_dlopen_preserves_binding
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=lazy_profile_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_lazy_dlopen_statslog;${PRELOAD_VAR}"
+      PASS_REGULAR_EXPRESSION "lazy_profile_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
+      FAIL_REGULAR_EXPRESSION "RTLD_LAZY dlopen failed|undefined symbol|symbol lookup error"
+      TIMEOUT 20
+  )
+endif()
+
 # ----- find Python interpreter and development config used by the Makefile -----
 find_package(Python3 COMPONENTS Interpreter Development)
 if(NOT Python3_Interpreter_FOUND OR NOT Python3_Development_FOUND)
@@ -32,11 +65,6 @@ set(_MAKE_ENV
   PY_EXT_SUFFIX=${_PY_EXT_SUFFIX}
 )
 
-# Keep generated shared libraries, executables, objects, and Python extensions
-# in the build tree so stale source-tree artifacts cannot affect test results.
-set(DL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(DL_DIR "${CMAKE_CURRENT_BINARY_DIR}")
-
 # ----- build via Makefile: `make -f Makefile -j all` -----
 add_custom_target(dynamic_lib_build ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -46,6 +74,8 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/main.c
           ${DL_SRC_DIR}/customCpackage.c
           ${DL_SRC_DIR}/dlopen_flags_test.c
+          ${DL_SRC_DIR}/dlopen_lazy_undefined_test.c
+          ${DL_SRC_DIR}/lazy_undefined_lib.c
           ${DL_SRC_DIR}/dlopen_own_library.py
           ${DL_SRC_DIR}/import_customCpackage_variant.py
           ${DL_SRC_DIR}/test_customCpackage_script.sh
@@ -178,4 +208,5 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
       FAIL_REGULAR_EXPRESSION "Segmentation fault|SIGSEGV|Caught signal|Fatal error"
       TIMEOUT 20
   )
+
 endif()

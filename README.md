@@ -161,8 +161,8 @@ configuration.
 - `test/`: CTest-based unit, runtime, MPI, JIT, dynamic loading, and memory
   profiling tests.
 - `benchmarks/`: detach-controller benchmark and stress workloads.
-- `docs/`: deeper design notes for JIT profiling, strict detach, and patched
-  Frida Gum support.
+- `docs/`: deeper design notes for heartbeat overhead control, JIT profiling,
+  strict detach, and patched Frida Gum support.
 
 ## Configuration
 
@@ -416,17 +416,62 @@ Enables heartbeat-driven physical reattach after a target has been detached.
 Default: enabled. Set to `0` or `false` to keep physically detached targets
 detached until shutdown.
 
-**`PEAK_REATTACH_COOLDOWN_MS`**
-
-Minimum time a physically detached target must stay detached before heartbeat
-may reattach it again. Default: `60000` ms. This prevents hot functions from
-repeatedly re-entering profiling and thrashing detach/reattach. Set to `0` for
-aggressive test or sampling runs.
-
 **`PEAK_OVERHEAD_RATIO`**
 
-Target profiling overhead ratio. Default: `0.1`. If actual overhead exceeds
-this ratio, the monitoring process detaches to reduce overhead.
+Target profiling overhead ratio. Default: `0.1`. If PEAK's estimated profiling
+overhead exceeds this ratio, the monitoring process detaches to reduce overhead.
+
+Heartbeat-driven reattach is governed by the same overhead budget. PEAK includes
+both the projected callback cost after reattach and the measured physical
+detach/reattach stop-window cost before it re-enables profiling for a detached
+target. This prevents hot targets from oscillating between detached and
+reattached states when profiling overhead is already too high.
+
+This budget is based on PEAK's calibrated callback/profiling cost and measured
+physical mutation stop-window time. It is the controller's overhead estimate,
+not a direct promise that total wall-clock runtime will stay within the same
+percentage of a no-PEAK run for every workload.
+
+**`PEAK_GLOBAL_OVERHEAD_RATIO`**
+
+Global overhead budget used only by global heartbeat scheduling. Default: `0.1`.
+If set to `0`, global-budget scheduling is effectively disabled and global
+heartbeat cannot trigger.
+
+This is the aggregate version of `PEAK_OVERHEAD_RATIO`: it limits PEAK's
+estimated overhead across all profiled targets participating in global
+heartbeat scheduling.
+
+**`PEAK_GLOBAL_DETACH_FACTOR`**
+
+Multiplier for yielding per-target detach decisions to global scheduling.
+Default: `1.2`. Global detach starts from the aggregate attached-overhead budget
+itself; this factor controls when per-target detach backs off because effective
+global overhead exceeds
+`PEAK_GLOBAL_OVERHEAD_RATIO * PEAK_GLOBAL_DETACH_FACTOR`.
+
+**`PEAK_GLOBAL_REATTACH_FACTOR`**
+
+Multiplier for the global reattach threshold. Default: `0.85`. Global reattach is
+allowed while projected global overhead remains below
+`PEAK_GLOBAL_OVERHEAD_RATIO * PEAK_GLOBAL_REATTACH_FACTOR` and the projected
+reattach callback plus transition cost still fits the base global budget.
+
+**`PEAK_ENABLE_PER_TARGET_HEARTBEAT`**
+
+Enable per-target heartbeat scheduling. Set to `1` or `true` to enable adaptive
+per-target detach/reattach pressure; leave unset/`0` to disable it.
+
+**`PEAK_ENABLE_GLOBAL_HEARTBEAT`**
+
+Enable global overhead-aware detach/reattach scheduling. Set to `1` or `true` to
+enable. If set to `0` or unset, only per-target heartbeat (if enabled) is used.
+Set both heartbeat toggles to `0`/unset to keep the controller from driving
+heartbeat-based detach/reattach transitions.
+
+See [Heartbeat controller](docs/heartbeat-controller.md) for the detailed
+per-target/global scheduling model, transition-overhead accounting, and manual
+many-target stress validation.
 
 **`PEAK_MAX_NUM_THREADS`**
 
@@ -437,7 +482,9 @@ controller/helper/main threads fit in the snapshot table.
 **`PEAK_HB_MIN_US`**
 
 Adaptive heartbeat monitor minimum sleep interval in microseconds. Default:
-`10000`.
+`1000`. The first heartbeat sample also uses
+`min(PEAK_HEARTBEAT_INTERVAL, PEAK_HB_MIN_US)` so extremely hot targets can be
+detached before a full base heartbeat interval elapses.
 
 **`PEAK_HB_MAX_US`**
 
@@ -535,7 +582,8 @@ request_global_overhead,request_total_time,request_rate
 
 The first seven fields are stable; later fields are diagnostics.
 `request_source` records whether the pending transition came from an API
-request, explicit detach count, per-target heartbeat, or global heartbeat.
+request, explicit detach count, per-target heartbeat, global heartbeat, or
+`global-overhead-recovery`.
 
 ### Gum Prologue Safety
 
@@ -658,6 +706,11 @@ Default: 5,000,000. Initial and incremental size, in events, for the virtual
 memory buffer used to store memory profiling data. PEAK allocates this buffer in
 virtual memory and expands it by this amount when more space is needed.
 
+**`PEAK_MEMLOG_OTF2_DIR`**
+
+Directory for optional OTF2 memory trace output when memory logging is active.
+Default: current working directory (`.`).
+
 **`PEAK_MEMORY_TRACK_ALL`**
 
 Default: `FALSE`. Track all memory allocation events. If set to `TRUE`, the
@@ -692,6 +745,8 @@ export PEAK_NAME_TRUNCATE=TRUE
 
 - [JIT profiling](docs/jit-profiling.md): provider guarantees, retry behavior,
   and runtime metadata lifetime limits.
+- [Heartbeat controller](docs/heartbeat-controller.md): per-target and global
+  overhead budgets, detach/reattach probes, and stress validation.
 - [Physical detach controller](docs/physical-detach-controller.md): strict
   attach/detach/reattach and shutdown safety model.
 - [Patched Frida Gum](docs/patched-frida-gum.md): PEAK-specific Gum APIs and

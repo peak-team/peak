@@ -590,29 +590,9 @@ if(BUILD_TESTING)
                     --overhead-ratio 0.01
                     --heartbeat-interval 0.5
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-reattach-trace
-                    --reattach-cooldown-ms 100
                     --require-detach-batch-size 2
                     --require-reattach-batch-size 2)
         set_tests_properties(test_detach_hotloop_batch_reattach_strict
-            PROPERTIES
-                TIMEOUT 60
-                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
-        add_test(NAME test_detach_hotloop_reattach_cooldown_strict
-            COMMAND ${Python3_EXECUTABLE}
-                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
-                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
-                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
-                    --threads 4
-                    --seconds 2
-                    --samples 1
-                    --timeout 45
-                    --overhead-ratio 0.01
-                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-reattach-cooldown-trace
-                    --require-trace-diagnostics
-                    --reattach-cooldown-ms 60000
-                    --max-reattach-success 0
-                    --fail-on-transition-skips)
-        set_tests_properties(test_detach_hotloop_reattach_cooldown_strict
             PROPERTIES
                 TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
@@ -630,7 +610,6 @@ if(BUILD_TESTING)
                     --require-reattach
                     --require-trace-diagnostics
                     --detach-backend signal
-                    --reattach-cooldown-ms 1000
                     --fail-on-transition-skips
                     --max-reattach-classify-failed 0)
         set_tests_properties(test_detach_hotloop_signal_reattach_trace_strict
@@ -652,7 +631,6 @@ if(BUILD_TESTING)
                     --require-reattach
                     --require-trace-diagnostics
                     --detach-backend signal
-                    --reattach-cooldown-ms 1000
                     --spawn-transient-threads
                     --spawner-threads 4
                     --peak-max-threads 256
@@ -679,7 +657,6 @@ if(BUILD_TESTING)
                     --require-trace-diagnostics
                     --detach-backend helper
                     --detach-helper $<TARGET_FILE:test_peak_detach_helper>
-                    --reattach-cooldown-ms 1000
                     --helper-retry-log-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-retry
                     --spawn-transient-threads
                     --spawner-threads 4
@@ -693,6 +670,87 @@ if(BUILD_TESTING)
                 TIMEOUT 210
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
                 SKIP_RETURN_CODE 77)
+        option(PEAK_ENABLE_MANUAL_DETACH_MANY_TARGETS_STRESS
+            "Enable manual many-target strict detach heartbeat storm CTest entry" OFF)
+        if(PEAK_ENABLE_MANUAL_DETACH_MANY_TARGETS_STRESS)
+            foreach(_manual_backend IN ITEMS auto helper signal)
+                add_test(NAME manual_detach_many_targets_heartbeat_storm_${_manual_backend}
+                    COMMAND ${Python3_EXECUTABLE}
+                            ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_many_targets_stress.py
+                            --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_many_targets_stress
+                            --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                            --helper $<TARGET_FILE:test_peak_detach_helper>
+                            --backend ${_manual_backend}
+                            --threads 56
+                            --samples 1
+                            --seconds 180
+                            --targets 832
+                            --hot-targets 256
+                            --burst 128
+                            --all-target-period 0
+                            --hot-only-workload
+                            --call-cold-targets-once
+                            --peak-cost ""
+                            --overhead-ratio 0.005
+                            --global-overhead-ratio 0.05
+                            --global-detach-factor 1.2
+                            --global-reattach-factor 0.95
+                            --heartbeat-interval 0.01
+                            --sample-counts-interval-ms 100
+                            --min-trace-rows 1
+                            --min-detach-success 96
+                            --min-distinct-detached-hooks 64
+                            --min-distinct-batches 3
+                            --min-global-detach-success 64
+                            --min-global-overhead-recovery-detach-success 1
+                            --min-reattach-success 8
+                            --min-distinct-reattached-hooks 8
+                            --min-global-reattach-success 8
+                            --min-distinct-oscillating-hot-hooks 8
+                            --min-distinct-global-oscillating-hot-hooks 8
+                            --min-sampling-bins-with-reattach 2
+                            --min-post-detach-bins-with-attached-hot 2
+                            --min-sampling-reattach-span-s 10
+                            --min-reattach-sampled-cycles 8
+                            --min-distinct-reattach-sampled-hot-hooks 8
+                            --min-distinct-global-reattach-sampled-hot-hooks 8
+                            --min-reattach-sampled-span-s 10
+                            --min-reattach-sampled-call-delta-total 1000
+                            --min-strict-reattach-ordered-cycles 8
+                            --min-strict-reattach-ordered-distinct-hot-hooks 8
+                            --min-strict-global-reattach-ordered-hot-cycles 8
+                            --min-strict-global-reattach-ordered-distinct-hot-hooks 8
+                            --min-strict-reattach-ordered-call-delta-total 1000
+                            --min-strict-reattach-ordered-sample-delta-total 1000
+                            --require-peak-text-output
+                            --require-csv-report
+                            --require-shutdown-trace
+                            --max-distinct-detached-hooks 832
+                            --max-detach-success 10000
+                            --max-batch 64
+                            --max-top-hook-transition-share 0.20
+                            --max-top-global-hook-transition-share 0.10
+                            --max-reattach-success-per-sec 80
+                            --max-batches-per-sec 3.0
+                            --max-hook-oscillations 64
+                            --min-hot-profiled-targets 128
+                            --min-hot-profiled-target-ratio 0.50
+                            --max-hot-top-profiled-share 0.30
+                            --max-estimated-effective-overhead-per-sec 0.05
+                            --max-stop-window-per-sec 0.05
+                            --max-stop-window-us 2000000
+                            --min-distinct-called-targets 832
+                            --min-distinct-called-hot-targets 256
+                            --min-distinct-called-cold-targets 576
+                            --timeout 240
+                            --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/manual-many-targets-heartbeat-storm-${_manual_backend})
+                set_tests_properties(manual_detach_many_targets_heartbeat_storm_${_manual_backend}
+                    PROPERTIES
+                        LABELS "manual;stress;strict-detach"
+                        PASS_REGULAR_EXPRESSION "many_targets_stress_all_ok"
+                        TIMEOUT 300)
+            endforeach()
+        endif()
         add_test(NAME test_detach_stale_threads_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_stale_threads
                     --active-threads 8

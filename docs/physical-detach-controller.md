@@ -537,14 +537,33 @@ behavior. The code bytes are not mutated when safety was not proven.
 Shutdown uses a bounded retry loop and then fails closed by leaving listener
 state alive if safety still cannot be proven.
 
-Heartbeat-driven reattach is intentionally rate-limited separately from safety
-retries. A target that was physically detached because profiling overhead was
-too high remains detached for at least `PEAK_REATTACH_COOLDOWN_MS` before the
-heartbeat may reattach it again. The default is `60000` ms. This protects PEAK's
-physical-detach performance guarantee for extremely hot targets: once a target
-has proven too expensive, PEAK samples it only periodically instead of
-reattaching as soon as detached global overhead drops. Set the cooldown to `0`
-for aggressive resampling or focused reattach tests.
+Heartbeat-driven reattach is governed by the profiling overhead budget, not by
+a fixed wall-clock cooldown. The controller records every successful physical
+detach/reattach STOP window and folds that measured transition cost into the
+per-target and global heartbeat decisions. A detached target is only reattached
+when the projected callback overhead after reattach plus the expected physical
+mutation cost still fits inside the configured target/global overhead budgets.
+This keeps the physical-detach performance guarantee intact for extremely hot
+targets without depending on a tuning knob that can hide detach/reattach storms.
+
+Heartbeat selection is controlled by these environment variables:
+
+- `PEAK_ENABLE_PER_TARGET_HEARTBEAT` (default: off): enable per-target heartbeat
+  detach/reattach pressure using `PEAK_OVERHEAD_RATIO`.
+- `PEAK_ENABLE_GLOBAL_HEARTBEAT` (default: off): enable global-budget-driven
+  heartbeat scheduling using `PEAK_GLOBAL_OVERHEAD_RATIO`.
+- `PEAK_GLOBAL_DETACH_FACTOR` (default: `1.2`): global-detach threshold is
+  `PEAK_GLOBAL_OVERHEAD_RATIO * factor`.
+- `PEAK_GLOBAL_REATTACH_FACTOR` (default: `0.85`): projected global overhead
+  must stay below `PEAK_GLOBAL_OVERHEAD_RATIO * factor` for normal reattach.
+
+With both heartbeat modes disabled, only explicit requests and cost/target-based
+detachment paths remain active.
+
+The heartbeat budgets are based on PEAK's calibrated callback/profiling cost and
+measured physical mutation stop-window time. They are controller estimates used
+to decide when to detach or reattach hooks; they are not exact no-PEAK versus
+PEAK wall-clock slowdown measurements.
 
 The strict pthread-create gate is also bounded by
 `PEAK_STRICT_GATE_WAIT_TIMEOUT_MS` (default `10000`). The intercepted creator

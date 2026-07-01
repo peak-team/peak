@@ -19,11 +19,14 @@ LIBB_SRC := libB.c
 MAIN_SRC := main.c
 PY_SRC   := customCpackage.c
 FLAGS_TEST_SRC := dlopen_flags_test.c
+LAZY_UNDEFINED_LIB_SRC := lazy_undefined_lib.c
+LAZY_UNDEFINED_TEST_SRC := dlopen_lazy_undefined_test.c
 
 LIBA_O   := libA.pic.o
 LIBB_O   := libB.pic.o
 MAIN_O   := main.o
 PY_O     := customCpackage.pic.o
+LAZY_UNDEFINED_LIB_O := lazy_undefined_lib.pic.o
 
 # --------------------------------------------------------------------
 # Top-level
@@ -31,7 +34,7 @@ PY_O     := customCpackage.pic.o
 .PHONY: all clean explain
 all: libB.so libB.a libA_dynB.so libA_staB.so libA.a \
      main_dynA_dynB main_dynA_staB main_staA_dynB main_staA_staB \
-     dlopen_flags_test \
+     dlopen_flags_test dlopen_lazy_undefined_test \
      customCpackage_dynA_dynB$(PY_EXT_SUFFIX) \
      customCpackage_dynA_staB$(PY_EXT_SUFFIX) \
      customCpackage_staA_dynB$(PY_EXT_SUFFIX) \
@@ -64,6 +67,9 @@ $(MAIN_O): $(MAIN_SRC)
 
 $(PY_O): $(PY_SRC)
 	$(CC) $(CFLAGS) $(PY_INCLUDE) -c $< -o $@
+
+$(LAZY_UNDEFINED_LIB_O): $(LAZY_UNDEFINED_LIB_SRC)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # --------------------------------------------------------------------
 # libB: shared and static
@@ -104,6 +110,12 @@ main_staA_staB: $(MAIN_O) libA.a libB.a
 dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl
 
+liblazy_undefined.so: $(LAZY_UNDEFINED_LIB_O)
+	$(CC) $(LDSO) -o $@ $^ -Wl,-soname,liblazy_undefined.so
+
+dlopen_lazy_undefined_test: $(LAZY_UNDEFINED_TEST_SRC) liblazy_undefined.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl
+
 # --------------------------------------------------------------------
 # Python extension modules: four combinations
 # --------------------------------------------------------------------
@@ -134,4 +146,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test dlopen_lazy_undefined_test customCpackage*.so

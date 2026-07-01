@@ -36,6 +36,38 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_detach_stale_threads PRIVATE -Wl,--export-dynamic)
 endif()
 
+set(PEAK_MANY_TARGET_STRESS_TARGET_COUNT "1024" CACHE STRING
+  "Number of generated exported targets for test_detach_many_targets_stress")
+set(PEAK_MANY_TARGET_STRESS_GENERATED
+  ${CMAKE_CURRENT_BINARY_DIR}/test_detach_many_targets_generated.c)
+add_custom_command(
+  OUTPUT ${PEAK_MANY_TARGET_STRESS_GENERATED}
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/generate_many_targets_stress.py
+          --output ${PEAK_MANY_TARGET_STRESS_GENERATED}
+          --targets ${PEAK_MANY_TARGET_STRESS_TARGET_COUNT}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/generate_many_targets_stress.py
+          ${CMAKE_CURRENT_SOURCE_DIR}/test_detach_many_targets_stress_generated.h
+  VERBATIM
+)
+
+add_executable(test_detach_many_targets_stress
+  test_detach_many_targets_stress.c
+  ${PEAK_MANY_TARGET_STRESS_GENERATED})
+target_compile_definitions(test_detach_many_targets_stress
+  PRIVATE
+    PEAK_STRESS_TARGET_COUNT=${PEAK_MANY_TARGET_STRESS_TARGET_COUNT})
+target_include_directories(test_detach_many_targets_stress
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_detach_many_targets_stress PRIVATE Threads::Threads ${DL_LIBRARY})
+if(RT_LIBRARY)
+  target_link_libraries(test_detach_many_targets_stress PRIVATE ${RT_LIBRARY})
+endif()
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_detach_many_targets_stress PRIVATE -Wl,--export-dynamic)
+endif()
+
 add_executable(test_signal_timer_abi test_signal_timer_abi.c)
 if(RT_LIBRARY)
   target_link_libraries(test_signal_timer_abi PRIVATE ${RT_LIBRARY})
