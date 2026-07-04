@@ -237,6 +237,21 @@ timespec_after(struct timespec lhs, struct timespec rhs)
     return lhs.tv_nsec > rhs.tv_nsec;
 }
 
+static struct timespec
+stat_mtime_timespec(const struct stat* st)
+{
+#if defined(__APPLE__) && defined(__MACH__)
+    return st->st_mtimespec;
+#elif defined(__linux__) || defined(_GNU_SOURCE) || defined(_DEFAULT_SOURCE)
+    return st->st_mtim;
+#else
+    struct timespec result;
+    result.tv_sec = st->st_mtime;
+    result.tv_nsec = 0;
+    return result;
+#endif
+}
+
 static int
 env_u64_file_after(const char* name,
                    struct timespec threshold,
@@ -244,6 +259,7 @@ env_u64_file_after(const char* name,
 {
     const char* path = getenv(name);
     struct stat st;
+    struct timespec mtime;
     struct timespec now = { 0, 0 };
 
     if (path == NULL || path[0] == '\0') {
@@ -252,9 +268,10 @@ env_u64_file_after(const char* name,
     if (stat(path, &st) != 0) {
         return errno == ENOENT ? 0 : -1;
     }
-    if (!timespec_after(st.st_mtim, threshold) &&
+    mtime = stat_mtime_timespec(&st);
+    if (!timespec_after(mtime, threshold) &&
         (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
-         now.tv_sec - st.st_mtim.tv_sec > 5)) {
+         now.tv_sec - mtime.tv_sec > 5)) {
         return 0;
     }
 

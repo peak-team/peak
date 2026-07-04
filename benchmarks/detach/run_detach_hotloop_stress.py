@@ -378,10 +378,13 @@ def main():
     parser.add_argument("--paired-targets", action="store_true")
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
-    parser.add_argument("--fail-on-transition-skips", action="store_true",
-                        default=True)
-    parser.add_argument("--allow-transition-skips", action="store_false",
-                        dest="fail_on_transition_skips")
+    transition_skip_group = parser.add_mutually_exclusive_group()
+    transition_skip_group.add_argument("--fail-on-transition-skips",
+                                       action="store_true",
+                                       dest="fail_on_transition_skips")
+    transition_skip_group.add_argument("--allow-transition-skips",
+                                       action="store_false",
+                                       dest="fail_on_transition_skips")
     parser.add_argument("--max-classify-failed", type=int, default=-1)
     parser.add_argument("--max-prepare-failed", type=int, default=-1)
     parser.add_argument("--max-gum-failed", type=int, default=-1)
@@ -396,6 +399,7 @@ def main():
                         default="")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True)
+    parser.set_defaults(fail_on_transition_skips=True)
     args = parser.parse_args()
 
     if args.threads <= 0 or args.seconds <= 0 or args.samples <= 0:

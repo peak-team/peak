@@ -196,7 +196,10 @@ peak_runtime_atfork_child(void)
     atomic_store_explicit(&peak_heartbeat_thread_started,
                           0,
                           memory_order_release);
-    pthread_mutex_init(&peak_runtime_fork_mutex, NULL);
+    {
+        static const pthread_mutex_t reset_mutex = PTHREAD_MUTEX_INITIALIZER;
+        memcpy(&peak_runtime_fork_mutex, &reset_mutex, sizeof(reset_mutex));
+    }
     peak_runtime_fork_stopped_heartbeat = 0;
     peak_runtime_fork_stopped_controller = 0;
 }

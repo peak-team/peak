@@ -23,6 +23,9 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
     PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY ${DL_LAZY_UNDEFINED_DIR}
   )
+  if(DL_LIBRARY)
+    target_link_libraries(dlopen_lazy_undefined_test PRIVATE ${DL_LIBRARY})
+  endif()
   add_dependencies(dlopen_lazy_undefined_test lazy_undefined_fixture)
 
   add_test(NAME test_dynamic_lib_lazy_dlopen_preserves_binding

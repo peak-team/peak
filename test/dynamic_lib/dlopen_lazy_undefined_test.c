@@ -9,12 +9,6 @@ typedef int (*lazy_profile_target_fn)(int);
 int
 main(void)
 {
-    if (getenv("I_MPI_ROOT") != NULL) {
-        fprintf(stderr,
-                "skipping RTLD_LAZY unresolved-symbol probe under Intel MPI environment\n");
-        return 77;
-    }
-
     dlerror();
     void* handle = dlopen("./liblazy_undefined.so", RTLD_LAZY | RTLD_LOCAL);
     if (handle == NULL) {

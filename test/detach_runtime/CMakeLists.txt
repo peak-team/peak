@@ -7,7 +7,10 @@ target_include_directories(test_detach_hotloop
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   target_compile_definitions(test_detach_hotloop PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
 endif()
-target_link_libraries(test_detach_hotloop PRIVATE Threads::Threads ${DL_LIBRARY})
+target_link_libraries(test_detach_hotloop PRIVATE Threads::Threads)
+if(DL_LIBRARY)
+  target_link_libraries(test_detach_hotloop PRIVATE ${DL_LIBRARY})
+endif()
 if(RT_LIBRARY)
   target_link_libraries(test_detach_hotloop PRIVATE ${RT_LIBRARY})
 endif()
@@ -31,7 +34,10 @@ if(TARGET peak_detach_helper)
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)
-target_link_libraries(test_detach_stale_threads PRIVATE Threads::Threads ${DL_LIBRARY})
+target_link_libraries(test_detach_stale_threads PRIVATE Threads::Threads)
+if(DL_LIBRARY)
+  target_link_libraries(test_detach_stale_threads PRIVATE ${DL_LIBRARY})
+endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_detach_stale_threads PRIVATE -Wl,--export-dynamic)
 endif()
@@ -60,7 +66,10 @@ target_compile_definitions(test_detach_many_targets_stress
 target_include_directories(test_detach_many_targets_stress
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_detach_many_targets_stress PRIVATE Threads::Threads ${DL_LIBRARY})
+target_link_libraries(test_detach_many_targets_stress PRIVATE Threads::Threads)
+if(DL_LIBRARY)
+  target_link_libraries(test_detach_many_targets_stress PRIVATE ${DL_LIBRARY})
+endif()
 if(RT_LIBRARY)
   target_link_libraries(test_detach_many_targets_stress PRIVATE ${RT_LIBRARY})
 endif()
@@ -96,10 +105,12 @@ target_link_libraries(test_unsafe_gum_prologue_policy
   PRIVATE
     ${FRIDA_GUM_LIBRARIES}
     Threads::Threads
-    ${DL_LIBRARY}
     ${RT_LIBRARY}
     ${M_LIBRARY}
 )
+if(DL_LIBRARY)
+  target_link_libraries(test_unsafe_gum_prologue_policy PRIVATE ${DL_LIBRARY})
+endif()
 
 add_executable(test_syscall_interceptor_policy
   test_syscall_interceptor_policy.c
