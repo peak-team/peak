@@ -421,11 +421,80 @@ detached until shutdown.
 Target profiling overhead ratio. Default: `0.1`. If PEAK's estimated profiling
 overhead exceeds this ratio, the monitoring process detaches to reduce overhead.
 
-Heartbeat-driven reattach is governed by the same overhead budget. PEAK includes
-both the projected callback cost after reattach and the measured physical
-detach/reattach stop-window cost before it re-enables profiling for a detached
-target. This prevents hot targets from oscillating between detached and
-reattached states when profiling overhead is already too high.
+Normal heartbeat reattach uses the same per-target/global budget checks. PEAK
+includes both the projected callback cost after reattach and the expected
+physical detach/reattach stop-window cost before it re-enables profiling for a
+detached target through that normal path.
+
+Heartbeat-detached hot targets may instead use a bounded probe path. Probe
+reattach is rate-limited by a two-ledger model and by a per-hook detached dwell
+floor. Probe tokens pay the expected callback cost of the minimum attached
+sample window, while shared heartbeat mutation tokens pay only the current
+incremental physical stop-window cost for the actual reattach batch. The paired
+closeout detach is represented as pending/follow-up transition debt as soon as
+the probe is admitted, so it is visible to the global overhead estimate without
+requiring two stop windows to be immediately available in the shared token
+bucket. After the probe has collected calls, PEAK computes the measured
+callback exposure from that attached sample. If the sample is within the
+per-target budget, the probe is promoted back to normal attached profiling and
+the pre-reserved closeout debt is released. If that hook is carrying the probe
+wave's amortized closeout reservation while other probes in the wave still have
+zero local closeout credit, PEAK keeps the probe attached briefly with the
+reservation intact and retries the decision after those peers close out or
+promote. This prevents one cool reservation-carrying probe from releasing the
+shared closeout debt while hot peers still depend on it. If the sample is still
+hot, or if the sample is invalid, the follow-up detach
+budget remains pre-reserved and the closeout request is prioritized, but still
+goes through controller admission and strict safety. An all-closeout batch may
+bypass only the heartbeat
+burst/token pacing ledger because that physical cleanup was already admitted as
+follow-up debt; closeout batches are capped to the same small probe wave size,
+and new detach/reattach work and mixed batches remain paced. PEAK does not
+recheck that old reservation against a newer stop-window EMA before draining a
+hot closeout, because doing so can strand hot probes attached long after their
+sampling window should have closed. PEAK admits only a small probe wave per
+heartbeat, so many hot targets are sampled over time instead of being
+reattached all at once.
+This makes hot targets behave like sampled targets instead of creating an
+unlimited detach/reattach storm.
+
+The probe path also has a per-hook adaptive detached-dwell interval computed
+from the sample-exposure probe cost and the currently available heartbeat
+budget. `PEAK_REATTACH_PROBE_MIN_DETACHED_MS` sets the minimum time a
+heartbeat-detached target must stay detached before it can be reattached for a
+probe. It defaults to `5000` ms. `PEAK_REATTACH_PROBE_MAX_DETACHED_MS` caps the
+adaptive dwell and defaults to `60000` ms; set it to `0` for no adaptive cap.
+This cap is not a maximum detached duration, only the largest minimum dwell
+that PEAK will require before another sampling probe. A target can stay
+detached longer when admission or overhead budget does not allow reattach. If a
+probe shows the target is still too hot, PEAK raises that hook's detached dwell;
+cooler samples let it decay back toward the floor. Empty or invalid probe
+windows do not change the dwell. `PEAK_REATTACH_COOLDOWN_MS` is retained as a
+master-compatible hard gate and defaults to `60000` ms. This means a
+heartbeat-detached hook is not eligible for heartbeat reattach for at least 60
+seconds; after that gate opens, the adaptive probe dwell and mutation budgets
+still have to admit the sample. Set it to `0` only for aggressive stress
+testing or short controlled experiments; normal overhead control should use
+`PEAK_OVERHEAD_RATIO` and `PEAK_GLOBAL_OVERHEAD_RATIO` instead of relying on a
+very small reattach cooldown.
+
+Probe coverage does not get to reserve the shared mutation budget while the
+currently attached callback overhead is still above the global detach-pressure
+threshold. In that state PEAK spends the next safe stop-window opportunities on
+detaching more hot hooks; once attached overhead is near the configured budget,
+the same adaptive probe budget resumes reattaching detached hooks for fresh
+samples.
+
+Heartbeat physical mutations are additionally shaped by recent measured
+stop-window time. On many-target workloads PEAK allows ordinary heartbeat
+detach to use full controller-sized batches, because detach is the operation
+that removes callback overhead. The adaptive burst shaper is applied to
+reattach/probe-closeout sampling batches, where concentrating too much
+stop-the-world time would exceed the sampling budget. A deferral does not count
+as a backend failure and does not leave the controller queue stuck; PEAK
+restores the hook's last stable physical state and lets a later heartbeat retry
+when budget recovers. Requests that already reached the helper/signal backend
+still use the retry and failure-cooldown bounds below.
 
 This budget is based on PEAK's calibrated callback/profiling cost and measured
 physical mutation stop-window time. It is the controller's overhead estimate,
@@ -440,15 +509,30 @@ heartbeat cannot trigger.
 
 This is the aggregate version of `PEAK_OVERHEAD_RATIO`: it limits PEAK's
 estimated overhead across all profiled targets participating in global
-heartbeat scheduling.
+heartbeat scheduling. The global scheduler treats effective overhead as
+attached callback pressure plus measured and pending reserved physical
+transition overhead. Attached callback pressure is the larger of recent
+callback rate and cumulative attached callback ratio. The recent rate catches a
+new hot phase quickly; the cumulative ratio keeps pressure visible after an MPI
+rank reaches a collective or setup wait, where wall-clock wait time can
+otherwise hide a profiling burst that already delayed peers. Global detach
+projects recent and cumulative pressure separately and only admits candidates
+that lower the active pressure ledger. Physical transition cost is bounded
+separately by mutation tokens, burst shaping, and pending reservations. This
+prevents successful detach work from lowering the callback-cost target and
+causing a self-sustaining detach storm.
 
 **`PEAK_GLOBAL_DETACH_FACTOR`**
 
-Multiplier for yielding per-target detach decisions to global scheduling.
-Default: `1.2`. Global detach starts from the aggregate attached-overhead budget
-itself; this factor controls when per-target detach backs off because effective
-global overhead exceeds
-`PEAK_GLOBAL_OVERHEAD_RATIO * PEAK_GLOBAL_DETACH_FACTOR`.
+Multiplier for starting additional global detach pressure. Default: `1.2`.
+Per-target detach remains the local safety valve for hooks above
+`PEAK_OVERHEAD_RATIO`; it does not yield merely because global overhead is high.
+It also does not add a synthetic STOP-window estimate to the per-hook detach
+threshold, matching the original master-branch behavior: once a hook's own
+callback overhead is above the per-target budget, PEAK requests detach and lets
+the strict controller batch and safely execute the physical mutation.
+Global detach adds ranked process-wide detach candidates once attached callback
+pressure exceeds `PEAK_GLOBAL_OVERHEAD_RATIO * PEAK_GLOBAL_DETACH_FACTOR`.
 
 **`PEAK_GLOBAL_REATTACH_FACTOR`**
 
@@ -456,6 +540,56 @@ Multiplier for the global reattach threshold. Default: `0.85`. Global reattach i
 allowed while projected global overhead remains below
 `PEAK_GLOBAL_OVERHEAD_RATIO * PEAK_GLOBAL_REATTACH_FACTOR` and the projected
 reattach callback plus transition cost still fits the base global budget.
+
+**`PEAK_HEARTBEAT_MUTATION_TIMEOUT_MS`**
+
+Strict detach/reattach acquisition timeout for heartbeat-triggered physical
+mutations. Default: `1000` ms. This bounds STOP/classification/evacuation
+attempts so failed heartbeat mutations cannot spend many fresh timeout windows.
+Once PEAK has stopped target threads, release/resume is mandatory cleanup and
+uses a fresh cleanup lease with the same timeout budget as the heartbeat
+mutation request. Explicit API requests, detach-count requests, and shutdown use
+the conservative controller timeout throughout. This timeout is an acquisition
+lease, not the cost charged to heartbeat pacing; the scheduler still charges
+predicted/measured STOP-window time and caps bootstrap batch cost separately.
+
+**`PEAK_HEARTBEAT_MUTATION_MAX_RETRY_COUNT`**,
+**`PEAK_HEARTBEAT_MUTATION_MAX_PENDING_AGE_MS`**,
+**`PEAK_HEARTBEAT_MUTATION_FAILURE_COOLDOWN_MS`**
+
+Bounds for failed heartbeat-triggered physical mutations. Defaults are `3`
+retries, `5000` ms pending age, and `30000` ms per-hook failure cooldown. These
+knobs limit failed transition storms; they do not disable successful reattach
+sampling for hooks that are safe to mutate. See
+[`docs/heartbeat-controller.md`](docs/heartbeat-controller.md) for the full
+per-target/global heartbeat model. In `auto` backend mode, PEAK still tries the
+helper first, but a slow successful helper stop window can demote later auto
+mutations to the signal backend so hot hooks are not left attached while the
+heartbeat waits for helper-transition debt to recover.
+
+**`PEAK_AUTO_HELPER_PERF_FALLBACK_STOP_WINDOW_US`**
+
+Stop-window threshold for that auto-mode helper performance demotion. Default:
+`5000` microseconds. Set to `0` to disable performance-based demotion. This does
+not make auto signal-first: the first physical mutation still tries the helper
+unless helper use is known to be impossible, but later auto mutations use the
+signal backend after a successful helper stop window exceeds this threshold.
+
+**`PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS`**
+
+Conservative helper/signal controller I/O timeout for non-heartbeat strict
+detach operations. Default: `10000` ms.
+
+**`PEAK_DETACH_HELPER_SPAWN`**
+
+Controls how PEAK starts the external strict-detach helper. The default is a
+plain `fork()` launch path. `PEAK_DETACH_BACKEND=helper` may warm the helper
+eagerly. Strict `auto` remains helper-first for the first real mutation, but it
+does not pre-spawn helpers during PEAK initialization; that avoids a
+rank-wide helper startup storm before user work begins. Set
+`PEAK_DETACH_HELPER_SPAWN=clone-vfork` only as a
+diagnostic/compatibility escape hatch for the Linux no-atfork shared-VM launch
+path.
 
 **`PEAK_ENABLE_PER_TARGET_HEARTBEAT`**
 
@@ -583,7 +717,10 @@ request_global_overhead,request_total_time,request_rate
 The first seven fields are stable; later fields are diagnostics.
 `request_source` records whether the pending transition came from an API
 request, explicit detach count, per-target heartbeat, global heartbeat, or
-`global-overhead-recovery`.
+`global-overhead-recovery`. Signal backend diagnostics may also emit rows with
+`symbol=__peak_signal` and `operation=signal`; these record bounded stop,
+evacuation, and release phases for hang diagnosis and are not target-hook
+transition rows.
 
 ### Gum Prologue Safety
 

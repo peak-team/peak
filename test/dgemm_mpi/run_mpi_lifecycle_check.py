@@ -133,6 +133,7 @@ def parse_args():
             "finalize-clean-output-socket-token-mismatch-no-fallback",
             "finalize-socket-post-work",
             "finalize-defer-post-work",
+            "startup-calibration-no-helper",
             "finalize-nonzero",
             "subset-finalize-nonzero",
             "subset-finalize-clean",
@@ -201,6 +202,7 @@ def main():
     expected_extra = []
     forbidden_output = []
     done_file = None
+    helper_log_path = None
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -318,6 +320,27 @@ def main():
         expected_peak_tables = 0
         expected_stats_files = nprocs
         expected_min_target_count = nprocs * (16 + 32)
+    elif args.mode == "startup-calibration-no-helper":
+        if not env.get("PEAK_DETACH_HELPER"):
+            raise AssertionError(
+                "startup-calibration-no-helper requires PEAK_DETACH_HELPER"
+            )
+        env["PEAK_TARGET"] = "peak_mpi_exit_target"
+        env["PEAK_MPI_EXIT_LOOPS"] = "1"
+        env["PEAK_ENABLE_PER_TARGET_HEARTBEAT"] = "0"
+        env["PEAK_ENABLE_GLOBAL_HEARTBEAT"] = "0"
+        env["PEAK_ENABLE_REATTACH"] = "0"
+        env["PEAK_COST"] = "0"
+        env["PEAK_HEARTBEAT_INTERVAL"] = "0.001"
+        env["PEAK_HIBERNATION_CYCLE"] = "1"
+        env["PEAK_REQUIRE_SAFE_DETACH"] = "1"
+        env["PEAK_SAFE_DETACH_MODE"] = "strict"
+        env["PEAK_DETACH_BACKEND"] = "auto"
+        env["PEAK_OUTPUT_AGGREGATION"] = "rank-local"
+        app_args.append("finalize-then-exit0")
+        expected = "Aggregate output is disabled for strict teardown"
+        expected_peak_tables = 0
+        expected_stats_files = nprocs
     elif args.mode == "finalize-nonzero":
         app_args.append("finalize-then-exit1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -404,6 +427,14 @@ def main():
     ) as stats_dir:
         stats_prefix = str(Path(stats_dir) / "peak-stats")
         env["PEAK_STATSLOG_PATH"] = stats_prefix
+        if args.mode == "startup-calibration-no-helper":
+            helper_log_path = Path(stats_dir) / "peak-helper-calibration.log"
+            try:
+                helper_log_path.unlink()
+            except FileNotFoundError:
+                pass
+            env["FAKE_DETACH_HELPER_LOG"] = str(helper_log_path)
+            env["FAKE_DETACH_HELPER_TRUNCATE_LOG_ON_START"] = "1"
         returncode, output, timed_out = run_mpi_command(
             command,
             env=env,
@@ -422,6 +453,12 @@ def main():
             stats_rows.extend(rows)
             if re.search(r"-exec[0-9]+\.csv$", path.name):
                 exec_checkpoint_rows.extend(rows)
+        helper_log_text = ""
+        if helper_log_path is not None and helper_log_path.exists():
+            helper_log_text = helper_log_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
     sys.stdout.write(output)
     if done_file is not None:
         try:
@@ -441,6 +478,11 @@ def main():
             raise AssertionError(f"unexpected PEAK diagnostic: {forbidden}")
     if args.require_pinned_finalize and "Leaving PEAK target hooks pinned" not in output:
         raise AssertionError("missing pinned-finalize diagnostic")
+    if args.mode == "startup-calibration-no-helper" and "START" in helper_log_text:
+        raise AssertionError(
+            "MPI startup overhead calibration unexpectedly started "
+            f"the detach helper; log={helper_log_text!r}"
+        )
     for function_name in args.forbid_stats_function:
         if f'"{function_name}",' in stats_text:
             raise AssertionError(f"unexpected stats row for {function_name}")

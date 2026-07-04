@@ -87,6 +87,11 @@ def make_env(args, sample):
     if args.helper_retry_log_prefix:
         env["G_TEST_PEAK_DETACH_HELPER_STOP_RETRY_ONCE"] = "1"
         env["G_TEST_PEAK_DETACH_HELPER_RETRY_LOG"] = helper_retry_log_path(args, sample)
+    if args.helper_verify_retry_log_prefix:
+        env["G_TEST_PEAK_DETACH_HELPER_VERIFY_UNSTOPPED_ONCE"] = "1"
+        env["G_TEST_PEAK_DETACH_HELPER_RETRY_LOG"] = (
+            helper_verify_retry_log_path(args, sample)
+        )
     if args.trace_prefix:
         env["PEAK_DETACH_TRACE_PATH"] = f"{args.trace_prefix}-{sample}.csv"
     return env
@@ -104,8 +109,18 @@ def helper_retry_log_path(args, sample):
     return f"{args.helper_retry_log_prefix}-{sample}.log"
 
 
+def helper_verify_retry_log_path(args, sample):
+    if not args.helper_verify_retry_log_prefix:
+        return None
+    return f"{args.helper_verify_retry_log_prefix}-{sample}.log"
+
+
 def reset_trace(args, sample):
-    for path in (trace_path(args, sample), helper_retry_log_path(args, sample)):
+    for path in (
+        trace_path(args, sample),
+        helper_retry_log_path(args, sample),
+        helper_verify_retry_log_path(args, sample),
+    ):
         if not path:
             continue
         try:
@@ -115,14 +130,24 @@ def reset_trace(args, sample):
 
 
 def helper_retry_was_exercised(args, sample):
-    path = helper_retry_log_path(args, sample)
-    if not path:
+    paths = [
+        path
+        for path in (
+            helper_retry_log_path(args, sample),
+            helper_verify_retry_log_path(args, sample),
+        )
+        if path
+    ]
+    if not paths:
         return True
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return "stop_snapshot_retry" in handle.read()
-    except OSError:
-        return False
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                if "stop_snapshot_retry" not in handle.read():
+                    return False
+        except OSError:
+            return False
+    return True
 
 
 def trace_row_has_diagnostics(fields, expected_last_retry_status=None):
@@ -542,6 +567,7 @@ def main():
                         default="")
     parser.add_argument("--detach-helper", default="")
     parser.add_argument("--helper-retry-log-prefix", default="")
+    parser.add_argument("--helper-verify-retry-log-prefix", default="")
     parser.add_argument("--skip-helper-unavailable", action="store_true")
     parser.add_argument("--trace-prefix", default="")
     parser.set_defaults(enable_reattach=True, enable_per_target_heartbeat=True)

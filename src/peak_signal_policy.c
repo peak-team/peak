@@ -1177,17 +1177,47 @@ peak_signal_policy_cookie_matches_async(const siginfo_t* info,
                                         int epoch,
                                         pid_t tid)
 {
+    int decoded_epoch = 0;
+
+    if (!peak_signal_policy_cookie_decode_epoch_async(info,
+                                                      tid,
+                                                      &decoded_epoch)) {
+        return 0;
+    }
+    return decoded_epoch == epoch;
+}
+
+int
+peak_signal_policy_cookie_decode_epoch_async(const siginfo_t* info,
+                                             pid_t tid,
+                                             int* epoch_out)
+{
     if (info == NULL || info->si_code != SI_QUEUE ||
         info->si_pid != getpid() || info->si_uid != getuid()) {
         return 0;
     }
-    unsigned long cookie =
-        peak_signal_policy_cookie_for_preinitialized(epoch, tid);
-    if (cookie == 0) {
+    unsigned long base =
+        atomic_load_explicit(&cookie_base, memory_order_acquire);
+    if (base == 0) {
         return 0;
     }
-    return (unsigned long)(uintptr_t)info->si_value.sival_ptr ==
-           cookie;
+    unsigned long t = (unsigned long)(uint32_t)tid;
+    unsigned long decoded =
+        ((unsigned long)(uintptr_t)info->si_value.sival_ptr) ^
+        base ^
+        (t * 0x45d9f3bu);
+    if ((decoded & 0xfffffffful) != 0) {
+        return 0;
+    }
+
+    uint32_t epoch = (uint32_t)(decoded >> 32);
+    if (epoch == 0 || epoch > (uint32_t)INT_MAX) {
+        return 0;
+    }
+    if (epoch_out != NULL) {
+        *epoch_out = (int)epoch;
+    }
+    return 1;
 }
 
 void

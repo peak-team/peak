@@ -887,9 +887,9 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         if (!peak_general_listener_attach_target_is_supported(
                 peak_hook_strings[i],
                 dynamic_hook_address)) {
-            g_printerr("[peak] skipping dynamic Gum attach for hook %lu (%s): unsafe Gum prologue\n",
-                       (unsigned long)i,
-                       peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>");
+            peak_log_debug("[peak] skipping dynamic Gum attach for hook %lu (%s): unsupported target prologue\n",
+                           (unsigned long)i,
+                           peak_hook_strings[i] != NULL ? peak_hook_strings[i] : "<unknown>");
             continue;
         }
         char* demangled = cxa_demangle(peak_hook_strings[i]);
@@ -1141,27 +1141,42 @@ int dlopen_interceptor_attach()
     }
     if (!peak_general_listener_attach_target_is_supported("dlopen",
                                                           dlopen_hook_address)) {
-        g_printerr("[peak] skipping dlopen Gum replace: unsupported target prologue\n");
+        if (peak_general_listener_should_log_attach_diagnostic()) {
+            g_printerr("[peak] skipping dlopen Gum replace: unsupported target prologue\n");
+        }
         g_object_unref(dlopen_interceptor);
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
         return replace_check;
     }
 
+    gboolean startup_replace_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
     PeakDetachRequest mutation_request = {
         .hook_id = 0,
         .symbol_name = "dlopen",
         .function_address = dlopen_hook_address,
         .interceptor = dlopen_interceptor,
         .listener = NULL,
-        .operation = PEAK_DETACH_OPERATION_REPLACE
+        .operation = PEAK_DETACH_OPERATION_REPLACE,
+        .avoid_external_helper = TRUE
     };
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
-    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+    /*
+     * This replacement is installed during PEAK startup.  If the process is
+     * still single-threaded, direct Gum replacement matches the historical
+     * startup path and avoids signal-stopping a rank while libc/loader state
+     * is still being initialized.  Once another thread exists, keep strict
+     * controller ownership of the mutation.
+     */
+    if (!startup_replace_can_skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
-        g_printerr("[peak] skipping dlopen Gum replace: %s\n",
-                   peak_detach_controller_status_string(detach_status));
+        if (peak_general_listener_should_log_attach_diagnostic()) {
+            g_printerr("[peak] skipping dlopen Gum replace: %s\n",
+                       peak_detach_controller_status_string(detach_status));
+        }
         g_object_unref(dlopen_interceptor);
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
@@ -1175,7 +1190,8 @@ int dlopen_interceptor_attach()
                                                  (gpointer*)(&original_dlopen),
                                                  NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
-    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+    if (!startup_replace_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish("dlopen replace finish",
                                                         detach_status);

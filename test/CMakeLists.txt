@@ -144,6 +144,8 @@ if(BUILD_TESTING)
         set(UNSAFE_GUM_PROLOGUE_CONSERVATIVE_ALLOWED_CASES)
         set(UNSAFE_GUM_PROLOGUE_NO_POLICY_SKIP_CASES)
         set(UNSAFE_GUM_PROLOGUE_OVERRIDE_CASES)
+        set(UNSAFE_GUM_PROLOGUE_DIAGNOSTIC_CASE)
+        set(UNSAFE_GUM_PROLOGUE_DIAGNOSTIC_POLICY "default")
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             list(APPEND UNSAFE_GUM_PROLOGUE_GUARD_CASES
                 "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target"
@@ -180,6 +182,8 @@ if(BUILD_TESTING)
                 "x86_dl_sub_zero|peak_unsafe_gum_x86_dl_sub_zero_target|72"
                 "x86_edx_sub_zero|peak_unsafe_gum_x86_edx_sub_zero_target|72"
                 "x86_dl_mov_zero|peak_unsafe_gum_x86_dl_mov_zero_target|72")
+            set(UNSAFE_GUM_PROLOGUE_DIAGNOSTIC_CASE
+                "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target")
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
             list(APPEND UNSAFE_GUM_PROLOGUE_ALLOWED_CASES
                 "arm64_ip_counter|peak_unsafe_gum_arm64_ip_counter_target"
@@ -191,6 +195,9 @@ if(BUILD_TESTING)
                 "arm64_ip_x17_counter|peak_unsafe_gum_arm64_ip_x17_counter_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_CONSERVATIVE_GUARD_CASES
                 "arm64_ip_cursor|peak_unsafe_gum_arm64_ip_cursor_target")
+            set(UNSAFE_GUM_PROLOGUE_DIAGNOSTIC_CASE
+                "arm64_ip_cursor|peak_unsafe_gum_arm64_ip_cursor_target")
+            set(UNSAFE_GUM_PROLOGUE_DIAGNOSTIC_POLICY "conservative")
         endif()
 
         foreach(_unsafe_case IN LISTS UNSAFE_GUM_PROLOGUE_GUARD_CASES)
@@ -404,6 +411,33 @@ if(BUILD_TESTING)
                 TIMEOUT 30
                 PASS_REGULAR_EXPRESSION "signal_bad_cookie_ok.*contamination_seen=1.*detach_blocked=1")
 
+        add_test(NAME test_detach_hotloop_signal_stale_cookie_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-stale-cookie-check)
+        set_tests_properties(test_detach_hotloop_signal_stale_cookie_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-stale-cookie-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_stale_cookie_ok.*stale_ignored=1.*detach_success=1.*unexpected_count=0.*stale_count_delta=[1-9][0-9]*")
+
+        add_test(NAME test_detach_hotloop_signal_stale_cookie_during_stop_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-stale-cookie-during-stop-check)
+        set_tests_properties(test_detach_hotloop_signal_stale_cookie_during_stop_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-stale-cookie-during-stop-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_stale_cookie_during_stop_ok.*stale_ignored=1.*detach_success=1.*reattach_success=1.*unexpected_count=0.*stale_count_delta=[1-9][0-9]*")
+
+        add_test(NAME test_detach_hotloop_signal_future_cookie_during_stop_strict
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --signal-future-cookie-during-stop-check)
+        set_tests_properties(test_detach_hotloop_signal_future_cookie_during_stop_strict
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=64;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-future-cookie-during-stop-trace.csv;${PRELOAD_VAR}"
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "signal_future_cookie_during_stop_ok.*contamination_seen=1.*reattach_blocked=1.*unexpected_count_delta=[1-9][0-9]*.*stale_count_delta=0")
+
         add_test(NAME test_detach_hotloop_signal_pthread_create_gate_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                     --pthread-gate-race-check
@@ -411,9 +445,9 @@ if(BUILD_TESTING)
                     --creator-threads 4)
         set_tests_properties(test_detach_hotloop_signal_pthread_create_gate_strict
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_ENABLE_STRICT_GATE_DELAY=1;PEAK_TEST_STRICT_GATE_DELAY_US=250000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-pthread-create-gate-trace.csv;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_ENABLE_STRICT_GATE_DELAY=1;PEAK_TEST_STRICT_GATE_DELAY_US=1000000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-pthread-create-gate-trace.csv;${PRELOAD_VAR}"
                 TIMEOUT 60
-                PASS_REGULAR_EXPRESSION "pthread_gate_race_ok.*gate_waiters_ok=1.*create_attempted_during_gate=4.*child_started_while_gate=0")
+                PASS_REGULAR_EXPRESSION "pthread_gate_race_ok.*creation_blocked_ok=1.*child_started_while_gate=0")
 
         add_test(NAME test_detach_hotloop_batch_strict
             COMMAND ${Python3_EXECUTABLE}
@@ -455,7 +489,7 @@ if(BUILD_TESTING)
                     --global-overhead-ratio 0.000001
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-global-source-trace
                     --require-trace-diagnostics
-                    --require-detach-source global-heartbeat
+                    --require-detach-source global-overhead-recovery
                     --min-detach-request-calls 1
                     --fail-on-transition-skips)
         set_tests_properties(test_detach_hotloop_global_source_strict
@@ -481,7 +515,7 @@ if(BUILD_TESTING)
                     --global-overhead-ratio 0.000001
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-global-cold-trace
                     --require-trace-diagnostics
-                    --require-detach-source global-heartbeat
+                    --require-detach-source global-overhead-recovery
                     --min-detach-request-calls 1
                     --fail-on-transition-skips)
         set_tests_properties(test_detach_hotloop_global_ignores_cold_one_shot_strict
@@ -525,22 +559,67 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_CONTROLLER_MAX_PENDING_AGE_MS=20;PEAK_CONTROLLER_MAX_RETRY_COUNT=0;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_no_trace_pending_age_ok"
+                    FAIL_REGULAR_EXPRESSION "Abandoning .* for hook"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_hotloop_trace_retry_abandoned_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --controller-trace-retry-abandoned-check)
+            set_tests_properties(test_detach_hotloop_trace_retry_abandoned_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_CONTROLLER_MAX_PENDING_AGE_MS=20;PEAK_CONTROLLER_MAX_RETRY_COUNT=0;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-trace-retry-abandoned.csv;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "controller_trace_retry_abandoned_ok"
+                    FAIL_REGULAR_EXPRESSION "Abandoning .* for hook"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_hotloop_trace_heartbeat_retry_abandoned_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --controller-trace-heartbeat-retry-abandoned-check)
+            set_tests_properties(test_detach_hotloop_trace_heartbeat_retry_abandoned_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_HEARTBEAT_MUTATION_MAX_PENDING_AGE_MS=20;PEAK_HEARTBEAT_MUTATION_MAX_RETRY_COUNT=0;PEAK_HEARTBEAT_MUTATION_FAILURE_COOLDOWN_MS=1000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-trace-heartbeat-retry-abandoned.csv;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "controller_trace_heartbeat_retry_abandoned_ok"
+                    FAIL_REGULAR_EXPRESSION "Abandoning .* for hook"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_hotloop_trace_heartbeat_pacing_deferred_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --controller-trace-heartbeat-pacing-deferred-check)
+            set_tests_properties(test_detach_hotloop_trace_heartbeat_pacing_deferred_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.000001;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_HEARTBEAT_MUTATION_MAX_RETRY_COUNT=0;PEAK_HEARTBEAT_MUTATION_FAILURE_COOLDOWN_MS=1000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-trace-heartbeat-pacing-deferred.csv;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "controller_trace_heartbeat_pacing_deferred_ok"
+                    FAIL_REGULAR_EXPRESSION "Abandoning .* for hook"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_hotloop_trace_heartbeat_bootstrap_pacing_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --controller-trace-heartbeat-bootstrap-pacing-check)
+            set_tests_properties(test_detach_hotloop_trace_heartbeat_bootstrap_pacing_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_OVERHEAD_RATIO=0.005;PEAK_GLOBAL_OVERHEAD_RATIO=0.05;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;PEAK_HEARTBEAT_MUTATION_TIMEOUT_MS=250;PEAK_HEARTBEAT_MUTATION_MAX_RETRY_COUNT=0;PEAK_HEARTBEAT_MUTATION_FAILURE_COOLDOWN_MS=1000;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-trace-heartbeat-bootstrap-pacing.csv;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "controller_trace_heartbeat_bootstrap_pacing_ok"
+                    FAIL_REGULAR_EXPRESSION "late-bootstrap heartbeat detach was pacing-blocked|pacing-deferred"
                     TIMEOUT 30)
             add_test(NAME test_detach_helper_warmup_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                         --helper-warmup-check)
             set_tests_properties(test_detach_helper_warmup_strict
                 PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-helper-warmup.log;FAKE_DETACH_HELPER_TRUNCATE_LOG_ON_START=1;${PRELOAD_VAR}"
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-helper-warmup.log;FAKE_DETACH_HELPER_TRUNCATE_LOG_ON_START=1;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "helper_warmup_ok"
                     TIMEOUT 30)
-            add_test(NAME test_detach_helper_warmup_failure_latch_strict
+            add_test(NAME test_detach_auto_deferred_helper_first_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
-                        --helper-warmup-failure-latch-check)
-            set_tests_properties(test_detach_helper_warmup_failure_latch_strict
+                        --auto-deferred-helper-first-check)
+            set_tests_properties(test_detach_auto_deferred_helper_first_strict
                 PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=handshake-fail;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-helper-warmup-failure.log;${PRELOAD_VAR}"
-                    PASS_REGULAR_EXPRESSION "helper_warmup_failure_latch_ok"
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=stop-permission;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-auto-deferred-helper-first.log;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "auto_deferred_helper_first_ok"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_auto_deferred_helper_success_strict
+                COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --auto-deferred-helper-first-check)
+            set_tests_properties(test_detach_auto_deferred_helper_success_strict
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-auto-deferred-helper-success.log;PEAK_TEST_AUTO_DEFERRED_EXPECT_EVACUATE=1;${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "auto_deferred_helper_first_ok"
                     TIMEOUT 30)
             add_test(NAME test_detach_hotloop_reattach_entry_byte_gum_pc_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
@@ -670,6 +749,28 @@ if(BUILD_TESTING)
                 TIMEOUT 210
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
                 SKIP_RETURN_CODE 77)
+        add_test(NAME test_detach_hotloop_helper_verify_unstopped_retry_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 90
+                    --overhead-ratio 0.000001
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-verify-unstopped-retry-trace
+                    --require-trace-diagnostics
+                    --detach-backend helper
+                    --detach-helper $<TARGET_FILE:test_peak_detach_helper>
+                    --helper-verify-retry-log-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-verify-unstopped-retry
+                    --disable-reattach
+                    --skip-helper-unavailable)
+        set_tests_properties(test_detach_hotloop_helper_verify_unstopped_retry_strict
+            PROPERTIES
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77)
         option(PEAK_ENABLE_MANUAL_DETACH_MANY_TARGETS_STRESS
             "Enable manual many-target strict detach heartbeat storm CTest entry" OFF)
         if(PEAK_ENABLE_MANUAL_DETACH_MANY_TARGETS_STRESS)
@@ -688,43 +789,76 @@ if(BUILD_TESTING)
                             --hot-targets 256
                             --burst 128
                             --all-target-period 0
-                            --hot-only-workload
-                            --call-cold-targets-once
+                            --hot-rotation-period-us 50000
+                            --active-hot-targets 64
+                            --cold-sweep-period 4096
                             --peak-cost ""
                             --overhead-ratio 0.005
                             --global-overhead-ratio 0.05
                             --global-detach-factor 1.2
                             --global-reattach-factor 0.95
                             --heartbeat-interval 0.01
-                            --sample-counts-interval-ms 100
+                            --extra-env PEAK_HEARTBEAT_MUTATION_FAILURE_COOLDOWN_MS=0
+                            --sample-counts-interval-ms 50
                             --min-trace-rows 1
-                            --min-detach-success 96
+                            --min-total-calls 20000000
+                            --min-rotating-hot-calls 1000000
+                            --min-cold-sweep-calls 1000
+                            --max-reattached-cold-hooks 0
+                            --min-detach-success 128
                             --min-distinct-detached-hooks 64
                             --min-distinct-batches 3
                             --min-global-detach-success 64
-                            --min-global-overhead-recovery-detach-success 1
-                            --min-reattach-success 8
-                            --min-distinct-reattached-hooks 8
-                            --min-global-reattach-success 8
-                            --min-distinct-oscillating-hot-hooks 8
-                            --min-distinct-global-oscillating-hot-hooks 8
-                            --min-sampling-bins-with-reattach 2
-                            --min-post-detach-bins-with-attached-hot 2
-                            --min-sampling-reattach-span-s 10
-                            --min-reattach-sampled-cycles 8
-                            --min-distinct-reattach-sampled-hot-hooks 8
-                            --min-distinct-global-reattach-sampled-hot-hooks 8
-                            --min-reattach-sampled-span-s 10
+                            --min-first-global-detach-batch-size 32
+                            --min-first-global-detach-batch-hot-hooks 32
+                            --max-first-global-detach-batch-time-s 5
+                            --min-global-detached-hot-hooks 64
+                            --min-global-reattached-hot-hooks 64
+                            --min-global-oscillating-hot-hooks 64
+                            --max-global-overhead-recovery-detach-success 64
+                            --min-reattach-success 64
+                            --min-distinct-reattached-hooks 64
+                            --min-global-reattach-success 64
+                            --min-reattach-success-per-sec 0.05
+                            --min-distinct-oscillating-hot-hooks 64
+                            --min-distinct-global-oscillating-hot-hooks 64
+                            --min-sampling-bins-with-reattach 8
+                            --min-sampling-bins-with-hot-reattach 8
+                            --min-sampling-bins-with-global-hot-reattach 8
+                            --global-hot-reattach-final-window-s 30
+                            --min-global-hot-reattach-final-window 8
+                            --min-global-hot-reattach-final-window-distinct-hooks 8
+                            --max-global-hot-reattach-gap-s 30
+                            --min-post-detach-bins-with-attached-hot 8
+                            --min-sampling-reattach-span-s 60
+                            --min-reattach-sampled-cycles 64
+                            --min-distinct-reattach-sampled-hot-hooks 64
+                            --min-distinct-global-reattach-sampled-hot-hooks 64
+                            --min-global-hot-probe-detached-dwell-count 128
+                            --min-probe-detached-dwell-s 4.5
+                            --min-probe-dwell-hot-increases 128
+                            --min-probe-dwell-hot-increase-hot-hooks 128
+                            --min-probe-dwell-hot-increase-global-hot-hooks 64
+                            --max-probe-dwell-invalid-count 0
+                            --min-trace-ordered-reattach-cycles 128
+                            --min-trace-ordered-reattach-distinct-hot-hooks 128
+                            --min-trace-ordered-global-hot-reattach-cycles 64
+                            --min-trace-ordered-global-hot-reattach-distinct-hooks 64
+                            --min-reattach-sampled-span-s 60
                             --min-reattach-sampled-call-delta-total 1000
-                            --min-strict-reattach-ordered-cycles 8
-                            --min-strict-reattach-ordered-distinct-hot-hooks 8
-                            --min-strict-global-reattach-ordered-hot-cycles 8
-                            --min-strict-global-reattach-ordered-distinct-hot-hooks 8
+                            --min-strict-reattach-ordered-cycles 4
+                            --min-strict-reattach-ordered-distinct-hot-hooks 4
+                            --min-strict-global-reattach-ordered-hot-cycles 4
+                            --min-strict-global-reattach-ordered-distinct-hot-hooks 4
                             --min-strict-reattach-ordered-call-delta-total 1000
-                            --min-strict-reattach-ordered-sample-delta-total 1000
+                            --min-strict-reattach-ordered-sample-delta-total 1
+                            --min-strict-reattach-ordered-sample-bins 1
                             --require-peak-text-output
                             --require-csv-report
                             --require-shutdown-trace
+                            --require-exact-shutdown-trace
+                            --require-single-stats-file
+                            --fail-on-malformed-csv-report
                             --max-distinct-detached-hooks 832
                             --max-detach-success 10000
                             --max-batch 64
@@ -733,11 +867,21 @@ if(BUILD_TESTING)
                             --max-reattach-success-per-sec 80
                             --max-batches-per-sec 3.0
                             --max-hook-oscillations 64
-                            --min-hot-profiled-targets 128
-                            --min-hot-profiled-target-ratio 0.50
+                            --max-pacing-blocked 32
+                            --max-global-no-admission 32
+                            --min-hot-profiled-targets 192
+                            --min-hot-profiled-target-ratio 0.75
+                            --min-hot-total-coverage 0.000001
                             --max-hot-top-profiled-share 0.30
-                            --max-estimated-effective-overhead-per-sec 0.05
+                            --min-liveness-samples 8
+                            --min-liveness-window-count 3
+                            --max-liveness-final-effective-overhead 0.06
+                            --max-liveness-window-avg-effective-overhead 0.06
+                            --max-liveness-window-max-effective-overhead 0.06
                             --max-stop-window-per-sec 0.05
+                            --max-stop-window-bin-per-sec 0.30
+                            --max-stop-window-over-budget-bins 0
+                            --max-consecutive-stop-window-over-budget-bins 0
                             --max-stop-window-us 2000000
                             --min-distinct-called-targets 832
                             --min-distinct-called-hot-targets 256
@@ -815,6 +959,7 @@ if(BUILD_TESTING)
                     --timeout 90
                     --stale-threads 48
                     --stale-calls 2048
+                    --overhead-ratio 0.25
                     --
                     --active-threads 16
                     --stale-threads 48
@@ -825,6 +970,7 @@ if(BUILD_TESTING)
                     --request-detach-after-start)
         set_tests_properties(test_detach_stale_threads_reattach_strict
             PROPERTIES
+                ENVIRONMENT "PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper"
                 PASS_REGULAR_EXPRESSION "stale_threads_trace_check_ok"
                 TIMEOUT 100)
     endif()
@@ -1161,6 +1307,25 @@ if(BUILD_TESTING)
                     --mode finalize-defer-post-work
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET test_detach_fake_helper)
+            add_test(NAME test_mpi_startup_calibration_does_not_start_helper
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                        --mpiexec ${MPIEXEC_EXECUTABLE}
+                        --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                        --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                        --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --mode startup-calibration-no-helper
+                        --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                        --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
+                        --timeout 20)
+            set_tests_properties(test_mpi_startup_calibration_does_not_start_helper
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;PEAK_TEST_PTRACE_SCOPE=0;FAKE_DETACH_HELPER_SCENARIO=success-zero"
+                    PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=startup-calibration-no-helper"
+            )
+        endif()
         add_test(NAME test_mpi_finalize_then_nonzero_exit
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py

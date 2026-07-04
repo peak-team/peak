@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--stale-threads", type=int, required=True)
     parser.add_argument("--stale-calls", type=int, required=True)
+    parser.add_argument("--overhead-ratio", default="0.01")
     parser.add_argument("program_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -57,9 +58,10 @@ def main():
             "PEAK_TARGET": "peak_detach_stale_target",
             "PEAK_MAX_NUM_THREADS": "192",
             "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "1",
+            "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
             "PEAK_ENABLE_REATTACH": "1",
             "PEAK_COST": "0.0000001",
-            "PEAK_OVERHEAD_RATIO": "0.01",
+            "PEAK_OVERHEAD_RATIO": args.overhead_ratio,
             "PEAK_HEARTBEAT_INTERVAL": "0.001",
             "PEAK_HIBERNATION_CYCLE": "1",
             "PEAK_REQUIRE_SAFE_DETACH": "1",

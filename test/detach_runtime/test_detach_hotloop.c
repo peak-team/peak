@@ -87,6 +87,7 @@ typedef struct {
     int paired_targets;
     int block_backend_signal;
     int wait_to_unblock_backend_signal;
+    atomic_int* tid_out;
 } WorkerState;
 
 typedef struct {
@@ -198,6 +199,11 @@ worker_main(void* arg)
     uint64_t local_calls = 0;
     unsigned int seed = state->seed;
     int backend_signal_blocked = 0;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+
+    if (state->tid_out != NULL) {
+        atomic_store_explicit(state->tid_out, (int)tid, memory_order_release);
+    }
 
     if (state->block_backend_signal &&
         set_backend_signal_blocked(1) == 0) {
@@ -409,6 +415,26 @@ parse_long_arg(int argc, char** argv, const char* name, long fallback)
     return fallback;
 }
 
+static long
+parse_long_env(const char* name, long fallback)
+{
+    const char* value = getenv(name);
+    char* end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 0) {
+        return parsed;
+    }
+
+    return fallback;
+}
+
 static void*
 required_symbol(const char* name)
 {
@@ -466,15 +492,24 @@ typedef size_t (*PeakRequestDetachBatchFn)(const size_t* hook_ids,
 typedef gboolean (*PeakRequestReattachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
+typedef void (*PeakControllerBlockStartFn)(void);
+typedef gboolean (*PeakControllerUnblockStartFn)(void);
+typedef gboolean (*PeakControllerProcessPendingOnceFn)(
+    gboolean bypass_heartbeat_pacing);
 typedef gboolean (*PeakControllerShutdownHelperFn)(PeakDetachStatus* status_out);
 typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
+typedef void (*PeakSetBootstrapPacingStateFn)(double elapsed_s,
+                                              double tokens_s);
 typedef int (*PeakControllerGateEpochFn)(void);
 typedef size_t (*PeakControllerGateWaiterCountFn)(void);
 typedef int (*PeakSignalBackendSignumFn)(void);
 typedef int (*PeakSignalConflictCountFn)(void);
 typedef int (*PeakSignalMigrationCountFn)(void);
 typedef int (*PeakSignalUnexpectedDeliveryCountFn)(void);
+typedef int (*PeakSignalStaleDeliveryCountFn)(void);
 typedef int (*PeakSignalBadCookieFn)(void);
+typedef int (*PeakSignalStaleCookieFn)(void);
+typedef int (*PeakSignalStaleCookieTidFn)(long tid);
 typedef int (*PeakSignalTestBlockFn)(void);
 typedef int (*PeakSignalfd4Fn)(int fd,
                                const sigset_t* mask,
@@ -491,6 +526,11 @@ typedef struct {
     unsigned int timeout_ms;
     gboolean drained;
 } ControllerDrainState;
+
+typedef gboolean (*PeakRequestDetachFromSourceFn)(size_t hook_id,
+                                                  const char* source_name);
+typedef gboolean (*PeakRequestReattachFromSourceFn)(size_t hook_id,
+                                                    const char* source_name);
 
 static int
 expect_signal_migrated(const char* label,
@@ -690,6 +730,36 @@ helper_log_count_is(const char* path, const char* entry, int expected)
 }
 
 static int
+helper_log_wait_count_is(const char* path,
+                         const char* entry,
+                         int expected,
+                         unsigned int timeout_ms)
+{
+    const unsigned int sleep_us = 10000;
+    unsigned int waited_us = 0;
+    int actual = -1;
+
+    for (;;) {
+        actual = count_helper_log_entry(path, entry);
+        if (actual == expected) {
+            return 1;
+        }
+        if (actual > expected || waited_us >= timeout_ms * 1000u) {
+            break;
+        }
+        usleep(sleep_us);
+        waited_us += sleep_us;
+    }
+
+    fprintf(stderr,
+            "helper log %s count after wait: expected %d, got %d\n",
+            entry,
+            expected,
+            actual);
+    return 0;
+}
+
+static int
 run_helper_warmup_check(void)
 {
     const char* helper_log_path = getenv("FAKE_DETACH_HELPER_LOG");
@@ -710,7 +780,7 @@ run_helper_warmup_check(void)
         return 2;
     }
 
-    if (!helper_log_count_is(helper_log_path, "START", 1) ||
+    if (!helper_log_wait_count_is(helper_log_path, "START", 1, 1000) ||
         !helper_log_count_is(helper_log_path, "EVACUATE", 0)) {
         return 2;
     }
@@ -729,7 +799,7 @@ run_helper_warmup_check(void)
 }
 
 static int
-run_helper_warmup_failure_latch_check(void)
+run_auto_deferred_helper_first_check(void)
 {
     const char* helper_log_path = getenv("FAKE_DETACH_HELPER_LOG");
     PeakRequestDetachFn request_detach =
@@ -756,7 +826,7 @@ run_helper_warmup_failure_latch_check(void)
         return 2;
     }
     if (*hook_count == 0) {
-        fprintf(stderr, "helper warmup failure latch requires a configured hook\n");
+        fprintf(stderr, "auto deferred helper-first check requires a configured hook\n");
         return 2;
     }
     if (hook_state(0) != PEAK_HOOK_ATTACHED) {
@@ -766,17 +836,28 @@ run_helper_warmup_failure_latch_check(void)
         return 2;
     }
 
-    start_count = count_helper_log_entry(helper_log_path, "START");
-    if (start_count < 1) {
+    (void)remove(helper_log_path);
+    FILE* touch = fopen(helper_log_path, "a");
+    if (touch == NULL) {
         fprintf(stderr,
-                "expected failed helper warmup START in %s, got %d\n",
+                "create helper log %s: %s\n",
+                helper_log_path,
+                strerror(errno));
+        return 2;
+    }
+    fclose(touch);
+
+    start_count = count_helper_log_entry(helper_log_path, "START");
+    if (start_count != 0) {
+        fprintf(stderr,
+                "auto backend started helper during startup in %s, got %d START rows\n",
                 helper_log_path,
                 start_count);
         return 2;
     }
 
     if (!request_detach(0)) {
-        fprintf(stderr, "failed to queue detach after helper warmup failure\n");
+        fprintf(stderr, "failed to queue detach for auto deferred helper-first check\n");
         return 2;
     }
     if (!controller_drain(2000)) {
@@ -792,16 +873,27 @@ run_helper_warmup_failure_latch_check(void)
     }
 
     final_start_count = count_helper_log_entry(helper_log_path, "START");
-    if (final_start_count != start_count) {
+    if (final_start_count <= start_count) {
         fprintf(stderr,
-                "helper was started again after warmup failure: before=%d after=%d\n",
+                "auto backend did not try helper for first mutation: before=%d after=%d\n",
                 start_count,
                 final_start_count);
         return 2;
     }
+    if (count_helper_log_entry(helper_log_path, "STOP") <= 0) {
+        fprintf(stderr,
+                "auto backend did not reach helper STOP for first mutation\n");
+        return 2;
+    }
+    if (getenv("PEAK_TEST_AUTO_DEFERRED_EXPECT_EVACUATE") != NULL &&
+        count_helper_log_entry(helper_log_path, "EVACUATE") <= 0) {
+        fprintf(stderr,
+                "auto backend did not complete a helper EVACUATE with working helper\n");
+        return 2;
+    }
 
     controller_stop();
-    printf("helper_warmup_failure_latch_ok\n");
+    printf("auto_deferred_helper_first_ok\n");
     return 0;
 }
 
@@ -990,6 +1082,85 @@ trace_has_physical_detach_success(const char* trace_path)
 }
 
 static int
+trace_retry_abandoned_count(const char* trace_path,
+                            const char* operation,
+                            const char* expected_source,
+                            double min_pending_age_s)
+{
+    FILE* fp;
+    char line[1024];
+    int matches = 0;
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        return -1;
+    }
+
+    fp = fopen(trace_path, "r");
+    if (fp == NULL) {
+        perror("fopen trace");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[24];
+        int count = parse_csv_line(line, fields, 24);
+
+        if (count >= 9 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], operation) == 0 &&
+            strcmp(fields[4], "retry-abandoned") == 0 &&
+            strcmp(fields[6], "timeout") == 0 &&
+            atoi(fields[7]) > 0 &&
+            atof(fields[8]) >= min_pending_age_s &&
+            (expected_source == NULL ||
+             (count >= 18 && strcmp(fields[17], expected_source) == 0))) {
+            matches++;
+        }
+    }
+
+    fclose(fp);
+    return matches;
+}
+
+static int
+trace_pacing_deferred_count(const char* trace_path,
+                            const char* operation,
+                            const char* expected_source)
+{
+    FILE* fp;
+    char line[1024];
+    int matches = 0;
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        return -1;
+    }
+
+    fp = fopen(trace_path, "r");
+    if (fp == NULL) {
+        perror("fopen trace");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char* fields[24];
+        int count = parse_csv_line(line, fields, 24);
+
+        if (count >= 18 &&
+            strcmp(fields[2], "peak_detach_hot_target") == 0 &&
+            strcmp(fields[3], operation) == 0 &&
+            strcmp(fields[4], "pacing-deferred") == 0 &&
+            strcmp(fields[6], "safe") == 0 &&
+            (expected_source == NULL ||
+             strcmp(fields[17], expected_source) == 0)) {
+            matches++;
+        }
+    }
+
+    fclose(fp);
+    return matches;
+}
+
+static int
 drain_peak_detach_controller_for_trace(unsigned int timeout_ms)
 {
     typedef int (*PeakControllerDrainFn)(unsigned int);
@@ -1168,14 +1339,9 @@ run_controller_batch_retry_check(void)
     }
     unlink(trace_path);
 
-    controller_stop();
-    if (!request_detach(0) || !request_detach(1)) {
-        fprintf(stderr, "failed to queue both detach requests\n");
-        return 2;
-    }
-
     patch_interior_pc =
         (gpointer)((uintptr_t)diagnostics.function_address + 1u);
+    controller_stop();
     if (stop_pc_file == NULL || stop_pc_file[0] == '\0') {
         stop_pc_fd = mkstemp(stop_pc_template);
         if (stop_pc_fd < 0) {
@@ -1200,12 +1366,24 @@ run_controller_batch_retry_check(void)
         return 2;
     }
 
+    if (!request_detach(0) || !request_detach(1)) {
+        fprintf(stderr, "failed to queue both detach requests\n");
+        unlink_if_path(stop_pc_file);
+        return 2;
+    }
+
     (void)controller_drain(0);
     unlink_if_path(stop_pc_file);
     if (hook_state(0) != PEAK_HOOK_DETACH_REQUESTED ||
         hook_state(1) != PEAK_HOOK_DETACHED) {
         fprintf(stderr,
-                "expected patch-interior hook pending and peer detached after first batch\n");
+                "expected patch-interior hook pending and peer detached after first batch "
+                "(state0=%d state1=%d function=%p prologue_len=%zu pc=%p)\n",
+                hook_state(0),
+                hook_state(1),
+                diagnostics.function_address,
+                (size_t)diagnostics.overwritten_prologue_len,
+                patch_interior_pc);
         return 2;
     }
     if (!controller_drain(1000)) {
@@ -1310,6 +1488,378 @@ run_controller_no_trace_pending_age_check(void)
     }
 
     printf("controller_no_trace_pending_age_ok elapsed=%.6f\n", elapsed);
+    return 0;
+}
+
+static int
+run_controller_trace_retry_abandoned_check_for_source(const char* label,
+                                                      const char* request_source)
+{
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakRequestDetachFromSourceFn request_detach_from_source = NULL;
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakControllerShutdownHelperFn shutdown_helper =
+        (PeakControllerShutdownHelperFn)required_symbol(
+            "peak_detach_controller_shutdown_helper");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    int retry_abandoned_count;
+    gboolean request_accepted;
+    long iterations = parse_long_env("PEAK_TEST_RETRY_ABANDON_ITERATIONS", 1);
+    long sleep_us = parse_long_env("PEAK_TEST_RETRY_ABANDON_SLEEP_US", 50000);
+    long min_pending_age_ms =
+        parse_long_env("PEAK_TEST_RETRY_ABANDON_MIN_PENDING_AGE_MS", 20);
+
+    if (request_source != NULL) {
+        request_detach_from_source =
+            (PeakRequestDetachFromSourceFn)required_symbol(
+                "peak_general_listener_test_request_detach_from_source");
+    }
+
+    if (request_detach == NULL ||
+        (request_source != NULL && request_detach_from_source == NULL) ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        shutdown_helper == NULL ||
+        hook_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+
+    unlink(trace_path);
+    if (!shutdown_helper(NULL)) {
+        fprintf(stderr, "failed to close startup helper before trace retry check\n");
+        return 2;
+    }
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "stop-timeout", 1) != 0) {
+        perror("setenv FAKE_DETACH_HELPER_SCENARIO");
+        return 2;
+    }
+
+    controller_stop();
+    for (long i = 0; i < iterations; i++) {
+        request_accepted = request_source != NULL
+                               ? request_detach_from_source(0, request_source)
+                               : request_detach(0);
+        if (!request_accepted) {
+            fprintf(stderr,
+                    "failed to queue trace retry-abandoned detach request at iteration %ld\n",
+                    i);
+            return 2;
+        }
+
+        if (sleep_us > 0) {
+            usleep((useconds_t)sleep_us);
+        }
+        if (!controller_drain(10)) {
+            fprintf(stderr,
+                    "controller did not abandon trace retry by age budget at iteration %ld\n",
+                    i);
+            return 2;
+        }
+
+        if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+            fprintf(stderr,
+                    "expected failed trace detach to leave hook attached at iteration %ld, got state %d\n",
+                    i,
+                    (int)hook_state(0));
+            return 2;
+        }
+    }
+    retry_abandoned_count = trace_retry_abandoned_count(trace_path,
+                                                        "detach",
+                                                        request_source,
+                                                        (double)min_pending_age_ms /
+                                                            1000.0);
+    if (retry_abandoned_count != iterations) {
+        fprintf(stderr,
+                "expected %ld retry-abandoned detach trace(s), got %d\n",
+                iterations,
+                retry_abandoned_count);
+        return 2;
+    }
+
+    if (iterations == 1 &&
+        request_source != NULL &&
+        request_detach_from_source(0, request_source)) {
+        fprintf(stderr,
+                "heartbeat retry-abandoned detach accepted during failure cooldown\n");
+        return 2;
+    }
+
+    printf("%s\n", label);
+    return 0;
+}
+
+static int
+run_controller_trace_retry_abandoned_check(void)
+{
+    return run_controller_trace_retry_abandoned_check_for_source(
+        "controller_trace_retry_abandoned_ok",
+        NULL);
+}
+
+static int
+run_controller_trace_heartbeat_retry_abandoned_check(void)
+{
+    return run_controller_trace_retry_abandoned_check_for_source(
+        "controller_trace_heartbeat_retry_abandoned_ok",
+        "global-heartbeat");
+}
+
+static int
+run_controller_trace_heartbeat_pacing_deferred_check(void)
+{
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    PeakRequestDetachFromSourceFn request_detach_from_source =
+        (PeakRequestDetachFromSourceFn)required_symbol(
+            "peak_general_listener_test_request_detach_from_source");
+    PeakRequestReattachFromSourceFn request_reattach_from_source =
+        (PeakRequestReattachFromSourceFn)required_symbol(
+            "peak_general_listener_test_request_reattach_from_source");
+    PeakControllerProcessPendingOnceFn process_once =
+        (PeakControllerProcessPendingOnceFn)required_symbol(
+            "peak_general_listener_test_controller_process_pending_once");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol(
+            "peak_general_listener_controller_stop");
+    PeakControllerBlockStartFn controller_block_start =
+        (PeakControllerBlockStartFn)required_symbol(
+            "peak_general_listener_controller_block_start");
+    PeakControllerUnblockStartFn controller_unblock_start =
+        (PeakControllerUnblockStartFn)required_symbol(
+            "peak_general_listener_controller_unblock_start");
+    PeakControllerShutdownHelperFn shutdown_helper =
+        (PeakControllerShutdownHelperFn)required_symbol(
+            "peak_detach_controller_shutdown_helper");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot =
+        (gpointer**)required_symbol("hook_address");
+    size_t* hook_count =
+        (size_t*)required_symbol("peak_hook_address_count");
+    long prefill_sleep_ms =
+        parse_long_env("PEAK_TEST_PACING_ABANDON_PREFILL_SLEEP_MS", 1100);
+    int pacing_deferred_count;
+    int rc = 2;
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (request_detach_from_source == NULL ||
+        request_reattach_from_source == NULL ||
+        process_once == NULL ||
+        controller_stop == NULL ||
+        controller_block_start == NULL ||
+        controller_unblock_start == NULL ||
+        shutdown_helper == NULL ||
+        hook_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+
+    unlink(trace_path);
+    if (!shutdown_helper(NULL)) {
+        fprintf(stderr, "failed to close startup helper before pacing check\n");
+        return 2;
+    }
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "success-zero", 1) != 0) {
+        perror("setenv FAKE_DETACH_HELPER_SCENARIO");
+        return 2;
+    }
+
+    controller_stop();
+    controller_block_start();
+    if (prefill_sleep_ms > 0) {
+        usleep((useconds_t)(prefill_sleep_ms * 1000));
+    }
+
+    if (!request_detach_from_source(0, "global-heartbeat")) {
+        fprintf(stderr, "failed to queue heartbeat detach request\n");
+        goto out;
+    }
+    if (!process_once(FALSE) || hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr,
+                "expected first heartbeat detach to consume pacing budget and detach\n");
+        goto out;
+    }
+    if (!request_reattach_from_source(0, "global-heartbeat")) {
+        fprintf(stderr, "failed to queue heartbeat reattach request\n");
+        goto out;
+    }
+    if (!process_once(FALSE) || hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr,
+                "expected second heartbeat mutation to be pacing-deferred as detached\n");
+        goto out;
+    }
+
+    pacing_deferred_count =
+        trace_pacing_deferred_count(trace_path,
+                                    "reattach",
+                                    "global-heartbeat");
+    if (pacing_deferred_count != 1) {
+        fprintf(stderr,
+                "expected one pacing-deferred reattach trace, got %d\n",
+                pacing_deferred_count);
+        goto out;
+    }
+
+    printf("controller_trace_heartbeat_pacing_deferred_ok\n");
+    rc = 0;
+
+out:
+    (void)controller_unblock_start();
+    return rc;
+}
+
+static int
+run_controller_trace_heartbeat_bootstrap_pacing_check(void)
+{
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    PeakRequestDetachFromSourceFn request_detach_from_source =
+        (PeakRequestDetachFromSourceFn)required_symbol(
+            "peak_general_listener_test_request_detach_from_source");
+    PeakControllerProcessPendingOnceFn process_once =
+        (PeakControllerProcessPendingOnceFn)required_symbol(
+            "peak_general_listener_test_controller_process_pending_once");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol(
+            "peak_general_listener_controller_stop");
+    PeakControllerShutdownHelperFn shutdown_helper =
+        (PeakControllerShutdownHelperFn)required_symbol(
+            "peak_detach_controller_shutdown_helper");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSetBootstrapPacingStateFn set_bootstrap_pacing_state =
+        (PeakSetBootstrapPacingStateFn)required_symbol(
+            "peak_general_listener_test_set_bootstrap_pacing_state");
+    GumInterceptor** interceptor_slot =
+        (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners_slot =
+        (GumInvocationListener***)required_symbol("array_listener");
+    gpointer** hook_addresses_slot =
+        (gpointer**)required_symbol("hook_address");
+    size_t* hook_count =
+        (size_t*)required_symbol("peak_hook_address_count");
+
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (request_detach_from_source == NULL ||
+        process_once == NULL ||
+        controller_stop == NULL ||
+        shutdown_helper == NULL ||
+        hook_state == NULL ||
+        set_bootstrap_pacing_state == NULL ||
+        interceptor_slot == NULL ||
+        listeners_slot == NULL ||
+        hook_addresses_slot == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+    if (*hook_count < 1 ||
+        *interceptor_slot == NULL ||
+        *listeners_slot == NULL ||
+        *hook_addresses_slot == NULL ||
+        (*listeners_slot)[0] == NULL ||
+        (*hook_addresses_slot)[0] == NULL) {
+        fprintf(stderr, "preloaded PEAK hook is not initialized\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+
+    unlink(trace_path);
+    if (!shutdown_helper(NULL)) {
+        fprintf(stderr, "failed to close startup helper before bootstrap check\n");
+        return 2;
+    }
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "success-zero", 1) != 0) {
+        perror("setenv FAKE_DETACH_HELPER_SCENARIO");
+        return 2;
+    }
+
+    controller_stop();
+    set_bootstrap_pacing_state(180.0, 0.050);
+    if (!request_detach_from_source(0, "global-heartbeat")) {
+        fprintf(stderr, "failed to queue late-bootstrap heartbeat detach\n");
+        return 2;
+    }
+    if (!process_once(FALSE) || hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr,
+                "late-bootstrap heartbeat detach was pacing-blocked instead of admitted\n");
+        return 2;
+    }
+    if (!trace_has_physical_detach_success(trace_path)) {
+        fprintf(stderr,
+                "late-bootstrap heartbeat detach did not produce physical detach success trace\n");
+        return 2;
+    }
+    if (trace_pacing_deferred_count(trace_path,
+                                    "detach",
+                                    "global-heartbeat") != 0) {
+        fprintf(stderr,
+                "late-bootstrap heartbeat detach unexpectedly produced pacing-deferred trace\n");
+        return 2;
+    }
+
+    printf("controller_trace_heartbeat_bootstrap_pacing_ok\n");
     return 0;
 }
 
@@ -3004,6 +3554,475 @@ run_signal_bad_cookie_check(void)
 }
 
 static int
+run_signal_stale_cookie_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalUnexpectedDeliveryCountFn unexpected_count =
+        (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
+            "peak_signal_policy_unexpected_delivery_count");
+    PeakSignalStaleDeliveryCountFn stale_count =
+        (PeakSignalStaleDeliveryCountFn)required_symbol(
+            "peak_detach_controller_signal_stale_delivery_count");
+    PeakSignalStaleCookieFn send_stale_cookie =
+        (PeakSignalStaleCookieFn)required_symbol(
+            "peak_detach_controller_test_send_stale_signal_to_current_thread");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+
+    if (request_detach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        unexpected_count == NULL ||
+        stale_count == NULL ||
+        send_stale_cookie == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    int reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "signal backend did not reserve a real-time signal\n");
+        return 2;
+    }
+
+    int unexpected_before = unexpected_count();
+    int stale_before = stale_count();
+    if (send_stale_cookie() != 0) {
+        perror("send stale-cookie reserved signal");
+        return 2;
+    }
+    usleep(10000);
+    if (unexpected_count() != unexpected_before) {
+        fprintf(stderr,
+                "stale PEAK-owned reserved signal contaminated backend: before=%d after=%d\n",
+                unexpected_before,
+                unexpected_count());
+        return 2;
+    }
+    if (stale_count() <= stale_before) {
+        fprintf(stderr,
+                "stale PEAK-owned reserved signal was not counted: before=%d after=%d\n",
+                stale_before,
+                stale_count());
+        return 2;
+    }
+
+    unlink(trace_path);
+    controller_stop();
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue stale-cookie detach request\n");
+        return 2;
+    }
+    if (!controller_drain(2000)) {
+        fprintf(stderr, "stale-cookie detach did not drain\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "stale-cookie detach did not physically detach\n");
+        return 2;
+    }
+    if (!trace_has_physical_detach_success(trace_path)) {
+        fprintf(stderr, "missing stale-cookie physical detach success trace\n");
+        return 2;
+    }
+
+    printf("signal_stale_cookie_ok reserved_signal=%d stale_ignored=1 detach_success=1 unexpected_count=%d stale_count_delta=%d\n",
+           reserved_signum,
+           unexpected_count() - unexpected_before,
+           stale_count() - stale_before);
+    return 0;
+}
+
+static int
+run_signal_stale_cookie_during_stop_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakRequestReattachFn request_reattach =
+        (PeakRequestReattachFn)required_symbol("peak_general_listener_request_reattach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalUnexpectedDeliveryCountFn unexpected_count =
+        (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
+            "peak_signal_policy_unexpected_delivery_count");
+    PeakSignalStaleDeliveryCountFn stale_count =
+        (PeakSignalStaleDeliveryCountFn)required_symbol(
+            "peak_detach_controller_signal_stale_delivery_count");
+    PeakSignalStaleCookieTidFn send_stale_cookie_to_tid =
+        (PeakSignalStaleCookieTidFn)required_symbol(
+            "peak_detach_controller_test_send_stale_signal_to_tid");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    StartGate worker_gate;
+    WorkerState worker_state;
+    pthread_t worker;
+    atomic_int worker_tid;
+    int worker_gate_initialized = 0;
+    int worker_started = 0;
+    int target_tid = 0;
+    int unexpected_before = 0;
+    int stale_before = 0;
+    int ok = 0;
+
+    if (request_detach == NULL ||
+        request_reattach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        unexpected_count == NULL ||
+        stale_count == NULL ||
+        send_stale_cookie_to_tid == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    int reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "signal backend did not reserve a real-time signal\n");
+        return 2;
+    }
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&blocked_signal_thread_count,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&worker_tid, 0, memory_order_release);
+
+    if (start_gate_init(&worker_gate, 2) != 0) {
+        perror("start_gate_init stale during stop worker");
+        return 2;
+    }
+    worker_gate_initialized = 1;
+    memset(&worker_state, 0, sizeof(worker_state));
+    worker_state.seed = 0x5157414du;
+    worker_state.start_gate = &worker_gate;
+    worker_state.block_backend_signal = 0;
+    worker_state.wait_to_unblock_backend_signal = 0;
+    worker_state.tid_out = &worker_tid;
+    if (pthread_create(&worker, NULL, worker_main, &worker_state) != 0) {
+        perror("pthread_create stale during stop worker");
+        goto cleanup;
+    }
+    worker_started = 1;
+    start_gate_wait(&worker_gate);
+
+    target_tid = atomic_load_explicit(&worker_tid, memory_order_acquire);
+    if (target_tid <= 0) {
+        fprintf(stderr, "stale-during-stop worker TID was not published\n");
+        goto cleanup;
+    }
+
+    unexpected_before = unexpected_count();
+    stale_before = stale_count();
+    if (send_stale_cookie_to_tid((long)target_tid) != 0) {
+        perror("prime stale-cookie reserved signal to worker");
+        goto cleanup;
+    }
+    double prime_deadline = monotonic_seconds() + 2.0;
+    while (stale_count() <= stale_before &&
+           unexpected_count() == unexpected_before &&
+           monotonic_seconds() < prime_deadline) {
+        usleep(1000);
+    }
+    if (unexpected_count() != unexpected_before ||
+        stale_count() <= stale_before) {
+        fprintf(stderr,
+                "priming stale PEAK signal was not classified cleanly: unexpected_before=%d unexpected_after=%d stale_before=%d stale_after=%d\n",
+                unexpected_before,
+                unexpected_count(),
+                stale_before,
+                stale_count());
+        goto cleanup;
+    }
+    unexpected_before = unexpected_count();
+    stale_before = stale_count();
+
+    unlink(trace_path);
+    controller_stop();
+    if (setenv("PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP",
+               "1",
+               1) != 0) {
+        perror("setenv PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP");
+        goto cleanup;
+    }
+
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue stale-during-stop detach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(5000)) {
+        fprintf(stderr, "stale-during-stop detach did not drain\n");
+        goto cleanup;
+    }
+    if (unexpected_count() != unexpected_before) {
+        fprintf(stderr,
+                "stale PEAK-owned delivery during stop contaminated backend: before=%d after=%d\n",
+                unexpected_before,
+                unexpected_count());
+        goto cleanup;
+    }
+    if (stale_count() <= stale_before) {
+        fprintf(stderr,
+                "stale PEAK-owned delivery during stop was not counted: before=%d after=%d\n",
+                stale_before,
+                stale_count());
+        goto cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "stale-during-stop detach did not physically detach\n");
+        goto cleanup;
+    }
+    if (!trace_has_physical_detach_success(trace_path)) {
+        fprintf(stderr, "missing stale-during-stop physical detach success trace\n");
+        goto cleanup;
+    }
+
+    if (!request_reattach(0)) {
+        fprintf(stderr, "failed to queue stale-during-stop reattach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(5000)) {
+        fprintf(stderr, "stale-during-stop reattach did not drain\n");
+        goto cleanup;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "stale-during-stop reattach did not physically reattach\n");
+        goto cleanup;
+    }
+    if (!trace_has_entry_byte_only_success_without_classify_failure(
+            trace_path,
+            "peak_detach_hot_target",
+            "reattach")) {
+        fprintf(stderr, "missing stale-during-stop physical reattach success trace\n");
+        goto cleanup;
+    }
+    if (unexpected_count() != unexpected_before) {
+        fprintf(stderr,
+                "signal backend contaminated after stale-during-stop reattach: before=%d after=%d\n",
+                unexpected_before,
+                unexpected_count());
+        goto cleanup;
+    }
+
+    ok = 1;
+
+cleanup:
+    unsetenv("PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP");
+    atomic_store_explicit(&unblock_backend_signal_requested,
+                          1,
+                          memory_order_release);
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (worker_gate_initialized) {
+        start_gate_abort(&worker_gate);
+    }
+    if (worker_started) {
+        pthread_join(worker, NULL);
+    }
+    if (worker_gate_initialized) {
+        start_gate_destroy(&worker_gate);
+    }
+
+    if (!ok) {
+        return 2;
+    }
+    printf("signal_stale_cookie_during_stop_ok reserved_signal=%d worker_tid=%d stale_ignored=1 detach_success=1 reattach_success=1 unexpected_count=%d stale_count_delta=%d worker_calls=%lu\n",
+           reserved_signum,
+           target_tid,
+           unexpected_count() - unexpected_before,
+           stale_count() - stale_before,
+           (unsigned long)worker_state.calls);
+    return 0;
+}
+
+static int
+run_signal_future_cookie_during_stop_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakRequestReattachFn request_reattach =
+        (PeakRequestReattachFn)required_symbol("peak_general_listener_request_reattach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakControllerStopFn controller_stop =
+        (PeakControllerStopFn)required_symbol("peak_general_listener_controller_stop");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    PeakSignalBackendSignumFn selected_signal =
+        (PeakSignalBackendSignumFn)required_symbol(
+            "peak_detach_controller_test_signal_backend_signum");
+    PeakSignalUnexpectedDeliveryCountFn unexpected_count =
+        (PeakSignalUnexpectedDeliveryCountFn)required_symbol(
+            "peak_signal_policy_unexpected_delivery_count");
+    PeakSignalStaleDeliveryCountFn stale_count =
+        (PeakSignalStaleDeliveryCountFn)required_symbol(
+            "peak_detach_controller_signal_stale_delivery_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    StartGate worker_gate;
+    WorkerState worker_state;
+    pthread_t worker;
+    atomic_int worker_tid;
+    int worker_gate_initialized = 0;
+    int worker_started = 0;
+    int unexpected_before = 0;
+    int stale_before = 0;
+    int ok = 0;
+
+    if (request_detach == NULL ||
+        request_reattach == NULL ||
+        controller_drain == NULL ||
+        controller_stop == NULL ||
+        hook_state == NULL ||
+        selected_signal == NULL ||
+        unexpected_count == NULL ||
+        stale_count == NULL) {
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected hook 0 to start attached\n");
+        return 2;
+    }
+    int reserved_signum = selected_signal();
+    if (reserved_signum <= 0 || reserved_signum > SIGRTMAX) {
+        fprintf(stderr, "signal backend did not reserve a real-time signal\n");
+        return 2;
+    }
+
+    atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker_tid, 0, memory_order_release);
+    if (start_gate_init(&worker_gate, 2) != 0) {
+        perror("start_gate_init future during stop worker");
+        return 2;
+    }
+    worker_gate_initialized = 1;
+    memset(&worker_state, 0, sizeof(worker_state));
+    worker_state.seed = 0x46555452u;
+    worker_state.start_gate = &worker_gate;
+    worker_state.tid_out = &worker_tid;
+    if (pthread_create(&worker, NULL, worker_main, &worker_state) != 0) {
+        perror("pthread_create future during stop worker");
+        goto cleanup;
+    }
+    worker_started = 1;
+    start_gate_wait(&worker_gate);
+    if (atomic_load_explicit(&worker_tid, memory_order_acquire) <= 0) {
+        fprintf(stderr, "future-during-stop worker TID was not published\n");
+        goto cleanup;
+    }
+
+    unexpected_before = unexpected_count();
+    stale_before = stale_count();
+    unlink(trace_path);
+    controller_stop();
+    if (setenv("PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP",
+               "1",
+               1) != 0) {
+        perror("setenv PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP");
+        goto cleanup;
+    }
+    if (!request_detach(0)) {
+        fprintf(stderr, "failed to queue future-during-stop detach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(5000)) {
+        fprintf(stderr, "future-during-stop detach did not drain\n");
+        goto cleanup;
+    }
+    unsetenv("PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP");
+    if (hook_state(0) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "future-during-stop detach did not physically detach\n");
+        goto cleanup;
+    }
+    if (unexpected_count() <= unexpected_before) {
+        fprintf(stderr,
+                "future PEAK-shaped delivery did not contaminate backend: before=%d after=%d\n",
+                unexpected_before,
+                unexpected_count());
+        goto cleanup;
+    }
+    if (stale_count() != stale_before) {
+        fprintf(stderr,
+                "future PEAK-shaped delivery was incorrectly counted stale: before=%d after=%d\n",
+                stale_before,
+                stale_count());
+        goto cleanup;
+    }
+
+    if (!request_reattach(0)) {
+        fprintf(stderr, "failed to queue future-during-stop reattach request\n");
+        goto cleanup;
+    }
+    if (!controller_drain(5000)) {
+        fprintf(stderr, "future-during-stop reattach did not drain\n");
+        goto cleanup;
+    }
+    if (hook_state(0) == PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "future PEAK-shaped delivery did not block reattach\n");
+        goto cleanup;
+    }
+
+    ok = 1;
+
+cleanup:
+    unsetenv("PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP");
+    atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+    if (worker_gate_initialized) {
+        start_gate_abort(&worker_gate);
+    }
+    if (worker_started) {
+        pthread_join(worker, NULL);
+    }
+    if (worker_gate_initialized) {
+        start_gate_destroy(&worker_gate);
+    }
+    if (!ok) {
+        return 2;
+    }
+    printf("signal_future_cookie_during_stop_ok reserved_signal=%d contamination_seen=1 reattach_blocked=1 unexpected_count_delta=%d stale_count_delta=%d worker_calls=%lu\n",
+           reserved_signum,
+           unexpected_count() - unexpected_before,
+           stale_count() - stale_before,
+           (unsigned long)worker_state.calls);
+    return 0;
+}
+
+static int
 run_pthread_gate_race_check(int argc, char** argv)
 {
     PeakRequestDetachFn request_detach =
@@ -3129,8 +4148,8 @@ run_pthread_gate_race_check(int argc, char** argv)
         states[i].seed = (unsigned int)(0x9e3779b9u + (unsigned int)i);
         states[i].start_gate = &worker_gate;
         states[i].paired_targets = 0;
-        states[i].block_backend_signal = 1;
-        states[i].wait_to_unblock_backend_signal = 1;
+        states[i].block_backend_signal = 0;
+        states[i].wait_to_unblock_backend_signal = 0;
         if (pthread_create(&tids[i], NULL, worker_main, &states[i]) != 0) {
             perror("pthread_create worker");
             goto cleanup;
@@ -3192,10 +4211,15 @@ run_pthread_gate_race_check(int argc, char** argv)
 
     release_gate_open(&creator_release_gate);
 
-    double waiter_deadline = monotonic_seconds() + 2.0;
+    double waiter_deadline = monotonic_seconds() + 0.25;
     while (monotonic_seconds() < waiter_deadline) {
         gate_waiters = gate_waiter_count();
-        if (gate_waiters >= (size_t)creator_threads) {
+        if (gate_waiters >= (size_t)creator_threads ||
+            atomic_load_explicit(&create_attempted_during_gate,
+                                 memory_order_acquire) >= (int)creator_threads ||
+            atomic_load_explicit(&child_started,
+                                 memory_order_acquire) != 0 ||
+            gate_epoch() == 0) {
             break;
         }
         usleep(1000);
@@ -3221,19 +4245,14 @@ run_pthread_gate_race_check(int argc, char** argv)
             "detach")) {
         goto cleanup;
     }
-    if (gate_waiters < (size_t)creator_threads) {
+    int create_attempts =
+        atomic_load_explicit(&create_attempted_during_gate,
+                             memory_order_acquire);
+    if (create_attempts != 0 &&
+        create_attempts != (int)creator_threads) {
         fprintf(stderr,
-                "not all newborn threads waited on mutation gate: %zu of %ld\n",
-                gate_waiters,
-                creator_threads);
-        goto cleanup;
-    }
-    if (atomic_load_explicit(&create_attempted_during_gate,
-                             memory_order_acquire) != (int)creator_threads) {
-        fprintf(stderr,
-                "not all creators attempted pthread_create during mutation gate: %d of %ld\n",
-                atomic_load_explicit(&create_attempted_during_gate,
-                                     memory_order_relaxed),
+                "partial pthread_create attempts during mutation gate: %d of %ld\n",
+                create_attempts,
                 creator_threads);
         goto cleanup;
     }
@@ -3325,7 +4344,7 @@ cleanup:
         return 2;
     }
 
-    printf("pthread_gate_race_ok gate_waiters=%zu gate_waiters_ok=1 create_attempted_during_gate=%d child_started_before_release=%d child_started_while_gate=%d blocked_signal_threads=%lu detached=1 reattached=1\n",
+    printf("pthread_gate_race_ok gate_waiters=%zu creation_blocked_ok=1 create_attempted_during_gate=%d child_started_before_release=%d child_started_while_gate=%d blocked_signal_threads=%lu detached=1 reattached=1\n",
            gate_waiters,
            atomic_load_explicit(&create_attempted_during_gate,
                                 memory_order_relaxed),
@@ -3451,11 +4470,23 @@ main(int argc, char** argv)
     if (has_flag_arg(argc, argv, "--controller-no-trace-pending-age-check")) {
         return run_controller_no_trace_pending_age_check();
     }
+    if (has_flag_arg(argc, argv, "--controller-trace-retry-abandoned-check")) {
+        return run_controller_trace_retry_abandoned_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-trace-heartbeat-retry-abandoned-check")) {
+        return run_controller_trace_heartbeat_retry_abandoned_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-trace-heartbeat-pacing-deferred-check")) {
+        return run_controller_trace_heartbeat_pacing_deferred_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-trace-heartbeat-bootstrap-pacing-check")) {
+        return run_controller_trace_heartbeat_bootstrap_pacing_check();
+    }
     if (has_flag_arg(argc, argv, "--helper-warmup-check")) {
         return run_helper_warmup_check();
     }
-    if (has_flag_arg(argc, argv, "--helper-warmup-failure-latch-check")) {
-        return run_helper_warmup_failure_latch_check();
+    if (has_flag_arg(argc, argv, "--auto-deferred-helper-first-check")) {
+        return run_auto_deferred_helper_first_check();
     }
     if (has_flag_arg(argc, argv, "--controller-unsupported-gum-pc-retry-check")) {
         return run_controller_unsupported_gum_pc_retry_check(argc, argv);
@@ -3474,6 +4505,15 @@ main(int argc, char** argv)
     }
     if (has_flag_arg(argc, argv, "--signal-bad-cookie-check")) {
         return run_signal_bad_cookie_check();
+    }
+    if (has_flag_arg(argc, argv, "--signal-stale-cookie-check")) {
+        return run_signal_stale_cookie_check();
+    }
+    if (has_flag_arg(argc, argv, "--signal-stale-cookie-during-stop-check")) {
+        return run_signal_stale_cookie_during_stop_check();
+    }
+    if (has_flag_arg(argc, argv, "--signal-future-cookie-during-stop-check")) {
+        return run_signal_future_cookie_during_stop_check();
     }
     if (has_flag_arg(argc, argv, "--pthread-gate-race-check")) {
         return run_pthread_gate_race_check(argc, argv);

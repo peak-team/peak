@@ -981,7 +981,7 @@ main(int argc, char** argv)
             if (write_target_count_sample(sample_counts_fp,
                                           0.0,
                                           monotonic_seconds(),
-                                          (int)target_count) != 0) {
+                                          (int)hot_targets) != 0) {
                 perror("write sample counts");
                 atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
             }
@@ -1041,7 +1041,7 @@ main(int argc, char** argv)
             if (write_target_count_sample(sample_counts_fp,
                                           loop_elapsed,
                                           loop_now,
-                                          (int)target_count) != 0) {
+                                          (int)hot_targets) != 0) {
                 perror("write sample counts");
                 atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
                 break;
@@ -1051,7 +1051,20 @@ main(int argc, char** argv)
                     (double)sample_counts_interval_ms / 1000.0;
             } while (loop_elapsed >= next_sample_time_s);
         }
-        sleep_us(100000);
+        long sleep_interval_us = 100000;
+        if (sample_counts_fp != NULL && sample_counts_interval_ms > 0) {
+            double until_next_sample_s = next_sample_time_s - loop_elapsed;
+            long sample_sleep_us =
+                (long)(until_next_sample_s * 1000000.0 + 0.5);
+
+            if (sample_sleep_us < 1000) {
+                sample_sleep_us = 1000;
+            }
+            if (sample_sleep_us < sleep_interval_us) {
+                sleep_interval_us = sample_sleep_us;
+            }
+        }
+        sleep_us(sleep_interval_us);
     }
 
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
@@ -1085,7 +1098,7 @@ main(int argc, char** argv)
         if (write_target_count_sample(sample_counts_fp,
                                       elapsed,
                                       final_now,
-                                      (int)target_count) != 0) {
+                                      (int)hot_targets) != 0) {
             perror("write final sample counts");
             fclose(sample_counts_fp);
             return 2;

@@ -10,15 +10,30 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#define PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS 10000
+#define PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS_ENV \
+    "PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS"
+#define PEAK_DETACH_HELPER_SPAWN_ENV "PEAK_DETACH_HELPER_SPAWN"
+#define PEAK_TEST_DETACH_HELPER_FORCE_CLONE_SPAWN_FAIL_ENV \
+    "PEAK_TEST_DETACH_HELPER_FORCE_CLONE_SPAWN_FAIL"
+#define PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP_ENV \
+    "PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP"
+#define PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP_ENV \
+    "PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP"
+#define PEAK_DETACH_CONTROLLER_DEFAULT_IO_TIMEOUT_MS 10000u
+#define PEAK_DETACH_HELPER_CLOSE_GRACE_MS 250u
+#define PEAK_DETACH_HELPER_CLOSE_POLL_US 1000u
 #define PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS 8192u
 #define PEAK_DETACH_HELPER_PROTOCOL_FD 3
+#define PEAK_AUTO_HELPER_PERF_FALLBACK_STOP_WINDOW_US_ENV \
+    "PEAK_AUTO_HELPER_PERF_FALLBACK_STOP_WINDOW_US"
+#define PEAK_AUTO_HELPER_PERF_FALLBACK_DEFAULT_STOP_WINDOW_US 5000u
 #define PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS \
     PEAK_DETACH_HELPER_MAX_BATCH_WRITES
 #define PEAK_STRICT_GATE_WAIT_TIMEOUT_MS_ENV "PEAK_STRICT_GATE_WAIT_TIMEOUT_MS"
@@ -41,6 +56,9 @@ static gboolean warned_missing_gum_api = FALSE;
 #include <poll.h>
 #include <signal.h>
 #include <stdatomic.h>
+#ifdef __linux__
+#include <linux/futex.h>
+#endif
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -63,15 +81,27 @@ typedef enum {
 
 typedef struct {
     gboolean active;
+    gboolean finishing;
+    gboolean batch;
+    gboolean auto_helper_candidate;
     gboolean uses_physical_patch;
     gboolean mutates_entry_bytes;
     gboolean mutates_gum_metadata;
     gboolean frees_listener_state;
     gboolean requires_target_entry_idle;
+    gboolean owner_thread_set;
+    pthread_t owner_thread;
     PeakDetachOperation operation;
+    size_t hook_id;
+    gpointer function_address;
+    GumInvocationListener* listener;
     PeakDetachHoldBackend backend;
+    unsigned int timeout_ms;
+    double deadline;
     PeakDetachHelperInstruction instructions[PEAK_DETACH_HELPER_MAX_INSTRUCTIONS];
     uint32_t instruction_count;
+    void* deferred_cleanup_1;
+    void* deferred_cleanup_2;
 } PeakDetachHeldMutation;
 
 typedef struct {
@@ -120,8 +150,22 @@ typedef struct {
     _Atomic int gate_epoch;
 } PeakDetachGateWaiterSlot;
 
-static gboolean peak_detach_controller_wait_fd(int fd, short events);
-static void peak_detach_controller_signal_release_or_fatal(const char* context);
+typedef struct {
+    unsigned long suppressed_rows;
+    int last_epoch;
+    PeakDetachStatus last_status;
+    uint32_t active;
+    uint32_t arrived;
+    uint32_t done;
+    uint32_t evacuate_started;
+    uint32_t evacuated;
+    pid_t first_pending_tid;
+    pid_t first_not_done_tid;
+} PeakDetachSignalDeferredTrace;
+
+static void peak_detach_controller_signal_release_or_fatal_with_timeout(
+    const char* context,
+    unsigned int timeout_ms);
 static void peak_detach_controller_signal_handler(int signo,
                                                   siginfo_t* info,
                                                   void* context);
@@ -129,7 +173,13 @@ static void peak_detach_controller_signal_trap_handler(int signo,
                                                        siginfo_t* info,
                                                        void* context);
 static void peak_detach_controller_init_signal_backend_once(void);
+static gboolean peak_detach_controller_ensure_signal_backend(
+    PeakDetachStatus* status_out);
+static gboolean peak_detach_controller_close_helper(void);
 static int peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid);
+static gboolean peak_detach_controller_signal_slot_active(
+    const PeakDetachSignalSlot* slot,
+    int epoch);
 static PeakDetachStatus peak_detach_controller_errno_status(void);
 static double peak_detach_controller_monotonic_second(void);
 extern char** environ;
@@ -147,9 +197,14 @@ static gboolean warned_helper_unavailable = FALSE;
 static gboolean warned_helper_resume_failed = FALSE;
 static gboolean warned_helper_fatal = FALSE;
 static gboolean warned_auto_helper_ptrace_scope = FALSE;
+static gboolean warned_auto_helper_fallback_cached = FALSE;
+static gboolean warned_auto_helper_performance_fallback_cached = FALSE;
 static gboolean helper_state_fatal = FALSE;
 static gboolean warned_signal_gate_unavailable = FALSE;
 static gboolean warned_helper_gate_unavailable = FALSE;
+static gsize auto_helper_perf_fallback_initialized = 0;
+static unsigned int auto_helper_perf_fallback_stop_window_us =
+    PEAK_AUTO_HELPER_PERF_FALLBACK_DEFAULT_STOP_WINDOW_US;
 static gboolean warned_strict_gate_wait_timeout = FALSE;
 static gboolean signal_breakpoint_supported = FALSE;
 static struct sigaction previous_trap_action;
@@ -157,8 +212,13 @@ static char resolved_helper_path[PATH_MAX];
 static PeakDetachHeldMutation held_mutation = { 0 };
 static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS];
 static double held_mutation_started_at = 0.0;
+static _Atomic int held_mutation_window_active = 0;
 static double last_stop_window_us = 0.0;
+static PeakDetachSignalDeferredTrace signal_deferred_trace = { 0 };
 static _Atomic int trace_diagnostics_enabled = 0;
+static _Atomic int trace_diagnostics_fd = -1;
+static _Atomic int auto_signal_fallback_cached = 0;
+static char trace_diagnostics_path[PATH_MAX];
 static pthread_once_t signal_backend_initialized = PTHREAD_ONCE_INIT;
 static _Atomic int signal_backend_signum = 0;
 static int signal_trap_handler_installed = 0;
@@ -171,9 +231,15 @@ static _Atomic int strict_mutation_thread_gate_installed = 0;
 static PeakDetachSignalSlot signal_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static PeakDetachGateWaiterSlot gate_waiter_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static _Atomic uint32_t signal_slot_count = 0;
+static _Atomic int signal_stale_delivery_count = 0;
 static gsize strict_gate_wait_timeout_initialized = 0;
 static double strict_gate_wait_timeout_s =
     (double)PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS / 1000.0;
+static gsize controller_io_timeout_initialized = 0;
+static unsigned int controller_io_timeout_ms =
+    PEAK_DETACH_CONTROLLER_DEFAULT_IO_TIMEOUT_MS;
+
+static gboolean peak_detach_controller_stop_window_trace_deferred(void);
 
 static void
 peak_detach_controller_raw_close(int fd)
@@ -241,6 +307,144 @@ peak_detach_controller_raw_close_range(unsigned int first,
     (void)last;
     (void)flags;
 #endif
+}
+
+static int*
+peak_detach_controller_signal_futex_word(_Atomic int* word)
+{
+    return (int*)(void*)word;
+}
+
+static void
+peak_detach_controller_signal_futex_wait(_Atomic int* word, int expected)
+{
+#if defined(__linux__) && defined(SYS_futex) && defined(FUTEX_WAIT)
+    /*
+     * Signal-backend stop windows park application threads from inside the
+     * PEAK reserved signal handler.  A raw futex wait avoids burning an entire
+     * core per parked thread while preserving a dependency-free wait path.
+     * The short timeout is intentional: evacuation is announced through a
+     * per-slot word, while the futex wait is on the shared release word.
+     */
+    struct timespec timeout = { 0, 1000000L };
+    (void)syscall(SYS_futex,
+                  peak_detach_controller_signal_futex_word(word),
+                  FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                  expected,
+                  &timeout,
+                  NULL,
+                  0);
+#else
+    (void)word;
+    (void)expected;
+#ifdef SYS_sched_yield
+    (void)syscall(SYS_sched_yield);
+#endif
+#endif
+}
+
+static void
+peak_detach_controller_signal_futex_wake_all(_Atomic int* word)
+{
+#if defined(__linux__) && defined(SYS_futex) && defined(FUTEX_WAKE)
+    (void)syscall(SYS_futex,
+                  peak_detach_controller_signal_futex_word(word),
+                  FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                  INT_MAX,
+                  NULL,
+                  NULL,
+                  0);
+#else
+    (void)word;
+#endif
+}
+
+static void
+peak_detach_controller_signal_wake_waiters(void)
+{
+    peak_detach_controller_signal_futex_wake_all(&signal_release_epoch);
+}
+
+static unsigned int
+peak_detach_controller_parse_uint_env(const char* name,
+                                      unsigned int default_value)
+{
+    const char* value = g_getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > UINT_MAX) {
+        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
+        return default_value;
+    }
+
+    return (unsigned int)parsed;
+}
+
+static void
+peak_detach_controller_init_io_timeout_once(void)
+{
+    controller_io_timeout_ms =
+        peak_detach_controller_parse_uint_env(
+            PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS_ENV,
+            PEAK_DETACH_CONTROLLER_DEFAULT_IO_TIMEOUT_MS);
+    if (controller_io_timeout_ms == 0) {
+        controller_io_timeout_ms =
+            PEAK_DETACH_CONTROLLER_DEFAULT_IO_TIMEOUT_MS;
+    }
+}
+
+static unsigned int
+peak_detach_controller_default_io_timeout_ms(void)
+{
+    if (g_once_init_enter(&controller_io_timeout_initialized)) {
+        peak_detach_controller_init_io_timeout_once();
+        g_once_init_leave(&controller_io_timeout_initialized, 1);
+    }
+
+    return controller_io_timeout_ms;
+}
+
+static unsigned int
+peak_detach_controller_effective_timeout_ms(unsigned int request_timeout_ms)
+{
+    return request_timeout_ms > 0
+               ? request_timeout_ms
+               : peak_detach_controller_default_io_timeout_ms();
+}
+
+static void
+peak_detach_controller_init_auto_helper_perf_fallback_once(void)
+{
+    auto_helper_perf_fallback_stop_window_us =
+        peak_detach_controller_parse_uint_env(
+            PEAK_AUTO_HELPER_PERF_FALLBACK_STOP_WINDOW_US_ENV,
+            PEAK_AUTO_HELPER_PERF_FALLBACK_DEFAULT_STOP_WINDOW_US);
+}
+
+static unsigned int
+peak_detach_controller_auto_helper_perf_fallback_stop_window_us(void)
+{
+    if (g_once_init_enter(&auto_helper_perf_fallback_initialized)) {
+        peak_detach_controller_init_auto_helper_perf_fallback_once();
+        g_once_init_leave(&auto_helper_perf_fallback_initialized, 1);
+    }
+
+    return auto_helper_perf_fallback_stop_window_us;
+}
+
+static double
+peak_detach_controller_deadline_for_timeout(unsigned int timeout_ms)
+{
+    return peak_detach_controller_monotonic_second() +
+           ((double)peak_detach_controller_effective_timeout_ms(timeout_ms) /
+            1000.0);
 }
 
 static int
@@ -330,28 +534,6 @@ peak_detach_controller_signal_backend_signum_store(int signum)
     atomic_store_explicit(&signal_backend_signum, signum, memory_order_release);
 }
 
-static unsigned int
-peak_detach_controller_parse_uint_env(const char* name,
-                                      unsigned int default_value)
-{
-    const char* value = g_getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
-
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
-}
-
 static void
 peak_detach_controller_init_strict_gate_wait_timeout_once(void)
 {
@@ -372,6 +554,7 @@ peak_detach_controller_init_strict_gate_wait_timeout(void)
         g_once_init_leave(&strict_gate_wait_timeout_initialized, 1);
     }
 }
+
 #endif
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
@@ -556,6 +739,43 @@ peak_detach_controller_note_thread_creation_gate_installed(gboolean installed)
                           memory_order_release);
 }
 
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_signal_stale_delivery_count(void)
+{
+    return atomic_load_explicit(&signal_stale_delivery_count,
+                                memory_order_acquire);
+}
+
+static gboolean
+peak_detach_controller_signal_cookie_epoch_is_stale(int cookie_epoch,
+                                                    int active_epoch)
+{
+    if (cookie_epoch <= 0) {
+        return FALSE;
+    }
+    if (active_epoch > 0) {
+        return cookie_epoch < active_epoch;
+    }
+
+    int next_epoch =
+        atomic_load_explicit(&signal_epoch_counter, memory_order_acquire);
+    return next_epoch > 0 && cookie_epoch < next_epoch;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static gboolean
+peak_detach_controller_test_env_truthy(const char* name)
+{
+    const char* value = getenv(name);
+
+    return value != NULL && value[0] != '\0' &&
+           strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 &&
+           strcasecmp(value, "off") != 0;
+}
+#endif
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 int
 peak_detach_controller_test_thread_creation_gate_epoch(void)
@@ -588,6 +808,48 @@ peak_detach_controller_test_signal_backend_signum(void)
     return reserved > 0 ? reserved :
            peak_detach_controller_signal_backend_signum_load();
 }
+
+int
+peak_detach_controller_test_send_stale_signal_to_tid(long target_tid)
+{
+    (void)pthread_once(&signal_backend_initialized,
+                       peak_detach_controller_init_signal_backend_once);
+    int signum = peak_detach_controller_signal_backend_signum_load();
+    if (signum <= 0) {
+        signum = peak_signal_policy_reserved_signal();
+    }
+    if (signum <= 0 || signum > SIGRTMAX) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (target_tid <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int stale_epoch =
+        atomic_fetch_add_explicit(&signal_epoch_counter,
+                                  1,
+                                  memory_order_acq_rel);
+    if (stale_epoch <= 0) {
+        stale_epoch = 1;
+        atomic_store_explicit(&signal_epoch_counter,
+                              2,
+                              memory_order_release);
+    }
+    pid_t tid = (pid_t)target_tid;
+    return peak_signal_policy_send_thread_signal(
+        tid,
+        signum,
+        peak_signal_policy_cookie_for(stale_epoch, tid));
+}
+
+int
+peak_detach_controller_test_send_stale_signal_to_current_thread(void)
+{
+    return peak_detach_controller_test_send_stale_signal_to_tid(
+        (long)syscall(SYS_gettid));
+}
 #endif
 
 static gboolean
@@ -619,7 +881,15 @@ peak_detach_controller_atfork_child(void)
     helper_pid = -1;
     helper_owner_pid = -1;
     helper_state_fatal = FALSE;
+    atomic_store_explicit(&auto_signal_fallback_cached,
+                          0,
+                          memory_order_release);
     held_mutation = (PeakDetachHeldMutation){ 0 };
+    held_mutation_started_at = 0.0;
+    atomic_store_explicit(&held_mutation_window_active,
+                          0,
+                          memory_order_release);
+    last_stop_window_us = 0.0;
     memset(physical_patch_records, 0, sizeof(physical_patch_records));
     peak_detach_controller_init_mutation_guard();
 }
@@ -652,7 +922,15 @@ peak_detach_controller_reset_inherited_helper_if_needed(void)
         helper_pid = -1;
         helper_owner_pid = -1;
         helper_state_fatal = FALSE;
+        atomic_store_explicit(&auto_signal_fallback_cached,
+                              0,
+                              memory_order_release);
         held_mutation = (PeakDetachHeldMutation){ 0 };
+        held_mutation_started_at = 0.0;
+        atomic_store_explicit(&held_mutation_window_active,
+                              0,
+                              memory_order_release);
+        last_stop_window_us = 0.0;
         memset(physical_patch_records, 0, sizeof(physical_patch_records));
     }
 }
@@ -711,6 +989,11 @@ peak_detach_controller_requested_backend(void)
 static gboolean
 peak_detach_controller_auto_should_use_signal_backend(void)
 {
+    if (atomic_load_explicit(&auto_signal_fallback_cached,
+                             memory_order_acquire) != 0) {
+        return TRUE;
+    }
+
 #ifdef __linux__
     const char* override = g_getenv("PEAK_TEST_PTRACE_SCOPE");
     char buffer[32];
@@ -746,12 +1029,66 @@ peak_detach_controller_auto_should_use_signal_backend(void)
     return FALSE;
 }
 
+static void
+peak_detach_controller_cache_auto_signal_fallback(PeakDetachStatus status,
+                                                  const char* context)
+{
+    if (status != PEAK_DETACH_STATUS_PERMISSION_DENIED &&
+        status != PEAK_DETACH_STATUS_UNSUPPORTED &&
+        status != PEAK_DETACH_STATUS_TIMEOUT) {
+        return;
+    }
+
+    atomic_store_explicit(&auto_signal_fallback_cached,
+                          1,
+                          memory_order_release);
+    if (!warned_auto_helper_fallback_cached) {
+        warned_auto_helper_fallback_cached = TRUE;
+        peak_log_info("[peak] auto safe detach using signal backend after helper %s: %s\n",
+                      context != NULL ? context : "fallback",
+                      peak_detach_controller_status_string(status));
+    }
+}
+
+static void
+peak_detach_controller_cache_auto_signal_performance_fallback(
+    double stop_window_us,
+    const char* context)
+{
+    PeakDetachStatus signal_status = PEAK_DETACH_STATUS_ERROR;
+    unsigned int threshold_us =
+        peak_detach_controller_auto_helper_perf_fallback_stop_window_us();
+
+    if (threshold_us == 0 ||
+        stop_window_us < (double)threshold_us ||
+        atomic_load_explicit(&auto_signal_fallback_cached,
+                             memory_order_acquire) != 0) {
+        return;
+    }
+
+    if (!peak_detach_controller_ensure_signal_backend(&signal_status)) {
+        return;
+    }
+
+    (void)peak_detach_controller_close_helper();
+    atomic_store_explicit(&auto_signal_fallback_cached,
+                          1,
+                          memory_order_release);
+    if (!warned_auto_helper_performance_fallback_cached) {
+        warned_auto_helper_performance_fallback_cached = TRUE;
+        peak_log_info("[peak] auto safe detach switching to signal backend after slow helper %s stop window %.3f us (threshold %u us)\n",
+                      context != NULL ? context : "mutation",
+                      stop_window_us,
+                      threshold_us);
+    }
+}
+
 static gboolean
 peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus status)
 {
     return status == PEAK_DETACH_STATUS_PERMISSION_DENIED ||
-           status == PEAK_DETACH_STATUS_TIMEOUT ||
-           status == PEAK_DETACH_STATUS_UNSUPPORTED;
+           status == PEAK_DETACH_STATUS_UNSUPPORTED ||
+           status == PEAK_DETACH_STATUS_TIMEOUT;
 }
 
 static size_t
@@ -915,18 +1252,91 @@ peak_detach_controller_last_failure_detail(void)
 }
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static int
+peak_detach_controller_deadline_remaining_ms(double deadline)
+{
+    double remaining_s = deadline - peak_detach_controller_monotonic_second();
+
+    if (remaining_s <= 0.0) {
+        return 0;
+    }
+    if (remaining_s > ((double)INT_MAX / 1000.0)) {
+        return INT_MAX;
+    }
+
+    int remaining_ms = (int)(remaining_s * 1000.0);
+    return remaining_ms > 0 ? remaining_ms : 1;
+}
+
+static unsigned int
+peak_detach_controller_timeout_until_deadline(double deadline,
+                                              gboolean cleanup_grace)
+{
+    int remaining_ms = peak_detach_controller_deadline_remaining_ms(deadline);
+
+    if (remaining_ms <= 0) {
+        return cleanup_grace ? 1u : 0u;
+    }
+    return (unsigned int)remaining_ms;
+}
+
 static gboolean
-peak_detach_controller_read_exact(int fd, void* buffer, size_t size)
+peak_detach_controller_wait_fd_until(int fd, short events, double deadline)
+{
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = events,
+        .revents = 0
+    };
+
+    for (;;) {
+        int timeout_ms = peak_detach_controller_deadline_remaining_ms(deadline);
+
+        if (timeout_ms <= 0) {
+            errno = ETIMEDOUT;
+            return FALSE;
+        }
+
+        int ret = poll(&pfd, 1, timeout_ms);
+
+        if (ret > 0) {
+            if ((pfd.revents & events) != 0) {
+                return TRUE;
+            }
+            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                errno = EPIPE;
+                return FALSE;
+            }
+            errno = EAGAIN;
+            return FALSE;
+        }
+        if (ret == 0) {
+            errno = ETIMEDOUT;
+            return FALSE;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return FALSE;
+    }
+}
+
+static gboolean
+peak_detach_controller_read_exact_until(int fd,
+                                        void* buffer,
+                                        size_t size,
+                                        double deadline)
 {
     char* cursor = (char*)buffer;
     size_t done = 0;
 
     while (done < size) {
-        if (!peak_detach_controller_wait_fd(fd, POLLIN)) {
+        if (!peak_detach_controller_wait_fd_until(fd, POLLIN, deadline)) {
             return FALSE;
         }
         ssize_t n = read(fd, cursor + done, size - done);
         if (n == 0) {
+            errno = EPIPE;
             return FALSE;
         }
         if (n < 0) {
@@ -942,13 +1352,16 @@ peak_detach_controller_read_exact(int fd, void* buffer, size_t size)
 }
 
 static gboolean
-peak_detach_controller_write_exact(int fd, const void* buffer, size_t size)
+peak_detach_controller_write_exact_until(int fd,
+                                         const void* buffer,
+                                         size_t size,
+                                         double deadline)
 {
     const char* cursor = (const char*)buffer;
     size_t done = 0;
 
     while (done < size) {
-        if (!peak_detach_controller_wait_fd(fd, POLLOUT)) {
+        if (!peak_detach_controller_wait_fd_until(fd, POLLOUT, deadline)) {
             return FALSE;
         }
         ssize_t n = send(fd, cursor + done, size - done, MSG_NOSIGNAL);
@@ -973,40 +1386,6 @@ peak_detach_controller_write_exact(int fd, const void* buffer, size_t size)
     }
 
     return TRUE;
-}
-
-static gboolean
-peak_detach_controller_wait_fd(int fd, short events)
-{
-    struct pollfd pfd = {
-        .fd = fd,
-        .events = events,
-        .revents = 0
-    };
-
-    for (;;) {
-        int ret = poll(&pfd, 1, PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS);
-
-        if (ret > 0) {
-            if ((pfd.revents & events) != 0) {
-                return TRUE;
-            }
-            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-                errno = EPIPE;
-                return FALSE;
-            }
-            errno = EAGAIN;
-            return FALSE;
-        }
-        if (ret == 0) {
-            errno = ETIMEDOUT;
-            return FALSE;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        return FALSE;
-    }
 }
 
 static PeakDetachStatus
@@ -1270,10 +1649,575 @@ peak_detach_controller_child_exec_helper(const char* path,
     peak_detach_controller_child_raw_execve(path, helper_argv, helper_env);
 }
 
+typedef struct {
+    const char* path;
+    int parent_fd;
+    int child_fd;
+    char fd_arg[32];
+    char** helper_env;
+} PeakDetachHelperSpawnArgs;
+
+static int
+peak_detach_controller_child_exec_helper_from_clone(void* data)
+{
+    PeakDetachHelperSpawnArgs* args = (PeakDetachHelperSpawnArgs*)data;
+    char* const helper_argv[] = {
+        (char*)args->path,
+        args->fd_arg,
+        NULL
+    };
+
+    peak_detach_controller_raw_close(args->parent_fd);
+    peak_detach_controller_child_close_inherited_fds(args->child_fd);
+    peak_detach_controller_child_exec_helper(args->path,
+                                             helper_argv,
+                                             args->helper_env);
+    _exit(127);
+}
+
+static gboolean
+peak_detach_controller_helper_spawn_should_use_fork(void)
+{
+    const char* value = g_getenv(PEAK_DETACH_HELPER_SPAWN_ENV);
+
+    if (value == NULL || value[0] == '\0') {
+        return TRUE;
+    }
+
+    if (g_ascii_strcasecmp(value, "clone") == 0 ||
+        g_ascii_strcasecmp(value, "clone-vfork") == 0 ||
+        g_ascii_strcasecmp(value, "no-atfork") == 0) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean
+peak_detach_controller_trace_diagnostics_enabled(void)
+{
+    return atomic_load_explicit(&trace_diagnostics_enabled,
+                                memory_order_acquire) != 0;
+}
+
 static void
+peak_detach_controller_trace_helper_spawn(const char* event,
+                                          const char* method,
+                                          pid_t pid,
+                                          PeakDetachStatus status)
+{
+    if (!peak_detach_controller_trace_diagnostics_enabled()) {
+        return;
+    }
+
+    peak_log_info("[peak] detach helper %s method=%s pid=%ld status=%s\n",
+                  event != NULL ? event : "unknown",
+                  method != NULL ? method : "unknown",
+                  (long)pid,
+                  peak_detach_controller_status_string(status));
+}
+
+static const char*
+peak_detach_controller_requested_backend_string(PeakDetachRequestedBackend backend)
+{
+    switch (backend) {
+        case PEAK_DETACH_REQUESTED_BACKEND_AUTO:
+            return "auto";
+        case PEAK_DETACH_REQUESTED_BACKEND_HELPER:
+            return "helper";
+        case PEAK_DETACH_REQUESTED_BACKEND_SIGNAL:
+            return "signal";
+        default:
+            return "unknown";
+    }
+}
+
+static const char*
+peak_detach_controller_hold_backend_string(PeakDetachHoldBackend backend)
+{
+    switch (backend) {
+        case PEAK_DETACH_HOLD_BACKEND_NONE:
+            return "none";
+        case PEAK_DETACH_HOLD_BACKEND_HELPER:
+            return "helper";
+        case PEAK_DETACH_HOLD_BACKEND_SIGNAL:
+            return "signal";
+        default:
+            return "unknown";
+    }
+}
+
+static void
+peak_detach_controller_trace_backend_phase(const char* phase,
+                                           const PeakDetachRequest* request,
+                                           PeakDetachRequestedBackend requested_backend,
+                                           PeakDetachHoldBackend selected_backend,
+                                           PeakDetachStatus status,
+                                           const char* reason,
+                                           size_t request_count)
+{
+    int saved_errno = errno;
+    char detail[512];
+    char row[1024];
+    int fd;
+
+    if (!peak_detach_controller_trace_diagnostics_enabled()) {
+        errno = saved_errno;
+        return;
+    }
+    if (peak_detach_controller_stop_window_trace_deferred()) {
+        errno = saved_errno;
+        return;
+    }
+
+    fd = atomic_load_explicit(&trace_diagnostics_fd, memory_order_acquire);
+    if (fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    snprintf(detail,
+             sizeof(detail),
+             "phase=%s;requested=%s;selected=%s;reason=%s;operation=%s;avoid_external_helper=%d;requests=%lu",
+             phase != NULL ? phase : "unknown",
+             peak_detach_controller_requested_backend_string(requested_backend),
+             peak_detach_controller_hold_backend_string(selected_backend),
+             reason != NULL ? reason : "none",
+             request != NULL
+                 ? peak_detach_controller_operation_string(request->operation)
+                 : "batch",
+             request != NULL && request->avoid_external_helper ? 1 : 0,
+             (unsigned long)request_count);
+
+    int n = snprintf(row,
+                     sizeof(row),
+                     "%.9f,-1,__peak_controller_backend__,backend,%s,0,%s,0,0.000000000,%lu,0.000,0,%s,%s,0,0x0,0x0,%s,%lu,0.000000000,0.000000000,0.000000000,0.000000000\n",
+                     peak_detach_controller_monotonic_second(),
+                     phase != NULL ? phase : "unknown",
+                     peak_detach_controller_status_string(status),
+                     (unsigned long)request_count,
+                     peak_detach_controller_status_string(status),
+                     detail,
+                     peak_detach_controller_hold_backend_string(selected_backend),
+                     (unsigned long)request_count);
+    if (n <= 0) {
+        errno = saved_errno;
+        return;
+    }
+    if ((size_t)n >= sizeof(row)) {
+        row[sizeof(row) - 2] = '\n';
+        row[sizeof(row) - 1] = '\0';
+        n = (int)strlen(row);
+    }
+
+    ssize_t ignored = write(fd, row, (size_t)n);
+    (void)ignored;
+    errno = saved_errno;
+}
+
+void
+peak_detach_controller_trace_diagnostic_phase(const char* phase,
+                                              PeakDetachStatus status,
+                                              size_t request_count,
+                                              const char* reason)
+{
+    peak_detach_controller_trace_backend_phase(
+        phase,
+        NULL,
+        PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+        PEAK_DETACH_HOLD_BACKEND_NONE,
+        status,
+        reason,
+        request_count);
+}
+
+static void
+peak_detach_controller_signal_count_epoch(int epoch,
+                                          uint32_t* active_out,
+                                          uint32_t* arrived_out,
+                                          uint32_t* done_out,
+                                          uint32_t* evacuate_started_out,
+                                          uint32_t* evacuated_out,
+                                          pid_t* first_pending_tid_out,
+                                          pid_t* first_not_done_tid_out)
+{
+    uint32_t active = 0;
+    uint32_t arrived = 0;
+    uint32_t done = 0;
+    uint32_t evacuate_started = 0;
+    uint32_t evacuated = 0;
+    pid_t first_pending_tid = 0;
+    pid_t first_not_done_tid = 0;
+    uint32_t count =
+        atomic_load_explicit(&signal_slot_count, memory_order_acquire);
+
+    for (uint32_t i = 0; i < count; i++) {
+        PeakDetachSignalSlot* slot = &signal_slots[i];
+        if (!peak_detach_controller_signal_slot_active(slot, epoch)) {
+            continue;
+        }
+        active++;
+        if (atomic_load_explicit(&slot->arrived_epoch,
+                                 memory_order_acquire) == epoch) {
+            arrived++;
+        }
+        if (atomic_load_explicit(&slot->done_epoch,
+                                 memory_order_acquire) == epoch) {
+            done++;
+        }
+        if (atomic_load_explicit(&slot->evacuate_started_epoch,
+                                 memory_order_acquire) == epoch) {
+            evacuate_started++;
+        }
+        if (atomic_load_explicit(&slot->evacuated_epoch,
+                                 memory_order_acquire) == epoch) {
+            evacuated++;
+        }
+        if (first_pending_tid == 0 &&
+            atomic_load_explicit(&slot->arrived_epoch,
+                                 memory_order_acquire) != epoch) {
+            first_pending_tid =
+                (pid_t)atomic_load_explicit(&slot->tid,
+                                            memory_order_acquire);
+        }
+        if (first_not_done_tid == 0 &&
+            atomic_load_explicit(&slot->arrived_epoch,
+                                 memory_order_acquire) == epoch &&
+            atomic_load_explicit(&slot->done_epoch,
+                                 memory_order_acquire) != epoch) {
+            first_not_done_tid =
+                (pid_t)atomic_load_explicit(&slot->tid,
+                                            memory_order_acquire);
+        }
+    }
+
+    if (active_out != NULL) {
+        *active_out = active;
+    }
+    if (arrived_out != NULL) {
+        *arrived_out = arrived;
+    }
+    if (done_out != NULL) {
+        *done_out = done;
+    }
+    if (evacuate_started_out != NULL) {
+        *evacuate_started_out = evacuate_started;
+    }
+    if (evacuated_out != NULL) {
+        *evacuated_out = evacuated;
+    }
+    if (first_pending_tid_out != NULL) {
+        *first_pending_tid_out = first_pending_tid;
+    }
+    if (first_not_done_tid_out != NULL) {
+        *first_not_done_tid_out = first_not_done_tid;
+    }
+}
+
+static void
+peak_detach_controller_signal_record_deferred_trace(int epoch,
+                                                    PeakDetachStatus status)
+{
+    if (epoch <= 0) {
+        return;
+    }
+
+    signal_deferred_trace.suppressed_rows++;
+    signal_deferred_trace.last_epoch = epoch;
+    signal_deferred_trace.last_status = status;
+    peak_detach_controller_signal_count_epoch(
+        epoch,
+        &signal_deferred_trace.active,
+        &signal_deferred_trace.arrived,
+        &signal_deferred_trace.done,
+        &signal_deferred_trace.evacuate_started,
+        &signal_deferred_trace.evacuated,
+        &signal_deferred_trace.first_pending_tid,
+        &signal_deferred_trace.first_not_done_tid);
+}
+
+static void
+peak_detach_controller_signal_reset_deferred_trace(void)
+{
+    signal_deferred_trace = (PeakDetachSignalDeferredTrace){ 0 };
+    signal_deferred_trace.last_status = PEAK_DETACH_STATUS_SAFE;
+}
+
+static void
+peak_detach_controller_signal_flush_deferred_trace(double stop_window_us)
+{
+    int saved_errno = errno;
+    char detail[512];
+    char row[1024];
+    int fd;
+
+    if (signal_deferred_trace.suppressed_rows == 0 ||
+        !peak_detach_controller_trace_diagnostics_enabled()) {
+        errno = saved_errno;
+        return;
+    }
+
+    fd = atomic_load_explicit(&trace_diagnostics_fd, memory_order_acquire);
+    if (fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    snprintf(detail,
+             sizeof(detail),
+             "phase=held-summary;suppressed=%lu;last_epoch=%d;active=%u;arrived=%u;done=%u;evac_started=%u;evacuated=%u;first_pending_tid=%ld;first_not_done_tid=%ld;stop_window_us=%.3f",
+             signal_deferred_trace.suppressed_rows,
+             signal_deferred_trace.last_epoch,
+             signal_deferred_trace.active,
+             signal_deferred_trace.arrived,
+             signal_deferred_trace.done,
+             signal_deferred_trace.evacuate_started,
+             signal_deferred_trace.evacuated,
+             (long)signal_deferred_trace.first_pending_tid,
+             (long)signal_deferred_trace.first_not_done_tid,
+             stop_window_us);
+
+    int n = snprintf(row,
+                     sizeof(row),
+                     "%.9f,-1,__peak_signal,signal,held-summary,0,%s,0,0.000000000,%u,%.3f,%u,%s,%s,%ld,0x0,0x0,signal,%u,%.9f,%.9f,%.9f,0.000000000\n",
+                     peak_detach_controller_monotonic_second(),
+                     peak_detach_controller_status_string(
+                         signal_deferred_trace.last_status),
+                     signal_deferred_trace.active,
+                     stop_window_us,
+                     signal_deferred_trace.last_epoch > 0
+                         ? (unsigned int)signal_deferred_trace.last_epoch
+                         : 0u,
+                     peak_detach_controller_status_string(
+                         signal_deferred_trace.last_status),
+                     detail,
+                     signal_deferred_trace.first_pending_tid != 0
+                         ? (long)signal_deferred_trace.first_pending_tid
+                         : (long)signal_deferred_trace.first_not_done_tid,
+                     signal_deferred_trace.arrived,
+                     (double)signal_deferred_trace.done,
+                     (double)signal_deferred_trace.evacuate_started,
+                     (double)signal_deferred_trace.evacuated);
+    if (n > 0) {
+        if ((size_t)n >= sizeof(row)) {
+            row[sizeof(row) - 2] = '\n';
+            row[sizeof(row) - 1] = '\0';
+            n = (int)strlen(row);
+        }
+        ssize_t ignored = write(fd, row, (size_t)n);
+        (void)ignored;
+    }
+    errno = saved_errno;
+}
+
+static void
+peak_detach_controller_trace_signal_phase(const char* phase,
+                                          int epoch,
+                                          PeakDetachStatus status,
+                                          long tid,
+                                          uintptr_t detail_pc,
+                                          uintptr_t aux)
+{
+    int saved_errno = errno;
+    uint32_t active = 0;
+    uint32_t arrived = 0;
+    uint32_t done = 0;
+    uint32_t evacuate_started = 0;
+    uint32_t evacuated = 0;
+    pid_t first_pending_tid = 0;
+    pid_t first_not_done_tid = 0;
+    char detail[256];
+    char row[1024];
+    int fd;
+
+    if (!peak_detach_controller_trace_diagnostics_enabled()) {
+        errno = saved_errno;
+        return;
+    }
+    if (peak_detach_controller_stop_window_trace_deferred()) {
+        peak_detach_controller_signal_record_deferred_trace(epoch, status);
+        errno = saved_errno;
+        return;
+    }
+
+    fd = atomic_load_explicit(&trace_diagnostics_fd, memory_order_acquire);
+    if (fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    peak_detach_controller_signal_count_epoch(epoch,
+                                              &active,
+                                              &arrived,
+                                              &done,
+                                              &evacuate_started,
+                                              &evacuated,
+                                              &first_pending_tid,
+                                              &first_not_done_tid);
+    snprintf(detail,
+             sizeof(detail),
+             "phase=%s;active=%u;arrived=%u;done=%u;evac_started=%u;evacuated=%u;first_pending_tid=%ld;first_not_done_tid=%ld",
+             phase != NULL ? phase : "unknown",
+             active,
+             arrived,
+             done,
+             evacuate_started,
+             evacuated,
+             (long)first_pending_tid,
+             (long)first_not_done_tid);
+    int n = snprintf(row,
+                     sizeof(row),
+                     "%.9f,-1,__peak_signal,signal,%s,0,%s,0,0.000000000,%u,0.000,%u,%s,%s,%ld,0x%llx,0x%llx,signal,%u,%.9f,%.9f,%.9f,0.000000000\n",
+                     peak_detach_controller_monotonic_second(),
+                     phase != NULL ? phase : "unknown",
+                     peak_detach_controller_status_string(status),
+                     active,
+                     epoch > 0 ? (unsigned int)epoch : 0u,
+                     peak_detach_controller_status_string(status),
+                     detail,
+                     tid != 0 ? tid :
+                         first_pending_tid != 0 ? (long)first_pending_tid :
+                                                  (long)first_not_done_tid,
+                     (unsigned long long)detail_pc,
+                     (unsigned long long)aux,
+                     arrived,
+                     (double)done,
+                     (double)evacuate_started,
+                     (double)evacuated);
+    if (n <= 0) {
+        errno = saved_errno;
+        return;
+    }
+    if ((size_t)n >= sizeof(row)) {
+        row[sizeof(row) - 2] = '\n';
+        row[sizeof(row) - 1] = '\0';
+        n = (int)strlen(row);
+    }
+
+    ssize_t ignored = write(fd, row, (size_t)n);
+    (void)ignored;
+    errno = saved_errno;
+}
+
+static pid_t
+peak_detach_controller_spawn_helper_no_atfork(const char* path,
+                                              const char* fd_arg,
+                                              char** helper_env,
+                                              int parent_fd,
+                                              int child_fd)
+{
+#if defined(__linux__) && defined(CLONE_VM) && defined(CLONE_VFORK)
+    const size_t stack_size = 64 * 1024;
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (g_getenv(PEAK_TEST_DETACH_HELPER_FORCE_CLONE_SPAWN_FAIL_ENV) != NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+
+    void* stack = mmap(NULL,
+                       stack_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+                       -1,
+                       0);
+    if (stack == MAP_FAILED) {
+        return -1;
+    }
+
+    PeakDetachHelperSpawnArgs args = {
+        .path = path,
+        .parent_fd = parent_fd,
+        .child_fd = child_fd,
+        .helper_env = helper_env
+    };
+    g_strlcpy(args.fd_arg, fd_arg, sizeof(args.fd_arg));
+
+    /*
+     * The helper may be started from a large MPI rank after MPI_Init.  Plain
+     * fork() runs every pthread_atfork handler in the process and duplicates a
+     * huge address space, both of which are fragile inside Intel MPI/libfabric
+     * at scale.  clone(CLONE_VM | CLONE_VFORK | SIGCHLD) gives the child its
+     * own stack, blocks the parent until exec/_exit, and avoids atfork handlers.
+     * The child path below must remain raw-syscall-only until exec.
+     */
+    void* stack_top = (char*)stack + stack_size;
+    pid_t pid = (pid_t)clone(peak_detach_controller_child_exec_helper_from_clone,
+                             stack_top,
+                             CLONE_VM | CLONE_VFORK | SIGCHLD,
+                             &args);
+    int saved_errno = errno;
+    (void)munmap(stack, stack_size);
+    errno = saved_errno;
+    return pid;
+#else
+    (void)path;
+    (void)fd_arg;
+    (void)helper_env;
+    (void)parent_fd;
+    (void)child_fd;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static pid_t
+peak_detach_controller_spawn_helper_with_fork(const char* path,
+                                              const char* fd_arg,
+                                              char** helper_env,
+                                              int parent_fd,
+                                              int child_fd)
+{
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        char* const helper_argv[] = { (char*)path, (char*)fd_arg, NULL };
+        peak_detach_controller_raw_close(parent_fd);
+        peak_detach_controller_child_close_inherited_fds(child_fd);
+        peak_detach_controller_child_exec_helper(path, helper_argv, helper_env);
+        _exit(127);
+    }
+
+    return pid;
+}
+
+static gboolean
+peak_detach_controller_wait_helper_exit_until(pid_t pid, double deadline)
+{
+    int status = 0;
+
+    for (;;) {
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid || (waited < 0 && errno == ECHILD)) {
+            return TRUE;
+        }
+        if (waited < 0 && errno != EINTR) {
+            return FALSE;
+        }
+
+        int remaining_ms = peak_detach_controller_deadline_remaining_ms(deadline);
+        if (remaining_ms <= 0) {
+            errno = ETIMEDOUT;
+            return FALSE;
+        }
+
+        useconds_t sleep_us = PEAK_DETACH_HELPER_CLOSE_POLL_US;
+        if (remaining_ms == 1 && sleep_us > 500u) {
+            sleep_us = 500u;
+        }
+        usleep(sleep_us);
+    }
+}
+
+static gboolean
 peak_detach_controller_close_helper(void)
 {
     pid_t pid = helper_pid;
+    double start = peak_detach_controller_monotonic_second();
+    double graceful_deadline = start + 0.025;
+    double term_deadline = start + 0.125;
+    double kill_deadline =
+        start + ((double)PEAK_DETACH_HELPER_CLOSE_GRACE_MS / 1000.0);
 
     if (helper_fd >= 0) {
         peak_detach_controller_raw_close(helper_fd);
@@ -1282,35 +2226,45 @@ peak_detach_controller_close_helper(void)
     helper_owner_pid = -1;
 
     if (pid > 0) {
-        int status = 0;
-
-        for (unsigned int attempt = 0; attempt < 50; attempt++) {
-            pid_t waited = waitpid(pid, &status, WNOHANG);
-            if (waited == pid || (waited < 0 && errno == ECHILD)) {
-                helper_pid = -1;
-                return;
-            }
-            usleep(1000);
+        if (peak_detach_controller_wait_helper_exit_until(pid,
+                                                          graceful_deadline)) {
+            helper_pid = -1;
+            return TRUE;
         }
 
         kill(pid, SIGTERM);
-        for (unsigned int attempt = 0; attempt < 100; attempt++) {
-            pid_t waited = waitpid(pid, &status, WNOHANG);
-            if (waited == pid || (waited < 0 && errno == ECHILD)) {
-                helper_pid = -1;
-                return;
-            }
-            usleep(1000);
+        if (peak_detach_controller_wait_helper_exit_until(pid, term_deadline)) {
+            helper_pid = -1;
+            return TRUE;
         }
 
         kill(pid, SIGKILL);
-        (void)waitpid(pid, &status, 0);
-        helper_pid = -1;
+        if (peak_detach_controller_wait_helper_exit_until(pid, kill_deadline)) {
+            helper_pid = -1;
+            return TRUE;
+        }
+
+        peak_detach_controller_note_failure_detail(
+            "helper-close-timeout",
+            (long)pid,
+            (uintptr_t)errno,
+            0);
+        return FALSE;
     }
+
+    helper_pid = -1;
+    return TRUE;
 }
 
 static gboolean
-peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
+peak_detach_controller_helper_is_closed(void)
+{
+    return helper_fd < 0 && helper_pid <= 0;
+}
+
+static gboolean
+peak_detach_controller_ensure_helper_until(double deadline,
+                                           PeakDetachStatus* status_out)
 {
     const char* path;
     int sockets[2];
@@ -1318,11 +2272,20 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     char** helper_env;
     pid_t pid;
     PeakDetachHelperResponse handshake;
+    gboolean spawn_with_fork;
+    const char* spawn_method;
 
     peak_detach_controller_reset_inherited_helper_if_needed();
     memset(&handshake, 0, sizeof(handshake));
     if (helper_fd >= 0 && helper_pid > 0) {
         return TRUE;
+    }
+    if (helper_fd < 0 && helper_pid > 0 &&
+        !peak_detach_controller_close_helper()) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
     }
     if (helper_warmup_failed && !helper_warmup_active) {
         if (status_out != NULL) {
@@ -1383,28 +2346,47 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     }
 
     snprintf(fd_arg, sizeof(fd_arg), "%d", PEAK_DETACH_HELPER_PROTOCOL_FD);
-    pid = fork();
+    spawn_with_fork = peak_detach_controller_helper_spawn_should_use_fork();
+    spawn_method = spawn_with_fork ? "fork" : "clone-vfork";
+    peak_detach_controller_trace_helper_spawn("spawn-begin",
+                                              spawn_method,
+                                              -1,
+                                              PEAK_DETACH_STATUS_SAFE);
+    if (spawn_with_fork) {
+        pid = peak_detach_controller_spawn_helper_with_fork(path,
+                                                            fd_arg,
+                                                            helper_env,
+                                                            sockets[0],
+                                                            sockets[1]);
+    } else {
+        pid = peak_detach_controller_spawn_helper_no_atfork(path,
+                                                            fd_arg,
+                                                            helper_env,
+                                                            sockets[0],
+                                                            sockets[1]);
+    }
     if (pid < 0) {
+        int spawn_errno = errno;
+        PeakDetachStatus spawn_status = spawn_with_fork
+                                            ? peak_detach_controller_errno_status()
+                                            : PEAK_DETACH_STATUS_UNSUPPORTED;
+
+        peak_detach_controller_trace_helper_spawn("spawn-failed",
+                                                  spawn_method,
+                                                  -1,
+                                                  spawn_status);
         peak_detach_controller_note_failure_detail(
-            "helper-fork",
+            "helper-spawn",
             0,
-            (uintptr_t)errno,
+            (uintptr_t)spawn_errno,
             0);
         peak_detach_controller_free_helper_env(helper_env);
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_raw_close(sockets[1]);
         if (status_out != NULL) {
-            *status_out = PEAK_DETACH_STATUS_ERROR;
+            *status_out = spawn_status;
         }
         return FALSE;
-    }
-
-    if (pid == 0) {
-        char* const helper_argv[] = { (char*)path, fd_arg, NULL };
-        peak_detach_controller_raw_close(sockets[0]);
-        peak_detach_controller_child_close_inherited_fds(sockets[1]);
-        peak_detach_controller_child_exec_helper(path, helper_argv, helper_env);
-        _exit(127);
     }
 
     peak_detach_controller_free_helper_env(helper_env);
@@ -1412,6 +2394,10 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     helper_fd = sockets[0];
     helper_pid = pid;
     helper_owner_pid = getpid();
+    peak_detach_controller_trace_helper_spawn("spawned",
+                                              spawn_method,
+                                              helper_pid,
+                                              PEAK_DETACH_STATUS_SAFE);
 
     int flags = fcntl(helper_fd, F_GETFD);
     if (flags >= 0) {
@@ -1435,9 +2421,10 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
     }
 #endif
 
-    if (!peak_detach_controller_read_exact(helper_fd,
-                                           &handshake,
-                                           sizeof(handshake)) ||
+    if (!peak_detach_controller_read_exact_until(helper_fd,
+                                                 &handshake,
+                                                 sizeof(handshake),
+                                                 deadline) ||
         handshake.magic != PEAK_DETACH_HELPER_MAGIC ||
         handshake.version != PEAK_DETACH_HELPER_VERSION ||
         handshake.status != PEAK_DETACH_HELPER_STATUS_OK) {
@@ -1449,6 +2436,10 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         if (waited == helper_pid) {
             child_detail = (uintptr_t)child_status;
         }
+        peak_detach_controller_trace_helper_spawn("handshake-failed",
+                                                  spawn_method,
+                                                  helper_pid,
+                                                  status);
         peak_detach_controller_note_failure_detail(
             "helper-handshake",
             0,
@@ -1461,33 +2452,75 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
+    peak_detach_controller_trace_helper_spawn("handshake-ok",
+                                              spawn_method,
+                                              helper_pid,
+                                              PEAK_DETACH_STATUS_SAFE);
+    if (status_out != NULL) {
+        *status_out = PEAK_DETACH_STATUS_SAFE;
+    }
     return TRUE;
+}
+
+static gboolean
+peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
+{
+    return peak_detach_controller_ensure_helper_until(
+        peak_detach_controller_deadline_for_timeout(0),
+        status_out);
 }
 
 static gboolean
 peak_detach_controller_send_helper_command(PeakDetachHelperCommand command,
                                            uint32_t instruction_count,
                                            PeakDetachHelperInstruction* instructions,
+                                           unsigned int timeout_ms,
+                                           double deadline,
                                            gboolean close_on_io_failure,
                                            PeakDetachStatus* status_out)
 {
+    unsigned int effective_timeout_ms = timeout_ms > 0
+        ? timeout_ms
+        : peak_detach_controller_timeout_until_deadline(deadline, TRUE);
     PeakDetachHelperRequest request = {
         .magic = PEAK_DETACH_HELPER_MAGIC,
         .version = PEAK_DETACH_HELPER_VERSION,
         .command = (uint32_t)command,
         .pid = (int32_t)getpid(),
         .controller_tid = (int32_t)syscall(SYS_gettid),
-        .instruction_count = instruction_count
+        .instruction_count = instruction_count,
+        .timeout_ms = effective_timeout_ms
     };
     PeakDetachHelperResponse response;
+    gboolean trace_resume =
+        command == PEAK_DETACH_HELPER_CMD_RESUME;
+
+    if (trace_resume) {
+        peak_detach_controller_trace_backend_phase(
+            "helper-resume-command-start",
+            NULL,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            PEAK_DETACH_HOLD_BACKEND_HELPER,
+            PEAK_DETACH_STATUS_SAFE,
+            "helper-command",
+            effective_timeout_ms);
+    }
 
     if (helper_fd < 0 ||
-        !peak_detach_controller_write_exact(helper_fd, &request, sizeof(request)) ||
+        !peak_detach_controller_write_exact_until(helper_fd,
+                                                  &request,
+                                                  sizeof(request),
+                                                  deadline) ||
         (instruction_count > 0 &&
-         !peak_detach_controller_write_exact(helper_fd,
-                                             instructions,
-                                             sizeof(instructions[0]) * instruction_count)) ||
-        !peak_detach_controller_read_exact(helper_fd, &response, sizeof(response)) ||
+         !peak_detach_controller_write_exact_until(
+             helper_fd,
+             instructions,
+             sizeof(instructions[0]) * instruction_count,
+             deadline)) ||
+        !peak_detach_controller_read_exact_until(helper_fd,
+                                                 &response,
+                                                 sizeof(response),
+                                                 deadline) ||
         response.magic != PEAK_DETACH_HELPER_MAGIC ||
         response.version != PEAK_DETACH_HELPER_VERSION) {
         PeakDetachStatus status = peak_detach_controller_errno_status();
@@ -1500,10 +2533,22 @@ peak_detach_controller_send_helper_command(PeakDetachHelperCommand command,
         if (status_out != NULL) {
             *status_out = status;
         }
+        if (trace_resume) {
+            peak_detach_controller_trace_backend_phase(
+                "helper-resume-command-failed",
+                NULL,
+                PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+                PEAK_DETACH_HOLD_BACKEND_HELPER,
+                status,
+                "helper-command",
+                effective_timeout_ms);
+        }
         return FALSE;
     }
 
     if (response.status != PEAK_DETACH_HELPER_STATUS_OK) {
+        PeakDetachStatus detach_status =
+            peak_detach_controller_helper_status_to_detach_status(response.status);
         if (response.status == PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED) {
             peak_detach_controller_mark_helper_fatal("stop cleanup failure",
                                                      PEAK_DETACH_STATUS_ERROR);
@@ -1512,8 +2557,17 @@ peak_detach_controller_send_helper_command(PeakDetachHelperCommand command,
             peak_detach_controller_close_helper();
         }
         if (status_out != NULL) {
-            *status_out =
-                peak_detach_controller_helper_status_to_detach_status(response.status);
+            *status_out = detach_status;
+        }
+        if (trace_resume) {
+            peak_detach_controller_trace_backend_phase(
+                "helper-resume-command-failed",
+                NULL,
+                PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+                PEAK_DETACH_HOLD_BACKEND_HELPER,
+                detach_status,
+                "helper-command-status",
+                effective_timeout_ms);
         }
         return FALSE;
     }
@@ -1521,29 +2575,45 @@ peak_detach_controller_send_helper_command(PeakDetachHelperCommand command,
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
+    if (trace_resume) {
+        peak_detach_controller_trace_backend_phase(
+            "helper-resume-command-complete",
+            NULL,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            PEAK_DETACH_HOLD_BACKEND_HELPER,
+            PEAK_DETACH_STATUS_SAFE,
+            "helper-command",
+            effective_timeout_ms);
+    }
     return TRUE;
 }
 
 static gboolean
 peak_detach_controller_send_evacuate(uint32_t instruction_count,
                                      PeakDetachHelperInstruction* instructions,
+                                     double deadline,
                                      PeakDetachStatus* status_out)
 {
     return peak_detach_controller_send_helper_command(
         PEAK_DETACH_HELPER_CMD_EVACUATE,
         instruction_count,
         instructions,
+        peak_detach_controller_timeout_until_deadline(deadline, TRUE),
+        deadline,
         FALSE,
         status_out);
 }
 
 static gboolean
-peak_detach_controller_send_resume(PeakDetachStatus* status_out)
+peak_detach_controller_send_resume(double deadline,
+                                   PeakDetachStatus* status_out)
 {
     return peak_detach_controller_send_helper_command(
         PEAK_DETACH_HELPER_CMD_RESUME,
         0,
         NULL,
+        peak_detach_controller_timeout_until_deadline(deadline, TRUE),
+        deadline,
         FALSE,
         status_out);
 }
@@ -1556,6 +2626,8 @@ peak_detach_controller_send_shutdown(gboolean close_on_io_failure,
         PEAK_DETACH_HELPER_CMD_SHUTDOWN,
         0,
         NULL,
+        0,
+        peak_detach_controller_deadline_for_timeout(0),
         close_on_io_failure,
         status_out);
 
@@ -1568,21 +2640,35 @@ peak_detach_controller_send_shutdown(gboolean close_on_io_failure,
 static gboolean
 peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
                                     uint32_t* snapshot_count_out,
+                                    double deadline,
                                     PeakDetachStatus* status_out)
 {
+    unsigned int timeout_ms =
+        peak_detach_controller_timeout_until_deadline(deadline, FALSE);
     PeakDetachHelperRequest request = {
         .magic = PEAK_DETACH_HELPER_MAGIC,
         .version = PEAK_DETACH_HELPER_VERSION,
         .command = PEAK_DETACH_HELPER_CMD_STOP,
         .pid = (int32_t)getpid(),
         .controller_tid = (int32_t)syscall(SYS_gettid),
-        .instruction_count = 0
+        .instruction_count = 0,
+        .timeout_ms = timeout_ms
     };
     PeakDetachHelperResponse response;
 
     *snapshot_count_out = 0;
 
-    if (!peak_detach_controller_write_exact(helper_fd, &request, sizeof(request))) {
+    if (timeout_ms == 0) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
+    }
+
+    if (!peak_detach_controller_write_exact_until(helper_fd,
+                                                  &request,
+                                                  sizeof(request),
+                                                  deadline)) {
         PeakDetachStatus status = peak_detach_controller_errno_status();
         peak_detach_controller_note_failure_detail(
             "helper-stop-write",
@@ -1596,7 +2682,10 @@ peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
         return FALSE;
     }
 
-    if (!peak_detach_controller_read_exact(helper_fd, &response, sizeof(response)) ||
+    if (!peak_detach_controller_read_exact_until(helper_fd,
+                                                 &response,
+                                                 sizeof(response),
+                                                 deadline) ||
         response.magic != PEAK_DETACH_HELPER_MAGIC ||
         response.version != PEAK_DETACH_HELPER_VERSION) {
         PeakDetachStatus status = peak_detach_controller_errno_status();
@@ -1605,7 +2694,11 @@ peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
             0,
             (uintptr_t)errno,
             0);
-        peak_detach_controller_mark_helper_fatal("stop response failure", status);
+        peak_detach_controller_close_helper();
+        if (status_out != NULL) {
+            *status_out = status;
+        }
+        return FALSE;
     }
 
     if (response.status != PEAK_DETACH_HELPER_STATUS_OK) {
@@ -1631,11 +2724,22 @@ peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
     }
 
     if (response.thread_count > PEAK_DETACH_HELPER_MAX_THREADS ||
-        !peak_detach_controller_read_exact(helper_fd,
-                                           snapshots,
-                                           sizeof(snapshots[0]) * response.thread_count)) {
+        !peak_detach_controller_read_exact_until(
+            helper_fd,
+            snapshots,
+            sizeof(snapshots[0]) * response.thread_count,
+            deadline)) {
         PeakDetachStatus status = peak_detach_controller_errno_status();
-        peak_detach_controller_mark_helper_fatal("stop snapshot failure", status);
+        peak_detach_controller_note_failure_detail(
+            "helper-stop-snapshot",
+            0,
+            (uintptr_t)errno,
+            (uintptr_t)response.thread_count);
+        peak_detach_controller_close_helper();
+        if (status_out != NULL) {
+            *status_out = status;
+        }
+        return FALSE;
     }
 
     *snapshot_count_out = response.thread_count;
@@ -1663,6 +2767,7 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_slots[0].pc) &&
            atomic_is_lock_free(&signal_slots[0].new_pc) &&
            atomic_is_lock_free(&signal_slots[0].evacuate_breakpoint_pc) &&
+           atomic_is_lock_free(&signal_stale_delivery_count) &&
            peak_signal_policy_atomics_lock_free();
 }
 
@@ -1828,16 +2933,27 @@ peak_detach_controller_signal_trap_handler_is_installed(void)
 }
 
 static int
-peak_detach_controller_signal_tid_blocks_reserved(pid_t tid)
+peak_detach_controller_signal_tid_blocks_reserved_until(pid_t tid,
+                                                        double deadline)
 {
     const unsigned int max_attempts = 100;
 
     for (unsigned int attempt = 0; attempt < max_attempts; attempt++) {
+        if (peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+            return -2;
+        }
         int blocked = peak_detach_controller_signal_tid_blocks_reserved_once(tid);
         if (blocked <= 0) {
             return blocked;
         }
-        usleep(1000);
+        int remaining_ms =
+            peak_detach_controller_deadline_remaining_ms(deadline);
+        if (remaining_ms <= 0) {
+            return -2;
+        }
+        useconds_t sleep_us =
+            remaining_ms > 1 ? 1000u : (useconds_t)(remaining_ms * 1000);
+        usleep(sleep_us);
     }
     return 1;
 }
@@ -1945,6 +3061,8 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
 {
     while (atomic_load_explicit(&signal_release_epoch, memory_order_acquire) != epoch &&
            atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) == epoch) {
+        int release_epoch;
+
         if (allow_evacuation &&
             atomic_load_explicit(&slot->evacuate_epoch, memory_order_acquire) == epoch) {
             atomic_store_explicit(&slot->evacuate_started_epoch,
@@ -1952,7 +3070,14 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                   memory_order_release);
             return FALSE;
         }
-        /* Dependency-free evacuation corridor: wait only on atomic words. */
+
+        release_epoch =
+            atomic_load_explicit(&signal_release_epoch, memory_order_acquire);
+        if (release_epoch == epoch) {
+            break;
+        }
+        peak_detach_controller_signal_futex_wait(&signal_release_epoch,
+                                                 release_epoch);
     }
 
     if (atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) == epoch &&
@@ -1982,6 +3107,17 @@ peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
     pid_t tid = (pid_t)syscall(SYS_gettid);
     if (epoch == 0 ||
         !peak_signal_policy_cookie_matches_async(info, epoch, tid)) {
+        int cookie_epoch = 0;
+        if (peak_signal_policy_cookie_decode_epoch_async(info,
+                                                         tid,
+                                                         &cookie_epoch) &&
+            peak_detach_controller_signal_cookie_epoch_is_stale(cookie_epoch,
+                                                                epoch)) {
+            atomic_fetch_add_explicit(&signal_stale_delivery_count,
+                                      1,
+                                      memory_order_relaxed);
+            return;
+        }
         peak_signal_policy_note_unexpected_delivery();
         return;
     }
@@ -2240,6 +3376,7 @@ peak_detach_controller_signal_clear_slots(void)
     atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
     atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
     atomic_store_explicit(&signal_release_epoch, 0, memory_order_release);
+    peak_detach_controller_signal_wake_waiters();
 }
 
 static void
@@ -2279,6 +3416,13 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
                                            double deadline,
                                            PeakDetachStatus* status_out)
 {
+    if (peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
+    }
+
     PeakDetachSignalSlot* slot =
         peak_detach_controller_signal_alloc_slot(tid, epoch);
 
@@ -2298,16 +3442,19 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
 
     int backend_signum =
         peak_detach_controller_signal_backend_signum_load();
-    int blocked = peak_detach_controller_signal_tid_blocks_reserved(tid);
+    int blocked = peak_detach_controller_signal_tid_blocks_reserved_until(tid,
+                                                                          deadline);
     if (blocked != 0) {
         peak_detach_controller_note_failure_detail(
+            blocked == -2 ? "signal-reserved-mask-timeout" :
             blocked > 0 ? "signal-reserved-blocked" :
                           "signal-reserved-mask-unknown",
             (long)tid,
             (uintptr_t)backend_signum,
             (uintptr_t)epoch);
         if (status_out != NULL) {
-            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+            *status_out = blocked == -2 ? PEAK_DETACH_STATUS_TIMEOUT :
+                          PEAK_DETACH_STATUS_UNSUPPORTED;
         }
         return FALSE;
     }
@@ -2323,7 +3470,9 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
             }
             return TRUE;
         }
-        peak_detach_controller_signal_release_or_fatal("signal admit send failure");
+        peak_detach_controller_signal_release_or_fatal_with_timeout(
+            "signal admit send failure",
+            peak_detach_controller_timeout_until_deadline(deadline, TRUE));
         if (status_out != NULL) {
             *status_out = errno == EAGAIN ? PEAK_DETACH_STATUS_TIMEOUT :
                           peak_detach_controller_errno_status();
@@ -2463,7 +3612,8 @@ peak_detach_controller_signal_verify_no_unheld_threads(pid_t controller_tid,
 }
 
 static gboolean
-peak_detach_controller_signal_release(PeakDetachStatus* status_out)
+peak_detach_controller_signal_release(PeakDetachStatus* status_out,
+                                      unsigned int timeout_ms)
 {
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
     if (epoch == 0) {
@@ -2474,9 +3624,17 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     }
 
     atomic_store_explicit(&signal_release_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_wake_waiters();
+    peak_detach_controller_trace_signal_phase("release-start",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              0);
 
     double deadline = peak_detach_controller_monotonic_second() +
-        ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
+        ((double)peak_detach_controller_effective_timeout_ms(timeout_ms) /
+         1000.0);
     for (;;) {
         gboolean all_done = TRUE;
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
@@ -2506,17 +3664,30 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
                     break;
                 }
             }
+            if (!rewrite_ok) {
+                peak_detach_controller_trace_signal_phase(
+                    "release-rewrite-failed",
+                    epoch,
+                    PEAK_DETACH_STATUS_ERROR,
+                    0,
+                    0,
+                    0);
+                if (status_out != NULL) {
+                    *status_out = PEAK_DETACH_STATUS_ERROR;
+                }
+                return FALSE;
+            }
+            peak_detach_controller_trace_signal_phase("release-complete",
+                                                      epoch,
+                                                      PEAK_DETACH_STATUS_SAFE,
+                                                      0,
+                                                      0,
+                                                      0);
             if (all_arrived) {
                 peak_detach_controller_signal_clear_slots();
             } else {
                 atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
                 atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
-            }
-            if (!rewrite_ok) {
-                if (status_out != NULL) {
-                    *status_out = PEAK_DETACH_STATUS_ERROR;
-                }
-                return FALSE;
             }
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -2524,6 +3695,12 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             return TRUE;
         }
         if (peak_detach_controller_monotonic_second() >= deadline) {
+            peak_detach_controller_trace_signal_phase("release-timeout",
+                                                      epoch,
+                                                      PEAK_DETACH_STATUS_TIMEOUT,
+                                                      0,
+                                                      0,
+                                                      0);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_TIMEOUT;
             }
@@ -2534,11 +3711,13 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
 }
 
 static void
-peak_detach_controller_signal_release_or_fatal(const char* context)
+peak_detach_controller_signal_release_or_fatal_with_timeout(
+    const char* context,
+    unsigned int timeout_ms)
 {
     PeakDetachStatus release_status = PEAK_DETACH_STATUS_ERROR;
 
-    if (!peak_detach_controller_signal_release(&release_status)) {
+    if (!peak_detach_controller_signal_release(&release_status, timeout_ms)) {
         peak_detach_controller_mark_helper_fatal(context, release_status);
     }
 }
@@ -2546,9 +3725,26 @@ peak_detach_controller_signal_release_or_fatal(const char* context)
 static gboolean
 peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
                                            uint32_t* snapshot_count_out,
+                                           double deadline,
                                            PeakDetachStatus* status_out)
 {
-    if (!peak_detach_controller_ensure_signal_backend(status_out)) {
+    if (peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
+    }
+    PeakDetachStatus ensure_status = PEAK_DETACH_STATUS_ERROR;
+    if (!peak_detach_controller_ensure_signal_backend(&ensure_status)) {
+        peak_detach_controller_trace_signal_phase("ensure-failed",
+                                                  0,
+                                                  ensure_status,
+                                                  0,
+                                                  0,
+                                                  0);
+        if (status_out != NULL) {
+            *status_out = ensure_status;
+        }
         return FALSE;
     }
     int backend_signum =
@@ -2566,9 +3762,22 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
     peak_detach_controller_signal_clear_slots();
     atomic_store_explicit(&signal_hold_epoch, epoch, memory_order_release);
     *snapshot_count_out = 0;
+    peak_detach_controller_trace_signal_phase("stop-start",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
     DIR* dir = opendir("/proc/self/task");
     if (dir == NULL) {
+        peak_detach_controller_trace_signal_phase(
+            "enum-failed",
+            epoch,
+            peak_detach_controller_errno_status(),
+            0,
+            (uintptr_t)errno,
+            (uintptr_t)backend_signum);
         peak_detach_controller_signal_clear_slots();
         if (status_out != NULL) {
             *status_out = peak_detach_controller_errno_status();
@@ -2597,6 +3806,14 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
         PeakDetachSignalSlot* slot =
             peak_detach_controller_signal_alloc_slot(tid, epoch);
         if (slot == NULL) {
+            peak_detach_controller_trace_signal_phase(
+                "slot-overflow",
+                epoch,
+                PEAK_DETACH_STATUS_UNSUPPORTED,
+                (long)tid,
+                (uintptr_t)atomic_load_explicit(&signal_slot_count,
+                                                memory_order_acquire),
+                (uintptr_t)backend_signum);
             closedir(dir);
             peak_detach_controller_signal_clear_slots();
             if (status_out != NULL) {
@@ -2609,12 +3826,24 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
     gboolean enum_ok = errno == 0;
     closedir(dir);
     if (!enum_ok) {
+        peak_detach_controller_trace_signal_phase("enum-failed",
+                                                  epoch,
+                                                  PEAK_DETACH_STATUS_ERROR,
+                                                  0,
+                                                  (uintptr_t)errno,
+                                                  (uintptr_t)backend_signum);
         peak_detach_controller_signal_clear_slots();
         if (status_out != NULL) {
             *status_out = PEAK_DETACH_STATUS_ERROR;
         }
         return FALSE;
     }
+    peak_detach_controller_trace_signal_phase("enum-done",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
         PeakDetachSignalSlot* slot = &signal_slots[i];
@@ -2623,45 +3852,97 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
         }
         pid_t tid =
             (pid_t)atomic_load_explicit(&slot->tid, memory_order_acquire);
-        int blocked = peak_detach_controller_signal_tid_blocks_reserved(tid);
+        int blocked =
+            peak_detach_controller_signal_tid_blocks_reserved_until(tid,
+                                                                    deadline);
         if (blocked != 0) {
             peak_detach_controller_note_failure_detail(
+                blocked == -2 ? "signal-reserved-mask-timeout" :
                 blocked > 0 ? "signal-reserved-blocked" :
                               "signal-reserved-mask-unknown",
                 (long)tid,
                 (uintptr_t)backend_signum,
                 (uintptr_t)epoch);
+            peak_detach_controller_trace_signal_phase(
+                "mask-failed",
+                epoch,
+                blocked == -2 ? PEAK_DETACH_STATUS_TIMEOUT :
+                                PEAK_DETACH_STATUS_UNSUPPORTED,
+                (long)tid,
+                (uintptr_t)blocked,
+                (uintptr_t)backend_signum);
             peak_detach_controller_signal_clear_slots();
             if (status_out != NULL) {
-                *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+                *status_out = blocked == -2 ? PEAK_DETACH_STATUS_TIMEOUT :
+                              PEAK_DETACH_STATUS_UNSUPPORTED;
             }
             return FALSE;
         }
     }
+    peak_detach_controller_trace_signal_phase("mask-done",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
         PeakDetachSignalSlot* slot = &signal_slots[i];
         pid_t tid =
             (pid_t)atomic_load_explicit(&slot->tid, memory_order_acquire);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (epoch > 1 &&
+            peak_detach_controller_test_env_truthy(
+                PEAK_TEST_DETACH_SIGNAL_INJECT_STALE_BEFORE_STOP_ENV)) {
+            (void)peak_signal_policy_send_thread_signal(
+                tid,
+                backend_signum,
+                peak_signal_policy_cookie_for(epoch - 1, tid));
+        }
+        if (epoch < INT_MAX &&
+            peak_detach_controller_test_env_truthy(
+                PEAK_TEST_DETACH_SIGNAL_INJECT_FUTURE_BEFORE_STOP_ENV)) {
+            (void)peak_signal_policy_send_thread_signal(
+                tid,
+                backend_signum,
+                peak_signal_policy_cookie_for(epoch + 1, tid));
+        }
+#endif
         if (peak_signal_policy_send_thread_signal(
                 tid,
                 backend_signum,
                 peak_signal_policy_cookie_for(epoch, tid)) != 0) {
+            int send_errno = errno;
+            PeakDetachStatus send_status =
+                send_errno == EAGAIN ? PEAK_DETACH_STATUS_TIMEOUT :
+                                       peak_detach_controller_errno_status();
             if (errno == ESRCH) {
                 atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
                 continue;
             }
-            peak_detach_controller_signal_release_or_fatal("signal stop send failure");
+            peak_detach_controller_trace_signal_phase(
+                "send-failed",
+                epoch,
+                send_status,
+                (long)tid,
+                (uintptr_t)send_errno,
+                (uintptr_t)backend_signum);
+            peak_detach_controller_signal_release_or_fatal_with_timeout(
+                "signal stop send failure",
+                peak_detach_controller_timeout_until_deadline(deadline, TRUE));
             if (status_out != NULL) {
-                *status_out = errno == EAGAIN ? PEAK_DETACH_STATUS_TIMEOUT :
-                              peak_detach_controller_errno_status();
+                *status_out = send_status;
             }
             return FALSE;
         }
     }
+    peak_detach_controller_trace_signal_phase("signals-sent",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
-    double deadline = peak_detach_controller_monotonic_second() +
-        ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     for (;;) {
         gboolean all_arrived = TRUE;
         peak_detach_controller_signal_deactivate_exited_slots(epoch);
@@ -2677,7 +3958,15 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
             break;
         }
         if (peak_detach_controller_monotonic_second() >= deadline) {
-            peak_detach_controller_signal_release_or_fatal("signal stop timeout");
+            peak_detach_controller_trace_signal_phase("arrivals-timeout",
+                                                      epoch,
+                                                      PEAK_DETACH_STATUS_TIMEOUT,
+                                                      0,
+                                                      0,
+                                                      (uintptr_t)backend_signum);
+            peak_detach_controller_signal_release_or_fatal_with_timeout(
+                "signal stop timeout",
+                peak_detach_controller_timeout_until_deadline(deadline, TRUE));
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_TIMEOUT;
             }
@@ -2685,6 +3974,12 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
         }
         usleep(1000);
     }
+    peak_detach_controller_trace_signal_phase("arrivals-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
     if (!peak_detach_controller_signal_verify_no_unheld_threads(controller_tid,
                                                                epoch,
@@ -2693,9 +3988,24 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
                                                                "signal-unheld-stop",
                                                                deadline,
                                                                status_out)) {
-        peak_detach_controller_signal_release_or_fatal("signal stop verification failure");
+        peak_detach_controller_trace_signal_phase(
+            "verify-failed",
+            epoch,
+            status_out != NULL ? *status_out : PEAK_DETACH_STATUS_ERROR,
+            0,
+            0,
+            (uintptr_t)backend_signum);
+        peak_detach_controller_signal_release_or_fatal_with_timeout(
+            "signal stop verification failure",
+            peak_detach_controller_timeout_until_deadline(deadline, TRUE));
         return FALSE;
     }
+    peak_detach_controller_trace_signal_phase("verify-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              0,
+                                              (uintptr_t)backend_signum);
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
         PeakDetachSignalSlot* slot = &signal_slots[i];
@@ -2704,7 +4014,16 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
             continue;
         }
         if (*snapshot_count_out >= PEAK_DETACH_HELPER_MAX_THREADS) {
-            peak_detach_controller_signal_release_or_fatal("signal stop snapshot overflow");
+            peak_detach_controller_trace_signal_phase(
+                "snapshot-overflow",
+                epoch,
+                PEAK_DETACH_STATUS_UNSUPPORTED,
+                0,
+                (uintptr_t)*snapshot_count_out,
+                (uintptr_t)backend_signum);
+            peak_detach_controller_signal_release_or_fatal_with_timeout(
+                "signal stop snapshot overflow",
+                peak_detach_controller_timeout_until_deadline(deadline, TRUE));
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
             }
@@ -2717,6 +4036,12 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
         snapshot->pc = (uint64_t)atomic_load_explicit(&slot->pc,
                                                        memory_order_acquire);
     }
+    peak_detach_controller_trace_signal_phase("snapshots-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)*snapshot_count_out,
+                                              (uintptr_t)backend_signum);
 
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -2775,6 +4100,7 @@ static gboolean
 peak_detach_controller_signal_temp_breakpoint_out_of_range(
     const PeakDetachHelperInstruction* instruction,
     int epoch,
+    double deadline,
     PeakDetachStatus* status_out)
 {
     PeakDetachSignalSlot* slot =
@@ -2822,13 +4148,27 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
         }
         return TRUE;
     }
+    peak_detach_controller_trace_signal_phase("evac-breakpoint-start",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              instruction != NULL ? (long)instruction->tid : 0,
+                                              (uintptr_t)instruction->address,
+                                              (uintptr_t)instruction->size);
 
     memcpy(original, (void*)breakpoint_pc, trap_size);
     if (peak_detach_controller_signal_write_memory(breakpoint_u64,
                                                    trap,
                                                    trap_size) != 0) {
+        PeakDetachStatus status = peak_detach_controller_errno_status();
+        peak_detach_controller_trace_signal_phase(
+            "evac-breakpoint-write-failed",
+            epoch,
+            status,
+            instruction != NULL ? (long)instruction->tid : 0,
+            breakpoint_pc,
+            (uintptr_t)trap_size);
         if (status_out != NULL) {
-            *status_out = peak_detach_controller_errno_status();
+            *status_out = status;
         }
         return FALSE;
     }
@@ -2840,11 +4180,23 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
     atomic_store_explicit(&slot->evacuated_epoch, 0, memory_order_release);
     atomic_store_explicit(&slot->evacuate_started_epoch, 0, memory_order_release);
     atomic_store_explicit(&slot->evacuate_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_wake_waiters();
+    peak_detach_controller_trace_signal_phase("evac-breakpoint-armed",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              instruction != NULL ? (long)instruction->tid : 0,
+                                              breakpoint_pc,
+                                              (uintptr_t)trap_size);
 
-    double deadline = peak_detach_controller_monotonic_second() +
-        ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     for (;;) {
         if (atomic_load_explicit(&slot->evacuated_epoch, memory_order_acquire) == epoch) {
+            peak_detach_controller_trace_signal_phase(
+                "evac-breakpoint-hit",
+                epoch,
+                PEAK_DETACH_STATUS_SAFE,
+                instruction != NULL ? (long)instruction->tid : 0,
+                breakpoint_pc,
+                (uintptr_t)trap_size);
             break;
         }
         if (atomic_load_explicit(&slot->evacuate_status, memory_order_acquire) < 0) {
@@ -2860,6 +4212,13 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
                 }
                 return FALSE;
             }
+            peak_detach_controller_trace_signal_phase(
+                "evac-breakpoint-aborted",
+                epoch,
+                PEAK_DETACH_STATUS_ERROR,
+                instruction != NULL ? (long)instruction->tid : 0,
+                breakpoint_pc,
+                (uintptr_t)trap_size);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_ERROR;
             }
@@ -2869,6 +4228,13 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
             (void)peak_detach_controller_signal_write_memory(breakpoint_u64,
                                                              original,
                                                              trap_size);
+            peak_detach_controller_trace_signal_phase(
+                "evac-breakpoint-timeout",
+                epoch,
+                PEAK_DETACH_STATUS_TIMEOUT,
+                instruction != NULL ? (long)instruction->tid : 0,
+                breakpoint_pc,
+                (uintptr_t)trap_size);
             peak_detach_controller_mark_helper_fatal(
                 "signal breakpoint evacuation timeout",
                 PEAK_DETACH_STATUS_TIMEOUT);
@@ -2903,6 +4269,7 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
 static gboolean
 peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                                        PeakDetachHelperInstruction* instructions,
+                                       double deadline,
                                        PeakDetachStatus* status_out)
 {
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
@@ -2912,6 +4279,12 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
         }
         return FALSE;
     }
+    peak_detach_controller_trace_signal_phase("evac-start",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
     for (uint32_t i = 0; i < instruction_count; i++) {
         PeakDetachHelperInstruction* instruction = &instructions[i];
@@ -2921,6 +4294,13 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                                                         epoch);
             if (slot == NULL ||
                 atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) != epoch) {
+                peak_detach_controller_trace_signal_phase(
+                    "evac-validation-failed",
+                    epoch,
+                    PEAK_DETACH_STATUS_ERROR,
+                    instruction != NULL ? (long)instruction->tid : 0,
+                    instruction != NULL ? (uintptr_t)instruction->address : 0,
+                    instruction != NULL ? (uintptr_t)instruction->action : 0);
                 if (status_out != NULL) {
                     *status_out = PEAK_DETACH_STATUS_ERROR;
                 }
@@ -2929,6 +4309,13 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
         } else if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY) {
             if (instruction->address == 0 || instruction->size == 0 ||
                 instruction->size > PEAK_DETACH_HELPER_MAX_PATCH_BYTES) {
+                peak_detach_controller_trace_signal_phase(
+                    "evac-validation-failed",
+                    epoch,
+                    PEAK_DETACH_STATUS_ERROR,
+                    instruction != NULL ? (long)instruction->tid : 0,
+                    instruction != NULL ? (uintptr_t)instruction->address : 0,
+                    instruction != NULL ? (uintptr_t)instruction->action : 0);
                 if (status_out != NULL) {
                     *status_out = PEAK_DETACH_STATUS_ERROR;
                 }
@@ -2946,12 +4333,26 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                     instruction != NULL ? (long)instruction->tid : 0,
                     instruction != NULL ? (uintptr_t)instruction->address : 0,
                     instruction != NULL ? (uintptr_t)instruction->size : 0);
+                peak_detach_controller_trace_signal_phase(
+                    "evac-validation-failed",
+                    epoch,
+                    PEAK_DETACH_STATUS_CLASSIFY_FAILED,
+                    instruction != NULL ? (long)instruction->tid : 0,
+                    instruction != NULL ? (uintptr_t)instruction->address : 0,
+                    instruction != NULL ? (uintptr_t)instruction->action : 0);
                 if (status_out != NULL) {
                     *status_out = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
                 }
                 return FALSE;
             }
         } else {
+            peak_detach_controller_trace_signal_phase(
+                "evac-validation-failed",
+                epoch,
+                PEAK_DETACH_STATUS_ERROR,
+                instruction != NULL ? (long)instruction->tid : 0,
+                instruction != NULL ? (uintptr_t)instruction->address : 0,
+                instruction != NULL ? (uintptr_t)instruction->action : 0);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_ERROR;
             }
@@ -2959,18 +4360,29 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
         }
     }
 
-    double verify_deadline = peak_detach_controller_monotonic_second() +
-        ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     if (!peak_detach_controller_signal_verify_no_unheld_threads(
             (pid_t)syscall(SYS_gettid),
             epoch,
             TRUE,
             TRUE,
             "signal-unheld-before-evac",
-            verify_deadline,
+            deadline,
             status_out)) {
+        peak_detach_controller_trace_signal_phase(
+            "evac-preverify-failed",
+            epoch,
+            status_out != NULL ? *status_out : PEAK_DETACH_STATUS_ERROR,
+            0,
+            0,
+            0);
         return FALSE;
     }
+    peak_detach_controller_trace_signal_phase("evac-preverify-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
     for (uint32_t i = 0; i < instruction_count; i++) {
         PeakDetachHelperInstruction* instruction = &instructions[i];
@@ -2979,23 +4391,48 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
             !peak_detach_controller_signal_temp_breakpoint_out_of_range(
                 instruction,
                 epoch,
+                deadline,
                 status_out)) {
+            peak_detach_controller_trace_signal_phase(
+                "evac-breakpoint-failed",
+                epoch,
+                status_out != NULL ? *status_out : PEAK_DETACH_STATUS_ERROR,
+                instruction != NULL ? (long)instruction->tid : 0,
+                instruction != NULL ? (uintptr_t)instruction->address : 0,
+                instruction != NULL ? (uintptr_t)instruction->size : 0);
             return FALSE;
         }
     }
+    peak_detach_controller_trace_signal_phase("evac-breakpoint-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
-    verify_deadline = peak_detach_controller_monotonic_second() +
-        ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     if (!peak_detach_controller_signal_verify_no_unheld_threads(
             (pid_t)syscall(SYS_gettid),
             epoch,
             TRUE,
             TRUE,
             "signal-unheld-after-evac",
-            verify_deadline,
+            deadline,
             status_out)) {
+        peak_detach_controller_trace_signal_phase(
+            "evac-postverify-failed",
+            epoch,
+            status_out != NULL ? *status_out : PEAK_DETACH_STATUS_ERROR,
+            0,
+            0,
+            0);
         return FALSE;
     }
+    peak_detach_controller_trace_signal_phase("evac-postverify-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
     gboolean mutation_started = FALSE;
     for (uint32_t i = 0; i < instruction_count; i++) {
@@ -3006,6 +4443,13 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                                                            instruction->bytes,
                                                            instruction->size) != 0) {
                 PeakDetachStatus status = peak_detach_controller_errno_status();
+                peak_detach_controller_trace_signal_phase(
+                    "evac-write-failed",
+                    epoch,
+                    status,
+                    instruction != NULL ? (long)instruction->tid : 0,
+                    instruction != NULL ? (uintptr_t)instruction->address : 0,
+                    instruction != NULL ? (uintptr_t)instruction->size : 0);
                 if (status_out != NULL) {
                     *status_out = status;
                 }
@@ -3017,6 +4461,12 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
             }
         }
     }
+    peak_detach_controller_trace_signal_phase("evac-write-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
     for (uint32_t i = 0; i < instruction_count; i++) {
         PeakDetachHelperInstruction* instruction = &instructions[i];
@@ -3035,6 +4485,12 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                                   memory_order_release);
         }
     }
+    peak_detach_controller_trace_signal_phase("evac-complete",
+                                              epoch,
+                                              PEAK_DETACH_STATUS_SAFE,
+                                              0,
+                                              (uintptr_t)instruction_count,
+                                              0);
 
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -3044,27 +4500,40 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
 
 static gboolean
 peak_detach_controller_resume_backend(PeakDetachHoldBackend backend,
+                                      double deadline,
                                       PeakDetachStatus* status_out)
 {
     if (backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-        return peak_detach_controller_signal_release(status_out);
+        return peak_detach_controller_signal_release(
+            status_out,
+            peak_detach_controller_timeout_until_deadline(deadline, TRUE));
     }
-    return peak_detach_controller_send_resume(status_out);
+    return peak_detach_controller_send_resume(deadline, status_out);
 }
 
 static gboolean
 peak_detach_controller_evacuate_backend(PeakDetachHoldBackend backend,
                                         uint32_t instruction_count,
                                         PeakDetachHelperInstruction* instructions,
+                                        double deadline,
                                         PeakDetachStatus* status_out)
 {
+    if (peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
+    }
+
     if (backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
         return peak_detach_controller_signal_evacuate(instruction_count,
-                                                     instructions,
+                                                      instructions,
+                                                     deadline,
                                                      status_out);
     }
     return peak_detach_controller_send_evacuate(instruction_count,
                                                instructions,
+                                               deadline,
                                                status_out);
 }
 
@@ -3108,11 +4577,42 @@ peak_detach_controller_monotonic_second(void)
 }
 
 void
-peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
+peak_detach_controller_configure_trace_diagnostics(gboolean enabled,
+                                                   const char* path)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     (void)enabled;
+    (void)path;
 #else
+    int old_fd = atomic_exchange_explicit(&trace_diagnostics_fd,
+                                          -1,
+                                          memory_order_acq_rel);
+    if (old_fd >= 0) {
+        peak_detach_controller_raw_close(old_fd);
+    }
+
+    if (enabled && path != NULL && path[0] != '\0') {
+        int fd;
+
+        snprintf(trace_diagnostics_path,
+                 sizeof(trace_diagnostics_path),
+                 "%s",
+                 path);
+        fd = open(trace_diagnostics_path,
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                  0600);
+        if (fd < 0) {
+            trace_diagnostics_path[0] = '\0';
+            enabled = FALSE;
+        } else {
+            atomic_store_explicit(&trace_diagnostics_fd,
+                                  fd,
+                                  memory_order_release);
+        }
+    } else {
+        trace_diagnostics_path[0] = '\0';
+        enabled = FALSE;
+    }
     atomic_store_explicit(&trace_diagnostics_enabled,
                           enabled ? 1 : 0,
                           memory_order_release);
@@ -3123,7 +4623,27 @@ static void
 peak_detach_controller_note_stop_window_started(void)
 {
     held_mutation_started_at = peak_detach_controller_monotonic_second();
+    atomic_store_explicit(&held_mutation_window_active,
+                          1,
+                          memory_order_release);
     last_stop_window_us = 0.0;
+    peak_detach_controller_signal_reset_deferred_trace();
+}
+
+static void
+peak_detach_controller_clear_stop_window_started(void)
+{
+    held_mutation_started_at = 0.0;
+    atomic_store_explicit(&held_mutation_window_active,
+                          0,
+                          memory_order_release);
+}
+
+static gboolean
+peak_detach_controller_stop_window_trace_deferred(void)
+{
+    return atomic_load_explicit(&held_mutation_window_active,
+                                memory_order_acquire) != 0;
 }
 
 static void
@@ -3135,7 +4655,8 @@ peak_detach_controller_note_stop_window_finished(void)
              held_mutation_started_at) *
             1000000.0;
     }
-    held_mutation_started_at = 0.0;
+    peak_detach_controller_clear_stop_window_started();
+    peak_detach_controller_signal_flush_deferred_trace(last_stop_window_us);
 }
 
 static gboolean
@@ -3282,6 +4803,7 @@ peak_detach_controller_classify_pc_from_snapshot(
     gpointer pc)
 {
     const GumPeakPcDiagnostics* diagnostics = &gum_snapshot->diagnostics;
+    gsize overwritten_prologue_len = diagnostics->overwritten_prologue_len;
     uintptr_t slice_start;
     uintptr_t slice_end;
 
@@ -3293,10 +4815,14 @@ peak_detach_controller_classify_pc_from_snapshot(
         return GUM_PEAK_PC_SAFE;
     }
 
+    if (overwritten_prologue_len == 0 && gum_snapshot->has_patch) {
+        overwritten_prologue_len = gum_snapshot->prologue_len;
+    }
+
     if (peak_detach_controller_pointer_in_range(
             pc,
             diagnostics->function_address,
-            diagnostics->overwritten_prologue_len)) {
+            overwritten_prologue_len)) {
         return GUM_PEAK_PC_AT_PATCH_ENTRY;
     }
 
@@ -3537,6 +5063,137 @@ peak_detach_controller_mutation_is_physical_entry_bytes_only(
            !mutation->frees_listener_state;
 }
 
+static void
+peak_detach_controller_set_single_owner(PeakDetachHeldMutation* mutation,
+                                        const PeakDetachRequest* request,
+                                        const PeakDetachGumSnapshot* snapshot)
+{
+    mutation->batch = FALSE;
+    mutation->owner_thread_set = TRUE;
+    mutation->owner_thread = pthread_self();
+    mutation->hook_id = request->hook_id;
+    mutation->function_address =
+        peak_detach_controller_canonical_function_address(request, snapshot);
+    mutation->listener = request->listener;
+}
+
+static gboolean
+peak_detach_controller_request_matches_held_mutation(
+    const PeakDetachRequest* request,
+    const PeakDetachHeldMutation* mutation)
+{
+    if (mutation->batch) {
+        return request == NULL;
+    }
+    if (request == NULL) {
+        return FALSE;
+    }
+    if (request->operation != mutation->operation ||
+        request->hook_id != mutation->hook_id ||
+        request->listener != mutation->listener) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_detach_controller_current_thread_owns_held_mutation(
+    const PeakDetachHeldMutation* mutation)
+{
+    return mutation->owner_thread_set &&
+           pthread_equal(pthread_self(), mutation->owner_thread);
+}
+
+static int
+peak_detach_controller_compare_snapshot_tid(const void* lhs, const void* rhs)
+{
+    const PeakDetachHelperThreadSnapshot* a =
+        (const PeakDetachHelperThreadSnapshot*)lhs;
+    const PeakDetachHelperThreadSnapshot* b =
+        (const PeakDetachHelperThreadSnapshot*)rhs;
+
+    if (a->tid < b->tid) {
+        return -1;
+    }
+    if (a->tid > b->tid) {
+        return 1;
+    }
+    return 0;
+}
+
+static gboolean
+peak_detach_controller_validate_stopped_snapshots(
+    const PeakDetachHelperThreadSnapshot* snapshots,
+    uint32_t snapshot_count,
+    double deadline,
+    PeakDetachStatus* status_out)
+{
+    PeakDetachHelperThreadSnapshot sorted[PEAK_DETACH_HELPER_MAX_THREADS];
+
+    if (snapshot_count > PEAK_DETACH_HELPER_MAX_THREADS) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+        }
+        return FALSE;
+    }
+
+    for (uint32_t i = 0; i < snapshot_count; i++) {
+        if ((i & 63u) == 0 &&
+            peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+            peak_detach_controller_note_failure_detail("classify-timeout",
+                                                       0,
+                                                       (uintptr_t)i,
+                                                       (uintptr_t)snapshot_count);
+            if (status_out != NULL) {
+                *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+            }
+            return FALSE;
+        }
+        if (snapshots[i].status != PEAK_DETACH_HELPER_THREAD_OK) {
+            if (status_out != NULL) {
+                *status_out = PEAK_DETACH_STATUS_ERROR;
+            }
+            return FALSE;
+        }
+        sorted[i] = snapshots[i];
+    }
+
+    qsort(sorted,
+          snapshot_count,
+          sizeof(sorted[0]),
+          peak_detach_controller_compare_snapshot_tid);
+
+    for (uint32_t i = 1; i < snapshot_count; i++) {
+        if ((i & 63u) == 0 &&
+            peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+            peak_detach_controller_note_failure_detail("classify-timeout",
+                                                       0,
+                                                       (uintptr_t)i,
+                                                       (uintptr_t)snapshot_count);
+            if (status_out != NULL) {
+                *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+            }
+            return FALSE;
+        }
+        if (sorted[i - 1].tid == sorted[i].tid) {
+            peak_detach_controller_note_failure_detail(
+                "duplicate-stopped-tid",
+                (long)sorted[i].tid,
+                (uintptr_t)(gpointer)(uintptr_t)sorted[i].pc,
+                0);
+            if (status_out != NULL) {
+                *status_out = PEAK_DETACH_STATUS_ERROR;
+            }
+            return FALSE;
+        }
+    }
+
+    if (status_out != NULL) {
+        *status_out = PEAK_DETACH_STATUS_SAFE;
+    }
+    return TRUE;
+}
+
 static gboolean
 peak_detach_controller_classify_stopped_threads(
     const PeakDetachRequest* request,
@@ -3544,12 +5201,14 @@ peak_detach_controller_classify_stopped_threads(
     PeakDetachHoldBackend backend,
     PeakDetachHelperThreadSnapshot* snapshots,
     uint32_t snapshot_count,
+    double deadline,
     PeakDetachHeldMutation* mutation,
     PeakDetachStatus* status_out)
 {
     mutation->instruction_count = 0;
     mutation->uses_physical_patch = FALSE;
     mutation->operation = request->operation;
+    peak_detach_controller_set_single_owner(mutation, request, snapshot);
     peak_detach_controller_init_mutation_semantics(mutation,
                                                    request->operation);
 
@@ -3561,23 +5220,14 @@ peak_detach_controller_classify_stopped_threads(
             peak_detach_controller_canonical_function_address(request,
                                                               snapshot);
 
-        for (uint32_t j = 0; j < i; j++) {
-            if (snapshots[j].tid == thread_snapshot->tid) {
-                peak_detach_controller_note_failure_detail(
-                    "duplicate-stopped-tid",
-                    (long)thread_snapshot->tid,
-                    (uintptr_t)pc,
-                    0);
-                if (status_out != NULL) {
-                    *status_out = PEAK_DETACH_STATUS_ERROR;
-                }
-                return FALSE;
-            }
-        }
-
-        if (thread_snapshot->status != PEAK_DETACH_HELPER_THREAD_OK) {
+        if ((i & 63u) == 0 &&
+            peak_detach_controller_deadline_remaining_ms(deadline) <= 0) {
+            peak_detach_controller_note_failure_detail("classify-timeout",
+                                                       (long)thread_snapshot->tid,
+                                                       (uintptr_t)pc,
+                                                       (uintptr_t)i);
             if (status_out != NULL) {
-                *status_out = PEAK_DETACH_STATUS_ERROR;
+                *status_out = PEAK_DETACH_STATUS_TIMEOUT;
             }
             return FALSE;
         }
@@ -3639,6 +5289,9 @@ peak_detach_controller_classify_stopped_threads(
                     gsize prologue_len =
                         snapshot->diagnostics.overwritten_prologue_len;
 
+                    if (prologue_len == 0 && snapshot->has_patch) {
+                        prologue_len = snapshot->prologue_len;
+                    }
                     if (pc == function_address) {
                         break;
                     }
@@ -3918,7 +5571,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_unlock_mutation_guard();
         return FALSE;
     }
-    held_mutation_started_at = 0.0;
+    peak_detach_controller_clear_stop_window_started();
     last_stop_window_us = 0.0;
 
     if (helper_state_fatal) {
@@ -3933,13 +5586,44 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_requested_backend();
     PeakDetachHoldBackend stop_backend = PEAK_DETACH_HOLD_BACKEND_NONE;
     gboolean creation_gate_active = FALSE;
+    double mutation_deadline =
+        peak_detach_controller_deadline_for_timeout(request->timeout_ms);
     gboolean auto_use_signal_backend =
         requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
-        peak_detach_controller_auto_should_use_signal_backend();
+        (request->avoid_external_helper ||
+         peak_detach_controller_auto_should_use_signal_backend());
+    gboolean auto_signal_fallback_pending = FALSE;
+    PeakDetachStatus auto_signal_fallback_status = PEAK_DETACH_STATUS_ERROR;
+    const char* auto_signal_fallback_context = NULL;
+    const char* backend_reason =
+        requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL
+            ? "explicit-signal"
+            : requested_backend == PEAK_DETACH_REQUESTED_BACKEND_HELPER
+                  ? "explicit-helper"
+                  : auto_use_signal_backend
+                        ? (request->avoid_external_helper
+                               ? "auto-avoid-external-helper"
+                               : "auto-cached-signal-fallback")
+                        : "auto-helper-first";
+
+    peak_detach_controller_trace_backend_phase("prepare-start",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               status,
+                                               backend_reason,
+                                               1);
 
     if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL ||
         auto_use_signal_backend) {
         if (!peak_detach_controller_ensure_signal_backend(&status)) {
+            peak_detach_controller_trace_backend_phase("prepare-backend-failed",
+                                                       request,
+                                                       requested_backend,
+                                                       PEAK_DETACH_HOLD_BACKEND_SIGNAL,
+                                                       status,
+                                                       backend_reason,
+                                                       1);
             if (status_out != NULL) {
                 *status_out = status;
             }
@@ -3947,18 +5631,54 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
             return FALSE;
         }
         stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
-    } else if (!peak_detach_controller_ensure_helper(&status)) {
+        peak_detach_controller_trace_backend_phase("prepare-backend-selected",
+                                                   request,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
+    } else if (!peak_detach_controller_ensure_helper_until(mutation_deadline,
+                                                           &status)) {
+        PeakDetachStatus helper_status = status;
         if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
-            peak_detach_controller_status_allows_auto_signal_fallback(status) &&
+            peak_detach_controller_status_allows_auto_signal_fallback(
+                helper_status) &&
+            peak_detach_controller_helper_is_closed() &&
             peak_detach_controller_ensure_signal_backend(&status)) {
             stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+            auto_signal_fallback_pending = TRUE;
+            auto_signal_fallback_status = helper_status;
+            auto_signal_fallback_context = "startup failure";
+            peak_detach_controller_trace_backend_phase("prepare-backend-selected",
+                                                       request,
+                                                       requested_backend,
+                                                       stop_backend,
+                                                       PEAK_DETACH_STATUS_SAFE,
+                                                       "auto-helper-fallback",
+                                                       1);
         } else {
+            peak_detach_controller_trace_backend_phase("prepare-backend-failed",
+                                                       request,
+                                                       requested_backend,
+                                                       PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                       status,
+                                                       backend_reason,
+                                                       1);
             if (status_out != NULL) {
                 *status_out = status;
             }
             peak_detach_controller_unlock_mutation_guard();
             return FALSE;
         }
+    } else {
+        peak_detach_controller_trace_backend_phase("prepare-backend-selected",
+                                                   request,
+                                                   requested_backend,
+                                                   PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
     }
 
     if (!peak_detach_controller_capture_gum_snapshot(request,
@@ -3976,11 +5696,19 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     peak_detach_controller_test_delay_after_gate_begin();
 
     if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
+        peak_detach_controller_trace_backend_phase("stop-signal-start",
+                                                   request,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
         peak_detach_controller_note_stop_window_started();
         if (!peak_detach_controller_signal_stop_threads(snapshots,
                                                         &snapshot_count,
+                                                        mutation_deadline,
                                                         &status)) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_clear_stop_window_started();
             if (creation_gate_active) {
                 peak_detach_controller_end_thread_creation_gate();
                 creation_gate_active = FALSE;
@@ -3992,20 +5720,66 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
             return FALSE;
         }
     } else {
+        peak_detach_controller_trace_backend_phase("stop-helper-start",
+                                                   request,
+                                                   requested_backend,
+                                                   PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
         peak_detach_controller_note_stop_window_started();
         if (!peak_detach_controller_stop_threads(snapshots,
                                                  &snapshot_count,
+                                                 mutation_deadline,
                                                  &status)) {
             if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
                 peak_detach_controller_status_allows_auto_signal_fallback(status)) {
-                peak_detach_controller_close_helper();
-                if (peak_detach_controller_ensure_signal_backend(&status) &&
+                PeakDetachStatus helper_status = status;
+                gboolean helper_closed;
+                int remaining_ms = 0;
+                peak_detach_controller_trace_backend_phase("stop-helper-fallback-start",
+                                                           request,
+                                                           requested_backend,
+                                                           PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                           status,
+                                                           "auto-helper-stop-fallback",
+                                                           1);
+                helper_closed = peak_detach_controller_close_helper();
+                if (helper_closed) {
+                    remaining_ms =
+                        peak_detach_controller_deadline_remaining_ms(
+                            mutation_deadline);
+                }
+                if (helper_closed &&
+                    remaining_ms > 0 &&
+                    peak_detach_controller_ensure_signal_backend(&status) &&
                     peak_detach_controller_signal_stop_threads(snapshots,
                                                                &snapshot_count,
+                                                               mutation_deadline,
                                                                &status)) {
                     stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+                    auto_signal_fallback_pending = TRUE;
+                    auto_signal_fallback_status = helper_status;
+                    auto_signal_fallback_context = "stop failure";
+                    peak_detach_controller_trace_backend_phase("stop-helper-fallback-selected",
+                                                               request,
+                                                               requested_backend,
+                                                               stop_backend,
+                                                               PEAK_DETACH_STATUS_SAFE,
+                                                               "auto-helper-stop-fallback",
+                                                               1);
                 } else {
-                    held_mutation_started_at = 0.0;
+                    if (!helper_closed || remaining_ms <= 0) {
+                        status = helper_status;
+                    }
+                    peak_detach_controller_trace_backend_phase("stop-helper-fallback-failed",
+                                                               request,
+                                                               requested_backend,
+                                                               PEAK_DETACH_HOLD_BACKEND_SIGNAL,
+                                                               status,
+                                                               "auto-helper-stop-fallback",
+                                                               1);
+                    peak_detach_controller_clear_stop_window_started();
                     if (creation_gate_active) {
                         peak_detach_controller_end_thread_creation_gate();
                         creation_gate_active = FALSE;
@@ -4017,7 +5791,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                     return FALSE;
                 }
             } else {
-                held_mutation_started_at = 0.0;
+                peak_detach_controller_clear_stop_window_started();
                 if (creation_gate_active) {
                     peak_detach_controller_end_thread_creation_gate();
                     creation_gate_active = FALSE;
@@ -4030,10 +5804,17 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
             }
         } else {
             stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
+            peak_detach_controller_trace_backend_phase("stop-helper-complete",
+                                                       request,
+                                                       requested_backend,
+                                                       stop_backend,
+                                                       PEAK_DETACH_STATUS_SAFE,
+                                                       backend_reason,
+                                                       1);
         }
 
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_NONE) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_clear_stop_window_started();
             if (creation_gate_active) {
                 peak_detach_controller_end_thread_creation_gate();
                 creation_gate_active = FALSE;
@@ -4046,16 +5827,85 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         }
     }
 
+    if (auto_signal_fallback_pending &&
+        stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
+        peak_detach_controller_cache_auto_signal_fallback(
+            auto_signal_fallback_status,
+            auto_signal_fallback_context);
+    }
+
+    peak_detach_controller_trace_backend_phase("validate-snapshots-start",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               1);
+    if (!peak_detach_controller_validate_stopped_snapshots(snapshots,
+                                                          snapshot_count,
+                                                          mutation_deadline,
+                                                          &status)) {
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+        peak_detach_controller_trace_backend_phase("validate-snapshots-failed",
+                                                   request,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   status,
+                                                   backend_reason,
+                                                   1);
+
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(request->timeout_ms),
+                                                   &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("snapshot validation abort",
+                                                     resume_status);
+        }
+        peak_detach_controller_note_stop_window_finished();
+        if (creation_gate_active) {
+            peak_detach_controller_end_thread_creation_gate();
+            creation_gate_active = FALSE;
+        }
+        if (status_out != NULL) {
+            *status_out = status;
+        }
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+    peak_detach_controller_trace_backend_phase("validate-snapshots-complete",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               1);
+
+    peak_detach_controller_trace_backend_phase("classify-start",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               1);
     if (!peak_detach_controller_classify_stopped_threads(request,
                                                         &gum_snapshot,
                                                         stop_backend,
                                                         snapshots,
                                                         snapshot_count,
+                                                        mutation_deadline,
                                                         &held_mutation,
                                                         &status)) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+        peak_detach_controller_trace_backend_phase("classify-failed",
+                                                   request,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   status,
+                                                   backend_reason,
+                                                   1);
 
-        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(request->timeout_ms),
+                                                   &resume_status)) {
             peak_detach_controller_mark_helper_fatal("classify abort",
                                                      resume_status);
         }
@@ -4071,15 +5921,34 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_unlock_mutation_guard();
         return FALSE;
     }
+    peak_detach_controller_trace_backend_phase("classify-complete",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               1);
 
+    if (held_mutation.instruction_count > 0) {
+        peak_detach_controller_trace_backend_phase("evacuation-start",
+                                                   request,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   held_mutation.instruction_count);
+    }
     if (held_mutation.instruction_count > 0 &&
         !peak_detach_controller_evacuate_backend(stop_backend,
                                                  held_mutation.instruction_count,
                                                  held_mutation.instructions,
+                                                 mutation_deadline,
                                                  &status)) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
-        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(request->timeout_ms),
+                                                   &resume_status)) {
             peak_detach_controller_mark_helper_fatal("evacuate abort",
                                                      resume_status);
         }
@@ -4095,14 +5964,34 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_unlock_mutation_guard();
         return FALSE;
     }
+    peak_detach_controller_trace_backend_phase("evacuation-complete",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               status,
+                                               backend_reason,
+                                               1);
     held_mutation.instruction_count = 0;
     held_mutation.active = TRUE;
+    held_mutation.finishing = FALSE;
     held_mutation.backend = stop_backend;
+    held_mutation.auto_helper_candidate =
+        requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+        stop_backend == PEAK_DETACH_HOLD_BACKEND_HELPER;
+    held_mutation.timeout_ms = request->timeout_ms;
+    held_mutation.deadline = mutation_deadline;
     peak_signal_policy_push_migration_disabled();
 
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
+    peak_detach_controller_trace_backend_phase("held-mutation-ready",
+                                               request,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               1);
     peak_detach_controller_unlock_mutation_guard();
     return TRUE;
 #endif
@@ -4134,11 +6023,10 @@ peak_detach_controller_warmup_backend(void)
 
     PeakDetachRequestedBackend requested_backend =
         peak_detach_controller_requested_backend();
-    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL) {
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO) {
         return;
     }
-    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
-        peak_detach_controller_auto_should_use_signal_backend()) {
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL) {
         return;
     }
 
@@ -4225,9 +6113,30 @@ peak_detach_controller_prepare_hook_mutation_batch(
     size_t safe_count = 0;
     gboolean ambiguous_batch = FALSE;
     gboolean creation_gate_active = FALSE;
+    unsigned int stop_timeout_ms = 0;
+    double mutation_deadline = 0.0;
+    gboolean batch_avoids_external_helper = FALSE;
+    for (size_t i = 0; i < request_count; i++) {
+        batch_avoids_external_helper =
+            batch_avoids_external_helper || requests[i].avoid_external_helper;
+    }
     gboolean auto_use_signal_backend =
         requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
-        peak_detach_controller_auto_should_use_signal_backend();
+        (batch_avoids_external_helper ||
+         peak_detach_controller_auto_should_use_signal_backend());
+    gboolean auto_signal_fallback_pending = FALSE;
+    PeakDetachStatus auto_signal_fallback_status = PEAK_DETACH_STATUS_ERROR;
+    const char* auto_signal_fallback_context = NULL;
+    const char* backend_reason =
+        requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL
+            ? "explicit-signal"
+            : requested_backend == PEAK_DETACH_REQUESTED_BACKEND_HELPER
+                  ? "explicit-helper"
+                  : auto_use_signal_backend
+                        ? (batch_avoids_external_helper
+                               ? "auto-avoid-external-helper"
+                               : "auto-cached-signal-fallback")
+                        : "auto-helper-first";
 
     if (usable_count > PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS) {
         usable_count = PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS;
@@ -4250,7 +6159,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
         status = PEAK_DETACH_STATUS_ERROR;
         goto fail_all_locked;
     }
-    held_mutation_started_at = 0.0;
+    peak_detach_controller_clear_stop_window_started();
     last_stop_window_us = 0.0;
     if (helper_state_fatal) {
         status = PEAK_DETACH_STATUS_ERROR;
@@ -4376,20 +6285,85 @@ peak_detach_controller_prepare_hook_mutation_batch(
         goto fail_without_stop_locked;
     }
 
+    gboolean have_timeout = FALSE;
+    for (size_t i = 0; i < usable_count; i++) {
+        if (!candidates[i].valid) {
+            continue;
+        }
+        unsigned int effective_timeout_ms =
+            peak_detach_controller_effective_timeout_ms(requests[i].timeout_ms);
+        if (!have_timeout || effective_timeout_ms < stop_timeout_ms) {
+            stop_timeout_ms = effective_timeout_ms;
+            have_timeout = TRUE;
+        }
+    }
+    mutation_deadline =
+        peak_detach_controller_deadline_for_timeout(stop_timeout_ms);
+    peak_detach_controller_trace_backend_phase("batch-prepare-start",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               status,
+                                               backend_reason,
+                                               valid_count);
+
     if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL ||
         auto_use_signal_backend) {
         if (!peak_detach_controller_ensure_signal_backend(&status)) {
+            peak_detach_controller_trace_backend_phase("batch-backend-failed",
+                                                       NULL,
+                                                       requested_backend,
+                                                       PEAK_DETACH_HOLD_BACKEND_SIGNAL,
+                                                       status,
+                                                       backend_reason,
+                                                       valid_count);
             goto fail_all_locked;
         }
         stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
-    } else if (!peak_detach_controller_ensure_helper(&status)) {
+        peak_detach_controller_trace_backend_phase("batch-backend-selected",
+                                                   NULL,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   valid_count);
+    } else if (!peak_detach_controller_ensure_helper_until(mutation_deadline,
+                                                           &status)) {
+        PeakDetachStatus helper_status = status;
         if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
-            peak_detach_controller_status_allows_auto_signal_fallback(status) &&
+            peak_detach_controller_status_allows_auto_signal_fallback(
+                helper_status) &&
+            peak_detach_controller_helper_is_closed() &&
             peak_detach_controller_ensure_signal_backend(&status)) {
             stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+            auto_signal_fallback_pending = TRUE;
+            auto_signal_fallback_status = helper_status;
+            auto_signal_fallback_context = "batch startup failure";
+            peak_detach_controller_trace_backend_phase("batch-backend-selected",
+                                                       NULL,
+                                                       requested_backend,
+                                                       stop_backend,
+                                                       PEAK_DETACH_STATUS_SAFE,
+                                                       "auto-helper-fallback",
+                                                       valid_count);
         } else {
+            peak_detach_controller_trace_backend_phase("batch-backend-failed",
+                                                       NULL,
+                                                       requested_backend,
+                                                       PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                       status,
+                                                       backend_reason,
+                                                       valid_count);
             goto fail_all_locked;
         }
+    } else {
+        peak_detach_controller_trace_backend_phase("batch-backend-selected",
+                                                   NULL,
+                                                   requested_backend,
+                                                   PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   valid_count);
     }
 
     physical_patch_snapshot = malloc(sizeof(physical_patch_records));
@@ -4404,56 +6378,193 @@ peak_detach_controller_prepare_hook_mutation_batch(
     peak_detach_controller_begin_thread_creation_gate();
     creation_gate_active = TRUE;
     peak_detach_controller_test_delay_after_gate_begin();
+
+    peak_detach_controller_trace_backend_phase(
+        stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL
+            ? "batch-stop-signal-start"
+            : "batch-stop-helper-start",
+        NULL,
+        requested_backend,
+        stop_backend,
+        PEAK_DETACH_STATUS_SAFE,
+        backend_reason,
+        valid_count);
     peak_detach_controller_note_stop_window_started();
     if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
         if (!peak_detach_controller_signal_stop_threads(snapshots,
                                                         &snapshot_count,
+                                                        mutation_deadline,
                                                         &status)) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_clear_stop_window_started();
             goto fail_all_locked;
         }
     } else if (!peak_detach_controller_stop_threads(snapshots,
                                                     &snapshot_count,
+                                                    mutation_deadline,
                                                     &status)) {
         if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
             peak_detach_controller_status_allows_auto_signal_fallback(status)) {
-            peak_detach_controller_close_helper();
-            if (peak_detach_controller_ensure_signal_backend(&status) &&
+            PeakDetachStatus helper_status = status;
+            gboolean helper_closed;
+            int remaining_ms = 0;
+            peak_detach_controller_trace_backend_phase("batch-stop-helper-fallback-start",
+                                                       NULL,
+                                                       requested_backend,
+                                                       PEAK_DETACH_HOLD_BACKEND_HELPER,
+                                                       status,
+                                                       "auto-helper-stop-fallback",
+                                                       valid_count);
+            helper_closed = peak_detach_controller_close_helper();
+            if (helper_closed) {
+                remaining_ms =
+                    peak_detach_controller_deadline_remaining_ms(
+                        mutation_deadline);
+            }
+            if (helper_closed &&
+                remaining_ms > 0 &&
+                peak_detach_controller_ensure_signal_backend(&status) &&
                 peak_detach_controller_signal_stop_threads(snapshots,
                                                            &snapshot_count,
+                                                           mutation_deadline,
                                                            &status)) {
                 stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
+                auto_signal_fallback_pending = TRUE;
+                auto_signal_fallback_status = helper_status;
+                auto_signal_fallback_context = "batch stop failure";
+                peak_detach_controller_trace_backend_phase("batch-stop-helper-fallback-selected",
+                                                           NULL,
+                                                           requested_backend,
+                                                           stop_backend,
+                                                           PEAK_DETACH_STATUS_SAFE,
+                                                           "auto-helper-stop-fallback",
+                                                           valid_count);
             } else {
-                held_mutation_started_at = 0.0;
+                if (!helper_closed || remaining_ms <= 0) {
+                    status = helper_status;
+                }
+                peak_detach_controller_trace_backend_phase("batch-stop-helper-fallback-failed",
+                                                           NULL,
+                                                           requested_backend,
+                                                           PEAK_DETACH_HOLD_BACKEND_SIGNAL,
+                                                           status,
+                                                           "auto-helper-stop-fallback",
+                                                           valid_count);
+                peak_detach_controller_clear_stop_window_started();
                 goto fail_all_locked;
             }
         } else {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_clear_stop_window_started();
             goto fail_all_locked;
         }
     } else {
         stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
+        peak_detach_controller_trace_backend_phase("batch-stop-helper-complete",
+                                                   NULL,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   valid_count);
     }
+
+    if (auto_signal_fallback_pending &&
+        stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
+        peak_detach_controller_cache_auto_signal_fallback(
+            auto_signal_fallback_status,
+            auto_signal_fallback_context);
+    }
+
+    peak_detach_controller_trace_backend_phase("batch-validate-snapshots-start",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               valid_count);
+    if (!peak_detach_controller_validate_stopped_snapshots(snapshots,
+                                                          snapshot_count,
+                                                          mutation_deadline,
+                                                          &status)) {
+        PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
+        peak_detach_controller_trace_backend_phase("batch-validate-snapshots-failed",
+                                                   NULL,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   status,
+                                                   backend_reason,
+                                                   valid_count);
+
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(stop_timeout_ms),
+                                                   &resume_status)) {
+            peak_detach_controller_mark_helper_fatal("batch snapshot validation abort",
+                                                     resume_status);
+        }
+        peak_detach_controller_note_stop_window_finished();
+        if (creation_gate_active) {
+            peak_detach_controller_end_thread_creation_gate();
+            creation_gate_active = FALSE;
+        }
+        memcpy(physical_patch_records,
+               physical_patch_snapshot,
+               sizeof(physical_patch_records));
+        goto fail_unlocked_after_resume;
+    }
+    peak_detach_controller_trace_backend_phase("batch-validate-snapshots-complete",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               valid_count);
 
     for (size_t i = 0; i < usable_count; i++) {
         PeakDetachStatus candidate_status = PEAK_DETACH_STATUS_ERROR;
 
+        if ((i & 15u) == 0 &&
+            peak_detach_controller_deadline_remaining_ms(mutation_deadline) <= 0) {
+            status = PEAK_DETACH_STATUS_TIMEOUT;
+            ambiguous_batch = TRUE;
+            break;
+        }
         if (!candidates[i].valid) {
             continue;
         }
 
+        peak_detach_controller_trace_backend_phase("batch-classify-candidate-start",
+                                                   &requests[i],
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
         if (!peak_detach_controller_classify_stopped_threads(
                 &requests[i],
                 &candidates[i].snapshot,
                 stop_backend,
                 snapshots,
                 snapshot_count,
+                mutation_deadline,
                 &candidates[i].mutation,
                 &candidate_status)) {
             candidates[i].status = candidate_status;
             results[i].status = candidate_status;
+            peak_detach_controller_trace_backend_phase("batch-classify-candidate-failed",
+                                                       &requests[i],
+                                                       requested_backend,
+                                                       stop_backend,
+                                                       candidate_status,
+                                                       backend_reason,
+                                                       1);
             continue;
         }
+        peak_detach_controller_trace_backend_phase("batch-classify-candidate-complete",
+                                                   &requests[i],
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   1);
 
         if (!peak_detach_controller_append_candidate_mutation(
                 &aggregate,
@@ -4469,11 +6580,20 @@ peak_detach_controller_prepare_hook_mutation_batch(
         results[i].status = PEAK_DETACH_STATUS_SAFE;
         safe_count++;
     }
+    peak_detach_controller_trace_backend_phase("batch-classify-loop-complete",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               status,
+                                               backend_reason,
+                                               valid_count);
 
     if (ambiguous_batch) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
-        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(stop_timeout_ms),
+                                                   &resume_status)) {
             peak_detach_controller_mark_helper_fatal("batch classify abort",
                                                      resume_status);
         }
@@ -4498,7 +6618,9 @@ peak_detach_controller_prepare_hook_mutation_batch(
     if (safe_count == 0) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
-        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(stop_timeout_ms),
+                                                   &resume_status)) {
             peak_detach_controller_mark_helper_fatal("batch classify retry",
                                                      resume_status);
         }
@@ -4514,14 +6636,26 @@ peak_detach_controller_prepare_hook_mutation_batch(
         goto fail_unlocked_after_resume;
     }
 
+    if (aggregate.instruction_count > 0) {
+        peak_detach_controller_trace_backend_phase("batch-evacuation-start",
+                                                   NULL,
+                                                   requested_backend,
+                                                   stop_backend,
+                                                   PEAK_DETACH_STATUS_SAFE,
+                                                   backend_reason,
+                                                   aggregate.instruction_count);
+    }
     if (aggregate.instruction_count > 0 &&
         !peak_detach_controller_evacuate_backend(stop_backend,
                                                  aggregate.instruction_count,
                                                  aggregate.instructions,
+                                                 mutation_deadline,
                                                  &status)) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
-        if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
+        if (!peak_detach_controller_resume_backend(stop_backend,
+                                                   peak_detach_controller_deadline_for_timeout(stop_timeout_ms),
+                                                   &resume_status)) {
             peak_detach_controller_mark_helper_fatal("batch evacuate abort",
                                                      resume_status);
         }
@@ -4541,11 +6675,32 @@ peak_detach_controller_prepare_hook_mutation_batch(
                sizeof(physical_patch_records));
         goto fail_without_resume_locked;
     }
+    peak_detach_controller_trace_backend_phase("batch-evacuation-complete",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               status,
+                                               backend_reason,
+                                               valid_count);
 
     aggregate.instruction_count = 0;
     aggregate.active = TRUE;
+    aggregate.finishing = FALSE;
+    aggregate.batch = TRUE;
+    aggregate.owner_thread_set = TRUE;
+    aggregate.owner_thread = pthread_self();
     aggregate.operation = PEAK_DETACH_OPERATION_DETACH;
+    aggregate.hook_id = (size_t)-1;
+    aggregate.function_address = NULL;
+    aggregate.listener = NULL;
     aggregate.backend = stop_backend;
+    aggregate.auto_helper_candidate =
+        requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO &&
+        stop_backend == PEAK_DETACH_HOLD_BACKEND_HELPER;
+    aggregate.timeout_ms = stop_timeout_ms;
+    aggregate.deadline = mutation_deadline;
+    aggregate.deferred_cleanup_1 = physical_patch_snapshot;
+    aggregate.deferred_cleanup_2 = candidates;
     held_mutation = aggregate;
     peak_signal_policy_push_migration_disabled();
 
@@ -4563,9 +6718,30 @@ peak_detach_controller_prepare_hook_mutation_batch(
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
+    peak_detach_controller_trace_backend_phase("batch-held-mutation-ready",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               safe_count);
+    physical_patch_snapshot = NULL;
+    candidates = NULL;
+    peak_detach_controller_trace_backend_phase("batch-prepare-before-unlock",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               safe_count);
     peak_detach_controller_unlock_mutation_guard();
-    free(physical_patch_snapshot);
-    free(candidates);
+    peak_detach_controller_trace_backend_phase("batch-prepare-returning",
+                                               NULL,
+                                               requested_backend,
+                                               stop_backend,
+                                               PEAK_DETACH_STATUS_SAFE,
+                                               backend_reason,
+                                               safe_count);
     return TRUE;
 
 fail_all_locked:
@@ -4730,17 +6906,112 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
     }
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    void* deferred_cleanup_1 = NULL;
+    void* deferred_cleanup_2 = NULL;
+    gboolean mutation_active = FALSE;
+    gboolean wait_for_owner = FALSE;
+    gboolean request_mismatch = FALSE;
+    gboolean owner_mismatch = FALSE;
+    gboolean auto_helper_candidate = FALSE;
+    PeakDetachHoldBackend backend = PEAK_DETACH_HOLD_BACKEND_NONE;
+    unsigned int timeout_ms = 0;
+
     peak_detach_controller_init_atfork_once();
     peak_detach_controller_lock_mutation_guard();
+    mutation_active = held_mutation.active;
+    if (mutation_active) {
+        backend = held_mutation.backend;
+        timeout_ms = held_mutation.timeout_ms;
+        auto_helper_candidate = held_mutation.auto_helper_candidate;
+        if (!peak_detach_controller_request_matches_held_mutation(
+                request,
+                &held_mutation)) {
+            request_mismatch = TRUE;
+        } else if (held_mutation.finishing) {
+            wait_for_owner = TRUE;
+        } else if (!peak_detach_controller_current_thread_owns_held_mutation(
+                       &held_mutation)) {
+            owner_mismatch = TRUE;
+        } else {
+            held_mutation.finishing = TRUE;
+        }
+    }
+    peak_detach_controller_unlock_mutation_guard();
 
-    if (held_mutation.active) {
+    peak_detach_controller_trace_backend_phase(
+        "finish-enter",
+        request,
+        PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+        mutation_active ? backend : PEAK_DETACH_HOLD_BACKEND_NONE,
+        PEAK_DETACH_STATUS_SAFE,
+        request_mismatch ? "held-request-mismatch" :
+            owner_mismatch ? "held-owner-mismatch" :
+            wait_for_owner ? "held-finishing" :
+            (mutation_active ? "held-active" : "no-held-mutation"),
+        mutation_active ? timeout_ms : 0);
+
+    if (request_mismatch || owner_mismatch) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_ERROR;
+        }
+        return FALSE;
+    }
+
+    if (wait_for_owner) {
+        double wait_deadline =
+            peak_detach_controller_deadline_for_timeout(timeout_ms);
+        for (;;) {
+            gboolean still_active;
+
+            peak_detach_controller_lock_mutation_guard();
+            still_active = held_mutation.active;
+            peak_detach_controller_unlock_mutation_guard();
+
+            if (!still_active) {
+                mutation_active = FALSE;
+                backend = PEAK_DETACH_HOLD_BACKEND_NONE;
+                timeout_ms = 0;
+                break;
+            }
+            if (peak_detach_controller_monotonic_second() >= wait_deadline) {
+                if (status_out != NULL) {
+                    *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+                }
+                return FALSE;
+            }
+            usleep(100);
+        }
+    }
+
+    if (mutation_active) {
         PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
 
+        peak_detach_controller_trace_backend_phase(
+            "finish-resume-start",
+            request,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            backend,
+            PEAK_DETACH_STATUS_SAFE,
+            "held-release",
+            timeout_ms);
         gboolean released =
-            peak_detach_controller_resume_backend(held_mutation.backend, &status);
+            peak_detach_controller_resume_backend(backend,
+                                                  peak_detach_controller_deadline_for_timeout(timeout_ms),
+                                                  &status);
+        peak_detach_controller_trace_backend_phase(
+            released ? "finish-resume-complete" : "finish-resume-failed",
+            request,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            backend,
+            status,
+            "held-release",
+            timeout_ms);
 
         if (!released) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_lock_mutation_guard();
+            peak_detach_controller_clear_stop_window_started();
+            held_mutation.finishing = FALSE;
+            peak_detach_controller_unlock_mutation_guard();
             if (!warned_helper_resume_failed) {
                 warned_helper_resume_failed = TRUE;
                 g_printerr("[peak] detach helper failed to resume stopped threads after Gum mutation: %s\n",
@@ -4750,25 +7021,70 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
             if (status_out != NULL) {
                 *status_out = status;
             }
-            peak_detach_controller_unlock_mutation_guard();
             return FALSE;
         }
 
+        peak_detach_controller_lock_mutation_guard();
         peak_detach_controller_note_stop_window_finished();
+        if (auto_helper_candidate &&
+            backend == PEAK_DETACH_HOLD_BACKEND_HELPER) {
+            peak_detach_controller_cache_auto_signal_performance_fallback(
+                last_stop_window_us,
+                held_mutation.batch ? "batch" : "single");
+        }
+        peak_detach_controller_unlock_mutation_guard();
         peak_detach_controller_end_thread_creation_gate();
+        peak_detach_controller_trace_backend_phase(
+            "finish-cleanup-lock-start",
+            request,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            backend,
+            PEAK_DETACH_STATUS_SAFE,
+            "held-release",
+            timeout_ms);
+        peak_detach_controller_lock_mutation_guard();
+        peak_detach_controller_trace_backend_phase(
+            "finish-cleanup-lock-acquired",
+            request,
+            PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+            backend,
+            PEAK_DETACH_STATUS_SAFE,
+            "held-release",
+            timeout_ms);
+        deferred_cleanup_1 = held_mutation.deferred_cleanup_1;
+        deferred_cleanup_2 = held_mutation.deferred_cleanup_2;
         held_mutation.active = FALSE;
+        held_mutation.batch = FALSE;
+        held_mutation.auto_helper_candidate = FALSE;
+        held_mutation.owner_thread_set = FALSE;
         held_mutation.uses_physical_patch = FALSE;
         held_mutation.mutates_entry_bytes = FALSE;
         held_mutation.mutates_gum_metadata = FALSE;
         held_mutation.frees_listener_state = FALSE;
         held_mutation.requires_target_entry_idle = FALSE;
         held_mutation.operation = PEAK_DETACH_OPERATION_ATTACH;
+        held_mutation.hook_id = 0;
+        held_mutation.function_address = NULL;
+        held_mutation.listener = NULL;
         held_mutation.backend = PEAK_DETACH_HOLD_BACKEND_NONE;
         held_mutation.instruction_count = 0;
+        held_mutation.deferred_cleanup_1 = NULL;
+        held_mutation.deferred_cleanup_2 = NULL;
+        held_mutation.finishing = FALSE;
         peak_signal_policy_pop_migration_disabled();
+        peak_detach_controller_unlock_mutation_guard();
     }
 
-    peak_detach_controller_unlock_mutation_guard();
+    free(deferred_cleanup_1);
+    free(deferred_cleanup_2);
+    peak_detach_controller_trace_backend_phase(
+        "finish-complete",
+        request,
+        PEAK_DETACH_REQUESTED_BACKEND_AUTO,
+        PEAK_DETACH_HOLD_BACKEND_NONE,
+        PEAK_DETACH_STATUS_SAFE,
+        "held-release",
+        0);
 #endif
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;

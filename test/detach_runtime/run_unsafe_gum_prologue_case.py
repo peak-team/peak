@@ -118,8 +118,9 @@ def run_case(args):
                     f"guarded run for {args.case} did not print "
                     f"{expected_ok!r}\n{combined}"
                 )
-            if not line_mentions_peak_policy_skip_for_target(proc.stderr,
-                                                             args.target):
+            mentions_skip = line_mentions_peak_policy_skip_for_target(
+                proc.stderr, args.target)
+            if not mentions_skip:
                 raise AssertionError(
                     f"guarded run for {args.case} did not prove PEAK skipped "
                     f"{args.target}\n{combined}"

@@ -42,6 +42,8 @@ typedef struct {
     PeakDetachOperation operation;
     gpointer blocked_pc_start;
     size_t blocked_pc_size;
+    unsigned int timeout_ms;
+    gboolean avoid_external_helper;
 } PeakDetachRequest;
 
 typedef struct {
@@ -86,7 +88,16 @@ void peak_detach_controller_wait_for_mutation_window(void);
 void peak_detach_controller_note_thread_creation_gate_installed(
     gboolean installed);
 
-void peak_detach_controller_configure_trace_diagnostics(gboolean enabled);
+void peak_detach_controller_configure_trace_diagnostics(gboolean enabled,
+                                                        const char* path);
+
+void peak_detach_controller_trace_diagnostic_phase(const char* phase,
+                                                   PeakDetachStatus status,
+                                                   size_t request_count,
+                                                   const char* reason);
+
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_signal_stale_delivery_count(void);
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 PEAK_DETACH_CONTROLLER_TEST_API int
@@ -97,6 +108,12 @@ peak_detach_controller_test_gate_waiter_count(void);
 
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_send_stale_signal_to_current_thread(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_send_stale_signal_to_tid(long tid);
 #endif
 
 gboolean peak_detach_controller_finish_hook_mutation(

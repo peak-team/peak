@@ -72,6 +72,36 @@ monotonic_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static void
+sleep_monotonic_seconds(long seconds)
+{
+    double deadline = monotonic_seconds() + (double)seconds;
+
+    while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
+        double remaining = deadline - monotonic_seconds();
+        if (remaining <= 0.0) {
+            return;
+        }
+
+        struct timespec nap;
+        nap.tv_sec = (time_t)remaining;
+        nap.tv_nsec = (long)((remaining - (double)nap.tv_sec) * 1000000000.0);
+        if (nap.tv_nsec < 0) {
+            nap.tv_nsec = 0;
+        } else if (nap.tv_nsec >= 1000000000L) {
+            nap.tv_sec++;
+            nap.tv_nsec -= 1000000000L;
+        }
+
+        if (nanosleep(&nap, NULL) == 0) {
+            return;
+        }
+        if (errno != EINTR) {
+            return;
+        }
+    }
+}
+
 static long
 parse_long_arg(int argc, char** argv, const char* name, long fallback)
 {
@@ -422,7 +452,7 @@ main(int argc, char** argv)
     }
 
     double start = monotonic_seconds();
-    usleep((useconds_t)seconds * 1000000u);
+    sleep_monotonic_seconds(seconds);
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
     blocker_release(&blocker);
 

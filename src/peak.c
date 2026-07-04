@@ -525,18 +525,7 @@ void peak_init()
     found_MPI = check_MPI();
 #endif
     pthread_listener_attach();
-    /*
-     * Do not fork/exec the helper before MPI runtime initialization. Large
-     * Intel MPI jobs initialize OFI/UCX/libnuma after PEAK startup; adding one
-     * helper child per rank before PMPI_Init_thread perturbs that fragile
-     * phase at scale. Auto mode still tries the helper first when the first
-     * mutation needs a backend; this only removes eager pre-MPI warmup.
-     */
-    if (peak_hook_address_count > 0
-#ifdef HAVE_MPI
-        && !found_MPI
-#endif
-    ) {
+    if (peak_hook_address_count > 0) {
         peak_detach_controller_warmup_backend();
     }
 #ifdef HAVE_MPI
@@ -862,6 +851,13 @@ peak_fini_impl(void)
             } else {
                 peak_log_info("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
             }
+        }
+        PeakDetachStatus helper_shutdown_status = PEAK_DETACH_STATUS_ERROR;
+        if (!peak_detach_controller_shutdown_helper(&helper_shutdown_status) &&
+            mpi_log_rank) {
+            g_printerr("[peak] detach helper shutdown failed before MPI finalization: %s; leaving helper cleanup to process exit\n",
+                       peak_detach_controller_status_string(
+                           helper_shutdown_status));
         }
         syscall_interceptor_dettach();
         if (!pthread_listener_dettach()) {

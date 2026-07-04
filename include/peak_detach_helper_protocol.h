@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define PEAK_DETACH_HELPER_MAGIC 0x50444a48u
-#define PEAK_DETACH_HELPER_VERSION 1u
+#define PEAK_DETACH_HELPER_VERSION 2u
 #define PEAK_DETACH_HELPER_MAX_THREADS 4096u
 #define PEAK_DETACH_HELPER_MAX_BATCH_WRITES 64u
 #define PEAK_DETACH_HELPER_MAX_INSTRUCTIONS \
@@ -50,6 +50,7 @@ typedef struct {
     int32_t pid;
     int32_t controller_tid;
     uint32_t instruction_count;
+    uint32_t timeout_ms;
 } PeakDetachHelperRequest;
 
 typedef struct {

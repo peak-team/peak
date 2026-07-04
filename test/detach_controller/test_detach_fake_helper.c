@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int
@@ -113,6 +115,43 @@ log_command(const char* command)
     fclose(fp);
 }
 
+static const char*
+command_name(uint32_t command)
+{
+    switch (command) {
+        case PEAK_DETACH_HELPER_CMD_STOP:
+            return "STOP";
+        case PEAK_DETACH_HELPER_CMD_EVACUATE:
+            return "EVACUATE";
+        case PEAK_DETACH_HELPER_CMD_RESUME:
+            return "RESUME";
+        case PEAK_DETACH_HELPER_CMD_SHUTDOWN:
+            return "SHUTDOWN";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static void
+log_command_timeout(uint32_t command, uint32_t timeout_ms)
+{
+    const char* path = getenv("FAKE_DETACH_HELPER_LOG");
+    FILE* fp;
+
+    if (path == NULL || path[0] == '\0' ||
+        getenv("FAKE_DETACH_HELPER_LOG_TIMEOUTS") == NULL) {
+        return;
+    }
+
+    fp = fopen(path, "a");
+    if (fp == NULL) {
+        return;
+    }
+
+    fprintf(fp, "TIMEOUT %s %u\n", command_name(command), timeout_ms);
+    fclose(fp);
+}
+
 static long
 env_long_default(const char* name, long fallback)
 {
@@ -187,6 +226,39 @@ env_u64_file(const char* name, uint64_t* value_out)
 
     *value_out = (uint64_t)parsed;
     return 1;
+}
+
+static int
+timespec_after(struct timespec lhs, struct timespec rhs)
+{
+    if (lhs.tv_sec != rhs.tv_sec) {
+        return lhs.tv_sec > rhs.tv_sec;
+    }
+    return lhs.tv_nsec > rhs.tv_nsec;
+}
+
+static int
+env_u64_file_after(const char* name,
+                   struct timespec threshold,
+                   uint64_t* value_out)
+{
+    const char* path = getenv(name);
+    struct stat st;
+    struct timespec now = { 0, 0 };
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (stat(path, &st) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!timespec_after(st.st_mtim, threshold) &&
+        (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
+         now.tv_sec - st.st_mtim.tv_sec > 5)) {
+        return 0;
+    }
+
+    return env_u64_file(name, value_out);
 }
 
 static int
@@ -505,10 +577,16 @@ main(int argc, char** argv)
     if (scenario == NULL) {
         scenario = "stop-permission";
     }
+    long handshake_delay_ms =
+        env_long_default("FAKE_DETACH_HELPER_HANDSHAKE_DELAY_MS", 0);
+    long stop_delay_ms =
+        env_long_default("FAKE_DETACH_HELPER_STOP_DELAY_MS", 0);
     long resume_count = 0;
     long synthetic_stop_count = 0;
     long fail_resume_index =
         env_long_default("FAKE_DETACH_HELPER_FAIL_RESUME_INDEX", 0);
+    struct timespec helper_start_time = { 0, 0 };
+    (void)clock_gettime(CLOCK_REALTIME, &helper_start_time);
 
     if (!environment_is_sanitized()) {
         log_command("UNSANITIZED_ENV");
@@ -522,6 +600,10 @@ main(int argc, char** argv)
     if (strcmp(scenario, "handshake-fail") == 0) {
         log_command("START");
         return 1;
+    }
+
+    if (handshake_delay_ms > 0) {
+        usleep((useconds_t)handshake_delay_ms * 1000u);
     }
 
     if (send_response((int)fd, PEAK_DETACH_HELPER_STATUS_OK, 0, 0) != 0) {
@@ -558,9 +640,13 @@ main(int argc, char** argv)
                               request.instruction_count) != 0) {
             return 1;
         }
+        log_command_timeout(request.command, request.timeout_ms);
 
         if (request.command == PEAK_DETACH_HELPER_CMD_STOP) {
             log_command("STOP");
+            if (stop_delay_ms > 0) {
+                usleep((useconds_t)stop_delay_ms * 1000u);
+            }
             if (strcmp(scenario, "synthetic-stop") == 0 ||
                 (strcmp(scenario, "synthetic-stop-once") == 0 &&
                  synthetic_stop_count == 0) ||
@@ -587,11 +673,19 @@ main(int argc, char** argv)
                     continue;
                 }
                 if (got_pc == 0) {
-                    got_pc =
-                        env_u64_file("FAKE_DETACH_HELPER_STOP_PC_FILE", &pc);
+                    got_pc = strcmp(scenario,
+                                    "synthetic-stop-file-once") == 0
+                                 ? env_u64_file_after(
+                                       "FAKE_DETACH_HELPER_STOP_PC_FILE",
+                                       helper_start_time,
+                                       &pc)
+                                 : env_u64_file(
+                                       "FAKE_DETACH_HELPER_STOP_PC_FILE",
+                                       &pc);
                 }
                 if (got_pc == 0 &&
                     strcmp(scenario, "synthetic-stop-file-once") == 0) {
+                    log_command("STOP_FILE_EMPTY");
                     (void)send_response((int)fd,
                                         PEAK_DETACH_HELPER_STATUS_OK,
                                         0,
@@ -607,6 +701,7 @@ main(int argc, char** argv)
                 }
                 snapshot.tid = stop_tid;
                 snapshot.pc = pc;
+                log_command("STOP_SYNTHETIC");
                 if (send_response((int)fd,
                                   PEAK_DETACH_HELPER_STATUS_OK,
                                   0,
@@ -621,6 +716,7 @@ main(int argc, char** argv)
                 strcmp(scenario, "synthetic-stop-once") == 0 ||
                 strcmp(scenario, "synthetic-stop-file-once") == 0 ||
                 strcmp(scenario, "evacuate-error") == 0 ||
+                strcmp(scenario, "evacuate-missing-response") == 0 ||
                 strcmp(scenario, "evacuate-release-failed") == 0 ||
                 strcmp(scenario, "resume-release-failed") == 0 ||
                 strcmp(scenario, "shutdown-missing-response") == 0) {
@@ -640,12 +736,24 @@ main(int argc, char** argv)
             if (strcmp(scenario, "stop-missing-response") == 0) {
                 return 0;
             }
+            if (strcmp(scenario, "stop-truncated-snapshot") == 0) {
+                (void)send_response((int)fd,
+                                    PEAK_DETACH_HELPER_STATUS_OK,
+                                    0,
+                                    1);
+                return 0;
+            }
             if (strcmp(scenario, "stop-release-failed") == 0) {
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED,
                                     EIO,
                                     0);
                 continue;
+            }
+            if (strcmp(scenario, "stop-hang") == 0) {
+                for (;;) {
+                    sleep(3600);
+                }
             }
             if (strcmp(scenario, "stop-timeout") == 0 ||
                 strcmp(scenario, "stop-timeout-delayed") == 0) {
@@ -747,6 +855,9 @@ main(int argc, char** argv)
                                     EPROTO,
                                     0);
                 continue;
+            }
+            if (strcmp(scenario, "evacuate-missing-response") == 0) {
+                return 0;
             }
             if (strcmp(scenario, "evacuate-release-failed") == 0) {
                 (void)send_response((int)fd,

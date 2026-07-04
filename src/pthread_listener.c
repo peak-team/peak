@@ -205,6 +205,7 @@ pthread_listener_on_leave(GumInvocationListener* listener,
 {
     PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     int create_ret = GPOINTER_TO_INT(gum_invocation_context_get_return_value(ic));
+
     if (create_ret != 0 && thread_state->start_context != NULL) {
         g_free(thread_state->start_context);
         thread_state->start_context = NULL;

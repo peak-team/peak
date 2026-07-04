@@ -20,10 +20,14 @@ backend selection is `auto`: PEAK uses the external helper unless Linux
 `ptrace_scope` is already known to block helper attachment, in which case it
 selects the signal backend up front. Auto also falls back to the signal backend
 when helper startup is unavailable or a structured helper STOP response reports
-permission denied, timeout, or unsupported. Helper protocol loss or no-response
-after a STOP request is still fail-stop because the controller cannot prove
-whether the helper already stopped target threads. `PEAK_SAFE_DETACH_MODE=helper`
-/ `debugger` force ptrace-helper behavior; `PEAK_SAFE_DETACH_MODE=signal` or
+permission denied, timeout, or unsupported. Auto remains helper-first, but if a
+successful helper mutation observes an expensive stop-the-world window, PEAK
+keeps strict mode and demotes later auto mutations to the signal backend. This
+prevents a slow-but-successful helper from leaving hot targets attached long
+enough to dominate the run. Helper protocol loss or no-response after a STOP
+request is still fail-stop because the controller cannot prove whether the
+helper already stopped target threads. `PEAK_SAFE_DETACH_MODE=helper` /
+`debugger` force ptrace-helper behavior; `PEAK_SAFE_DETACH_MODE=signal` or
 `PEAK_DETACH_BACKEND=signal` forces the in-process signal backend. `dlopen`
 replace/revert is also guarded because it changes a
 process-wide Gum patch site. With stock Gum, startup target hooks are skipped,
@@ -136,6 +140,16 @@ The external helper provides thread control and PC classification:
 The helper does not call Gum APIs directly. Gum mutation remains in-process so it
 can operate on Gum's live data structures.
 
+The controller starts the helper with plain `fork()` by default. Explicit
+`PEAK_DETACH_BACKEND=helper` may warm this helper before the first mutation.
+Strict `auto` does not eagerly start the helper during PEAK initialization; it
+starts the helper only when the first real detach/reattach mutation needs a
+backend, then falls back to the signal backend only for structured helper
+unavailability, permission, timeout, or unsupported outcomes. This preserves
+helper-first `auto` semantics while avoiding the shared-VM launch hazards seen
+with large threaded MPI ranks. Set `PEAK_DETACH_HELPER_SPAWN=clone-vfork` only
+when diagnosing compatibility with the Linux no-atfork helper launch path.
+
 ### Strict signal backend
 
 On systems where ptrace is denied, PEAK can use
@@ -175,9 +189,12 @@ symbol path, or JIT code remain outside this user-space wrapper boundary; if
 they actually deliver PEAK's reserved signal without a valid cookie, that
 delivery is treated as backend contamination and signal-backed mutation then
 fails closed with `signal-unexpected-delivery`, while helper-backed mutation
-remains independent. Before every signal-backed stop, PEAK revalidates that its
-handler still owns the current reserved signal and that no unexpected
-non-cookie delivery has contaminated the backend.
+remains independent. A delayed PEAK-owned signal from an older stop epoch is
+different: its cookie still decodes to PEAK's secret epoch/TID form, so the
+handler ignores it as stale rather than poisoning the backend. Before every
+signal-backed stop, PEAK revalidates that its handler still owns the current
+reserved signal and that no unexpected non-cookie delivery has contaminated the
+backend.
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current
@@ -429,7 +446,7 @@ the Gum metadata needed for classification: overwritten prologue bytes,
 trampoline labels, trampoline slice bounds, shared thunk bounds, and active
 patch bytes. While non-controller threads are stopped, classification is pure
 range math against that immutable snapshot. This keeps Gum/GLib table lookups
-and helper `fork()` out of the most fragile part of the detach window.
+and helper startup out of the most fragile part of the detach window.
 
 ## Physical Detach Sequence
 
@@ -537,14 +554,28 @@ behavior. The code bytes are not mutated when safety was not proven.
 Shutdown uses a bounded retry loop and then fails closed by leaving listener
 state alive if safety still cannot be proven.
 
-Heartbeat-driven reattach is governed by the profiling overhead budget, not by
-a fixed wall-clock cooldown. The controller records every successful physical
-detach/reattach STOP window and folds that measured transition cost into the
-per-target and global heartbeat decisions. A detached target is only reattached
-when the projected callback overhead after reattach plus the expected physical
-mutation cost still fits inside the configured target/global overhead budgets.
-This keeps the physical-detach performance guarantee intact for extremely hot
-targets without depending on a tuning knob that can hide detach/reattach storms.
+Heartbeat-driven reattach is governed by the profiling overhead budget plus a
+conservative detached-dwell floor. The controller records every successful
+physical detach/reattach STOP window and folds that measured transition cost
+into the per-target and global heartbeat decisions. Global detach pressure is
+the larger of recent attached callback rate and cumulative attached callback
+ratio. This preserves pressure after an MPI rank reaches a collective or setup
+wait, where wall-clock wait time can hide a profiling burst that already
+delayed peer ranks. Global detach projects the recent and cumulative ledgers
+separately; a candidate in an already-paid batch can share the STOP window, but
+it still must lower the active pressure ledger. A detached target is only
+reattached when the projected callback overhead after reattach plus the
+expected physical mutation cost still fits inside the configured target/global
+overhead budgets. For heartbeat-detached hot targets, the sampling-probe
+interval is computed from the minimum callback sample cost and the available
+probe budget; the physical reattach and follow-up detach are paced by the
+shared mutation and pending closeout ledgers. `PEAK_REATTACH_COOLDOWN_MS`
+provides a master-compatible hard gate before heartbeat-detached hooks can be
+reattached and defaults to 60 seconds. Setting it to `0` removes only that
+compatibility gate for aggressive stress tests; the dynamic budget-derived
+interval remains active. This keeps the physical-detach performance guarantee
+intact for extremely hot targets while avoiding a default detach/reattach
+storm.
 
 Heartbeat selection is controlled by these environment variables:
 
@@ -598,6 +629,12 @@ returned to its stable state. STOP-window timing is collected only for
 `PEAK_DETACH_TRACE_PATH` diagnostics. Existing hot-callback timing remains part
 of the legacy
 overhead/profiling model and is separate from this STOP-window diagnostic path.
+For the signal backend, PEAK also emits bounded diagnostic rows with
+`symbol=__peak_signal` and `operation=signal` at major stop, mask-check,
+arrival, evacuation, and release phases. These rows carry active/arrived/done
+thread counts and first pending/not-done TIDs in the diagnostic fields. They are
+for backend liveness diagnosis and must not be treated as target-hook detach
+batches.
 The hot-loop stress runner now parses these trace rows directly: manual
 benchmark tests can fail on any transition skip or on configured per-operation
 `classify-failed` limits, so a retry storm cannot be hidden by one eventual safe

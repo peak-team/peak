@@ -172,6 +172,20 @@ void peak_general_listener_resume_callbacks(void);
  */
 void peak_general_listener_note_mpi_finalize_requested(void);
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API gboolean peak_general_listener_test_request_detach_from_source(
+    size_t hook_id,
+    const char* source_name);
+PEAK_API gboolean peak_general_listener_test_request_reattach_from_source(
+    size_t hook_id,
+    const char* source_name);
+PEAK_API gboolean peak_general_listener_test_controller_process_pending_once(
+    gboolean bypass_heartbeat_pacing);
+PEAK_API void peak_general_listener_test_set_bootstrap_pacing_state(
+    double elapsed_s,
+    double tokens_s);
+#endif
+
 #if defined(PEAK_ENABLE_TEST_HOOKS) && defined(HAVE_MPI)
 gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                      char* out,
@@ -191,6 +205,12 @@ void peak_general_listener_free(PeakGeneralListener* self);
  */
 gboolean peak_general_listener_attach_target_is_supported(const char* symbol_name,
                                                           gpointer address);
+
+/**
+ * @brief Returns whether PEAK should emit attach-skip diagnostics.
+ */
+gboolean peak_general_listener_should_log_attach_diagnostic(void);
+
 /**
  * @brief Returns whether an internal PEAK support replacement should proceed.
  *
@@ -200,6 +220,8 @@ gboolean peak_general_listener_attach_target_is_supported(const char* symbol_nam
 gboolean peak_general_listener_support_attach_target_is_supported(
     const char* symbol_name,
     gpointer address);
+
+gboolean peak_general_listener_startup_attach_can_skip_stop(void);
 
 /**
  * @brief Resolve a function through Frida's symbol APIs.
@@ -292,12 +314,12 @@ gboolean peak_general_listener_controller_thread_started(void);
 /**
  * @brief Defers controller starts while PEAK quiesces around fork.
  */
-void peak_general_listener_controller_block_start(void);
+PEAK_API void peak_general_listener_controller_block_start(void);
 
 /**
  * @brief Re-enables controller starts and returns TRUE if one was deferred.
  */
-gboolean peak_general_listener_controller_unblock_start(void);
+PEAK_API gboolean peak_general_listener_controller_unblock_start(void);
 
 /**
  * @brief Returns TRUE when the general listener can be quiesced around fork.
