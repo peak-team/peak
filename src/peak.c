@@ -123,7 +123,9 @@ typedef enum {
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static pthread_once_t peak_runtime_atfork_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t peak_runtime_fork_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t peak_runtime_parent_fork_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t peak_runtime_child_fork_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t* peak_runtime_fork_mutex = &peak_runtime_parent_fork_mutex;
 static _Atomic int peak_heartbeat_thread_started = 0;
 static int peak_runtime_fork_stopped_heartbeat = 0;
 static int peak_runtime_fork_stopped_controller = 0;
@@ -196,10 +198,7 @@ peak_runtime_atfork_child(void)
     atomic_store_explicit(&peak_heartbeat_thread_started,
                           0,
                           memory_order_release);
-    {
-        static const pthread_mutex_t reset_mutex = PTHREAD_MUTEX_INITIALIZER;
-        memcpy(&peak_runtime_fork_mutex, &reset_mutex, sizeof(reset_mutex));
-    }
+    peak_runtime_fork_mutex = &peak_runtime_child_fork_mutex;
     peak_runtime_fork_stopped_heartbeat = 0;
     peak_runtime_fork_stopped_controller = 0;
 }
@@ -242,7 +241,7 @@ peak_runtime_before_fork(void)
         return 0;
     }
 
-    pthread_mutex_lock(&peak_runtime_fork_mutex);
+    pthread_mutex_lock(peak_runtime_fork_mutex);
     peak_general_listener_controller_block_start();
     token |= PEAK_RUNTIME_FORK_TOKEN_BLOCKED_CONTROLLER;
     heartbeat_started = atomic_load_explicit(&peak_heartbeat_thread_started,
@@ -253,7 +252,7 @@ peak_runtime_before_fork(void)
             return token;
         }
         (void)peak_general_listener_controller_unblock_start();
-        pthread_mutex_unlock(&peak_runtime_fork_mutex);
+        pthread_mutex_unlock(peak_runtime_fork_mutex);
         return 0;
     }
     peak_runtime_fork_stopped_heartbeat = 0;
@@ -297,7 +296,7 @@ peak_runtime_after_fork_parent(int token)
     }
     peak_runtime_fork_stopped_heartbeat = 0;
     peak_runtime_fork_stopped_controller = 0;
-    pthread_mutex_unlock(&peak_runtime_fork_mutex);
+    pthread_mutex_unlock(peak_runtime_fork_mutex);
     errno = saved_errno;
 }
 
@@ -1091,13 +1090,17 @@ void exit_interceptor_detach() {
 }
 
 static int main_wrapper(int argc, char** argv, char** envp) {
+    int exit_interceptor_attached = 0;
+
     // Call peak_init before main
     // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
     if (exit_interceptor_attach() != 0) {
         peak_log_warn("[peak] exit interceptor attach failed; using atexit fallback for PEAK finalization\n");
+    } else {
+        exit_interceptor_attached = 1;
     }
     peak_init();
-    if (atexit(peak_fini) != 0) {
+    if (!exit_interceptor_attached && atexit(peak_fini) != 0) {
         peak_log_warn("[peak] failed to register atexit fallback for PEAK finalization\n");
     }
 
