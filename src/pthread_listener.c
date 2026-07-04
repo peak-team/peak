@@ -298,6 +298,7 @@ void pthread_listener_atfork_child()
      * contain vanished parent threads, so drop the pointer and rebuild lazily
      * if exec fails and PEAK code runs in the child.
      */
+    memset(&tid_mapping_mutex, 0, sizeof(tid_mapping_mutex));
     g_mutex_init(&tid_mapping_mutex);
     peak_tid_mapping = NULL;
     g_queue_init(&reusable_tid_ids);

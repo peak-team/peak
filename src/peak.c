@@ -196,7 +196,7 @@ peak_runtime_atfork_child(void)
     atomic_store_explicit(&peak_heartbeat_thread_started,
                           0,
                           memory_order_release);
-    pthread_mutex_init(&peak_runtime_fork_mutex, NULL);
+    peak_runtime_fork_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
     peak_runtime_fork_stopped_heartbeat = 0;
     peak_runtime_fork_stopped_controller = 0;
 }
