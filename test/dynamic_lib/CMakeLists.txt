@@ -9,17 +9,19 @@ set(DL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(DL_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
 if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+  set(DL_LAZY_UNDEFINED_DIR "${CMAKE_CURRENT_BINARY_DIR}/lazy_undefined_cmake")
+
   add_library(lazy_undefined_fixture SHARED lazy_undefined_lib.c)
   set_target_properties(lazy_undefined_fixture
     PROPERTIES
       OUTPUT_NAME lazy_undefined
-      LIBRARY_OUTPUT_DIRECTORY ${DL_DIR}
+      LIBRARY_OUTPUT_DIRECTORY ${DL_LAZY_UNDEFINED_DIR}
   )
 
   add_executable(dlopen_lazy_undefined_test dlopen_lazy_undefined_test.c)
   set_target_properties(dlopen_lazy_undefined_test
     PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY ${DL_DIR}
+      RUNTIME_OUTPUT_DIRECTORY ${DL_LAZY_UNDEFINED_DIR}
   )
   add_dependencies(dlopen_lazy_undefined_test lazy_undefined_fixture)
 
@@ -28,7 +30,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
   )
   set_tests_properties(test_dynamic_lib_lazy_dlopen_preserves_binding
     PROPERTIES
-      WORKING_DIRECTORY ${DL_DIR}
+      WORKING_DIRECTORY ${DL_LAZY_UNDEFINED_DIR}
       ENVIRONMENT "PEAK_TARGET=lazy_profile_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_lazy_dlopen_statslog;${PRELOAD_VAR}"
       PASS_REGULAR_EXPRESSION "lazy_profile_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
       FAIL_REGULAR_EXPRESSION "RTLD_LAZY dlopen failed|undefined symbol|symbol lookup error"

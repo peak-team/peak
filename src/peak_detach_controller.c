@@ -1681,6 +1681,10 @@ peak_detach_controller_helper_spawn_should_use_fork(void)
     const char* value = g_getenv(PEAK_DETACH_HELPER_SPAWN_ENV);
 
     if (value == NULL || value[0] == '\0') {
+        return FALSE;
+    }
+
+    if (g_ascii_strcasecmp(value, "fork") == 0) {
         return TRUE;
     }
 
@@ -1690,7 +1694,7 @@ peak_detach_controller_helper_spawn_should_use_fork(void)
         return FALSE;
     }
 
-    return TRUE;
+    return FALSE;
 }
 
 static gboolean

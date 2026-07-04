@@ -1,5 +1,5 @@
-#ifndef __EXEC_INTERCEPTOR_H
-#define __EXEC_INTERCEPTOR_H
+#ifndef PEAK_EXEC_INTERCEPTOR_H
+#define PEAK_EXEC_INTERCEPTOR_H
 
 /**
  * @file exec_interceptor.h
@@ -94,4 +94,4 @@ long peak_exec_call_raw_syscall6(long number,
 }
 #endif
 
-#endif /* __EXEC_INTERCEPTOR_H */
+#endif /* PEAK_EXEC_INTERCEPTOR_H */

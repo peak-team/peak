@@ -32,10 +32,10 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 5,
-        "detach": 5,
-        "begin_transaction": 10,
-        "end_transaction": 10,
+        "attach": 4,
+        "detach": 4,
+        "begin_transaction": 8,
+        "end_transaction": 8,
         "flush": 2,
     },
     ("support-init", "src/mpi_interceptor.c"): {

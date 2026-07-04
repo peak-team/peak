@@ -254,6 +254,13 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_fake_helper_default_no_atfork_spawn
+    COMMAND test_detach_controller fake-helper-default-no-atfork-spawn)
+  set_tests_properties(test_detach_controller_fake_helper_default_no_atfork_spawn
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero"
+      SKIP_RETURN_CODE 77)
+
   add_test(NAME test_detach_controller_fake_helper_fork_atfork_spawn
     COMMAND test_detach_controller fake-helper-fork-atfork-spawn)
   set_tests_properties(test_detach_controller_fake_helper_fork_atfork_spawn

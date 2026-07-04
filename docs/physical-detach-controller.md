@@ -140,15 +140,18 @@ The external helper provides thread control and PC classification:
 The helper does not call Gum APIs directly. Gum mutation remains in-process so it
 can operate on Gum's live data structures.
 
-The controller starts the helper with plain `fork()` by default. Explicit
-`PEAK_DETACH_BACKEND=helper` may warm this helper before the first mutation.
-Strict `auto` does not eagerly start the helper during PEAK initialization; it
-starts the helper only when the first real detach/reattach mutation needs a
-backend, then falls back to the signal backend only for structured helper
-unavailability, permission, timeout, or unsupported outcomes. This preserves
-helper-first `auto` semantics while avoiding the shared-VM launch hazards seen
-with large threaded MPI ranks. Set `PEAK_DETACH_HELPER_SPAWN=clone-vfork` only
-when diagnosing compatibility with the Linux no-atfork helper launch path.
+On Linux, the controller starts the helper with a raw
+`clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` + `execve()` launch path by default,
+avoiding libc `fork()`/`pthread_atfork()` handlers that can make MPI/libfabric
+abort after `MPI_Init`. Explicit `PEAK_DETACH_BACKEND=helper` may warm this
+helper before the first mutation. Strict `auto` does not eagerly start the
+helper during PEAK initialization; it starts the helper only when the first real
+detach/reattach mutation needs a backend, then falls back to the signal backend
+only for structured helper unavailability, permission, timeout, or unsupported
+outcomes. This preserves helper-first `auto` semantics while avoiding a
+rank-wide helper startup storm before user work begins. Set
+`PEAK_DETACH_HELPER_SPAWN=fork` only when diagnosing compatibility with the
+plain fork helper launch path.
 
 ### Strict signal backend
 

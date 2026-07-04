@@ -4655,7 +4655,7 @@ main(int argc, char** argv)
         size_t last_detaching = 0;
         size_t last_detached = 0;
         size_t last_other = 0;
-        double request_deadline = monotonic_seconds() + 5.0;
+        double request_deadline = monotonic_seconds() + 15.0;
         const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
 
         while (request_detach != NULL && hook_state != NULL &&

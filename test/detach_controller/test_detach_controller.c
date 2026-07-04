@@ -1823,7 +1823,7 @@ run_fake_helper_batch_abort_rolls_back_records(void)
 }
 
 static int
-run_fake_helper_atfork_spawn_control(gboolean use_fork)
+run_fake_helper_atfork_spawn_control(int spawn_mode)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     fprintf(stderr, "fake-helper atfork spawn control requires PEAK_HAVE_GUM_PEAK_PC_API\n");
@@ -1835,7 +1835,9 @@ run_fake_helper_atfork_spawn_control(gboolean use_fork)
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
-    const char* spawn_value = use_fork ? "fork" : "clone";
+    const gboolean use_fork = spawn_mode > 0;
+    const char* spawn_value = spawn_mode > 0 ? "fork" :
+                              spawn_mode == 0 ? "clone" : NULL;
 
     if (log_fd < 0) {
         perror("mkstemp");
@@ -1843,7 +1845,9 @@ run_fake_helper_atfork_spawn_control(gboolean use_fork)
     }
     close(log_fd);
     if (set_fake_helper_env_default("success-zero", log_template) != 0 ||
-        setenv("PEAK_DETACH_HELPER_SPAWN", spawn_value, 1) != 0) {
+        (spawn_value != NULL &&
+         setenv("PEAK_DETACH_HELPER_SPAWN", spawn_value, 1) != 0) ||
+        (spawn_value == NULL && unsetenv("PEAK_DETACH_HELPER_SPAWN") != 0)) {
         perror("setenv");
         unlink(log_template);
         return EXIT_FAILURE;
@@ -1931,13 +1935,19 @@ run_fake_helper_atfork_spawn_control(gboolean use_fork)
 static int
 run_fake_helper_no_atfork_spawn(void)
 {
-    return run_fake_helper_atfork_spawn_control(FALSE);
+    return run_fake_helper_atfork_spawn_control(0);
 }
 
 static int
 run_fake_helper_fork_atfork_spawn(void)
 {
-    return run_fake_helper_atfork_spawn_control(TRUE);
+    return run_fake_helper_atfork_spawn_control(1);
+}
+
+static int
+run_fake_helper_default_no_atfork_spawn(void)
+{
+    return run_fake_helper_atfork_spawn_control(-1);
 }
 
 static int
@@ -4298,6 +4308,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-no-atfork-spawn") == 0) {
         return run_fake_helper_no_atfork_spawn();
+    }
+    if (strcmp(argv[1], "fake-helper-default-no-atfork-spawn") == 0) {
+        return run_fake_helper_default_no_atfork_spawn();
     }
     if (strcmp(argv[1], "fake-helper-fork-atfork-spawn") == 0) {
         return run_fake_helper_fork_atfork_spawn();
