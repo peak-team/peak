@@ -140,6 +140,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
                 --libpeak $<TARGET_FILE:peak>
                 --mode two-generations
                 --iterations 1000000
+                --metadata-sleep-us 200000
                 --timeout 30)
     set_tests_properties(test_jit_profiling_mmap_perfmap_two_generations
         PROPERTIES

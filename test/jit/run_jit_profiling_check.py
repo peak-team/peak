@@ -355,9 +355,10 @@ def run_one(args, tmpdir, mode):
                 )
     if expects_positive_count(mode):
         if stats_csv is None:
+            trace = read_text(trace_path)
             raise AssertionError(
                 f"{mode} JIT run did not create stats csv for pid {pid}\n"
-                f"expected prefix: {stats_prefix}\n{output}"
+                f"expected prefix: {stats_prefix}\ntrace={trace}\n{output}"
             )
         if count <= 0:
             trace = read_text(trace_path)
