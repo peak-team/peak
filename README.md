@@ -583,14 +583,13 @@ detach operations. Default: `10000` ms.
 **`PEAK_DETACH_HELPER_SPAWN`**
 
 Controls how PEAK starts the external strict-detach helper. On Linux, the
-default is `clone-vfork`, a raw `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)`
-launch path that immediately `execve()`s the helper without running libc
-`fork()`/`pthread_atfork()` handlers. This avoids libfabric/MPI aborts when a
-helper must be started after `MPI_Init`. Set `PEAK_DETACH_HELPER_SPAWN=fork`
-only as a diagnostic/compatibility escape hatch. Strict `auto` remains
-helper-first for the first real mutation, but it does not pre-spawn helpers
-during PEAK initialization; that avoids a rank-wide helper startup storm before
-user work begins.
+default is `fork`, matching the long-tested helper startup path. Set
+`PEAK_DETACH_HELPER_SPAWN=clone`, `clone-vfork`, or `no-atfork` to use the raw
+`clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` launch path that immediately
+`execve()`s the helper without running libc `fork()`/`pthread_atfork()`
+handlers. Strict `auto` remains helper-first for the first real mutation, but
+it does not pre-spawn helpers during PEAK initialization; that avoids a
+rank-wide helper startup storm before user work begins.
 
 **`PEAK_ENABLE_PER_TARGET_HEARTBEAT`**
 

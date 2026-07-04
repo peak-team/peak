@@ -1835,9 +1835,11 @@ run_fake_helper_atfork_spawn_control(int spawn_mode)
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
-    const gboolean use_fork = spawn_mode > 0;
+    const gboolean use_fork = spawn_mode != 0;
     const char* spawn_value = spawn_mode > 0 ? "fork" :
-                              spawn_mode == 0 ? "clone" : NULL;
+                              spawn_mode == 0 ? "clone" :
+                              spawn_mode == -2 ? "" :
+                              spawn_mode == -3 ? "unknown" : NULL;
 
     if (log_fd < 0) {
         perror("mkstemp");
@@ -1945,9 +1947,21 @@ run_fake_helper_fork_atfork_spawn(void)
 }
 
 static int
-run_fake_helper_default_no_atfork_spawn(void)
+run_fake_helper_default_fork_atfork_spawn(void)
 {
     return run_fake_helper_atfork_spawn_control(-1);
+}
+
+static int
+run_fake_helper_empty_fork_atfork_spawn(void)
+{
+    return run_fake_helper_atfork_spawn_control(-2);
+}
+
+static int
+run_fake_helper_unknown_fork_atfork_spawn(void)
+{
+    return run_fake_helper_atfork_spawn_control(-3);
 }
 
 static int
@@ -4270,7 +4284,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|strict-helper-held-timeout-lease|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-finish-mismatch|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-no-atfork-spawn|fake-helper-fork-atfork-spawn|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-performance-fallback|fake-helper-auto-fallback-not-cached-on-signal-stop-failure|fake-helper-auto-avoid-external|signal-backend-blocked-thread|signal-backend-mask-timeout|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|strict-helper-held-timeout-lease|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-finish-mismatch|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-no-atfork-spawn|fake-helper-default-fork-atfork-spawn|fake-helper-empty-fork-atfork-spawn|fake-helper-unknown-fork-atfork-spawn|fake-helper-fork-atfork-spawn|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-performance-fallback|fake-helper-auto-fallback-not-cached-on-signal-stop-failure|fake-helper-auto-avoid-external|signal-backend-blocked-thread|signal-backend-mask-timeout|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -4309,8 +4323,14 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "fake-helper-no-atfork-spawn") == 0) {
         return run_fake_helper_no_atfork_spawn();
     }
-    if (strcmp(argv[1], "fake-helper-default-no-atfork-spawn") == 0) {
-        return run_fake_helper_default_no_atfork_spawn();
+    if (strcmp(argv[1], "fake-helper-default-fork-atfork-spawn") == 0) {
+        return run_fake_helper_default_fork_atfork_spawn();
+    }
+    if (strcmp(argv[1], "fake-helper-empty-fork-atfork-spawn") == 0) {
+        return run_fake_helper_empty_fork_atfork_spawn();
+    }
+    if (strcmp(argv[1], "fake-helper-unknown-fork-atfork-spawn") == 0) {
+        return run_fake_helper_unknown_fork_atfork_spawn();
     }
     if (strcmp(argv[1], "fake-helper-fork-atfork-spawn") == 0) {
         return run_fake_helper_fork_atfork_spawn();
