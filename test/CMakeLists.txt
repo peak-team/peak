@@ -670,7 +670,8 @@ if(BUILD_TESTING)
                     --heartbeat-interval 0.5
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-reattach-trace
                     --require-detach-batch-size 2
-                    --require-reattach-batch-size 2)
+                    --require-reattach-batch-size 2
+                    --allow-split-reattach-batch)
         set_tests_properties(test_detach_hotloop_batch_reattach_strict
             PROPERTIES
                 TIMEOUT 60

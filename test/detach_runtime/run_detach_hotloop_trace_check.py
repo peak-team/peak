@@ -194,6 +194,36 @@ def trace_has_success(args, sample, operation):
     return False
 
 
+def trace_has_success_for_required_symbols(args, sample, operation):
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False
+
+    required_symbols = {TARGET_SYMBOL}
+    if args.paired_targets:
+        required_symbols.add(PAIRED_TARGET_SYMBOL)
+
+    successful_symbols = set()
+    for fields in rows:
+        if (len(fields) >= 7 and
+                fields[2] in required_symbols and
+                fields[3] == operation and
+                fields[4] == "success" and
+                fields[5] == "1" and
+                fields[6] == "safe" and
+                (not args.require_trace_diagnostics or
+                 trace_row_has_diagnostics(fields))):
+            successful_symbols.add(fields[2])
+
+    missing = required_symbols - successful_symbols
+    if missing:
+        print(f"missing successful {operation} trace rows for "
+              f"{sorted(missing)}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def read_trace_rows(args, sample):
     path = trace_path(args, sample)
     if not path:
@@ -429,6 +459,11 @@ def run_sample(args, sample):
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
         args, sample, "reattach", args.require_reattach_batch_size)
+    if (not trace_reattach_batched and
+            args.allow_split_reattach_batch and
+            args.require_reattach_batch_size > 0):
+        trace_reattach_batched = trace_has_success_for_required_symbols(
+            args, sample, "reattach")
     trace_source_ok = trace_has_required_request_source(args, sample)
     trace_transition_ok = trace_transition_limits_ok(args, sample)
     helper_retry_ok = helper_retry_was_exercised(args, sample)
@@ -555,6 +590,7 @@ def main():
     parser.add_argument("--spawner-threads", type=int, default=2)
     parser.add_argument("--require-detach-batch-size", type=int, default=0)
     parser.add_argument("--require-reattach-batch-size", type=int, default=0)
+    parser.add_argument("--allow-split-reattach-batch", action="store_true")
     parser.add_argument("--fail-on-transition-skips", action="store_true")
     parser.add_argument("--max-classify-failed", type=int, default=-1)
     parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
