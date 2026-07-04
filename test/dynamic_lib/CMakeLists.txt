@@ -31,7 +31,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
   set_tests_properties(test_dynamic_lib_lazy_dlopen_preserves_binding
     PROPERTIES
       WORKING_DIRECTORY ${DL_LAZY_UNDEFINED_DIR}
-      ENVIRONMENT "PEAK_TARGET=lazy_profile_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_lazy_dlopen_statslog;${PRELOAD_VAR}"
+      ENVIRONMENT "LD_BIND_NOW=;PEAK_TARGET=lazy_profile_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_lazy_dlopen_statslog;${PRELOAD_VAR}"
       PASS_REGULAR_EXPRESSION "lazy_profile_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
       FAIL_REGULAR_EXPRESSION "RTLD_LAZY dlopen failed|undefined symbol|symbol lookup error"
       TIMEOUT 20

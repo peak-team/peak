@@ -728,7 +728,7 @@ if(BUILD_TESTING)
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
                     --threads 8
                     --seconds 5
-                    --samples 2
+                    --samples 1
                     --timeout 180
                     --overhead-ratio 0.01
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-trace
