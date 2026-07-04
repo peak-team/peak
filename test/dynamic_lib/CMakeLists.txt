@@ -37,6 +37,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
       ENVIRONMENT "PEAK_TARGET=lazy_profile_target;PEAK_HEARTBEAT_INTERVAL=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_lazy_dlopen_statslog"
       PASS_REGULAR_EXPRESSION "lazy_profile_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
       FAIL_REGULAR_EXPRESSION "RTLD_LAZY dlopen failed|undefined symbol|symbol lookup error"
+      SKIP_RETURN_CODE 77
       TIMEOUT 20
   )
 endif()
