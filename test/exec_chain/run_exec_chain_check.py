@@ -268,6 +268,10 @@ CHAIN_DISABLED_MODES = {
     "posix_spawn_chain_disabled",
 }
 
+OPTIONAL_EXEC_ENV_TRACE_MODES = {
+    "exec_checkpoint_write_target_no_reentry",
+}
+
 NO_CHILD_PROFILE_MODES = {
     "execve_chain_disabled",
     "execve_propagate_disabled",
@@ -770,10 +774,11 @@ def require_trace(tmpdir, mode, expect_failed, expected_exec_errno=None):
         require(any(row.get("errno") == "14" for row in failed_rows),
                 "preflight exec-failed row did not preserve EFAULT")
         return
-    require(
-        "exec-env-injected" in events or "exec-env-unchanged" in events,
-        "trace missing exec env event",
-    )
+    if mode not in OPTIONAL_EXEC_ENV_TRACE_MODES:
+        require(
+            "exec-env-injected" in events or "exec-env-unchanged" in events,
+            "trace missing exec env event",
+        )
     if mode in BAD_STATS_MODES:
         require("exec-checkpoint-failed" in events,
                 "trace missing checkpoint failure")
