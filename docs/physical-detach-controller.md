@@ -540,11 +540,11 @@ state alive if safety still cannot be proven.
 Heartbeat-driven reattach is intentionally rate-limited separately from safety
 retries. A target that was physically detached because profiling overhead was
 too high remains detached for at least `PEAK_REATTACH_COOLDOWN_MS` before the
-heartbeat may reattach it again. The default is `60000` ms. This protects PEAK's
-physical-detach performance guarantee for extremely hot targets: once a target
-has proven too expensive, PEAK samples it only periodically instead of
-reattaching as soon as detached global overhead drops. Set the cooldown to `0`
-for aggressive resampling or focused reattach tests.
+heartbeat may reattach it again. The current default is `20000` ms. This avoids
+immediate detach/reattach thrashing while still allowing long-running targets
+to be sampled again. Set the cooldown to `0` for aggressive resampling or
+focused reattach tests. See [Heartbeat mechanism and runtime
+policy](heartbeat.md) for admission behavior.
 
 The strict pthread-create gate is also bounded by
 `PEAK_STRICT_GATE_WAIT_TIMEOUT_MS` (default `10000`). The intercepted creator
@@ -566,18 +566,24 @@ to a concrete verifier or PC-classifier branch. Heartbeat provenance appends
 `request_source`, `request_calls`, `request_ratio`,
 `request_global_overhead`, `request_total_time`, and `request_rate` so a final
 report marker can be joined back to the decision that requested the physical
-transition. The first seven fields are
+transition. The tail also includes completed-window count, cumulative control
+wall seconds and ratio, accounting snapshot validity, and failed-window count.
+The first seven fields are
 stable; parsers should treat every tail field as optional diagnostics and accept
 older rows that stop after `batch_id`. `last_retry_status` records the most
 recent retryable controller status for the hook, so a successful after-retry row
 can keep `status=safe` while still reporting the pre-reset retry reason such as
-`classify-failed`. `stop_window_us` is the measured helper-held STOP window when
-trace diagnostics are enabled, otherwise `0`; `batch_id` is a nonzero identifier
-shared by all rows emitted from one controller batch and `0` for single-row
-paths. Retry exhaustion emits `result=retry-abandoned` before the transition is
-returned to its stable state. STOP-window timing is collected only for
-`PEAK_DETACH_TRACE_PATH` diagnostics. Existing hot-callback timing remains part
-of the legacy
+`classify-failed`. `stop_window_us` is the completed controller STOP-window
+sample associated with a successful scalar transition or prepared batch. A
+scalar prepare-failed, retry-abandoned, or wholly unprepared batch row uses `0`
+rather than reusing an older successful sample. In a partially prepared batch,
+an unprepared candidate carries the same nonzero window sample and `batch_id`
+as the successful candidates because its classification occurred inside that
+shared window. `batch_id` is `0` for single-row paths. Retry exhaustion emits
+`result=retry-abandoned` before the transition is returned to its stable state.
+STOP-window accounting is always collected, including with tracing disabled;
+the trace only renders the already-published diagnostic. Existing hot-callback
+timing remains part of the legacy
 overhead/profiling model and is separate from this STOP-window diagnostic path.
 The hot-loop stress runner now parses these trace rows directly: manual
 benchmark tests can fail on any transition skip or on configured per-operation
@@ -919,8 +925,10 @@ same STOP window. The helper failure tests still cover permission denial,
 timeout, malformed snapshots, evacuation errors, and release failures so the
 fatal-after-mutation boundary stays explicit. A trace-disabled fake-helper
 runtime test also runs strict detach and reattach prepare/finish with
-`PEAK_DETACH_TRACE_PATH` unset and asserts `last_stop_window_us == 0`, proving
-STOP-window timing is not gathered for the default runtime path.
+`PEAK_DETACH_TRACE_PATH` unset and verifies that completed and failed
+control-window accounting remains active. A later failed attempt preserves
+`last_stop_window_us` as the most recent completed predictor sample while
+incrementing the separate failed-window count and total wall time.
 Additional fake-helper Gum-PC corridor tests force STOP snapshots at real
 diagnostic PCs from an attached hook. They prove physical entry-byte-only
 `detach` writes only `WRITE_MEMORY` for exact `on_enter_trampoline`, interior
