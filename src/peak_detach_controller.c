@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,6 +24,7 @@
     PEAK_DETACH_HELPER_MAX_BATCH_WRITES
 #define PEAK_STRICT_GATE_WAIT_TIMEOUT_MS_ENV "PEAK_STRICT_GATE_WAIT_TIMEOUT_MS"
 #define PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS 10000u
+#define PEAK_DETACH_ACCOUNTING_SNAPSHOT_MAX_ATTEMPTS 64u
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -34,13 +36,32 @@ typedef enum {
 
 static gsize mode_initialized = 0;
 static PeakSafeDetachMode configured_mode = PEAK_SAFE_DETACH_MODE_STRICT;
+static _Atomic unsigned long long
+    peak_detach_accounting_completed_stop_window_count = 0;
+static _Atomic unsigned long long
+    peak_detach_accounting_failed_stop_window_count = 0;
+static _Atomic unsigned long long
+    peak_detach_accounting_stop_window_wall_ns = 0;
+static _Atomic unsigned long long peak_detach_accounting_sequence = 0;
+
+static unsigned long long
+peak_detach_controller_seconds_to_ns(double seconds)
+{
+    if (seconds <= 0.0) {
+        return 0;
+    }
+    if (seconds >= (double)ULLONG_MAX / 1e9) {
+        return ULLONG_MAX;
+    }
+    return (unsigned long long)(seconds * 1e9 + 0.5);
+}
+
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
 static gboolean warned_missing_gum_api = FALSE;
 #else
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -2924,40 +2945,110 @@ peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
 #endif
 }
 
-static gboolean
-peak_detach_controller_trace_diagnostics_enabled(void)
-{
-    return atomic_load_explicit(&trace_diagnostics_enabled,
-                                memory_order_acquire) != 0;
-}
-
 static void
 peak_detach_controller_note_stop_window_started(void)
 {
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        held_mutation_started_at = 0.0;
-        last_stop_window_us = 0.0;
-        return;
+    held_mutation_started_at = peak_detach_controller_monotonic_second();
+}
+
+static void
+peak_detach_controller_accounting_begin_publication(void)
+{
+    atomic_fetch_add_explicit(&peak_detach_accounting_sequence,
+                              1,
+                              memory_order_acq_rel);
+}
+
+static void
+peak_detach_controller_accounting_end_publication(void)
+{
+    atomic_fetch_add_explicit(&peak_detach_accounting_sequence,
+                              1,
+                              memory_order_release);
+}
+
+static void
+peak_detach_controller_accounting_add_saturated(
+    _Atomic unsigned long long* counter,
+    unsigned long long delta)
+{
+    const unsigned long long max_published = ULLONG_MAX - 1;
+    unsigned long long current =
+        atomic_load_explicit(counter, memory_order_relaxed);
+
+    for (;;) {
+        unsigned long long next = current;
+
+        if (delta > 0 && current < max_published) {
+            next = max_published - current < delta ?
+                max_published :
+                current + delta;
+        }
+        if (atomic_compare_exchange_weak_explicit(counter,
+                                                  &current,
+                                                  next,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+static unsigned long long
+peak_detach_controller_elapsed_stop_window_ns(void)
+{
+    if (held_mutation_started_at > 0.0) {
+        double elapsed_s =
+            peak_detach_controller_monotonic_second() -
+            held_mutation_started_at;
+        return peak_detach_controller_seconds_to_ns(elapsed_s);
+    }
+    return 0;
+}
+
+static void
+peak_detach_controller_publish_stop_window_accounting(
+    unsigned long long elapsed_ns,
+    gboolean completed)
+{
+    if (elapsed_ns == ULLONG_MAX) {
+        elapsed_ns = ULLONG_MAX - 1;
     }
 
-    held_mutation_started_at = peak_detach_controller_monotonic_second();
-    last_stop_window_us = 0.0;
+    peak_detach_controller_accounting_begin_publication();
+    peak_detach_controller_accounting_add_saturated(
+        &peak_detach_accounting_stop_window_wall_ns,
+        elapsed_ns);
+    peak_detach_controller_accounting_add_saturated(
+        completed ? &peak_detach_accounting_completed_stop_window_count :
+                    &peak_detach_accounting_failed_stop_window_count,
+        1);
+    peak_detach_controller_accounting_end_publication();
 }
 
 static void
 peak_detach_controller_note_stop_window_finished(void)
 {
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        held_mutation_started_at = 0.0;
-        last_stop_window_us = 0.0;
-        return;
-    }
+    unsigned long long elapsed_ns =
+        peak_detach_controller_elapsed_stop_window_ns();
 
     if (held_mutation_started_at > 0.0) {
-        last_stop_window_us =
-            (peak_detach_controller_monotonic_second() -
-             held_mutation_started_at) *
-            1000000.0;
+        peak_detach_controller_publish_stop_window_accounting(elapsed_ns,
+                                                              TRUE);
+        last_stop_window_us = (double)elapsed_ns / 1000.0;
+    }
+    held_mutation_started_at = 0.0;
+}
+
+static void
+peak_detach_controller_note_stop_window_failed(void)
+{
+    unsigned long long elapsed_ns =
+        peak_detach_controller_elapsed_stop_window_ns();
+
+    if (held_mutation_started_at > 0.0) {
+        peak_detach_controller_publish_stop_window_accounting(elapsed_ns,
+                                                              FALSE);
     }
     held_mutation_started_at = 0.0;
 }
@@ -3743,7 +3834,6 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         return FALSE;
     }
     held_mutation_started_at = 0.0;
-    last_stop_window_us = 0.0;
 
     if (helper_state_fatal) {
         if (status_out != NULL) {
@@ -3804,7 +3894,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         if (!peak_detach_controller_signal_stop_threads(snapshots,
                                                         &snapshot_count,
                                                         &status)) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_note_stop_window_failed();
             if (creation_gate_active) {
                 peak_detach_controller_end_thread_creation_gate();
                 creation_gate_active = FALSE;
@@ -3829,7 +3919,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                                &status)) {
                     stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
                 } else {
-                    held_mutation_started_at = 0.0;
+                    peak_detach_controller_note_stop_window_failed();
                     if (creation_gate_active) {
                         peak_detach_controller_end_thread_creation_gate();
                         creation_gate_active = FALSE;
@@ -3841,7 +3931,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                     return FALSE;
                 }
             } else {
-                held_mutation_started_at = 0.0;
+                peak_detach_controller_note_stop_window_failed();
                 if (creation_gate_active) {
                     peak_detach_controller_end_thread_creation_gate();
                     creation_gate_active = FALSE;
@@ -3857,7 +3947,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         }
 
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_NONE) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_note_stop_window_failed();
             if (creation_gate_active) {
                 peak_detach_controller_end_thread_creation_gate();
                 creation_gate_active = FALSE;
@@ -3883,7 +3973,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
             peak_detach_controller_mark_helper_fatal("classify abort",
                                                      resume_status);
         }
-        peak_detach_controller_note_stop_window_finished();
+        peak_detach_controller_note_stop_window_failed();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -3903,8 +3993,8 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                  &status)) {
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
             peak_detach_controller_signal_release_or_fatal("signal evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
         }
+        peak_detach_controller_note_stop_window_failed();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4072,7 +4162,6 @@ peak_detach_controller_prepare_hook_mutation_batch(
         goto fail_all_locked;
     }
     held_mutation_started_at = 0.0;
-    last_stop_window_us = 0.0;
     if (helper_state_fatal) {
         status = PEAK_DETACH_STATUS_ERROR;
         goto fail_all_locked;
@@ -4230,7 +4319,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
         if (!peak_detach_controller_signal_stop_threads(snapshots,
                                                         &snapshot_count,
                                                         &status)) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_note_stop_window_failed();
             goto fail_all_locked;
         }
     } else if (!peak_detach_controller_stop_threads(snapshots,
@@ -4245,11 +4334,11 @@ peak_detach_controller_prepare_hook_mutation_batch(
                                                            &status)) {
                 stop_backend = PEAK_DETACH_HOLD_BACKEND_SIGNAL;
             } else {
-                held_mutation_started_at = 0.0;
+                peak_detach_controller_note_stop_window_failed();
                 goto fail_all_locked;
             }
         } else {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_note_stop_window_failed();
             goto fail_all_locked;
         }
     } else {
@@ -4298,7 +4387,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
             peak_detach_controller_mark_helper_fatal("batch classify abort",
                                                      resume_status);
         }
-        peak_detach_controller_note_stop_window_finished();
+        peak_detach_controller_note_stop_window_failed();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4323,7 +4412,7 @@ peak_detach_controller_prepare_hook_mutation_batch(
             peak_detach_controller_mark_helper_fatal("batch classify retry",
                                                      resume_status);
         }
-        peak_detach_controller_note_stop_window_finished();
+        peak_detach_controller_note_stop_window_failed();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4342,8 +4431,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
                                                  &status)) {
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
             peak_detach_controller_signal_release_or_fatal("signal batch evacuate abort");
-            peak_detach_controller_note_stop_window_finished();
         }
+        peak_detach_controller_note_stop_window_failed();
         if (creation_gate_active) {
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
@@ -4519,10 +4608,6 @@ peak_detach_controller_last_stop_window_us(void)
     double value = 0.0;
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
-    if (!peak_detach_controller_trace_diagnostics_enabled()) {
-        return 0.0;
-    }
-
     peak_detach_controller_init_atfork_once();
     peak_detach_controller_lock_mutation_guard();
     value = last_stop_window_us;
@@ -4531,6 +4616,67 @@ peak_detach_controller_last_stop_window_us(void)
 
     return value;
 }
+
+gboolean
+peak_detach_controller_accounting_snapshot(
+    PeakDetachAccountingSnapshot* out)
+{
+    unsigned long long sequence_before;
+    unsigned long long sequence_after;
+    PeakDetachAccountingSnapshot snapshot;
+
+    if (out == NULL) {
+        return FALSE;
+    }
+
+    for (unsigned int attempt = 0;
+         attempt < PEAK_DETACH_ACCOUNTING_SNAPSHOT_MAX_ATTEMPTS;
+         attempt++) {
+        sequence_before =
+            atomic_load_explicit(&peak_detach_accounting_sequence,
+                                 memory_order_acquire);
+        if ((sequence_before & 1U) != 0) {
+            continue;
+        }
+
+        snapshot.completed_stop_window_count =
+            atomic_load_explicit(
+                &peak_detach_accounting_completed_stop_window_count,
+                memory_order_relaxed);
+        snapshot.failed_stop_window_count =
+            atomic_load_explicit(
+                &peak_detach_accounting_failed_stop_window_count,
+                memory_order_relaxed);
+        snapshot.stop_window_wall_ns =
+            atomic_load_explicit(&peak_detach_accounting_stop_window_wall_ns,
+                                 memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        sequence_after =
+            atomic_load_explicit(&peak_detach_accounting_sequence,
+                                 memory_order_relaxed);
+        if (sequence_before == sequence_after &&
+            (sequence_after & 1U) == 0) {
+            *out = snapshot;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+void
+peak_detach_controller_test_accounting_begin_publish(void)
+{
+    peak_detach_controller_accounting_begin_publication();
+}
+
+void
+peak_detach_controller_test_accounting_end_publish(void)
+{
+    peak_detach_controller_accounting_end_publication();
+}
+#endif
 
 gboolean
 peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
@@ -4562,7 +4708,7 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
             peak_detach_controller_resume_backend(held_mutation.backend, &status);
 
         if (!released) {
-            held_mutation_started_at = 0.0;
+            peak_detach_controller_note_stop_window_failed();
             if (!warned_helper_resume_failed) {
                 warned_helper_resume_failed = TRUE;
                 g_printerr("[peak] detach helper failed to resume stopped threads after Gum mutation: %s\n",

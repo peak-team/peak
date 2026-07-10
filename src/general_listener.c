@@ -9,6 +9,7 @@
 #include "unsafe_gum_prologue.h"
 #include <errno.h>
 #include <dirent.h>
+#include <float.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
@@ -23,12 +24,14 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 #define PEAK_HEARTBEAT_MIN_OBSERVATION_US 10000U
+#define PEAK_GLOBAL_DETACH_MIN_CALLS 2U
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
@@ -57,6 +60,7 @@ PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
 static gboolean* array_listener_reattached;
+static gboolean* array_listener_revisited;
 static gboolean* array_listener_gum_detached;
 static gboolean* array_listener_gum_detach_flushed;
 static double* peak_hook_last_detach_time;
@@ -76,16 +80,60 @@ static double* peak_hook_pending_request_ratio;
 static double* peak_hook_pending_request_global_overhead;
 static double* peak_hook_pending_request_total_time;
 static double* peak_hook_pending_request_rate;
+static double* peak_hook_detach_profile_seconds;
+static gulong* peak_hook_reattach_request_calls;
+static gboolean* peak_hook_reattach_request_calls_valid;
+static gulong* peak_hook_cached_sample_calls;
+static double* peak_hook_cached_sample_profile_seconds;
+static gboolean* peak_hook_cached_sample_valid;
 static unsigned int* peak_hook_retry_count;
 static PeakDetachStatus* peak_hook_last_retry_status;
 static const char*
 peak_hook_request_source_string(PeakHookRequestSource source);
 static gboolean
 peak_general_listener_startup_attach_can_skip_stop(void);
+static gboolean
+peak_general_listener_refresh_hook_sample_cache_unlocked(
+    size_t hook_id,
+    gulong* calls_out,
+    double* profile_seconds_out);
+static gboolean
+peak_general_listener_try_hook_sample_cache_unlocked(
+    size_t hook_id,
+    gulong* calls_out,
+    double* profile_seconds_out);
+static _Atomic unsigned long long peak_general_listener_runtime_start_ns = 0;
+static _Atomic unsigned long long
+    peak_general_listener_heartbeat_control_baseline_ns = 0;
+static _Atomic unsigned long long
+    peak_general_listener_heartbeat_control_baseline_count = 0;
+static _Atomic unsigned long long
+    peak_general_listener_heartbeat_control_baseline_failed_count = 0;
+static _Atomic gboolean
+    peak_general_listener_heartbeat_control_baseline_valid = FALSE;
+static _Atomic unsigned long long
+    peak_general_listener_heartbeat_management_cpu_ns = 0;
+static double peak_general_listener_final_heartbeat_overhead_seconds = 0.0;
+typedef struct {
+    gboolean valid;
+    gboolean accounting_valid;
+    uint64_t stop_window_count;
+    uint64_t failed_stop_window_count;
+    double elapsed_seconds;
+    double profile_seconds;
+    double control_seconds;
+    double management_seconds;
+    double profile_ratio;
+    double control_ratio;
+    double profile_control_risk_ratio;
+    double control_risk_ratio;
+    double management_ratio;
+    double ratio;
+} PeakFinalReportSnapshot;
+static PeakFinalReportSnapshot peak_general_listener_final_report_snapshot;
 extern gboolean* peak_need_detach;
 extern gboolean* peak_detached;
 extern gdouble* heartbeat_overhead;
-extern gboolean** peak_target_thread_called;
 extern unsigned int check_interval;
 PEAK_API gpointer* hook_address = NULL;
 static double peak_general_overhead;
@@ -129,7 +177,7 @@ static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
 static _Atomic gboolean peak_general_mpi_finalize_requested = FALSE;
 static _Atomic gboolean peak_general_mpi_reducer_failed_closed = FALSE;
-static const unsigned int peak_reattach_default_cooldown_ms = 60000;
+static const unsigned int peak_reattach_default_cooldown_ms = 20000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
 static gsize peak_controller_retry_limits_initialized = 0;
@@ -190,6 +238,56 @@ peak_general_listener_parse_uint_env_default(const char* name,
     }
 
     return (unsigned int)parsed;
+}
+
+static gboolean
+peak_general_listener_parse_positive_uint_text(const char* value,
+                                               unsigned int* parsed_out)
+{
+    const char* cursor;
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return FALSE;
+    }
+    for (cursor = value; *cursor != '\0'; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return FALSE;
+        }
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
+        parsed > G_MAXUINT) {
+        return FALSE;
+    }
+    if (parsed_out != NULL) {
+        *parsed_out = (unsigned int)parsed;
+    }
+    return TRUE;
+}
+
+static unsigned int
+peak_general_listener_local_mpi_ranks(void)
+{
+    static const char* local_size_envs[] = {
+        "MPI_LOCALNRANKS",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "MV2_COMM_WORLD_LOCAL_SIZE",
+        "PMI_LOCAL_SIZE",
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(local_size_envs); i++) {
+        unsigned int parsed = 0;
+        if (peak_general_listener_parse_positive_uint_text(
+                getenv(local_size_envs[i]),
+                &parsed)) {
+            return parsed;
+        }
+    }
+    return 1U;
 }
 
 static void
@@ -637,6 +735,283 @@ peak_general_controller_trace_enabled(void)
     return peak_controller_trace_enabled;
 }
 
+static unsigned long long
+peak_general_listener_seconds_to_ns(double seconds)
+{
+    if (seconds <= 0.0) {
+        return 0;
+    }
+    if (seconds >= (double)ULLONG_MAX / 1e9) {
+        return ULLONG_MAX;
+    }
+    return (unsigned long long)(seconds * 1e9 + 0.5);
+}
+
+static unsigned long long
+peak_general_listener_timespec_to_ns_saturating(const struct timespec* value)
+{
+    unsigned long long seconds;
+    unsigned long long nanoseconds;
+
+    if (value == NULL || value->tv_sec < 0 || value->tv_nsec < 0) {
+        return 0;
+    }
+    seconds = (unsigned long long)value->tv_sec;
+    nanoseconds = (unsigned long long)value->tv_nsec;
+    if (seconds > ULLONG_MAX / 1000000000ULL) {
+        return ULLONG_MAX;
+    }
+    seconds *= 1000000000ULL;
+    if (nanoseconds > ULLONG_MAX - seconds) {
+        return ULLONG_MAX;
+    }
+    return seconds + nanoseconds;
+}
+
+static gboolean
+peak_general_listener_thread_cpu_ns(unsigned long long* out)
+{
+    struct timespec value;
+
+    if (out == NULL || clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+        return FALSE;
+    }
+    *out = peak_general_listener_timespec_to_ns_saturating(&value);
+    return TRUE;
+}
+
+static unsigned long long
+peak_general_listener_monotonic_delta_ns(unsigned long long current,
+                                         unsigned long long previous)
+{
+    return current >= previous ? current - previous : 0;
+}
+
+static void
+peak_general_listener_management_cpu_add_saturating(
+    unsigned long long delta_ns)
+{
+    unsigned long long observed = atomic_load_explicit(
+        &peak_general_listener_heartbeat_management_cpu_ns,
+        memory_order_relaxed);
+
+    while (delta_ns != 0 && observed != ULLONG_MAX) {
+        unsigned long long updated =
+            delta_ns > ULLONG_MAX - observed
+                ? ULLONG_MAX
+                : observed + delta_ns;
+        if (atomic_compare_exchange_weak_explicit(
+                &peak_general_listener_heartbeat_management_cpu_ns,
+                &observed,
+                updated,
+                memory_order_relaxed,
+                memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+static void
+peak_general_listener_management_cpu_checkpoint(
+    unsigned long long* previous_ns,
+    gboolean* previous_valid)
+{
+    unsigned long long current_ns;
+
+    if (previous_ns == NULL || previous_valid == NULL ||
+        !peak_general_listener_thread_cpu_ns(&current_ns)) {
+        return;
+    }
+    if (*previous_valid) {
+        peak_general_listener_management_cpu_add_saturating(
+            peak_general_listener_monotonic_delta_ns(current_ns,
+                                                     *previous_ns));
+    }
+    *previous_ns = current_ns;
+    *previous_valid = TRUE;
+}
+
+static double
+peak_general_listener_management_cpu_seconds(void)
+{
+    return (double)atomic_load_explicit(
+               &peak_general_listener_heartbeat_management_cpu_ns,
+               memory_order_relaxed) /
+           1e9;
+}
+
+static double
+peak_general_listener_elapsed_at(double now)
+{
+    unsigned long long start_ns =
+        atomic_load_explicit(&peak_general_listener_runtime_start_ns,
+                             memory_order_relaxed);
+    double start_time = (double)start_ns / 1e9;
+
+    if (start_time <= 0.0) {
+        start_time = peak_main_time;
+    }
+
+    if (start_time > 0.0 && now > start_time) {
+        return now - start_time;
+    }
+    if (peak_main_time > 0.0 && peak_main_time < 3600.0) {
+        return peak_main_time;
+    }
+    return 1e-12;
+}
+
+static uint64_t
+peak_general_listener_count_since_baseline(uint64_t count,
+                                           const _Atomic unsigned long long* baseline)
+{
+    uint64_t baseline_count;
+
+    if (baseline == NULL) {
+        return 0;
+    }
+    baseline_count =
+        atomic_load_explicit(baseline, memory_order_relaxed);
+    if (baseline_count == 0) {
+        return count;
+    }
+    return count > baseline_count ? count - baseline_count : 0;
+}
+
+static uint64_t
+peak_general_listener_control_window_count_since_heartbeat(
+    const PeakDetachAccountingSnapshot* accounting)
+{
+    if (accounting == NULL) {
+        return 0;
+    }
+    return peak_general_listener_count_since_baseline(
+        accounting->completed_stop_window_count,
+        &peak_general_listener_heartbeat_control_baseline_count);
+}
+
+static uint64_t
+peak_general_listener_failed_window_count_since_heartbeat(
+    const PeakDetachAccountingSnapshot* accounting)
+{
+    if (accounting == NULL) {
+        return 0;
+    }
+    return peak_general_listener_count_since_baseline(
+        accounting->failed_stop_window_count,
+        &peak_general_listener_heartbeat_control_baseline_failed_count);
+}
+
+static uint64_t
+peak_general_listener_control_wall_ns_since_heartbeat(
+    const PeakDetachAccountingSnapshot* accounting)
+{
+    if (accounting == NULL) {
+        return 0;
+    }
+    return peak_general_listener_count_since_baseline(
+        accounting->stop_window_wall_ns,
+        &peak_general_listener_heartbeat_control_baseline_ns);
+}
+
+static gboolean
+peak_general_listener_accounting_snapshot_is_finite(
+    const PeakDetachAccountingSnapshot* accounting)
+{
+    return accounting != NULL &&
+           accounting->completed_stop_window_count != UINT64_MAX &&
+           accounting->failed_stop_window_count != UINT64_MAX &&
+           accounting->stop_window_wall_ns != UINT64_MAX;
+}
+
+static PeakDetachAccountingSnapshot
+peak_general_listener_zero_accounting_snapshot(void)
+{
+    PeakDetachAccountingSnapshot accounting = {
+        .completed_stop_window_count = 0,
+        .failed_stop_window_count = 0,
+        .stop_window_wall_ns = 0
+    };
+
+    return accounting;
+}
+
+static gboolean
+peak_general_listener_accounting_snapshot(PeakDetachAccountingSnapshot* out)
+{
+    PeakDetachAccountingSnapshot candidate =
+        peak_general_listener_zero_accounting_snapshot();
+
+    if (out == NULL) {
+        return FALSE;
+    }
+
+    if (!peak_detach_controller_accounting_snapshot(&candidate) ||
+        !peak_general_listener_accounting_snapshot_is_finite(&candidate)) {
+        *out = peak_general_listener_zero_accounting_snapshot();
+        return FALSE;
+    }
+
+    *out = candidate;
+    return TRUE;
+}
+
+static gboolean
+peak_general_listener_runtime_accounting_snapshot(
+    PeakDetachAccountingSnapshot* out)
+{
+    gboolean current_valid =
+        peak_general_listener_accounting_snapshot(out);
+    gboolean baseline_valid = atomic_load_explicit(
+        &peak_general_listener_heartbeat_control_baseline_valid,
+        memory_order_acquire);
+
+    return current_valid && baseline_valid;
+}
+
+static void
+peak_general_listener_reset_final_report_snapshot(void)
+{
+    memset(&peak_general_listener_final_report_snapshot,
+           0,
+           sizeof(peak_general_listener_final_report_snapshot));
+}
+
+void
+peak_general_listener_note_runtime_start(double start_time)
+{
+    PeakDetachAccountingSnapshot accounting_baseline =
+        peak_general_listener_zero_accounting_snapshot();
+    gboolean baseline_valid;
+
+    peak_general_listener_reset_final_report_snapshot();
+    baseline_valid =
+        peak_general_listener_accounting_snapshot(&accounting_baseline);
+    atomic_store_explicit(&peak_general_listener_runtime_start_ns,
+                          peak_general_listener_seconds_to_ns(start_time),
+                          memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_ns,
+        accounting_baseline.stop_window_wall_ns,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_count,
+        accounting_baseline.completed_stop_window_count,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_failed_count,
+        accounting_baseline.failed_stop_window_count,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_valid,
+        baseline_valid,
+        memory_order_release);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_management_cpu_ns,
+        0,
+        memory_order_relaxed);
+}
+
 static void
 peak_general_controller_trace_mutation_detail(size_t hook_id,
                                               PeakDetachOperation operation,
@@ -663,6 +1038,13 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     double request_global_overhead = 0.0;
     double request_total_time = 0.0;
     double request_rate = 0.0;
+    double trace_now;
+    double trace_elapsed_time;
+    uint64_t accounting_wall_ns;
+    double accounting_wall_s = 0.0;
+    double accounting_ratio = 0.0;
+    PeakDetachAccountingSnapshot detach_accounting;
+    gboolean accounting_valid;
     FILE* fp;
 
     if (path == NULL || path[0] == '\0') {
@@ -691,12 +1073,25 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
         }
     }
 
+    trace_now = peak_second();
+    trace_elapsed_time = peak_general_listener_elapsed_at(trace_now);
+    if (trace_elapsed_time <= 0.0) {
+        trace_elapsed_time = 1e-12;
+    }
+    accounting_valid =
+        peak_general_listener_runtime_accounting_snapshot(&detach_accounting);
+    accounting_wall_ns =
+        peak_general_listener_control_wall_ns_since_heartbeat(
+            &detach_accounting);
+    accounting_wall_s = (double)accounting_wall_ns / 1e9;
+    accounting_ratio = accounting_wall_s / trace_elapsed_time;
+
     pthread_mutex_lock(&detach_trace_mutex);
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.9f,%.9f,%.9f,%.9f\n",
-                peak_second(),
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.12f,%.9f,%.9f,%.9f,%llu,%.9f,%.9f,%d,%llu\n",
+                trace_now,
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
                         peak_hook_strings[hook_id] != NULL
@@ -721,7 +1116,16 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 request_ratio,
                 request_global_overhead,
                 request_total_time,
-                request_rate);
+                request_rate,
+                (unsigned long long)
+                    peak_general_listener_control_window_count_since_heartbeat(
+                        &detach_accounting),
+                accounting_wall_s,
+                accounting_ratio,
+                accounting_valid ? 1 : 0,
+                (unsigned long long)
+                    peak_general_listener_failed_window_count_since_heartbeat(
+                        &detach_accounting));
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
@@ -749,7 +1153,9 @@ peak_general_controller_trace_mutation(size_t hook_id,
                                                       : 0,
                                                   0.0,
                                                   1,
-                                                  peak_detach_controller_last_stop_window_us(),
+                                                  strcmp(result, "prepare-failed") == 0
+                                                      ? 0.0
+                                                      : peak_detach_controller_last_stop_window_us(),
                                                   0,
                                                   hook_id < peak_hook_address_count &&
                                                           peak_hook_last_retry_status != NULL
@@ -1241,6 +1647,347 @@ peak_general_controller_set_pending_request_context_unlocked(
     }
 }
 
+static gboolean
+peak_general_listener_positive_finite(double value)
+{
+    return value > 0.0 && value == value && value <= DBL_MAX;
+}
+
+static gboolean
+peak_general_listener_nonnegative_finite(double value)
+{
+    return value >= 0.0 && value == value && value <= DBL_MAX;
+}
+
+static gboolean
+peak_general_listener_add_nonnegative_finite(double lhs,
+                                             double rhs,
+                                             double* out)
+{
+    if (!peak_general_listener_nonnegative_finite(lhs) ||
+        !peak_general_listener_nonnegative_finite(rhs) ||
+        lhs > DBL_MAX - rhs) {
+        return FALSE;
+    }
+
+    if (out != NULL) {
+        *out = lhs + rhs;
+    }
+    return TRUE;
+}
+
+static uint64_t
+peak_general_listener_add_uint64_saturated(uint64_t lhs, uint64_t rhs)
+{
+    const uint64_t max_published = UINT64_MAX - 1;
+
+    if (lhs >= max_published || rhs > max_published - lhs) {
+        return max_published;
+    }
+    return lhs + rhs;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+uint64_t
+peak_general_listener_test_add_uint64_saturated(uint64_t lhs, uint64_t rhs)
+{
+    return peak_general_listener_add_uint64_saturated(lhs, rhs);
+}
+#endif
+
+static gboolean
+peak_general_listener_subtract_nonnegative_finite(double* value,
+                                                  double amount)
+{
+    double result;
+
+    if (value == NULL ||
+        !peak_general_listener_nonnegative_finite(*value) ||
+        !peak_general_listener_nonnegative_finite(amount) ||
+        amount > *value) {
+        return FALSE;
+    }
+
+    result = *value - amount;
+    if (!peak_general_listener_nonnegative_finite(result)) {
+        return FALSE;
+    }
+    *value = result;
+    return TRUE;
+}
+
+static gboolean
+peak_general_listener_multiply_nonnegative_finite(double lhs,
+                                                  double rhs,
+                                                  double* out)
+{
+    double result;
+
+    if (!peak_general_listener_nonnegative_finite(lhs) ||
+        !peak_general_listener_nonnegative_finite(rhs) ||
+        (rhs > 0.0 && lhs > DBL_MAX / rhs)) {
+        return FALSE;
+    }
+
+    result = lhs * rhs;
+    if (!peak_general_listener_nonnegative_finite(result)) {
+        return FALSE;
+    }
+    if (out != NULL) {
+        *out = result;
+    }
+    return TRUE;
+}
+
+static double
+peak_general_listener_control_risk_seconds(double raw_control_seconds)
+{
+    double risk_control_seconds = DBL_MAX;
+
+    if (!peak_general_listener_multiply_nonnegative_finite(
+            raw_control_seconds,
+            (double)peak_general_listener_local_mpi_ranks(),
+            &risk_control_seconds)) {
+        return DBL_MAX;
+    }
+    return risk_control_seconds;
+}
+
+static gboolean
+peak_general_listener_multiply_positive_finite(double lhs,
+                                               double rhs,
+                                               double* out)
+{
+    double result;
+
+    if (!peak_general_listener_positive_finite(lhs) ||
+        !peak_general_listener_positive_finite(rhs) ||
+        lhs > DBL_MAX / rhs) {
+        return FALSE;
+    }
+
+    result = lhs * rhs;
+    if (!peak_general_listener_positive_finite(result)) {
+        return FALSE;
+    }
+    if (out != NULL) {
+        *out = result;
+    }
+    return TRUE;
+}
+
+static double
+peak_general_listener_profile_seconds_floor(void)
+{
+    if (peak_general_listener_positive_finite(peak_general_overhead)) {
+        return peak_general_overhead;
+    }
+    return 1e-12;
+}
+
+static double
+peak_general_listener_saved_detach_profile_seconds_unlocked(
+    size_t hook_id,
+    double fallback_seconds)
+{
+    if (hook_id < peak_hook_address_count &&
+        peak_hook_detach_profile_seconds != NULL &&
+        peak_general_listener_positive_finite(
+            peak_hook_detach_profile_seconds[hook_id])) {
+        return peak_hook_detach_profile_seconds[hook_id];
+    }
+    if (peak_general_listener_positive_finite(fallback_seconds)) {
+        return fallback_seconds;
+    }
+    return peak_general_listener_profile_seconds_floor();
+}
+
+static double
+peak_general_listener_projected_detach_profile_seconds_unlocked(
+    size_t hook_id,
+    double current_profile_seconds)
+{
+    double saved_seconds = 0.0;
+    gboolean have_saved = FALSE;
+    gboolean have_current =
+        peak_general_listener_positive_finite(current_profile_seconds);
+
+    if (hook_id < peak_hook_address_count &&
+        peak_hook_detach_profile_seconds != NULL &&
+        peak_general_listener_positive_finite(
+            peak_hook_detach_profile_seconds[hook_id])) {
+        saved_seconds = peak_hook_detach_profile_seconds[hook_id];
+        have_saved = TRUE;
+    }
+
+    if (have_saved && have_current) {
+        return saved_seconds > current_profile_seconds
+                   ? saved_seconds
+                   : current_profile_seconds;
+    }
+    if (have_saved) {
+        return saved_seconds;
+    }
+    if (have_current) {
+        return current_profile_seconds;
+    }
+    return peak_general_listener_profile_seconds_floor();
+}
+
+static double
+peak_general_listener_historical_profile_rate(double projected_seconds,
+                                              double elapsed_seconds)
+{
+    double rate;
+
+    if (!peak_general_listener_positive_finite(projected_seconds) ||
+        !peak_general_listener_positive_finite(elapsed_seconds) ||
+        projected_seconds == DBL_MAX) {
+        return DBL_MAX;
+    }
+
+    rate = projected_seconds / elapsed_seconds;
+    return peak_general_listener_positive_finite(rate) ? rate : DBL_MAX;
+}
+
+static double
+peak_general_listener_next_observation_lease_seconds(
+    double request_rate,
+    double observation_horizon_seconds)
+{
+    double lease_seconds = 0.0;
+
+    if (!peak_general_listener_positive_finite(request_rate) ||
+        !peak_general_listener_positive_finite(observation_horizon_seconds) ||
+        request_rate == DBL_MAX) {
+        return DBL_MAX;
+    }
+
+    if (!peak_general_listener_multiply_positive_finite(
+            request_rate,
+            observation_horizon_seconds,
+            &lease_seconds)) {
+        return DBL_MAX;
+    }
+
+    return lease_seconds;
+}
+
+static gboolean
+peak_general_listener_hook_is_attached_for_policy_unlocked(size_t hook_id)
+{
+    if (hook_id >= peak_hook_address_count) {
+        return FALSE;
+    }
+
+    if (peak_hook_states != NULL) {
+        return peak_hook_states[hook_id] == PEAK_HOOK_ATTACHED;
+    }
+    return peak_detached == NULL || !peak_detached[hook_id];
+}
+
+static double
+peak_general_listener_heartbeat_overhead_seconds_unlocked(void)
+{
+    double seconds = 0.0;
+
+    if (heartbeat_overhead == NULL) {
+        return 0.0;
+    }
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address != NULL &&
+            array_listener != NULL &&
+            hook_address[i] &&
+            array_listener[i] &&
+            peak_general_listener_positive_finite(heartbeat_overhead[i]) &&
+            seconds <= DBL_MAX - heartbeat_overhead[i]) {
+            seconds += heartbeat_overhead[i];
+        }
+    }
+
+    return seconds;
+}
+
+static void
+peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked(void)
+{
+    peak_general_listener_final_heartbeat_overhead_seconds =
+        peak_general_listener_heartbeat_overhead_seconds_unlocked();
+}
+
+static double
+peak_general_listener_report_heartbeat_overhead_seconds(void)
+{
+    double seconds;
+
+    pthread_mutex_lock(&lock);
+    seconds = heartbeat_overhead != NULL
+                  ? peak_general_listener_heartbeat_overhead_seconds_unlocked()
+                  : peak_general_listener_final_heartbeat_overhead_seconds;
+    pthread_mutex_unlock(&lock);
+    return seconds;
+}
+
+static void
+peak_general_listener_note_detach_profile_seconds_unlocked(size_t hook_id)
+{
+    double profile_seconds = 0.0;
+    double fallback_seconds = 0.0;
+    double detached_profile_seconds = 0.0;
+    gboolean have_detached_sample = FALSE;
+
+    if (hook_id >= peak_hook_address_count ||
+        peak_hook_detach_profile_seconds == NULL) {
+        return;
+    }
+
+    have_detached_sample =
+        peak_general_listener_refresh_hook_sample_cache_unlocked(
+            hook_id,
+            NULL,
+            &detached_profile_seconds);
+    if (have_detached_sample) {
+        fallback_seconds = detached_profile_seconds;
+    }
+
+    if (peak_hook_pending_request_ratio != NULL &&
+        peak_hook_pending_request_total_time != NULL) {
+        (void)peak_general_listener_multiply_positive_finite(
+            peak_hook_pending_request_ratio[hook_id],
+            peak_hook_pending_request_total_time[hook_id],
+            &profile_seconds);
+    }
+
+    if (!have_detached_sample &&
+        peak_hook_pending_request_calls != NULL &&
+        peak_general_listener_positive_finite(peak_general_overhead) &&
+        (double)peak_hook_pending_request_calls[hook_id] <=
+            DBL_MAX / peak_general_overhead) {
+        fallback_seconds =
+            (double)peak_hook_pending_request_calls[hook_id] *
+            peak_general_overhead;
+    }
+    if (!have_detached_sample &&
+        heartbeat_overhead != NULL &&
+        peak_general_listener_positive_finite(heartbeat_overhead[hook_id]) &&
+        fallback_seconds <= DBL_MAX - heartbeat_overhead[hook_id]) {
+        fallback_seconds += heartbeat_overhead[hook_id];
+    }
+    if (!peak_general_listener_positive_finite(fallback_seconds) &&
+        peak_general_listener_positive_finite(
+            peak_hook_detach_profile_seconds[hook_id])) {
+        fallback_seconds = peak_hook_detach_profile_seconds[hook_id];
+    }
+
+    peak_hook_detach_profile_seconds[hook_id] =
+        peak_general_listener_positive_finite(profile_seconds)
+            ? profile_seconds
+            : peak_general_listener_saved_detach_profile_seconds_unlocked(
+                  hook_id,
+                  fallback_seconds);
+}
+
 static void
 peak_general_controller_reset_retry_unlocked(size_t hook_id)
 {
@@ -1283,6 +2030,27 @@ peak_general_listener_note_detach_success_unlocked(size_t hook_id,
     }
 
     peak_hook_last_detach_time[hook_id] = now;
+}
+
+static void
+peak_general_listener_note_reattach_success_unlocked(size_t hook_id)
+{
+    if (hook_id >= peak_hook_address_count ||
+        peak_hook_reattach_request_calls == NULL ||
+        peak_hook_reattach_request_calls_valid == NULL ||
+        peak_hook_pending_request_calls == NULL) {
+        return;
+    }
+
+    if (peak_hook_reattach_request_calls_valid[hook_id] &&
+        array_listener_revisited != NULL &&
+        peak_hook_pending_request_calls[hook_id] >
+            peak_hook_reattach_request_calls[hook_id]) {
+        array_listener_revisited[hook_id] = TRUE;
+    }
+    peak_hook_reattach_request_calls[hook_id] =
+        peak_hook_pending_request_calls[hook_id];
+    peak_hook_reattach_request_calls_valid[hook_id] = TRUE;
 }
 
 static gboolean
@@ -1492,10 +2260,26 @@ peak_general_listener_request_reattach_with_context_unlocked(
 static gboolean
 peak_general_listener_request_reattach_unlocked(size_t hook_id)
 {
+    gulong calls = 0;
+
+    if (hook_id < peak_hook_address_count &&
+        peak_hook_states != NULL &&
+        peak_hook_states[hook_id] == PEAK_HOOK_DETACHED &&
+        !peak_general_listener_refresh_hook_sample_cache_unlocked(
+            hook_id,
+            &calls,
+            NULL) &&
+        !peak_general_listener_try_hook_sample_cache_unlocked(
+            hook_id,
+            &calls,
+            NULL)) {
+        return FALSE;
+    }
+
     return peak_general_listener_request_reattach_with_context_unlocked(
         hook_id,
         PEAK_HOOK_REQUEST_SOURCE_API,
-        0,
+        calls,
         0.0,
         0.0,
         0.0,
@@ -1677,6 +2461,8 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     array_listener = g_renew(GumInvocationListener*, array_listener, new_count);
     array_listener_detached = g_renew(gboolean, array_listener_detached, new_count);
     array_listener_reattached = g_renew(gboolean, array_listener_reattached, new_count);
+    array_listener_revisited =
+        g_renew(gboolean, array_listener_revisited, new_count);
     array_listener_gum_detached =
         g_renew(gboolean, array_listener_gum_detached, new_count);
     array_listener_gum_detach_flushed =
@@ -1701,6 +2487,20 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
         g_renew(double, peak_hook_pending_request_total_time, new_count);
     peak_hook_pending_request_rate =
         g_renew(double, peak_hook_pending_request_rate, new_count);
+    peak_hook_detach_profile_seconds =
+        g_renew(double, peak_hook_detach_profile_seconds, new_count);
+    peak_hook_reattach_request_calls =
+        g_renew(gulong, peak_hook_reattach_request_calls, new_count);
+    peak_hook_reattach_request_calls_valid =
+        g_renew(gboolean,
+                peak_hook_reattach_request_calls_valid,
+                new_count);
+    peak_hook_cached_sample_calls =
+        g_renew(gulong, peak_hook_cached_sample_calls, new_count);
+    peak_hook_cached_sample_profile_seconds =
+        g_renew(double, peak_hook_cached_sample_profile_seconds, new_count);
+    peak_hook_cached_sample_valid =
+        g_renew(gboolean, peak_hook_cached_sample_valid, new_count);
     peak_hook_retry_count =
         g_renew(unsigned int, peak_hook_retry_count, new_count);
     peak_hook_last_retry_status =
@@ -1717,6 +2517,7 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     array_listener[old_count] = NULL;
     array_listener_detached[old_count] = FALSE;
     array_listener_reattached[old_count] = FALSE;
+    array_listener_revisited[old_count] = FALSE;
     array_listener_gum_detached[old_count] = FALSE;
     array_listener_gum_detach_flushed[old_count] = TRUE;
     peak_hook_last_detach_time[old_count] = 0.0;
@@ -1730,6 +2531,12 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_pending_request_global_overhead[old_count] = 0.0;
     peak_hook_pending_request_total_time[old_count] = 0.0;
     peak_hook_pending_request_rate[old_count] = 0.0;
+    peak_hook_detach_profile_seconds[old_count] = 0.0;
+    peak_hook_reattach_request_calls[old_count] = 0;
+    peak_hook_reattach_request_calls_valid[old_count] = FALSE;
+    peak_hook_cached_sample_calls[old_count] = 0;
+    peak_hook_cached_sample_profile_seconds[old_count] = 0.0;
+    peak_hook_cached_sample_valid[old_count] = FALSE;
     peak_hook_retry_count[old_count] = 0;
     peak_hook_last_retry_status[old_count] = PEAK_DETACH_STATUS_SAFE;
     hook_address[old_count] = NULL;
@@ -2081,7 +2888,7 @@ peak_general_controller_handle_prepare_failure_unlocked(size_t hook_id,
                 hook_id,
                 peak_second()),
             1,
-            peak_detach_controller_last_stop_window_us(),
+            0.0,
             0,
             last_retry_status);
         peak_general_controller_reset_retry_unlocked(hook_id);
@@ -2221,6 +3028,7 @@ static gboolean peak_general_controller_detach_if_requested_unlocked(
     array_listener_detached[hook_id] = TRUE;
     peak_general_listener_note_detach_success_unlocked(hook_id,
                                                        peak_second());
+    peak_general_listener_note_detach_profile_seconds_unlocked(hook_id);
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_DETACHED);
     if (peak_general_controller_trace_enabled()) {
         unsigned int retry_count =
@@ -2381,6 +3189,7 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
     array_listener_gum_detach_flushed[hook_id] = TRUE;
     array_listener_reattached[hook_id] = TRUE;
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
+    peak_general_listener_note_reattach_success_unlocked(hook_id);
     if (peak_general_controller_trace_enabled()) {
         unsigned int retry_count =
             peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0;
@@ -2763,8 +3572,6 @@ peak_general_controller_process_pending_batch_unlocked(void)
                                                              results,
                                                              &prepared_count,
                                                              &batch_status);
-    stop_window_us = peak_detach_controller_last_stop_window_us();
-
     for (size_t i = 0; i < candidate_count; i++) {
         size_t hook_id = candidates[i].hook_id;
 
@@ -2823,6 +3630,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
                 peak_general_listener_note_detach_success_unlocked(
                     candidates[i].hook_id,
                     peak_second());
+                peak_general_listener_note_detach_profile_seconds_unlocked(
+                    candidates[i].hook_id);
                 peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                            PEAK_HOOK_DETACHED);
                 peak_general_controller_trace_mutation_detail(
@@ -2870,6 +3679,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
             array_listener_reattached[candidates[i].hook_id] = TRUE;
             peak_general_controller_set_state_unlocked(candidates[i].hook_id,
                                                        PEAK_HOOK_ATTACHED);
+            peak_general_listener_note_reattach_success_unlocked(
+                candidates[i].hook_id);
             peak_general_controller_trace_mutation_detail(
                 candidates[i].hook_id,
                 candidates[i].operation,
@@ -3167,8 +3978,9 @@ peak_general_listener_controller_stop(void)
 
 typedef struct {
     size_t index;
-    double ratio;  // hard-gate ratio
-    double rate;   // diagnostic trend, and reattach tie-breaking
+    double ratio;  // detach pressure, or reattach historical seconds
+    double rate;   // detach contribution key, or oldest-detach ordering key
+    double lifetime;
 } OverheadEntry;
 
 // ratio descending (global detach)
@@ -3182,6 +3994,8 @@ static int compare_ratio_de(const void* a, const void* b) {
     // tie-break: faster-growing overhead first
     if (x->rate < y->rate) return 1;
     if (x->rate > y->rate) return -1;
+    if (x->index < y->index) return -1;
+    if (x->index > y->index) return 1;
     return 0;
 }
 
@@ -3193,9 +4007,11 @@ static int compare_rate_inc(const void* a, const void* b) {
     if (x->rate < y->rate) return -1;
     if (x->rate > y->rate) return 1;
 
-    // tie-break: smaller ratio first
+    // tie-break: smaller historical projection first
     if (x->ratio < y->ratio) return -1;
     if (x->ratio > y->ratio) return 1;
+    if (x->index < y->index) return -1;
+    if (x->index > y->index) return 1;
     return 0;
 }
 
@@ -3203,6 +4019,222 @@ static inline double clipd(double x, double lo, double hi) {
     if (x < lo) return lo;
     if (x > hi) return hi;
     return x;
+}
+
+static inline gulong
+peak_general_listener_num_calls_load(const gulong* slot)
+{
+    return __atomic_load_n(slot, __ATOMIC_RELAXED);
+}
+
+static inline gulong
+peak_general_listener_num_calls_increment(gulong* slot)
+{
+    return __atomic_add_fetch(slot, 1, __ATOMIC_RELAXED);
+}
+
+static double
+peak_general_listener_profile_seconds_for_calls_unlocked(size_t hook_id,
+                                                         gulong calls)
+{
+    double profile_seconds = (double)calls * peak_general_overhead;
+
+    if (heartbeat_overhead != NULL && hook_id < peak_hook_address_count) {
+        profile_seconds += heartbeat_overhead[hook_id];
+    }
+    return profile_seconds;
+}
+
+static double
+peak_general_listener_profile_seconds_at_boundary(void)
+{
+    double profile_seconds = 0.0;
+
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address == NULL ||
+            array_listener == NULL ||
+            !hook_address[i] ||
+            array_listener[i] == NULL) {
+            continue;
+        }
+
+        PeakGeneralListener* pg_listener =
+            PEAKGENERAL_LISTENER(array_listener[i]);
+        gulong total_calls = 0;
+        for (size_t j = 0; j < peak_max_num_threads; j++) {
+            total_calls +=
+                peak_general_listener_num_calls_load(
+                    &pg_listener->num_calls[j]);
+        }
+        if (total_calls != 0 &&
+            profile_seconds <=
+                DBL_MAX - ((double)total_calls * peak_general_overhead)) {
+            profile_seconds += (double)total_calls * peak_general_overhead;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+
+    double heartbeat_profile_seconds =
+        peak_general_listener_report_heartbeat_overhead_seconds();
+    if (peak_general_listener_positive_finite(heartbeat_profile_seconds) &&
+        profile_seconds <= DBL_MAX - heartbeat_profile_seconds) {
+        profile_seconds += heartbeat_profile_seconds;
+    }
+
+    return profile_seconds;
+}
+
+void
+peak_general_listener_freeze_final_report_snapshot(void)
+{
+    PeakDetachAccountingSnapshot accounting;
+    PeakFinalReportSnapshot snapshot = {0};
+    double control_risk_seconds;
+    double profile_control_risk_seconds = DBL_MAX;
+
+    snapshot.accounting_valid =
+        peak_general_listener_runtime_accounting_snapshot(&accounting);
+    snapshot.valid = TRUE;
+    snapshot.stop_window_count =
+        peak_general_listener_control_window_count_since_heartbeat(
+            &accounting);
+    snapshot.failed_stop_window_count =
+        peak_general_listener_failed_window_count_since_heartbeat(
+            &accounting);
+    snapshot.elapsed_seconds = peak_main_time;
+    snapshot.profile_seconds =
+        peak_general_listener_profile_seconds_at_boundary();
+    snapshot.control_seconds =
+        (double)peak_general_listener_control_wall_ns_since_heartbeat(
+            &accounting) / 1e9;
+    snapshot.management_seconds =
+        peak_general_listener_management_cpu_seconds();
+    control_risk_seconds =
+        peak_general_listener_control_risk_seconds(snapshot.control_seconds);
+    (void)peak_general_listener_add_nonnegative_finite(
+        snapshot.profile_seconds,
+        control_risk_seconds,
+        &profile_control_risk_seconds);
+    if (snapshot.elapsed_seconds > 0.0) {
+        snapshot.profile_ratio =
+            snapshot.profile_seconds / snapshot.elapsed_seconds;
+        snapshot.control_ratio =
+            snapshot.control_seconds / snapshot.elapsed_seconds;
+        snapshot.profile_control_risk_ratio =
+            profile_control_risk_seconds / snapshot.elapsed_seconds;
+        snapshot.control_risk_ratio =
+            control_risk_seconds / snapshot.elapsed_seconds;
+        snapshot.ratio =
+            (snapshot.profile_seconds + snapshot.control_seconds) /
+            snapshot.elapsed_seconds;
+        snapshot.management_ratio =
+            snapshot.management_seconds / snapshot.elapsed_seconds;
+    }
+
+    peak_general_listener_final_report_snapshot = snapshot;
+}
+
+static void
+peak_general_listener_cache_hook_sample_unlocked(size_t hook_id,
+                                                 gulong calls,
+                                                 double profile_seconds)
+{
+    if (hook_id >= peak_hook_address_count ||
+        peak_hook_cached_sample_calls == NULL ||
+        peak_hook_cached_sample_profile_seconds == NULL ||
+        peak_hook_cached_sample_valid == NULL) {
+        return;
+    }
+
+    peak_hook_cached_sample_calls[hook_id] = calls;
+    peak_hook_cached_sample_profile_seconds[hook_id] = profile_seconds;
+    peak_hook_cached_sample_valid[hook_id] = TRUE;
+}
+
+static gboolean
+peak_general_listener_try_hook_sample_cache_unlocked(
+    size_t hook_id,
+    gulong* calls_out,
+    double* profile_seconds_out)
+{
+    if (hook_id >= peak_hook_address_count ||
+        peak_hook_cached_sample_calls == NULL ||
+        peak_hook_cached_sample_profile_seconds == NULL ||
+        peak_hook_cached_sample_valid == NULL ||
+        !peak_hook_cached_sample_valid[hook_id]) {
+        return FALSE;
+    }
+
+    if (calls_out != NULL) {
+        *calls_out = peak_hook_cached_sample_calls[hook_id];
+    }
+    if (profile_seconds_out != NULL) {
+        *profile_seconds_out =
+            peak_hook_cached_sample_profile_seconds[hook_id];
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_general_listener_refresh_hook_sample_cache_unlocked(
+    size_t hook_id,
+    gulong* calls_out,
+    double* profile_seconds_out)
+{
+    if (hook_id >= peak_hook_address_count ||
+        hook_address == NULL ||
+        array_listener == NULL ||
+        hook_address[hook_id] == NULL ||
+        array_listener[hook_id] == NULL) {
+        return FALSE;
+    }
+
+    PeakGeneralListener* pg_listener =
+        PEAKGENERAL_LISTENER(array_listener[hook_id]);
+    gulong total_num_calls = 0;
+    for (size_t j = 0; j < peak_max_num_threads; j++) {
+        total_num_calls += peak_general_listener_num_calls_load(
+            &pg_listener->num_calls[j]);
+    }
+
+    double profile_seconds =
+        peak_general_listener_profile_seconds_for_calls_unlocked(
+            hook_id,
+            total_num_calls);
+    peak_general_listener_cache_hook_sample_unlocked(hook_id,
+                                                     total_num_calls,
+                                                     profile_seconds);
+    if (calls_out != NULL) {
+        *calls_out = total_num_calls;
+    }
+    if (profile_seconds_out != NULL) {
+        *profile_seconds_out = profile_seconds;
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
+    size_t hook_id)
+{
+    if (hook_id >= peak_hook_address_count || peak_hook_states == NULL) {
+        return FALSE;
+    }
+
+    switch (peak_hook_states[hook_id]) {
+        case PEAK_HOOK_DETACHED:
+        case PEAK_HOOK_REATTACH_REQUESTED:
+            return TRUE;
+        case PEAK_HOOK_REATTACHING:
+            /*
+             * The controller has entered the physical reattach path. Keep
+             * scanning so the first attached sample is seeded from live slots.
+             */
+            return FALSE;
+        default:
+            return FALSE;
+    }
 }
 
 static gboolean
@@ -3239,24 +4271,32 @@ void* peak_heartbeat_monitor(void* arg) {
     double hb_k_rate = heartbeat_args->hb_k_rate;
     double hb_ema_a = heartbeat_args->hb_ema_a;
     unsigned int heartbeat_counter = 0;
+    const unsigned int local_mpi_ranks =
+        peak_general_listener_local_mpi_ranks();
 
     gum_interceptor_ignore_current_thread(interceptor);
 
     OverheadEntry* entries = g_new0(OverheadEntry, peak_hook_address_count);
 
     gulong* calls_snapshot = g_new0(gulong, peak_hook_address_count);
+    double* profile_seconds_snapshot = g_new0(double, peak_hook_address_count);
+    double* lifetime_snapshot = g_new0(double, peak_hook_address_count);
     double* ratio_snapshot = g_new0(double, peak_hook_address_count);
-    double* rate_snapshot  = g_new0(double, peak_hook_address_count);
-    double* prev_ratio     = g_new0(double, peak_hook_address_count);
-    double* prev_time      = g_new0(double, peak_hook_address_count);
+    double* rate_snapshot = g_new0(double, peak_hook_address_count);
+    gulong* previous_calls = g_new0(gulong, peak_hook_address_count);
+    double* previous_time = g_new0(double, peak_hook_address_count);
+    gboolean* recent_baseline_ready = g_new0(gboolean, peak_hook_address_count);
 
     double now0 = peak_second();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         calls_snapshot[i] = 0;
+        profile_seconds_snapshot[i] = 0.0;
+        lifetime_snapshot[i] = 0.0;
         ratio_snapshot[i] = 0.0;
-        rate_snapshot[i]  = 0.0;
-        prev_ratio[i]     = 0.0;
-        prev_time[i]      = now0;
+        rate_snapshot[i] = 0.0;
+        previous_calls[i] = 0;
+        previous_time[i] = now0;
+        recent_baseline_ready[i] = TRUE;
     }
 
     // ------------------------------
@@ -3281,6 +4321,10 @@ void* peak_heartbeat_monitor(void* arg) {
     }
 
     while (atomic_load(&heartbeat_running)) {
+        unsigned long long management_cpu_checkpoint_ns = 0;
+        gboolean management_cpu_checkpoint_valid =
+            peak_general_listener_thread_cpu_ns(
+                &management_cpu_checkpoint_ns);
         gboolean wake_controller = FALSE;
         heartbeat_counter++;
         double now = peak_second();
@@ -3292,66 +4336,147 @@ void* peak_heartbeat_monitor(void* arg) {
             size_t old_capacity = heartbeat_capacity;
             entries = g_renew(OverheadEntry, entries, current_hook_count);
             calls_snapshot = g_renew(gulong, calls_snapshot, current_hook_count);
-            ratio_snapshot = g_renew(double, ratio_snapshot, current_hook_count);
+            profile_seconds_snapshot =
+                g_renew(double, profile_seconds_snapshot, current_hook_count);
+            lifetime_snapshot =
+                g_renew(double, lifetime_snapshot, current_hook_count);
+            ratio_snapshot =
+                g_renew(double, ratio_snapshot, current_hook_count);
             rate_snapshot = g_renew(double, rate_snapshot, current_hook_count);
-            prev_ratio = g_renew(double, prev_ratio, current_hook_count);
-            prev_time = g_renew(double, prev_time, current_hook_count);
+            previous_calls = g_renew(gulong, previous_calls, current_hook_count);
+            previous_time = g_renew(double, previous_time, current_hook_count);
+            recent_baseline_ready =
+                g_renew(gboolean, recent_baseline_ready, current_hook_count);
             for (size_t i = old_capacity; i < current_hook_count; i++) {
                 calls_snapshot[i] = 0;
+                profile_seconds_snapshot[i] = 0.0;
+                lifetime_snapshot[i] = 0.0;
                 ratio_snapshot[i] = 0.0;
                 rate_snapshot[i] = 0.0;
-                prev_ratio[i] = 0.0;
-                prev_time[i] = now;
+                previous_calls[i] = 0;
+                previous_time[i] = now;
+                recent_baseline_ready[i] = FALSE;
             }
             heartbeat_capacity = current_hook_count;
         }
 
         double total_execution_time = now - peak_main_time;
         if (total_execution_time <= 0.0) total_execution_time = 1e-12;
+        double heartbeat_observation_horizon_seconds =
+            (double)hb_max_us / 1e6;
         gboolean detach_observation_ready =
             total_execution_time >= min_detach_observation_time;
 
-        double global_overhead = 0.0;
+        double profile_spent_seconds = 0.0;
+        double control_spent_seconds = 0.0;
+        double spent_ratio = 0.0;
+        double attached_recent_sum = 0.0;
+        double attached_lifetime_sum = 0.0;
+        double attached_pressure = 0.0;
+        double profile_global_overhead = 0.0;
+        double projected_pending_reattach_seconds = 0.0;
+        uint64_t control_pause_wall_ns = 0;
+        PeakDetachAccountingSnapshot detach_accounting;
 
         pthread_mutex_lock(&lock);
         for (size_t i = 0; i < heartbeat_capacity; i++) {
             if (!(hook_address[i] && array_listener[i])) {
                 calls_snapshot[i] = 0;
+                profile_seconds_snapshot[i] = 0.0;
+                lifetime_snapshot[i] = 0.0;
                 ratio_snapshot[i] = 0.0;
-                rate_snapshot[i]  = 0.0;
-                prev_ratio[i]     = 0.0;
-                prev_time[i]      = now;
+                rate_snapshot[i] = 0.0;
+                previous_calls[i] = 0;
+                previous_time[i] = now;
+                recent_baseline_ready[i] = FALSE;
+                if (peak_hook_cached_sample_valid != NULL &&
+                    i < peak_hook_address_count) {
+                    peak_hook_cached_sample_valid[i] = FALSE;
+                }
                 continue;
             }
 
-            PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
-
             gulong total_num_calls = 0;
-            for (size_t j = 0; j < peak_max_num_threads; j++) {
-                total_num_calls += pg_listener->num_calls[j];
+            double hook_profile_spent_seconds = 0.0;
+            gboolean reuse_cached_sample =
+                peak_general_listener_heartbeat_sample_can_reuse_cache_unlocked(
+                    i);
+            gboolean have_sample =
+                reuse_cached_sample &&
+                peak_general_listener_try_hook_sample_cache_unlocked(
+                    i,
+                    &total_num_calls,
+                    &hook_profile_spent_seconds);
+            if (!have_sample) {
+                have_sample =
+                    peak_general_listener_refresh_hook_sample_cache_unlocked(
+                        i,
+                        &total_num_calls,
+                        &hook_profile_spent_seconds);
+            }
+            if (!have_sample) {
+                calls_snapshot[i] = 0;
+                profile_seconds_snapshot[i] = 0.0;
+                lifetime_snapshot[i] = 0.0;
+                ratio_snapshot[i] = 0.0;
+                rate_snapshot[i] = 0.0;
+                previous_calls[i] = 0;
+                previous_time[i] = now;
+                recent_baseline_ready[i] = FALSE;
+                continue;
             }
 
             calls_snapshot[i] = total_num_calls;
-            double ratio =
-                (total_num_calls * peak_general_overhead + heartbeat_overhead[i]) / total_execution_time;
+            profile_seconds_snapshot[i] = hook_profile_spent_seconds;
+            double ratio = hook_profile_spent_seconds / total_execution_time;
+            lifetime_snapshot[i] = ratio;
 
-            ratio_snapshot[i] = ratio;
             // g_printerr ("ratio %ld: %ld\n", i, total_num_calls);
 
-            double dt = now - prev_time[i];
-            if (dt <= 1e-12) dt = 1e-12;
-            rate_snapshot[i] = (ratio - prev_ratio[i]) / dt;
+            double recent_rate = 0.0;
+            if (!reuse_cached_sample && recent_baseline_ready[i]) {
+                double dt = now - previous_time[i];
+                if (dt <= 1e-12) dt = 1e-12;
+                gulong previous_num_calls = previous_calls[i];
+                gulong recent_calls =
+                    total_num_calls >= previous_num_calls
+                        ? total_num_calls - previous_num_calls
+                        : total_num_calls;
+                recent_rate =
+                    ((double)recent_calls * peak_general_overhead) / dt;
+            }
+            rate_snapshot[i] = recent_rate;
+            ratio_snapshot[i] = ratio;
 
-            prev_ratio[i] = ratio;
-            prev_time[i]  = now;
+            previous_calls[i] = total_num_calls;
+            previous_time[i] = now;
+            recent_baseline_ready[i] = TRUE;
+            profile_spent_seconds += hook_profile_spent_seconds;
 
-            if (!peak_detached[i]) {
-                global_overhead += ratio;
+            if (peak_general_listener_hook_is_attached_for_policy_unlocked(i)) {
+                attached_recent_sum += recent_rate;
+                attached_lifetime_sum += ratio;
             }
         }
         pthread_mutex_unlock(&lock);
 
-        // g_printerr ("global_overhead %.3e\n", global_overhead);
+        peak_general_listener_runtime_accounting_snapshot(&detach_accounting);
+        control_pause_wall_ns =
+            peak_general_listener_control_wall_ns_since_heartbeat(
+                &detach_accounting);
+        control_spent_seconds = (double)control_pause_wall_ns / 1e9;
+        peak_general_listener_management_cpu_checkpoint(
+            &management_cpu_checkpoint_ns,
+            &management_cpu_checkpoint_valid);
+        spent_ratio =
+            (profile_spent_seconds + control_spent_seconds) /
+            total_execution_time;
+        attached_pressure = MAX(attached_recent_sum, attached_lifetime_sum);
+        profile_global_overhead = attached_pressure;
+        double projected_attached_recent_sum = attached_recent_sum;
+        double projected_attached_lifetime_sum = attached_lifetime_sum;
+
+        // g_printerr ("profile_global_overhead %.3e spent_ratio %.3e\n", profile_global_overhead, spent_ratio);
 
         // ------------------------------------------------------------
         // 1) Per-target DETACH
@@ -3360,18 +4485,33 @@ void* peak_heartbeat_monitor(void* arg) {
             pthread_mutex_lock(&lock);
             for (size_t i = 0; i < heartbeat_capacity; i++) {
                 if (!(hook_address[i] && array_listener[i])) continue;
-                if (peak_detached[i]) continue;
+                if (!peak_general_listener_hook_is_attached_for_policy_unlocked(
+                        i)) {
+                    continue;
+                }
 
-                if (ratio_snapshot[i] > target_profile_ratio) {
-                    wake_controller |=
+                if (calls_snapshot[i] >= PEAK_GLOBAL_DETACH_MIN_CALLS &&
+                    ratio_snapshot[i] > target_profile_ratio) {
+                    gboolean accepted =
                         peak_general_listener_request_detach_with_context_unlocked(
                             i,
                             PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
                             calls_snapshot[i],
-                            ratio_snapshot[i],
-                            global_overhead,
+                            lifetime_snapshot[i],
+                            profile_global_overhead,
                             total_execution_time,
                             rate_snapshot[i]);
+                    if (accepted) {
+                        wake_controller = TRUE;
+                        projected_attached_recent_sum -= rate_snapshot[i];
+                        if (projected_attached_recent_sum < 0.0) {
+                            projected_attached_recent_sum = 0.0;
+                        }
+                        projected_attached_lifetime_sum -= ratio_snapshot[i];
+                        if (projected_attached_lifetime_sum < 0.0) {
+                            projected_attached_lifetime_sum = 0.0;
+                        }
+                    }
                 }
             }
              pthread_mutex_unlock(&lock);
@@ -3381,17 +4521,29 @@ void* peak_heartbeat_monitor(void* arg) {
         // 2) Global DETACH
         // ------------------------------------------------------------
         if (detach_observation_ready && enable_global_heartbeat) {
-            if (global_overhead > global_target_ratio * peak_global_detach_factor) {
+            double projected_global_overhead =
+                MAX(projected_attached_recent_sum,
+                    projected_attached_lifetime_sum);
+            if (projected_global_overhead >
+                global_target_ratio * peak_global_detach_factor) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
                     if (!(hook_address[i] && array_listener[i])) continue;
-                    if (peak_detached[i]) continue;
-                    if (ratio_snapshot[i] <= target_profile_ratio) continue;
-
+                    if (!peak_general_listener_hook_is_attached_for_policy_unlocked(
+                            i)) {
+                        continue;
+                    }
+                    if (calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS) {
+                        continue;
+                    }
+                    double contribution =
+                        MAX(rate_snapshot[i], ratio_snapshot[i]);
+                    if (contribution <= 0.0) continue;
                     entries[n_attached].index = i;
-                    entries[n_attached].ratio = ratio_snapshot[i];
-                    entries[n_attached].rate  = rate_snapshot[i];
+                    entries[n_attached].ratio = contribution;
+                    entries[n_attached].rate = rate_snapshot[i];
+                    entries[n_attached].lifetime = ratio_snapshot[i];
                     n_attached++;
                 }
 
@@ -3402,25 +4554,49 @@ void* peak_heartbeat_monitor(void* arg) {
                           compare_ratio_de);
                 }
 
-                double reduced = global_overhead;
-                for (size_t k = 0; k < n_attached && reduced > global_target_ratio; k++) {
+                double reduced_recent_sum = projected_attached_recent_sum;
+                double reduced_lifetime_sum = projected_attached_lifetime_sum;
+                double reduced_global_overhead = projected_global_overhead;
+                for (size_t k = 0; k < n_attached; k++) {
                     size_t idx = entries[k].index;
 
-                    if (!(hook_address[idx] && array_listener[idx])) continue;
-                    if (peak_detached[idx]) continue;
-                    if (entries[k].ratio <= target_profile_ratio) break;
+                    if (reduced_global_overhead <= global_target_ratio) {
+                        break;
+                    }
+                    if (entries[k].ratio <= 0.0) {
+                        break;
+                    }
 
-                    reduced -= entries[k].ratio;
-                    wake_controller |=
+                    if (!(hook_address[idx] && array_listener[idx])) continue;
+                    if (!peak_general_listener_hook_is_attached_for_policy_unlocked(
+                            idx)) {
+                        continue;
+                    }
+                    gboolean accepted =
                         peak_general_listener_request_detach_with_context_unlocked(
                             idx,
                             PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT,
                             calls_snapshot[idx],
-                            ratio_snapshot[idx],
-                            global_overhead,
+                            lifetime_snapshot[idx],
+                            profile_global_overhead,
                             total_execution_time,
                             rate_snapshot[idx]);
+                    if (accepted) {
+                        wake_controller = TRUE;
+                        reduced_recent_sum -= entries[k].rate;
+                        if (reduced_recent_sum < 0.0) {
+                            reduced_recent_sum = 0.0;
+                        }
+                        reduced_lifetime_sum -= entries[k].lifetime;
+                        if (reduced_lifetime_sum < 0.0) {
+                            reduced_lifetime_sum = 0.0;
+                        }
+                        reduced_global_overhead =
+                            MAX(reduced_recent_sum, reduced_lifetime_sum);
+                    }
                 }
+                projected_attached_recent_sum = reduced_recent_sum;
+                projected_attached_lifetime_sum = reduced_lifetime_sum;
                 pthread_mutex_unlock(&lock);
             }
         }
@@ -3432,91 +4608,279 @@ void* peak_heartbeat_monitor(void* arg) {
             enable_reattach &&
             check_interval != 0 &&
             (heartbeat_counter % check_interval) == 0) {
-            // Per-target REATTACH
-            if (enable_per_target_heartbeat) {
-                for (size_t i = 0; i < heartbeat_capacity; i++) {
-                    pthread_mutex_lock(&lock);
-                    gboolean should_consider =
-                        (hook_address[i] && array_listener[i] &&
-                         peak_detached[i] && !peak_need_detach[i] &&
-                         peak_general_listener_reattach_cooldown_ready_unlocked(i,
-                                                                                now));
-                    pthread_mutex_unlock(&lock);
-                    if (!should_consider) continue;
+            double reattach_gate_ratio = 0.0;
+            double reattach_spent_seconds = 0.0;
+            double reattach_risk_spent_ratio = 0.0;
+            double headroom_seconds = 0.0;
+            double last_stop_seconds =
+                peak_detach_controller_last_stop_window_us() / 1e6;
+            double predicted_batch_stop_seconds = DBL_MAX;
 
-                    if (ratio_snapshot[i] <= target_profile_ratio) {
-                        pthread_mutex_lock(&lock);
-                        wake_controller |=
-                            peak_general_listener_request_reattach_with_context_unlocked(
-                                i,
-                                PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
-                                calls_snapshot[i],
-                                ratio_snapshot[i],
-                                global_overhead,
-                                total_execution_time,
-                                rate_snapshot[i]);
-                        pthread_mutex_unlock(&lock);
-                    }
-                }
+            PeakDetachAccountingSnapshot reattach_accounting;
+            gboolean reattach_accounting_valid =
+                peak_general_listener_runtime_accounting_snapshot(
+                    &reattach_accounting);
+            double reattach_control_spent_seconds =
+                (double)peak_general_listener_control_wall_ns_since_heartbeat(
+                    &reattach_accounting) / 1e9;
+            double reattach_control_risk_seconds = DBL_MAX;
+            gboolean reattach_budget_ok =
+                reattach_accounting_valid &&
+                (enable_per_target_heartbeat || enable_global_heartbeat) &&
+                peak_general_listener_positive_finite(total_execution_time) &&
+                peak_general_listener_nonnegative_finite(global_target_ratio) &&
+                peak_general_listener_nonnegative_finite(
+                    peak_global_reattach_factor) &&
+                peak_general_listener_nonnegative_finite(
+                    profile_spent_seconds) &&
+                peak_general_listener_nonnegative_finite(
+                    reattach_control_spent_seconds) &&
+                peak_general_listener_nonnegative_finite(
+                    last_stop_seconds) &&
+                peak_general_listener_multiply_nonnegative_finite(
+                    reattach_control_spent_seconds,
+                    (double)local_mpi_ranks,
+                    &reattach_control_risk_seconds) &&
+                peak_general_listener_multiply_nonnegative_finite(
+                    last_stop_seconds,
+                    (double)local_mpi_ranks,
+                    &predicted_batch_stop_seconds) &&
+                peak_general_listener_add_nonnegative_finite(
+                    profile_spent_seconds,
+                    reattach_control_risk_seconds,
+                    &reattach_spent_seconds) &&
+                peak_general_listener_multiply_nonnegative_finite(
+                    peak_global_reattach_factor,
+                    global_target_ratio,
+                    &reattach_gate_ratio) &&
+                peak_general_listener_multiply_nonnegative_finite(
+                    global_target_ratio,
+                    total_execution_time,
+                    &headroom_seconds) &&
+                peak_general_listener_subtract_nonnegative_finite(
+                    &headroom_seconds,
+                    profile_spent_seconds) &&
+                peak_general_listener_subtract_nonnegative_finite(
+                    &headroom_seconds,
+                    reattach_control_risk_seconds);
+            if (reattach_budget_ok) {
+                reattach_risk_spent_ratio =
+                    reattach_spent_seconds / total_execution_time;
+                reattach_budget_ok =
+                    peak_general_listener_nonnegative_finite(
+                        reattach_risk_spent_ratio) &&
+                    reattach_risk_spent_ratio <= reattach_gate_ratio;
             }
-            // Global REATTACH
-            if (enable_global_heartbeat) {
-                if (global_overhead <= peak_global_reattach_factor * global_target_ratio) {
-                    size_t detached_cnt = 0;
-                    pthread_mutex_lock(&lock);
-                    for (size_t i = 0; i < heartbeat_capacity; i++) {
-                        if (!(hook_address[i] && array_listener[i])) continue;
-                        if (!peak_detached[i]) continue;
-                        if (peak_need_detach[i]) continue;
-                        if (!peak_general_listener_reattach_cooldown_ready_unlocked(
+
+            if (reattach_budget_ok) {
+                size_t pending_mutation_count = 0;
+                size_t detached_cnt = 0;
+                size_t admitted_count = 0;
+
+                projected_pending_reattach_seconds = 0.0;
+                pthread_mutex_lock(&lock);
+                for (size_t i = 0; i < heartbeat_capacity; i++) {
+                    double projected_seconds;
+                    double projected_ratio;
+                    gboolean per_target_eligible;
+                    gboolean global_eligible;
+
+                    if (!(hook_address[i] && array_listener[i])) continue;
+                    if (peak_hook_states == NULL) continue;
+                    if (peak_hook_states[i] == PEAK_HOOK_DETACH_REQUESTED ||
+                        peak_hook_states[i] == PEAK_HOOK_DETACHING ||
+                        peak_hook_states[i] == PEAK_HOOK_REATTACH_REQUESTED ||
+                        peak_hook_states[i] == PEAK_HOOK_REATTACHING) {
+                        pending_mutation_count++;
+                    }
+                    if (peak_hook_states[i] == PEAK_HOOK_REATTACH_REQUESTED ||
+                        peak_hook_states[i] == PEAK_HOOK_REATTACHING) {
+                        double projected_seconds =
+                            peak_general_listener_projected_detach_profile_seconds_unlocked(
                                 i,
-                                now)) {
-                            continue;
+                                profile_seconds_snapshot[i]);
+                        double historical_rate =
+                            peak_general_listener_historical_profile_rate(
+                                projected_seconds,
+                                total_execution_time);
+                        double pending_rate = historical_rate;
+                        if (peak_hook_pending_request_rate != NULL &&
+                            peak_general_listener_positive_finite(
+                                peak_hook_pending_request_rate[i])) {
+                            pending_rate = peak_hook_pending_request_rate[i];
                         }
-
-                        entries[detached_cnt].index = i;
-                        entries[detached_cnt].ratio = ratio_snapshot[i];
-                        entries[detached_cnt].rate  = rate_snapshot[i];
-                        detached_cnt++;
-                    }
-                    pthread_mutex_unlock(&lock);
-
-                    if (detached_cnt > 1) {
-                        qsort(entries, detached_cnt, sizeof(OverheadEntry), compare_rate_inc);
-                    }
-
-                    for (size_t k = 0; k < detached_cnt; k++) {
-                        size_t i = entries[k].index;
-
-                        pthread_mutex_lock(&lock);
-                        gboolean still_detached =
-                            hook_address[i] && array_listener[i] &&
-                            peak_detached[i] && !peak_need_detach[i];
-                        pthread_mutex_unlock(&lock);
-                        if (!still_detached) continue;
-
-                        if (global_overhead + entries[k].ratio > global_target_ratio) {
-                            break;
-                        }
-
-                        pthread_mutex_lock(&lock);
-                        wake_controller |=
-                            peak_general_listener_request_reattach_with_context_unlocked(
-                                i,
-                                PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT,
-                                calls_snapshot[i],
-                                ratio_snapshot[i],
-                                global_overhead,
-                                total_execution_time,
-                                rate_snapshot[i]);
-                        pthread_mutex_unlock(&lock);
-                        global_overhead += entries[k].ratio;
-
-                        if (global_overhead > peak_global_reattach_factor * global_target_ratio) {
-                            break;
+                        double pending_lease_seconds =
+                            peak_general_listener_next_observation_lease_seconds(
+                                pending_rate,
+                                heartbeat_observation_horizon_seconds);
+                        if (pending_lease_seconds == DBL_MAX ||
+                            !peak_general_listener_add_nonnegative_finite(
+                                projected_pending_reattach_seconds,
+                                pending_lease_seconds,
+                                &projected_pending_reattach_seconds)) {
+                            reattach_budget_ok = FALSE;
                         }
                     }
+                    if (!peak_detached[i]) continue;
+                    if (peak_need_detach[i]) continue;
+                    if (peak_hook_states[i] != PEAK_HOOK_DETACHED) {
+                        continue;
+                    }
+                    if (!peak_general_listener_reattach_cooldown_ready_unlocked(
+                            i,
+                            now)) {
+                        continue;
+                    }
+
+                    projected_seconds =
+                        peak_general_listener_projected_detach_profile_seconds_unlocked(
+                            i,
+                            profile_seconds_snapshot[i]);
+                    projected_ratio =
+                        projected_seconds / total_execution_time;
+                    per_target_eligible =
+                        enable_per_target_heartbeat &&
+                        projected_ratio <= target_profile_ratio;
+                    global_eligible = enable_global_heartbeat;
+                    if (!per_target_eligible && !global_eligible) {
+                        continue;
+                    }
+
+                    entries[detached_cnt].index = i;
+                    entries[detached_cnt].ratio = projected_seconds;
+                    entries[detached_cnt].rate =
+                        peak_hook_last_detach_time != NULL
+                            ? peak_hook_last_detach_time[i]
+                            : 0.0;
+                    entries[detached_cnt].lifetime = projected_ratio;
+                    detached_cnt++;
                 }
+
+                size_t pending_batch_windows =
+                    (pending_mutation_count +
+                     PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES - 1) /
+                    PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES;
+                double pending_stop_seconds = 0.0;
+                reattach_budget_ok =
+                    reattach_budget_ok &&
+                    projected_pending_reattach_seconds != DBL_MAX &&
+                    peak_general_listener_subtract_nonnegative_finite(
+                        &headroom_seconds,
+                        projected_pending_reattach_seconds) &&
+                    peak_general_listener_multiply_nonnegative_finite(
+                        (double)pending_batch_windows,
+                        predicted_batch_stop_seconds,
+                        &pending_stop_seconds) &&
+                    peak_general_listener_subtract_nonnegative_finite(
+                        &headroom_seconds,
+                        pending_stop_seconds) &&
+                    headroom_seconds > 0.0;
+
+                if (reattach_budget_ok && detached_cnt > 1) {
+                    qsort(entries,
+                          detached_cnt,
+                          sizeof(OverheadEntry),
+                          compare_rate_inc);
+                }
+
+                for (size_t k = 0;
+                     reattach_budget_ok && headroom_seconds > 0.0 &&
+                         k < detached_cnt;
+                     k++) {
+                    size_t i = entries[k].index;
+                    double projected_seconds;
+                    double projected_ratio;
+                    double request_rate;
+                    double incremental_lease_seconds;
+                    gboolean per_target_eligible;
+                    gboolean global_eligible;
+                    PeakHookRequestSource source;
+                    gboolean still_detached =
+                        hook_address[i] && array_listener[i] &&
+                        peak_detached[i] && !peak_need_detach[i] &&
+                        peak_hook_states != NULL &&
+                        peak_hook_states[i] == PEAK_HOOK_DETACHED;
+                    if (!still_detached) continue;
+                    if (!peak_general_listener_reattach_cooldown_ready_unlocked(
+                            i,
+                            now)) {
+                        continue;
+                    }
+
+                    projected_seconds = entries[k].ratio;
+                    projected_ratio = entries[k].lifetime;
+                    per_target_eligible =
+                        enable_per_target_heartbeat &&
+                        projected_ratio <= target_profile_ratio;
+                    global_eligible = enable_global_heartbeat;
+                    if (!per_target_eligible && !global_eligible) {
+                        continue;
+                    }
+                    source = per_target_eligible
+                                 ? PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT
+                                 : PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT;
+                    request_rate =
+                        peak_general_listener_historical_profile_rate(
+                            projected_seconds,
+                            total_execution_time);
+                    incremental_lease_seconds =
+                        peak_general_listener_next_observation_lease_seconds(
+                            request_rate,
+                            heartbeat_observation_horizon_seconds);
+
+                    size_t before_count =
+                        pending_mutation_count + admitted_count;
+                    size_t after_count = before_count + 1;
+                    size_t before_windows =
+                        (before_count +
+                         PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES - 1) /
+                        PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES;
+                    size_t after_windows =
+                        (after_count +
+                         PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES - 1) /
+                        PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES;
+                    double extra_stop_seconds = DBL_MAX;
+                    (void)peak_general_listener_multiply_nonnegative_finite(
+                        (double)(after_windows - before_windows),
+                        predicted_batch_stop_seconds,
+                        &extra_stop_seconds);
+                    double candidate_seconds = DBL_MAX;
+                    double remaining_headroom_seconds = headroom_seconds;
+                    if (incremental_lease_seconds != DBL_MAX) {
+                        (void)peak_general_listener_add_nonnegative_finite(
+                            incremental_lease_seconds,
+                            extra_stop_seconds,
+                            &candidate_seconds);
+                    }
+
+                    if (candidate_seconds == DBL_MAX ||
+                        !peak_general_listener_subtract_nonnegative_finite(
+                            &remaining_headroom_seconds,
+                            candidate_seconds)) {
+                        continue;
+                    }
+
+                    gboolean accepted;
+                    double request_ratio =
+                        projected_seconds / total_execution_time;
+                    accepted =
+                        peak_general_listener_request_reattach_with_context_unlocked(
+                            i,
+                            source,
+                            calls_snapshot[i],
+                            request_ratio,
+                            spent_ratio,
+                            total_execution_time,
+                            request_rate);
+                    if (!accepted) {
+                        continue;
+                    }
+
+                    wake_controller = TRUE;
+                    headroom_seconds = remaining_headroom_seconds;
+                    admitted_count++;
+                }
+                pthread_mutex_unlock(&lock);
             }
         }
 
@@ -3530,14 +4894,17 @@ void* peak_heartbeat_monitor(void* arg) {
         double gdt = now - prev_global_time;
         if (gdt <= 1e-12) gdt = 1e-12;
 
-        double global_rate = (global_overhead - prev_global_overhead) / gdt;
+        double global_rate =
+            (profile_global_overhead - prev_global_overhead) / gdt;
         ema_global_rate = hb_ema_a * global_rate + (1.0 - hb_ema_a) * ema_global_rate;
 
-        prev_global_overhead = global_overhead;
+        prev_global_overhead = profile_global_overhead;
         prev_global_time     = now;
 
         // error: how much we exceed global target (normalized)
-        double err = (global_target_ratio > 0.0) ? (global_overhead / global_target_ratio - 1.0) : 0.0;
+        double err = (global_target_ratio > 0.0)
+                         ? (profile_global_overhead / global_target_ratio - 1.0)
+                         : 0.0;
         if (err < 0.0) err = 0.0;
 
         // // only care positive growth (shrinking shouldn't speed up)
@@ -3550,16 +4917,25 @@ void* peak_heartbeat_monitor(void* arg) {
                                        (double)hb_min_us,
                                        (double)hb_max_us) + 0.5);
 
+        peak_general_listener_management_cpu_checkpoint(
+            &management_cpu_checkpoint_ns,
+            &management_cpu_checkpoint_valid);
         if (!peak_heartbeat_wait_us((unsigned int)sleep_us)) {
             break;
         }
     }
 
 cleanup:
-    g_free(prev_time);
-    g_free(prev_ratio);
+    pthread_mutex_lock(&lock);
+    peak_general_listener_snapshot_heartbeat_overhead_seconds_unlocked();
+    pthread_mutex_unlock(&lock);
+    g_free(previous_time);
+    g_free(previous_calls);
+    g_free(recent_baseline_ready);
     g_free(rate_snapshot);
     g_free(ratio_snapshot);
+    g_free(lifetime_snapshot);
+    g_free(profile_seconds_snapshot);
     g_free(calls_snapshot);
     g_free(entries);
 
@@ -3697,7 +5073,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             thread_data.capacity *= 2;
             thread_data.child_time = g_renew(double, thread_data.child_time, thread_data.capacity);
         }
-        self->num_calls[index]++;
+        (void)peak_general_listener_num_calls_increment(
+            &self->num_calls[index]);
         // g_printerr ("hook_id %lu time %f count %lu\n", hook_id, *current_time, self->num_calls[mapped_tid]);
     } else {
         // g_print ("hook_id %lu tid %lu mapped %lu\n", hook_id, pthread_self(), mapped_tid);
@@ -3718,18 +5095,18 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
             thread_data.child_time = g_renew(double, thread_data.child_time, thread_data.capacity);
             pthread_pause_enable();
         }
-        self->num_calls[index]++;
+        gulong current_num_calls =
+            peak_general_listener_num_calls_increment(
+                &self->num_calls[index]);
         size_t hook_id = self->hook_id;
-        if (self->target_thread_called != NULL) {
-            self->target_thread_called[index] = TRUE;
-        }
         gboolean detach_requested = FALSE;
 
         pthread_mutex_lock(&lock);
-        if (self->num_calls[index] >= peak_detach_count) {
+        if (current_num_calls >= peak_detach_count) {
             gulong total_num_calls = 0;
             for (size_t j = 0; j < peak_max_num_threads; j++) {
-                total_num_calls += self->num_calls[j];
+                total_num_calls += peak_general_listener_num_calls_load(
+                    &self->num_calls[j]);
             }
             detach_requested =
                 peak_general_listener_request_detach_with_context_unlocked(
@@ -3803,7 +5180,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
-        if (end_time < self->min_time[index] || self->num_calls[index] == 1)
+        if (end_time < self->min_time[index] ||
+            peak_general_listener_num_calls_load(&self->num_calls[index]) == 1)
             self->min_time[index] = end_time;
         self->total_time[index] += end_time;
         // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
@@ -3861,7 +5239,8 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
         }
         if (end_time > self->max_time[index])
             self->max_time[index] = end_time;
-        if (end_time < self->min_time[index] || self->num_calls[index] == 1)
+        if (end_time < self->min_time[index] ||
+            peak_general_listener_num_calls_load(&self->num_calls[index]) == 1)
             self->min_time[index] = end_time;
         self->total_time[index] += end_time;
         // g_printerr ("hook_id %lu time %f endtime %f child_time %f count %lu\n", hook_id, *current_time, end_time, *child_time, self->num_calls[index]);
@@ -4105,11 +5484,18 @@ void peak_general_listener_attach()
 {
     peak_general_controller_init_trace_config();
     peak_general_listener_init_attach_policy();
+    peak_general_listener_final_heartbeat_overhead_seconds = 0.0;
+    peak_general_listener_reset_final_report_snapshot();
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_valid,
+        FALSE,
+        memory_order_release);
     pthread_pause_enable();
     interceptor = gum_interceptor_obtain();
     array_listener = (GumInvocationListener**)g_new0(gpointer, peak_hook_address_count);
     array_listener_detached = g_new0(gboolean, peak_hook_address_count);
     array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
+    array_listener_revisited = g_new0(gboolean, peak_hook_address_count);
     array_listener_gum_detached = g_new0(gboolean, peak_hook_address_count);
     array_listener_gum_detach_flushed = g_new0(gboolean, peak_hook_address_count);
     peak_hook_last_detach_time = g_new0(double, peak_hook_address_count);
@@ -4125,6 +5511,17 @@ void peak_general_listener_attach()
     peak_hook_pending_request_total_time =
         g_new0(double, peak_hook_address_count);
     peak_hook_pending_request_rate = g_new0(double, peak_hook_address_count);
+    peak_hook_detach_profile_seconds =
+        g_new0(double, peak_hook_address_count);
+    peak_hook_reattach_request_calls =
+        g_new0(gulong, peak_hook_address_count);
+    peak_hook_reattach_request_calls_valid =
+        g_new0(gboolean, peak_hook_address_count);
+    peak_hook_cached_sample_calls = g_new0(gulong, peak_hook_address_count);
+    peak_hook_cached_sample_profile_seconds =
+        g_new0(double, peak_hook_address_count);
+    peak_hook_cached_sample_valid =
+        g_new0(gboolean, peak_hook_address_count);
     peak_hook_retry_count = g_new0(unsigned int, peak_hook_address_count);
     peak_hook_last_retry_status = g_new0(PeakDetachStatus, peak_hook_address_count);
 
@@ -4396,6 +5793,26 @@ static FILE* peak_stats_csv_open(void) {
     return fp;
 }
 
+typedef struct {
+    gboolean valid;
+    gboolean accounting_valid;
+    gboolean per_rank_max;
+    uint64_t stop_window_count;
+    uint64_t failed_stop_window_count;
+    double elapsed_seconds;
+    double elapsed_min_seconds;
+    double elapsed_max_seconds;
+    double profile_seconds;
+    double control_seconds;
+    double management_seconds;
+    double profile_ratio;
+    double control_ratio;
+    double profile_control_risk_ratio;
+    double control_risk_ratio;
+    double management_ratio;
+    double ratio;
+} PeakReportOverhead;
+
 static void
 peak_general_listener_export_csv_result(gulong* sum_num_calls,
     gdouble* sum_total_time,
@@ -4424,6 +5841,8 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
     if (csv) {
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
+                double hook_profile_overhead =
+                    (double)sum_num_calls[i] * peak_general_overhead;
                 fprintf(csv, "\"%s\",%lu,%lu,%lu,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
                     peak_demangled_strings[i],
                     (unsigned long)sum_num_calls[i],
@@ -4435,7 +5854,7 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
                     (double)sum_exclusive_time[i],
                     (double)max_total_time[i],
                     (double)min_total_time[i],
-                    (double)(sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0)) * peak_general_overhead);
+                    hook_profile_overhead);
             }
         }
         fclose(csv);
@@ -4451,7 +5870,8 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                         gfloat* sum_max_time,
                                         gfloat* sum_min_time,
                                         gulong* thread_count,
-                                        const int rank_count)
+                                        const int rank_count,
+                                        const PeakReportOverhead* report_overhead)
 {
     guint max_function_width = 20;
     guint max_col_width = 10;
@@ -4463,13 +5883,88 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     char* argv_o;
     get_argv0(&argv_o);
     double total_overhead = 0.0;
+    PeakDetachAccountingSnapshot detach_accounting;
+    uint64_t stop_window_count = 0;
+    uint64_t failed_stop_window_count = 0;
+    double stop_window_seconds = 0.0;
+    double stop_window_ratio = 0.0;
+    double elapsed_seconds = peak_main_time;
+    gboolean accounting_valid = FALSE;
+    size_t detached_targets = 0;
+    size_t reattached_targets = 0;
+    size_t revisited_targets = 0;
     gboolean have_output = FALSE;
+
+    if (report_overhead != NULL && report_overhead->valid) {
+        accounting_valid = report_overhead->accounting_valid;
+        stop_window_count = report_overhead->stop_window_count;
+        failed_stop_window_count = report_overhead->failed_stop_window_count;
+        stop_window_seconds = report_overhead->control_seconds;
+        elapsed_seconds = report_overhead->elapsed_seconds;
+    } else {
+        accounting_valid =
+            peak_general_listener_runtime_accounting_snapshot(
+                &detach_accounting);
+        stop_window_count =
+            peak_general_listener_control_window_count_since_heartbeat(
+                &detach_accounting);
+        failed_stop_window_count =
+            peak_general_listener_failed_window_count_since_heartbeat(
+                &detach_accounting);
+        stop_window_seconds =
+            (double)peak_general_listener_control_wall_ns_since_heartbeat(
+                &detach_accounting) / 1e9;
+    }
+    if (elapsed_seconds > 0.0) {
+        if (report_overhead != NULL && report_overhead->valid) {
+            stop_window_ratio = stop_window_seconds / elapsed_seconds;
+        } else {
+            stop_window_ratio = stop_window_seconds / peak_main_time;
+        }
+    }
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (array_listener_detached != NULL &&
+            array_listener_detached[i]) {
+            detached_targets++;
+        }
+        if (array_listener_reattached != NULL &&
+            array_listener_reattached[i]) {
+            reattached_targets++;
+        }
+        if (array_listener_revisited != NULL &&
+            array_listener_revisited[i]) {
+            revisited_targets++;
+        }
+    }
+
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i] && sum_num_calls[i] != 0) {
-            total_overhead += (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                              * peak_general_overhead;
+            total_overhead +=
+                (double)sum_num_calls[i] * peak_general_overhead;
             have_output = TRUE;
         }
+    }
+    if (report_overhead != NULL &&
+        report_overhead->valid &&
+        peak_general_listener_positive_finite(
+            report_overhead->profile_seconds)) {
+        total_overhead = report_overhead->profile_seconds;
+    } else {
+        double heartbeat_profile_seconds =
+            peak_general_listener_report_heartbeat_overhead_seconds();
+        if (peak_general_listener_positive_finite(
+                heartbeat_profile_seconds) &&
+            total_overhead <= DBL_MAX - heartbeat_profile_seconds) {
+            total_overhead += heartbeat_profile_seconds;
+        }
+    }
+    if (!have_output) {
+        have_output =
+            (report_overhead != NULL && report_overhead->valid) ||
+            detached_targets > 0 ||
+            reattached_targets > 0 ||
+            peak_general_listener_positive_finite(stop_window_seconds);
     }
     if (have_output &&
         peak_general_listener_should_print_text(
@@ -4477,9 +5972,69 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
         peak_log_report("%.*s\n", row_width, row_separator);
         peak_log_report("%*s PEAK Library\n", (row_width - 12) / 2, "");
         peak_log_report("%.*s\n", row_width, row_separator);
-        peak_log_report("Time: %f\n", peak_main_time);
+        peak_log_report("Time: %f\n", elapsed_seconds);
+        if (report_overhead != NULL && report_overhead->valid) {
+            peak_log_report("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f\n",
+                            report_overhead->elapsed_min_seconds,
+                            report_overhead->elapsed_max_seconds);
+        }
         peak_log_report("PEAK done with: %s\n", argv_o);
         peak_log_report("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
+        if (report_overhead != NULL && report_overhead->valid) {
+            if (report_overhead->per_rank_max) {
+                peak_log_report("[peak] per-rank maximum profile+control overhead ratio: %.9f\n",
+                                report_overhead->ratio);
+                peak_log_report("[peak] per-rank maximum profile overhead ratio: %.9f\n",
+                                report_overhead->profile_ratio);
+                peak_log_report("[peak] per-rank maximum control overhead ratio: %.9f\n",
+                                report_overhead->control_ratio);
+                peak_log_report("[peak] per-rank maximum profile+control risk overhead ratio: %.9f\n",
+                                report_overhead->profile_control_risk_ratio);
+                peak_log_report("[peak] per-rank maximum control risk overhead ratio: %.9f\n",
+                                report_overhead->control_risk_ratio);
+                peak_log_report("[peak] per-rank maximum heartbeat management overhead ratio: %.9f\n",
+                                report_overhead->management_ratio);
+            } else {
+                unsigned int report_local_ranks =
+                    peak_general_listener_local_mpi_ranks();
+                double report_control_risk_seconds =
+                    peak_general_listener_control_risk_seconds(
+                        report_overhead->control_seconds);
+                peak_log_report("[peak] local profile+control overhead: profile_seconds=%.9f control_seconds=%.9f profile_ratio=%.9f control_ratio=%.9f ratio=%.9f\n",
+                                report_overhead->profile_seconds,
+                                report_overhead->control_seconds,
+                                report_overhead->profile_ratio,
+                                report_overhead->control_ratio,
+                                report_overhead->ratio);
+                peak_log_report("[peak] local profile+local-rank-control risk: profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u risk_control_seconds=%.9f ratio=%.9f\n",
+                                report_overhead->profile_seconds,
+                                report_overhead->control_seconds,
+                                report_local_ranks,
+                                report_control_risk_seconds,
+                                report_overhead->profile_control_risk_ratio);
+                peak_log_report("[peak] local profile+control risk overhead ratio: %.9f\n",
+                                report_overhead->profile_control_risk_ratio);
+                peak_log_report("[peak] local control risk overhead ratio: %.9f\n",
+                                report_overhead->control_risk_ratio);
+                peak_log_report("[peak] heartbeat management overhead: cpu_seconds=%.9f ratio=%.9f\n",
+                                report_overhead->management_seconds,
+                                report_overhead->management_ratio);
+            }
+        }
+        peak_log_report("[peak] %s control stop-window overhead: windows=%llu wall_seconds=%.9f ratio=%.9f\n",
+                        rank_count > 1 ? "rank-0/local" : "local",
+                        (unsigned long long)stop_window_count,
+                        stop_window_seconds,
+                        stop_window_ratio);
+        peak_log_report("[peak] %s failed control windows: windows=%llu snapshot_valid=%d\n",
+                        rank_count > 1 ? "aggregate" : "local",
+                        (unsigned long long)failed_stop_window_count,
+                        accounting_valid ? 1 : 0);
+        peak_log_report("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu\n",
+                        rank_count > 1 ? "aggregate" : "local",
+                        detached_targets,
+                        reattached_targets,
+                        revisited_targets);
 
         peak_log_report("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
         peak_log_report(" individual call counts and time (in seconds)\n");
@@ -4597,6 +6152,119 @@ peak_general_listener_sanitize_output_times(gdouble* sum_total_time,
     }
 }
 
+static double
+peak_general_listener_profile_seconds_from_calls(gulong* sum_num_calls)
+{
+    double profile_seconds = 0.0;
+
+    if (sum_num_calls == NULL) {
+        return 0.0;
+    }
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address[i] && sum_num_calls[i] != 0) {
+            profile_seconds +=
+                (double)sum_num_calls[i] * peak_general_overhead;
+        }
+    }
+    double heartbeat_profile_seconds =
+        peak_general_listener_report_heartbeat_overhead_seconds();
+    if (peak_general_listener_positive_finite(heartbeat_profile_seconds) &&
+        profile_seconds <= DBL_MAX - heartbeat_profile_seconds) {
+        profile_seconds += heartbeat_profile_seconds;
+    }
+
+    return profile_seconds;
+}
+
+static PeakReportOverhead
+peak_general_listener_local_report_overhead(gulong* sum_num_calls)
+{
+    PeakReportOverhead overhead = {0};
+    PeakDetachAccountingSnapshot accounting;
+    double elapsed_seconds = peak_main_time;
+    double control_risk_seconds = 0.0;
+    double profile_control_risk_seconds = DBL_MAX;
+
+    if (peak_general_listener_final_report_snapshot.valid) {
+        overhead = (PeakReportOverhead) {
+            .valid = TRUE,
+            .accounting_valid =
+                peak_general_listener_final_report_snapshot.accounting_valid,
+            .stop_window_count =
+                peak_general_listener_final_report_snapshot.stop_window_count,
+            .failed_stop_window_count =
+                peak_general_listener_final_report_snapshot.failed_stop_window_count,
+            .elapsed_seconds =
+                peak_general_listener_final_report_snapshot.elapsed_seconds,
+            .elapsed_min_seconds =
+                peak_general_listener_final_report_snapshot.elapsed_seconds,
+            .elapsed_max_seconds =
+                peak_general_listener_final_report_snapshot.elapsed_seconds,
+            .profile_seconds =
+                peak_general_listener_final_report_snapshot.profile_seconds,
+            .control_seconds =
+                peak_general_listener_final_report_snapshot.control_seconds,
+            .management_seconds =
+                peak_general_listener_final_report_snapshot.management_seconds,
+            .profile_ratio =
+                peak_general_listener_final_report_snapshot.profile_ratio,
+            .control_ratio =
+                peak_general_listener_final_report_snapshot.control_ratio,
+            .profile_control_risk_ratio =
+                peak_general_listener_final_report_snapshot.profile_control_risk_ratio,
+            .control_risk_ratio =
+                peak_general_listener_final_report_snapshot.control_risk_ratio,
+            .ratio = peak_general_listener_final_report_snapshot.ratio,
+            .management_ratio =
+                peak_general_listener_final_report_snapshot.management_ratio,
+        };
+        return overhead;
+    }
+
+    overhead.profile_seconds =
+        peak_general_listener_profile_seconds_from_calls(sum_num_calls);
+    overhead.accounting_valid =
+        peak_general_listener_runtime_accounting_snapshot(&accounting);
+    overhead.stop_window_count =
+        peak_general_listener_control_window_count_since_heartbeat(
+            &accounting);
+    overhead.failed_stop_window_count =
+        peak_general_listener_failed_window_count_since_heartbeat(
+            &accounting);
+    overhead.elapsed_seconds = elapsed_seconds;
+    overhead.elapsed_min_seconds = elapsed_seconds;
+    overhead.elapsed_max_seconds = elapsed_seconds;
+    overhead.control_seconds =
+        (double)peak_general_listener_control_wall_ns_since_heartbeat(
+            &accounting) / 1e9;
+    overhead.management_seconds =
+        peak_general_listener_management_cpu_seconds();
+    control_risk_seconds =
+        peak_general_listener_control_risk_seconds(overhead.control_seconds);
+    (void)peak_general_listener_add_nonnegative_finite(
+        overhead.profile_seconds,
+        control_risk_seconds,
+        &profile_control_risk_seconds);
+    if (elapsed_seconds > 0.0) {
+        overhead.profile_ratio =
+            overhead.profile_seconds / elapsed_seconds;
+        overhead.control_ratio =
+            overhead.control_seconds / elapsed_seconds;
+        overhead.profile_control_risk_ratio =
+            profile_control_risk_seconds / elapsed_seconds;
+        overhead.control_risk_ratio =
+            control_risk_seconds / elapsed_seconds;
+        overhead.ratio =
+            (overhead.profile_seconds + overhead.control_seconds) /
+            elapsed_seconds;
+        overhead.management_ratio =
+            overhead.management_seconds / elapsed_seconds;
+    }
+    overhead.valid = TRUE;
+    return overhead;
+}
+
 static void
 peak_general_listener_print_result(gulong* sum_num_calls,
                                    gdouble* sum_total_time,
@@ -4606,7 +6274,8 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                    gfloat* sum_max_time,
                                    gfloat* sum_min_time,
                                    gulong* thread_count,
-                                   const int rank_count)
+                                   const int rank_count,
+                                   const PeakReportOverhead* report_overhead)
 {
     peak_general_listener_sanitize_output_times(sum_total_time,
                                                 sum_exclusive_time);
@@ -4627,7 +6296,8 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                             sum_max_time,
                                             sum_min_time,
                                             thread_count,
-                                            rank_count);
+                                            rank_count,
+                                            report_overhead);
 }
 
 #ifdef HAVE_MPI
@@ -4759,6 +6429,17 @@ typedef struct {
     uint32_t rank;
     uint64_t hook_count;
     uint64_t session_token;
+    double elapsed_seconds;
+    double profile_seconds;
+    double profile_ratio;
+    double control_ratio;
+    double profile_control_ratio;
+    double profile_control_risk_ratio;
+    double control_risk_ratio;
+    double management_ratio;
+    uint64_t failed_stop_window_count;
+    uint32_t accounting_valid;
+    uint32_t reserved;
 } PeakSocketReduceHeader;
 
 typedef struct {
@@ -4783,10 +6464,11 @@ typedef struct {
     uint64_t thread_count;
     int detached;
     int reattached;
+    int revisited;
 } PeakSocketReduceRecord;
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 2U
+#define PEAK_SOCKET_REDUCE_VERSION 8U
 #define PEAK_SOCKET_REDUCE_RELEASE_ACK 0x51U
 #define PEAK_SOCKET_REDUCE_RELEASE_FALLBACK 0x52U
 #define PEAK_SOCKET_REDUCE_DEFAULT_TIMEOUT_MS 60000
@@ -5143,6 +6825,7 @@ peak_socket_reduce_build_records(gulong* sum_num_calls,
         records[i].thread_count = (uint64_t)thread_count[i];
         records[i].detached = array_listener_detached[i] ? 1 : 0;
         records[i].reattached = array_listener_reattached[i] ? 1 : 0;
+        records[i].revisited = array_listener_revisited[i] ? 1 : 0;
     }
 
     return records;
@@ -5474,6 +7157,8 @@ peak_socket_reduce_merge_records(PeakSocketReduceRecord* aggregate,
         aggregate[i].detached = aggregate[i].detached || incoming[i].detached;
         aggregate[i].reattached =
             aggregate[i].reattached || incoming[i].reattached;
+        aggregate[i].revisited =
+            aggregate[i].revisited || incoming[i].revisited;
     }
 
     return TRUE;
@@ -5490,7 +7175,8 @@ peak_socket_reduce_records_to_arrays(PeakSocketReduceRecord* records,
                                      gfloat* sum_min_time,
                                      gulong* thread_count,
                                      gboolean* detached,
-                                     gboolean* reattached)
+                                     gboolean* reattached,
+                                     gboolean* revisited)
 {
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         sum_num_calls[i] = (gulong)records[i].num_calls;
@@ -5503,6 +7189,7 @@ peak_socket_reduce_records_to_arrays(PeakSocketReduceRecord* records,
         thread_count[i] = (gulong)records[i].thread_count;
         detached[i] = records[i].detached ? TRUE : FALSE;
         reattached[i] = records[i].reattached ? TRUE : FALSE;
+        revisited[i] = records[i].revisited ? TRUE : FALSE;
     }
 }
 
@@ -5567,6 +7254,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     uint64_t session_token = peak_socket_reduce_session_token();
     PeakSocketReduceRecord* local_records = NULL;
     PeakSocketReduceHeader header;
+    PeakReportOverhead local_report = {0};
 
     if (!peak_socket_reduce_rank_size(&rank, &size, allow_mpi_rank_query)) {
         g_printerr("[peak] Socket aggregation could not determine rank/size from %s; skipping aggregate output\n",
@@ -5582,6 +7270,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
         return FALSE;
     }
 
+    local_report = peak_general_listener_local_report_overhead(sum_num_calls);
     if (size <= 1) {
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
@@ -5591,8 +7280,14 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                                            sum_max_time,
                                            sum_min_time,
                                            thread_count,
-                                           1);
+                                           1,
+                                           &local_report);
         return TRUE;
+    }
+    if (!peak_general_listener_positive_finite(
+            local_report.elapsed_seconds)) {
+        g_printerr("[peak] Socket aggregation observed an invalid local elapsed time; skipping aggregate output\n");
+        return FALSE;
     }
 
     local_records = peak_socket_reduce_build_records(sum_num_calls,
@@ -5603,11 +7298,23 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                                                      sum_max_time,
                                                      sum_min_time,
                                                      thread_count);
+    memset(&header, 0, sizeof(header));
     header.magic = PEAK_SOCKET_REDUCE_MAGIC;
     header.version = PEAK_SOCKET_REDUCE_VERSION;
     header.rank = (uint32_t)rank;
     header.hook_count = (uint64_t)peak_hook_address_count;
     header.session_token = session_token;
+    header.elapsed_seconds = local_report.elapsed_seconds;
+    header.profile_seconds = local_report.profile_seconds;
+    header.profile_ratio = local_report.profile_ratio;
+    header.control_ratio = local_report.control_ratio;
+    header.profile_control_ratio = local_report.ratio;
+    header.profile_control_risk_ratio =
+        local_report.profile_control_risk_ratio;
+    header.control_risk_ratio = local_report.control_risk_ratio;
+    header.management_ratio = local_report.management_ratio;
+    header.failed_stop_window_count = local_report.failed_stop_window_count;
+    header.accounting_valid = local_report.accounting_valid ? 1U : 0U;
 
     if (rank != 0) {
         char root_host[256];
@@ -5672,6 +7379,19 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     PeakSocketReduceRecord* aggregate =
         g_memdup2(local_records,
                   sizeof(PeakSocketReduceRecord) * peak_hook_address_count);
+    double socket_profile_seconds = local_report.profile_seconds;
+    double socket_min_elapsed_seconds = local_report.elapsed_seconds;
+    double socket_max_elapsed_seconds = local_report.elapsed_seconds;
+    double socket_max_profile_ratio = local_report.profile_ratio;
+    double socket_max_control_ratio = local_report.control_ratio;
+    double socket_max_profile_control_ratio = local_report.ratio;
+    double socket_max_profile_control_risk_ratio =
+        local_report.profile_control_risk_ratio;
+    double socket_max_control_risk_ratio = local_report.control_risk_ratio;
+    double socket_max_management_ratio = local_report.management_ratio;
+    uint64_t socket_failed_stop_window_count =
+        local_report.failed_stop_window_count;
+    gboolean socket_accounting_valid = local_report.accounting_valid;
     unsigned int received = 0;
     gboolean failed = FALSE;
     seen[0] = TRUE;
@@ -5722,6 +7442,10 @@ peak_general_listener_socket_reduce_result_with_rank_source(
             incoming_header.hook_count == (uint64_t)peak_hook_address_count &&
             incoming_header.rank < (uint32_t)size &&
             incoming_header.rank > 0 &&
+            incoming_header.accounting_valid <= 1U &&
+            incoming_header.failed_stop_window_count != UINT64_MAX &&
+            peak_general_listener_positive_finite(
+                incoming_header.elapsed_seconds) &&
             !seen[incoming_header.rank];
         if (ok) {
             release_targets[incoming_header.rank] = TRUE;
@@ -5733,6 +7457,61 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                 sizeof(PeakSocketReduceRecord) * peak_hook_address_count,
                 deadline_us) &&
             peak_socket_reduce_merge_records(aggregate, incoming);
+        if (ok) {
+            if (incoming_header.elapsed_seconds <
+                socket_min_elapsed_seconds) {
+                socket_min_elapsed_seconds =
+                    incoming_header.elapsed_seconds;
+            }
+            if (incoming_header.elapsed_seconds >
+                socket_max_elapsed_seconds) {
+                socket_max_elapsed_seconds =
+                    incoming_header.elapsed_seconds;
+            }
+            if (peak_general_listener_positive_finite(
+                    incoming_header.profile_seconds) &&
+                socket_profile_seconds <=
+                    DBL_MAX - incoming_header.profile_seconds) {
+                socket_profile_seconds += incoming_header.profile_seconds;
+            }
+            if (incoming_header.profile_control_ratio >
+                socket_max_profile_control_ratio) {
+                socket_max_profile_control_ratio =
+                    incoming_header.profile_control_ratio;
+            }
+            if (incoming_header.profile_ratio >
+                socket_max_profile_ratio) {
+                socket_max_profile_ratio =
+                    incoming_header.profile_ratio;
+            }
+            if (incoming_header.control_ratio >
+                socket_max_control_ratio) {
+                socket_max_control_ratio =
+                    incoming_header.control_ratio;
+            }
+            if (incoming_header.profile_control_risk_ratio >
+                socket_max_profile_control_risk_ratio) {
+                socket_max_profile_control_risk_ratio =
+                    incoming_header.profile_control_risk_ratio;
+            }
+            if (incoming_header.control_risk_ratio >
+                socket_max_control_risk_ratio) {
+                socket_max_control_risk_ratio =
+                    incoming_header.control_risk_ratio;
+            }
+            if (incoming_header.management_ratio >
+                socket_max_management_ratio) {
+                socket_max_management_ratio =
+                    incoming_header.management_ratio;
+            }
+            socket_failed_stop_window_count =
+                peak_general_listener_add_uint64_saturated(
+                    socket_failed_stop_window_count,
+                    incoming_header.failed_stop_window_count);
+            socket_accounting_valid =
+                socket_accounting_valid &&
+                incoming_header.accounting_valid != 0U;
+        }
         close(fd);
         g_free(incoming);
 
@@ -5777,6 +7556,8 @@ peak_general_listener_socket_reduce_result_with_rank_source(
         g_new0(gboolean, peak_hook_address_count);
     gboolean* socket_array_listener_reattached =
         g_new0(gboolean, peak_hook_address_count);
+    gboolean* socket_array_listener_revisited =
+        g_new0(gboolean, peak_hook_address_count);
     peak_socket_reduce_records_to_arrays(aggregate,
                                          socket_sum_num_calls,
                                          socket_sum_total_time,
@@ -5787,13 +7568,16 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                                          socket_sum_min_time,
                                          socket_thread_count,
                                          socket_array_listener_detached,
-                                         socket_array_listener_reattached);
+                                         socket_array_listener_reattached,
+                                         socket_array_listener_revisited);
     g_free(aggregate);
 
     gboolean* previous_array_listener_detached = array_listener_detached;
     gboolean* previous_array_listener_reattached = array_listener_reattached;
+    gboolean* previous_array_listener_revisited = array_listener_revisited;
     array_listener_detached = socket_array_listener_detached;
     array_listener_reattached = socket_array_listener_reattached;
+    array_listener_revisited = socket_array_listener_revisited;
 
     peak_general_listener_export_csv_result(socket_sum_num_calls,
                                             socket_sum_total_time,
@@ -5814,8 +7598,10 @@ peak_general_listener_socket_reduce_result_with_rank_source(
         peak_stats_csv_unlink();
         array_listener_detached = previous_array_listener_detached;
         array_listener_reattached = previous_array_listener_reattached;
+        array_listener_revisited = previous_array_listener_revisited;
         g_free(socket_array_listener_detached);
         g_free(socket_array_listener_reattached);
+        g_free(socket_array_listener_revisited);
         g_free(socket_sum_num_calls);
         g_free(socket_sum_total_time);
         g_free(socket_max_total_time);
@@ -5827,6 +7613,26 @@ peak_general_listener_socket_reduce_result_with_rank_source(
         g_free(release_targets);
         return FALSE;
     }
+    PeakReportOverhead socket_report = {0};
+    socket_report.valid = TRUE;
+    socket_report.accounting_valid = socket_accounting_valid;
+    socket_report.per_rank_max = TRUE;
+    socket_report.stop_window_count = local_report.stop_window_count;
+    socket_report.failed_stop_window_count =
+        socket_failed_stop_window_count;
+    socket_report.elapsed_seconds = local_report.elapsed_seconds;
+    socket_report.elapsed_min_seconds = socket_min_elapsed_seconds;
+    socket_report.elapsed_max_seconds = socket_max_elapsed_seconds;
+    socket_report.profile_seconds = socket_profile_seconds;
+    socket_report.control_seconds = local_report.control_seconds;
+    socket_report.management_seconds = local_report.management_seconds;
+    socket_report.profile_ratio = socket_max_profile_ratio;
+    socket_report.control_ratio = socket_max_control_ratio;
+    socket_report.ratio = socket_max_profile_control_ratio;
+    socket_report.profile_control_risk_ratio =
+        socket_max_profile_control_risk_ratio;
+    socket_report.control_risk_ratio = socket_max_control_risk_ratio;
+    socket_report.management_ratio = socket_max_management_ratio;
     peak_general_listener_print_text_result(socket_sum_num_calls,
                                             socket_sum_total_time,
                                             socket_max_total_time,
@@ -5835,9 +7641,11 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                                             socket_sum_max_time,
                                             socket_sum_min_time,
                                             socket_thread_count,
-                                            size);
+                                            size,
+                                            &socket_report);
     g_free(previous_array_listener_detached);
     g_free(previous_array_listener_reattached);
+    g_free(previous_array_listener_revisited);
     g_free(socket_sum_num_calls);
     g_free(socket_sum_total_time);
     g_free(socket_max_total_time);
@@ -6010,6 +7818,8 @@ peak_general_listener_print_rank_local_result(gulong* sum_num_calls,
                                               gfloat* sum_min_time,
                                               gulong* thread_count)
 {
+    PeakReportOverhead local_report =
+        peak_general_listener_local_report_overhead(sum_num_calls);
     peak_general_listener_print_result(sum_num_calls,
                                        sum_total_time,
                                        max_total_time,
@@ -6018,7 +7828,8 @@ peak_general_listener_print_rank_local_result(gulong* sum_num_calls,
                                        sum_max_time,
                                        sum_min_time,
                                        thread_count,
-                                       1);
+                                       1,
+                                       &local_report);
 }
 
 static gboolean
@@ -6045,9 +7856,56 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
         MPI_Init(NULL, NULL);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    PeakReportOverhead local_report =
+        peak_general_listener_local_report_overhead(sum_num_calls);
+    double local_overhead_ratios[6] = {
+        local_report.ratio,
+        local_report.profile_ratio,
+        local_report.control_ratio,
+        local_report.management_ratio,
+        local_report.profile_control_risk_ratio,
+        local_report.control_risk_ratio
+    };
+    double max_overhead_ratios[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double local_profile_seconds = local_report.profile_seconds;
+    double mpi_profile_seconds = 0.0;
+    double local_elapsed_seconds = local_report.elapsed_seconds;
+    double mpi_min_elapsed_seconds = 0.0;
+    double mpi_max_elapsed_seconds = 0.0;
+    uint64_t local_failed_stop_window_count =
+        local_report.failed_stop_window_count;
+    uint64_t mpi_failed_stop_window_count = 0;
+    uint64_t mpi_max_failed_stop_window_count = 0;
+    int local_elapsed_valid =
+        peak_general_listener_positive_finite(local_elapsed_seconds) ? 1 : 0;
+    int all_elapsed_valid = 0;
+    int local_accounting_valid = local_report.accounting_valid ? 1 : 0;
+    int all_accounting_valid = 0;
     gulong local_hook_count = (gulong)peak_hook_address_count;
     gulong min_hook_count = 0;
     gulong max_hook_count = 0;
+    if (!peak_mpi_allreduce_checked(&local_elapsed_valid,
+                                    &all_elapsed_valid,
+                                    1,
+                                    MPI_INT,
+                                    MPI_MIN,
+                                    "elapsed-valid")) {
+        goto rank_local;
+    }
+    if (!all_elapsed_valid) {
+        if (rank == 0) {
+            g_printerr("[peak] MPI output observed an invalid per-rank elapsed time; writing rank-local output\n");
+        }
+        goto rank_local;
+    }
+    if (!peak_mpi_allreduce_checked(&local_accounting_valid,
+                                    &all_accounting_valid,
+                                    1,
+                                    MPI_INT,
+                                    MPI_MIN,
+                                    "accounting-valid")) {
+        goto rank_local;
+    }
     if (!peak_mpi_allreduce_checked(&local_hook_count,
                                     &min_hook_count,
                                     1,
@@ -6161,6 +8019,80 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                                       thread_count);
         return FALSE;
     }
+    if (!peak_mpi_reduce_checked(local_overhead_ratios,
+                                 max_overhead_ratios,
+                                 6,
+                                 MPI_DOUBLE,
+                                 MPI_MAX,
+                                 0,
+                                 "profile-control-ratio")) {
+        goto rank_local;
+    }
+    if (!peak_mpi_reduce_checked(&local_profile_seconds,
+                                 &mpi_profile_seconds,
+                                 1,
+                                 MPI_DOUBLE,
+                                 MPI_SUM,
+                                 0,
+                                 "profile-seconds")) {
+        goto rank_local;
+    }
+    if (!peak_mpi_allreduce_checked(&local_failed_stop_window_count,
+                                    &mpi_max_failed_stop_window_count,
+                                    1,
+                                    MPI_UNSIGNED_LONG_LONG,
+                                    MPI_MAX,
+                                    "failed-stop-window-max")) {
+        goto rank_local;
+    }
+    if (mpi_max_failed_stop_window_count >
+        (UINT64_MAX - 1) / (uint64_t)size) {
+        mpi_failed_stop_window_count = UINT64_MAX - 1;
+    } else if (!peak_mpi_reduce_checked(&local_failed_stop_window_count,
+                                        &mpi_failed_stop_window_count,
+                                        1,
+                                        MPI_UNSIGNED_LONG_LONG,
+                                        MPI_SUM,
+                                        0,
+                                        "failed-stop-window-count")) {
+        goto rank_local;
+    }
+    if (!peak_mpi_reduce_checked(&local_elapsed_seconds,
+                                 &mpi_min_elapsed_seconds,
+                                 1,
+                                 MPI_DOUBLE,
+                                 MPI_MIN,
+                                 0,
+                                 "elapsed-min")) {
+        goto rank_local;
+    }
+    if (!peak_mpi_reduce_checked(&local_elapsed_seconds,
+                                 &mpi_max_elapsed_seconds,
+                                 1,
+                                 MPI_DOUBLE,
+                                 MPI_MAX,
+                                 0,
+                                 "elapsed-max")) {
+        goto rank_local;
+    }
+    PeakReportOverhead mpi_report = {0};
+    mpi_report.valid = TRUE;
+    mpi_report.accounting_valid = all_accounting_valid != 0;
+    mpi_report.per_rank_max = TRUE;
+    mpi_report.stop_window_count = local_report.stop_window_count;
+    mpi_report.failed_stop_window_count = mpi_failed_stop_window_count;
+    mpi_report.elapsed_seconds = local_report.elapsed_seconds;
+    mpi_report.elapsed_min_seconds = mpi_min_elapsed_seconds;
+    mpi_report.elapsed_max_seconds = mpi_max_elapsed_seconds;
+    mpi_report.profile_seconds = mpi_profile_seconds;
+    mpi_report.control_seconds = local_report.control_seconds;
+    mpi_report.management_seconds = local_report.management_seconds;
+    mpi_report.ratio = max_overhead_ratios[0];
+    mpi_report.profile_ratio = max_overhead_ratios[1];
+    mpi_report.control_ratio = max_overhead_ratios[2];
+    mpi_report.management_ratio = max_overhead_ratios[3];
+    mpi_report.profile_control_risk_ratio = max_overhead_ratios[4];
+    mpi_report.control_risk_ratio = max_overhead_ratios[5];
     gulong* mpi_sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_max_total_time = g_new0(gdouble, peak_hook_address_count);
@@ -6171,6 +8103,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     gulong* mpi_thread_count = g_new0(gulong, peak_hook_address_count);
     gboolean* mpi_array_listener_detached = g_new0(gboolean, peak_hook_address_count);
     gboolean* mpi_array_listener_reattached = g_new0(gboolean, peak_hook_address_count);
+    gboolean* mpi_array_listener_revisited = g_new0(gboolean, peak_hook_address_count);
     if (!peak_mpi_reduce_checked(sum_num_calls, mpi_sum_num_calls, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, "sum-num-calls") ||
         !peak_mpi_reduce_checked(sum_total_time, mpi_sum_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_SUM, 0, "sum-total-time") ||
         !peak_mpi_reduce_checked(max_total_time, mpi_max_total_time, peak_hook_address_count, MPI_DOUBLE, MPI_MAX, 0, "max-total-time") ||
@@ -6180,7 +8113,8 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
         !peak_mpi_reduce_checked(sum_min_time, mpi_sum_min_time, peak_hook_address_count, MPI_FLOAT, MPI_MIN, 0, "sum-min-time") ||
         !peak_mpi_reduce_checked(thread_count, mpi_thread_count, peak_hook_address_count, MPI_UNSIGNED_LONG, MPI_SUM, 0, "thread-count") ||
         !peak_mpi_reduce_checked(array_listener_detached, mpi_array_listener_detached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "detached-marker") ||
-        !peak_mpi_reduce_checked(array_listener_reattached, mpi_array_listener_reattached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "reattached-marker")) {
+        !peak_mpi_reduce_checked(array_listener_reattached, mpi_array_listener_reattached, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "reattached-marker") ||
+        !peak_mpi_reduce_checked(array_listener_revisited, mpi_array_listener_revisited, peak_hook_address_count, MPI_INT, MPI_MAX, 0, "revisited-marker")) {
         g_free(mpi_sum_num_calls);
         g_free(mpi_sum_total_time);
         g_free(mpi_max_total_time);
@@ -6191,12 +8125,15 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
         g_free(mpi_thread_count);
         g_free(mpi_array_listener_detached);
         g_free(mpi_array_listener_reattached);
+        g_free(mpi_array_listener_revisited);
         goto rank_local;
     }
     g_free(array_listener_detached);
     g_free(array_listener_reattached);
+    g_free(array_listener_revisited);
     array_listener_detached = mpi_array_listener_detached;
     array_listener_reattached = mpi_array_listener_reattached;
+    array_listener_revisited = mpi_array_listener_revisited;
     if (rank == 0) {
         peak_general_listener_print_result(mpi_sum_num_calls,
                                            mpi_sum_total_time,
@@ -6205,7 +8142,9 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                            mpi_sum_exclusive_time,
                                            mpi_sum_max_time,
                                            mpi_sum_min_time,
-                                           mpi_thread_count, size);
+                                           mpi_thread_count,
+                                           size,
+                                           &mpi_report);
     }
     g_free(mpi_sum_num_calls);
     g_free(mpi_sum_total_time);
@@ -6247,6 +8186,28 @@ rank_local:
 }
 #endif
 
+static void
+peak_general_listener_refresh_revisited_markers(
+    const gulong* local_final_calls)
+{
+    if (array_listener_revisited == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (!array_listener_revisited[i] &&
+            local_final_calls != NULL &&
+            array_listener_reattached != NULL &&
+            array_listener_reattached[i] &&
+            peak_hook_reattach_request_calls != NULL &&
+            peak_hook_reattach_request_calls_valid != NULL &&
+            peak_hook_reattach_request_calls_valid[i] &&
+            local_final_calls[i] > peak_hook_reattach_request_calls[i]) {
+            array_listener_revisited[i] = TRUE;
+        }
+    }
+}
+
 gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
 {
     gboolean used_mpi_aggregation = FALSE;
@@ -6272,10 +8233,13 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
             PeakGeneralListener* pg_listener = PEAKGENERAL_LISTENER(array_listener[i]);
             for (size_t j = 0; j < peak_max_num_threads; j++) {
                 size_t index = j;
-                sum_num_calls[i] += pg_listener->num_calls[index];
+                gulong calls =
+                    peak_general_listener_num_calls_load(
+                        &pg_listener->num_calls[index]);
+                sum_num_calls[i] += calls;
                 sum_total_time[i] += pg_listener->total_time[index];
                 sum_exclusive_time[i] += pg_listener->exclusive_time[index];
-                if (pg_listener->num_calls[index] != 0) {
+                if (calls != 0) {
                     thread_count[i]++;
                     if (pg_listener->total_time[index] > max_total_time[i])
                         max_total_time[i] = pg_listener->total_time[index];
@@ -6291,6 +8255,7 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                 thread_count[i] = 1;
         }
     }
+    peak_general_listener_refresh_revisited_markers(sum_num_calls);
 #ifdef HAVE_MPI
     if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
         used_mpi_aggregation =
@@ -6313,6 +8278,8 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                                                        thread_count) &&
             peak_socket_reduce_fallback_enabled()) {
             g_printerr("[peak] Socket aggregation failed; falling back to rank-local output\n");
+            PeakReportOverhead local_report =
+                peak_general_listener_local_report_overhead(sum_num_calls);
             peak_general_listener_print_result(sum_num_calls,
                                               sum_total_time,
                                               max_total_time,
@@ -6321,9 +8288,12 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                                               sum_max_time,
                                               sum_min_time,
                                               thread_count,
-                                              1);
+                                              1,
+                                              &local_report);
         }
     } else {
+        PeakReportOverhead local_report =
+            peak_general_listener_local_report_overhead(sum_num_calls);
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
                                            max_total_time,
@@ -6331,9 +8301,13 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                                            sum_exclusive_time,
                                            sum_max_time,
                                            sum_min_time,
-                                           thread_count, 1);
+                                           thread_count,
+                                           1,
+                                           &local_report);
     }
 #else
+    PeakReportOverhead local_report =
+        peak_general_listener_local_report_overhead(sum_num_calls);
     peak_general_listener_print_result(sum_num_calls,
                                        sum_total_time,
                                        max_total_time,
@@ -6341,7 +8315,9 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                                        sum_exclusive_time,
                                        sum_max_time,
                                        sum_min_time,
-                                       thread_count, 1);
+                                       thread_count,
+                                       1,
+                                       &local_report);
 #endif
     g_free(sum_num_calls);
     g_free(sum_total_time);
@@ -6466,6 +8442,7 @@ gboolean peak_general_listener_dettach()
     g_free(hook_address);
     g_free(array_listener_detached);
     g_free(array_listener_reattached);
+    g_free(array_listener_revisited);
     g_free(array_listener_gum_detached);
     g_free(array_listener_gum_detach_flushed);
     g_free(peak_hook_last_detach_time);
@@ -6478,6 +8455,12 @@ gboolean peak_general_listener_dettach()
     g_free(peak_hook_pending_request_global_overhead);
     g_free(peak_hook_pending_request_total_time);
     g_free(peak_hook_pending_request_rate);
+    g_free(peak_hook_detach_profile_seconds);
+    g_free(peak_hook_reattach_request_calls);
+    g_free(peak_hook_reattach_request_calls_valid);
+    g_free(peak_hook_cached_sample_calls);
+    g_free(peak_hook_cached_sample_profile_seconds);
+    g_free(peak_hook_cached_sample_valid);
     g_free(peak_hook_retry_count);
     g_free(peak_hook_last_retry_status);
     g_free(array_listener);
@@ -6486,18 +8469,43 @@ gboolean peak_general_listener_dettach()
     hook_address = NULL;
     array_listener_detached = NULL;
     array_listener_reattached = NULL;
+    array_listener_revisited = NULL;
     array_listener_gum_detached = NULL;
     array_listener_gum_detach_flushed = NULL;
     peak_hook_last_detach_time = NULL;
     peak_hook_states = NULL;
     peak_hook_next_retry_time = NULL;
     peak_hook_pending_observed_time = NULL;
+    atomic_store_explicit(&peak_general_listener_runtime_start_ns,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_general_listener_heartbeat_control_baseline_ns,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_count,
+        0,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_failed_count,
+        0,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &peak_general_listener_heartbeat_control_baseline_valid,
+        FALSE,
+        memory_order_release);
     peak_hook_pending_request_source = NULL;
     peak_hook_pending_request_calls = NULL;
     peak_hook_pending_request_ratio = NULL;
     peak_hook_pending_request_global_overhead = NULL;
     peak_hook_pending_request_total_time = NULL;
     peak_hook_pending_request_rate = NULL;
+    peak_hook_detach_profile_seconds = NULL;
+    peak_hook_reattach_request_calls = NULL;
+    peak_hook_reattach_request_calls_valid = NULL;
+    peak_hook_cached_sample_calls = NULL;
+    peak_hook_cached_sample_profile_seconds = NULL;
+    peak_hook_cached_sample_valid = NULL;
     peak_hook_retry_count = NULL;
     peak_hook_last_retry_status = NULL;
     array_listener = NULL;
