@@ -60,6 +60,8 @@ def main():
             "PEAK_ENABLE_REATTACH": "1",
             "PEAK_COST": "0.0000001",
             "PEAK_OVERHEAD_RATIO": "0.01",
+            "PEAK_GLOBAL_OVERHEAD_RATIO": "1.0",
+            "PEAK_GLOBAL_REATTACH_FACTOR": "1.0",
             "PEAK_HEARTBEAT_INTERVAL": "0.001",
             "PEAK_HIBERNATION_CYCLE": "1",
             "PEAK_REATTACH_COOLDOWN_MS": "0",

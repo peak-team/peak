@@ -29,6 +29,7 @@ bool enable_per_target_heartbeat;
 bool enable_global_heartbeat;
 bool enable_reattach;
 pthread_t heartbeat_thread;
+gboolean peak_truncate_function_name = false;
 
 extern gpointer* hook_address;
 extern GumInvocationListener** array_listener;
@@ -191,6 +192,58 @@ detach_with_stderr_capture(char** output_out)
     return result;
 }
 
+static gboolean
+print_with_stderr_capture(char** output_out)
+{
+    char capture_template[] = "/tmp/peak_public_listener_report_XXXXXX";
+    int capture_fd = mkstemp(capture_template);
+    int saved_stderr = -1;
+    gchar* contents = NULL;
+
+    if (output_out != NULL) {
+        *output_out = NULL;
+    }
+    if (capture_fd < 0) {
+        perror("mkstemp");
+        failures++;
+        return FALSE;
+    }
+
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0 || dup2(capture_fd, STDERR_FILENO) < 0) {
+        perror("dup2");
+        if (saved_stderr >= 0) {
+            close(saved_stderr);
+        }
+        close(capture_fd);
+        unlink(capture_template);
+        failures++;
+        return FALSE;
+    }
+    close(capture_fd);
+
+    fflush(stderr);
+    (void)peak_general_listener_print(PEAK_OUTPUT_AGGREGATION_LOCAL);
+    fflush(stderr);
+
+    if (dup2(saved_stderr, STDERR_FILENO) < 0) {
+        perror("restore stderr");
+        failures++;
+    }
+    close(saved_stderr);
+
+    if (!g_file_get_contents(capture_template, &contents, NULL, NULL)) {
+        contents = g_strdup("");
+    }
+    unlink(capture_template);
+    if (output_out != NULL) {
+        *output_out = contents;
+    } else {
+        g_free(contents);
+    }
+    return TRUE;
+}
+
 static void
 cleanup_public_listener_globals(void)
 {
@@ -301,6 +354,8 @@ finish_public_listener_fixture(const char* log_template)
     gum_deinit_embedded();
 
     unsetenv("PEAK_TEST_CONTROLLER_SHUTDOWN_DRAIN_MS");
+    unsetenv("PEAK_TEXT_OUTPUT");
+    unsetenv("FAKE_DETACH_HELPER_STOP_DELAY_US");
     unsetenv("FAKE_DETACH_HELPER_LOG");
     if (log_template != NULL && log_template[0] != '\0') {
         unlink(log_template);
@@ -432,6 +487,114 @@ run_idle_shutdown_io_fail_closed(void)
 }
 
 static int
+run_final_freeze_after_controller_stop(void)
+{
+    char log_template[] = "/tmp/peak_public_listener_shutdown_log_XXXXXX";
+    PeakDetachStatus helper_status = PEAK_DETACH_STATUS_ERROR;
+    char* report_log = NULL;
+    double stop_start;
+    double stop_elapsed;
+
+    if (setup_public_listener_fixture(log_template,
+                                      sizeof(log_template),
+                                      "success-zero") != 0) {
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+
+    check_true("close setup helper before delayed final-boundary STOP",
+               peak_detach_controller_shutdown_helper(&helper_status) == TRUE);
+    check_status("close setup helper status",
+                 helper_status,
+                 PEAK_DETACH_STATUS_SAFE);
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO",
+               "success-zero-delayed",
+               1) != 0 ||
+        setenv("FAKE_DETACH_HELPER_STOP_DELAY_US", "50000", 1) != 0 ||
+        setenv("PEAK_TEST_CONTROLLER_SHUTDOWN_DRAIN_MS", "250", 1) != 0 ||
+        setenv("PEAK_TEXT_OUTPUT", "1", 1) != 0) {
+        perror("setenv");
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+
+    peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    check_true("final-boundary detach request accepted",
+               peak_general_listener_request_detach(0) == TRUE);
+    peak_general_listener_controller_wake();
+
+    stop_start = peak_second();
+    peak_general_listener_controller_stop();
+    stop_elapsed = peak_second() - stop_start;
+    check_true("final-boundary delayed STOP was observed",
+               stop_elapsed >= 0.020);
+    check_true("final-boundary controller stop stayed bounded",
+               stop_elapsed < 0.500);
+
+    peak_main_time = peak_second() - peak_main_time;
+    peak_general_listener_freeze_final_report_snapshot();
+    check_true("final-boundary report captured",
+               print_with_stderr_capture(&report_log) == TRUE);
+    check_contains("final-boundary accepted STOP window included",
+                   report_log,
+                   "[peak] local control stop-window overhead: windows=1");
+    check_contains("final-boundary failed-window diagnostics",
+                   report_log,
+                   "[peak] local failed control windows: windows=0 snapshot_valid=1");
+    g_free(report_log);
+
+    if (finish_public_listener_fixture(log_template) != 0) {
+        return EXIT_FAILURE;
+    }
+    fprintf(stderr, "general-listener-final-freeze-after-controller-stop-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
+run_invalid_accounting_baseline_report(void)
+{
+    char log_template[] = "/tmp/peak_public_listener_baseline_log_XXXXXX";
+    char* report_log = NULL;
+
+    if (setup_public_listener_fixture(log_template,
+                                      sizeof(log_template),
+                                      "success-zero") != 0) {
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+    if (setenv("PEAK_TEXT_OUTPUT", "1", 1) != 0) {
+        perror("setenv");
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+
+    peak_main_time = peak_second();
+    peak_detach_controller_test_accounting_begin_publish();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    peak_detach_controller_test_accounting_end_publish();
+    peak_general_listener_controller_stop();
+    peak_main_time = peak_second() - peak_main_time;
+    peak_general_listener_freeze_final_report_snapshot();
+
+    check_true("invalid baseline report captured",
+               print_with_stderr_capture(&report_log) == TRUE);
+    check_contains("invalid baseline report uses finite zero fallback",
+                   report_log,
+                   "[peak] local control stop-window overhead: windows=0 wall_seconds=0.000000000 ratio=0.000000000");
+    check_contains("invalid baseline provenance stays invalid",
+                   report_log,
+                   "[peak] local failed control windows: windows=0 snapshot_valid=0");
+    g_free(report_log);
+
+    if (finish_public_listener_fixture(log_template) != 0) {
+        return EXIT_FAILURE;
+    }
+    fprintf(stderr, "general-listener-invalid-accounting-baseline-report-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
 run_slurm_host_parser(void)
 {
 #ifndef HAVE_MPI
@@ -471,12 +634,29 @@ run_slurm_host_parser(void)
 #endif
 }
 
+static int
+run_uint64_saturation(void)
+{
+    check_true("uint64 accounting add preserves ordinary sums",
+               peak_general_listener_test_add_uint64_saturated(2, 3) == 5);
+    check_true("uint64 accounting add preserves reserved maximum",
+               peak_general_listener_test_add_uint64_saturated(
+                   UINT64_MAX - 2,
+                   1) == UINT64_MAX - 1);
+    check_true("uint64 accounting add saturates before sentinel",
+               peak_general_listener_test_add_uint64_saturated(
+                   UINT64_MAX - 2,
+                   2) == UINT64_MAX - 1);
+    fprintf(stderr, "general-listener-uint64-saturation-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int
 main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-slurm-host-parser\n",
+                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-slurm-host-parser|general-listener-uint64-saturation\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -487,8 +667,17 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "general-listener-idle-shutdown-io-fail-closed") == 0) {
         return run_idle_shutdown_io_fail_closed();
     }
+    if (strcmp(argv[1], "general-listener-final-freeze-after-controller-stop") == 0) {
+        return run_final_freeze_after_controller_stop();
+    }
+    if (strcmp(argv[1], "general-listener-invalid-accounting-baseline-report") == 0) {
+        return run_invalid_accounting_baseline_report();
+    }
     if (strcmp(argv[1], "general-listener-slurm-host-parser") == 0) {
         return run_slurm_host_parser();
+    }
+    if (strcmp(argv[1], "general-listener-uint64-saturation") == 0) {
+        return run_uint64_saturation();
     }
 
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);

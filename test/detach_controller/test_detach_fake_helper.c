@@ -132,6 +132,22 @@ env_long_default(const char* name, long fallback)
     return parsed;
 }
 
+static void
+maybe_delay_stop_response(void)
+{
+    long delay_us =
+        env_long_default("FAKE_DETACH_HELPER_STOP_DELAY_US", 0);
+
+    if (delay_us <= 0) {
+        return;
+    }
+    while (delay_us > 0) {
+        long chunk = delay_us > 1000000L ? 1000000L : delay_us;
+        usleep((useconds_t)chunk);
+        delay_us -= chunk;
+    }
+}
+
 static int
 env_u64(const char* name, uint64_t* value_out)
 {
@@ -618,12 +634,16 @@ main(int argc, char** argv)
                 continue;
             }
             if (strcmp(scenario, "success-zero") == 0 ||
+                strcmp(scenario, "success-zero-delayed") == 0 ||
                 strcmp(scenario, "synthetic-stop-once") == 0 ||
                 strcmp(scenario, "synthetic-stop-file-once") == 0 ||
                 strcmp(scenario, "evacuate-error") == 0 ||
                 strcmp(scenario, "evacuate-release-failed") == 0 ||
                 strcmp(scenario, "resume-release-failed") == 0 ||
                 strcmp(scenario, "shutdown-missing-response") == 0) {
+                if (strcmp(scenario, "success-zero-delayed") == 0) {
+                    maybe_delay_stop_response();
+                }
                 (void)send_response((int)fd,
                                     PEAK_DETACH_HELPER_STATUS_OK,
                                     0,

@@ -361,6 +361,40 @@ def trace_transition_limits_ok(args, sample):
     return ok
 
 
+def trace_has_observed_guard_evidence(args, sample):
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False
+    if args.reattach_cooldown_ms != "0" or not args.enable_reattach:
+        return False
+
+    threshold = (
+        float(args.global_overhead_ratio) *
+        float(args.global_reattach_factor)
+    )
+    detach_success_seen = False
+    over_budget_seen = False
+    reattach_success_seen = False
+
+    for fields in rows:
+        if len(fields) >= 7 and fields[2] == TARGET_SYMBOL:
+            if (fields[3] == "detach" and fields[4] == "success" and
+                    fields[5] == "1" and fields[6] == "safe"):
+                detach_success_seen = True
+            if fields[3] == "reattach" and fields[4] == "success":
+                reattach_success_seen = True
+        if len(fields) < 26:
+            continue
+        try:
+            accounting_ratio = float(fields[25])
+        except ValueError:
+            continue
+        if accounting_ratio > threshold:
+            over_budget_seen = True
+
+    return detach_success_seen and over_budget_seen and not reattach_success_seen
+
+
 def run_sample(args, sample):
     cmd = [
         args.exe,
@@ -403,6 +437,10 @@ def run_sample(args, sample):
         args, sample, "reattach", args.require_reattach_batch_size)
     trace_source_ok = trace_has_required_request_source(args, sample)
     trace_transition_ok = trace_transition_limits_ok(args, sample)
+    observed_guard_ok = (
+        not args.require_observed_guard_suppression or
+        trace_has_observed_guard_evidence(args, sample)
+    )
     helper_retry_ok = helper_retry_was_exercised(args, sample)
     bad_output = BAD_OUTPUT_RE.search(output)
     transition_skip = TRANSITION_SKIP_RE.search(output)
@@ -431,6 +469,7 @@ def run_sample(args, sample):
         not trace_reattach_batched or
         not trace_source_ok or
         not trace_transition_ok or
+        not observed_guard_ok or
         not helper_retry_ok or
         (args.require_reattach and not trace_reattached) or
         (args.spawn_transient_threads and spawned_threads <= 0) or
@@ -464,6 +503,8 @@ def run_sample(args, sample):
             print("missing required detach request source evidence", file=sys.stderr)
         if not trace_transition_ok:
             print("trace transition limits failed", file=sys.stderr)
+        if not observed_guard_ok:
+            print("missing observed-overhead guard trace evidence", file=sys.stderr)
         if not helper_retry_ok:
             print("helper STOP snapshot retry was not exercised", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
@@ -531,6 +572,8 @@ def main():
     parser.add_argument("--max-detach-classify-failed", type=int, default=-1)
     parser.add_argument("--max-reattach-classify-failed", type=int, default=-1)
     parser.add_argument("--max-reattach-success", type=int, default=-1)
+    parser.add_argument("--require-observed-guard-suppression",
+                        action="store_true")
     parser.add_argument("--require-trace-diagnostics", action="store_true")
     parser.add_argument("--require-detach-source", default="")
     parser.add_argument("--min-detach-request-calls", type=int, default=1)

@@ -18,6 +18,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_detach_hotloop PRIVATE -Wl,--export-dynamic)
 endif()
 
+add_executable(test_detach_milc_like test_detach_milc_like.c)
+target_link_libraries(test_detach_milc_like PRIVATE Threads::Threads)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_detach_milc_like PRIVATE -Wl,--export-dynamic)
+endif()
+
 if(TARGET peak_detach_helper)
   add_executable(test_peak_detach_helper ${PROJECT_SOURCE_DIR}/src/peak_detach_helper.c)
   target_include_directories(test_peak_detach_helper
