@@ -40,6 +40,19 @@ check_int(const char* label, int actual, int expected)
 }
 
 static void
+check_uint64(const char* label, uint64_t actual, uint64_t expected)
+{
+    if (actual != expected) {
+        fprintf(stderr,
+                "FAIL: %s: expected %" PRIu64 ", got %" PRIu64 "\n",
+                label,
+                expected,
+                actual);
+        failures++;
+    }
+}
+
+static void
 check_double_zero(const char* label, double actual)
 {
     if (actual != 0.0) {
@@ -50,6 +63,104 @@ check_double_zero(const char* label, double actual)
         failures++;
     }
 }
+
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+static gboolean
+check_accounting_snapshot(const char* label,
+                          PeakDetachAccountingSnapshot* snapshot)
+{
+    gboolean ok = peak_detach_controller_accounting_snapshot(snapshot);
+
+    if (!ok) {
+        fprintf(stderr, "FAIL: %s snapshot returned FALSE\n", label);
+        failures++;
+    }
+    return ok;
+}
+
+static void
+check_stop_window_finish(const char* label,
+                         PeakDetachAccountingSnapshot* before)
+{
+    PeakDetachAccountingSnapshot after;
+    uint64_t wall_ns = 0;
+    double expected_us = 0.0;
+    double actual_us = peak_detach_controller_last_stop_window_us();
+
+    if (!check_accounting_snapshot(label, &after)) {
+        return;
+    }
+    if (after.stop_window_wall_ns > before->stop_window_wall_ns) {
+        wall_ns = after.stop_window_wall_ns - before->stop_window_wall_ns;
+        expected_us = (double)wall_ns / 1000.0;
+    }
+
+    if (after.completed_stop_window_count !=
+            before->completed_stop_window_count + 1 ||
+        after.failed_stop_window_count != before->failed_stop_window_count ||
+        wall_ns == 0 || actual_us <= 0.0 || actual_us != expected_us) {
+        fprintf(stderr,
+                "FAIL: %s: before=(completed=%" PRIu64
+                ", failed=%" PRIu64 ", %" PRIu64
+                " ns), after=(completed=%" PRIu64
+                ", failed=%" PRIu64 ", %" PRIu64
+                " ns), last=%.9f us, expected=%.9f us\n",
+                label,
+                before->completed_stop_window_count,
+                before->failed_stop_window_count,
+                before->stop_window_wall_ns,
+                after.completed_stop_window_count,
+                after.failed_stop_window_count,
+                after.stop_window_wall_ns,
+                actual_us,
+                expected_us);
+        failures++;
+    }
+
+    *before = after;
+}
+
+static void
+check_stop_window_failure(const char* label,
+                          PeakDetachAccountingSnapshot* before,
+                          uint64_t min_wall_delta_ns)
+{
+    PeakDetachAccountingSnapshot after;
+    uint64_t wall_ns = 0;
+
+    if (!check_accounting_snapshot(label, &after)) {
+        return;
+    }
+    if (after.stop_window_wall_ns >= before->stop_window_wall_ns) {
+        wall_ns = after.stop_window_wall_ns - before->stop_window_wall_ns;
+    }
+
+    if (after.completed_stop_window_count !=
+            before->completed_stop_window_count ||
+        after.failed_stop_window_count != before->failed_stop_window_count + 1 ||
+        wall_ns < min_wall_delta_ns) {
+        fprintf(stderr,
+                "FAIL: %s: before=(completed=%" PRIu64
+                ", failed=%" PRIu64 ", %" PRIu64
+                " ns), after=(completed=%" PRIu64
+                ", failed=%" PRIu64 ", %" PRIu64
+                " ns), wall_delta=%" PRIu64
+                " ns, min=%" PRIu64 " ns\n",
+                label,
+                before->completed_stop_window_count,
+                before->failed_stop_window_count,
+                before->stop_window_wall_ns,
+                after.completed_stop_window_count,
+                after.failed_stop_window_count,
+                after.stop_window_wall_ns,
+                wall_ns,
+                min_wall_delta_ns);
+        failures++;
+    }
+
+    *before = after;
+}
+#endif
 
 static void
 check_status(const char* label,
@@ -802,6 +913,8 @@ run_fake_helper_trace_disabled_stop_window(void)
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    PeakDetachAccountingSnapshot accounting;
+    double last_success_us;
 
     if (log_fd < 0) {
         perror("mkstemp");
@@ -837,6 +950,7 @@ run_fake_helper_trace_disabled_stop_window(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
+    check_accounting_snapshot("trace-disabled accounting baseline", &accounting);
     check_prepare("trace-disabled detach prepare",
                   &request,
                   TRUE,
@@ -846,8 +960,9 @@ run_fake_helper_trace_disabled_stop_window(void)
     check_double_zero("trace-disabled detach prepare stop window",
                       peak_detach_controller_last_stop_window_us());
     check_finish("trace-disabled detach finish", &request, PEAK_DETACH_STATUS_SAFE);
-    check_double_zero("trace-disabled detach finish stop window",
-                      peak_detach_controller_last_stop_window_us());
+    check_stop_window_finish("trace-disabled detach finish stop window",
+                             &accounting);
+    last_success_us = peak_detach_controller_last_stop_window_us();
 
     request.operation = PEAK_DETACH_OPERATION_REATTACH;
     check_prepare("trace-disabled reattach prepare",
@@ -856,11 +971,41 @@ run_fake_helper_trace_disabled_stop_window(void)
                   PEAK_DETACH_STATUS_SAFE);
     check_true("trace-disabled reattach physical",
                peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
-    check_double_zero("trace-disabled reattach prepare stop window",
-                      peak_detach_controller_last_stop_window_us());
+    check_true("trace-disabled reattach prepare preserves last stop window",
+               peak_detach_controller_last_stop_window_us() == last_success_us);
     check_finish("trace-disabled reattach finish", &request, PEAK_DETACH_STATUS_SAFE);
-    check_double_zero("trace-disabled reattach finish stop window",
-                      peak_detach_controller_last_stop_window_us());
+    check_stop_window_finish("trace-disabled reattach finish stop window",
+                             &accounting);
+    last_success_us = peak_detach_controller_last_stop_window_us();
+
+    check_true("trace-disabled helper shutdown before failure",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+    check_status("trace-disabled helper shutdown before failure status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "stop-permission", 1) != 0) {
+        perror("setenv");
+        gum_interceptor_detach(interceptor, listener);
+        gum_interceptor_flush(interceptor);
+        g_object_unref(listener);
+        g_object_unref(interceptor);
+        gum_deinit_embedded();
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    request.operation = PEAK_DETACH_OPERATION_DETACH;
+    check_prepare("trace-disabled fast stop failure",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_PERMISSION_DENIED);
+    check_stop_window_failure("trace-disabled fast stop failure accounting",
+                              &accounting,
+                              1);
+    check_true("trace-disabled fast stop failure leaves no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+    check_true("trace-disabled fast stop failure preserves last stop window",
+               peak_detach_controller_last_stop_window_us() == last_success_us);
 
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
@@ -3013,6 +3158,9 @@ run_fake_helper_fail_closed(void)
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
+    PeakDetachAccountingSnapshot accounting;
+    double last_success_us;
+    uint64_t min_failure_wall_ns = 1;
 
     if (scenario == NULL) {
         scenario = "stop-permission";
@@ -3027,6 +3175,9 @@ run_fake_helper_fail_closed(void)
     } else if (strcmp(scenario, "stop-timeout") == 0 ||
                strcmp(scenario, "stop-timeout-delayed") == 0) {
         expected = PEAK_DETACH_STATUS_TIMEOUT;
+        if (strcmp(scenario, "stop-timeout-delayed") == 0) {
+            min_failure_wall_ns = 5ULL * 1000ULL * 1000ULL * 1000ULL;
+        }
     } else if (strcmp(scenario, "bad-snapshot") == 0 ||
                strcmp(scenario, "duplicate-snapshot") == 0) {
         expected = PEAK_DETACH_STATUS_ERROR;
@@ -3082,7 +3233,13 @@ run_fake_helper_fail_closed(void)
         request.blocked_pc_start = (gpointer)(uintptr_t)0x1200;
         request.blocked_pc_size = 0x100;
     }
+    check_accounting_snapshot("fake helper failure accounting before",
+                              &accounting);
+    last_success_us = peak_detach_controller_last_stop_window_us();
     check_prepare(scenario, &request, FALSE, expected);
+    check_stop_window_failure(scenario, &accounting, min_failure_wall_ns);
+    check_true("fake helper failure preserves last stop window",
+               peak_detach_controller_last_stop_window_us() == last_success_us);
     check_true("fake helper failure leaves no held mutation",
                peak_detach_controller_threads_are_held() == FALSE);
 
@@ -3115,6 +3272,7 @@ run_fake_helper_auto_fallback(void)
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
+    PeakDetachAccountingSnapshot accounting;
 
     if (scenario == NULL) {
         scenario = "stop-permission";
@@ -3157,10 +3315,14 @@ run_fake_helper_auto_fallback(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
+    check_accounting_snapshot("auto helper fallback accounting before",
+                              &accounting);
     check_prepare("auto helper fallback prepare", &request, TRUE, PEAK_DETACH_STATUS_SAFE);
     check_true("auto helper fallback uses physical mutation",
                peak_detach_controller_current_mutation_uses_physical_patch() == TRUE);
     check_finish("auto helper fallback finish", &request, PEAK_DETACH_STATUS_SAFE);
+    check_stop_window_finish("auto helper fallback composite stop window",
+                             &accounting);
     check_true("auto helper fallback releases held mutation",
                peak_detach_controller_threads_are_held() == FALSE);
 
@@ -3208,12 +3370,54 @@ run_signal_reserve_helper_auto(void)
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+static int
+run_accounting_snapshot_contention(void)
+{
+#ifndef PEAK_ENABLE_TEST_HOOKS
+    fprintf(stderr,
+            "accounting-snapshot-contention requires PEAK_ENABLE_TEST_HOOKS\n");
+    return 77;
+#else
+    PeakDetachAccountingSnapshot snapshot = {
+        .completed_stop_window_count = 11,
+        .failed_stop_window_count = 22,
+        .stop_window_wall_ns = 44
+    };
+
+    peak_detach_controller_test_accounting_begin_publish();
+    check_true("accounting snapshot returns false while publish is odd",
+               peak_detach_controller_accounting_snapshot(&snapshot) == FALSE);
+    peak_detach_controller_test_accounting_end_publish();
+
+    check_uint64("accounting contention preserves completed",
+                 snapshot.completed_stop_window_count,
+                 11);
+    check_uint64("accounting contention preserves failed",
+                 snapshot.failed_stop_window_count,
+                 22);
+    check_uint64("accounting contention preserves wall",
+                 snapshot.stop_window_wall_ns,
+                 44);
+
+    check_true("accounting snapshot returns true after publish release",
+               peak_detach_controller_accounting_snapshot(&snapshot) == TRUE);
+    check_true("accounting snapshot completed never sentinel",
+               snapshot.completed_stop_window_count != UINT64_MAX);
+    check_true("accounting snapshot failed never sentinel",
+               snapshot.failed_stop_window_count != UINT64_MAX);
+    check_true("accounting snapshot wall never sentinel",
+               snapshot.stop_window_wall_ns != UINT64_MAX);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
 int
 main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -3293,6 +3497,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "signal-reserve-helper-auto") == 0) {
         return run_signal_reserve_helper_auto();
+    }
+    if (strcmp(argv[1], "accounting-snapshot-contention") == 0) {
+        return run_accounting_snapshot_contention();
     }
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return EXIT_FAILURE;

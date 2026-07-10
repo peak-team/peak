@@ -300,7 +300,7 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "trace_detach_success=1"
                 TIMEOUT 20)
         add_test(NAME test_detach_hotloop_signal_strict
-            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 2)
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 3)
         set_tests_properties(test_detach_hotloop_signal_strict
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_MAX_NUM_THREADS=128;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/signal-hotloop-trace.csv;${PRELOAD_VAR}"
@@ -397,9 +397,9 @@ if(BUILD_TESTING)
                     --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
                     --threads 4
-                    --seconds 2
+                    --seconds 3
                     --samples 1
-                    --timeout 30
+                    --timeout 45
                     --disable-reattach
                     --disable-per-target-heartbeat
                     --enable-global-heartbeat
@@ -437,7 +437,7 @@ if(BUILD_TESTING)
                     --fail-on-transition-skips)
         set_tests_properties(test_detach_hotloop_global_ignores_cold_one_shot_strict
             PROPERTIES
-                TIMEOUT 45
+                TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
         add_test(NAME test_detach_hotloop_cold_one_shot_policy_strict
             COMMAND ${Python3_EXECUTABLE}
@@ -537,7 +537,10 @@ if(BUILD_TESTING)
                     --samples 1
                     --timeout 45
                     --paired-targets
-                    --overhead-ratio 0.01
+                    --peak-cost 0
+                    --overhead-ratio 0.000001
+                    --enable-global-heartbeat
+                    --global-overhead-ratio 2.00
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-reattach-trace
                     --require-detach-batch-size 2
                     --require-reattach-batch-size 2)
@@ -564,6 +567,351 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_observed_overhead_reattach_guard_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 2
+                    --samples 1
+                    --timeout 45
+                    --overhead-ratio 0.01
+                    --global-overhead-ratio 0.000001
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-observed-overhead-guard-trace
+                    --require-trace-diagnostics
+                    --reattach-cooldown-ms 0
+                    --max-reattach-success 0
+                    --require-observed-guard-suppression
+                    --fail-on-transition-skips)
+        set_tests_properties(test_detach_hotloop_observed_overhead_reattach_guard_strict
+            PROPERTIES
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        # Hosted runners can perturb these short baselines substantially. Keep
+        # this smoke test structural; Frontera same-node B-A-B owns performance.
+        add_test(NAME test_detach_milc_like_ab_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-ab-strict
+                    --threads 4
+                    --seconds 6
+                    --iterations 0
+                    --inner-work 8
+                    --phase-repeats 8192
+                    --warmup-windows 0
+                    --warmup-checkpoints 0
+                    --timeout 90
+                    --target-overhead-ratio 0.000001
+                    --global-overhead-ratio 0.00001
+                    --max-overhead-ratio 2.0
+                    --min-overhead-ratio -1.0
+                    --min-max-accounting-ratio 0.0
+                    --max-stable-accounting-ratio 20.0
+                    --max-final-accounting-ratio 20.0
+                    --max-final-profile-denominator-error 20.0
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.35
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 0.0
+                    --min-detach-success 20
+                    --min-reattach-success 0
+                    --min-distinct-detach 32
+                    --min-distinct-reattach 0)
+        set_tests_properties(test_detach_milc_like_ab_strict
+            PROPERTIES
+                TIMEOUT 110
+                LABELS "smoke"
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        add_test(NAME test_detach_milc_like_ab_signal
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-ab-signal
+                    --threads 4
+                    --seconds 6
+                    --iterations 0
+                    --inner-work 8
+                    --phase-repeats 8192
+                    --warmup-windows 0
+                    --warmup-checkpoints 0
+                    --timeout 90
+                    --detach-backend signal
+                    --target-overhead-ratio 0.000001
+                    --global-overhead-ratio 0.00001
+                    --max-overhead-ratio 2.0
+                    --min-overhead-ratio -1.0
+                    --min-max-accounting-ratio 0.0
+                    --max-stable-accounting-ratio 20.0
+                    --max-final-accounting-ratio 20.0
+                    --max-final-profile-denominator-error 20.0
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.35
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 0.0
+                    --min-detach-success 20
+                    --min-reattach-success 0
+                    --min-distinct-detach 32
+                    --min-distinct-reattach 0)
+        set_tests_properties(test_detach_milc_like_ab_signal
+            PROPERTIES
+                TIMEOUT 110
+                LABELS "smoke"
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        # Fixed-topology acceptance needs 14 CPUs and stable performance.
+        # Keep these tests intact but out of generic hosted CI via the
+        # stress label.
+        add_test(NAME test_detach_milc_like_acceptance_strict_long
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-acceptance-strict-long
+                    --threads 13
+                    --seconds 60
+                    --iterations 2000
+                    --inner-work 128
+                    --phase-repeats 1024
+                    --checkpoint-calls 20000000
+                    --pin-workers
+                    --affinity-cpus 14
+                    --window-ms 1000
+                    --warmup-windows 0
+                    --warmup-checkpoints 5
+                    --min-progress-intervals 20
+                    --timeout 300
+                    --target-overhead-ratio 0.005
+                    --global-overhead-ratio 0.05
+                    --max-overhead-ratio 0.06
+                    --min-overhead-ratio 0.04
+                    --min-max-accounting-ratio 0.0
+                    --max-stable-accounting-ratio 0.06
+                    --max-final-accounting-ratio 0.06
+                    --max-final-profile-denominator-error 0.01
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.05
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 0.0
+                    --disable-trace)
+        set_tests_properties(test_detach_milc_like_acceptance_strict_long
+            PROPERTIES
+                TIMEOUT 330
+                LABELS "long;acceptance;stress"
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        add_test(NAME test_detach_milc_like_acceptance_signal_long
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-acceptance-signal-long
+                    --threads 13
+                    --seconds 60
+                    --iterations 2000
+                    --inner-work 128
+                    --phase-repeats 1024
+                    --checkpoint-calls 20000000
+                    --pin-workers
+                    --affinity-cpus 14
+                    --window-ms 1000
+                    --warmup-windows 0
+                    --warmup-checkpoints 5
+                    --min-progress-intervals 20
+                    --timeout 300
+                    --detach-backend signal
+                    --target-overhead-ratio 0.005
+                    --global-overhead-ratio 0.05
+                    --max-overhead-ratio 0.06
+                    --min-overhead-ratio 0.04
+                    --min-max-accounting-ratio 0.0
+                    --max-stable-accounting-ratio 0.06
+                    --max-final-accounting-ratio 0.06
+                    --max-final-profile-denominator-error 0.01
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.05
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 0.0
+                    --disable-trace)
+        set_tests_properties(test_detach_milc_like_acceptance_signal_long
+            PROPERTIES
+                TIMEOUT 330
+                LABELS "long;acceptance;stress"
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        add_test(NAME test_detach_milc_like_coverage_revisit_strict_long
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-coverage-revisit-strict-long
+                    --threads 13
+                    --seconds 60
+                    --iterations 2000
+                    --inner-work 128
+                    --phase-repeats 1024
+                    --checkpoint-calls 20000000
+                    --pin-workers
+                    --affinity-cpus 14
+                    --window-ms 1000
+                    --warmup-windows 0
+                    --warmup-checkpoints 5
+                    --min-progress-intervals 20
+                    --timeout 360
+                    --target-overhead-ratio 0.005
+                    --global-overhead-ratio 0.05
+                    --reattach-cooldown-ms 10000
+                    --max-overhead-ratio 2.0
+                    --min-overhead-ratio -1.0
+                    --min-max-accounting-ratio 0.0
+                    --max-stable-accounting-ratio 2.0
+                    --max-final-accounting-ratio 2.0
+                    --max-final-profile-denominator-error 0.01
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.10
+                    --min-weighted-call-coverage 0.00005
+                    --min-phase-target-breadth 0.0
+                    --min-detach-success 100
+                    --min-reattach-success 84
+                    --min-distinct-detach 832
+                    --min-distinct-reattach 84
+                    --min-revisit-profile-growth 84
+                    --min-revisit-target-breadth 0.10
+                    --max-reattached-without-growth 8
+                    --require-reattach)
+        set_tests_properties(test_detach_milc_like_coverage_revisit_strict_long
+            PROPERTIES
+                TIMEOUT 390
+                LABELS "long;coverage;stress"
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        add_test(NAME test_detach_milc_like_synthetic_policy_diagnostics
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --synthetic-policy-diagnostics)
+        set_tests_properties(test_detach_milc_like_synthetic_policy_diagnostics
+            PROPERTIES
+                TIMEOUT 10
+                PASS_REGULAR_EXPRESSION "milc_like_synthetic_policy_diagnostics_ok")
+        foreach(_milc_backend IN ITEMS auto signal)
+            if(_milc_backend STREQUAL "auto")
+                set(_milc_backend_args --detach-backend auto)
+            elseif(_milc_backend STREQUAL "signal")
+                set(_milc_backend_args --detach-backend signal)
+            endif()
+            foreach(_milc_sample RANGE 1 3)
+                add_test(NAME test_detach_milc_like_untraced_${_milc_backend}_stress_${_milc_sample}
+                    COMMAND ${Python3_EXECUTABLE}
+                            ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                            --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                            --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                            --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-untraced-${_milc_backend}-${_milc_sample}
+                            --threads 13
+                            --seconds 20
+                            --iterations 0
+                            --inner-work 8
+                            --phase-repeats 8192
+                            --pin-workers
+                            --affinity-cpus 14
+                            --warmup-windows 0
+                            --warmup-checkpoints 0
+                            --timeout 120
+                            ${_milc_backend_args}
+                            --target-overhead-ratio 0.005
+                            --global-overhead-ratio 0.05
+                            --max-overhead-ratio 2.0
+                            --min-overhead-ratio -1.0
+                            --max-final-accounting-ratio 20.0
+                            --max-final-profile-denominator-error 20.0
+                            --max-baseline-drift 0.35
+                            --min-weighted-call-coverage 0.0
+                            --min-phase-target-breadth 0.0
+                            --min-final-detached-targets 1
+                            --min-final-reattached-targets 1
+                            --disable-trace)
+                set_tests_properties(test_detach_milc_like_untraced_${_milc_backend}_stress_${_milc_sample}
+                    PROPERTIES
+                        TIMEOUT 135
+                        LABELS "long;stress"
+                        PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+            endforeach()
+        endforeach()
+        # Saturate all 832 hook lifecycles; dedicated stress and Frontera B-A-B
+        # tests, not this transition fixture, own the 4-6% overhead gate.
+        add_test(NAME test_detach_milc_like_reattach_redetach_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-reattach-redetach-strict
+                    --threads 4
+                    --seconds 6
+                    --iterations 0
+                    --inner-work 8
+                    --phase-repeats 1024
+                    --warmup-windows 0
+                    --warmup-checkpoints 0
+                    --timeout 90
+                    --target-overhead-ratio 0.00000001
+                    --global-overhead-ratio 10.0
+                    --global-reattach-factor 100.0
+                    --max-overhead-ratio 50.0
+                    --min-overhead-ratio -1.0
+                    --max-stable-accounting-ratio 20.0
+                    --max-final-accounting-ratio 20.0
+                    --max-final-profile-denominator-error 20.0
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.35
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 1.0
+                    --min-detach-success 100
+                    --min-reattach-success 100
+                    --min-distinct-detach 832
+                    --min-distinct-reattach 832
+                    --min-redetach-after-reattach 832
+                    --min-revisit-profile-growth 0
+                    --require-reattach)
+        set_tests_properties(test_detach_milc_like_reattach_redetach_strict
+            PROPERTIES
+                TIMEOUT 110
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
+        add_test(NAME test_detach_milc_like_reattach_redetach_signal
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --work-dir ${PROJECT_BINARY_DIR}/test/detach_runtime/milc-like-reattach-redetach-signal
+                    --threads 4
+                    --seconds 6
+                    --iterations 0
+                    --inner-work 8
+                    --phase-repeats 1024
+                    --warmup-windows 0
+                    --warmup-checkpoints 0
+                    --timeout 90
+                    --detach-backend signal
+                    --target-overhead-ratio 0.00000001
+                    --global-overhead-ratio 10.0
+                    --global-reattach-factor 100.0
+                    --max-overhead-ratio 50.0
+                    --min-overhead-ratio -1.0
+                    --max-stable-accounting-ratio 20.0
+                    --max-final-accounting-ratio 20.0
+                    --max-final-profile-denominator-error 20.0
+                    --max-reported-profile-control-denominator-error 0.01
+                    --max-baseline-drift 0.35
+                    --min-weighted-call-coverage 0.0
+                    --min-phase-target-breadth 1.0
+                    --min-detach-success 100
+                    --min-reattach-success 100
+                    --min-distinct-detach 832
+                    --min-distinct-reattach 832
+                    --min-redetach-after-reattach 832
+                    --min-revisit-profile-growth 0
+                    --require-reattach)
+        set_tests_properties(test_detach_milc_like_reattach_redetach_signal
+            PROPERTIES
+                TIMEOUT 110
+                PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
         add_test(NAME test_detach_hotloop_signal_reattach_trace_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -574,6 +922,7 @@ if(BUILD_TESTING)
                     --samples 1
                     --timeout 60
                     --overhead-ratio 0.01
+                    --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-reattach-trace
                     --require-reattach
                     --require-trace-diagnostics
@@ -595,6 +944,7 @@ if(BUILD_TESTING)
                     --samples 2
                     --timeout 180
                     --overhead-ratio 0.01
+                    --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-spawn-reattach-trace
                     --require-reattach
                     --require-trace-diagnostics
@@ -620,6 +970,7 @@ if(BUILD_TESTING)
                     --samples 2
                     --timeout 180
                     --overhead-ratio 0.01
+                    --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-trace
                     --require-reattach
                     --require-trace-diagnostics

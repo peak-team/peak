@@ -203,6 +203,12 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
 endif()
 
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  add_test(NAME test_detach_controller_accounting_snapshot_contention
+    COMMAND test_detach_controller accounting-snapshot-contention)
+  set_tests_properties(test_detach_controller_accounting_snapshot_contention
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict")
+
   function(add_fatal_safe_detach_test test_name test_arg fake_scenario)
     add_test(NAME ${test_name}
       COMMAND ${CMAKE_COMMAND}
@@ -434,6 +440,28 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=shutdown-missing-response"
       PASS_REGULAR_EXPRESSION "general-listener-idle-shutdown-io-fail-closed-ok")
+
+  add_test(NAME test_detach_controller_general_listener_final_freeze_after_controller_stop
+    COMMAND test_detach_listener_shutdown general-listener-final-freeze-after-controller-stop)
+  set_tests_properties(test_detach_controller_general_listener_final_freeze_after_controller_stop
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
+      PASS_REGULAR_EXPRESSION "general-listener-final-freeze-after-controller-stop-ok"
+      SKIP_RETURN_CODE 77)
+
+  add_test(NAME test_detach_controller_general_listener_invalid_accounting_baseline_report
+    COMMAND test_detach_listener_shutdown general-listener-invalid-accounting-baseline-report)
+  set_tests_properties(test_detach_controller_general_listener_invalid_accounting_baseline_report
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
+      PASS_REGULAR_EXPRESSION "general-listener-invalid-accounting-baseline-report-ok"
+      SKIP_RETURN_CODE 77)
+
+  add_test(NAME test_detach_controller_general_listener_uint64_saturation
+    COMMAND test_detach_listener_shutdown general-listener-uint64-saturation)
+  set_tests_properties(test_detach_controller_general_listener_uint64_saturation
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION "general-listener-uint64-saturation-ok")
 
   add_test(NAME test_detach_controller_general_listener_slurm_host_parser
     COMMAND test_detach_listener_shutdown general-listener-slurm-host-parser)

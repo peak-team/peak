@@ -100,15 +100,25 @@ def check_dlopen_revert_transactions(repo_root):
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
+    fini = extract_function(source, "peak_fini_impl")
 
     main_time_position = body.find("peak_main_time = peak_second();")
+    runtime_start_position = body.find("peak_general_listener_note_runtime_start")
     heartbeat_position = body.find("pthread_create(&heartbeat_thread")
     require(main_time_position != -1,
             "peak_init must initialize peak_main_time")
+    require(runtime_start_position != -1 and
+            main_time_position < runtime_start_position,
+            "peak_init must publish the runtime start timestamp after peak_main_time")
     require(heartbeat_position != -1,
             "peak_init must create the heartbeat thread explicitly")
-    require(main_time_position < heartbeat_position,
-            "peak_main_time must be initialized before heartbeat thread startup")
+    require(runtime_start_position < heartbeat_position,
+            "runtime start timestamp must be initialized before heartbeat thread startup")
+    elapsed_position = fini.find("peak_main_time = peak_second() - peak_runtime_start_time")
+    controller_stop_position = fini.find("peak_general_listener_controller_stop()")
+    require(elapsed_position != -1 and controller_stop_position != -1 and
+            controller_stop_position < elapsed_position,
+            "application elapsed time must freeze after controller drain")
 
 
 def check_mpi_finalize_trampoline_default(repo_root):
@@ -143,15 +153,193 @@ def check_mpi_finalize_trampoline_default(repo_root):
             "Intel MPI finalize guard must inspect Intel MPI environment markers")
 
 
-def check_stop_window_trace_gating(repo_root):
+def check_final_report_snapshot_order(repo_root):
+    peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    general = (repo_root / "src/general_listener.c").read_text(
+        encoding="utf-8"
+    )
+    fini = extract_function(peak_source, "peak_fini_impl")
+    local_report = extract_function(
+        general, "peak_general_listener_local_report_overhead"
+    )
+    freeze_report = extract_function(
+        general, "peak_general_listener_freeze_final_report_snapshot"
+    )
+    print_result = extract_function(
+        general, "peak_general_listener_print_result"
+    )
+    print_text = extract_function(
+        general, "peak_general_listener_print_text_result"
+    )
+    print_entry = extract_function(general, "peak_general_listener_print")
+    local_ranks = extract_function(
+        general, "peak_general_listener_local_mpi_ranks"
+    )
+    parse_positive_uint = extract_function(
+        general, "peak_general_listener_parse_positive_uint_text"
+    )
+    control_risk = extract_function(
+        general, "peak_general_listener_control_risk_seconds"
+    )
+
+    elapsed_position = fini.find(
+        "peak_main_time = peak_second() - peak_runtime_start_time"
+    )
+    controller_stop_position = fini.find(
+        "peak_general_listener_controller_stop()"
+    )
+    freeze_position = fini.find(
+        "peak_general_listener_freeze_final_report_snapshot()"
+    )
+    require(elapsed_position != -1 and controller_stop_position != -1 and
+            freeze_position != -1 and
+            controller_stop_position < elapsed_position < freeze_position,
+            "final report snapshot must freeze after controller drain and elapsed time")
+    heartbeat_free_position = fini.find("g_free(heartbeat_overhead)")
+    require(heartbeat_free_position != -1 and
+            controller_stop_position < heartbeat_free_position,
+            "heartbeat sample storage must outlive the active detach controller")
+
+    accounting_snapshot_position = freeze_report.find(
+        "peak_general_listener_runtime_accounting_snapshot(&accounting)"
+    )
+    elapsed_snapshot_position = freeze_report.find(
+        "snapshot.elapsed_seconds = peak_main_time"
+    )
+    assignment_position = freeze_report.find(
+        "peak_general_listener_final_report_snapshot = snapshot"
+    )
+    require(accounting_snapshot_position != -1 and
+            elapsed_snapshot_position != -1 and
+            assignment_position != -1 and
+            accounting_snapshot_position < elapsed_snapshot_position <
+            assignment_position,
+            "final report snapshot must capture accounting and frozen elapsed before publishing")
+    require("snapshot.profile_seconds =" in freeze_report and
+            "snapshot.control_seconds =" in freeze_report and
+            "snapshot.profile_ratio =" in freeze_report and
+            "snapshot.control_ratio =" in freeze_report and
+            "snapshot.profile_control_risk_ratio =" in freeze_report and
+            "snapshot.control_risk_ratio =" in freeze_report and
+            "peak_general_listener_control_risk_seconds(snapshot.control_seconds)" in freeze_report and
+            "snapshot.profile_seconds / snapshot.elapsed_seconds" in freeze_report and
+            "snapshot.control_seconds / snapshot.elapsed_seconds" in freeze_report and
+            "(snapshot.profile_seconds + snapshot.control_seconds) /\n            snapshot.elapsed_seconds" in freeze_report,
+            "final report snapshot must publish explicit profile/control fields from frozen elapsed")
+    require("peak_detach_controller_accounting_snapshot" not in freeze_report,
+            "final report snapshot must use the general listener accounting boundary")
+    require("peak_general_listener_final_report_snapshot.valid" in local_report and
+            "peak_general_listener_final_report_snapshot.profile_seconds" in local_report and
+            "peak_general_listener_final_report_snapshot.control_seconds" in local_report and
+            "peak_general_listener_final_report_snapshot.profile_ratio" in local_report and
+            "peak_general_listener_final_report_snapshot.control_ratio" in local_report and
+            "peak_general_listener_final_report_snapshot.profile_control_risk_ratio" in local_report and
+            "peak_general_listener_final_report_snapshot.control_risk_ratio" in local_report,
+            "final local report must consume separate frozen raw and risk fields")
+
+    require("parsed == 0" in parse_positive_uint and
+            "parsed > G_MAXUINT" in parse_positive_uint and
+            "MPI_LOCALNRANKS" in local_ranks and
+            "OMPI_COMM_WORLD_LOCAL_SIZE" in local_ranks and
+            "MV2_COMM_WORLD_LOCAL_SIZE" in local_ranks and
+            "PMI_LOCAL_SIZE" in local_ranks and
+            "return parsed;" in local_ranks and
+            "return 1U;" in local_ranks,
+            "local MPI rank discovery must reject invalid values and fall back to one")
+    require("peak_general_listener_multiply_nonnegative_finite" in control_risk and
+            "peak_general_listener_local_mpi_ranks()" in control_risk and
+            "return DBL_MAX;" in control_risk,
+            "control risk must be local ranks times raw control and fail closed")
+
+    require("const PeakReportOverhead* report_overhead" in print_result and
+            "report_overhead);" in print_result,
+            "final reporting wrapper must forward the report snapshot")
+    require("const PeakReportOverhead* report_overhead" in print_text and
+            "report_overhead != NULL && report_overhead->valid" in print_text and
+            "report_overhead->profile_seconds" in print_text and
+            "report_overhead->control_seconds" in print_text and
+            "report_overhead->profile_ratio" in print_text and
+            "report_overhead->control_ratio" in print_text and
+            "report_overhead->profile_control_risk_ratio" in print_text and
+            "report_overhead->control_risk_ratio" in print_text and
+            "report_overhead->management_ratio" in print_text,
+            "text output must consume explicit raw and risk report fields")
+    require("profile_ratio=%.9f control_ratio=%.9f ratio=%.9f" in print_text,
+            "local text output must include explicit profile/control ratio fields")
+    require("[peak] local profile+local-rank-control risk: profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u risk_control_seconds=%.9f ratio=%.9f" in print_text and
+            "[peak] per-rank maximum profile+control risk overhead ratio: %.9f" in print_text and
+            "[peak] per-rank maximum profile+control overhead ratio: %.9f" in print_text,
+            "text output must keep strict and separate raw/risk ratio contracts")
+    require("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu" in print_text and
+            "rank_count > 1 ? \"aggregate\" : \"local\"" in print_text,
+            "final output must expose exact aggregate ever-revisited coverage")
+    require("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f" in print_text and
+            "report_overhead->elapsed_min_seconds" in print_text and
+            "report_overhead->elapsed_max_seconds" in print_text,
+            "final output must expose the exact per-rank elapsed range contract")
+    require("PeakReportOverhead local_report =" in print_entry and
+            "peak_general_listener_local_report_overhead(sum_num_calls)" in print_entry and
+            "&local_report" in print_entry,
+            "local final output must consume the frozen report snapshot")
+
+    if "peak_general_listener_reduce_result" in general:
+        reduce_result = extract_function(
+            general, "peak_general_listener_reduce_result"
+        )
+        require("local_report.profile_ratio" in reduce_result and
+                "local_report.control_ratio" in reduce_result and
+                "local_report.profile_control_risk_ratio" in reduce_result and
+                "local_report.control_risk_ratio" in reduce_result and
+                "mpi_report.profile_ratio = max_overhead_ratios[1]" in reduce_result and
+                "mpi_report.control_ratio = max_overhead_ratios[2]" in reduce_result and
+                "mpi_report.profile_control_risk_ratio = max_overhead_ratios[4]" in reduce_result and
+                "mpi_report.control_risk_ratio = max_overhead_ratios[5]" in reduce_result and
+                "max_overhead_ratios,\n                                 6," in reduce_result,
+                "MPI final reporting must reduce raw and risk ratios separately")
+        require("local_elapsed_valid" in reduce_result and
+                "\"elapsed-valid\"" in reduce_result and
+                "MPI_MIN" in reduce_result and
+                "\"elapsed-min\"" in reduce_result and
+                "MPI_MAX" in reduce_result and
+                "\"elapsed-max\"" in reduce_result and
+                "mpi_report.elapsed_min_seconds = mpi_min_elapsed_seconds" in reduce_result and
+                "mpi_report.elapsed_max_seconds = mpi_max_elapsed_seconds" in reduce_result,
+                "MPI final reporting must validate and reduce exact elapsed endpoints")
+        require("\"accounting-valid\"" in reduce_result and
+                "MPI_MIN" in reduce_result and
+                "\"failed-stop-window-max\"" in reduce_result and
+                "(UINT64_MAX - 1) / (uint64_t)size" in reduce_result and
+                "\"failed-stop-window-count\"" in reduce_result and
+                "MPI_SUM" in reduce_result and
+                "mpi_report.accounting_valid = all_accounting_valid != 0" in reduce_result and
+                "mpi_report.failed_stop_window_count = mpi_failed_stop_window_count" in reduce_result,
+                "MPI final reporting must carry all-rank accounting validity and failed-window evidence")
+    if "peak_general_listener_socket_reduce_result_with_rank_source" in general:
+        socket_result = extract_function(
+            general, "peak_general_listener_socket_reduce_result_with_rank_source"
+        )
+        require("#define PEAK_SOCKET_REDUCE_VERSION 8U" in general and
+                "header.profile_ratio = local_report.profile_ratio" in socket_result and
+                "header.control_ratio = local_report.control_ratio" in socket_result and
+                "header.profile_control_risk_ratio =\n        local_report.profile_control_risk_ratio" in socket_result and
+                "header.control_risk_ratio = local_report.control_risk_ratio" in socket_result and
+                "header.failed_stop_window_count = local_report.failed_stop_window_count" in socket_result and
+                "header.accounting_valid = local_report.accounting_valid ? 1U : 0U" in socket_result and
+                "socket_report.profile_ratio = socket_max_profile_ratio" in socket_result and
+                "socket_report.control_ratio = socket_max_control_ratio" in socket_result and
+                "socket_report.profile_control_risk_ratio =\n        socket_max_profile_control_risk_ratio" in socket_result and
+                "socket_report.control_risk_ratio = socket_max_control_risk_ratio" in socket_result and
+                "socket_report.accounting_valid = socket_accounting_valid" in socket_result and
+                "peak_general_listener_add_uint64_saturated" in socket_result,
+                "socket reducer version and aggregation must carry raw, risk, and accounting health")
+
+
+def check_stop_window_accounting_sidecar(repo_root):
     source = (repo_root / "src/peak_detach_controller.c").read_text(
         encoding="utf-8"
     )
     general = (repo_root / "src/general_listener.c").read_text(
         encoding="utf-8"
-    )
-    gate = extract_function(
-        source, "peak_detach_controller_trace_diagnostics_enabled"
     )
     started = extract_function(
         source, "peak_detach_controller_note_stop_window_started"
@@ -159,8 +347,17 @@ def check_stop_window_trace_gating(repo_root):
     finished = extract_function(
         source, "peak_detach_controller_note_stop_window_finished"
     )
+    failed = extract_function(
+        source, "peak_detach_controller_note_stop_window_failed"
+    )
+    publish = extract_function(
+        source, "peak_detach_controller_publish_stop_window_accounting"
+    )
     last_window = extract_function(
         source, "peak_detach_controller_last_stop_window_us"
+    )
+    snapshot = extract_function(
+        source, "peak_detach_controller_accounting_snapshot"
     )
     controller_trace_configure = extract_function(
         source, "peak_detach_controller_configure_trace_diagnostics"
@@ -170,6 +367,9 @@ def check_stop_window_trace_gating(repo_root):
     )
     general_trace_detail = extract_function(
         general, "peak_general_controller_trace_mutation_detail"
+    )
+    general_trace = extract_function(
+        general, "peak_general_controller_trace_mutation"
     )
     general_trace_init = extract_function(
         general, "peak_general_controller_init_trace_config_once"
@@ -186,30 +386,484 @@ def check_stop_window_trace_gating(repo_root):
     general_attach_policy_init = extract_function(
         general, "peak_general_listener_init_attach_policy_once"
     )
+    heartbeat = extract_function(general, "peak_heartbeat_monitor")
+    note_runtime_start = extract_function(
+        general, "peak_general_listener_note_runtime_start"
+    )
+    print_text = extract_function(
+        general, "peak_general_listener_print_text_result"
+    )
+    clear_pending_context = extract_function(
+        general,
+        "peak_general_controller_clear_pending_request_context_unlocked",
+    )
+    set_pending_context = extract_function(
+        general,
+        "peak_general_controller_set_pending_request_context_unlocked",
+    )
+    expand_dynamic_hooks = extract_function(
+        general,
+        "peak_general_listener_expand_dynamic_hook_tables_unlocked",
+    )
+    nonnegative_finite = extract_function(
+        general,
+        "peak_general_listener_nonnegative_finite",
+    )
+    checked_add = extract_function(
+        general,
+        "peak_general_listener_add_nonnegative_finite",
+    )
+    checked_subtract = extract_function(
+        general,
+        "peak_general_listener_subtract_nonnegative_finite",
+    )
+    checked_multiply = extract_function(
+        general,
+        "peak_general_listener_multiply_nonnegative_finite",
+    )
+    checked_positive_multiply = extract_function(
+        general,
+        "peak_general_listener_multiply_positive_finite",
+    )
+    profile_seconds_floor = extract_function(
+        general,
+        "peak_general_listener_profile_seconds_floor",
+    )
+    note_reattach_success = extract_function(
+        general,
+        "peak_general_listener_note_reattach_success_unlocked",
+    )
+    refresh_revisited = extract_function(
+        general,
+        "peak_general_listener_refresh_revisited_markers",
+    )
+    reduce_result = extract_function(
+        general,
+        "peak_general_listener_reduce_result",
+    )
+    scalar_reattach = extract_function(
+        general,
+        "peak_general_controller_reattach_if_requested_unlocked",
+    )
+    batch_mutation = extract_function(
+        general,
+        "peak_general_controller_process_pending_batch_unlocked",
+    )
+    handle_prepare_failure = extract_function(
+        general,
+        "peak_general_controller_handle_prepare_failure_unlocked",
+    )
 
-    require("trace_diagnostics_enabled" in gate,
-            "STOP-window diagnostics must be gated by cached trace diagnostics")
-    require("getenv(" not in gate and "g_getenv(" not in gate,
-            "STOP-window diagnostics must not read environment in mutation path")
     require("getenv(" not in controller_trace_configure and
             "g_getenv(" not in controller_trace_configure,
             "detach controller trace configuration must not read environment")
     require("atomic_store_explicit(&trace_diagnostics_enabled" in source,
             "detach controller trace configuration must cache explicit state")
-    for label, body in (("start", started), ("finish", finished)):
-        require("peak_detach_controller_trace_diagnostics_enabled()" in body,
-                f"STOP-window {label} helper must check trace diagnostics")
-        require("last_stop_window_us = 0.0" in body,
-                f"STOP-window {label} helper must clear timing when disabled")
-    require("return 0.0;" in last_window,
-            "last_stop_window_us must return zero when diagnostics are disabled")
-    require(last_window.find("return 0.0;") <
-            last_window.find("peak_detach_controller_lock_mutation_guard"),
-            "last_stop_window_us must gate before reading stored timing")
+    require("peak_detach_controller_trace_diagnostics_enabled" not in source,
+            "stop-window accounting must not be gated by trace diagnostics")
+    require("held_mutation_started_at = peak_detach_controller_monotonic_second()" in started and
+            "last_stop_window_us = 0.0" not in started,
+            "control-window start must record monotonic time without discarding the last successful predictor")
+    require("peak_detach_accounting_completed_stop_window_count" in source and
+            "peak_detach_accounting_failed_stop_window_count" in source and
+            "peak_detach_accounting_stop_window_wall_ns" in source and
+            "peak_detach_accounting_sequence" in source and
+            "peak_detach_controller_publish_stop_window_accounting(elapsed_ns" in finished and
+            "peak_detach_controller_publish_stop_window_accounting(elapsed_ns" in failed and
+            "peak_detach_controller_accounting_begin_publication" in publish and
+            "peak_detach_controller_accounting_add_saturated" in publish and
+            "peak_detach_controller_accounting_end_publication" in publish and
+            "last_stop_window_us = (double)elapsed_ns / 1000.0" in finished,
+            "completed and failed control windows must update total accounting without changing the failed predictor")
+    snapshot_bound = snapshot.find(
+        "attempt < PEAK_DETACH_ACCOUNTING_SNAPSHOT_MAX_ATTEMPTS"
+    )
+    snapshot_first_sequence = snapshot.find(
+        "sequence_before =\n            atomic_load_explicit"
+    )
+    snapshot_odd_check = snapshot.find("(sequence_before & 1U) != 0")
+    snapshot_completed = snapshot.find("snapshot.completed_stop_window_count =")
+    snapshot_failed = snapshot.find("snapshot.failed_stop_window_count =")
+    snapshot_wall = snapshot.find(
+        "snapshot.stop_window_wall_ns ="
+    )
+    snapshot_fence = snapshot.find("atomic_thread_fence(memory_order_acquire)")
+    snapshot_final_sequence = snapshot.find(
+        "sequence_after =\n            atomic_load_explicit"
+    )
+    snapshot_validation = snapshot.find("sequence_before == sequence_after")
+    snapshot_success = snapshot.find("return TRUE;", snapshot_validation)
+    snapshot_failure = snapshot.find("return FALSE;", snapshot_success)
+    require("peak_detach_controller_lock_mutation_guard" not in snapshot and
+            snapshot_bound != -1 and
+            snapshot_first_sequence != -1 and
+            snapshot_odd_check != -1 and
+            snapshot_completed != -1 and
+            snapshot_failed != -1 and
+            snapshot_wall != -1 and
+            snapshot_fence != -1 and
+            snapshot_final_sequence != -1 and
+            snapshot_validation != -1 and
+            snapshot_success != -1 and
+            snapshot_failure != -1 and
+            snapshot_bound < snapshot_first_sequence < snapshot_odd_check <
+            snapshot_completed < snapshot_failed < snapshot_wall < snapshot_fence <
+            snapshot_final_sequence < snapshot_validation < snapshot_success <
+            snapshot_failure and
+            "UINT64_MAX" not in snapshot,
+            "accounting snapshot must be bounded, lock-free, coherent, and return explicit validity")
+    require("return 0.0;" not in last_window,
+            "last_stop_window_us must not be trace-gated")
     require("PEAK_DETACH_TRACE_PATH" in general_trace_init,
             "general listener must snapshot PEAK_DETACH_TRACE_PATH during init")
     require("peak_detach_controller_configure_trace_diagnostics" in general_trace_init,
             "general listener must configure detach-controller trace diagnostics")
+    require("PeakDetachAccountingSnapshot detach_accounting" in general_trace_detail and
+            "accounting_stop_window_count" not in general_trace_detail and
+            "trace_elapsed_time = peak_general_listener_elapsed_at(trace_now)" in general_trace_detail and
+            "peak_general_listener_control_wall_ns_since_heartbeat" in general_trace_detail and
+            "accounting_ratio = accounting_wall_s / trace_elapsed_time" in general_trace_detail and
+            "peak_general_listener_control_window_count_since_heartbeat" in general_trace_detail,
+            "trace rows must append accounting fields after existing request fields with current elapsed denominator")
+    require("strcmp(result, \"prepare-failed\") == 0" in general_trace and
+            "? 0.0" in general_trace and
+            "\n            0.0,\n            0," in handle_prepare_failure and
+            "stop_window_us = peak_detach_controller_last_stop_window_us();" not in
+                batch_mutation[:batch_mutation.find("if (prepared_count > 0)")] and
+            "stop_window_us = peak_detach_controller_last_stop_window_us();" in
+                batch_mutation[batch_mutation.find("if (prepared_count > 0)"):],
+            "prepare-failed traces must use zero unless they share a completed partial-batch window")
+    require("PeakDetachAccountingSnapshot detach_accounting" in print_text and
+            "control stop-window overhead:" in print_text and
+            "stop_window_seconds / peak_main_time" in print_text,
+            "text output must report measured stop-window overhead")
+    require("double profile_spent_seconds = 0.0" in heartbeat and
+            "double control_spent_seconds = 0.0" in heartbeat and
+            "double spent_ratio = 0.0" in heartbeat and
+            "double attached_recent_sum = 0.0" in heartbeat and
+            "double attached_lifetime_sum = 0.0" in heartbeat and
+            "double attached_pressure = 0.0" in heartbeat,
+            "heartbeat must split profile spend, control spend, and both attached pressure signals")
+    require("profile_spent_seconds += hook_profile_spent_seconds" in heartbeat and
+            "control_pause_wall_ns =\n            peak_general_listener_control_wall_ns_since_heartbeat" in heartbeat and
+            "control_spent_seconds = (double)control_pause_wall_ns / 1e9" in heartbeat and
+            "spent_ratio =\n            (profile_spent_seconds + control_spent_seconds) /\n            total_execution_time" in heartbeat,
+            "heartbeat spent ratio must add measured workload stop-window seconds")
+    require("peak_general_listener_runtime_accounting_snapshot(\n                    &reattach_accounting)" in heartbeat and
+            "reattach_accounting_valid &&" in heartbeat,
+            "reattach admission must reject a failed accounting snapshot")
+    require("peak_general_listener_accounting_snapshot(&accounting_baseline)" in note_runtime_start and
+            "&peak_general_listener_heartbeat_control_baseline_ns" in note_runtime_start and
+            "accounting_baseline.stop_window_wall_ns" in note_runtime_start and
+            "&peak_general_listener_heartbeat_control_baseline_count" in note_runtime_start and
+            "accounting_baseline.completed_stop_window_count" in note_runtime_start and
+            "&peak_general_listener_heartbeat_control_baseline_failed_count" in note_runtime_start and
+            "accounting_baseline.failed_stop_window_count" in note_runtime_start and
+            "&peak_general_listener_heartbeat_control_baseline_valid" in note_runtime_start and
+            "baseline_valid" in note_runtime_start and
+            "&peak_general_listener_heartbeat_control_baseline_ns" not in heartbeat,
+            "control accounting baseline must be captured synchronously before heartbeat startup")
+    require("_Atomic unsigned long long peak_general_listener_runtime_start_ns" in general and
+            "_Atomic unsigned long long\n    peak_general_listener_heartbeat_control_baseline_ns" in general and
+            "atomic_load_explicit(&peak_general_listener_runtime_start_ns" in general and
+            "peak_general_listener_count_since_baseline" in general and
+            "&peak_general_listener_heartbeat_control_baseline_ns" in general and
+            "peak_general_listener_runtime_accounting_snapshot" in general and
+            "peak_general_listener_heartbeat_control_baseline_valid" in general,
+            "heartbeat accounting baseline must be shared with trace through atomics")
+    per_target_detach = heartbeat[
+        heartbeat.find("// 1) Per-target DETACH"):
+        heartbeat.find("// 2) Global DETACH")
+    ]
+    global_detach_for_budget = heartbeat[
+        heartbeat.find("// 2) Global DETACH"):
+        heartbeat.find("// 3) Reattach")
+    ]
+    adaptive_sleep_start = heartbeat.find("// Adaptive heartbeat sleep")
+    adaptive_sleep = heartbeat[
+        adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
+    ]
+    require("ratio_snapshot[i] = ratio" in heartbeat and
+            "rate_snapshot[i] = recent_rate" in heartbeat and
+            "attached_recent_sum += recent_rate" in heartbeat and
+            "attached_lifetime_sum += ratio" in heartbeat,
+            "heartbeat must snapshot and aggregate both recent and lifetime contributions")
+    require("attached_pressure = MAX(attached_recent_sum, attached_lifetime_sum)" in heartbeat and
+            "profile_global_overhead = attached_pressure" in heartbeat and
+            "double projected_attached_recent_sum = attached_recent_sum" in heartbeat and
+            "double projected_attached_lifetime_sum = attached_lifetime_sum" in heartbeat,
+            "global detach pressure must be the max of attached recent and lifetime sums")
+    request_context_start = heartbeat.find(
+        "profile_global_overhead = attached_pressure;"
+    )
+    require(request_context_start != -1 and
+            "profile_global_overhead =" not in heartbeat[
+                request_context_start + len(
+                    "profile_global_overhead = attached_pressure;"
+                ):
+            ] and
+            re.search(
+                r"PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,\s*"
+                r"calls_snapshot\[i\],\s*lifetime_snapshot\[i\],\s*"
+                r"profile_global_overhead,\s*total_execution_time,\s*"
+                r"rate_snapshot\[i\]",
+                per_target_detach,
+                re.DOTALL,
+            ) is not None and
+            re.search(
+                r"PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT,\s*"
+                r"calls_snapshot\[idx\],\s*lifetime_snapshot\[idx\],\s*"
+                r"profile_global_overhead,\s*total_execution_time,\s*"
+                r"rate_snapshot\[idx\]",
+                global_detach_for_budget,
+                re.DOTALL,
+            ) is not None,
+            "detach requests must preserve the immutable hybrid global-overhead context and both hook signals")
+    require("#define PEAK_GLOBAL_DETACH_MIN_CALLS 2U" in general and
+            "calls_snapshot[i] >= PEAK_GLOBAL_DETACH_MIN_CALLS" in per_target_detach and
+            "if (calls_snapshot[i] < PEAK_GLOBAL_DETACH_MIN_CALLS)" in global_detach_for_budget,
+            "per-target and global detach must preserve the robust-reference two-call guard")
+    require("ratio_snapshot[i] > target_profile_ratio" in per_target_detach and
+            "rate_snapshot[i] > target_profile_ratio" not in per_target_detach and
+            "gboolean accepted =" in per_target_detach and
+            "projected_attached_recent_sum -= rate_snapshot[i]" in per_target_detach and
+            "projected_attached_lifetime_sum -= ratio_snapshot[i]" in per_target_detach and
+            "control_spent_seconds" not in per_target_detach and
+            "risk" not in per_target_detach and
+            "local_mpi_ranks" not in per_target_detach and
+            "spent_ratio" not in per_target_detach,
+            "per-target detach must remain cumulative-only and independent of reattach risk")
+    require("double projected_global_overhead =\n                MAX(projected_attached_recent_sum,\n                    projected_attached_lifetime_sum)" in global_detach_for_budget and
+            "if (projected_global_overhead >\n                global_target_ratio * peak_global_detach_factor)" in global_detach_for_budget and
+            "double contribution =\n                        MAX(rate_snapshot[i], ratio_snapshot[i])" in global_detach_for_budget and
+            "if (contribution <= 0.0) continue;" in global_detach_for_budget and
+            "entries[n_attached].ratio = contribution" in global_detach_for_budget and
+            "entries[n_attached].rate = rate_snapshot[i]" in global_detach_for_budget and
+            "entries[n_attached].lifetime = ratio_snapshot[i]" in global_detach_for_budget and
+            "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
+            "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
+            "double reduced_global_overhead = projected_global_overhead" in global_detach_for_budget and
+            "if (reduced_global_overhead <= global_target_ratio)" in global_detach_for_budget and
+            "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
+            "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
+            "reduced_global_overhead =\n                            MAX(reduced_recent_sum, reduced_lifetime_sum)" in global_detach_for_budget and
+            "projected_attached_recent_sum = reduced_recent_sum" in global_detach_for_budget and
+            "projected_attached_lifetime_sum = reduced_lifetime_sum" in global_detach_for_budget and
+            "spent_ratio" not in global_detach_for_budget and
+            "observed_global_overhead" not in global_detach_for_budget and
+            "control_spent_seconds" not in global_detach_for_budget and
+            "risk" not in global_detach_for_budget and
+            "local_mpi_ranks" not in global_detach_for_budget,
+            "global detach must carry both profile signals and exclude raw and risk control spend")
+    require("profile_global_overhead - prev_global_overhead" in adaptive_sleep and
+            "profile_global_overhead / global_target_ratio" in adaptive_sleep and
+            "recent_rate" not in adaptive_sleep and
+            "rate_snapshot" not in adaptive_sleep and
+            "risk" not in adaptive_sleep and
+            "local_mpi_ranks" not in adaptive_sleep,
+            "adaptive heartbeat sleep must use only the immutable hybrid global overhead")
+    reattach_section = heartbeat[heartbeat.find("// 3) Reattach"):]
+    require("value >= 0.0" in nonnegative_finite and
+            "value == value" in nonnegative_finite and
+            "value <= DBL_MAX" in nonnegative_finite and
+            "lhs > DBL_MAX - rhs" in checked_add and
+            "amount > *value" in checked_subtract and
+            "result = *value - amount" in checked_subtract and
+            "peak_general_listener_nonnegative_finite(result)" in checked_subtract and
+            "rhs > 0.0 && lhs > DBL_MAX / rhs" in checked_multiply and
+            "result = lhs * rhs" in checked_multiply and
+            "peak_general_listener_nonnegative_finite(result)" in checked_multiply,
+            "checked headroom helpers must reject nonfinite, overflow, and negative results")
+    require("double result" in checked_positive_multiply and
+            "result = lhs * rhs" in checked_positive_multiply and
+            "!peak_general_listener_positive_finite(result)" in checked_positive_multiply and
+            "*out = result" in checked_positive_multiply,
+            "positive multiplication must reject zero underflow after the product")
+    require("peak_general_listener_positive_finite(peak_general_overhead)" in profile_seconds_floor and
+            "return peak_general_overhead" in profile_seconds_floor and
+            "return 1e-12" in profile_seconds_floor,
+            "profile-seconds floor must use calibrated cost with 1e-12 fallback")
+    require("const unsigned int local_mpi_ranks =\n        peak_general_listener_local_mpi_ranks()" in heartbeat and
+            "double reattach_spent_seconds = 0.0" in reattach_section and
+            "double reattach_control_spent_seconds =" in reattach_section and
+            "double reattach_control_risk_seconds = DBL_MAX" in reattach_section and
+            "peak_general_listener_multiply_nonnegative_finite(\n"
+            "                    reattach_control_spent_seconds,\n"
+            "                    (double)local_mpi_ranks,\n"
+            "                    &reattach_control_risk_seconds)" in reattach_section and
+            "peak_general_listener_add_nonnegative_finite(\n"
+            "                    profile_spent_seconds,\n"
+            "                    reattach_control_risk_seconds,\n"
+            "                    &reattach_spent_seconds)" in reattach_section and
+            "double reattach_risk_spent_ratio = 0.0" in reattach_section and
+            "reattach_risk_spent_ratio =\n"
+            "                    reattach_spent_seconds / total_execution_time" in reattach_section and
+            "peak_general_listener_nonnegative_finite(\n"
+            "                        reattach_risk_spent_ratio)" in reattach_section and
+            "reattach_risk_spent_ratio <= reattach_gate_ratio" in reattach_section,
+            "reattach gate must use checked profile plus local-rank-scaled raw control risk")
+    require("double reattach_gate_ratio = 0.0" in reattach_section and
+            "peak_general_listener_nonnegative_finite(\n"
+            "                    peak_global_reattach_factor)" in reattach_section and
+            "peak_general_listener_nonnegative_finite(global_target_ratio)" in reattach_section and
+            "peak_general_listener_multiply_nonnegative_finite(\n"
+            "                    peak_global_reattach_factor,\n"
+            "                    global_target_ratio,\n"
+            "                    &reattach_gate_ratio)" in reattach_section,
+            "reattach gate must be built with checked factor-times-target arithmetic")
+    require("double headroom_seconds = 0.0" in reattach_section and
+            "peak_general_listener_multiply_nonnegative_finite(\n"
+            "                    global_target_ratio,\n"
+            "                    total_execution_time,\n"
+            "                    &headroom_seconds)" in reattach_section and
+            "peak_general_listener_subtract_nonnegative_finite(\n"
+            "                    &headroom_seconds,\n"
+            "                    profile_spent_seconds)" in reattach_section and
+            "peak_general_listener_subtract_nonnegative_finite(\n"
+            "                    &headroom_seconds,\n"
+            "                    reattach_control_risk_seconds)" in reattach_section and
+            "headroom_seconds > 0.0" in reattach_section,
+            "reattach headroom must debit local-rank risk through checked arithmetic")
+    require("double predicted_batch_stop_seconds = DBL_MAX" in reattach_section and
+            "peak_general_listener_multiply_nonnegative_finite(\n"
+            "                    last_stop_seconds,\n"
+            "                    (double)local_mpi_ranks,\n"
+            "                    &predicted_batch_stop_seconds)" in reattach_section,
+            "future stop-window reservations must use the same local-rank risk bound")
+    require("reattach_control_risk_seconds" not in scalar_reattach and
+            "reattach_control_risk_seconds" not in batch_mutation and
+            "profile_control_risk_ratio" not in heartbeat,
+            "risk accounting must remain an admission input, not hook or lifecycle state")
+    require("PEAK_HOOK_REATTACH_REQUESTED" in reattach_section and
+            "PEAK_HOOK_REATTACHING" in reattach_section and
+            "pending_lease_seconds == DBL_MAX" in reattach_section and
+            "peak_general_listener_add_nonnegative_finite(\n"
+            "                                projected_pending_reattach_seconds,\n"
+            "                                pending_lease_seconds,\n"
+            "                                &projected_pending_reattach_seconds)" in reattach_section and
+            "projected_pending_reattach_seconds != DBL_MAX" in reattach_section and
+            "peak_general_listener_subtract_nonnegative_finite(\n"
+            "                        &headroom_seconds,\n"
+            "                        projected_pending_reattach_seconds)" in reattach_section,
+            "pending reattach leases must use checked shared headroom accounting")
+    require("pending_batch_windows" in reattach_section and
+            "peak_general_listener_multiply_nonnegative_finite(\n"
+            "                        (double)pending_batch_windows,\n"
+            "                        predicted_batch_stop_seconds,\n"
+            "                        &pending_stop_seconds)" in reattach_section and
+            "peak_general_listener_subtract_nonnegative_finite(\n"
+            "                        &headroom_seconds,\n"
+            "                        pending_stop_seconds)" in reattach_section and
+            "(double)(after_windows - before_windows)" in reattach_section and
+            "incremental_lease_seconds != DBL_MAX" in reattach_section and
+            "candidate_seconds == DBL_MAX" in reattach_section and
+            "&remaining_headroom_seconds,\n"
+            "                            candidate_seconds" in reattach_section,
+            "batch stop reservations and candidate leases must reject overflow via DBL_MAX")
+    rate_write_pattern = re.compile(
+        r"peak_hook_pending_request_rate\s*\[[^]]+\]\s*="
+    )
+    require(rate_write_pattern.search(clear_pending_context) is not None and
+            rate_write_pattern.search(set_pending_context) is not None and
+            rate_write_pattern.search(expand_dynamic_hooks) is not None,
+            "pending request rate must be written by context clear/set and slot initialization")
+    rate_write_remainder = general
+    for allowed_body in (clear_pending_context,
+                         set_pending_context,
+                         expand_dynamic_hooks):
+        rate_write_remainder = rate_write_remainder.replace(allowed_body, "", 1)
+    require(rate_write_pattern.search(rate_write_remainder) is None,
+            "pending_request_rate must not be rewritten after reset/context clear")
+    require("peak_hook_reattach_request_calls_valid[hook_id]" in note_reattach_success and
+            "peak_hook_pending_request_calls[hook_id] >\n"
+            "            peak_hook_reattach_request_calls[hook_id]" in note_reattach_success and
+            "array_listener_revisited[hook_id] = TRUE" in note_reattach_success and
+            "peak_hook_reattach_request_calls[hook_id] =\n"
+            "        peak_hook_pending_request_calls[hook_id]" in note_reattach_success and
+            "peak_hook_reattach_request_calls_valid[hook_id] = TRUE" in note_reattach_success and
+            "array_listener_revisited[hook_id] = FALSE" not in note_reattach_success,
+            "reattach success must preserve an OR latch with a valid call baseline")
+    revisit_compare = note_reattach_success.find(
+        "peak_hook_pending_request_calls[hook_id] >"
+    )
+    revisit_latch = note_reattach_success.find(
+        "array_listener_revisited[hook_id] = TRUE",
+        revisit_compare,
+    )
+    baseline_overwrite = note_reattach_success.find(
+        "peak_hook_reattach_request_calls[hook_id] =",
+        revisit_latch,
+    )
+    baseline_valid = note_reattach_success.find(
+        "peak_hook_reattach_request_calls_valid[hook_id] = TRUE",
+        baseline_overwrite,
+    )
+    require(revisit_compare != -1 and revisit_latch != -1 and
+            baseline_overwrite != -1 and baseline_valid != -1 and
+            revisit_compare < revisit_latch < baseline_overwrite < baseline_valid,
+            "revisit growth must be compared and latched before baseline overwrite")
+    require("peak_hook_reattach_request_calls_valid =\n"
+            "        g_new0(gboolean, peak_hook_address_count)" in general and
+            "peak_hook_reattach_request_calls_valid[old_count] = FALSE" in expand_dynamic_hooks,
+            "revisit call baselines must start invalid for static and dynamic hooks")
+    require("if (!array_listener_revisited[i]" in refresh_revisited and
+            "peak_hook_reattach_request_calls_valid[i]" in refresh_revisited and
+            "local_final_calls[i] > peak_hook_reattach_request_calls[i]" in refresh_revisited and
+            "array_listener_revisited[i] = TRUE" in refresh_revisited and
+            "array_listener_revisited[i] = FALSE" not in refresh_revisited,
+            "final revisit refresh must only OR in growth from a valid baseline")
+    require("array_listener_revisited, mpi_array_listener_revisited" in reduce_result and
+            "MPI_INT, MPI_MAX, 0, \"revisited-marker\"" in reduce_result and
+            "array_listener_revisited = mpi_array_listener_revisited" in reduce_result,
+            "MPI revisit aggregation must use logical OR via integer maximum")
+    scalar_mark = scalar_reattach.find(
+        "array_listener_reattached[hook_id] = TRUE"
+    )
+    scalar_note = scalar_reattach.find(
+        "peak_general_listener_note_reattach_success_unlocked(hook_id)",
+        scalar_mark,
+    )
+    scalar_reset = scalar_reattach.find(
+        "peak_general_controller_reset_retry_unlocked(hook_id)",
+        scalar_note,
+    )
+    batch_mark = batch_mutation.find(
+        "array_listener_reattached[candidates[i].hook_id] = TRUE"
+    )
+    batch_note = batch_mutation.find(
+        "peak_general_listener_note_reattach_success_unlocked(\n"
+        "                candidates[i].hook_id)",
+        batch_mark,
+    )
+    batch_reset = batch_mutation.find(
+        "peak_general_controller_reset_retry_unlocked(candidates[i].hook_id)",
+        batch_note,
+    )
+    require(scalar_mark != -1 and scalar_note != -1 and scalar_reset != -1 and
+            scalar_mark < scalar_note < scalar_reset,
+            "scalar reattach success must latch revisit state before context reset")
+    require(batch_mark != -1 and batch_note != -1 and batch_reset != -1 and
+            batch_mark < batch_note < batch_reset,
+            "batch reattach success must latch revisit state before context reset")
+    require(general.count(
+                "peak_general_listener_note_reattach_success_unlocked("
+            ) == 3,
+            "revisit baseline hook must have exactly scalar and batch success callsites")
+    require("peak_hook_reattach_projected_overhead_seconds" not in general and
+            "peak_hook_pending_reattach_reserved_ratio" not in general and
+            "peak_general_listener_estimated_transition_ratio" not in general and
+            "reattach_transition_charge" not in reattach_section,
+            "heartbeat fix must not add projection, reservation, or transition admission sidecars")
+    require("global_reattach_queued_this_cycle" not in reattach_section,
+            "global reattach must remain budget-driven rather than fixed one-per-cycle")
+    require("entries[detached_cnt].rate =\n"
+            "                        peak_hook_last_detach_time" in reattach_section,
+            "global reattach fairness must remain explicit when enabled")
+    require("control_management_ratio" not in heartbeat and
+            "reattach_budget_token" not in source + general and
+            "reattach_probe" not in source + general and
+            "admission_cap" not in source + general,
+            "heartbeat fix must not add management guards, token buckets, probes, or admission caps")
     for label, body in (("general trace gate", general_trace_enabled),
                         ("general trace detail", general_trace_detail)):
         require("getenv(" not in body and "g_getenv(" not in body,
@@ -277,6 +931,57 @@ def check_mpi_startup_helper_warmup(repo_root):
             "helper warmup must be suppressed for MPI-linked programs before PMPI_Init")
 
 
+def check_detach_profile_accounting_order(repo_root):
+    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    scalar = extract_function(
+        source, "peak_general_controller_detach_if_requested_unlocked"
+    )
+    batch = extract_function(
+        source, "peak_general_controller_process_pending_batch_unlocked"
+    )
+    reset = extract_function(
+        source, "peak_general_controller_reset_retry_unlocked"
+    )
+
+    require("peak_general_controller_clear_pending_request_context_unlocked" in reset,
+            "reset_retry must clear pending request context")
+
+    scalar_gum_detach = scalar.find("gum_interceptor_detach")
+    scalar_finish = scalar.find(
+        "peak_general_controller_finish_hook_mutation",
+        scalar_gum_detach,
+    )
+    scalar_note = scalar.find(
+        "peak_general_listener_note_detach_profile_seconds_unlocked",
+        scalar_finish,
+    )
+    scalar_reset = scalar.find(
+        "peak_general_controller_reset_retry_unlocked",
+        scalar_note,
+    )
+    require(scalar_gum_detach != -1 and scalar_finish != -1 and
+            scalar_note != -1 and scalar_reset != -1,
+            "scalar detach success must finish, save profile seconds, then reset retry/context")
+    require(scalar_finish < scalar_note < scalar_reset,
+            "scalar detach profile accounting must run after finish and before reset/context clear")
+
+    batch_finish = batch.find("peak_detach_controller_finish_hook_mutation_batch")
+    batch_detach_arm = batch.find("PEAK_DETACH_OPERATION_DETACH", batch_finish)
+    batch_note = batch.find(
+        "peak_general_listener_note_detach_profile_seconds_unlocked",
+        batch_detach_arm,
+    )
+    batch_reset = batch.find(
+        "peak_general_controller_reset_retry_unlocked",
+        batch_note,
+    )
+    require(batch_finish != -1 and batch_detach_arm != -1 and
+            batch_note != -1 and batch_reset != -1,
+            "batch detach success must finish, save profile seconds, then reset retry/context")
+    require(batch_finish < batch_note < batch_reset,
+            "batch detach profile accounting must run after finish and before reset/context clear")
+
+
 def check_global_detach_overhead_selection(repo_root):
     source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
@@ -295,12 +1000,6 @@ def check_global_detach_overhead_selection(repo_root):
             "global detach must not sort by transient overhead rate")
     require("compare_ratio_de" in global_detach,
             "global detach must sort candidates by actual overhead ratio")
-    require("ratio_snapshot[i] <= target_profile_ratio" in global_detach and
-            "continue;" in global_detach,
-            "global detach must not enqueue below-threshold one-shot/cold targets")
-    require("entries[k].ratio <= target_profile_ratio" in global_detach and
-            "break;" in global_detach,
-            "global detach loop must fail closed if a below-threshold candidate appears")
     require(comparator.find("x->ratio") < comparator.find("x->rate"),
             "global detach comparator must prioritize ratio before rate")
     initial_wait = heartbeat.find("peak_heartbeat_wait_us(initial_sleep_us)")
@@ -317,6 +1016,86 @@ def check_global_detach_overhead_selection(repo_root):
     require("detach_observation_ready && enable_per_target_heartbeat" in heartbeat and
             "detach_observation_ready && enable_global_heartbeat" in heartbeat,
             "heartbeat detach gates must use the minimum observation window")
+
+
+def check_heartbeat_state_machine_boundary(repo_root):
+    header = (repo_root / "include/general_listener.h").read_text(
+        encoding="utf-8"
+    )
+    general = (repo_root / "src/general_listener.c").read_text(
+        encoding="utf-8"
+    )
+    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+        encoding="utf-8"
+    )
+    enum_match = re.search(
+        r"typedef\s+enum\s*\{(?P<body>.*?)\}\s*PeakHookState\s*;",
+        header,
+        re.S,
+    )
+    require(enum_match is not None, "missing PeakHookState enum")
+    states = [
+        re.sub(r"\s*=.*", "", item).strip()
+        for item in enum_match.group("body").split(",")
+        if item.strip()
+    ]
+    require(states == [
+        "PEAK_HOOK_UNRESOLVED",
+        "PEAK_HOOK_ATTACHED",
+        "PEAK_HOOK_DETACH_REQUESTED",
+        "PEAK_HOOK_DETACHING",
+        "PEAK_HOOK_DETACHED",
+        "PEAK_HOOK_REATTACH_REQUESTED",
+        "PEAK_HOOK_REATTACHING",
+        "PEAK_HOOK_SHUTDOWN",
+    ], f"PeakHookState boundary changed: {states}")
+
+    combined = general + "\n" + controller
+    forbidden_tokens = (
+        "PEAK_HOOK_PROBE",
+        "PEAK_HOOK_CLOSEOUT",
+        "probe_closeout",
+        "reattach_probe",
+        "closeout_state",
+        "transition_reservation",
+        "reattach_reservation",
+        "reservation_state",
+        "token_bucket",
+        "controller_pacing",
+        "pacing_budget",
+    )
+    for token in forbidden_tokens:
+        require(token not in combined,
+                f"heartbeat policy must not add lifecycle sidecar {token}")
+
+    request_detach = extract_function(
+        general, "peak_general_listener_request_detach_with_context_unlocked"
+    )
+    request_reattach = extract_function(
+        general, "peak_general_listener_request_reattach_with_context_unlocked"
+    )
+    for label, body in (("detach request", request_detach),
+                        ("reattach request", request_reattach)):
+        require("peak_detach_controller_prepare_hook_mutation" not in body and
+                "peak_detach_controller_finish_hook_mutation" not in body and
+                "gum_interceptor_" not in body,
+                f"{label} path must only mark request state")
+
+    batch = extract_function(
+        general, "peak_general_controller_process_pending_batch_unlocked"
+    )
+    prepare = batch.find("peak_detach_controller_prepare_hook_mutation_batch")
+    finish = batch.find("peak_detach_controller_finish_hook_mutation_batch")
+    detach_state = batch.find("PEAK_HOOK_DETACHING", prepare)
+    reattach_state = batch.find("PEAK_HOOK_REATTACHING", prepare)
+    detach_gum = batch.find("gum_interceptor_detach", prepare)
+    reattach_gum = batch.find("gum_interceptor_attach", prepare)
+    require(prepare != -1 and finish != -1 and prepare < finish,
+            "batch controller must preserve prepare-before-finish ordering")
+    require(prepare < detach_state < finish and prepare < reattach_state < finish,
+            "batch controller must keep transient states inside prepare/finish")
+    require(prepare < detach_gum < finish and prepare < reattach_gum < finish,
+            "Gum mutation must remain inside the prepared stop window")
 
 
 def check_general_controller_dlopen_drain_order(repo_root):
@@ -771,9 +1550,12 @@ def main():
     check_dlopen_revert_transactions(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
-    check_stop_window_trace_gating(repo_root)
+    check_final_report_snapshot_order(repo_root)
+    check_stop_window_accounting_sidecar(repo_root)
     check_mpi_startup_helper_warmup(repo_root)
+    check_detach_profile_accounting_order(repo_root)
     check_global_detach_overhead_selection(repo_root)
+    check_heartbeat_state_machine_boundary(repo_root)
     check_general_controller_dlopen_drain_order(repo_root)
     check_exclusive_time_nonnegative(repo_root)
     check_dlopen_test_hook_visibility(repo_root)

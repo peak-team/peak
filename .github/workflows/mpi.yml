@@ -24,6 +24,11 @@ jobs:
       with:
         mpi: ${{ matrix.mpi }}
 
+    - name: Install test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes libopenblas-dev
+
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
       id: strings
