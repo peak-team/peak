@@ -17,6 +17,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <time.h>
 #include <stdatomic.h>
 
@@ -96,6 +97,19 @@ typedef struct {
  */
 void peak_general_listener_attach();
 
+void peak_general_listener_note_runtime_start(double start_time);
+
+/**
+ * @brief Freezes final application-boundary overhead inputs.
+ *
+ * Called after heartbeat shutdown and after the controller has stopped and
+ * joined under its existing drain/finalize policy. `peak_main_time` must
+ * already be converted to elapsed application runtime. Later per-hook cleanup in
+ * `peak_general_listener_dettach()` is intentionally outside this report
+ * boundary.
+ */
+void peak_general_listener_freeze_final_report_snapshot(void);
+
 /**
  * @brief Prints the results of the Peak General Listener.
  *
@@ -138,6 +152,11 @@ void peak_general_listener_note_mpi_finalize_requested(void);
 gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                      char* out,
                                                      size_t out_size);
+#endif
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
+                                                          uint64_t rhs);
 #endif
 
 /**

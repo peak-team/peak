@@ -51,6 +51,12 @@ typedef struct {
 } PeakDetachBatchResult;
 
 typedef struct {
+    uint64_t completed_stop_window_count;
+    uint64_t failed_stop_window_count;
+    uint64_t stop_window_wall_ns;
+} PeakDetachAccountingSnapshot;
+
+typedef struct {
     const char* reason;
     long tid;
     uintptr_t pc;
@@ -78,6 +84,9 @@ gboolean peak_detach_controller_current_mutation_uses_physical_patch(void);
 
 double peak_detach_controller_last_stop_window_us(void);
 
+gboolean peak_detach_controller_accounting_snapshot(
+    PeakDetachAccountingSnapshot* out);
+
 const PeakDetachFailureDetail*
 peak_detach_controller_last_failure_detail(void);
 
@@ -97,6 +106,12 @@ peak_detach_controller_test_gate_waiter_count(void);
 
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_accounting_begin_publish(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_accounting_end_publish(void);
 #endif
 
 gboolean peak_detach_controller_finish_hook_mutation(

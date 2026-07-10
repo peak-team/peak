@@ -386,6 +386,7 @@ void peak_init()
         }
     }
     peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
         heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);
@@ -503,6 +504,8 @@ peak_mpi_all_ranks_requested_finalize(int local_requested)
 static void
 peak_fini_impl(void)
 {
+    double peak_runtime_start_time = peak_main_time;
+
 #ifdef HAVE_MPI
     int mpi_finalize_path =
         found_MPI && mpi_interceptor_finalize_path_active();
@@ -517,18 +520,21 @@ peak_fini_impl(void)
         pthread_cond_signal(&heartbeat_cond);
         pthread_mutex_unlock(&heartbeat_mutex);
         pthread_join(heartbeat_thread, NULL);
-        if (heartbeat_overhead) {
-            g_free(heartbeat_overhead);
-            heartbeat_overhead = NULL;
-        }
         if (args) {
             g_free(args);
             args = NULL;
         }
     }
-    peak_main_time = peak_second() - peak_main_time;
 
     peak_general_listener_controller_stop();
+    if (peak_runtime_start_time > 0.0) {
+        peak_main_time = peak_second() - peak_runtime_start_time;
+    }
+    peak_general_listener_freeze_final_report_snapshot();
+    if (heartbeat_overhead) {
+        g_free(heartbeat_overhead);
+        heartbeat_overhead = NULL;
+    }
     peak_jit_provider_disable();
     if (
 #ifdef HAVE_MPI
