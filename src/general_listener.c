@@ -117,12 +117,15 @@ static double peak_general_listener_final_heartbeat_overhead_seconds = 0.0;
 typedef struct {
     gboolean valid;
     gboolean accounting_valid;
+    unsigned int local_ranks;
     uint64_t stop_window_count;
     uint64_t failed_stop_window_count;
     double elapsed_seconds;
     double profile_seconds;
     double control_seconds;
     double management_seconds;
+    double control_risk_seconds;
+    double profile_control_risk_seconds;
     double profile_ratio;
     double control_ratio;
     double profile_control_risk_ratio;

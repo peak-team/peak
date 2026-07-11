@@ -1254,6 +1254,15 @@ if(BUILD_TESTING)
                     --mode finalize-clean-output-mpi
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_report_owner_tuples
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_report_reduction_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_report_reduction
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_finalize_clean_exit_output_mpi_reducer_fail
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -1266,6 +1275,29 @@ if(BUILD_TESTING)
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
                     --timeout 15)
+        set(_PEAK_MPI_TUPLE_FAIL_SUFFIXES owner validity local_rank counts)
+        set(_PEAK_MPI_TUPLE_FAIL_LABELS
+            profile-control-ratio-owner
+            profile-control-ratio-tuple-valid
+            profile-control-ratio-tuple-local-ranks
+            profile-control-ratio-tuple-counts)
+        foreach(_peak_fail_index RANGE 0 3)
+            list(GET _PEAK_MPI_TUPLE_FAIL_SUFFIXES ${_peak_fail_index} _peak_fail_suffix)
+            list(GET _PEAK_MPI_TUPLE_FAIL_LABELS ${_peak_fail_index} _peak_fail_label)
+            add_test(NAME test_mpi_report_bcast_fail_${_peak_fail_suffix}
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                        --mpiexec ${MPIEXEC_EXECUTABLE}
+                        --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                        --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                        --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --mode finalize-clean-output-mpi-reducer-fail
+                        --reducer-fail-label ${_peak_fail_label}
+                        --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                        --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
+                        --timeout 15)
+        endforeach()
         add_test(NAME test_mpi_finalize_clean_exit_output_mpi_intel_default
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -1714,11 +1746,23 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
+        set_tests_properties(test_mpi_report_owner_tuples
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_report_lines_ok"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_reducer_fail
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-reducer-fail"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
+        foreach(_peak_fail_suffix IN LISTS _PEAK_MPI_TUPLE_FAIL_SUFFIXES)
+            set_tests_properties(test_mpi_report_bcast_fail_${_peak_fail_suffix}
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-reducer-fail"
+                    FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                    TIMEOUT 30)
+        endforeach()
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-intel-default"

@@ -47,7 +47,6 @@ INTEL_MPI_ONLY_MODES = {
     "finalize-clean-output-mpi-intel-real-finalize",
 }
 
-
 def split_flags(value):
     return [flag for flag in shlex.split(value) if flag]
 
@@ -147,6 +146,7 @@ def parse_args():
     parser.add_argument("--require-detach-trace", action="store_true")
     parser.add_argument("--include-finalize-target", action="store_true")
     parser.add_argument("--forbid-stats-function", action="append", default=[])
+    parser.add_argument("--reducer-fail-label")
     return parser.parse_args()
 
 
@@ -215,15 +215,26 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         app_args.append("finalize-then-exit0")
         expected = "PMPI_Finalize was observed on every rank"
+        expected_extra.append(
+            "per-rank maximum profile+control overhead: owner_rank="
+        )
+        expected_extra.append(
+            "owner/local control stop-window overhead: owner_rank="
+        )
         expected_peak_tables = 1
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-reducer-fail":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env.setdefault("PEAK_TARGET", "peak_mpi_exit_target")
         env["PEAK_MPI_REAL_FINALIZE"] = "1"
         env["PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
-        env["PEAK_TEST_MPI_REDUCER_FAIL_LABEL"] = "hook-count-min"
+        reducer_fail_label = (
+            args.reducer_fail_label or
+            "profile-control-ratio-tuple-doubles"
+        )
+        env["PEAK_TEST_MPI_REDUCER_FAIL_LABEL"] = reducer_fail_label
         app_args.append("finalize-then-exit0")
-        expected = "MPI reducer test hook forced failure for hook-count-min"
+        expected = f"MPI reducer test hook forced failure for {reducer_fail_label}"
         expected_extra.append("MPI reducer failed; trying PEAK-owned socket aggregation fallback")
         expected_extra.append("MPI output reducer failed or timed out")
         expected_extra.append("PEAK output reducer did not complete cleanly")

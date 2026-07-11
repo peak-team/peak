@@ -119,6 +119,7 @@ peak_general_listener_freeze_final_report_snapshot(void)
     snapshot.accounting_valid =
         peak_general_listener_runtime_accounting_snapshot(&accounting);
     snapshot.valid = TRUE;
+    snapshot.local_ranks = peak_general_listener_local_mpi_ranks();
     snapshot.stop_window_count =
         peak_general_listener_control_window_count_since_heartbeat(
             &accounting);
@@ -139,6 +140,8 @@ peak_general_listener_freeze_final_report_snapshot(void)
         snapshot.profile_seconds,
         control_risk_seconds,
         &profile_control_risk_seconds);
+    snapshot.control_risk_seconds = control_risk_seconds;
+    snapshot.profile_control_risk_seconds = profile_control_risk_seconds;
     if (snapshot.elapsed_seconds > 0.0) {
         snapshot.profile_ratio =
             snapshot.profile_seconds / snapshot.elapsed_seconds;
