@@ -112,6 +112,7 @@ static int found_MPI;
 static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
 static _Atomic int peak_runtime_active = 0;
+static _Atomic pid_t peak_runtime_owner_pid = 0;
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
 #define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
@@ -124,6 +125,15 @@ typedef enum {
 } PeakFiniState;
 
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
+
+static int
+peak_runtime_is_fork_child(void)
+{
+    pid_t owner = atomic_load_explicit(&peak_runtime_owner_pid,
+                                       memory_order_acquire);
+
+    return owner > 0 && getpid() != owner;
+}
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_test_checkpoint_reader_pause = 0;
@@ -439,6 +449,9 @@ void peak_init()
     if (!has_requested_work) {
         return;
     }
+    atomic_store_explicit(&peak_runtime_owner_pid,
+                          getpid(),
+                          memory_order_release);
     atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
 
     //gum_init_embedded();
@@ -842,7 +855,8 @@ void peak_fini()
 {
     int expected = PEAK_FINI_NOT_STARTED;
 
-    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0 ||
+        peak_runtime_is_fork_child()) {
         return;
     }
 
@@ -883,6 +897,7 @@ peak_runtime_is_active_for_checkpoint(void)
 {
     return atomic_load_explicit(&peak_runtime_active,
                                 memory_order_acquire) != 0 &&
+           !peak_runtime_is_fork_child() &&
            atomic_load_explicit(&peak_fini_state,
                                 memory_order_acquire) == PEAK_FINI_NOT_STARTED;
 }
@@ -955,9 +970,14 @@ static void
 peak_exit(int status) {
     //g_printerr("Custom exit called with status: %d\n", status);
 
+    if (peak_runtime_is_fork_child()) {
+        original_exit(status);
+        __builtin_unreachable();
+    }
+
     if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
         original_exit(status);
-        return;
+        __builtin_unreachable();
     }
 
     int expected = 0;
@@ -979,10 +999,13 @@ peak_exit(int status) {
         }
     }
     peak_fini();
-    atexit(exit_interceptor_detach);
+    if (atexit(exit_interceptor_detach) != 0) {
+        peak_log_warn("[peak] failed to register deferred exit interceptor teardown\n");
+    }
 
     // Call the original `exit` function to terminate the process
     original_exit(status);
+    __builtin_unreachable();
 }
 
 /**

@@ -141,6 +141,7 @@ MODE_TO_APP_ARG = {
     "posix_spawnp_bad_argv_failure_non_destructive": "posix-spawnp-bad-argv",
     "posix_spawn_explicit_peak_env_preserved": "posix-spawn-explicit-peak-env",
     "exec_checkpoint_concurrent_fini_callbacks": "exec-concurrent-fini-callbacks",
+    "exec_checkpoint_fork_child_fini": "exec-checkpoint-fork-child-fini",
     "text_output_not_corrupted": "exec-failure",
 }
 
@@ -193,6 +194,11 @@ NO_EXEC_CHECKPOINT_MODES = {
     "posix_spawnp_preflight_unavailable_bad_env_delegates",
     "posix_spawnp_bad_argv_failure_non_destructive",
     *SPAWN_MODES,
+}
+
+CAPACITY_PASSTHROUGH_MODES = {
+    "vfork_env_slots_fallback": ("env-slots", "large-env", 0),
+    "vfork_long_preload_fallback": ("long-preload", "postfork-long-preload", 1),
 }
 
 NATIVE_REFERENCE_MODES = {
@@ -609,6 +615,24 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(final_files,
                 f"fini did not complete after releasing checkpoint reader\n{output}")
 
+    if args.mode == "exec_checkpoint_fork_child_fini":
+        match = re.search(
+            r"fork_child_checkpoint_skipped=1 failed_exec_exit=1 "
+            r"normal_return_exit=1 parent_pid=(\d+)",
+            output,
+        )
+        require(match is not None,
+                f"fork-child lifecycle invariants were not proven\n{output}")
+        parent_pid = match.group(1)
+        require(len(exec_files) == 1,
+                f"expected one parent checkpoint, found {exec_files}\n{output}")
+        require(len(final_files) == 1,
+                f"expected one parent final CSV, found {final_files}\n{output}")
+        require(all(f"-p{parent_pid}" in path.name
+                    for path in exec_files + final_files),
+                f"fork child emitted PEAK artifacts: "
+                f"{exec_files + final_files}\n{output}")
+
     if args.mode == "execvp_enoexec_fallback":
         require(proc.returncode == 37,
                 f"ENOEXEC fallback returned {proc.returncode}\n{output}")
@@ -621,6 +645,35 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
 
     require(proc.returncode == 0,
             f"fixture exited {proc.returncode}\n{output}")
+
+    if args.mode in CAPACITY_PASSTHROUGH_MODES:
+        kind, marker, ld_preload_env_entries = CAPACITY_PASSTHROUGH_MODES[args.mode]
+        require(len(exec_files) <= 1,
+                f"capacity passthrough fabricated child/extra checkpoints: "
+                f"{exec_files}\n{output}")
+        if exec_files:
+            require(target_count(exec_files) == 5,
+                    "capacity passthrough checkpoint includes child calls or "
+                    f"misses the parent exec boundary: {exec_files}")
+        require(f"postfork_capacity_passthrough=1 kind={kind}" in output,
+                f"capacity fallback was not proven\n{output}")
+        require(f"marker={marker}" in output,
+                f"capacity fallback did not preserve the native child marker\n{output}")
+        require_ld_count(output, 0)
+        require(f"ld_preload_env_entries={ld_preload_env_entries}" in output,
+                f"capacity fallback changed the native LD_PRELOAD environment\n{output}")
+        for name in (
+            "peak_target",
+            "peak_statslog",
+            "peak_exec_chain",
+            "peak_exec_checkpoint",
+            "peak_exec_propagate",
+        ):
+            require(f"{name}=<missing>" in output,
+                    f"capacity fallback injected {name}\n{output}")
+        require("exec_child_ok" in output,
+                f"capacity fallback parent exec did not retain native success\n{output}")
+        return
 
     if args.mode not in NO_EXEC_CHECKPOINT_MODES:
         require(exec_files, f"missing exec checkpoint for {args.mode}\n{output}")
@@ -806,11 +859,6 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
     }:
         require("postfork_bad_env_efault=1" in output,
                 f"post-fork bad env did not preserve EFAULT\n{output}")
-
-    if args.mode in {"vfork_env_slots_fallback", "vfork_long_preload_fallback"}:
-        require_ld_count(output, 0)
-        require("postfork_capacity_passthrough=1" in output,
-                f"bounded child env did not pass through original envp\n{output}")
 
     if args.mode in {
         "no_duplicate_ld_preload",

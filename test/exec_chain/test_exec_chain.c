@@ -2264,8 +2264,10 @@ run_exec_checkpoint_concurrent_fini_callbacks(const char* self)
     printf("checkpoint_reader_gate_held=1 fini_waiting=1\n");
     fflush(stdout);
     reader_release();
-    if (join_test_thread(checkpoint_thread, "checkpoint reader") != 0 ||
-        join_test_thread(fini_thread, "fini") != 0) {
+    int checkpoint_join =
+        join_test_thread(checkpoint_thread, "checkpoint reader");
+    int fini_join = join_test_thread(fini_thread, "fini");
+    if (checkpoint_join != 0 || fini_join != 0) {
         return 185;
     }
 
@@ -2273,6 +2275,131 @@ run_exec_checkpoint_concurrent_fini_callbacks(const char* self)
     execv(self, argv);
     perror("exec-concurrent-fini-callbacks");
     return 186;
+}
+
+static int
+run_exec_checkpoint_fork_child_fini(const char* self)
+{
+    pthread_t checkpoint_thread;
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    PeakTestVoidFn pause_enable = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_pause_enable");
+    PeakTestReadyFn reader_is_held = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_is_held");
+    PeakTestVoidFn reader_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_release");
+    CheckpointThreadArgs checkpoint_args = {.self = self, .checkpoint = checkpoint};
+    pid_t pid;
+    int child_status;
+    int checkpoint_child_ok = 0;
+    int failed_exec_child_ok = 0;
+    int normal_return_child_ok = 0;
+
+    if (checkpoint == NULL || pause_enable == NULL ||
+        reader_is_held == NULL || reader_release == NULL) {
+        fprintf(stderr, "checkpoint/fork test hooks unavailable\n");
+        return 195;
+    }
+
+    call_hot_target(5);
+    pause_enable();
+    int create_rc = pthread_create(&checkpoint_thread,
+                                   NULL,
+                                   checkpoint_thread_main,
+                                   &checkpoint_args);
+    if (create_rc != 0) {
+        fprintf(stderr,
+                "pthread_create fork checkpoint reader failed: %s\n",
+                strerror(create_rc));
+        return 196;
+    }
+    if (wait_for_test_hook(reader_is_held,
+                           "checkpoint reader before fork") != 0) {
+        reader_release();
+        int join_rc = join_test_thread(checkpoint_thread,
+                                       "fork checkpoint reader");
+        return join_rc == 0 ? 196 : 198;
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        char* const child_argv[] = {(char*)self, (char*)"child-basic", NULL};
+
+        alarm(10);
+        errno = EAGAIN;
+        if (checkpoint(self, child_argv) != -1 || errno != EAGAIN) {
+            _exit(200);
+        }
+        exit(0);
+    }
+    if (pid < 0) {
+        int fork_errno = errno;
+
+        reader_release();
+        int join_rc = join_test_thread(checkpoint_thread,
+                                       "fork checkpoint reader");
+        fprintf(stderr,
+                "fork checkpoint child failed: %s\n",
+                strerror(fork_errno));
+        return join_rc == 0 ? 197 : 198;
+    }
+
+    child_status = wait_for_child(pid);
+    checkpoint_child_ok = child_status == 0;
+    if (!checkpoint_child_ok) {
+        fprintf(stderr, "checkpoint_fork_child_status=%d\n", child_status);
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        char* const child_argv[] = {(char*)"missing-exec", NULL};
+
+        alarm(10);
+        errno = 0;
+        if (execv("/definitely/missing/peak-exec-child", child_argv) != -1 ||
+            errno != ENOENT) {
+            _exit(201);
+        }
+        exit(0);
+    }
+    if (pid < 0) {
+        perror("fork failed-exec child");
+    } else {
+        child_status = wait_for_child(pid);
+        failed_exec_child_ok = child_status == 0;
+        if (!failed_exec_child_ok) {
+            fprintf(stderr, "failed_exec_fork_child_status=%d\n", child_status);
+        }
+    }
+
+    pid = fork();
+    if (pid == 0) {
+        alarm(10);
+        return 0;
+    }
+    if (pid < 0) {
+        perror("fork normal-return child");
+    } else {
+        child_status = wait_for_child(pid);
+        normal_return_child_ok = child_status == 0;
+        if (!normal_return_child_ok) {
+            fprintf(stderr, "normal_return_fork_child_status=%d\n", child_status);
+        }
+    }
+
+    reader_release();
+    if (join_test_thread(checkpoint_thread, "checkpoint reader") != 0) {
+        return 198;
+    }
+    if (!checkpoint_child_ok || !failed_exec_child_ok ||
+        !normal_return_child_ok) {
+        return 199;
+    }
+    printf("fork_child_checkpoint_skipped=1 failed_exec_exit=1 "
+           "normal_return_exit=1 parent_pid=%ld\n",
+           (long)getpid());
+    return 0;
 }
 
 int
@@ -2552,7 +2679,9 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "exec-concurrent-fini-callbacks") == 0) {
         return run_exec_checkpoint_concurrent_fini_callbacks(argv[0]);
     }
-
+    if (strcmp(argv[1], "exec-checkpoint-fork-child-fini") == 0) {
+        return run_exec_checkpoint_fork_child_fini(argv[0]);
+    }
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
 }
