@@ -61,8 +61,6 @@
 #define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
-#define PPID_FILE_NAME                         "/tmp/lock_peak_ppid_list"
-
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -107,7 +105,6 @@ gboolean peak_memory_profile = false;
 gboolean peak_memory_track_all = false;
 #ifdef HAVE_MPI
 static int found_MPI;
-static int flag_clean_fppid = 0;
 #endif
 
 static _Atomic int peak_exit_status_known = 0;
@@ -339,7 +336,7 @@ void peak_init()
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
-        int is_parent_MPI = check_parent_process(PPID_FILE_NAME, &flag_clean_fppid);
+        int is_parent_MPI = check_parent_process();
         if (is_parent_MPI > 0) {
             found_MPI = 0;
         }
@@ -551,18 +548,10 @@ peak_fini_impl(void)
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
     if (!dlopen_shutdown_flushed) {
-    #ifdef HAVE_MPI
-        if (flag_clean_fppid) {
-            remove_ppid_file(PPID_FILE_NAME);
-        }
-    #endif
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen replacement teardown was not proven safe\n");
         return;
     }
 #ifdef HAVE_MPI
-    if (flag_clean_fppid) {
-        remove_ppid_file(PPID_FILE_NAME);
-    }
     int exit_status_known =
         atomic_load_explicit(&peak_exit_status_known, memory_order_acquire);
     int exit_status =
