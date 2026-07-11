@@ -1,5 +1,5 @@
 #include "cuda_interceptor.h"
-#include "peak_logging.h"
+#include "logging.h"
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
 

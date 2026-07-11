@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
-#include "peak_logging.h"
+#include "logging.h"
 
 /*=========================
   Types

@@ -1,5 +1,5 @@
 #include "dlopen_interceptor.h"
-#include "peak_detach_controller.h"
+#include "detach_controller.h"
 
 #include <stdio.h>
 #include <stdlib.h>

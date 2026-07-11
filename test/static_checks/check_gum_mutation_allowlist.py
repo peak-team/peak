@@ -138,6 +138,25 @@ FUNCTION_ANCHORS = {
 }
 
 
+def read_source(repo_root, rel, path):
+    source = path.read_text(encoding="utf-8")
+    if rel != "src/general_listener.c":
+        return source
+
+    def include_fragment(match):
+        fragment = match.group(1)
+        return (
+            repo_root / "src/general_listener" / fragment
+        ).read_text(encoding="utf-8")
+
+    return re.sub(
+        r'^#include "general_listener/([^"]+\.inc)"$',
+        include_fragment,
+        source,
+        flags=re.MULTILINE,
+    )
+
+
 def classify_function(rel, line_no, function_starts):
     anchors = FUNCTION_ANCHORS.get(rel)
     if anchors is None:
@@ -164,33 +183,32 @@ def count_mutations(repo_root):
             continue
 
         rel = path.relative_to(repo_root).as_posix()
-        source_paths.append((rel, path))
+        source = read_source(repo_root, rel, path)
+        source_paths.append((rel, source))
         anchors = FUNCTION_ANCHORS.get(rel, {})
         if anchors:
-            with path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, 1):
-                    for function_name in anchors:
-                        if function_name in line:
-                            function_starts[rel].append(
-                                (line_number, function_name)
-                            )
+            for line_number, line in enumerate(source.splitlines(), 1):
+                for function_name in anchors:
+                    if function_name in line:
+                        function_starts[rel].append(
+                            (line_number, function_name)
+                        )
 
     found = collections.defaultdict(collections.Counter)
     unclassified = []
-    for rel, path in source_paths:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                stripped = line.strip()
-                if stripped.startswith("//") or stripped.startswith("*"):
+    for rel, source in source_paths:
+        for line_number, line in enumerate(source.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("//") or stripped.startswith("*"):
+                continue
+            for match in MUTATION_RE.finditer(line):
+                category = classify_function(rel, line_number, function_starts)
+                if category is None:
+                    unclassified.append(
+                        f"{rel}:{line_number}: {match.group(0)}"
+                    )
                     continue
-                for match in MUTATION_RE.finditer(line):
-                    category = classify_function(rel, line_number, function_starts)
-                    if category is None:
-                        unclassified.append(
-                            f"{rel}:{line_number}: {match.group(0)}"
-                        )
-                        continue
-                    found[(category, rel)][match.group(1)] += 1
+                found[(category, rel)][match.group(1)] += 1
 
     return {key: dict(counter) for key, counter in found.items()}, unclassified
 

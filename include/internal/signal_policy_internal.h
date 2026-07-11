@@ -1,7 +1,7 @@
 #ifndef __PEAK_SIGNAL_POLICY_INTERNAL_H
 #define __PEAK_SIGNAL_POLICY_INTERNAL_H
 
-#include "peak_signal_policy.h"
+#include "signal_policy.h"
 
 #include <signal.h>
 #include <sys/types.h>

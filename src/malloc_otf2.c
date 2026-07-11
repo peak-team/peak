@@ -1,5 +1,5 @@
 #include "malloc_otf2.h"
-#include "peak_logging.h"
+#include "logging.h"
 
 typedef struct {
     uint32_t tid;

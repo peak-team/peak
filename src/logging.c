@@ -1,4 +1,4 @@
-#include "peak_logging.h"
+#include "logging.h"
 
 #include <ctype.h>
 #include <stdio.h>

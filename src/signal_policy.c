@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "peak_signal_policy_internal.h"
+#include "internal/signal_policy_internal.h"
 #include "utils/utils.h"
 
 #include <aio.h>

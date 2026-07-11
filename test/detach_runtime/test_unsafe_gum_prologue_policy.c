@@ -1,4 +1,4 @@
-#include "unsafe_gum_prologue.h"
+#include "internal/unsafe_gum_prologue.h"
 
 #include <stdio.h>
 #include <stdint.h>

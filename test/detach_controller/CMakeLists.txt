@@ -1,8 +1,8 @@
 add_executable(test_detach_controller
   test_detach_controller.c
-  ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
-  ${PROJECT_SOURCE_DIR}/src/peak_logging.c
-  ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
+  ${PROJECT_SOURCE_DIR}/src/detach_controller.c
+  ${PROJECT_SOURCE_DIR}/src/logging.c
+  ${PROJECT_SOURCE_DIR}/src/signal_policy.c
   $<TARGET_OBJECTS:utils_c>
 )
 add_executable(test_detach_fake_helper test_detach_fake_helper.c)
@@ -11,12 +11,12 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   add_executable(test_detach_listener_shutdown
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
-    ${PROJECT_SOURCE_DIR}/src/peak_jit_provider.c
-    ${PROJECT_SOURCE_DIR}/src/peak_logging.c
+    ${PROJECT_SOURCE_DIR}/src/jit_provider.c
+    ${PROJECT_SOURCE_DIR}/src/logging.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
-    ${PROJECT_SOURCE_DIR}/src/peak_detach_controller.c
-    ${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c
+    ${PROJECT_SOURCE_DIR}/src/detach_controller.c
+    ${PROJECT_SOURCE_DIR}/src/signal_policy.c
     $<TARGET_OBJECTS:utils_c>
     $<TARGET_OBJECTS:utils_cxx>
   )

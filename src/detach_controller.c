@@ -1,8 +1,8 @@
 #define _GNU_SOURCE
-#include "peak_detach_controller.h"
-#include "peak_detach_helper_protocol.h"
-#include "peak_logging.h"
-#include "peak_signal_policy_internal.h"
+#include "detach_controller.h"
+#include "detach_helper_protocol.h"
+#include "logging.h"
+#include "internal/signal_policy_internal.h"
 
 #include <dirent.h>
 #include <dlfcn.h>

@@ -1,6 +1,6 @@
 #include "mpi_interceptor.h"
 #include "general_listener.h"
-#include "peak_logging.h"
+#include "logging.h"
 
 #include <sched.h>
 #include <stdlib.h>

@@ -11,6 +11,25 @@ def require(condition, message):
         raise SystemExit(1)
 
 
+def read_source(repo_root, rel):
+    source = (repo_root / rel).read_text(encoding="utf-8")
+    if rel != "src/general_listener.c":
+        return source
+
+    def include_fragment(match):
+        fragment = match.group(1)
+        return (
+            repo_root / "src/general_listener" / fragment
+        ).read_text(encoding="utf-8")
+
+    return re.sub(
+        r'^#include "general_listener/([^"]+\.inc)"$',
+        include_fragment,
+        source,
+        flags=re.MULTILINE,
+    )
+
+
 def extract_function(source, name):
     match = re.search(r"\b" + re.escape(name) + r"\s*\([^)]*\)\s*\{", source)
     require(match is not None, f"missing function {name}")
@@ -28,7 +47,7 @@ def extract_function(source, name):
 
 
 def check_shutdown_order(repo_root):
-    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    source = read_source(repo_root, "src/general_listener.c")
     body = extract_function(source, "peak_general_controller_shutdown_hook_unlocked")
     detach_positions = [
         match.start()
@@ -48,7 +67,7 @@ def check_safe_pc_alignment(repo_root):
     gum_source = (repo_root / "cmake/peak-gum/gum_peak_pc_api.c").read_text(
         encoding="utf-8"
     )
-    controller_source = (repo_root / "src/peak_detach_controller.c").read_text(
+    controller_source = (repo_root / "src/detach_controller.c").read_text(
         encoding="utf-8"
     )
     gum_body = extract_function(gum_source, "gum_interceptor_peak_safe_pc")
@@ -155,9 +174,7 @@ def check_mpi_finalize_trampoline_default(repo_root):
 
 def check_final_report_snapshot_order(repo_root):
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
-    general = (repo_root / "src/general_listener.c").read_text(
-        encoding="utf-8"
-    )
+    general = read_source(repo_root, "src/general_listener.c")
     fini = extract_function(peak_source, "peak_fini_impl")
     local_report = extract_function(
         general, "peak_general_listener_local_report_overhead"
@@ -335,12 +352,10 @@ def check_final_report_snapshot_order(repo_root):
 
 
 def check_stop_window_accounting_sidecar(repo_root):
-    source = (repo_root / "src/peak_detach_controller.c").read_text(
+    source = (repo_root / "src/detach_controller.c").read_text(
         encoding="utf-8"
     )
-    general = (repo_root / "src/general_listener.c").read_text(
-        encoding="utf-8"
-    )
+    general = read_source(repo_root, "src/general_listener.c")
     started = extract_function(
         source, "peak_detach_controller_note_stop_window_started"
     )
@@ -932,7 +947,7 @@ def check_mpi_startup_helper_warmup(repo_root):
 
 
 def check_detach_profile_accounting_order(repo_root):
-    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    source = read_source(repo_root, "src/general_listener.c")
     scalar = extract_function(
         source, "peak_general_controller_detach_if_requested_unlocked"
     )
@@ -983,7 +998,7 @@ def check_detach_profile_accounting_order(repo_root):
 
 
 def check_global_detach_overhead_selection(repo_root):
-    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    source = read_source(repo_root, "src/general_listener.c")
     heartbeat = extract_function(source, "peak_heartbeat_monitor")
     comparator = extract_function(source, "compare_ratio_de")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
@@ -1022,10 +1037,8 @@ def check_heartbeat_state_machine_boundary(repo_root):
     header = (repo_root / "include/general_listener.h").read_text(
         encoding="utf-8"
     )
-    general = (repo_root / "src/general_listener.c").read_text(
-        encoding="utf-8"
-    )
-    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+    general = read_source(repo_root, "src/general_listener.c")
+    controller = (repo_root / "src/detach_controller.c").read_text(
         encoding="utf-8"
     )
     enum_match = re.search(
@@ -1099,7 +1112,7 @@ def check_heartbeat_state_machine_boundary(repo_root):
 
 
 def check_general_controller_dlopen_drain_order(repo_root):
-    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    source = read_source(repo_root, "src/general_listener.c")
     body = extract_function(source, "peak_general_controller_thread_main")
     process_positions = [
         match.start()
@@ -1128,7 +1141,7 @@ def check_general_controller_dlopen_drain_order(repo_root):
 
 
 def check_exclusive_time_nonnegative(repo_root):
-    source = (repo_root / "src/general_listener.c").read_text(encoding="utf-8")
+    source = read_source(repo_root, "src/general_listener.c")
     helper = extract_function(
         source, "peak_general_listener_exclusive_duration"
     )
@@ -1199,10 +1212,8 @@ def check_shutdown_fail_closed_docs(repo_root):
     docs = (repo_root / "docs/physical-detach-controller.md").read_text(
         encoding="utf-8"
     )
-    general = (repo_root / "src/general_listener.c").read_text(
-        encoding="utf-8"
-    )
-    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+    general = read_source(repo_root, "src/general_listener.c")
+    controller = (repo_root / "src/detach_controller.c").read_text(
         encoding="utf-8"
     )
 
@@ -1223,17 +1234,17 @@ def check_shutdown_fail_closed_docs(repo_root):
 
 
 def check_signal_backend_strict_invariants(repo_root):
-    controller = (repo_root / "src/peak_detach_controller.c").read_text(
+    controller = (repo_root / "src/detach_controller.c").read_text(
         encoding="utf-8"
     )
-    signal_policy = (repo_root / "src/peak_signal_policy.c").read_text(
+    signal_policy = (repo_root / "src/signal_policy.c").read_text(
         encoding="utf-8"
     )
     signal_public_header = (
-        repo_root / "include/peak_signal_policy.h"
+        repo_root / "include/signal_policy.h"
     ).read_text(encoding="utf-8")
     signal_internal_header = (
-        repo_root / "src/peak_signal_policy_internal.h"
+        repo_root / "include/internal/signal_policy_internal.h"
     ).read_text(encoding="utf-8")
     pthread_listener = (repo_root / "src/pthread_listener.c").read_text(
         encoding="utf-8"
@@ -1531,7 +1542,7 @@ def check_signal_backend_strict_invariants(repo_root):
     require("PEAK_DETACH_BACKEND=helper" in tests and
             "PEAK_DETACH_BACKEND=helper" in controller_tests_cmake,
             "fake-helper tests must force helper backend, not auto signal fallback")
-    require("${PROJECT_SOURCE_DIR}/src/peak_signal_policy.c" in controller_tests_cmake and
+    require("${PROJECT_SOURCE_DIR}/src/signal_policy.c" in controller_tests_cmake and
             "PEAK_ENABLE_TEST_HOOKS=1" in controller_tests_cmake and
             "peak_signal_policy_test_block_reserved_for_current_thread() == 0" in controller_tests and
             "signal-reserved-blocked" in controller_tests,

@@ -1,8 +1,8 @@
 #include "pthread_listener.h"
 #include "general_listener.h"
-#include "peak_detach_controller.h"
-#include "peak_logging.h"
-#include "peak_signal_policy_internal.h"
+#include "detach_controller.h"
+#include "logging.h"
+#include "internal/signal_policy_internal.h"
 
 #include <string.h>
 
