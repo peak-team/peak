@@ -1057,6 +1057,7 @@ peak_detach_controller_build_helper_env(void)
 {
     size_t count = 0;
     size_t kept = 0;
+    static const char helper_exec_chain_env[] = "PEAK_EXEC_CHAIN=0";
 
     if (environ == NULL) {
         return NULL;
@@ -1066,7 +1067,7 @@ peak_detach_controller_build_helper_env(void)
         count++;
     }
 
-    char** helper_env = calloc(count + 1, sizeof(*helper_env));
+    char** helper_env = calloc(count + 2, sizeof(*helper_env));
     if (helper_env == NULL) {
         return NULL;
     }
@@ -1084,6 +1085,16 @@ peak_detach_controller_build_helper_env(void)
             kept++;
         }
     }
+    /* The helper is an internal control process, never an exec-chain target. */
+    helper_env[kept] = strdup(helper_exec_chain_env);
+    if (helper_env[kept] == NULL) {
+        for (size_t j = 0; j < kept; j++) {
+            free(helper_env[j]);
+        }
+        free(helper_env);
+        return NULL;
+    }
+    kept++;
     helper_env[kept] = NULL;
     return helper_env;
 }
