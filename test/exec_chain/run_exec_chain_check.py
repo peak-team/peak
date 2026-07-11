@@ -124,7 +124,10 @@ MODE_TO_APP_ARG = {
     ),
     "posix_spawn_chain_disabled": "posix-spawn-custom-env",
     "posix_spawn_failure_non_destructive": "posix-spawn-failure",
+    "posix_spawn_resolver_null_preserves_errno": "posix-spawn-resolver-null",
     "posix_spawnp_path_search": "posix-spawnp-path-search",
+    "posix_spawnp_env_build_failure_passthrough": "posix-spawnp-custom-env",
+    "posix_spawnp_resolver_null_preserves_errno": "posix-spawnp-resolver-null",
     "posix_spawnp_empty_path_component": "posix-spawnp-path-search",
     "posix_spawnp_child_env_path_ignored": "posix-spawnp-child-env-path-ignored",
     "posix_spawnp_preflight_unavailable_delegates": "posix-spawnp-path-search",
@@ -154,7 +157,10 @@ SPAWN_MODES = {
     "posix_spawn_preflight_unavailable_bad_env_delegates",
     "posix_spawn_chain_disabled",
     "posix_spawn_failure_non_destructive",
+    "posix_spawn_resolver_null_preserves_errno",
     "posix_spawnp_path_search",
+    "posix_spawnp_env_build_failure_passthrough",
+    "posix_spawnp_resolver_null_preserves_errno",
     "posix_spawnp_empty_path_component",
     "posix_spawnp_child_env_path_ignored",
     "posix_spawnp_preflight_unavailable_delegates",
@@ -168,7 +174,6 @@ NO_EXEC_CHECKPOINT_MODES = {
     "exec_checkpoint_concurrent_fini_callbacks",
     "execve_child_checkpoint_disabled",
     "exec_bad_stats_path_nonfatal",
-    "execve_child_peak_env_only_injection",
     "raw_syscall_nonexec_passthrough",
     "execve_bad_env_failure_non_destructive",
     "execve_bad_env_preflight_unknown_non_destructive",
@@ -238,6 +243,18 @@ PREFLIGHT_ALL_UNAVAILABLE_MODES = {
     *PREFLIGHT_UNKNOWN_BAD_ENV_MODES,
 }
 
+SPAWN_OBSERVATION_MODES = {
+    "posix_spawn_bad_env_failure_non_destructive",
+    "posix_spawn_bad_env_preflight_unknown_non_destructive",
+    "posix_spawn_preflight_unavailable_bad_env_delegates",
+    "posix_spawn_bad_argv_failure_non_destructive",
+    "posix_spawn_failure_non_destructive",
+    "posix_spawnp_bad_env_failure_non_destructive",
+    "posix_spawnp_bad_env_preflight_unknown_non_destructive",
+    "posix_spawnp_preflight_unavailable_bad_env_delegates",
+    "posix_spawnp_bad_argv_failure_non_destructive",
+}
+
 FALLBACK_EXECVP_MODES = {
     "no_duplicate_ld_preload_execvpe_path_fallback",
     "execvp_enotdir_enoent_fallback",
@@ -264,6 +281,10 @@ def require_native_reference(args, proc):
             f"native reference failed with {proc.returncode}\n{proc.stdout}")
     mode = args.mode
     output = proc.stdout
+    if mode in SPAWN_OBSERVATION_MODES:
+        observation = parse_spawn_observation(output)
+        require_valid_spawn_observation(observation, "native")
+        return observation
     if mode in {
         "execve_bad_env_failure_non_destructive",
         "execve_bad_env_preflight_unknown_non_destructive",
@@ -335,6 +356,36 @@ def require_native_reference(args, proc):
             f"native PATH reference missed child\n{output}")
 
 
+def parse_spawn_observation(output):
+    match = re.search(
+        r"spawn_observation operation=(?P<operation>\S+) "
+        r"result=(?P<result>-?\d+) errno=(?P<errno>-?\d+) "
+        r"pid_created=(?P<pid_created>[01]) "
+        r"invalid_success=(?P<invalid_success>[01]) "
+        r"wait_status=(?P<wait_status>-?\d+) "
+        r"child_exit=(?P<child_exit>-?\d+) "
+        r"child_signal=(?P<child_signal>-?\d+) "
+        r"wait_errno=(?P<wait_errno>-?\d+) "
+        r"continued_sink=(?P<continued_sink>\d+)",
+        output,
+    )
+    require(match is not None, f"missing spawn observation\n{output}")
+    observation = match.groupdict()
+    for name in observation:
+        if name != "operation":
+            observation[name] = int(observation[name])
+    return observation
+
+
+def require_valid_spawn_observation(observation, label):
+    require(observation["pid_created"] == int(observation["result"] == 0),
+            f"{label} spawn child creation did not follow its return value\n"
+            f"{observation}")
+    require(not observation["invalid_success"],
+            f"{label} posix_spawn returned success without a usable child PID\n"
+            f"{observation}")
+
+
 def install_path_fixture(tmpdir: Path, exe: Path):
     bindir = tmpdir / "bin"
     bindir.mkdir()
@@ -379,7 +430,7 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
     if preload:
         env["LD_PRELOAD"] = str(Path(args.libpeak).resolve())
         env["PEAK_TARGET"] = TARGET
-        env["PEAK_STATSLOG_PATH"] = str(tmpdir / "peak_stats")
+        env["PEAK_STATSLOG_PATH"] = "peak_stats"
         env["PEAK_HEARTBEAT_INTERVAL"] = "0"
         env["PEAK_TEXT_OUTPUT"] = "0"
     else:
@@ -400,7 +451,7 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
         "execve_child_peak_env_only_injection",
         "posix_spawn_child_peak_env_only_injection",
     }:
-        env["EXEC_CHAIN_CHILD_STATS_PREFIX"] = str(tmpdir / "peak_stats")
+        env["EXEC_CHAIN_CHILD_STATS_PREFIX"] = "peak_stats"
     if args.mode == "exec_checkpoint_disabled":
         env["PEAK_EXEC_CHECKPOINT"] = "0"
     if args.mode == "execve_propagate_disabled":
@@ -412,8 +463,14 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
     if args.mode in {
         "execve_env_build_failure_passthrough",
         "posix_spawn_env_build_failure_passthrough",
+        "posix_spawnp_env_build_failure_passthrough",
     }:
         env["PEAK_TEST_EXEC_ENV_BUILD_FAIL"] = "1"
+    if args.mode in {
+        "posix_spawn_resolver_null_preserves_errno",
+        "posix_spawnp_resolver_null_preserves_errno",
+    }:
+        env["PEAK_TEST_EXEC_SPAWN_RESOLVER_NULL"] = "1"
     if args.mode in PREFLIGHT_UNAVAILABLE_MODES | PREFLIGHT_UNKNOWN_BAD_ENV_MODES:
         env["PEAK_TEST_EXEC_PREFLIGHT_UNAVAILABLE"] = "1"
     if args.mode in PREFLIGHT_ALL_UNAVAILABLE_MODES:
@@ -464,9 +521,16 @@ def run_fixture(args, tmpdir: Path, preload=True):
 
 
 def csv_files(tmpdir: Path):
-    all_csv = sorted(tmpdir.glob("peak_stats-p*.csv"))
-    exec_files = [path for path in all_csv if "-exec" in path.name]
-    final_files = [path for path in all_csv if "-exec" not in path.name]
+    stats_name = re.compile(
+        r"^(?:peak_stats|peak_statslog)-p\d+(?P<checkpoint>-exec\d+)?\.csv$"
+    )
+    all_csv = sorted(tmpdir.glob("*.csv"))
+    matched_csv = [(path, stats_name.fullmatch(path.name)) for path in all_csv]
+    unexpected_csv = [path for path, match in matched_csv if match is None]
+    require(not unexpected_csv,
+            f"unexpected CSV artifacts in {tmpdir}: {unexpected_csv}")
+    exec_files = [path for path, match in matched_csv if match["checkpoint"]]
+    final_files = [path for path, match in matched_csv if not match["checkpoint"]]
     return exec_files, final_files
 
 
@@ -479,6 +543,46 @@ def target_count(paths, function=TARGET):
                 if row.get("function") == function:
                     total += int(row.get("count", "0"))
     return total
+
+
+def require_bad_env_artifacts(mode, final_files, exec_files, operation):
+    require(final_files, f"missing final CSV after bad-env {operation}")
+    if mode in PREFLIGHT_UNKNOWN_BAD_ENV_MODES:
+        require(len(final_files) == 1,
+                f"expected one final CSV after preflight-unknown {operation}: "
+                f"{final_files}")
+    require(target_count(final_files) >= 6,
+            f"normal final CSV missed calls after bad-env {operation}")
+    require(not exec_files,
+            f"bad-env {operation} should not write exec checkpoints: {exec_files}")
+
+
+def require_spawn_observation(args, output, final_files, exec_files,
+                              native_observation):
+    observation = parse_spawn_observation(output)
+    require(native_observation is not None,
+            f"missing native spawn reference for {args.mode}")
+    require_valid_spawn_observation(native_observation, "native")
+    require_valid_spawn_observation(observation, "PEAK")
+    require(observation == native_observation,
+            "PEAK spawn behavior diverged from the same-host native reference\n"
+            f"native={native_observation}\npeak={observation}\n{output}")
+    require(observation["continued_sink"] >= 6,
+            f"parent did not continue profiling after spawn call\n{output}")
+    if observation["pid_created"]:
+        require(observation["wait_status"] >= 0,
+                f"created spawn child was not waited\n{output}")
+        require(observation["wait_errno"] == 0,
+                f"waiting for created spawn child failed\n{output}")
+    else:
+        require(observation["wait_status"] == -1,
+                f"spawn reported no child but recorded a wait status\n{output}")
+    require(len(final_files) == 1,
+            f"expected exactly one final CSV after spawn failure: {final_files}")
+    require(target_count(final_files) >= 6,
+            "normal final CSV missed calls after spawn failure")
+    require(not exec_files,
+            f"spawn failure should not write exec checkpoints: {exec_files}")
 
 
 def require_ld_count(output, expected):
@@ -495,7 +599,7 @@ def require_single_ld_env(output):
             f"expected one LD_PRELOAD env entry\n{output}")
 
 
-def check_common(args, proc, tmpdir: Path):
+def check_common(args, proc, tmpdir: Path, native_observation=None):
     output = proc.stdout
     exec_files, final_files = csv_files(tmpdir)
 
@@ -552,6 +656,7 @@ def check_common(args, proc, tmpdir: Path):
         "execvp_empty_path_component",
         "helper_named_exec_still_checkpointed",
         "execvpe_caller_path_child_env_ignored",
+        "execve_child_peak_env_only_injection",
         "execve_child_chain_disabled",
         "execve_child_propagate_disabled",
         "fork_child_exec_parent_exec",
@@ -589,15 +694,26 @@ def check_common(args, proc, tmpdir: Path):
     if args.mode in {
         "execve_env_build_failure_passthrough",
         "posix_spawn_env_build_failure_passthrough",
+        "posix_spawnp_env_build_failure_passthrough",
     }:
         require_ld_count(output, 0)
-        expected_marker = (
-            "custom-env"
-            if args.mode == "execve_env_build_failure_passthrough"
-            else "posix-spawn-env"
-        )
+        expected_marker = {
+            "execve_env_build_failure_passthrough": "custom-env",
+            "posix_spawn_env_build_failure_passthrough": "posix-spawn-env",
+            "posix_spawnp_env_build_failure_passthrough": "posix-spawnp-env",
+        }[args.mode]
         require(f"marker={expected_marker}" in output,
                 f"original envp was not passed through\n{output}")
+
+    if args.mode in {
+        "posix_spawn_resolver_null_preserves_errno",
+        "posix_spawnp_resolver_null_preserves_errno",
+    }:
+        expected_path_search = "1" if args.mode.startswith("posix_spawnp_") else "0"
+        require(
+            f"posix_spawn_resolver_null_ok path_search={expected_path_search}" in output,
+            f"spawn resolver-null fallback did not preserve errno\n{output}",
+        )
 
     if args.mode in {
         "execve_custom_env_injection",
@@ -812,11 +928,7 @@ def check_common(args, proc, tmpdir: Path):
     }:
         require(f"execve_bad_env_errno={errno.EFAULT}" in output,
                 f"missing execve bad-env marker\n{output}")
-        require(final_files, "missing final CSV after bad-env execve")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after bad-env execve")
-        require(not exec_files,
-                f"bad-env execve should not write exec checkpoints: {exec_files}")
+        require_bad_env_artifacts(args.mode, final_files, exec_files, "execve")
 
     if args.mode == "execve_bad_argv_failure_non_destructive":
         require(f"execve_bad_argv_errno={errno.EFAULT}" in output,
@@ -833,11 +945,7 @@ def check_common(args, proc, tmpdir: Path):
     }:
         require(f"fexecve_bad_env_errno={errno.EFAULT}" in output,
                 f"missing fexecve bad-env marker\n{output}")
-        require(final_files, "missing final CSV after bad-env fexecve")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after bad-env fexecve")
-        require(not exec_files,
-                f"bad-env fexecve should not write exec checkpoints: {exec_files}")
+        require_bad_env_artifacts(args.mode, final_files, exec_files, "fexecve")
 
     if args.mode == "fexecve_bad_argv_failure_non_destructive":
         require(f"fexecve_bad_argv_errno={errno.EFAULT}" in output,
@@ -854,11 +962,7 @@ def check_common(args, proc, tmpdir: Path):
     }:
         require(f"execveat_bad_env_errno={errno.EFAULT}" in output,
                 f"missing execveat bad-env marker\n{output}")
-        require(final_files, "missing final CSV after bad-env execveat")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after bad-env execveat")
-        require(not exec_files,
-                f"bad-env execveat should not write exec checkpoints: {exec_files}")
+        require_bad_env_artifacts(args.mode, final_files, exec_files, "execveat")
 
     if args.mode == "execveat_bad_argv_failure_non_destructive":
         require(f"execveat_bad_argv_errno={errno.EFAULT}" in output,
@@ -869,50 +973,12 @@ def check_common(args, proc, tmpdir: Path):
         require(not exec_files,
                 f"bad-argv execveat should not write exec checkpoints: {exec_files}")
 
-    if args.mode == "posix_spawn_failure_non_destructive":
-        require(f"posix_spawn_failure_result={errno.ENOENT}" in output,
-                f"missing posix_spawn failure marker\n{output}")
-        require(final_files, "missing final CSV after failed posix_spawn")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after failed posix_spawn")
-
-    if args.mode in {
-        "posix_spawn_bad_env_failure_non_destructive",
-        "posix_spawn_bad_env_preflight_unknown_non_destructive",
-        "posix_spawn_preflight_unavailable_bad_env_delegates",
-        "posix_spawnp_bad_env_failure_non_destructive",
-        "posix_spawnp_bad_env_preflight_unknown_non_destructive",
-        "posix_spawnp_preflight_unavailable_bad_env_delegates",
-    }:
-        marker = (
-            f"posix_spawnp_bad_env_result={errno.EFAULT}"
-            if args.mode.startswith("posix_spawnp_")
-            else f"posix_spawn_bad_env_result={errno.EFAULT}"
-        )
-        require(marker in output,
-                f"missing spawn bad-env marker\n{output}")
-        require(final_files, "missing final CSV after spawn bad-env")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after spawn bad-env")
-        require(not exec_files,
-                f"spawn bad-env should not write exec checkpoints: {exec_files}")
-
-    if args.mode in {
-        "posix_spawn_bad_argv_failure_non_destructive",
-        "posix_spawnp_bad_argv_failure_non_destructive",
-    }:
-        marker = (
-            f"posix_spawnp_bad_argv_result={errno.EFAULT}"
-            if args.mode.startswith("posix_spawnp_")
-            else f"posix_spawn_bad_argv_result={errno.EFAULT}"
-        )
-        require(marker in output,
-                f"missing spawn bad-argv marker\n{output}")
-        require(final_files, "missing final CSV after spawn bad-argv")
-        require(target_count(final_files) >= 6,
-                "normal final CSV missed calls after spawn bad-argv")
-        require(not exec_files,
-                f"spawn bad-argv should not write exec checkpoints: {exec_files}")
+    if args.mode in SPAWN_OBSERVATION_MODES:
+        require_spawn_observation(args,
+                                  output,
+                                  final_files,
+                                  exec_files,
+                                  native_observation)
 
     if args.mode in {
         "posix_spawnp_path_search",
@@ -964,14 +1030,15 @@ def main():
         dir=os.getcwd(),
     ) as tmp:
         tmpdir = Path(tmp)
-        if args.mode in NATIVE_REFERENCE_MODES:
+        native_observation = None
+        if args.mode in NATIVE_REFERENCE_MODES | SPAWN_OBSERVATION_MODES:
             native_proc = run_fixture(args, tmpdir / "native", preload=False)
-            require_native_reference(args, native_proc)
+            native_observation = require_native_reference(args, native_proc)
         peak_tmp = tmpdir / "peak"
         peak_tmp.mkdir()
         proc = run_fixture(args, peak_tmp, preload=True)
         try:
-            check_common(args, proc, peak_tmp)
+            check_common(args, proc, peak_tmp, native_observation)
         except Exception:
             sys.stdout.write(proc.stdout)
             for path in sorted(peak_tmp.glob("*")):
