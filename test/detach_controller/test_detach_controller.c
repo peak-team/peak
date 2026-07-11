@@ -1,5 +1,5 @@
-#include "peak_detach_controller.h"
-#include "peak_signal_policy.h"
+#include "detach_controller.h"
+#include "signal_policy.h"
 
 #include <dirent.h>
 #include <errno.h>

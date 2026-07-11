@@ -1,6 +1,6 @@
 #include "syscall_interceptor.h"
 #include "general_listener.h"
-#include "peak_logging.h"
+#include "logging.h"
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)

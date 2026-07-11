@@ -22,7 +22,7 @@ def main():
     frida_cmake = read(root, "cmake/frida-gum.cmake")
     peak_api = read(root, "cmake/peak-gum/frida-gum-peak-api.h")
     gum_overlay = read(root, "cmake/peak-gum/gum_peak_pc_api.c")
-    helper = read(root, "src/peak_detach_helper.c")
+    helper = read(root, "src/detach_helper.c")
 
     require("aarch64" in top_cmake and "arm64" in top_cmake,
             "top-level CMake must enable the detach helper on Linux arm64/aarch64")

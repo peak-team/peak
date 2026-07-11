@@ -95,6 +95,24 @@ def require_order(body, *needles):
         offset = next_offset
 
 
+def read_general_listener_source(repo_root):
+    source = (repo_root / "src" / "general_listener.c").read_text(
+        encoding="utf-8")
+
+    def include_fragment(match):
+        fragment = match.group(1)
+        return (
+            repo_root / "src" / "general_listener" / fragment
+        ).read_text(encoding="utf-8")
+
+    return re.sub(
+        r'^#include "general_listener/([^"]+\.inc)"$',
+        include_fragment,
+        source,
+        flags=re.MULTILINE,
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: check_cuda_interceptor_consistency.py <repo-root>",
@@ -104,8 +122,7 @@ def main():
     repo_root = pathlib.Path(sys.argv[1]).resolve()
     cuda = (repo_root / "src" / "cuda_interceptor.cpp").read_text(
         encoding="utf-8")
-    general = (repo_root / "src" / "general_listener.c").read_text(
-        encoding="utf-8")
+    general = read_general_listener_source(repo_root)
     support_sources = {
         "src/dlopen_interceptor.c": ["dlopen"],
         "src/mpi_interceptor.c": ["PMPI_Finalize"],

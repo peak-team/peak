@@ -2,19 +2,19 @@ add_subdirectory(utils)
 add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 
 # Add all source files
-FILE(GLOB sources_peak
-    peak.c
-    general_listener.c
-    peak_logging.c
-    pthread_listener.c
-    peak_detach_controller.c
-    peak_signal_policy.c
-    unsafe_gum_prologue.c
-    peak_jit_provider.c
-    syscall_interceptor.c
+set(sources_peak
     dlopen_interceptor.c
+    general_listener.c
     malloc_interceptor.c
     malloc_otf2.c
+    peak.c
+    detach_controller.c
+    jit_provider.c
+    logging.c
+    signal_policy.c
+    pthread_listener.c
+    syscall_interceptor.c
+    unsafe_gum_prologue.c
 )
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
@@ -64,7 +64,7 @@ else()
 endif()
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
-    add_executable(peak_detach_helper peak_detach_helper.c)
+    add_executable(peak_detach_helper detach_helper.c)
     target_include_directories(peak_detach_helper
         PRIVATE
             ${PROJECT_SOURCE_DIR}/include

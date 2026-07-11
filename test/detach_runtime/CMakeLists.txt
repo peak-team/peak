@@ -25,7 +25,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 if(TARGET peak_detach_helper)
-  add_executable(test_peak_detach_helper ${PROJECT_SOURCE_DIR}/src/peak_detach_helper.c)
+  add_executable(test_peak_detach_helper ${PROJECT_SOURCE_DIR}/src/detach_helper.c)
   target_include_directories(test_peak_detach_helper
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include

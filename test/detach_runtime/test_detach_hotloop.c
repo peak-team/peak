@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "frida-gum.h"
 #include "general_listener.h"
-#include "peak_detach_controller.h"
+#include "detach_controller.h"
 
 #include <aio.h>
 #include <dlfcn.h>

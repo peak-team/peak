@@ -3,8 +3,8 @@
 
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
-#include "peak_detach_controller.h"
-#include "peak_logging.h"
+#include "detach_controller.h"
+#include "logging.h"
 
 #include <errno.h>
 #include <pthread.h>

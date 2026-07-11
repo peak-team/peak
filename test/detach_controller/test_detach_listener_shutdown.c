@@ -1,5 +1,5 @@
 #include "general_listener.h"
-#include "peak_detach_controller.h"
+#include "detach_controller.h"
 #include "pthread_listener.h"
 
 #include <stdbool.h>

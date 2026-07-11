@@ -15,9 +15,9 @@
 #endif
 
 #include "general_listener.h"
-#include "peak_detach_controller.h"
-#include "peak_jit_provider.h"
-#include "peak_logging.h"
+#include "detach_controller.h"
+#include "internal/jit_provider.h"
+#include "logging.h"
 #include "pthread_listener.h"
 #include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"

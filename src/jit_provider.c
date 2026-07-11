@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
-#include "peak_jit_provider.h"
-#include "peak_general_listener_internal.h"
+#include "internal/jit_provider.h"
+#include "internal/general_listener_internal.h"
 
 #include <ctype.h>
 #include <errno.h>

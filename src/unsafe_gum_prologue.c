@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "unsafe_gum_prologue.h"
+#include "internal/unsafe_gum_prologue.h"
 
 #include <stdint.h>
 #include <string.h>

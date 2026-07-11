@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 
-#include "peak_detach_helper_protocol.h"
+#include "detach_helper_protocol.h"
 
 #include <errno.h>
 #include <limits.h>
