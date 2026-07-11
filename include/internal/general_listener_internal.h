@@ -20,4 +20,7 @@ gboolean peak_general_listener_dynamic_symbol_matches_any_target(
     const char* symbol_name,
     const char* provider_name);
 
+gboolean peak_general_listener_checkpoint_for_exec(
+    unsigned long long checkpoint_index);
+
 #endif /* __PEAK_GENERAL_LISTENER_INTERNAL_H */

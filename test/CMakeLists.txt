@@ -127,6 +127,7 @@ if(BUILD_TESTING)
     set(PEAK_TARGET_CONFIG_PATH ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf)
 
     add_subdirectory(utils)
+    add_subdirectory(exec_chain)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
     add_subdirectory(dlopen_controller)

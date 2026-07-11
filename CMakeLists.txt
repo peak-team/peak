@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
-project(peak C CXX Fortran)
+project(peak C CXX Fortran ASM)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")

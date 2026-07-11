@@ -15,7 +15,12 @@ set(sources_peak
     pthread_listener.c
     syscall_interceptor.c
     unsafe_gum_prologue.c
+    exec_memory.c
+    exec_interceptor.c
+    exec_raw_syscall.c
+    exec_raw_syscall_trampoline.S
 )
+
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
 )

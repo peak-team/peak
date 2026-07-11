@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/exec_raw_syscall.h"
 #include "internal/signal_policy_internal.h"
 #include "utils/utils.h"
 
@@ -1913,24 +1914,42 @@ peak_signal_policy_forward_syscall(long number,
     return real_syscall_fn(number, a1, a2, a3, a4, a5, a6);
 }
 
+/*
+ * The exported syscall symbol is an architecture trampoline.  libc exposes
+ * it as variadic, so a C definition with six mandatory arguments is invalid
+ * for callers such as syscall(SYS_getpid).  The trampoline preserves the
+ * platform call frame/register layout and enters this fixed-width dispatcher.
+ */
 __attribute__((visibility("default"))) long
-peak_signal_policy_syscall(long number,
-                           long a1,
-                           long a2,
-                           long a3,
-                           long a4,
-                           long a5,
-                           long a6) __asm__("syscall");
+peak_signal_policy_syscall_dispatch(long number,
+                                    long a1,
+                                    long a2,
+                                    long a3,
+                                    long a4,
+                                    long a5,
+                                    long a6);
 
 __attribute__((visibility("default"))) long
-peak_signal_policy_syscall(long number,
-                           long a1,
-                           long a2,
-                           long a3,
-                           long a4,
-                           long a5,
-                           long a6)
+peak_signal_policy_syscall_dispatch(long number,
+                                    long a1,
+                                    long a2,
+                                    long a3,
+                                    long a4,
+                                    long a5,
+                                    long a6)
 {
+    long exec_result;
+
+    if (peak_exec_raw_syscall_handle(number,
+                                     a1,
+                                     a2,
+                                     a3,
+                                     a4,
+                                     a5,
+                                     a6,
+                                     &exec_result)) {
+        return exec_result;
+    }
     peak_signal_policy_ensure_real_symbols();
     if (real_syscall_fn == NULL) {
         errno = ENOSYS;

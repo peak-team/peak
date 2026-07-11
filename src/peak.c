@@ -16,6 +16,8 @@
 
 #include "general_listener.h"
 #include "detach_controller.h"
+#include "exec_interceptor.h"
+#include "internal/general_listener_internal.h"
 #include "internal/jit_provider.h"
 #include "logging.h"
 #include "pthread_listener.h"
@@ -110,6 +112,11 @@ static int found_MPI;
 static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
 static _Atomic int peak_runtime_active = 0;
+static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
+static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
+#define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
+#define PEAK_EXEC_CHECKPOINT_GATE_READERS \
+    (PEAK_EXEC_CHECKPOINT_GATE_CLOSING - 1U)
 typedef enum {
     PEAK_FINI_NOT_STARTED = 0,
     PEAK_FINI_IN_PROGRESS = 1,
@@ -117,6 +124,109 @@ typedef enum {
 } PeakFiniState;
 
 static _Atomic int peak_fini_state = PEAK_FINI_NOT_STARTED;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_test_checkpoint_reader_pause = 0;
+static _Atomic int peak_test_checkpoint_reader_held = 0;
+static _Atomic int peak_test_checkpoint_reader_released = 0;
+static _Atomic int peak_test_fini_waiting_for_reader = 0;
+
+void peak_fini(void);
+
+PEAK_EXEC_API void
+peak_test_fini(void)
+{
+    peak_fini();
+}
+
+PEAK_EXEC_API void
+peak_test_checkpoint_reader_pause_enable(void)
+{
+    atomic_store_explicit(&peak_test_checkpoint_reader_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_checkpoint_reader_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_fini_waiting_for_reader,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_checkpoint_reader_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_EXEC_API int
+peak_test_checkpoint_reader_is_held(void)
+{
+    return atomic_load_explicit(&peak_test_checkpoint_reader_held,
+                                memory_order_acquire);
+}
+
+PEAK_EXEC_API void
+peak_test_checkpoint_reader_release(void)
+{
+    atomic_store_explicit(&peak_test_checkpoint_reader_released,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_EXEC_API int
+peak_test_fini_waiting_for_checkpoint_reader(void)
+{
+    return atomic_load_explicit(&peak_test_fini_waiting_for_reader,
+                                memory_order_acquire);
+}
+
+static void
+peak_test_checkpoint_reader_pause_after_acquire(void)
+{
+    if (atomic_load_explicit(&peak_test_checkpoint_reader_pause,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+
+    atomic_store_explicit(&peak_test_checkpoint_reader_held,
+                          1,
+                          memory_order_release);
+    while (atomic_load_explicit(&peak_test_checkpoint_reader_released,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+}
+#endif
+
+static int
+peak_exec_checkpoint_reader_acquire(void)
+{
+    unsigned int observed =
+        atomic_load_explicit(&peak_exec_checkpoint_gate,
+                             memory_order_acquire);
+
+    for (;;) {
+        if ((observed & PEAK_EXEC_CHECKPOINT_GATE_CLOSING) != 0 ||
+            (observed & PEAK_EXEC_CHECKPOINT_GATE_READERS) ==
+                PEAK_EXEC_CHECKPOINT_GATE_READERS) {
+            return 0;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &peak_exec_checkpoint_gate,
+                &observed,
+                observed + 1U,
+                memory_order_acq_rel,
+                memory_order_acquire)) {
+            return 1;
+        }
+    }
+}
+
+static void
+peak_exec_checkpoint_reader_release(void)
+{
+    atomic_fetch_sub_explicit(&peak_exec_checkpoint_gate,
+                              1U,
+                              memory_order_release);
+}
 
 static gboolean
 peak_env_value_truthy(const char* value)
@@ -742,6 +852,19 @@ void peak_fini()
             PEAK_FINI_IN_PROGRESS,
             memory_order_acq_rel,
             memory_order_acquire)) {
+        atomic_fetch_or_explicit(&peak_exec_checkpoint_gate,
+                                 PEAK_EXEC_CHECKPOINT_GATE_CLOSING,
+                                 memory_order_acq_rel);
+        while ((atomic_load_explicit(&peak_exec_checkpoint_gate,
+                                     memory_order_acquire) &
+                PEAK_EXEC_CHECKPOINT_GATE_READERS) != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            atomic_store_explicit(&peak_test_fini_waiting_for_reader,
+                                  1,
+                                  memory_order_release);
+#endif
+            sched_yield();
+        }
         peak_fini_impl();
         atomic_store_explicit(&peak_fini_state,
                               PEAK_FINI_DONE,
@@ -753,6 +876,53 @@ void peak_fini()
            PEAK_FINI_IN_PROGRESS) {
         sched_yield();
     }
+}
+
+PEAK_EXEC_API int
+peak_runtime_is_active_for_checkpoint(void)
+{
+    return atomic_load_explicit(&peak_runtime_active,
+                                memory_order_acquire) != 0 &&
+           atomic_load_explicit(&peak_fini_state,
+                                memory_order_acquire) == PEAK_FINI_NOT_STARTED;
+}
+
+PEAK_EXEC_API int
+peak_checkpoint_for_exec(const char* path, char* const argv[])
+{
+    int saved_errno = errno;
+    unsigned long long checkpoint_index;
+    gboolean wrote;
+
+    (void)path;
+    (void)argv;
+
+    if (!peak_runtime_is_active_for_checkpoint()) {
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (!peak_exec_checkpoint_reader_acquire()) {
+        errno = saved_errno;
+        return -1;
+    }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_test_checkpoint_reader_pause_after_acquire();
+#endif
+    if (!peak_runtime_is_active_for_checkpoint()) {
+        peak_exec_checkpoint_reader_release();
+        errno = saved_errno;
+        return -1;
+    }
+
+    checkpoint_index =
+        atomic_fetch_add_explicit(&peak_exec_checkpoint_counter,
+                                  1,
+                                  memory_order_acq_rel) + 1;
+    wrote = peak_general_listener_checkpoint_for_exec(checkpoint_index);
+    peak_exec_checkpoint_reader_release();
+    errno = saved_errno;
+    return wrote ? 0 : -1;
 }
 
 #if defined(__APPLE__)

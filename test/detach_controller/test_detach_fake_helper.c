@@ -76,8 +76,13 @@ static int
 environment_is_sanitized(void)
 {
     extern char** environ;
+    int saw_exec_chain_disabled = 0;
 
     for (size_t i = 0; environ != NULL && environ[i] != NULL; i++) {
+        if (strcmp(environ[i], "PEAK_EXEC_CHAIN=0") == 0) {
+            saw_exec_chain_disabled = 1;
+            continue;
+        }
         if (strncmp(environ[i], "PEAK_", 5) == 0 ||
             strncmp(environ[i], "LD_PRELOAD=", 11) == 0 ||
             strncmp(environ[i], "LD_AUDIT=", 9) == 0) {
@@ -85,7 +90,7 @@ environment_is_sanitized(void)
         }
     }
 
-    return 1;
+    return saw_exec_chain_disabled;
 }
 
 static void

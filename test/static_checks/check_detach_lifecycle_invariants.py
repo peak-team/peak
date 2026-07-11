@@ -1307,6 +1307,9 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_policy = (repo_root / "src/signal_policy.c").read_text(
         encoding="utf-8"
     )
+    syscall_trampoline = (
+        repo_root / "src/exec_raw_syscall_trampoline.S"
+    ).read_text(encoding="utf-8")
     signal_public_header = (
         repo_root / "include/signal_policy.h"
     ).read_text(encoding="utf-8")
@@ -1475,8 +1478,9 @@ def check_signal_backend_strict_invariants(repo_root):
         require(f'__attribute__((visibility("default"))) int\n{wrapper}' in signal_policy or
                 f'__attribute__((visibility("default"))) void (*{wrapper}' in signal_policy,
                 f"signal policy must export {wrapper}")
-    require('__asm__("syscall")' in signal_policy and
-            "peak_signal_policy_syscall" in signal_policy and
+    require("peak_signal_policy_syscall_dispatch" in signal_policy and
+            ".globl syscall" in syscall_trampoline and
+            "peak_signal_policy_syscall_dispatch" in syscall_trampoline and
             "peak_signal_policy_safe_read" in signal_policy and
             "/proc/self/maps" not in signal_policy and
             "SYS_pread64" in signal_policy and
