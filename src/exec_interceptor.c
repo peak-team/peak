@@ -2179,11 +2179,19 @@ posix_spawn(pid_t* pid,
             char* const argv[],
             char* const envp[])
 {
+    int entry_errno = errno;
     peak_posix_spawn_fn fn = peak_real_posix_spawn();
     PeakExecEnv built_env = {0};
     char* const* spawn_envp;
     int result;
-    int entry_errno = errno;
+    int spawn_errno;
+
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (getenv("PEAK_TEST_EXEC_SPAWN_RESOLVER_NULL") != NULL) {
+        errno = EIO;
+        fn = NULL;
+    }
+#endif
 
     if (fn == NULL) {
         errno = entry_errno;
@@ -2192,23 +2200,17 @@ posix_spawn(pid_t* pid,
     PeakExecPreflightResult preflight_result =
         peak_exec_args_readable(path, argv, envp);
     if (preflight_result != PEAK_EXEC_PREFLIGHT_VALID) {
-        int preflight_errno = errno;
-
-        if (preflight_result == PEAK_EXEC_PREFLIGHT_INVALID &&
-            preflight_errno == EFAULT) {
-            errno = entry_errno;
-            return EFAULT;
-        }
-        result = fn(pid, path, file_actions, attrp, argv, envp);
         errno = entry_errno;
-        return result;
+        return fn(pid, path, file_actions, attrp, argv, envp);
     }
     if (peak_exec_prepare(path, argv, envp, &built_env, 0) != 0) {
-        spawn_envp = envp;
+        peak_exec_env_clear(&built_env);
         errno = entry_errno;
+        return fn(pid, path, file_actions, attrp, argv, envp);
     } else {
         spawn_envp = peak_exec_env_to_use(&built_env, envp);
     }
+    errno = entry_errno;
     peak_exec_spawn_depth++;
     result = fn(pid,
                 path,
@@ -2216,9 +2218,10 @@ posix_spawn(pid_t* pid,
                 attrp,
                 argv,
                 (char* const*)spawn_envp);
+    spawn_errno = errno;
     peak_exec_spawn_depth--;
     peak_exec_env_clear(&built_env);
-    errno = entry_errno;
+    errno = spawn_errno;
     return result;
 }
 
@@ -2230,11 +2233,19 @@ posix_spawnp(pid_t* pid,
              char* const argv[],
              char* const envp[])
 {
+    int entry_errno = errno;
     peak_posix_spawnp_fn fn = peak_real_posix_spawnp();
     PeakExecEnv built_env = {0};
     char* const* spawn_envp;
     int result;
-    int entry_errno = errno;
+    int spawn_errno;
+
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (getenv("PEAK_TEST_EXEC_SPAWN_RESOLVER_NULL") != NULL) {
+        errno = EIO;
+        fn = NULL;
+    }
+#endif
 
     if (fn == NULL) {
         errno = entry_errno;
@@ -2243,23 +2254,17 @@ posix_spawnp(pid_t* pid,
     PeakExecPreflightResult preflight_result =
         peak_exec_args_readable(file, argv, envp);
     if (preflight_result != PEAK_EXEC_PREFLIGHT_VALID) {
-        int preflight_errno = errno;
-
-        if (preflight_result == PEAK_EXEC_PREFLIGHT_INVALID &&
-            preflight_errno == EFAULT) {
-            errno = entry_errno;
-            return EFAULT;
-        }
-        result = fn(pid, file, file_actions, attrp, argv, envp);
         errno = entry_errno;
-        return result;
+        return fn(pid, file, file_actions, attrp, argv, envp);
     }
     if (peak_exec_prepare(file, argv, envp, &built_env, 0) != 0) {
-        spawn_envp = envp;
+        peak_exec_env_clear(&built_env);
         errno = entry_errno;
+        return fn(pid, file, file_actions, attrp, argv, envp);
     } else {
         spawn_envp = peak_exec_env_to_use(&built_env, envp);
     }
+    errno = entry_errno;
     peak_exec_spawn_depth++;
     result = fn(pid,
                 file,
@@ -2267,8 +2272,9 @@ posix_spawnp(pid_t* pid,
                 attrp,
                 argv,
                 (char* const*)spawn_envp);
+    spawn_errno = errno;
     peak_exec_spawn_depth--;
     peak_exec_env_clear(&built_env);
-    errno = entry_errno;
+    errno = spawn_errno;
     return result;
 }

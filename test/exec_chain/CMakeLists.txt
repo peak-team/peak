@@ -103,7 +103,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         posix_spawn_child_peak_env_only_injection
         posix_spawn_chain_disabled
         posix_spawn_failure_non_destructive
+        posix_spawn_resolver_null_preserves_errno
         posix_spawnp_path_search
+        posix_spawnp_env_build_failure_passthrough
+        posix_spawnp_resolver_null_preserves_errno
         posix_spawnp_empty_path_component
         posix_spawnp_child_env_path_ignored
         posix_spawnp_preflight_unavailable_delegates

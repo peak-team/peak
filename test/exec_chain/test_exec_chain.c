@@ -406,7 +406,9 @@ invalid_envp_for_test(void)
 static char* const*
 invalid_argv_for_test(void)
 {
-    return (char* const*)(uintptr_t)1;
+    static char* const argv[] = {(char*)(uintptr_t)1, NULL};
+
+    return argv;
 }
 
 static void
@@ -1254,6 +1256,58 @@ run_posix_spawn_null_env(const char* self)
 }
 
 static int
+finish_spawn_observation(const char* operation,
+                         int result,
+                         int saved_errno,
+                         pid_t pid)
+{
+    int status = -1;
+    int wait_errno = 0;
+    int child_created = result == 0;
+    int invalid_success = 0;
+    int child_exit = -1;
+    int child_signal = 0;
+
+    if (child_created && pid <= 0) {
+        invalid_success = 1;
+    } else if (child_created) {
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            wait_errno = errno;
+            status = -1;
+            break;
+        }
+        if (status >= 0) {
+            if (WIFEXITED(status)) {
+                child_exit = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                child_signal = WTERMSIG(status);
+            }
+        }
+    }
+
+    call_hot_target(4);
+    printf("spawn_observation operation=%s result=%d errno=%d "
+           "pid_created=%d invalid_success=%d wait_status=%d "
+           "child_exit=%d child_signal=%d "
+           "wait_errno=%d continued_sink=%lu\n",
+           operation,
+           result,
+           saved_errno,
+           child_created,
+           invalid_success,
+           status,
+           child_exit,
+           child_signal,
+           wait_errno,
+           peak_exec_chain_sink);
+    fflush(stdout);
+    return 0;
+}
+
+static int
 run_posix_spawn_bad_env(const char* self)
 {
     pid_t pid = -1;
@@ -1268,20 +1322,7 @@ run_posix_spawn_bad_env(const char* self)
                          NULL,
                          argv,
                          invalid_envp_for_test());
-    if (getenv("PEAK_TARGET") != NULL && errno != EDOM) {
-        fprintf(stderr, "posix_spawn_bad_env_errno=%d\n", errno);
-        return 157;
-    }
-    if (result != EFAULT) {
-        fprintf(stderr, "posix_spawn_bad_env_result=%d\n", result);
-        return 158;
-    }
-    call_hot_target(4);
-    printf("posix_spawn_bad_env_result=%d continued sink=%lu\n",
-           result,
-           peak_exec_chain_sink);
-    fflush(stdout);
-    return 0;
+    return finish_spawn_observation("posix_spawn_bad_env", result, errno, pid);
 }
 
 static int
@@ -1298,20 +1339,7 @@ run_posix_spawn_bad_argv(const char* self)
                          NULL,
                          invalid_argv_for_test(),
                          environ);
-    if (getenv("PEAK_TARGET") != NULL && errno != EDOM) {
-        fprintf(stderr, "posix_spawn_bad_argv_errno=%d\n", errno);
-        return 158;
-    }
-    if (result != EFAULT) {
-        fprintf(stderr, "posix_spawn_bad_argv_result=%d\n", result);
-        return 159;
-    }
-    call_hot_target(4);
-    printf("posix_spawn_bad_argv_result=%d continued sink=%lu\n",
-           result,
-           peak_exec_chain_sink);
-    fflush(stdout);
-    return 0;
+    return finish_spawn_observation("posix_spawn_bad_argv", result, errno, pid);
 }
 
 static int
@@ -1546,22 +1574,14 @@ run_posix_spawn_failure(const char* self)
     int result;
 
     call_hot_target(2);
+    errno = EDOM;
     result = posix_spawn(&pid,
                          "/definitely/not/found",
                          NULL,
                          NULL,
                          argv,
                          environ);
-    if (result != ENOENT) {
-        fprintf(stderr, "posix_spawn_failure_bad_result=%d\n", result);
-        return 138;
-    }
-    call_hot_target(4);
-    printf("posix_spawn_failure_result=%d continued sink=%lu\n",
-           result,
-           peak_exec_chain_sink);
-    fflush(stdout);
-    return 0;
+    return finish_spawn_observation("posix_spawn_failure", result, errno, pid);
 }
 
 static int
@@ -1583,6 +1603,72 @@ run_posix_spawnp_path_search(void)
         return 139;
     }
     return wait_for_child(pid);
+}
+
+static int
+run_posix_spawnp_custom_env(void)
+{
+    pid_t pid = -1;
+    char* const argv[] = {
+        (char*)"test_exec_chain",
+        (char*)"child-print-ld",
+        NULL
+    };
+    char** envp = make_minimal_child_env("posix-spawnp-env");
+    int result;
+
+    call_hot_target(5);
+    errno = EDOM;
+    result = posix_spawnp(&pid, "test_exec_chain", NULL, NULL, argv, envp);
+    if (getenv("PEAK_TARGET") != NULL && errno != EDOM) {
+        fprintf(stderr, "posix_spawnp_custom_env_errno=%d\n", errno);
+        return 173;
+    }
+    if (result != 0) {
+        fprintf(stderr, "posix_spawnp_custom_env_failed=%d\n", result);
+        return 174;
+    }
+    return wait_for_child(pid);
+}
+
+static int
+run_posix_spawn_resolver_null(const char* self, int use_path_search)
+{
+    pid_t pid = -1;
+    char* const spawn_argv[] = {(char*)self, (char*)"child-basic", NULL};
+    char* const spawnp_argv[] = {
+        (char*)"test_exec_chain",
+        (char*)"child-basic",
+        NULL
+    };
+    int result;
+
+    call_hot_target(2);
+    errno = EDOM;
+    result = use_path_search ?
+        posix_spawnp(&pid,
+                     "test_exec_chain",
+                     NULL,
+                     NULL,
+                     spawnp_argv,
+                     environ) :
+        posix_spawn(&pid, self, NULL, NULL, spawn_argv, environ);
+    if (result != ENOSYS || errno != EDOM || pid != -1) {
+        fprintf(stderr,
+                "posix_spawn_resolver_null_bad result=%d errno=%d pid=%ld "
+                "path_search=%d\n",
+                result,
+                errno,
+                (long)pid,
+                use_path_search);
+        return 175;
+    }
+    call_hot_target(4);
+    printf("posix_spawn_resolver_null_ok path_search=%d sink=%lu\n",
+           use_path_search,
+           peak_exec_chain_sink);
+    fflush(stdout);
+    return 0;
 }
 
 static int
@@ -1626,20 +1712,7 @@ run_posix_spawnp_bad_env(void)
                           NULL,
                           argv,
                           invalid_envp_for_test());
-    if (getenv("PEAK_TARGET") != NULL && errno != EDOM) {
-        fprintf(stderr, "posix_spawnp_bad_env_errno=%d\n", errno);
-        return 167;
-    }
-    if (result != EFAULT) {
-        fprintf(stderr, "posix_spawnp_bad_env_result=%d\n", result);
-        return 171;
-    }
-    call_hot_target(4);
-    printf("posix_spawnp_bad_env_result=%d continued sink=%lu\n",
-           result,
-           peak_exec_chain_sink);
-    fflush(stdout);
-    return 0;
+    return finish_spawn_observation("posix_spawnp_bad_env", result, errno, pid);
 }
 
 static int
@@ -1656,20 +1729,7 @@ run_posix_spawnp_bad_argv(void)
                           NULL,
                           invalid_argv_for_test(),
                           environ);
-    if (getenv("PEAK_TARGET") != NULL && errno != EDOM) {
-        fprintf(stderr, "posix_spawnp_bad_argv_errno=%d\n", errno);
-        return 168;
-    }
-    if (result != EFAULT) {
-        fprintf(stderr, "posix_spawnp_bad_argv_result=%d\n", result);
-        return 172;
-    }
-    call_hot_target(4);
-    printf("posix_spawnp_bad_argv_result=%d continued sink=%lu\n",
-           result,
-           peak_exec_chain_sink);
-    fflush(stdout);
-    return 0;
+    return finish_spawn_observation("posix_spawnp_bad_argv", result, errno, pid);
 }
 
 static int
@@ -2467,6 +2527,15 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "posix-spawnp-path-search") == 0) {
         return run_posix_spawnp_path_search();
+    }
+    if (strcmp(argv[1], "posix-spawnp-custom-env") == 0) {
+        return run_posix_spawnp_custom_env();
+    }
+    if (strcmp(argv[1], "posix-spawn-resolver-null") == 0) {
+        return run_posix_spawn_resolver_null(argv[0], 0);
+    }
+    if (strcmp(argv[1], "posix-spawnp-resolver-null") == 0) {
+        return run_posix_spawn_resolver_null(argv[0], 1);
     }
     if (strcmp(argv[1], "posix-spawnp-child-env-path-ignored") == 0) {
         return run_posix_spawnp_child_env_path_ignored();
