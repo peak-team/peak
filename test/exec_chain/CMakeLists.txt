@@ -116,6 +116,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         posix_spawnp_bad_argv_failure_non_destructive
         posix_spawn_explicit_peak_env_preserved
         exec_checkpoint_concurrent_fini_callbacks
+        exec_checkpoint_fork_child_fini
         text_output_not_corrupted)
 
     if(PEAK_TEST_HAVE_EXECVEAT)
@@ -133,6 +134,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     if(PEAK_TEST_HAVE_POSIX_SPAWN_USEVFORK)
         list(APPEND _PEAK_EXEC_CHAIN_TESTS posix_spawn_usevfork_custom_env)
     endif()
+
+    add_test(NAME test_exec_chain_check_contracts
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_exec_chain_check_contracts.py)
+    set_tests_properties(test_exec_chain_check_contracts
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "OK"
+            TIMEOUT 10)
 
     foreach(_peak_exec_test IN LISTS _PEAK_EXEC_CHAIN_TESTS)
         add_test(NAME test_${_peak_exec_test}
