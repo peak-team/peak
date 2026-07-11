@@ -20,6 +20,20 @@ peak_stats_csv_path(void)
     return g_strdup(out_csv);
 }
 
+#ifdef HAVE_MPI
+_Static_assert(sizeof(uint64_t) * CHAR_BIT == 64,
+               "PEAK MPI reporting requires an exact 64-bit uint64_t");
+#if defined(PEAK_HAVE_MPI_UINT64_T)
+#define PEAK_MPI_UINT64_DATATYPE MPI_UINT64_T
+#elif UINT64_MAX == ULONG_MAX
+#define PEAK_MPI_UINT64_DATATYPE MPI_UNSIGNED_LONG
+#elif UINT64_MAX == ULLONG_MAX
+#define PEAK_MPI_UINT64_DATATYPE MPI_UNSIGNED_LONG_LONG
+#else
+#error No exact MPI datatype fallback is available for uint64_t
+#endif
+#endif
+
 static void
 peak_stats_csv_unlink(void)
 {
@@ -45,10 +59,34 @@ static FILE* peak_stats_csv_open(void) {
     return fp;
 }
 
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(HAVE_MPI)
+typedef PeakMpiReportTestTuple PeakReportRankTuple;
+#else
+typedef struct {
+    gboolean accounting_valid;
+    unsigned int local_ranks;
+    uint64_t stop_window_count;
+    uint64_t failed_stop_window_count;
+    double elapsed_seconds;
+    double profile_seconds;
+    double control_seconds;
+    double management_seconds;
+    double control_risk_seconds;
+    double profile_control_risk_seconds;
+    double profile_ratio;
+    double control_ratio;
+    double profile_control_risk_ratio;
+    double control_risk_ratio;
+    double management_ratio;
+    double ratio;
+} PeakReportRankTuple;
+#endif
+
 typedef struct {
     gboolean valid;
     gboolean accounting_valid;
     gboolean per_rank_max;
+    unsigned int local_ranks;
     uint64_t stop_window_count;
     uint64_t failed_stop_window_count;
     double elapsed_seconds;
@@ -57,13 +95,55 @@ typedef struct {
     double profile_seconds;
     double control_seconds;
     double management_seconds;
+    double control_risk_seconds;
+    double profile_control_risk_seconds;
     double profile_ratio;
     double control_ratio;
     double profile_control_risk_ratio;
     double control_risk_ratio;
     double management_ratio;
     double ratio;
+    PeakReportRankTuple per_rank_max_reports[6];
+    int per_rank_max_owner_ranks[6];
 } PeakReportOverhead;
+
+static void
+peak_general_listener_print_mpi_maximum_reports(
+    const PeakReportRankTuple maximum[6],
+    const int owner_rank[6])
+{
+    peak_log_report("[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[0], maximum[0].profile_seconds,
+                    maximum[0].control_seconds,
+                    maximum[0].elapsed_seconds,
+                    maximum[0].ratio);
+    peak_log_report("[peak] per-rank maximum profile overhead: owner_rank=%d profile_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[1], maximum[1].profile_seconds,
+                    maximum[1].elapsed_seconds,
+                    maximum[1].profile_ratio);
+    peak_log_report("[peak] per-rank maximum control overhead: owner_rank=%d control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[2], maximum[2].control_seconds,
+                    maximum[2].elapsed_seconds,
+                    maximum[2].control_ratio);
+    peak_log_report("[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[4], maximum[4].profile_seconds,
+                    maximum[4].control_seconds,
+                    maximum[4].local_ranks,
+                    maximum[4].control_risk_seconds,
+                    maximum[4].profile_control_risk_seconds,
+                    maximum[4].elapsed_seconds,
+                    maximum[4].profile_control_risk_ratio);
+    peak_log_report("[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[5], maximum[5].control_seconds,
+                    maximum[5].local_ranks,
+                    maximum[5].control_risk_seconds,
+                    maximum[5].elapsed_seconds,
+                    maximum[5].control_risk_ratio);
+    peak_log_report("[peak] per-rank maximum heartbeat management overhead: owner_rank=%d cpu_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
+                    owner_rank[3], maximum[3].management_seconds,
+                    maximum[3].elapsed_seconds,
+                    maximum[3].management_ratio);
+}
 
 static void
 peak_general_listener_export_csv_result(gulong* sum_num_calls,
@@ -142,6 +222,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     double stop_window_ratio = 0.0;
     double elapsed_seconds = peak_main_time;
     gboolean accounting_valid = FALSE;
+    int stop_window_owner_rank = -1;
     size_t detached_targets = 0;
     size_t reattached_targets = 0;
     size_t revisited_targets = 0;
@@ -153,6 +234,10 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
         failed_stop_window_count = report_overhead->failed_stop_window_count;
         stop_window_seconds = report_overhead->control_seconds;
         elapsed_seconds = report_overhead->elapsed_seconds;
+        if (report_overhead->per_rank_max) {
+            stop_window_owner_rank =
+                report_overhead->per_rank_max_owner_ranks[0];
+        }
     } else {
         accounting_valid =
             peak_general_listener_runtime_accounting_snapshot(
@@ -234,18 +319,9 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
         peak_log_report("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
         if (report_overhead != NULL && report_overhead->valid) {
             if (report_overhead->per_rank_max) {
-                peak_log_report("[peak] per-rank maximum profile+control overhead ratio: %.9f\n",
-                                report_overhead->ratio);
-                peak_log_report("[peak] per-rank maximum profile overhead ratio: %.9f\n",
-                                report_overhead->profile_ratio);
-                peak_log_report("[peak] per-rank maximum control overhead ratio: %.9f\n",
-                                report_overhead->control_ratio);
-                peak_log_report("[peak] per-rank maximum profile+control risk overhead ratio: %.9f\n",
-                                report_overhead->profile_control_risk_ratio);
-                peak_log_report("[peak] per-rank maximum control risk overhead ratio: %.9f\n",
-                                report_overhead->control_risk_ratio);
-                peak_log_report("[peak] per-rank maximum heartbeat management overhead ratio: %.9f\n",
-                                report_overhead->management_ratio);
+                peak_general_listener_print_mpi_maximum_reports(
+                    report_overhead->per_rank_max_reports,
+                    report_overhead->per_rank_max_owner_ranks);
             } else {
                 unsigned int report_local_ranks =
                     peak_general_listener_local_mpi_ranks();
@@ -273,11 +349,19 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                 report_overhead->management_ratio);
             }
         }
-        peak_log_report("[peak] %s control stop-window overhead: windows=%llu wall_seconds=%.9f ratio=%.9f\n",
-                        rank_count > 1 ? "rank-0/local" : "local",
-                        (unsigned long long)stop_window_count,
-                        stop_window_seconds,
-                        stop_window_ratio);
+        if (stop_window_owner_rank >= 0) {
+            peak_log_report("[peak] owner/local control stop-window overhead: owner_rank=%d windows=%llu wall_seconds=%.9f ratio=%.9f\n",
+                            stop_window_owner_rank,
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio);
+        } else {
+            peak_log_report("[peak] %s control stop-window overhead: windows=%llu wall_seconds=%.9f ratio=%.9f\n",
+                            rank_count > 1 ? "rank-0/local" : "local",
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio);
+        }
         peak_log_report("[peak] %s failed control windows: windows=%llu snapshot_valid=%d\n",
                         rank_count > 1 ? "aggregate" : "local",
                         (unsigned long long)failed_stop_window_count,
@@ -429,6 +513,24 @@ peak_general_listener_profile_seconds_from_calls(gulong* sum_num_calls)
     return profile_seconds;
 }
 
+static void
+peak_general_listener_populate_report_risk_fields(PeakReportOverhead* report)
+{
+    double profile_control_risk_seconds = DBL_MAX;
+
+    if (report == NULL) {
+        return;
+    }
+    report->local_ranks = peak_general_listener_local_mpi_ranks();
+    report->control_risk_seconds =
+        peak_general_listener_control_risk_seconds(report->control_seconds);
+    (void)peak_general_listener_add_nonnegative_finite(
+        report->profile_seconds,
+        report->control_risk_seconds,
+        &profile_control_risk_seconds);
+    report->profile_control_risk_seconds = profile_control_risk_seconds;
+}
+
 static PeakReportOverhead
 peak_general_listener_local_report_overhead(gulong* sum_num_calls)
 {
@@ -443,6 +545,8 @@ peak_general_listener_local_report_overhead(gulong* sum_num_calls)
             .valid = TRUE,
             .accounting_valid =
                 peak_general_listener_final_report_snapshot.accounting_valid,
+            .local_ranks =
+                peak_general_listener_final_report_snapshot.local_ranks,
             .stop_window_count =
                 peak_general_listener_final_report_snapshot.stop_window_count,
             .failed_stop_window_count =
@@ -459,6 +563,10 @@ peak_general_listener_local_report_overhead(gulong* sum_num_calls)
                 peak_general_listener_final_report_snapshot.control_seconds,
             .management_seconds =
                 peak_general_listener_final_report_snapshot.management_seconds,
+            .control_risk_seconds =
+                peak_general_listener_final_report_snapshot.control_risk_seconds,
+            .profile_control_risk_seconds =
+                peak_general_listener_final_report_snapshot.profile_control_risk_seconds,
             .profile_ratio =
                 peak_general_listener_final_report_snapshot.profile_ratio,
             .control_ratio =
@@ -514,6 +622,7 @@ peak_general_listener_local_report_overhead(gulong* sum_num_calls)
             overhead.management_seconds / elapsed_seconds;
     }
     overhead.valid = TRUE;
+    peak_general_listener_populate_report_risk_fields(&overhead);
     return overhead;
 }
 
@@ -2060,6 +2169,228 @@ peak_mpi_reduce_checked(const void* sendbuf,
     return peak_mpi_wait_collective_request(&request, label);
 }
 
+static gboolean
+peak_mpi_bcast_checked(void* buffer,
+                       int count,
+                       MPI_Datatype datatype,
+                       int root,
+                       const char* label)
+{
+    if (peak_mpi_reducer_forced_failure(label)) {
+        g_printerr("[peak] MPI reducer test hook forced failure for %s; abandoning MPI reducer without touching MPI again\n",
+                   label);
+        peak_general_listener_mark_mpi_reducer_failed_closed();
+        return FALSE;
+    }
+
+    MPI_Request request = MPI_REQUEST_NULL;
+    int mpi_result = MPI_Ibcast(buffer,
+                                count,
+                                datatype,
+                                root,
+                                MPI_COMM_WORLD,
+                                &request);
+    if (mpi_result != MPI_SUCCESS) {
+        g_printerr("[peak] MPI_Ibcast for %s failed; abandoning MPI reducer\n",
+                   label);
+        peak_general_listener_mark_mpi_reducer_failed_closed();
+        return FALSE;
+    }
+    return peak_mpi_wait_collective_request(&request, label);
+}
+
+static PeakReportRankTuple
+peak_general_listener_report_rank_tuple(const PeakReportOverhead* report)
+{
+    PeakReportRankTuple tuple = {0};
+
+    if (report == NULL) {
+        return tuple;
+    }
+    tuple.accounting_valid = report->accounting_valid;
+    tuple.local_ranks = report->local_ranks;
+    tuple.stop_window_count = report->stop_window_count;
+    tuple.failed_stop_window_count = report->failed_stop_window_count;
+    tuple.elapsed_seconds = report->elapsed_seconds;
+    tuple.profile_seconds = report->profile_seconds;
+    tuple.control_seconds = report->control_seconds;
+    tuple.management_seconds = report->management_seconds;
+    tuple.control_risk_seconds = report->control_risk_seconds;
+    tuple.profile_control_risk_seconds =
+        report->profile_control_risk_seconds;
+    tuple.profile_ratio = report->profile_ratio;
+    tuple.control_ratio = report->control_ratio;
+    tuple.profile_control_risk_ratio = report->profile_control_risk_ratio;
+    tuple.control_risk_ratio = report->control_risk_ratio;
+    tuple.management_ratio = report->management_ratio;
+    tuple.ratio = report->ratio;
+    return tuple;
+}
+
+static gboolean
+peak_mpi_bcast_report_rank_tuple(PeakReportRankTuple* tuple, int owner_rank)
+{
+    int accounting_valid;
+    unsigned int local_ranks;
+    uint64_t count_fields[2];
+    double second_and_ratio_fields[12];
+
+    if (tuple == NULL) {
+        return FALSE;
+    }
+    accounting_valid = tuple->accounting_valid ? 1 : 0;
+    local_ranks = tuple->local_ranks;
+    count_fields[0] = tuple->stop_window_count;
+    count_fields[1] = tuple->failed_stop_window_count;
+    second_and_ratio_fields[0] = tuple->elapsed_seconds;
+    second_and_ratio_fields[1] = tuple->profile_seconds;
+    second_and_ratio_fields[2] = tuple->control_seconds;
+    second_and_ratio_fields[3] = tuple->management_seconds;
+    second_and_ratio_fields[4] = tuple->control_risk_seconds;
+    second_and_ratio_fields[5] = tuple->profile_control_risk_seconds;
+    second_and_ratio_fields[6] = tuple->profile_ratio;
+    second_and_ratio_fields[7] = tuple->control_ratio;
+    second_and_ratio_fields[8] = tuple->profile_control_risk_ratio;
+    second_and_ratio_fields[9] = tuple->control_risk_ratio;
+    second_and_ratio_fields[10] = tuple->management_ratio;
+    second_and_ratio_fields[11] = tuple->ratio;
+
+    if (!peak_mpi_bcast_checked(&accounting_valid,
+                                1,
+                                MPI_INT,
+                                owner_rank,
+                                "profile-control-ratio-tuple-valid") ||
+        !peak_mpi_bcast_checked(&local_ranks,
+                                1,
+                                MPI_UNSIGNED,
+                                owner_rank,
+                                "profile-control-ratio-tuple-local-ranks") ||
+        !peak_mpi_bcast_checked(count_fields,
+                                2,
+                                PEAK_MPI_UINT64_DATATYPE,
+                                owner_rank,
+                                "profile-control-ratio-tuple-counts") ||
+        !peak_mpi_bcast_checked(second_and_ratio_fields,
+                                12,
+                                MPI_DOUBLE,
+                                owner_rank,
+                                "profile-control-ratio-tuple-doubles")) {
+        return FALSE;
+    }
+
+    tuple->accounting_valid = accounting_valid != 0;
+    tuple->local_ranks = local_ranks;
+    tuple->stop_window_count = count_fields[0];
+    tuple->failed_stop_window_count = count_fields[1];
+    tuple->elapsed_seconds = second_and_ratio_fields[0];
+    tuple->profile_seconds = second_and_ratio_fields[1];
+    tuple->control_seconds = second_and_ratio_fields[2];
+    tuple->management_seconds = second_and_ratio_fields[3];
+    tuple->control_risk_seconds = second_and_ratio_fields[4];
+    tuple->profile_control_risk_seconds = second_and_ratio_fields[5];
+    tuple->profile_ratio = second_and_ratio_fields[6];
+    tuple->control_ratio = second_and_ratio_fields[7];
+    tuple->profile_control_risk_ratio = second_and_ratio_fields[8];
+    tuple->control_risk_ratio = second_and_ratio_fields[9];
+    tuple->management_ratio = second_and_ratio_fields[10];
+    tuple->ratio = second_and_ratio_fields[11];
+    return TRUE;
+}
+
+static gboolean
+peak_mpi_reduce_report_rank_tuples(const PeakReportRankTuple* local_tuple,
+                                   PeakReportRankTuple maximum_tuples[6],
+                                   int owner_ranks[6],
+                                   int rank)
+{
+    struct {
+        double value;
+        int rank;
+    } local_locations[6], maximum_locations[6] = {{0}};
+    double ratios[6];
+
+    if (local_tuple == NULL || maximum_tuples == NULL ||
+        owner_ranks == NULL) {
+        return FALSE;
+    }
+    ratios[0] = local_tuple->ratio;
+    ratios[1] = local_tuple->profile_ratio;
+    ratios[2] = local_tuple->control_ratio;
+    ratios[3] = local_tuple->management_ratio;
+    ratios[4] = local_tuple->profile_control_risk_ratio;
+    ratios[5] = local_tuple->control_risk_ratio;
+    for (size_t i = 0; i < G_N_ELEMENTS(local_locations); i++) {
+        local_locations[i].value = ratios[i];
+        local_locations[i].rank = rank;
+    }
+    if (!peak_mpi_reduce_checked(local_locations,
+                                 maximum_locations,
+                                 6,
+                                 MPI_DOUBLE_INT,
+                                 MPI_MAXLOC,
+                                 0,
+                                 "profile-control-ratio-maxloc")) {
+        return FALSE;
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(local_locations); i++) {
+        int owner_rank = rank == 0 ? maximum_locations[i].rank : 0;
+
+        if (!peak_mpi_bcast_checked(&owner_rank,
+                                    1,
+                                    MPI_INT,
+                                    0,
+                                    "profile-control-ratio-owner")) {
+            return FALSE;
+        }
+        if (rank == owner_rank) {
+            maximum_tuples[i] = *local_tuple;
+        }
+        if (!peak_mpi_bcast_report_rank_tuple(&maximum_tuples[i],
+                                              owner_rank)) {
+            return FALSE;
+        }
+        owner_ranks[i] = owner_rank;
+    }
+    return TRUE;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+gboolean
+peak_general_listener_test_reduce_report_tuples(
+    const PeakMpiReportTestTuple* local_tuple,
+    PeakMpiReportTestTuple maximum_tuples[6],
+    int owner_ranks[6])
+{
+    int rank;
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    return peak_mpi_reduce_report_rank_tuples(local_tuple,
+                                              maximum_tuples,
+                                              owner_ranks,
+                                              rank);
+}
+
+void
+peak_general_listener_test_print_report_tuples(
+    const PeakMpiReportTestTuple maximum_tuples[6],
+    const int owner_ranks[6])
+{
+    peak_general_listener_print_mpi_maximum_reports(maximum_tuples,
+                                                    owner_ranks);
+}
+
+int
+peak_general_listener_test_mpi_uint64_type_size(void)
+{
+    int type_size = 0;
+
+    if (MPI_Type_size(PEAK_MPI_UINT64_DATATYPE, &type_size) != MPI_SUCCESS) {
+        return -1;
+    }
+    return type_size;
+}
+#endif
+
 static void
 peak_general_listener_print_rank_local_result(gulong* sum_num_calls,
                                               gdouble* sum_total_time,
@@ -2110,15 +2441,10 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     PeakReportOverhead local_report =
         peak_general_listener_local_report_overhead(sum_num_calls);
-    double local_overhead_ratios[6] = {
-        local_report.ratio,
-        local_report.profile_ratio,
-        local_report.control_ratio,
-        local_report.management_ratio,
-        local_report.profile_control_risk_ratio,
-        local_report.control_risk_ratio
-    };
-    double max_overhead_ratios[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    PeakReportRankTuple local_report_tuple =
+        peak_general_listener_report_rank_tuple(&local_report);
+    PeakReportRankTuple max_ratio_reports[6] = {{0}};
+    int max_ratio_owner_ranks[6] = {0};
     double local_profile_seconds = local_report.profile_seconds;
     double mpi_profile_seconds = 0.0;
     double local_elapsed_seconds = local_report.elapsed_seconds;
@@ -2228,7 +2554,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     if (!peak_mpi_allreduce_checked(slot_hashes,
                                     min_slot_hashes,
                                     peak_hook_address_count,
-                                    MPI_UNSIGNED_LONG_LONG,
+                                    PEAK_MPI_UINT64_DATATYPE,
                                     MPI_MIN,
                                     "hook-slot-min-hash")) {
         g_free(max_slot_hashes);
@@ -2239,7 +2565,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     if (!peak_mpi_allreduce_checked(slot_hashes,
                                     max_slot_hashes,
                                     peak_hook_address_count,
-                                    MPI_UNSIGNED_LONG_LONG,
+                                    PEAK_MPI_UINT64_DATATYPE,
                                     MPI_MAX,
                                     "hook-slot-max-hash")) {
         g_free(max_slot_hashes);
@@ -2271,13 +2597,10 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
                                                       thread_count);
         return FALSE;
     }
-    if (!peak_mpi_reduce_checked(local_overhead_ratios,
-                                 max_overhead_ratios,
-                                 6,
-                                 MPI_DOUBLE,
-                                 MPI_MAX,
-                                 0,
-                                 "profile-control-ratio")) {
+    if (!peak_mpi_reduce_report_rank_tuples(&local_report_tuple,
+                                            max_ratio_reports,
+                                            max_ratio_owner_ranks,
+                                            rank)) {
         goto rank_local;
     }
     if (!peak_mpi_reduce_checked(&local_profile_seconds,
@@ -2292,7 +2615,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     if (!peak_mpi_allreduce_checked(&local_failed_stop_window_count,
                                     &mpi_max_failed_stop_window_count,
                                     1,
-                                    MPI_UNSIGNED_LONG_LONG,
+                                    PEAK_MPI_UINT64_DATATYPE,
                                     MPI_MAX,
                                     "failed-stop-window-max")) {
         goto rank_local;
@@ -2303,7 +2626,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     } else if (!peak_mpi_reduce_checked(&local_failed_stop_window_count,
                                         &mpi_failed_stop_window_count,
                                         1,
-                                        MPI_UNSIGNED_LONG_LONG,
+                                        PEAK_MPI_UINT64_DATATYPE,
                                         MPI_SUM,
                                         0,
                                         "failed-stop-window-count")) {
@@ -2331,20 +2654,28 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     mpi_report.valid = TRUE;
     mpi_report.accounting_valid = all_accounting_valid != 0;
     mpi_report.per_rank_max = TRUE;
-    mpi_report.stop_window_count = local_report.stop_window_count;
+    mpi_report.stop_window_count = max_ratio_reports[0].stop_window_count;
     mpi_report.failed_stop_window_count = mpi_failed_stop_window_count;
-    mpi_report.elapsed_seconds = local_report.elapsed_seconds;
+    mpi_report.elapsed_seconds = max_ratio_reports[0].elapsed_seconds;
     mpi_report.elapsed_min_seconds = mpi_min_elapsed_seconds;
     mpi_report.elapsed_max_seconds = mpi_max_elapsed_seconds;
     mpi_report.profile_seconds = mpi_profile_seconds;
-    mpi_report.control_seconds = local_report.control_seconds;
-    mpi_report.management_seconds = local_report.management_seconds;
-    mpi_report.ratio = max_overhead_ratios[0];
-    mpi_report.profile_ratio = max_overhead_ratios[1];
-    mpi_report.control_ratio = max_overhead_ratios[2];
-    mpi_report.management_ratio = max_overhead_ratios[3];
-    mpi_report.profile_control_risk_ratio = max_overhead_ratios[4];
-    mpi_report.control_risk_ratio = max_overhead_ratios[5];
+    mpi_report.control_seconds = max_ratio_reports[0].control_seconds;
+    mpi_report.management_seconds = max_ratio_reports[0].management_seconds;
+    mpi_report.ratio = max_ratio_reports[0].ratio;
+    mpi_report.profile_ratio = max_ratio_reports[1].profile_ratio;
+    mpi_report.control_ratio = max_ratio_reports[2].control_ratio;
+    mpi_report.management_ratio = max_ratio_reports[3].management_ratio;
+    mpi_report.profile_control_risk_ratio =
+        max_ratio_reports[4].profile_control_risk_ratio;
+    mpi_report.control_risk_ratio = max_ratio_reports[5].control_risk_ratio;
+    memcpy(mpi_report.per_rank_max_reports,
+           max_ratio_reports,
+           sizeof(max_ratio_reports));
+    for (size_t i = 0; i < G_N_ELEMENTS(mpi_report.per_rank_max_owner_ranks);
+         i++) {
+        mpi_report.per_rank_max_owner_ranks[i] = max_ratio_owner_ranks[i];
+    }
     gulong* mpi_sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_max_total_time = g_new0(gdouble, peak_hook_address_count);

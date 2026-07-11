@@ -152,6 +152,34 @@ void peak_general_listener_note_mpi_finalize_requested(void);
 gboolean peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                      char* out,
                                                      size_t out_size);
+
+typedef struct {
+    gboolean accounting_valid;
+    unsigned int local_ranks;
+    uint64_t stop_window_count;
+    uint64_t failed_stop_window_count;
+    double elapsed_seconds;
+    double profile_seconds;
+    double control_seconds;
+    double management_seconds;
+    double control_risk_seconds;
+    double profile_control_risk_seconds;
+    double profile_ratio;
+    double control_ratio;
+    double profile_control_risk_ratio;
+    double control_risk_ratio;
+    double management_ratio;
+    double ratio;
+} PeakMpiReportTestTuple;
+
+PEAK_API gboolean peak_general_listener_test_reduce_report_tuples(
+    const PeakMpiReportTestTuple* local_tuple,
+    PeakMpiReportTestTuple maximum_tuples[6],
+    int owner_ranks[6]);
+PEAK_API void peak_general_listener_test_print_report_tuples(
+    const PeakMpiReportTestTuple maximum_tuples[6],
+    const int owner_ranks[6]);
+PEAK_API int peak_general_listener_test_mpi_uint64_type_size(void);
 #endif
 
 #ifdef PEAK_ENABLE_TEST_HOOKS

@@ -188,6 +188,9 @@ def check_final_report_snapshot_order(repo_root):
     print_text = extract_function(
         general, "peak_general_listener_print_text_result"
     )
+    print_mpi_maxima = extract_function(
+        general, "peak_general_listener_print_mpi_maximum_reports"
+    )
     print_entry = extract_function(general, "peak_general_listener_print")
     local_ranks = extract_function(
         general, "peak_general_listener_local_mpi_ranks"
@@ -239,6 +242,9 @@ def check_final_report_snapshot_order(repo_root):
             "snapshot.profile_control_risk_ratio =" in freeze_report and
             "snapshot.control_risk_ratio =" in freeze_report and
             "peak_general_listener_control_risk_seconds(snapshot.control_seconds)" in freeze_report and
+            "snapshot.local_ranks = peak_general_listener_local_mpi_ranks()" in freeze_report and
+            "snapshot.control_risk_seconds = control_risk_seconds" in freeze_report and
+            "snapshot.profile_control_risk_seconds = profile_control_risk_seconds" in freeze_report and
             "snapshot.profile_seconds / snapshot.elapsed_seconds" in freeze_report and
             "snapshot.control_seconds / snapshot.elapsed_seconds" in freeze_report and
             "(snapshot.profile_seconds + snapshot.control_seconds) /\n            snapshot.elapsed_seconds" in freeze_report,
@@ -284,9 +290,11 @@ def check_final_report_snapshot_order(repo_root):
     require("profile_ratio=%.9f control_ratio=%.9f ratio=%.9f" in print_text,
             "local text output must include explicit profile/control ratio fields")
     require("[peak] local profile+local-rank-control risk: profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u risk_control_seconds=%.9f ratio=%.9f" in print_text and
-            "[peak] per-rank maximum profile+control risk overhead ratio: %.9f" in print_text and
-            "[peak] per-rank maximum profile+control overhead ratio: %.9f" in print_text,
-            "text output must keep strict and separate raw/risk ratio contracts")
+            "[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
+            "[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
+            "[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
+            "peak_general_listener_print_mpi_maximum_reports" in print_text,
+            "text output must keep strict, separate, and owner-consistent raw/risk ratio contracts")
     require("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu" in print_text and
             "rank_count > 1 ? \"aggregate\" : \"local\"" in print_text,
             "final output must expose exact aggregate ever-revisited coverage")
@@ -303,16 +311,36 @@ def check_final_report_snapshot_order(repo_root):
         reduce_result = extract_function(
             general, "peak_general_listener_reduce_result"
         )
-        require("local_report.profile_ratio" in reduce_result and
-                "local_report.control_ratio" in reduce_result and
-                "local_report.profile_control_risk_ratio" in reduce_result and
-                "local_report.control_risk_ratio" in reduce_result and
-                "mpi_report.profile_ratio = max_overhead_ratios[1]" in reduce_result and
-                "mpi_report.control_ratio = max_overhead_ratios[2]" in reduce_result and
-                "mpi_report.profile_control_risk_ratio = max_overhead_ratios[4]" in reduce_result and
-                "mpi_report.control_risk_ratio = max_overhead_ratios[5]" in reduce_result and
-                "max_overhead_ratios,\n                                 6," in reduce_result,
-                "MPI final reporting must reduce raw and risk ratios separately")
+        tuple_reduce = extract_function(
+            general, "peak_mpi_reduce_report_rank_tuples"
+        )
+        require("peak_general_listener_report_rank_tuple(&local_report)" in reduce_result and
+                "peak_mpi_reduce_report_rank_tuples" in reduce_result and
+                "mpi_report.per_rank_max_owner_ranks[i] = max_ratio_owner_ranks[i]" in reduce_result and
+                "local_tuple->profile_ratio" in tuple_reduce and
+                "local_tuple->control_ratio" in tuple_reduce and
+                "local_tuple->profile_control_risk_ratio" in tuple_reduce and
+                "local_tuple->control_risk_ratio" in tuple_reduce and
+                "MPI_DOUBLE_INT" in tuple_reduce and
+                "MPI_MAXLOC" in tuple_reduce and
+                "profile-control-ratio-maxloc" in tuple_reduce and
+                "profile-control-ratio-owner" in tuple_reduce and
+                "peak_mpi_bcast_report_rank_tuple" in tuple_reduce,
+                "MPI final reporting must retain the owner and local tuple for each maximum ratio")
+        tuple_bcast = extract_function(
+            general, "peak_mpi_bcast_report_rank_tuple"
+        )
+        require("MPI_BYTE" not in tuple_bcast and
+                "MPI_INT" in tuple_bcast and
+                "MPI_UNSIGNED" in tuple_bcast and
+                "PEAK_MPI_UINT64_DATATYPE" in tuple_bcast and
+                "MPI_DOUBLE" in tuple_bcast,
+                "MPI report tuples must use field-wise typed broadcasts")
+        require("_Static_assert(sizeof(uint64_t) * CHAR_BIT == 64" in general and
+                "MPI_UINT64_T" in general and
+                "UINT64_MAX == ULONG_MAX" in general and
+                "UINT64_MAX == ULLONG_MAX" in general,
+                "MPI reporting must select an exact uint64 datatype with a compile-time fallback")
         require("local_elapsed_valid" in reduce_result and
                 "\"elapsed-valid\"" in reduce_result and
                 "MPI_MIN" in reduce_result and
