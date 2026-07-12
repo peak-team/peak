@@ -395,6 +395,26 @@ def trace_has_observed_guard_evidence(args, sample):
     return detach_success_seen and over_budget_seen and not reattach_success_seen
 
 
+def trace_has_redetach_after_reattach(args, sample):
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False
+
+    reattach_batch_ids = set()
+    for fields in rows:
+        if (len(fields) < 12 or fields[2] != TARGET_SYMBOL or
+                fields[4] != "success" or fields[5] != "1" or
+                fields[6] != "safe" or fields[11] == "0"):
+            continue
+        if fields[3] == "reattach":
+            reattach_batch_ids.add(fields[11])
+        elif fields[3] == "detach" and any(
+                batch_id != fields[11] for batch_id in reattach_batch_ids):
+            return True
+
+    return False
+
+
 def run_sample(args, sample):
     cmd = [
         args.exe,
@@ -431,6 +451,7 @@ def run_sample(args, sample):
     marker_ok = required_marker.search(output) is not None
     trace_detached = trace_has_success(args, sample, "detach")
     trace_reattached = trace_has_success(args, sample, "reattach")
+    trace_redetached = trace_has_redetach_after_reattach(args, sample)
     trace_detach_batched = trace_has_required_batch(
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
@@ -472,6 +493,7 @@ def run_sample(args, sample):
         not observed_guard_ok or
         not helper_retry_ok or
         (args.require_reattach and not trace_reattached) or
+        (args.require_redetach_after_reattach and not trace_redetached) or
         (args.spawn_transient_threads and spawned_threads <= 0) or
         (args.cold_one_shot_target and
          (cold_marked or not cold_unmarked or cold_trace_transition)) or
@@ -509,6 +531,8 @@ def run_sample(args, sample):
             print("helper STOP snapshot retry was not exercised", file=sys.stderr)
         if args.require_reattach and not trace_reattached:
             print("missing trace reattach success", file=sys.stderr)
+        if args.require_redetach_after_reattach and not trace_redetached:
+            print("missing distinct trace detach after reattach", file=sys.stderr)
         if args.spawn_transient_threads and spawned_threads <= 0:
             print("transient thread spawners did not create workers", file=sys.stderr)
         if args.cold_one_shot_target and cold_marked:
@@ -553,6 +577,7 @@ def main():
     parser.add_argument("--peak-max-threads", type=int, default=0)
     parser.add_argument("--thread-slack", type=int, default=16)
     parser.add_argument("--require-reattach", action="store_true")
+    parser.add_argument("--require-redetach-after-reattach", action="store_true")
     parser.add_argument("--disable-reattach", action="store_false",
                         dest="enable_reattach")
     parser.add_argument("--disable-per-target-heartbeat", action="store_false",
@@ -594,6 +619,8 @@ def main():
         )
         return 2
     if args.require_reattach_batch_size > 0:
+        args.require_reattach = True
+    if args.require_redetach_after_reattach:
         args.require_reattach = True
 
     values = [run_sample(args, sample) for sample in range(args.samples)]

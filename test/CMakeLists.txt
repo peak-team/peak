@@ -308,6 +308,33 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum .* failed"
                 TIMEOUT 45)
 
+        add_test(NAME test_detach_hotloop_signal_wait_stress_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 32
+                    --seconds 6
+                    --samples 2
+                    --timeout 90
+                    --overhead-ratio 0.01
+                    --global-overhead-ratio 0.10
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/signal-wait-stress-trace
+                    --require-reattach
+                    --require-redetach-after-reattach
+                    --require-trace-diagnostics
+                    --detach-backend signal
+                    --spawn-transient-threads
+                    --spawner-threads 4
+                    --peak-max-threads 256
+                    --thread-slack 128
+                    --max-reattach-classify-failed 0)
+        set_tests_properties(test_detach_hotloop_signal_wait_stress_strict
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 210)
+
         add_test(NAME test_detach_hotloop_signal_thread_spawn_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                     --threads 8
