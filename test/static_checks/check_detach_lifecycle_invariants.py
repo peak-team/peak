@@ -1296,6 +1296,12 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_release = extract_function(
         controller, "peak_detach_controller_signal_release"
     )
+    signal_clear_slots = extract_function(
+        controller, "peak_detach_controller_signal_clear_slots"
+    )
+    signal_temp_breakpoint = extract_function(
+        controller, "peak_detach_controller_signal_temp_breakpoint_out_of_range"
+    )
     signal_stop = extract_function(
         controller, "peak_detach_controller_signal_stop_threads"
     )
@@ -1316,6 +1322,39 @@ def check_signal_backend_strict_invariants(repo_root):
             "signal handler must publish PC rewrite success/failure")
     require("rewrite_status" in signal_release and "return FALSE" in signal_release,
             "signal release must fail if an intended PC rewrite did not succeed")
+    require("FUTEX_WAIT | FUTEX_PRIVATE_FLAG" in controller and
+            "FUTEX_WAKE | FUTEX_PRIVATE_FLAG" in controller and
+            "INT_MAX" in controller and
+            ".tv_nsec = 1000000L" in controller,
+            "Linux signal waits must use a bounded private futex wait and wake-all")
+    require("_Static_assert(sizeof(signal_release_epoch) == sizeof(int)" in controller and
+            "_Static_assert(sizeof(int) * CHAR_BIT == 32" in controller and
+            "_Static_assert(_Alignof(_Atomic int) == _Alignof(int)" in controller and
+            "_Static_assert(ATOMIC_INT_LOCK_FREE == 2" in controller and
+            "explicit supported Linux compiler ABI" in controller and
+            "not a universal C11 representation proof" in controller and
+            "peak_detach_controller_signal_release_futex_word()" in controller and
+            "(int*)&signal_release_epoch" not in controller,
+            "Linux futex waits must enforce the supported compiler ABI contract for an always-lock-free, aligned 32-bit word")
+    require("expected_release_epoch" in signal_wait_for_release and
+            "peak_detach_controller_signal_wait_release_epoch(expected_release_epoch)" in signal_wait_for_release and
+            signal_wait_for_release.find("evacuate_epoch") <
+            signal_wait_for_release.find("peak_detach_controller_signal_wait_release_epoch"),
+            "signal wait must check evacuation before a futex wait using the current release word")
+    require(signal_release.find("atomic_store_explicit(&signal_release_epoch, epoch") <
+            signal_release.find("peak_detach_controller_signal_wake_release_waiters"),
+            "release publication must wake signal waiters")
+    require(signal_clear_slots.find("atomic_store_explicit(&signal_release_epoch, 0") <
+            signal_clear_slots.find("peak_detach_controller_signal_wake_release_waiters"),
+            "release reset must wake signal waiters")
+    require(signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
+            signal_temp_breakpoint.find("peak_detach_controller_signal_wake_release_waiters"),
+            "evacuation publication must wake signal waiters")
+    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 3,
+            "signal futex wake-all must occur only after release, reset, and evacuation publications")
+    require(signal_wait_for_release.find("rewrite_epoch") <
+            signal_wait_for_release.find("done_epoch"),
+            "signal PC rewrite must remain ordered before done publication")
     require("peak_detach_controller_signal_release_or_fatal" in controller,
             "signal cleanup failures must use release-or-fatal helper")
     for token in (
@@ -1497,6 +1536,7 @@ def check_signal_backend_strict_invariants(repo_root):
     for test_name in (
         "test_detach_hotloop_signal_strict",
         "test_detach_hotloop_signal_thread_spawn_strict",
+        "test_detach_hotloop_signal_wait_stress_strict",
         "test_detach_hotloop_signal_blocked_delivery_strict",
         "test_detach_hotloop_signal_user_collision_strict",
         "test_detach_hotloop_signal_bad_cookie_strict",
@@ -1523,6 +1563,21 @@ def check_signal_backend_strict_invariants(repo_root):
             "--pthread-gate-race-check" in tests and
             "pthread_gate_race_ok" in tests,
             "missing signal runtime stress CTest runner coverage")
+    signal_wait_stress_begin = tests.find(
+        "add_test(NAME test_detach_hotloop_signal_wait_stress_strict"
+    )
+    signal_wait_stress_end = tests.find(
+        "add_test(NAME test_detach_hotloop_signal_thread_spawn_strict",
+        signal_wait_stress_begin,
+    )
+    signal_wait_stress = tests[signal_wait_stress_begin:signal_wait_stress_end]
+    require(signal_wait_stress_begin >= 0 and signal_wait_stress_end > signal_wait_stress_begin and
+            "--require-redetach-after-reattach" in tests and
+            "--spawn-transient-threads" in tests and
+            "--fail-on-transition-skips" not in signal_wait_stress and
+            "--max-reattach-classify-failed 0" in signal_wait_stress and
+            "trace_has_redetach_after_reattach" in (repo_root / "test/detach_runtime/run_detach_hotloop_trace_check.py").read_text(encoding="utf-8"),
+            "signal wait stress must prove transient-thread reattach/redetach while allowing safe churn-time prepare skips")
     require("--signal-blocked-delivery-check" in runtime_hotloop and
             "blocked_signal_threads" in runtime_hotloop and
             "trace_has_detach_prepare_blocked_signal" in runtime_hotloop and

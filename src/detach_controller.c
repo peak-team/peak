@@ -17,6 +17,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <linux/futex.h>
+#endif
+
 #define PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS 10000
 #define PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS 8192u
 #define PEAK_DETACH_HELPER_PROTOCOL_FD 3
@@ -195,6 +199,27 @@ static _Atomic uint32_t signal_slot_count = 0;
 static gsize strict_gate_wait_timeout_initialized = 0;
 static double strict_gate_wait_timeout_s =
     (double)PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS / 1000.0;
+
+#if defined(__linux__)
+/*
+ * This same-address futex access is an explicit supported Linux compiler ABI
+ * contract for _Atomic int, not a universal C11 representation proof.
+ */
+_Static_assert(sizeof(signal_release_epoch) == sizeof(int),
+               "futex release word must match int storage");
+_Static_assert(sizeof(int) * CHAR_BIT == 32,
+               "Linux futex release word must be exactly 32 bits");
+_Static_assert(_Alignof(_Atomic int) == _Alignof(int),
+               "futex release word must retain int alignment");
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "Linux futex release word must be always lock-free");
+
+static int*
+peak_detach_controller_signal_release_futex_word(void)
+{
+    return (int*)(void*)&signal_release_epoch;
+}
+#endif
 
 static void
 peak_detach_controller_raw_close(int fd)
@@ -1763,14 +1788,60 @@ peak_detach_controller_signal_alloc_slot(pid_t tid, int epoch)
     return slot;
 }
 
+static void
+peak_detach_controller_signal_wait_release_epoch(int expected_release_epoch)
+{
+#if defined(__linux__)
+    const struct timespec timeout = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000L,
+    };
+    int saved_errno = errno;
+
+    /* EINTR, EAGAIN, and ETIMEDOUT are all rechecked by the caller's predicate. */
+    (void)syscall(SYS_futex,
+                  peak_detach_controller_signal_release_futex_word(),
+                  FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                  expected_release_epoch,
+                  &timeout,
+                  NULL,
+                  0);
+    errno = saved_errno;
+#else
+    (void)expected_release_epoch;
+#endif
+}
+
+static void
+peak_detach_controller_signal_wake_release_waiters(void)
+{
+#if defined(__linux__)
+    int saved_errno = errno;
+
+    (void)syscall(SYS_futex,
+                  peak_detach_controller_signal_release_futex_word(),
+                  FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                  INT_MAX,
+                  NULL,
+                  NULL,
+                  0);
+    errno = saved_errno;
+#endif
+}
+
 static gboolean
 peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                                int epoch,
                                                void* context,
                                                gboolean allow_evacuation)
 {
-    while (atomic_load_explicit(&signal_release_epoch, memory_order_acquire) != epoch &&
-           atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) == epoch) {
+    for (;;) {
+        int expected_release_epoch =
+            atomic_load_explicit(&signal_release_epoch, memory_order_acquire);
+        if (expected_release_epoch == epoch ||
+            atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) != epoch) {
+            break;
+        }
         if (allow_evacuation &&
             atomic_load_explicit(&slot->evacuate_epoch, memory_order_acquire) == epoch) {
             atomic_store_explicit(&slot->evacuate_started_epoch,
@@ -1778,7 +1849,7 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                   memory_order_release);
             return FALSE;
         }
-        /* Dependency-free evacuation corridor: wait only on atomic words. */
+        peak_detach_controller_signal_wait_release_epoch(expected_release_epoch);
     }
 
     if (atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) == epoch &&
@@ -2066,6 +2137,7 @@ peak_detach_controller_signal_clear_slots(void)
     atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
     atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
     atomic_store_explicit(&signal_release_epoch, 0, memory_order_release);
+    peak_detach_controller_signal_wake_release_waiters();
 }
 
 static void
@@ -2300,6 +2372,7 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     }
 
     atomic_store_explicit(&signal_release_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_wake_release_waiters();
 
     double deadline = peak_detach_controller_monotonic_second() +
         ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
@@ -2666,6 +2739,7 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
     atomic_store_explicit(&slot->evacuated_epoch, 0, memory_order_release);
     atomic_store_explicit(&slot->evacuate_started_epoch, 0, memory_order_release);
     atomic_store_explicit(&slot->evacuate_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_wake_release_waiters();
 
     double deadline = peak_detach_controller_monotonic_second() +
         ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
