@@ -34,6 +34,16 @@ if(TARGET peak_detach_helper)
     PRIVATE
       PEAK_DETACH_HELPER_ENABLE_TEST_HOOKS=1
   )
+
+  add_executable(test_detach_helper_sigchld_ignored_wrapper
+    test_detach_helper_sigchld_ignored_wrapper.c)
+
+  add_executable(test_detach_helper_ptrace_stop_wait
+    test_detach_helper_ptrace_stop_wait.c)
+  target_include_directories(test_detach_helper_ptrace_stop_wait
+    PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+  )
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)

@@ -91,6 +91,14 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "detach_lifecycle_invariants_ok")
 
+    add_test(NAME test_detach_helper_ptrace_stop_wait
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_detach_helper_ptrace_stop_wait.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_detach_helper_ptrace_stop_wait
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "detach_helper_ptrace_stop_wait_ok")
+
     if(TARGET peak_detach_helper)
         add_test(NAME test_detach_helper_self_test
             COMMAND $<TARGET_FILE:peak_detach_helper> --self-test)
@@ -106,6 +114,13 @@ if(BUILD_TESTING)
                     PASS_REGULAR_EXPRESSION "peak_detach_helper_self_test_ok"
                     FAIL_REGULAR_EXPRESSION "PEAK Library|overhead calibration|Estimated overhead")
         endif()
+
+        add_test(NAME test_detach_helper_ptrace_stop_wait_unit
+            COMMAND $<TARGET_FILE:test_detach_helper_ptrace_stop_wait>)
+        set_tests_properties(test_detach_helper_ptrace_stop_wait_unit
+            PROPERTIES
+                TIMEOUT 2
+                PASS_REGULAR_EXPRESSION "detach_helper_ptrace_stop_wait_unit_ok")
     endif()
 
     configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)
@@ -1014,6 +1029,32 @@ if(BUILD_TESTING)
         set_tests_properties(test_detach_hotloop_helper_thread_spawn_reattach_trace_strict
             PROPERTIES
                 TIMEOUT 210
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                SKIP_RETURN_CODE 77)
+        add_test(NAME test_detach_hotloop_helper_sigchld_ignored_reattach_trace_strict
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 3
+                    --samples 1
+                    --timeout 60
+                    --overhead-ratio 0.01
+                    --global-overhead-ratio 0.10
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-sigchld-ignored-reattach-trace
+                    --require-reattach
+                    --require-trace-diagnostics
+                    --detach-backend helper
+                    --detach-helper $<TARGET_FILE:test_detach_helper_sigchld_ignored_wrapper>
+                    --helper-retry-log-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-sigchld-ignored-reattach-retry
+                    --fail-on-transition-skips
+                    --max-reattach-classify-failed 0
+                    --skip-helper-unavailable)
+        set_tests_properties(test_detach_hotloop_helper_sigchld_ignored_reattach_trace_strict
+            PROPERTIES
+                ENVIRONMENT "TEST_REAL_DETACH_HELPER=$<TARGET_FILE:test_peak_detach_helper>"
+                TIMEOUT 75
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
                 SKIP_RETURN_CODE 77)
         add_test(NAME test_detach_stale_threads_strict

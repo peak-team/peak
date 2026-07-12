@@ -255,7 +255,11 @@ parse_tid_name(const char* name, pid_t* tid_out)
 static int
 wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
 {
+    sigset_t sigchld_mask;
     long deadline = monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
+
+    sigemptyset(&sigchld_mask);
+    sigaddset(&sigchld_mask, SIGCHLD);
 
     if (detach_signal_out != NULL) {
         *detach_signal_out = 0;
@@ -272,11 +276,28 @@ wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
             return -1;
         }
         if (waited == 0) {
-            if (monotonic_milliseconds() >= deadline) {
+            long remaining_ms = deadline - monotonic_milliseconds();
+            struct timespec timeout;
+            int signal_number;
+
+            if (remaining_ms <= 0) {
                 errno = ETIMEDOUT;
                 return -1;
             }
-            usleep(1000);
+
+            timeout.tv_sec = remaining_ms / 1000L;
+            timeout.tv_nsec = (remaining_ms % 1000L) * 1000000L;
+            signal_number = sigtimedwait(&sigchld_mask, NULL, &timeout);
+            if (signal_number == SIGCHLD ||
+                (signal_number < 0 && errno == EINTR)) {
+                continue;
+            }
+            if (signal_number < 0 && errno == EAGAIN) {
+                errno = ETIMEDOUT;
+            }
+            if (signal_number < 0) {
+                return -1;
+            }
             continue;
         }
 
@@ -1327,14 +1348,29 @@ serve_protocol(int fd)
     }
 }
 
+#if !defined(PEAK_DETACH_HELPER_PTRACE_STOP_WAIT_UNIT_TEST)
 int
 main(int argc, char** argv)
 {
     sigset_t empty_mask;
+    sigset_t sigchld_mask;
+    struct sigaction sigchld_action;
 
     signal(SIGPIPE, SIG_IGN);
     sigemptyset(&empty_mask);
     sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+
+    memset(&sigchld_action, 0, sizeof(sigchld_action));
+    sigchld_action.sa_handler = SIG_DFL;
+    sigemptyset(&sigchld_action.sa_mask);
+    if (sigaction(SIGCHLD, &sigchld_action, NULL) != 0) {
+        return 1;
+    }
+    sigemptyset(&sigchld_mask);
+    sigaddset(&sigchld_mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &sigchld_mask, NULL) != 0) {
+        return 1;
+    }
 
     if (argc == 2 && strcmp(argv[1], "--self-test") == 0) {
         puts("peak_detach_helper_self_test_ok");
@@ -1366,3 +1402,4 @@ main(int argc, char** argv)
     return serve_protocol((int)fd);
 #endif
 }
+#endif

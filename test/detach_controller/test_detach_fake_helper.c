@@ -540,6 +540,7 @@ main(int argc, char** argv)
         return 1;
     }
 
+    log_command("START");
     if (send_response((int)fd, PEAK_DETACH_HELPER_STATUS_OK, 0, 0) != 0) {
         log_command("HANDSHAKE_SEND_FAILED");
         fprintf(stderr,
@@ -548,7 +549,6 @@ main(int argc, char** argv)
                 errno);
         return 1;
     }
-    log_command("START");
 
     for (;;) {
         PeakDetachHelperRequest request;
