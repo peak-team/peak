@@ -168,7 +168,7 @@ full output and teardown behavior.
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |
-| `PEAK_REATTACH_COOLDOWN_MS` | Minimum detached time before reattach eligibility. Default: `20000`. |
+| `PEAK_REATTACH_COOLDOWN_MS` | Minimum detached time before reattach eligibility. Default: `60000`. |
 | `PEAK_HB_MIN_US`, `PEAK_HB_MAX_US` | Adaptive heartbeat sleep bounds. Defaults: `10000` and `500000` microseconds. |
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
@@ -274,7 +274,7 @@ toolchains and host capabilities detected during configuration.
   reattach policy input and reporting diagnostic, and is conservative only when
   launcher metadata reports the ranks per node correctly. It is not an MPI-wide
   overhead proof; measured A/B overhead remains authoritative. The current
-  20-second cooldown is provisional under the linked validation standard.
+  60-second cooldown is provisional under the linked validation standard.
 - MPI output and finalization behavior is runtime-sensitive. MPI aggregation is
   the default; Intel MPI may skip the real finalizer after reporting unless
   `PEAK_MPI_REAL_FINALIZE=1` is set. Consult the detach-controller document

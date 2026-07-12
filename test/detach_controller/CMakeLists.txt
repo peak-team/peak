@@ -209,6 +209,13 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict")
 
+  add_test(NAME test_detach_controller_accounting_snapshot_concurrent
+    COMMAND test_detach_controller accounting-snapshot-concurrent)
+  set_tests_properties(test_detach_controller_accounting_snapshot_concurrent
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict"
+      TIMEOUT 10)
+
   function(add_fatal_safe_detach_test test_name test_arg fake_scenario)
     add_test(NAME ${test_name}
       COMMAND ${CMAKE_COMMAND}

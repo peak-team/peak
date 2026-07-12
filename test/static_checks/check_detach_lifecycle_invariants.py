@@ -396,6 +396,15 @@ def check_stop_window_accounting_sidecar(repo_root):
     publish = extract_function(
         source, "peak_detach_controller_publish_stop_window_accounting"
     )
+    accounting_begin = extract_function(
+        source, "peak_detach_controller_accounting_begin_publication"
+    )
+    accounting_end = extract_function(
+        source, "peak_detach_controller_accounting_end_publication"
+    )
+    accounting_add = extract_function(
+        source, "peak_detach_controller_accounting_add_saturated"
+    )
     last_window = extract_function(
         source, "peak_detach_controller_last_stop_window_us"
     )
@@ -530,7 +539,6 @@ def check_stop_window_accounting_sidecar(repo_root):
     snapshot_wall = snapshot.find(
         "snapshot.stop_window_wall_ns ="
     )
-    snapshot_fence = snapshot.find("atomic_thread_fence(memory_order_acquire)")
     snapshot_final_sequence = snapshot.find(
         "sequence_after =\n            atomic_load_explicit"
     )
@@ -544,17 +552,22 @@ def check_stop_window_accounting_sidecar(repo_root):
             snapshot_completed != -1 and
             snapshot_failed != -1 and
             snapshot_wall != -1 and
-            snapshot_fence != -1 and
             snapshot_final_sequence != -1 and
             snapshot_validation != -1 and
             snapshot_success != -1 and
             snapshot_failure != -1 and
             snapshot_bound < snapshot_first_sequence < snapshot_odd_check <
-            snapshot_completed < snapshot_failed < snapshot_wall < snapshot_fence <
+            snapshot_completed < snapshot_failed < snapshot_wall <
             snapshot_final_sequence < snapshot_validation < snapshot_success <
             snapshot_failure and
+            "memory_order_seq_cst" in accounting_begin and
+            "memory_order_seq_cst" in accounting_end and
+            accounting_add.count("memory_order_seq_cst") == 3 and
+            snapshot.count("memory_order_seq_cst") == 5 and
+            "memory_order_relaxed" not in snapshot and
+            "atomic_thread_fence" not in snapshot and
             "UINT64_MAX" not in snapshot,
-            "accounting snapshot must be bounded, lock-free, coherent, and return explicit validity")
+            "accounting snapshot must be bounded, seq_cst coherent, and return explicit validity")
     require("return 0.0;" not in last_window,
             "last_stop_window_us must not be trace-gated")
     require("PEAK_DETACH_TRACE_PATH" in general_trace_init,
@@ -592,9 +605,35 @@ def check_stop_window_accounting_sidecar(repo_root):
             "control_spent_seconds = (double)control_pause_wall_ns / 1e9" in heartbeat and
             "spent_ratio =\n            (profile_spent_seconds + control_spent_seconds) /\n            total_execution_time" in heartbeat,
             "heartbeat spent ratio must add measured workload stop-window seconds")
-    require("peak_general_listener_runtime_accounting_snapshot(\n                    &reattach_accounting)" in heartbeat and
-            "reattach_accounting_valid &&" in heartbeat,
-            "reattach admission must reject a failed accounting snapshot")
+    reattach_before = heartbeat.find("reattach_accounting_before_valid =")
+    reattach_predictor = heartbeat.find("peak_detach_controller_last_stop_window_us()")
+    reattach_after = heartbeat.find("reattach_accounting_after_valid =")
+    reattach_coherent = heartbeat.find("reattach_accounting_coherent =")
+    reattach_budget = heartbeat.find("reattach_accounting_coherent &&")
+    reattach_coherence_contract = heartbeat[
+        reattach_coherent:reattach_budget
+    ]
+    unsaturated_accounting_fields = [
+        f"reattach_accounting_{side}.{field} <\n"
+        "                    (UINT64_MAX - 1)"
+        for side in ("before", "after")
+        for field in (
+            "completed_stop_window_count",
+            "failed_stop_window_count",
+            "stop_window_wall_ns",
+        )
+    ]
+    require(reattach_before != -1 and reattach_predictor != -1 and
+            reattach_after != -1 and reattach_coherent != -1 and
+            reattach_budget != -1 and
+            reattach_before < reattach_predictor < reattach_after <
+            reattach_coherent < reattach_budget and
+            all(field in reattach_coherence_contract
+                for field in unsaturated_accounting_fields) and
+            "reattach_accounting_before.completed_stop_window_count ==\n                    reattach_accounting_after.completed_stop_window_count" in heartbeat and
+            "reattach_accounting_before.failed_stop_window_count ==\n                    reattach_accounting_after.failed_stop_window_count" in heartbeat and
+            "reattach_accounting_before.stop_window_wall_ns ==\n                    reattach_accounting_after.stop_window_wall_ns" in heartbeat,
+            "reattach admission must use unsaturated accounting snapshots that bracket and match the predictor read")
     require("peak_general_listener_accounting_snapshot(&accounting_baseline)" in note_runtime_start and
             "&peak_general_listener_heartbeat_control_baseline_ns" in note_runtime_start and
             "accounting_baseline.stop_window_wall_ns" in note_runtime_start and

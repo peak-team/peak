@@ -540,7 +540,7 @@ state alive if safety still cannot be proven.
 Heartbeat-driven reattach is intentionally rate-limited separately from safety
 retries. A target that was physically detached because profiling overhead was
 too high remains detached for at least `PEAK_REATTACH_COOLDOWN_MS` before the
-heartbeat may reattach it again. The current default is `20000` ms. This avoids
+heartbeat may reattach it again. The current default is `60000` ms. This avoids
 immediate detach/reattach thrashing while still allowing long-running targets
 to be sampled again. Set the cooldown to `0` for aggressive resampling or
 focused reattach tests. See [Heartbeat mechanism and runtime
