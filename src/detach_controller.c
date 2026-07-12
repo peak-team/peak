@@ -3030,7 +3030,7 @@ peak_detach_controller_accounting_begin_publication(void)
 {
     atomic_fetch_add_explicit(&peak_detach_accounting_sequence,
                               1,
-                              memory_order_acq_rel);
+                              memory_order_seq_cst);
 }
 
 static void
@@ -3038,7 +3038,7 @@ peak_detach_controller_accounting_end_publication(void)
 {
     atomic_fetch_add_explicit(&peak_detach_accounting_sequence,
                               1,
-                              memory_order_release);
+                              memory_order_seq_cst);
 }
 
 static void
@@ -3048,7 +3048,7 @@ peak_detach_controller_accounting_add_saturated(
 {
     const unsigned long long max_published = ULLONG_MAX - 1;
     unsigned long long current =
-        atomic_load_explicit(counter, memory_order_relaxed);
+        atomic_load_explicit(counter, memory_order_seq_cst);
 
     for (;;) {
         unsigned long long next = current;
@@ -3061,8 +3061,8 @@ peak_detach_controller_accounting_add_saturated(
         if (atomic_compare_exchange_weak_explicit(counter,
                                                   &current,
                                                   next,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
+                                                  memory_order_seq_cst,
+                                                  memory_order_seq_cst)) {
             return;
         }
     }
@@ -4703,12 +4703,17 @@ peak_detach_controller_accounting_snapshot(
         return FALSE;
     }
 
+    /*
+     * Publication is serialized by the mutation guard. With every sequence
+     * and tuple operation seq_cst, equal even sequence loads bracket a tuple
+     * that cannot overlap a publication in the single global SC order.
+     */
     for (unsigned int attempt = 0;
          attempt < PEAK_DETACH_ACCOUNTING_SNAPSHOT_MAX_ATTEMPTS;
          attempt++) {
         sequence_before =
             atomic_load_explicit(&peak_detach_accounting_sequence,
-                                 memory_order_acquire);
+                                 memory_order_seq_cst);
         if ((sequence_before & 1U) != 0) {
             continue;
         }
@@ -4716,18 +4721,17 @@ peak_detach_controller_accounting_snapshot(
         snapshot.completed_stop_window_count =
             atomic_load_explicit(
                 &peak_detach_accounting_completed_stop_window_count,
-                memory_order_relaxed);
+                memory_order_seq_cst);
         snapshot.failed_stop_window_count =
             atomic_load_explicit(
                 &peak_detach_accounting_failed_stop_window_count,
-                memory_order_relaxed);
+                memory_order_seq_cst);
         snapshot.stop_window_wall_ns =
             atomic_load_explicit(&peak_detach_accounting_stop_window_wall_ns,
-                                 memory_order_relaxed);
-        atomic_thread_fence(memory_order_acquire);
+                                 memory_order_seq_cst);
         sequence_after =
             atomic_load_explicit(&peak_detach_accounting_sequence,
-                                 memory_order_relaxed);
+                                 memory_order_seq_cst);
         if (sequence_before == sequence_after &&
             (sequence_after & 1U) == 0) {
             *out = snapshot;
@@ -4749,6 +4753,20 @@ void
 peak_detach_controller_test_accounting_end_publish(void)
 {
     peak_detach_controller_accounting_end_publication();
+}
+
+void
+peak_detach_controller_test_accounting_update_tuple(
+    unsigned long long elapsed_ns,
+    gboolean completed)
+{
+    peak_detach_controller_accounting_add_saturated(
+        &peak_detach_accounting_stop_window_wall_ns,
+        elapsed_ns);
+    peak_detach_controller_accounting_add_saturated(
+        completed ? &peak_detach_accounting_completed_stop_window_count :
+                    &peak_detach_accounting_failed_stop_window_count,
+        1);
 }
 #endif
 

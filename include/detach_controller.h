@@ -112,6 +112,11 @@ peak_detach_controller_test_accounting_begin_publish(void);
 
 PEAK_DETACH_CONTROLLER_TEST_API void
 peak_detach_controller_test_accounting_end_publish(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_accounting_update_tuple(
+    unsigned long long elapsed_ns,
+    gboolean completed);
 #endif
 
 gboolean peak_detach_controller_finish_hook_mutation(

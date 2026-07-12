@@ -7,8 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -3412,12 +3414,164 @@ run_accounting_snapshot_contention(void)
 #endif
 }
 
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+typedef struct {
+    PeakDetachAccountingSnapshot baseline;
+    PeakDetachAccountingSnapshot accepted;
+    _Atomic int abort_requested;
+    _Atomic int reader_ready;
+    _Atomic int publication_open;
+    _Atomic int odd_rejected;
+    _Atomic int publication_closed;
+    _Atomic int post_close_accepted;
+} AccountingSnapshotConcurrentContext;
+
+static void*
+run_accounting_snapshot_writer(void* user_data)
+{
+    AccountingSnapshotConcurrentContext* context = user_data;
+
+    while (atomic_load_explicit(&context->reader_ready,
+                                memory_order_acquire) == 0) {
+        if (atomic_load_explicit(&context->abort_requested,
+                                 memory_order_acquire) != 0) {
+            return NULL;
+        }
+        sched_yield();
+    }
+
+    peak_detach_controller_test_accounting_begin_publish();
+    peak_detach_controller_test_accounting_update_tuple(7, TRUE);
+    atomic_store_explicit(&context->publication_open,
+                          1,
+                          memory_order_release);
+    while (atomic_load_explicit(&context->odd_rejected,
+                                memory_order_acquire) == 0) {
+        if (atomic_load_explicit(&context->abort_requested,
+                                 memory_order_acquire) != 0) {
+            peak_detach_controller_test_accounting_end_publish();
+            atomic_store_explicit(&context->publication_closed,
+                                  1,
+                                  memory_order_release);
+            return NULL;
+        }
+        sched_yield();
+    }
+    peak_detach_controller_test_accounting_end_publish();
+    atomic_store_explicit(&context->publication_closed,
+                          1,
+                          memory_order_release);
+    return NULL;
+}
+
+static void*
+run_accounting_snapshot_reader(void* user_data)
+{
+    AccountingSnapshotConcurrentContext* context = user_data;
+    PeakDetachAccountingSnapshot snapshot = {
+        .completed_stop_window_count = UINT64_MAX,
+        .failed_stop_window_count = UINT64_MAX,
+        .stop_window_wall_ns = UINT64_MAX
+    };
+
+    atomic_store_explicit(&context->reader_ready, 1, memory_order_release);
+    while (atomic_load_explicit(&context->publication_open,
+                                memory_order_acquire) == 0) {
+        if (atomic_load_explicit(&context->abort_requested,
+                                 memory_order_acquire) != 0) {
+            return NULL;
+        }
+        sched_yield();
+    }
+
+    if (peak_detach_controller_accounting_snapshot(&snapshot)) {
+        atomic_store_explicit(&context->abort_requested,
+                              1,
+                              memory_order_release);
+        return NULL;
+    }
+    atomic_store_explicit(&context->odd_rejected, 1, memory_order_release);
+
+    while (atomic_load_explicit(&context->publication_closed,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    if (peak_detach_controller_accounting_snapshot(&context->accepted)) {
+        atomic_store_explicit(&context->post_close_accepted,
+                              1,
+                              memory_order_release);
+    }
+    return NULL;
+}
+#endif
+
+static int
+run_accounting_snapshot_concurrent(void)
+{
+#if !defined(PEAK_ENABLE_TEST_HOOKS) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    fprintf(stderr,
+            "accounting-snapshot-concurrent requires PEAK_ENABLE_TEST_HOOKS and PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    AccountingSnapshotConcurrentContext context = { 0 };
+    pthread_t writer;
+    pthread_t reader;
+    int create_result;
+
+    if (!check_accounting_snapshot("accounting concurrent baseline",
+                                  &context.baseline)) {
+        return EXIT_FAILURE;
+    }
+    create_result = pthread_create(&reader,
+                                   NULL,
+                                   run_accounting_snapshot_reader,
+                                   &context);
+    check_int("accounting concurrent reader create", create_result, 0);
+    if (create_result != 0) {
+        return EXIT_FAILURE;
+    }
+    create_result = pthread_create(&writer,
+                                   NULL,
+                                   run_accounting_snapshot_writer,
+                                   &context);
+    check_int("accounting concurrent writer create", create_result, 0);
+    if (create_result != 0) {
+        atomic_store_explicit(&context.abort_requested,
+                              1,
+                              memory_order_release);
+        check_int("accounting concurrent reader cleanup join",
+                  pthread_join(reader, NULL),
+                  0);
+        return EXIT_FAILURE;
+    }
+    check_int("accounting concurrent writer join", pthread_join(writer, NULL), 0);
+    check_int("accounting concurrent reader join", pthread_join(reader, NULL), 0);
+    check_true("accounting concurrent reader rejected odd publication",
+               atomic_load_explicit(&context.odd_rejected,
+                                    memory_order_acquire) != 0);
+    check_true("accounting concurrent reader accepted closed publication",
+               atomic_load_explicit(&context.post_close_accepted,
+                                    memory_order_acquire) != 0);
+    check_uint64("accounting concurrent completed tuple",
+                 context.accepted.completed_stop_window_count,
+                 context.baseline.completed_stop_window_count + 1);
+    check_uint64("accounting concurrent failed tuple",
+                 context.accepted.failed_stop_window_count,
+                 context.baseline.failed_stop_window_count);
+    check_uint64("accounting concurrent wall tuple",
+                 context.accepted.stop_window_wall_ns,
+                 context.baseline.stop_window_wall_ns + 7);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
 int
 main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -3500,6 +3654,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "accounting-snapshot-contention") == 0) {
         return run_accounting_snapshot_contention();
+    }
+    if (strcmp(argv[1], "accounting-snapshot-concurrent") == 0) {
+        return run_accounting_snapshot_concurrent();
     }
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);
     return EXIT_FAILURE;

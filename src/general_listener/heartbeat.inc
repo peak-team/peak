@@ -638,20 +638,44 @@ void* peak_heartbeat_monitor(void* arg) {
             double reattach_spent_seconds = 0.0;
             double reattach_risk_spent_ratio = 0.0;
             double headroom_seconds = 0.0;
+            PeakDetachAccountingSnapshot reattach_accounting_before;
+            PeakDetachAccountingSnapshot reattach_accounting_after;
+            gboolean reattach_accounting_before_valid =
+                peak_general_listener_runtime_accounting_snapshot(
+                    &reattach_accounting_before);
             double last_stop_seconds =
                 peak_detach_controller_last_stop_window_us() / 1e6;
             double predicted_batch_stop_seconds = DBL_MAX;
-
-            PeakDetachAccountingSnapshot reattach_accounting;
-            gboolean reattach_accounting_valid =
+            gboolean reattach_accounting_after_valid =
                 peak_general_listener_runtime_accounting_snapshot(
-                    &reattach_accounting);
+                    &reattach_accounting_after);
+            gboolean reattach_accounting_coherent =
+                reattach_accounting_before_valid &&
+                reattach_accounting_after_valid &&
+                reattach_accounting_before.completed_stop_window_count <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_before.failed_stop_window_count <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_before.stop_window_wall_ns <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_after.completed_stop_window_count <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_after.failed_stop_window_count <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_after.stop_window_wall_ns <
+                    (UINT64_MAX - 1) &&
+                reattach_accounting_before.completed_stop_window_count ==
+                    reattach_accounting_after.completed_stop_window_count &&
+                reattach_accounting_before.failed_stop_window_count ==
+                    reattach_accounting_after.failed_stop_window_count &&
+                reattach_accounting_before.stop_window_wall_ns ==
+                    reattach_accounting_after.stop_window_wall_ns;
             double reattach_control_spent_seconds =
                 (double)peak_general_listener_control_wall_ns_since_heartbeat(
-                    &reattach_accounting) / 1e9;
+                    &reattach_accounting_after) / 1e9;
             double reattach_control_risk_seconds = DBL_MAX;
             gboolean reattach_budget_ok =
-                reattach_accounting_valid &&
+                reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
                 peak_general_listener_positive_finite(total_execution_time) &&
                 peak_general_listener_nonnegative_finite(global_target_ratio) &&

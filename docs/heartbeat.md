@@ -240,10 +240,10 @@ runtime overhead proof.
 when the heartbeat is enabled, `PEAK_HIBERNATION_CYCLE` is nonzero, and either
 per-target or global heartbeat policy is enabled.
 
-The default reattach cooldown in the current implementation is 20 seconds:
+The default reattach cooldown in the current implementation is 60 seconds:
 
 ```c
-static const unsigned int peak_reattach_default_cooldown_ms = 20000;
+static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 ```
 
 `peak_general_listener_init_reattach_policy_once()` reads the cooldown before
@@ -516,7 +516,7 @@ The defaults below describe the current implementation.
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | `false` | Enables per-target heartbeat detach and per-target reattach eligibility. |
 | `PEAK_ENABLE_GLOBAL_HEARTBEAT` | `false` | Enables global heartbeat detach and global reattach eligibility. |
 | `PEAK_ENABLE_REATTACH` | enabled when unset | Enables heartbeat reattach when other cadence/policy gates are satisfied. Set false/0 to disable. |
-| `PEAK_REATTACH_COOLDOWN_MS` | `20000` | Minimum time after successful detach before heartbeat may reattach that hook. `0` disables cooldown. |
+| `PEAK_REATTACH_COOLDOWN_MS` | `60000` | Minimum time after successful detach before heartbeat may reattach that hook. `0` disables cooldown. |
 | `PEAK_HB_MIN_US` | `10000` | Lower bound for adaptive heartbeat sleep. |
 | `PEAK_HB_MAX_US` | `500000` | Upper bound for adaptive heartbeat sleep and the reattach future-lease horizon. If less than min, it is raised to min. |
 | `PEAK_HB_K_ERR` | `3.0` | Adaptive-sleep error gain. |
