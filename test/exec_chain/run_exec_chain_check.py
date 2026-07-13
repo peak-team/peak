@@ -155,6 +155,7 @@ MODE_TO_APP_ARG = {
     "posix_spawnp_bad_argv_failure_non_destructive": "posix-spawnp-bad-argv",
     "posix_spawn_explicit_peak_env_preserved": "posix-spawn-explicit-peak-env",
     "exec_checkpoint_concurrent_fini_callbacks": "exec-concurrent-fini-callbacks",
+    "exec_checkpoint_snapshot_lock_contention": "exec-checkpoint-snapshot-lock-contention",
     "exec_checkpoint_fork_child_fini": "exec-checkpoint-fork-child-fini",
     "text_output_not_corrupted": "exec-failure",
 }
@@ -214,6 +215,43 @@ CAPACITY_PASSTHROUGH_MODES = {
     "vfork_env_slots_fallback": ("env-slots", "large-env", 0),
     "vfork_long_preload_fallback": ("long-preload", "postfork-long-preload", 1),
 }
+
+FAILURE_PATH_MODES = {
+    "raw_syscall_execve_failure_non_destructive",
+    "exec_failure_non_destructive",
+    "execvp_enoent_failure",
+    "execvp_enotdir_enoent_failure",
+    "execvp_enotdir_enoent_fallback",
+    "execvp_eacces_failure",
+    "execvp_eacces_fallback",
+    "execvp_enoent_fallback",
+    "text_output_not_corrupted",
+}
+
+CHECKPOINT_OPTIONAL_BASE_MODES = frozenset(
+    set(CAPACITY_PASSTHROUGH_MODES) |
+    FAILURE_PATH_MODES |
+    {"vfork_preload_entries_fallback"}
+)
+
+# Fork/vfork cases exercise the child lifecycle and parent state restoration
+# with the controller active.  The dedicated direct-exec cases below make the
+# best-effort checkpoint deterministic by quiescing before the exec boundary.
+ACTIVE_CONTROLLER_LIFECYCLE_MODES = frozenset(
+    mode for mode in MODE_TO_APP_ARG
+    if mode.startswith(("fork_", "vfork_"))
+)
+CHECKPOINT_OPTIONAL_MODES = frozenset(
+    set(CHECKPOINT_OPTIONAL_BASE_MODES) | ACTIVE_CONTROLLER_LIFECYCLE_MODES
+)
+CHECKPOINT_REQUIRED_MODES = frozenset(
+    set(MODE_TO_APP_ARG) - NO_EXEC_CHECKPOINT_MODES - CHECKPOINT_OPTIONAL_MODES
+)
+CHECKPOINT_ONLY_MODES = CHECKPOINT_REQUIRED_MODES
+PARENT_CALL_COUNT_EXEMPT_MODES = frozenset({
+    "execv_zero_call_checkpoint",
+    "exec_checkpoint_write_target_no_reentry",
+})
 
 POSTFORK_FALLBACK_OBSERVER_MODES = frozenset({
     "vfork_env_slots_fallback",
@@ -885,8 +923,11 @@ def run_fixture(args, tmpdir: Path, preload=True):
     bindir, blocked_dir = install_path_fixture(tmpdir, exe)
     env = base_env(args, tmpdir, bindir, blocked_dir, preload=preload)
     app_arg = MODE_TO_APP_ARG[args.mode]
+    command = [str(exe), app_arg]
+    if preload and args.mode in CHECKPOINT_ONLY_MODES:
+        command.append("--quiesce-controller")
     return subprocess.run(
-        [str(exe), app_arg],
+        command,
         cwd=tmpdir,
         env=env,
         text=True,
@@ -919,6 +960,43 @@ def target_count(paths, function=TARGET):
                 if row.get("function") == function:
                     total += int(row.get("count", "0"))
     return total
+
+
+def require_parent_checkpoint_calls(mode, exec_files):
+    if mode in PARENT_CALL_COUNT_EXEMPT_MODES:
+        return
+    if mode in ACTIVE_CONTROLLER_LIFECYCLE_MODES and not exec_files:
+        return
+    if mode not in CHECKPOINT_ONLY_MODES | ACTIVE_CONTROLLER_LIFECYCLE_MODES:
+        return
+    require(target_count(exec_files) >= 5,
+            f"checkpoint missed parent calls: {exec_files}")
+
+
+def run_checkpoint_contract_self_test():
+    with tempfile.TemporaryDirectory() as directory:
+        workdir = Path(directory)
+        valid = workdir / "peak_stats-p1-exec1.csv"
+        valid.write_text(
+            "function,count\npeak_exec_chain_hot_target,5\n",
+            encoding="utf-8",
+        )
+        require_parent_checkpoint_calls("fork_child_exec_parent_exec", [])
+        require_parent_checkpoint_calls("fork_child_exec_parent_exec", [valid])
+        try:
+            malformed = workdir / "peak_stats-p1-exec2.csv"
+            malformed.write_text(
+                "function,count\npeak_exec_chain_hot_target,4\n",
+                encoding="utf-8",
+            )
+            require_parent_checkpoint_calls(
+                "vfork_child_exec_parent_exec", [malformed])
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "active-controller malformed checkpoint was accepted")
+    print("exec_chain_checkpoint_contract_ok")
 
 
 def require_bad_env_artifacts(mode, final_files, exec_files, operation):
@@ -1118,9 +1196,9 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
                 f"capacity fallback parent exec did not retain native success\n{output}")
         return
 
-    if args.mode not in NO_EXEC_CHECKPOINT_MODES:
+    if args.mode in CHECKPOINT_REQUIRED_MODES:
         require(exec_files, f"missing exec checkpoint for {args.mode}\n{output}")
-    else:
+    elif args.mode in NO_EXEC_CHECKPOINT_MODES:
         require(not exec_files,
                 f"unexpected exec checkpoint for {args.mode}: {exec_files}\n{output}")
 
@@ -1134,68 +1212,12 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(target_count(exec_files, "write") == 1,
                 "checkpoint I/O re-entered the profiled write target")
 
-    if args.mode in {
-        "execv_success_checkpoint",
-        "execve_custom_env_injection",
-        "raw_syscall_execve_custom_env_injection",
-        "execve_preflight_unavailable_injection",
-        "execve_null_env_injection",
-        "execve_loader_path_missing",
-        "execve_loader_path_explicit",
-        "execve_loader_path_empty",
-        "execve_loader_path_duplicate",
-        "execve_loader_path_preload_present",
-        "execve_large_env_injection",
-        "fexecve_custom_env_injection",
-        "fexecve_preflight_unavailable_injection",
-        "execveat_custom_env_injection",
-        "raw_syscall_execveat_custom_env_injection",
-        "execl_success_checkpoint",
-        "execlp_path_search",
-        "execle_custom_env_injection",
-        "execvp_path_search",
-        "execvp_empty_path_component",
-        "helper_named_exec_still_checkpointed",
-        "execvpe_caller_path_child_env_ignored",
-        "execve_child_peak_env_only_injection",
-        "execve_child_chain_disabled",
-        "execve_child_propagate_disabled",
-        "fork_child_exec_parent_exec",
-        "vfork_child_exec_parent_exec",
-        "vfork_child_failed_exec_parent_exec",
-        "vfork_execl_parent_exec",
-        "vfork_execlp_parent_exec",
-        "vfork_execle_parent_exec",
-        "fork_custom_env_execve_chain",
-        "vfork_custom_env_execve_chain",
-        "fork_loader_path",
-        "vfork_loader_path",
-        "fork_loader_path_secure_skip",
-        "vfork_loader_path_secure_skip",
-        "vfork_custom_env_execle_chain",
-        "fork_custom_env_chain_disabled",
-        "vfork_custom_env_chain_disabled",
-        "vfork_custom_env_execvpe_chain",
-        "vfork_custom_env_execvp_chain",
-        "vfork_custom_env_execlp_chain",
-        "vfork_custom_env_fexecve_chain",
-        "vfork_custom_env_execveat_chain",
-        "fork_raw_syscall_custom_env_chain",
-        "fork_raw_syscall_chain_disabled",
-        "vfork_raw_syscall_execveat_chain",
-        "fork_bad_env_vector_efault",
-        "vfork_bad_env_vector_efault",
-        "fork_bad_env_string_efault",
-        "vfork_bad_env_string_efault",
-        "vfork_env_slots_fallback",
-        "vfork_long_preload_fallback",
-        "vfork_preload_entries_fallback",
-        "no_duplicate_ld_preload",
-        "no_duplicate_ld_preload_whitespace",
-        "no_duplicate_ld_preload_env_entries",
-    }:
-        require(target_count(exec_files) >= 5,
-                f"checkpoint missed parent calls: {exec_files}")
+    require_parent_checkpoint_calls(args.mode, exec_files)
+
+    if args.mode == "fork_child_exec_parent_exec":
+        require(output.count("exec_child_ok") == 2,
+                "fork child exec and parent exec did not both complete\n"
+                f"{output}")
 
     if args.mode in {
         "execve_env_build_failure_passthrough",
@@ -1473,6 +1495,11 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require("exec_child_ok" in output,
                 f"bad checkpoint path made exec fail\n{output}")
 
+    if args.mode == "exec_checkpoint_snapshot_lock_contention":
+        require("checkpoint_snapshot_lock_contention=1 errno_preserved=1 "
+                "missing_exec_enoent=1 cleanup=1 repeatable=1 success=1" in output,
+                f"checkpoint contention did not skip and clean up\n{output}")
+
     if args.mode == "exec_failure_non_destructive":
         require(f"exec_failure_errno={errno.ENOENT}" in output,
                 f"missing exec failure marker\n{output}")
@@ -1617,6 +1644,8 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
 
 
 def main():
+    if sys.argv[1:] == ["--self-test-checkpoint-contract"]:
+        return run_checkpoint_contract_self_test()
     args = parse_args()
     with tempfile.TemporaryDirectory(
         prefix=f"peak-exec-chain-{args.mode}-",

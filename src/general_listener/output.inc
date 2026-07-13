@@ -341,6 +341,20 @@ peak_exec_checkpoint_write_csv_name(int fd, const char* name)
     return peak_exec_checkpoint_write_all(fd, "\"", 1);
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API int
+peak_general_listener_test_checkpoint_snapshot_lock_hold(void)
+{
+    return pthread_mutex_lock(&lock);
+}
+
+PEAK_API int
+peak_general_listener_test_checkpoint_snapshot_lock_release(void)
+{
+    return pthread_mutex_unlock(&lock);
+}
+#endif
+
 static gboolean
 peak_general_listener_checkpoint_snapshot_lock(void)
 {
