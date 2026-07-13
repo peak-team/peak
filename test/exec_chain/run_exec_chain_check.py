@@ -29,6 +29,13 @@ MODE_TO_APP_ARG = {
     "execve_preflight_unavailable_injection": "execve-custom-env",
     "execve_child_peak_env_only_injection": "execve-child-peak-env-only",
     "execve_null_env_injection": "execve-null-env",
+    "execve_loader_path_missing": "execve-loader-path-missing",
+    "execve_loader_path_explicit": "execve-loader-path-explicit",
+    "execve_loader_path_empty": "execve-loader-path-empty",
+    "execve_loader_path_duplicate": "execve-loader-path-duplicate",
+    "execve_loader_path_preload_present": "execve-loader-path-preload-present",
+    "execve_loader_path_chain_disabled": "execve-loader-path-chain-disabled",
+    "execve_loader_path_secure_skip": "execve-loader-path-secure",
     "execve_large_env_injection": "execve-large-env",
     "execve_env_build_failure_passthrough": "execve-custom-env",
     "execve_bad_env_failure_non_destructive": "execve-bad-env",
@@ -79,6 +86,12 @@ MODE_TO_APP_ARG = {
     "vfork_execle_parent_exec": "vfork-execle-parent-exec",
     "fork_custom_env_execve_chain": "fork-custom-env-execve",
     "vfork_custom_env_execve_chain": "vfork-custom-env-execve",
+    "fork_loader_path": "fork-loader-path",
+    "vfork_loader_path": "vfork-loader-path",
+    "fork_loader_path_secure_skip": "fork-loader-path-secure",
+    "vfork_loader_path_secure_skip": "vfork-loader-path-secure",
+    "vfork_loader_path_preload_present": "vfork-loader-path-preload-present",
+    "fork_parent_env_exhaustion": "fork-parent-env-exhaustion",
     "vfork_custom_env_execle_chain": "vfork-custom-env-execle",
     "fork_custom_env_chain_disabled": "fork-custom-env-disabled",
     "vfork_custom_env_chain_disabled": "vfork-custom-env-disabled",
@@ -98,6 +111,7 @@ MODE_TO_APP_ARG = {
     # buffer.  Inputs beyond either bound deliberately use libc's original envp.
     "vfork_env_slots_fallback": "vfork-env-slots-fallback",
     "vfork_long_preload_fallback": "vfork-long-preload-fallback",
+    "vfork_preload_entries_fallback": "vfork-preload-entries-fallback",
     "no_duplicate_ld_preload": "duplicate-preload",
     "no_duplicate_ld_preload_whitespace": "duplicate-preload-whitespace",
     "no_duplicate_ld_preload_env_entries": "duplicate-preload-entry",
@@ -200,6 +214,18 @@ CAPACITY_PASSTHROUGH_MODES = {
     "vfork_env_slots_fallback": ("env-slots", "large-env", 0),
     "vfork_long_preload_fallback": ("long-preload", "postfork-long-preload", 1),
 }
+
+LOADER_SENTINEL = "/tmp/peak-parent-loader-sentinel"
+
+
+def loader_test_value():
+    original = os.environ.get("LD_LIBRARY_PATH", "")
+    return f"{LOADER_SENTINEL}{os.pathsep}{original}" if original else LOADER_SENTINEL
+
+
+def child_loader_test_value():
+    original = os.environ.get("LD_LIBRARY_PATH", "")
+    return f"/tmp/child-loader{os.pathsep}{original}" if original else "/tmp/child-loader"
 
 NATIVE_REFERENCE_MODES = {
     "execve_bad_env_failure_non_destructive",
@@ -428,6 +454,47 @@ def install_path_fixture(tmpdir: Path, exe: Path):
     return bindir, blocked_dir
 
 
+def install_chain_disabled_observer(tmpdir: Path):
+    observer = tmpdir / "chain-disabled-observer.py"
+    observer.write_text(
+        """#!/usr/bin/env python3
+import os
+
+
+def value(name):
+    return os.environ.get(name, "<missing>")
+
+
+preload = os.environ.get("LD_PRELOAD", "")
+loader_path = os.environ.get("LD_LIBRARY_PATH")
+print(
+    "ld_preload_libpeak_count={} ld_preload_env_entries={} "
+    "ld_preload_extra_count=0 peak_target={} peak_statslog={} "
+    "marker={} peak_exec_chain={} peak_exec_checkpoint={} "
+    "peak_exec_propagate={} ld_library_path_env_entries={} "
+    "ld_library_path_0={} ld_library_path_1={} "
+    "chain_disabled_observer={}".format(
+        sum("libpeak" in entry for entry in preload.split()),
+        int(bool(preload)),
+        value("PEAK_TARGET"),
+        value("PEAK_STATSLOG_PATH"),
+        value("EXEC_CHAIN_TEST_MARKER"),
+        value("PEAK_EXEC_CHAIN"),
+        value("PEAK_EXEC_CHECKPOINT"),
+        value("PEAK_EXEC_PROPAGATE_PEAK_ENV"),
+        int(loader_path is not None),
+        loader_path if loader_path is not None else "<missing>",
+        "<missing>",
+        value("EXEC_CHAIN_TEST_CHAIN_DISABLED_OBSERVER"),
+    )
+)
+""",
+        encoding="utf-8",
+    )
+    observer.chmod(0o755)
+    return observer
+
+
 def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool):
     env = os.environ.copy()
     for name in list(env):
@@ -464,7 +531,12 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
         env["PEAK_EXEC_PROPAGATE_PEAK_ENV"] = "0"
     if args.mode in {"execve_chain_disabled", "posix_spawn_chain_disabled"}:
         env["PEAK_EXEC_CHAIN"] = "0"
-    if args.mode == "execve_secure_skip":
+    if args.mode in {
+        "execve_secure_skip",
+        "execve_loader_path_secure_skip",
+        "fork_loader_path_secure_skip",
+        "vfork_loader_path_secure_skip",
+    }:
         env["PEAK_TEST_EXEC_AT_SECURE"] = "1"
     if args.mode in {
         "execve_env_build_failure_passthrough",
@@ -472,6 +544,37 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
         "posix_spawnp_env_build_failure_passthrough",
     }:
         env["PEAK_TEST_EXEC_ENV_BUILD_FAIL"] = "1"
+    if args.mode in {
+        "execve_null_env_injection",
+        "execve_loader_path_missing",
+        "execve_loader_path_explicit",
+        "execve_loader_path_empty",
+        "execve_loader_path_duplicate",
+        "execve_loader_path_preload_present",
+        "execve_loader_path_chain_disabled",
+        "execve_loader_path_secure_skip",
+        "fork_loader_path",
+        "vfork_loader_path",
+        "fork_loader_path_secure_skip",
+        "vfork_loader_path_secure_skip",
+        "posix_spawn_null_env_injection",
+        "vfork_env_slots_fallback",
+        "vfork_long_preload_fallback",
+        "vfork_preload_entries_fallback",
+    }:
+        env["LD_LIBRARY_PATH"] = loader_test_value()
+    if args.mode == "execve_loader_path_explicit":
+        env["EXEC_CHAIN_TEST_CHILD_LOADER_PATH"] = child_loader_test_value()
+    if args.mode == "execve_loader_path_duplicate":
+        env["EXEC_CHAIN_TEST_CHILD_LOADER_PATH"] = child_loader_test_value()
+        env["EXEC_CHAIN_TEST_CHILD_LOADER_PATH_SECOND"] = (
+            f"/tmp/child-loader-second{os.pathsep}"
+            f"{os.environ.get('LD_LIBRARY_PATH', '')}"
+        )
+    if args.mode == "execve_loader_path_chain_disabled":
+        env["EXEC_CHAIN_TEST_CHAIN_DISABLED_OBSERVER"] = str(
+            install_chain_disabled_observer(tmpdir)
+        )
     if args.mode in {
         "posix_spawn_resolver_null_preserves_errno",
         "posix_spawnp_resolver_null_preserves_errno",
@@ -605,6 +708,21 @@ def require_single_ld_env(output):
             f"expected one LD_PRELOAD env entry\n{output}")
 
 
+def require_loader_paths(output, expected):
+    match = re.search(r"(?:^|\s)ld_library_path_env_entries=(\d+)(?:\s|$)",
+                      output)
+    require(match is not None, f"missing LD_LIBRARY_PATH count\n{output}")
+    require(int(match.group(1)) == len(expected),
+            f"unexpected LD_LIBRARY_PATH entries\n{output}")
+    actual = {}
+    for index, value in re.findall(
+            r"(?:^|\s)ld_library_path_(\d+)=(.*?)(?=\sld_library_path_\d+=|\n|$)",
+            output):
+        actual[int(index)] = value
+    require([actual.get(index) for index in range(len(expected))] == expected,
+            f"LD_LIBRARY_PATH entries were not preserved exactly: {actual}\n{output}")
+
+
 def check_common(args, proc, tmpdir: Path, native_observation=None):
     output = proc.stdout
     exec_files, final_files = csv_files(tmpdir)
@@ -660,6 +778,7 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(f"marker={marker}" in output,
                 f"capacity fallback did not preserve the native child marker\n{output}")
         require_ld_count(output, 0)
+        require_loader_paths(output, [])
         require(f"ld_preload_env_entries={ld_preload_env_entries}" in output,
                 f"capacity fallback changed the native LD_PRELOAD environment\n{output}")
         for name in (
@@ -697,6 +816,11 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         "raw_syscall_execve_custom_env_injection",
         "execve_preflight_unavailable_injection",
         "execve_null_env_injection",
+        "execve_loader_path_missing",
+        "execve_loader_path_explicit",
+        "execve_loader_path_empty",
+        "execve_loader_path_duplicate",
+        "execve_loader_path_preload_present",
         "execve_large_env_injection",
         "fexecve_custom_env_injection",
         "fexecve_preflight_unavailable_injection",
@@ -720,6 +844,10 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         "vfork_execle_parent_exec",
         "fork_custom_env_execve_chain",
         "vfork_custom_env_execve_chain",
+        "fork_loader_path",
+        "vfork_loader_path",
+        "fork_loader_path_secure_skip",
+        "vfork_loader_path_secure_skip",
         "vfork_custom_env_execle_chain",
         "fork_custom_env_chain_disabled",
         "vfork_custom_env_chain_disabled",
@@ -737,6 +865,7 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         "vfork_bad_env_string_efault",
         "vfork_env_slots_fallback",
         "vfork_long_preload_fallback",
+        "vfork_preload_entries_fallback",
         "no_duplicate_ld_preload",
         "no_duplicate_ld_preload_whitespace",
         "no_duplicate_ld_preload_env_entries",
@@ -813,14 +942,42 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require_ld_count(check_text, 1)
         require_single_ld_env(check_text)
 
+    expected_loader_paths = {
+        "execve_null_env_injection": [loader_test_value()],
+        "execve_loader_path_missing": [loader_test_value()],
+        "execve_loader_path_explicit": [child_loader_test_value()],
+        "execve_loader_path_empty": [""],
+        "execve_loader_path_duplicate": [
+            child_loader_test_value(),
+            f"/tmp/child-loader-second{os.pathsep}"
+            f"{os.environ.get('LD_LIBRARY_PATH', '')}",
+        ],
+        "execve_loader_path_preload_present": [],
+        "execve_loader_path_chain_disabled": [],
+        "execve_loader_path_secure_skip": [],
+        "fork_loader_path": [loader_test_value()],
+        "vfork_loader_path": [loader_test_value()],
+        "fork_loader_path_secure_skip": [],
+        "vfork_loader_path_secure_skip": [],
+        "vfork_loader_path_preload_present": [],
+        "fork_parent_env_exhaustion": [],
+        "posix_spawn_null_env_injection": [loader_test_value()],
+    }
+    if args.mode in expected_loader_paths:
+        require_loader_paths(output, expected_loader_paths[args.mode])
+
     if args.mode in {
         "fork_custom_env_chain_disabled",
         "vfork_custom_env_chain_disabled",
         "fork_raw_syscall_chain_disabled",
+        "execve_loader_path_chain_disabled",
     }:
         require_ld_count(output, 0)
         require("peak_exec_chain=0" in output,
                 f"child PEAK_EXEC_CHAIN=0 was not preserved\n{output}")
+        if args.mode == "execve_loader_path_chain_disabled":
+            require("chain_disabled_observer=<missing>" in output,
+                    f"child environment inherited harness-only observer path\n{output}")
 
     if args.mode in {
         "fork_custom_env_execve_chain",
@@ -830,6 +987,10 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         "vfork_custom_env_chain_disabled",
         "fork_raw_syscall_custom_env_chain",
         "fork_raw_syscall_chain_disabled",
+        "fork_loader_path",
+        "vfork_loader_path",
+        "fork_loader_path_secure_skip",
+        "vfork_loader_path_secure_skip",
     }:
         require("parent_env_unchanged=1" in output,
                 f"post-fork child changed parent environment\n{output}")
@@ -920,9 +1081,35 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
     if args.mode in {
         "execve_chain_disabled",
         "execve_secure_skip",
+        "execve_loader_path_secure_skip",
+        "fork_loader_path_secure_skip",
+        "vfork_loader_path_secure_skip",
         "posix_spawn_chain_disabled",
+        "fork_parent_env_exhaustion",
     }:
         require_ld_count(output, 0)
+
+    if args.mode in {
+        "execve_loader_path_preload_present",
+        "vfork_loader_path_preload_present",
+    }:
+        require_ld_count(output, 1)
+        require("marker=loader-path-preload-present" in output,
+                f"preexisting libpeak child environment was not preserved\n{output}")
+
+    if args.mode == "fork_parent_env_exhaustion":
+        require("parent_env_exhaustion_passthrough=1" in output,
+                f"unterminated parent environment was augmented\n{output}")
+        require("marker=parent-env-exhaustion" in output,
+                f"original child environment was not retained\n{output}")
+
+    if args.mode == "vfork_preload_entries_fallback":
+        require("postfork_preload_entries_passthrough=1" in output,
+                f"unterminated preload vector was augmented\n{output}")
+        require_ld_count(output, 0)
+        require("ld_preload_env_entries=256" in output,
+                f"unterminated preload vector was truncated\n{output}")
+        require_loader_paths(output, [])
 
     if args.mode == "exec_bad_stats_path_nonfatal":
         require("exec_child_ok" in output,

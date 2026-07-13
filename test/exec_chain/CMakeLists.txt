@@ -30,6 +30,10 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         execve_preflight_unavailable_injection
         execve_child_peak_env_only_injection
         execve_null_env_injection
+        execve_loader_path_missing
+        execve_loader_path_explicit
+        execve_loader_path_chain_disabled
+        execve_loader_path_secure_skip
         execve_large_env_injection
         execve_env_build_failure_passthrough
         execve_bad_env_failure_non_destructive
@@ -71,6 +75,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         vfork_execle_parent_exec
         fork_custom_env_execve_chain
         vfork_custom_env_execve_chain
+        fork_loader_path
+        vfork_loader_path
+        fork_loader_path_secure_skip
+        vfork_loader_path_secure_skip
+        fork_parent_env_exhaustion
         vfork_custom_env_execle_chain
         fork_raw_syscall_custom_env_chain
         fork_raw_syscall_chain_disabled
@@ -86,6 +95,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         vfork_bad_env_string_efault
         vfork_env_slots_fallback
         vfork_long_preload_fallback
+        vfork_preload_entries_fallback
         no_duplicate_ld_preload
         no_duplicate_ld_preload_whitespace
         no_duplicate_ld_preload_env_entries
@@ -129,6 +139,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         list(APPEND _PEAK_EXEC_CHAIN_TESTS
             vfork_custom_env_execveat_chain
             vfork_raw_syscall_execveat_chain)
+    endif()
+
+    if(NOT MPI_FOUND)
+        list(APPEND _PEAK_EXEC_CHAIN_TESTS
+            execve_loader_path_empty
+            execve_loader_path_duplicate
+            execve_loader_path_preload_present
+            vfork_loader_path_preload_present)
     endif()
 
     if(PEAK_TEST_HAVE_POSIX_SPAWN_USEVFORK)

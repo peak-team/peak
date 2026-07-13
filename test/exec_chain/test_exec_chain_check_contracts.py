@@ -20,7 +20,8 @@ class ExecChainCheckContractsTest(unittest.TestCase):
             "ld_preload_extra_count=0 peak_target=<missing> "
             "peak_statslog=<missing> marker=postfork-long-preload "
             "peak_exec_chain=<missing> peak_exec_checkpoint=<missing> "
-            "peak_exec_propagate=<missing>\n"
+            "peak_exec_propagate=<missing> ld_library_path_env_entries=0 "
+            "ld_library_path_0=<missing> ld_library_path_1=<missing>\n"
             "postfork_capacity_passthrough=1 kind=long-preload\n"
             "exec_child_ok sink=0\n"
         )
