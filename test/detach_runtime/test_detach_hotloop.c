@@ -1161,6 +1161,89 @@ run_controller_batch_retry_check(void)
 }
 
 static int
+run_controller_two_target_lifecycle_check(void)
+{
+    PeakRequestDetachFn request_detach =
+        (PeakRequestDetachFn)required_symbol("peak_general_listener_request_detach");
+    PeakRequestReattachFn request_reattach =
+        (PeakRequestReattachFn)required_symbol("peak_general_listener_request_reattach");
+    PeakControllerDrainFn controller_drain =
+        (PeakControllerDrainFn)required_symbol("peak_general_listener_controller_drain");
+    PeakHookStateFn hook_state =
+        (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
+    size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
+    const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    const unsigned int drain_deadline_ms = 2000;
+
+    if (request_detach == NULL ||
+        request_reattach == NULL ||
+        controller_drain == NULL ||
+        hook_state == NULL ||
+        hook_count == NULL) {
+        return 2;
+    }
+    if (*hook_count < 2) {
+        fprintf(stderr, "two-target lifecycle check requires two configured hooks\n");
+        return 2;
+    }
+    if (trace_path == NULL || trace_path[0] == '\0') {
+        fprintf(stderr, "PEAK_DETACH_TRACE_PATH is required\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED ||
+        hook_state(1) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected both hooks to start attached\n");
+        return 2;
+    }
+
+    if (!request_detach(0) || !request_detach(1)) {
+        fprintf(stderr, "failed to queue two-target detach requests\n");
+        return 2;
+    }
+    /* The drain deadline only bounds failure; hook states establish success. */
+    if (!controller_drain(drain_deadline_ms)) {
+        fprintf(stderr, "controller did not drain two-target detach requests\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED ||
+        hook_state(1) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected both hooks detached after two-target detach drain\n");
+        return 2;
+    }
+
+    if (!request_reattach(0) || !request_reattach(1)) {
+        fprintf(stderr, "failed to queue two-target reattach requests\n");
+        return 2;
+    }
+    if (!controller_drain(drain_deadline_ms)) {
+        fprintf(stderr, "controller did not drain two-target reattach requests\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_ATTACHED ||
+        hook_state(1) != PEAK_HOOK_ATTACHED) {
+        fprintf(stderr, "expected both hooks attached after two-target reattach drain\n");
+        return 2;
+    }
+
+    if (!request_detach(0) || !request_detach(1)) {
+        fprintf(stderr, "failed to queue two-target re-detach requests\n");
+        return 2;
+    }
+    if (!controller_drain(drain_deadline_ms)) {
+        fprintf(stderr, "controller did not drain two-target re-detach requests\n");
+        return 2;
+    }
+    if (hook_state(0) != PEAK_HOOK_DETACHED ||
+        hook_state(1) != PEAK_HOOK_DETACHED) {
+        fprintf(stderr, "expected both hooks detached after two-target re-detach drain\n");
+        return 2;
+    }
+
+    printf("controller_two_target_lifecycle_ok\n");
+    return 0;
+}
+
+static int
 run_controller_no_trace_pending_age_check(void)
 {
     PeakRequestDetachFn request_detach =
@@ -3243,6 +3326,9 @@ main(int argc, char** argv)
 {
     if (has_flag_arg(argc, argv, "--controller-batch-retry-check")) {
         return run_controller_batch_retry_check();
+    }
+    if (has_flag_arg(argc, argv, "--controller-two-target-lifecycle-check")) {
+        return run_controller_two_target_lifecycle_check();
     }
     if (has_flag_arg(argc, argv, "--controller-no-trace-pending-age-check")) {
         return run_controller_no_trace_pending_age_check();
