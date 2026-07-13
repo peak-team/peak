@@ -343,6 +343,34 @@ def run_lifecycle_parser_self_test():
             print(f"lifecycle parser self-test failed: {name}: {reason}",
                   file=sys.stderr)
             return 1
+
+    batch_args = argparse.Namespace(
+        paired_targets=True,
+        fail_on_transition_skips=False,
+        require_trace_diagnostics=False,
+    )
+    mixed_operation_batch = [
+        row(TARGET_SYMBOL, "detach", 30, 2),
+        row(PAIRED_TARGET_SYMBOL, "reattach", 30, 2),
+    ]
+    for operation in ("detach", "reattach"):
+        if trace_rows_have_required_batch(
+                batch_args, mixed_operation_batch, operation, 2,
+                report_missing=False):
+            print("lifecycle parser self-test failed: mixed-operation "
+                  f"batch counted as {operation} batch", file=sys.stderr)
+            return 1
+
+    same_operation_batch = [
+        row(TARGET_SYMBOL, "detach", 31, 2),
+        row(PAIRED_TARGET_SYMBOL, "detach", 31, 2),
+    ]
+    if not trace_rows_have_required_batch(
+            batch_args, same_operation_batch, "detach", 2):
+        print("lifecycle parser self-test failed: same-operation detach "
+              "batch was not recognized", file=sys.stderr)
+        return 1
+
     print("detach_hotloop_lifecycle_parser_ok")
     return 0
 
@@ -467,6 +495,14 @@ def trace_has_required_batch(args, sample, operation, required_size):
     if rows is None:
         return False
 
+    return trace_rows_have_required_batch(args, rows, operation, required_size)
+
+
+def trace_rows_have_required_batch(args, rows, operation, required_size,
+                                  report_missing=True):
+    if required_size <= 0:
+        return True
+
     required_symbols = {TARGET_SYMBOL}
     if args.paired_targets:
         required_symbols.add(PAIRED_TARGET_SYMBOL)
@@ -505,14 +541,15 @@ def trace_has_required_batch(args, sample, operation, required_size):
         if required_symbols.issubset(symbols):
             return True
 
-    print(f"missing same-batch {operation} trace rows for "
-          f"{sorted(required_symbols)}",
-          file=sys.stderr)
-    for key, symbols in sorted(batch_groups.items()):
-        missing = required_symbols - symbols
-        if missing:
-            print(f"batch key {key} missing {sorted(missing)}",
+    if report_missing:
+        print(f"missing same-batch {operation} trace rows for "
+              f"{sorted(required_symbols)}",
               file=sys.stderr)
+        for key, symbols in sorted(batch_groups.items()):
+            missing = required_symbols - symbols
+            if missing:
+                print(f"batch key {key} missing {sorted(missing)}",
+                      file=sys.stderr)
     return False
 
 

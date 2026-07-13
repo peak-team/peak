@@ -28,6 +28,7 @@ static atomic_int unblock_backend_signal_requested;
 static atomic_int user_signal_handler_count;
 static atomic_uint_fast64_t side_effect;
 static atomic_uint_fast64_t spawned_worker_count;
+static atomic_uint_fast64_t spawned_worker_started_count;
 static atomic_uint_fast64_t blocked_signal_thread_count;
 
 #define PEAK_DETACH_HOT_BURST 64
@@ -90,12 +91,19 @@ typedef struct {
 } WorkerState;
 
 typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} SpawnProgress;
+
+typedef struct {
     unsigned int seed;
+    SpawnProgress* progress;
 } SpawnedWorkerState;
 
 typedef struct {
     unsigned int seed;
     uint64_t created;
+    SpawnProgress* progress;
 } SpawnerState;
 
 typedef struct {
@@ -149,6 +157,49 @@ sleep_for_seconds(long seconds)
         }
         nanosleep(&ts, NULL);
     }
+}
+
+static int
+spawn_progress_init(SpawnProgress* progress)
+{
+    pthread_condattr_t attr;
+    int status;
+
+    if (pthread_mutex_init(&progress->mutex, NULL) != 0) {
+        return -1;
+    }
+    status = pthread_condattr_init(&attr);
+    if (status != 0) {
+        pthread_mutex_destroy(&progress->mutex);
+        return -1;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&progress->cond, &attr);
+    }
+    pthread_condattr_destroy(&attr);
+    if (status != 0) {
+        pthread_mutex_destroy(&progress->mutex);
+        return -1;
+    }
+    return 0;
+}
+
+static void
+spawn_progress_destroy(SpawnProgress* progress)
+{
+    pthread_cond_destroy(&progress->cond);
+    pthread_mutex_destroy(&progress->mutex);
+}
+
+static void
+spawn_progress_publish(SpawnProgress* progress,
+                       atomic_uint_fast64_t* counter)
+{
+    pthread_mutex_lock(&progress->mutex);
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    pthread_cond_broadcast(&progress->cond);
+    pthread_mutex_unlock(&progress->mutex);
 }
 
 static int
@@ -251,6 +302,7 @@ spawned_worker_main(void* arg)
     SpawnedWorkerState* state = (SpawnedWorkerState*)arg;
     unsigned int seed = state->seed;
 
+    spawn_progress_publish(state->progress, &spawned_worker_started_count);
     for (uint64_t i = 0; i < 32; i++) {
         peak_detach_hot_target((uint64_t)(seed + i));
     }
@@ -368,17 +420,15 @@ spawner_main(void* arg)
             break;
         }
         child_state->seed = state->seed + (unsigned int)state->created;
+        child_state->progress = state->progress;
         if (pthread_create(&child, NULL, spawned_worker_main, child_state) != 0) {
             free(child_state);
             break;
         }
         pthread_join(child, NULL);
         state->created++;
+        spawn_progress_publish(state->progress, &spawned_worker_count);
     }
-
-    atomic_fetch_add_explicit(&spawned_worker_count,
-                              state->created,
-                              memory_order_relaxed);
     return NULL;
 }
 
@@ -957,6 +1007,76 @@ trace_has_physical_detach_success(const char* trace_path)
 
     fclose(fp);
     return 0;
+}
+
+static uint64_t
+wait_for_spawn_progress(SpawnProgress* progress,
+                        atomic_uint_fast64_t* counter,
+                        uint64_t observed_count,
+                        double monotonic_deadline)
+{
+    struct timespec timeout = {
+        .tv_sec = (time_t)monotonic_deadline,
+        .tv_nsec = (long)((monotonic_deadline -
+                           (double)(time_t)monotonic_deadline) *
+                          1000000000.0),
+    };
+    uint64_t current_count;
+
+    pthread_mutex_lock(&progress->mutex);
+    current_count = atomic_load_explicit(counter, memory_order_relaxed);
+    while (current_count <= observed_count) {
+        int status;
+
+        if (monotonic_seconds() >= monotonic_deadline) {
+            break;
+        }
+        status = pthread_cond_timedwait(&progress->cond,
+                                        &progress->mutex,
+                                        &timeout);
+        current_count = atomic_load_explicit(counter, memory_order_relaxed);
+        if (status != 0) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&progress->mutex);
+    return current_count;
+}
+
+static void
+observe_detach_during_spawn_churn(SpawnProgress* progress,
+                                  const char* trace_path,
+                                  double monotonic_deadline,
+                                  int* detach_during_churn,
+                                  uint64_t* detach_observed_spawned_threads,
+                                  int* post_detach_spawn)
+{
+    uint64_t observed_count = atomic_load_explicit(&spawned_worker_count,
+                                                   memory_order_relaxed);
+
+    while (monotonic_seconds() < monotonic_deadline) {
+        uint64_t current_count =
+            wait_for_spawn_progress(progress,
+                                    &spawned_worker_count,
+                                    observed_count,
+                                    monotonic_deadline);
+
+        if (current_count <= observed_count) {
+            continue;
+        }
+        observed_count = current_count;
+        if (!*detach_during_churn &&
+            trace_has_physical_detach_success(trace_path)) {
+            *detach_during_churn = 1;
+            *detach_observed_spawned_threads =
+                atomic_load_explicit(&spawned_worker_count,
+                                     memory_order_relaxed);
+            observed_count = *detach_observed_spawned_threads;
+        } else if (*detach_during_churn &&
+                   current_count > *detach_observed_spawned_threads) {
+            *post_detach_spawn = 1;
+        }
+    }
 }
 
 static int
@@ -3369,13 +3489,23 @@ main(int argc, char** argv)
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
     int cold_one_shot_target = has_flag_arg(argc, argv, "--cold-one-shot-target");
     int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
+    int require_detach_during_churn =
+        has_flag_arg(argc, argv, "--require-detach-during-churn");
     int block_backend_signal =
         has_flag_arg(argc, argv, "--block-backend-signal");
+    if (require_detach_during_churn &&
+        (!spawn_transient_threads || cold_one_shot_target)) {
+        fprintf(stderr,
+                "--require-detach-during-churn requires transient spawners and no pre-gate cold target\n");
+        return 2;
+    }
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
     WorkerState* states = calloc((size_t)threads, sizeof(*states));
     pthread_t* spawner_tids = NULL;
     SpawnerState* spawner_states = NULL;
     StartGate gate;
+    SpawnProgress spawn_progress;
+    int spawn_progress_initialized = 0;
     long created_threads = 0;
     long created_spawners = 0;
     if (spawn_transient_threads) {
@@ -3400,6 +3530,18 @@ main(int argc, char** argv)
         free(spawner_states);
         return 2;
     }
+    if (spawn_transient_threads) {
+        if (spawn_progress_init(&spawn_progress) != 0) {
+            fprintf(stderr, "spawn progress initialization failed\n");
+            start_gate_destroy(&gate);
+            free(tids);
+            free(states);
+            free(spawner_tids);
+            free(spawner_states);
+            return 2;
+        }
+        spawn_progress_initialized = 1;
+    }
 
     atomic_store_explicit(&stop_requested, 0, memory_order_relaxed);
     atomic_store_explicit(&unblock_backend_signal_requested,
@@ -3407,6 +3549,9 @@ main(int argc, char** argv)
                           memory_order_release);
     atomic_store_explicit(&side_effect, 0, memory_order_relaxed);
     atomic_store_explicit(&spawned_worker_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&spawned_worker_started_count,
+                          0,
+                          memory_order_relaxed);
     atomic_store_explicit(&blocked_signal_thread_count, 0, memory_order_relaxed);
     if (cold_one_shot_target) {
         peak_detach_cold_target(0xc01d);
@@ -3424,6 +3569,9 @@ main(int argc, char** argv)
             for (long j = 0; j < created_threads; j++) {
                 pthread_join(tids[j], NULL);
             }
+            if (spawn_progress_initialized) {
+                spawn_progress_destroy(&spawn_progress);
+            }
             start_gate_destroy(&gate);
             free(tids);
             free(states);
@@ -3434,22 +3582,36 @@ main(int argc, char** argv)
         created_threads++;
     }
 
-    start_gate_wait(&gate);
+    int detach_during_churn = 0;
+    uint64_t detach_observed_spawned_threads = 0;
+    int post_detach_spawn = 0;
+    uint64_t pre_detach_spawn_started = 0;
+    double start = 0.0;
+    double deadline = 0.0;
+    if (require_detach_during_churn) {
+        start = monotonic_seconds();
+        deadline = start + (double)seconds;
+    } else {
+        start_gate_wait(&gate);
+    }
     if (spawn_transient_threads) {
         for (long i = 0; i < spawner_threads; i++) {
             spawner_states[i].seed = 0x7f4a7c15u + (unsigned int)i;
+            spawner_states[i].progress = &spawn_progress;
             if (pthread_create(&spawner_tids[i],
                                NULL,
                                spawner_main,
                                &spawner_states[i]) != 0) {
                 perror("pthread_create spawner");
                 atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+                start_gate_abort(&gate);
                 for (long j = 0; j < created_spawners; j++) {
                     pthread_join(spawner_tids[j], NULL);
                 }
                 for (long j = 0; j < created_threads; j++) {
                     pthread_join(tids[j], NULL);
                 }
+                spawn_progress_destroy(&spawn_progress);
                 start_gate_destroy(&gate);
                 free(tids);
                 free(states);
@@ -3461,8 +3623,43 @@ main(int argc, char** argv)
         }
     }
 
-    double start = monotonic_seconds();
-    sleep_for_seconds(seconds);
+    if (require_detach_during_churn) {
+        pre_detach_spawn_started =
+            wait_for_spawn_progress(&spawn_progress,
+                                    &spawned_worker_started_count,
+                                    0,
+                                    deadline);
+        if (pre_detach_spawn_started == 0) {
+            fprintf(stderr,
+                    "transient worker did not start before the workload deadline\n");
+            atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+            start_gate_abort(&gate);
+            for (long i = 0; i < created_spawners; i++) {
+                pthread_join(spawner_tids[i], NULL);
+            }
+            for (long i = 0; i < created_threads; i++) {
+                pthread_join(tids[i], NULL);
+            }
+            spawn_progress_destroy(&spawn_progress);
+            start_gate_destroy(&gate);
+            free(tids);
+            free(states);
+            free(spawner_tids);
+            free(spawner_states);
+            return 2;
+        }
+        start_gate_wait(&gate);
+        observe_detach_during_spawn_churn(
+            &spawn_progress,
+            getenv("PEAK_DETACH_TRACE_PATH"),
+            deadline,
+            &detach_during_churn,
+            &detach_observed_spawned_threads,
+            &post_detach_spawn);
+    } else {
+        start = monotonic_seconds();
+        sleep_for_seconds(seconds);
+    }
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
 
     for (long i = 0; i < created_spawners; i++) {
@@ -3474,6 +3671,9 @@ main(int argc, char** argv)
         pthread_join(tids[i], NULL);
         calls += states[i].calls;
     }
+    if (spawn_progress_initialized) {
+        spawn_progress_destroy(&spawn_progress);
+    }
     double elapsed = monotonic_seconds() - start;
     int trace_detach_success = 0;
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
@@ -3481,7 +3681,11 @@ main(int argc, char** argv)
         trace_has_physical_detach_success(getenv("PEAK_DETACH_TRACE_PATH"));
 #endif
 
-    printf("threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu spawned_threads=%lu blocked_signal_threads=%lu trace_detach_success=%d\n",
+    printf("pre_detach_spawn_started=%lu detach_during_churn=%d detach_observed_spawned_threads=%lu post_detach_spawn=%d threads=%ld seconds=%ld calls=%lu elapsed=%.6f calls_per_sec=%.3f side_effect=%lu spawned_threads=%lu blocked_signal_threads=%lu trace_detach_success=%d\n",
+           (unsigned long)pre_detach_spawn_started,
+           detach_during_churn,
+           (unsigned long)detach_observed_spawned_threads,
+           post_detach_spawn,
            threads,
            seconds,
            (unsigned long)calls,
