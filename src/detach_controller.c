@@ -595,6 +595,7 @@ peak_detach_controller_mode(void)
     return configured_mode;
 }
 
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
 static PeakDetachRequestedBackend
 peak_detach_controller_requested_backend(void)
 {
@@ -664,6 +665,7 @@ peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus statu
            status == PEAK_DETACH_STATUS_TIMEOUT ||
            status == PEAK_DETACH_STATUS_UNSUPPORTED;
 }
+#endif
 
 static size_t
 peak_detach_controller_count_proc_threads(gboolean* ok_out)
@@ -3007,18 +3009,6 @@ peak_detach_controller_monotonic_second(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-void
-peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
-{
-#ifndef PEAK_HAVE_GUM_PEAK_PC_API
-    (void)enabled;
-#else
-    atomic_store_explicit(&trace_diagnostics_enabled,
-                          enabled ? 1 : 0,
-                          memory_order_release);
-#endif
-}
-
 static void
 peak_detach_controller_note_stop_window_started(void)
 {
@@ -3854,6 +3844,18 @@ peak_detach_controller_empty_batch_status(const PeakDetachBatchResult* results,
                              PEAK_DETACH_STATUS_CLASSIFY_FAILED;
 }
 #endif
+
+void
+peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
+{
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    atomic_store_explicit(&trace_diagnostics_enabled,
+                          enabled ? 1 : 0,
+                          memory_order_release);
+#else
+    (void)enabled;
+#endif
+}
 
 gboolean
 peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
@@ -4742,7 +4744,7 @@ peak_detach_controller_accounting_snapshot(
     return FALSE;
 }
 
-#ifdef PEAK_ENABLE_TEST_HOOKS
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
 void
 peak_detach_controller_test_accounting_begin_publish(void)
 {
