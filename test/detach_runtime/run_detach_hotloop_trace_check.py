@@ -28,6 +28,9 @@ TRANSITION_SKIP_RE = re.compile(
     r"skipping Gum (detach|reattach)|classify-failed",
     re.IGNORECASE,
 )
+EXPECTED_UNSAFE_SHUTDOWN_RE = re.compile(
+    r"(?m)^\[peak\] detach helper shutdown failed: error; "
+    r"leaving listener state alive$")
 TARGET_SYMBOL = "peak_detach_hot_target"
 PAIRED_TARGET_SYMBOL = "peak_detach_hot_target_two"
 COLD_TARGET_SYMBOL = "peak_detach_cold_target"
@@ -168,6 +171,280 @@ def trace_has_success(args, sample, operation):
                  trace_row_has_diagnostics(fields))):
             return True
     return False
+
+
+def paired_target_lifecycle_rows_ok(rows, require_trace_diagnostics):
+    required_symbols = (TARGET_SYMBOL, PAIRED_TARGET_SYMBOL)
+    lifecycle_events = {symbol: [] for symbol in required_symbols}
+    for fields in rows:
+        if (len(fields) < 7 or fields[2] not in lifecycle_events or
+                fields[3] not in {"detach", "reattach"} or
+                fields[4] != "success"):
+            continue
+        symbol = fields[2]
+        if fields[5] != "1" or fields[6] != "safe":
+            return False, (
+                f"non-strict successful lifecycle transition for {symbol}: "
+                f"{fields[3]} physical={fields[5]} status={fields[6]}"
+            )
+        if (require_trace_diagnostics and
+                not trace_row_has_diagnostics(fields)):
+            return False, f"missing lifecycle diagnostics for {symbol}: {fields}"
+
+        events = lifecycle_events[symbol]
+        expected = "detach" if len(events) % 2 == 0 else "reattach"
+        if fields[3] != expected:
+            return False, (
+                f"invalid lifecycle transition for {symbol}: expected {expected} "
+                f"after {events}, observed {fields[3]}"
+            )
+        events.append(fields[3])
+
+    missing = [symbol for symbol, events in lifecycle_events.items()
+               if len(events) < 3]
+    if missing:
+        return False, (
+            "missing paired target detach/reattach/revisit evidence: "
+            f"{sorted(missing)}"
+        )
+    return True, ""
+
+
+def controller_two_target_lifecycle_rows_ok(rows, require_trace_diagnostics):
+    # The controller may consume request 0 before request 1 is queued.  Batch
+    # identity and size are diagnostics, not a two-target lifecycle contract.
+    expected_events = ("detach", "reattach", "detach")
+    required_symbols = (TARGET_SYMBOL, PAIRED_TARGET_SYMBOL)
+    lifecycle_events = {symbol: [] for symbol in required_symbols}
+    for fields in rows:
+        if (len(fields) < 4 or fields[2] not in lifecycle_events or
+                fields[3] not in {"detach", "reattach"}):
+            continue
+        symbol = fields[2]
+        if (len(fields) < 7 or fields[4] != "success" or fields[5] != "1" or
+                fields[6] != "safe"):
+            return False, f"non-strict lifecycle row for {symbol}: {fields}"
+        if (require_trace_diagnostics and
+                not trace_row_has_diagnostics(fields)):
+            return False, f"missing lifecycle diagnostics for {symbol}: {fields}"
+        lifecycle_events[symbol].append(fields[3])
+
+    for symbol, events in lifecycle_events.items():
+        if tuple(events) != expected_events:
+            return False, (
+                f"invalid controller lifecycle for {symbol}: expected "
+                f"{expected_events}, observed {tuple(events)}"
+            )
+    return True, ""
+
+
+def controller_two_target_lifecycle_output_ok(output):
+    bad_output = BAD_OUTPUT_RE.search(output)
+    if bad_output is not None:
+        return False, f"matched unsafe output: {bad_output.group(0)}"
+    transition_skip = TRANSITION_SKIP_RE.search(output)
+    if transition_skip is not None:
+        return False, f"matched transition skip: {transition_skip.group(0)}"
+    return True, ""
+
+
+def controller_two_target_lifecycle_unsafe_shutdown_output_ok(output):
+    matches = EXPECTED_UNSAFE_SHUTDOWN_RE.findall(output)
+    if len(matches) != 1:
+        return False, "missing or repeated expected shutdown-missing-response diagnostic"
+    return controller_two_target_lifecycle_output_ok(
+        EXPECTED_UNSAFE_SHUTDOWN_RE.sub("", output))
+
+
+def trace_has_paired_target_lifecycle(args, sample):
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        print("missing paired target lifecycle trace", file=sys.stderr)
+        return False
+
+    ok, reason = paired_target_lifecycle_rows_ok(
+        rows, args.require_trace_diagnostics)
+    if not ok:
+        print(reason, file=sys.stderr)
+    return ok
+
+
+def run_lifecycle_parser_self_test():
+    def row(symbol, operation, batch_id=1, batch_size=2):
+        return ["0", "0", symbol, operation, "success", "1", "safe",
+                "0", "0", str(batch_size), "1", str(batch_id)]
+
+    valid_rows = []
+    for operation in ("detach", "reattach", "detach", "reattach"):
+        valid_rows.extend([
+            row(TARGET_SYMBOL, operation),
+            row(PAIRED_TARGET_SYMBOL, operation),
+        ])
+    cases = (
+        ("valid", valid_rows, True),
+        ("premature-reattach", [
+            row(TARGET_SYMBOL, "reattach"),
+            row(PAIRED_TARGET_SYMBOL, "detach"),
+            row(PAIRED_TARGET_SYMBOL, "reattach"),
+            row(PAIRED_TARGET_SYMBOL, "detach"),
+        ], False),
+        ("duplicate-detach", [
+            row(TARGET_SYMBOL, "detach"),
+            row(TARGET_SYMBOL, "detach"),
+            row(PAIRED_TARGET_SYMBOL, "detach"),
+            row(PAIRED_TARGET_SYMBOL, "reattach"),
+            row(PAIRED_TARGET_SYMBOL, "detach"),
+        ], False),
+    )
+    for name, rows, expected in cases:
+        ok, reason = paired_target_lifecycle_rows_ok(rows, False)
+        if ok != expected:
+            print(f"lifecycle parser self-test failed: {name}: {reason}",
+                  file=sys.stderr)
+            return 1
+    controller_cases = (
+        ("controller-two-target-valid", [
+            row(TARGET_SYMBOL, "detach", 10, 1),
+            row(PAIRED_TARGET_SYMBOL, "detach", 20, 1),
+            row(TARGET_SYMBOL, "reattach", 11, 1),
+            row(PAIRED_TARGET_SYMBOL, "reattach", 21, 1),
+            row(TARGET_SYMBOL, "detach", 12, 1),
+            row(PAIRED_TARGET_SYMBOL, "detach", 22, 1),
+        ], True),
+        ("controller-two-target-extra", [
+            row(TARGET_SYMBOL, "detach", 10),
+            row(PAIRED_TARGET_SYMBOL, "detach", 20),
+            row(TARGET_SYMBOL, "reattach", 21),
+            row(PAIRED_TARGET_SYMBOL, "reattach", 21),
+            row(TARGET_SYMBOL, "detach", 22),
+            row(PAIRED_TARGET_SYMBOL, "detach", 22),
+            row(TARGET_SYMBOL, "reattach", 23),
+        ], False),
+        ("controller-two-target-missing", [
+            row(TARGET_SYMBOL, "detach", 10),
+            row(PAIRED_TARGET_SYMBOL, "detach", 20),
+            row(TARGET_SYMBOL, "reattach", 11),
+            row(PAIRED_TARGET_SYMBOL, "reattach", 21),
+            row(TARGET_SYMBOL, "detach", 12),
+        ], False),
+        ("controller-two-target-truncated-transition", [
+            row(TARGET_SYMBOL, "detach", 10, 1),
+            row(PAIRED_TARGET_SYMBOL, "detach", 20, 1),
+            row(TARGET_SYMBOL, "reattach", 11, 1),
+            row(PAIRED_TARGET_SYMBOL, "reattach", 21, 1),
+            row(TARGET_SYMBOL, "detach", 12, 1),
+            row(PAIRED_TARGET_SYMBOL, "detach", 22, 1),
+            row(PAIRED_TARGET_SYMBOL, "reattach", 23, 1)[:4],
+        ], False),
+    )
+    for name, rows, expected in controller_cases:
+        ok, reason = controller_two_target_lifecycle_rows_ok(rows, False)
+        if ok != expected:
+            print(f"lifecycle parser self-test failed: {name}: {reason}",
+                  file=sys.stderr)
+            return 1
+    print("detach_hotloop_lifecycle_parser_ok")
+    return 0
+
+
+def run_controller_output_contract_self_test():
+    cases = (
+        ("clean", "controller_two_target_lifecycle_ok\n", True),
+        ("unsafe-shutdown",
+         "controller_two_target_lifecycle_ok\n"
+         "detach helper shutdown failed: missing-response; "
+         "leaving listener state alive\n",
+         False),
+        ("transition-skip",
+         "controller_two_target_lifecycle_ok\n"
+         "skipping Gum detach after classify-failed\n",
+         False),
+    )
+    for name, output, expected in cases:
+        ok, reason = controller_two_target_lifecycle_output_ok(output)
+        if ok != expected:
+            print(f"controller output self-test failed: {name}: {reason}",
+                  file=sys.stderr)
+            return 1
+    print("detach_hotloop_controller_output_contract_ok")
+    return 0
+
+
+def controller_two_target_lifecycle_env(args, trace_path):
+    env = os.environ.copy()
+    env.update({
+        "LD_PRELOAD": os.path.realpath(args.libpeak),
+        "PEAK_DETACH_TRACE_PATH": trace_path,
+        "PEAK_TARGET": f"{TARGET_SYMBOL},{PAIRED_TARGET_SYMBOL}",
+        "PEAK_MAX_NUM_THREADS": "16",
+        "PEAK_ENABLE_PER_TARGET_HEARTBEAT": "0",
+        "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
+        "PEAK_ENABLE_REATTACH": "0",
+        "PEAK_COST": "0",
+        "PEAK_HEARTBEAT_INTERVAL": "0",
+        "PEAK_HIBERNATION_CYCLE": "1",
+        "PEAK_REQUIRE_SAFE_DETACH": "1",
+        "PEAK_SAFE_DETACH_MODE": "strict",
+        "PEAK_DETACH_BACKEND": "helper",
+        "PEAK_DETACH_HELPER": os.path.realpath(args.detach_helper),
+        "FAKE_DETACH_HELPER_SCENARIO": args.controller_helper_scenario,
+    })
+    return env
+
+
+def run_controller_two_target_lifecycle_check(args):
+    trace_path = f"{args.trace_path}.{os.getpid()}"
+    try:
+        os.unlink(trace_path)
+    except FileNotFoundError:
+        pass
+
+    completed = subprocess.run(
+        [args.exe, "--controller-two-target-lifecycle-check"],
+        env=controller_two_target_lifecycle_env(args, trace_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=args.timeout,
+        check=False,
+    )
+    try:
+        with open(trace_path, "r", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+    except OSError:
+        rows = None
+    try:
+        os.unlink(trace_path)
+    except FileNotFoundError:
+        pass
+
+    ok = rows is not None
+    reason = "missing two-target lifecycle trace"
+    if ok:
+        ok, reason = controller_two_target_lifecycle_rows_ok(rows, True)
+    if args.controller_helper_scenario == "shutdown-missing-response":
+        output_ok, output_reason = (
+            controller_two_target_lifecycle_unsafe_shutdown_output_ok(
+                completed.stdout))
+        success_marker = "controller_two_target_lifecycle_unsafe_shutdown_rejected_ok"
+    else:
+        output_ok, output_reason = controller_two_target_lifecycle_output_ok(
+            completed.stdout)
+        success_marker = "controller_two_target_lifecycle_trace_ok"
+    if (completed.returncode != 0 or
+            "controller_two_target_lifecycle_ok" not in completed.stdout or
+            not ok or not output_ok):
+        print(f"controller two-target lifecycle check failed rc={completed.returncode}",
+              file=sys.stderr)
+        if not ok:
+            print(reason, file=sys.stderr)
+        if not output_ok:
+            print(output_reason, file=sys.stderr)
+        print(completed.stdout, file=sys.stderr)
+        return 1
+
+    print(success_marker)
+    return 0
 
 
 def read_trace_rows(args, sample):
@@ -456,6 +733,10 @@ def run_sample(args, sample):
         args, sample, "detach", args.require_detach_batch_size)
     trace_reattach_batched = trace_has_required_batch(
         args, sample, "reattach", args.require_reattach_batch_size)
+    paired_target_lifecycle_ok = (
+        not args.require_paired_target_lifecycle or
+        trace_has_paired_target_lifecycle(args, sample)
+    )
     trace_source_ok = trace_has_required_request_source(args, sample)
     trace_transition_ok = trace_transition_limits_ok(args, sample)
     observed_guard_ok = (
@@ -488,6 +769,7 @@ def run_sample(args, sample):
         not trace_detached or
         not trace_detach_batched or
         not trace_reattach_batched or
+        not paired_target_lifecycle_ok or
         not trace_source_ok or
         not trace_transition_ok or
         not observed_guard_ok or
@@ -521,6 +803,9 @@ def run_sample(args, sample):
             print("missing required batched detach trace evidence", file=sys.stderr)
         if not trace_reattach_batched:
             print("missing required batched reattach trace evidence", file=sys.stderr)
+        if not paired_target_lifecycle_ok:
+            print("missing required paired target lifecycle evidence",
+                  file=sys.stderr)
         if not trace_source_ok:
             print("missing required detach request source evidence", file=sys.stderr)
         if not trace_transition_ok:
@@ -558,9 +843,18 @@ def run_sample(args, sample):
 
 
 def main():
+    if sys.argv[1:] == ["--self-test-lifecycle-parser"]:
+        return run_lifecycle_parser_self_test()
+    if sys.argv[1:] == ["--self-test-controller-output-contract"]:
+        return run_controller_output_contract_self_test()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True)
     parser.add_argument("--libpeak", required=True)
+    parser.add_argument("--controller-two-target-lifecycle-check",
+                        action="store_true")
+    parser.add_argument("--controller-helper-scenario", default="success-zero")
+    parser.add_argument("--trace-path", default="")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--seconds", type=int, default=1)
     parser.add_argument("--samples", type=int, default=12)
@@ -587,6 +881,8 @@ def main():
     parser.add_argument("--global-detach-factor", default="1.0")
     parser.add_argument("--global-reattach-factor", default="1.0")
     parser.add_argument("--paired-targets", action="store_true")
+    parser.add_argument("--require-paired-target-lifecycle",
+                        action="store_true")
     parser.add_argument("--cold-one-shot-target", action="store_true")
     parser.add_argument("--spawn-transient-threads", action="store_true")
     parser.add_argument("--spawner-threads", type=int, default=2)
@@ -611,6 +907,14 @@ def main():
     parser.set_defaults(enable_reattach=True, enable_per_target_heartbeat=True)
     args = parser.parse_args()
 
+    if args.controller_two_target_lifecycle_check:
+        if not args.trace_path or not args.detach_helper:
+            print("--controller-two-target-lifecycle-check requires --trace-path "
+                  "and --detach-helper",
+                  file=sys.stderr)
+            return 2
+        return run_controller_two_target_lifecycle_check(args)
+
     if (args.threads <= 0 or args.seconds <= 0 or args.samples <= 0 or
             args.spawner_threads <= 0):
         print(
@@ -620,6 +924,12 @@ def main():
         return 2
     if args.require_reattach_batch_size > 0:
         args.require_reattach = True
+    if args.require_paired_target_lifecycle:
+        args.require_reattach = True
+        if not args.paired_targets:
+            print("--require-paired-target-lifecycle requires --paired-targets",
+                  file=sys.stderr)
+            return 2
     if args.require_redetach_after_reattach:
         args.require_reattach = True
 

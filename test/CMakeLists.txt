@@ -512,6 +512,36 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target,peak_detach_hot_target_two;PEAK_MAX_NUM_THREADS=16;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=synthetic-stop-file-once;FAKE_DETACH_HELPER_STOP_PC_FILE=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-pc.txt;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-batch-retry-trace.csv;${PRELOAD_VAR}"
                     PASS_REGULAR_EXPRESSION "controller_batch_retry_ok"
                     TIMEOUT 30)
+            # Request 0 may be consumed before request 1 is queued.  Validate
+            # each target's exact strict lifecycle without asserting same-batch
+            # timing, which is not a controller state-machine contract.
+            add_test(NAME test_detach_hotloop_two_target_lifecycle_strict
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                        --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --controller-two-target-lifecycle-check
+                        --trace-path ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-two-target-lifecycle-trace.csv
+                        --detach-helper $<TARGET_FILE:test_detach_fake_helper>
+                        --timeout 15)
+            set_tests_properties(test_detach_hotloop_two_target_lifecycle_strict
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "controller_two_target_lifecycle_trace_ok"
+                    TIMEOUT 30)
+            add_test(NAME test_detach_hotloop_two_target_lifecycle_unsafe_shutdown_rejected
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                        --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --controller-two-target-lifecycle-check
+                        --controller-helper-scenario shutdown-missing-response
+                        --trace-path ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-two-target-lifecycle-unsafe-shutdown-trace.csv
+                        --detach-helper $<TARGET_FILE:test_detach_fake_helper>
+                        --timeout 15)
+            set_tests_properties(test_detach_hotloop_two_target_lifecycle_unsafe_shutdown_rejected
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "controller_two_target_lifecycle_unsafe_shutdown_rejected_ok"
+                    TIMEOUT 30)
             add_test(NAME test_detach_hotloop_no_trace_pending_age_strict
                 COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
                         --controller-no-trace-pending-age-check)
@@ -591,6 +621,20 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
+        add_test(NAME test_detach_hotloop_lifecycle_parser
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --self-test-lifecycle-parser)
+        set_tests_properties(test_detach_hotloop_lifecycle_parser
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "detach_hotloop_lifecycle_parser_ok")
+        add_test(NAME test_detach_hotloop_controller_output_contract
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --self-test-controller-output-contract)
+        set_tests_properties(test_detach_hotloop_controller_output_contract
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "detach_hotloop_controller_output_contract_ok")
         add_test(NAME test_detach_hotloop_reattach_cooldown_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
