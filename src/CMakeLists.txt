@@ -18,8 +18,12 @@ set(sources_peak
     exec_memory.c
     exec_interceptor.c
     exec_raw_syscall.c
-    exec_raw_syscall_trampoline.S
 )
+
+# The C dispatcher is portable. Its assembly syscall interposer is selected by
+# the shared platform contract used at the project root and in platform tests.
+peak_exec_append_raw_syscall_trampoline(
+    sources_peak exec_raw_syscall_trampoline.S)
 
 FILE(GLOB sources_peak_mpi
     mpi_interceptor.c
