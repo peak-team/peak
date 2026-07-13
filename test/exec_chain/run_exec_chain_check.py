@@ -215,7 +215,179 @@ CAPACITY_PASSTHROUGH_MODES = {
     "vfork_long_preload_fallback": ("long-preload", "postfork-long-preload", 1),
 }
 
+POSTFORK_FALLBACK_OBSERVER_MODES = frozenset({
+    "vfork_env_slots_fallback",
+    "vfork_long_preload_fallback",
+    "vfork_preload_entries_fallback",
+})
+
+POSTFORK_FALLBACK_EXPECTATIONS = {
+    "vfork_env_slots_fallback": {
+        "marker": "large-env",
+        "preload_entries": "0",
+        "preload_length": "0",
+        "preload_all_x": "1",
+        "pad_validated_count": "512",
+        "pad_mismatch_count": "0",
+        "path": "observer",
+        "observer_mode": "capacity-env-slots",
+        "parent_contract": (
+            "input_entries=514 input_pad_validated_count=512 "
+            "input_pad_mismatch_count=0 input_preload_entries=0 "
+            "input_preload_length=0 input_preload_all_x=1 "
+            "input_path_entries=1 input_loader_path_entries=0 "
+            "input_terminator_null=1"
+        ),
+    },
+    "vfork_long_preload_fallback": {
+        "marker": "postfork-long-preload",
+        "preload_entries": "1",
+        "preload_length": "8192",
+        "preload_all_x": "1",
+        "pad_validated_count": "0",
+        "pad_mismatch_count": "0",
+        "path": "observer",
+        "observer_mode": "capacity-long-preload",
+        "parent_contract": (
+            "input_entries=3 input_pad_validated_count=0 "
+            "input_pad_mismatch_count=0 input_preload_entries=1 "
+            "input_preload_length=8192 input_preload_all_x=1 "
+            "input_path_entries=1 input_loader_path_entries=0 "
+            "input_terminator_null=1"
+        ),
+    },
+    "vfork_preload_entries_fallback": {
+        "marker": "<missing>",
+        "preload_entries": "1",
+        "preload_length": "0",
+        "preload_all_x": "1",
+        "pad_validated_count": "0",
+        "pad_mismatch_count": "0",
+        "path": None,
+        "observer_mode": "capacity-preload-entries",
+        "parent_contract": (
+            "input_entries=256 input_preload_entries=256 "
+            "input_nonempty_preload_entries=0 "
+            "input_path_entries=0 input_loader_path_entries=0 "
+            "input_terminator_null=1"
+        ),
+    },
+}
+
 LOADER_SENTINEL = "/tmp/peak-parent-loader-sentinel"
+EXTRA_PRELOAD_TOKEN_A = "/tmp/peak_exec_chain_extra_preload_a.so"
+EXTRA_PRELOAD_TOKEN_B = "/tmp/peak_exec_chain_extra_preload_b.so"
+LOADER_OBSERVER_ENV = "EXEC_CHAIN_TEST_LOADER_OBSERVER"
+
+NO_LOADER_MODE_EXPECTATIONS = {
+    "execve_loader_path_chain_disabled": {
+        "marker": "loader-path-disabled",
+        "peak_exec_chain": "0",
+        "peak_target": "<missing>",
+        "peak_statslog": "<missing>",
+        "secure_test_hook": "<missing>",
+        "preload_count": "0",
+        "preload_entries": "0",
+        "extra_count": "0",
+        "use_observer": True,
+    },
+    "execve_loader_path_secure_skip": {
+        "marker": "loader-path-secure",
+        "peak_exec_chain": "<missing>",
+        "peak_target": TARGET,
+        "peak_statslog": "peak_stats",
+        "secure_test_hook": "1",
+        "preload_count": "0",
+        "preload_entries": "0",
+        "extra_count": "0",
+        "use_observer": True,
+    },
+    "execve_loader_path_preload_present": {
+        "marker": "loader-path-preload-present",
+        "peak_exec_chain": "<missing>",
+        "peak_target": TARGET,
+        "peak_statslog": "peak_stats",
+        "secure_test_hook": "<missing>",
+        "preload_count": "1",
+        "preload_entries": "1",
+        "extra_count": "1",
+        "use_observer": False,
+    },
+    "fork_loader_path_secure_skip": {
+        "marker": "postfork-loader-path",
+        "peak_exec_chain": "<missing>",
+        "peak_target": "<missing>",
+        "peak_statslog": "<missing>",
+        "secure_test_hook": "<missing>",
+        "preload_count": "0",
+        "preload_entries": "0",
+        "extra_count": "0",
+        "use_observer": True,
+    },
+    "vfork_loader_path_secure_skip": {
+        "marker": "postfork-loader-path",
+        "peak_exec_chain": "<missing>",
+        "peak_target": "<missing>",
+        "peak_statslog": "<missing>",
+        "secure_test_hook": "<missing>",
+        "preload_count": "0",
+        "preload_entries": "0",
+        "extra_count": "0",
+        "use_observer": True,
+    },
+    "vfork_loader_path_preload_present": {
+        "marker": "loader-path-preload-present",
+        "peak_exec_chain": "<missing>",
+        "peak_target": TARGET,
+        "peak_statslog": "peak_stats",
+        "secure_test_hook": "<missing>",
+        "preload_count": "1",
+        "preload_entries": "1",
+        "extra_count": "1",
+        "use_observer": False,
+    },
+    "fork_parent_env_exhaustion": {
+        "marker": "parent-env-exhaustion",
+        "peak_exec_chain": "1",
+        "peak_exec_propagate": "1",
+        "peak_target": "<missing>",
+        "peak_statslog": "<missing>",
+        "secure_test_hook": "<missing>",
+        "preload_count": "0",
+        "preload_entries": "0",
+        "extra_count": "0",
+        "use_observer": True,
+    },
+}
+
+LOADER_OBSERVER_MODES = frozenset(
+    mode
+    for mode, expected in NO_LOADER_MODE_EXPECTATIONS.items()
+    if expected["use_observer"]
+)
+
+OBSERVER_FIELD_NAMES = (
+    "ld_preload_libpeak_count",
+    "ld_preload_env_entries",
+    "ld_preload_extra_count",
+    "peak_target",
+    "peak_statslog",
+    "marker",
+    "peak_exec_chain",
+    "peak_exec_checkpoint",
+    "peak_exec_propagate",
+    "ld_library_path_env_entries",
+    "ld_library_path_0",
+    "ld_library_path_1",
+    "path",
+    "observer_mode",
+    "child_pad_validated_count",
+    "child_pad_mismatch_count",
+    "ld_preload_length",
+    "ld_preload_all_x",
+    "loader_observer",
+    "secure_test_hook",
+)
 
 
 def loader_test_value():
@@ -454,45 +626,139 @@ def install_path_fixture(tmpdir: Path, exe: Path):
     return bindir, blocked_dir
 
 
-def install_chain_disabled_observer(tmpdir: Path):
-    observer = tmpdir / "chain-disabled-observer.py"
-    observer.write_text(
-        """#!/usr/bin/env python3
-import os
+def install_loader_observer(tmpdir: Path):
+    observer = tmpdir / "loader-observer.sh"
+    script = (
+        """#!/bin/sh
+if [ "${LD_PRELOAD+x}" = x ]; then
+    ld_preload_env_entries=1
+    ld_preload_libpeak_count=0
+    ld_preload_extra_count=0
+    saved_ifs=$IFS
+    IFS=":$IFS"
+    set -f
+    for preload_entry in $LD_PRELOAD; do
+        case "$preload_entry" in
+            *libpeak*)
+                ld_preload_libpeak_count=$((ld_preload_libpeak_count + 1))
+                ;;
+        esac
+        case "$preload_entry" in
+            @EXTRA_PRELOAD_TOKEN_A@|@EXTRA_PRELOAD_TOKEN_B@)
+                ld_preload_extra_count=$((ld_preload_extra_count + 1))
+                ;;
+        esac
+    done
+    set +f
+    IFS=$saved_ifs
+else
+    ld_preload_env_entries=0
+    ld_preload_libpeak_count=0
+    ld_preload_extra_count=0
+fi
 
+if [ "${LD_LIBRARY_PATH+x}" = x ]; then
+    ld_library_path_env_entries=1
+    ld_library_path_0=$LD_LIBRARY_PATH
+else
+    ld_library_path_env_entries=0
+    ld_library_path_0='<missing>'
+fi
 
-def value(name):
-    return os.environ.get(name, "<missing>")
+preload_value=${LD_PRELOAD-}
+ld_preload_length=${#preload_value}
+case "$preload_value" in
+    *[!x]*) ld_preload_all_x=0 ;;
+    *) ld_preload_all_x=1 ;;
+esac
 
+child_pad_validated_count=0
+child_pad_mismatch_count=0
+case "${1-}" in
+    capacity-env-slots)
+        pad_index=0
+        while [ "$pad_index" -lt 512 ]; do
+            case "$pad_index" in
+                [0-9]) pad_name=CHILD_PAD_000$pad_index ;;
+                [0-9][0-9]) pad_name=CHILD_PAD_00$pad_index ;;
+                *) pad_name=CHILD_PAD_0$pad_index ;;
+            esac
+            eval "pad_value=\\${$pad_name-}"
+            if [ "$pad_value" = x ]; then
+                child_pad_validated_count=$((child_pad_validated_count + 1))
+            else
+                child_pad_mismatch_count=$((child_pad_mismatch_count + 1))
+            fi
+            pad_index=$((pad_index + 1))
+        done
+        ;;
+esac
 
-preload = os.environ.get("LD_PRELOAD", "")
-loader_path = os.environ.get("LD_LIBRARY_PATH")
-print(
-    "ld_preload_libpeak_count={} ld_preload_env_entries={} "
-    "ld_preload_extra_count=0 peak_target={} peak_statslog={} "
-    "marker={} peak_exec_chain={} peak_exec_checkpoint={} "
-    "peak_exec_propagate={} ld_library_path_env_entries={} "
-    "ld_library_path_0={} ld_library_path_1={} "
-    "chain_disabled_observer={}".format(
-        sum("libpeak" in entry for entry in preload.split()),
-        int(bool(preload)),
-        value("PEAK_TARGET"),
-        value("PEAK_STATSLOG_PATH"),
-        value("EXEC_CHAIN_TEST_MARKER"),
-        value("PEAK_EXEC_CHAIN"),
-        value("PEAK_EXEC_CHECKPOINT"),
-        value("PEAK_EXEC_PROPAGATE_PEAK_ENV"),
-        int(loader_path is not None),
-        loader_path if loader_path is not None else "<missing>",
-        "<missing>",
-        value("EXEC_CHAIN_TEST_CHAIN_DISABLED_OBSERVER"),
+output="ld_preload_libpeak_count=$ld_preload_libpeak_count "
+output="${output}ld_preload_env_entries=$ld_preload_env_entries "
+output="${output}ld_preload_extra_count=$ld_preload_extra_count "
+output="${output}peak_target=${PEAK_TARGET-<missing>} "
+output="${output}peak_statslog=${PEAK_STATSLOG_PATH-<missing>} "
+output="${output}marker=${EXEC_CHAIN_TEST_MARKER-<missing>} "
+output="${output}peak_exec_chain=${PEAK_EXEC_CHAIN-<missing>} "
+output="${output}peak_exec_checkpoint=${PEAK_EXEC_CHECKPOINT-<missing>} "
+output="${output}peak_exec_propagate=${PEAK_EXEC_PROPAGATE_PEAK_ENV-<missing>} "
+output="${output}ld_library_path_env_entries=$ld_library_path_env_entries "
+output="${output}ld_library_path_0=$ld_library_path_0 "
+output="${output}ld_library_path_1=<missing> "
+output="${output}path=${PATH-<missing>} "
+output="${output}observer_mode=${1-<missing>} "
+output="${output}child_pad_validated_count=$child_pad_validated_count "
+output="${output}child_pad_mismatch_count=$child_pad_mismatch_count "
+output="${output}ld_preload_length=$ld_preload_length "
+output="${output}ld_preload_all_x=$ld_preload_all_x "
+output="${output}loader_observer=${EXEC_CHAIN_TEST_LOADER_OBSERVER-<missing>} "
+output="${output}secure_test_hook=${PEAK_TEST_EXEC_AT_SECURE-<missing>}"
+printf '%s\n' "$output"
+"""
+        .replace("@EXTRA_PRELOAD_TOKEN_A@", EXTRA_PRELOAD_TOKEN_A)
+        .replace("@EXTRA_PRELOAD_TOKEN_B@", EXTRA_PRELOAD_TOKEN_B)
     )
-)
-""",
-        encoding="utf-8",
-    )
+    observer.write_text(script, encoding="utf-8")
     observer.chmod(0o755)
+    validate_loader_observer(observer)
     return observer
+
+
+def validate_loader_observer(observer: Path):
+    unavailable_path = observer.parent / "no-external-commands"
+    preload = (
+        f"{EXTRA_PRELOAD_TOKEN_A}:{EXTRA_PRELOAD_TOKEN_A} "
+        f"/tmp/libpeak-one.so\t/tmp/not-an-extra.so\n"
+        f"{EXTRA_PRELOAD_TOKEN_B}:/tmp/libpeak-two.so"
+    )
+    proc = subprocess.run(
+        [str(observer)],
+        env={
+            "PATH": str(unavailable_path),
+            "LD_PRELOAD": preload,
+            "EXEC_CHAIN_TEST_MARKER": "observer-contract",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+    )
+    require(proc.returncode == 0,
+            f"chain-disabled observer contract failed\n{proc.stderr}")
+    require_observer_field(proc.stdout, "ld_preload_libpeak_count", "2")
+    require_observer_field(proc.stdout, "ld_preload_env_entries", "1")
+    require_observer_field(proc.stdout, "ld_preload_extra_count", "3")
+    require_observer_field(proc.stdout, "marker", "observer-contract")
+    require_observer_field(proc.stdout, "ld_library_path_env_entries", "0")
+    require_observer_field(proc.stdout, "path", str(unavailable_path))
+    require_observer_field(proc.stdout, "observer_mode", "<missing>")
+    require_observer_field(proc.stdout, "child_pad_validated_count", "0")
+    require_observer_field(proc.stdout, "child_pad_mismatch_count", "0")
+    require_observer_field(proc.stdout, "ld_preload_length", str(len(preload)))
+    require_observer_field(proc.stdout, "ld_preload_all_x", "0")
+    require_observer_field(proc.stdout, "loader_observer", "<missing>")
+    require_observer_field(proc.stdout, "secure_test_hook", "<missing>")
 
 
 def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool):
@@ -500,6 +766,7 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
     for name in list(env):
         if name.startswith("PEAK_"):
             env.pop(name, None)
+    env.pop(LOADER_OBSERVER_ENV, None)
     if preload:
         env["LD_PRELOAD"] = str(Path(args.libpeak).resolve())
         env["PEAK_TARGET"] = TARGET
@@ -571,10 +838,10 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
             f"/tmp/child-loader-second{os.pathsep}"
             f"{os.environ.get('LD_LIBRARY_PATH', '')}"
         )
-    if args.mode == "execve_loader_path_chain_disabled":
-        env["EXEC_CHAIN_TEST_CHAIN_DISABLED_OBSERVER"] = str(
-            install_chain_disabled_observer(tmpdir)
-        )
+    if args.mode in LOADER_OBSERVER_MODES | POSTFORK_FALLBACK_OBSERVER_MODES:
+        env[LOADER_OBSERVER_ENV] = str(install_loader_observer(tmpdir))
+        # The observer must remain usable without commands found through PATH.
+        env["PATH"] = str(tmpdir / "no-external-commands")
     if args.mode in {
         "posix_spawn_resolver_null_preserves_errno",
         "posix_spawnp_resolver_null_preserves_errno",
@@ -701,6 +968,17 @@ def require_ld_count(output, expected):
             f"expected {expected} libpeak LD_PRELOAD entries\n{output}")
 
 
+def require_observer_field(output, name, expected):
+    next_field = "|".join(re.escape(field) for field in OBSERVER_FIELD_NAMES)
+    match = re.search(
+        rf"(?:^|\s){re.escape(name)}=(.*?)(?=\s(?:{next_field})=|\n|$)",
+        output,
+    )
+    require(match is not None, f"missing observer field {name}\n{output}")
+    require(match.group(1) == expected,
+            f"expected {name}={expected}, got {match.group(1)}\n{output}")
+
+
 def require_single_ld_env(output):
     match = re.search(r"ld_preload_env_entries=(\d+)", output)
     require(match is not None, f"missing LD_PRELOAD env entry count\n{output}")
@@ -716,7 +994,9 @@ def require_loader_paths(output, expected):
             f"unexpected LD_LIBRARY_PATH entries\n{output}")
     actual = {}
     for index, value in re.findall(
-            r"(?:^|\s)ld_library_path_(\d+)=(.*?)(?=\sld_library_path_\d+=|\n|$)",
+            r"(?:^|\s)ld_library_path_(\d+)=(.*?)"
+            r"(?=\s(?:ld_library_path_\d+|path|loader_observer|"
+            r"secure_test_hook)=|\n|$)",
             output):
         actual[int(index)] = value
     require([actual.get(index) for index in range(len(expected))] == expected,
@@ -763,6 +1043,50 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
 
     require(proc.returncode == 0,
             f"fixture exited {proc.returncode}\n{output}")
+
+    expected_fallback_observer_modes = set(CAPACITY_PASSTHROUGH_MODES) | {
+        "vfork_preload_entries_fallback"
+    }
+    require(set(POSTFORK_FALLBACK_OBSERVER_MODES) ==
+            expected_fallback_observer_modes,
+            "post-fork fallback observer audit is incomplete: "
+            f"expected={sorted(expected_fallback_observer_modes)} "
+            f"observed={sorted(POSTFORK_FALLBACK_OBSERVER_MODES)}")
+    require(set(POSTFORK_FALLBACK_EXPECTATIONS) ==
+            expected_fallback_observer_modes,
+            "post-fork fallback assertions are incomplete")
+
+    if args.mode in POSTFORK_FALLBACK_OBSERVER_MODES:
+        expected = POSTFORK_FALLBACK_EXPECTATIONS[args.mode]
+        expected_fields = {
+            "ld_preload_libpeak_count": "0",
+            "ld_preload_env_entries": expected["preload_entries"],
+            "ld_preload_extra_count": "0",
+            "peak_target": "<missing>",
+            "peak_statslog": "<missing>",
+            "marker": expected["marker"],
+            "peak_exec_chain": "<missing>",
+            "peak_exec_checkpoint": "<missing>",
+            "peak_exec_propagate": "<missing>",
+            "ld_library_path_env_entries": "0",
+            "ld_library_path_0": "<missing>",
+            "ld_library_path_1": "<missing>",
+            "observer_mode": expected["observer_mode"],
+            "child_pad_validated_count": expected["pad_validated_count"],
+            "child_pad_mismatch_count": expected["pad_mismatch_count"],
+            "ld_preload_length": expected["preload_length"],
+            "ld_preload_all_x": expected["preload_all_x"],
+            "loader_observer": "<missing>",
+            "secure_test_hook": "<missing>",
+        }
+        if expected["path"] is not None:
+            expected_fields["path"] = (str(tmpdir / "no-external-commands")
+                                       if expected["path"] == "observer" else
+                                       expected["path"])
+        for name, value in expected_fields.items():
+            require_observer_field(output, name, value)
+        require(expected["parent_contract"] in output,
+                f"post-fork fallback input contract changed\n{output}")
 
     if args.mode in CAPACITY_PASSTHROUGH_MODES:
         kind, marker, ld_preload_env_entries = CAPACITY_PASSTHROUGH_MODES[args.mode]
@@ -963,8 +1287,46 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         "fork_parent_env_exhaustion": [],
         "posix_spawn_null_env_injection": [loader_test_value()],
     }
+    no_loader_modes = {
+        mode
+        for mode, expected in expected_loader_paths.items()
+        if expected == []
+    }
+    require(no_loader_modes == set(NO_LOADER_MODE_EXPECTATIONS),
+            "no-loader mode audit is incomplete: "
+            f"expected={sorted(no_loader_modes)} "
+            f"audited={sorted(NO_LOADER_MODE_EXPECTATIONS)}")
     if args.mode in expected_loader_paths:
         require_loader_paths(output, expected_loader_paths[args.mode])
+
+    if args.mode in NO_LOADER_MODE_EXPECTATIONS:
+        mode_expected = NO_LOADER_MODE_EXPECTATIONS[args.mode]
+        if mode_expected["use_observer"]:
+            expected_path = str(tmpdir / "no-external-commands")
+        else:
+            old_path = os.environ.get("PATH", "/bin:/usr/bin")
+            expected_path = f"{tmpdir / 'bin'}{os.pathsep}{old_path}"
+        expected_fields = {
+            "ld_preload_libpeak_count": mode_expected["preload_count"],
+            "ld_preload_env_entries": mode_expected["preload_entries"],
+            "ld_preload_extra_count": mode_expected["extra_count"],
+            "peak_target": mode_expected["peak_target"],
+            "peak_statslog": mode_expected["peak_statslog"],
+            "marker": mode_expected["marker"],
+            "peak_exec_chain": mode_expected["peak_exec_chain"],
+            "peak_exec_checkpoint": "<missing>",
+            "peak_exec_propagate": mode_expected.get(
+                "peak_exec_propagate", "<missing>"
+            ),
+            "ld_library_path_env_entries": "0",
+            "ld_library_path_0": "<missing>",
+            "ld_library_path_1": "<missing>",
+            "path": expected_path,
+            "loader_observer": "<missing>",
+            "secure_test_hook": mode_expected["secure_test_hook"],
+        }
+        for name, expected in expected_fields.items():
+            require_observer_field(output, name, expected)
 
     if args.mode in {
         "fork_custom_env_chain_disabled",
@@ -975,9 +1337,6 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require_ld_count(output, 0)
         require("peak_exec_chain=0" in output,
                 f"child PEAK_EXEC_CHAIN=0 was not preserved\n{output}")
-        if args.mode == "execve_loader_path_chain_disabled":
-            require("chain_disabled_observer=<missing>" in output,
-                    f"child environment inherited harness-only observer path\n{output}")
 
     if args.mode in {
         "fork_custom_env_execve_chain",
@@ -1107,8 +1466,7 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require("postfork_preload_entries_passthrough=1" in output,
                 f"unterminated preload vector was augmented\n{output}")
         require_ld_count(output, 0)
-        require("ld_preload_env_entries=256" in output,
-                f"unterminated preload vector was truncated\n{output}")
+        require_observer_field(output, "ld_preload_env_entries", "1")
         require_loader_paths(output, [])
 
     if args.mode == "exec_bad_stats_path_nonfatal":
