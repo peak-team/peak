@@ -91,6 +91,11 @@ static __thread int peak_exec_spawn_depth;
 static pid_t peak_exec_owner_pid;
 static char peak_exec_cached_libpeak_path[PATH_MAX];
 static int peak_exec_cached_libpeak_path_ready;
+static char* peak_exec_cached_ld_library_path;
+static int peak_exec_cached_ld_library_path_ready;
+static int peak_exec_cached_ld_library_path_failed;
+static int peak_exec_cached_secure_mode;
+static int peak_exec_cached_secure_mode_ready;
 
 static int
 peak_exec_in_fork_child(void)
@@ -217,7 +222,7 @@ peak_exec_child_entry_matches(const char* entry, const char* name)
     }
 }
 
-/* Returns 0 when found, 1 when absent, and -1 when memory is unreadable. */
+/* Returns 0 when found, 1 when absent, and -1 when unreadable or unterminated. */
 static int
 peak_exec_child_env_get(char* const envp[], const char* name, const char** value)
 {
@@ -243,7 +248,7 @@ peak_exec_child_env_get(char* const envp[], const char* name, const char** value
             return 0;
         }
     }
-    return 1;
+    return -1;
 }
 
 static int
@@ -372,10 +377,14 @@ peak_exec_child_build_env(char* const envp[],
     size_t out = 0;
     size_t ld_len = sizeof("LD_PRELOAD=") - 1;
     size_t libpeak_len = 0;
+    int child_has_ld_library_path = 0;
+    int libpeak_already_present = 0;
+    int env_terminated = envp == NULL;
     int propagate_peak_env;
     int chain_enabled;
 
-    if (!peak_exec_cached_libpeak_path_ready ||
+    if (!peak_exec_cached_secure_mode_ready || peak_exec_cached_secure_mode ||
+        !peak_exec_cached_libpeak_path_ready ||
         peak_exec_child_control_enabled(envp,
                                         PEAK_EXEC_CHAIN_ENV,
                                         &chain_enabled) != 0 ||
@@ -396,19 +405,31 @@ peak_exec_child_build_env(char* const envp[],
     if (envp != NULL) {
         for (size_t index = 0; index < PEAK_EXEC_CHILD_ENV_SLOTS; index++) {
             const char* entry;
-            int matches;
+            int preload_matches;
+            int library_path_matches;
 
             if (peak_exec_child_read_pointer(envp, index, &entry) != 0) {
                 return envp;
             }
             if (entry == NULL) {
+                env_terminated = 1;
                 break;
             }
-            matches = peak_exec_child_entry_matches(entry, "LD_PRELOAD");
-            if (matches < 0) {
+            preload_matches = peak_exec_child_entry_matches(entry, "LD_PRELOAD");
+            if (preload_matches < 0) {
                 return envp;
             }
-            if (matches != 0) {
+            if (preload_matches == 0) {
+                library_path_matches = peak_exec_child_entry_matches(
+                    entry, "LD_LIBRARY_PATH");
+                if (library_path_matches < 0) {
+                    return envp;
+                }
+                if (library_path_matches != 0) {
+                    child_has_ld_library_path = 1;
+                }
+            }
+            if (preload_matches != 0) {
                 const char* value = entry + sizeof("LD_PRELOAD=") - 1;
                 const char* cursor = value;
                 size_t cursor_index = 0;
@@ -442,6 +463,9 @@ peak_exec_child_build_env(char* const envp[],
                         peak_exec_child_token_is_cached_libpeak(
                             (const char*)((uintptr_t)cursor + token_start),
                             token_len)) {
+                        if (token_len != 0) {
+                            libpeak_already_present = 1;
+                        }
                         continue;
                     }
                     if (ld_len + 1 + token_len + 1 >
@@ -464,9 +488,24 @@ peak_exec_child_build_env(char* const envp[],
                 return envp;
             }
         }
+        if (!env_terminated) {
+            return envp;
+        }
     }
     if (peak_exec_child_append_preload(output, &out, ld_preload) != 0) {
         return envp;
+    }
+    if (!libpeak_already_present && !child_has_ld_library_path) {
+        if (!peak_exec_cached_ld_library_path_ready ||
+            peak_exec_cached_ld_library_path_failed) {
+            return envp;
+        }
+        if (peak_exec_cached_ld_library_path != NULL &&
+            peak_exec_child_append_preload(output,
+                                           &out,
+                                           peak_exec_cached_ld_library_path) != 0) {
+            return envp;
+        }
     }
 
     if (peak_exec_child_control_enabled(envp,
@@ -475,6 +514,8 @@ peak_exec_child_build_env(char* const envp[],
         return envp;
     }
     if (propagate_peak_env && environ != NULL) {
+        int parent_env_terminated = 0;
+
         for (size_t index = 0; index < PEAK_EXEC_CHILD_ENV_SLOTS; index++) {
             const char* entry;
             char prefix[5];
@@ -486,6 +527,7 @@ peak_exec_child_build_env(char* const envp[],
                 return envp;
             }
             if (entry == NULL) {
+                parent_env_terminated = 1;
                 break;
             }
             if (peak_exec_child_read(entry, prefix, sizeof(prefix)) != 0 ||
@@ -518,6 +560,9 @@ peak_exec_child_build_env(char* const envp[],
                     return envp;
                 }
             }
+        }
+        if (!parent_env_terminated) {
+            return envp;
         }
     }
     output[out] = NULL;
@@ -1150,6 +1195,8 @@ peak_exec_build_env(char* const envp[],
     int secure;
     int should_touch_ld = 0;
     int new_ld_changed = 0;
+    int libpeak_already_present = 0;
+    int add_ld_library_path = 0;
     int ld_written = 0;
     char* libpeak_path = NULL;
     char* existing_ld_joined = NULL;
@@ -1182,6 +1229,8 @@ peak_exec_build_env(char* const envp[],
             errno = ENOMEM;
             return -1;
         }
+        libpeak_already_present = peak_exec_preload_contains_libpeak(
+            existing_ld_joined, libpeak_path);
         new_ld_value = peak_exec_build_ld_preload(existing_ld_joined,
                                                   libpeak_path,
                                                   &new_ld_changed);
@@ -1195,7 +1244,21 @@ peak_exec_build_env(char* const envp[],
         missing_peak_count = peak_exec_count_missing_peak_env(base_env);
     }
 
-    if (!new_ld_changed && missing_peak_count == 0 && ld_entry_count <= 1) {
+    if (new_ld_changed && !libpeak_already_present &&
+        !peak_exec_env_has_name(base_env, "LD_LIBRARY_PATH")) {
+        if (!peak_exec_cached_ld_library_path_ready ||
+            peak_exec_cached_ld_library_path_failed) {
+            free(new_ld_value);
+            free(existing_ld_joined);
+            free(libpeak_path);
+            errno = ENOMEM;
+            return -1;
+        }
+        add_ld_library_path = peak_exec_cached_ld_library_path != NULL;
+    }
+
+    if (!new_ld_changed && !add_ld_library_path && missing_peak_count == 0 &&
+        ld_entry_count <= 1) {
         free(new_ld_value);
         free(existing_ld_joined);
         free(libpeak_path);
@@ -1204,7 +1267,8 @@ peak_exec_build_env(char* const envp[],
 
     if (peak_exec_size_add(
             missing_peak_count,
-            (should_touch_ld && ld_entry_count == 0) ? 1 : 0,
+            ((should_touch_ld && ld_entry_count == 0) ? 1 : 0) +
+                (add_ld_library_path ? 1 : 0),
             &extra_count) != 0 ||
         peak_exec_size_add(base_count, extra_count, &env_capacity) != 0 ||
         peak_exec_size_add(env_capacity, 1, &env_capacity) != 0) {
@@ -1344,6 +1408,18 @@ peak_exec_build_env(char* const envp[],
             return -1;
         }
         built->envp[out++] = entry;
+        built->changed = 1;
+    }
+
+    if (add_ld_library_path) {
+        if (out + 1 >= env_capacity) {
+            free(new_ld_value);
+            free(existing_ld_joined);
+            free(libpeak_path);
+            errno = E2BIG;
+            return -1;
+        }
+        built->envp[out++] = peak_exec_cached_ld_library_path;
         built->changed = 1;
     }
 
@@ -1545,12 +1621,49 @@ peak_exec_cache_libpeak_path(void)
     free(libpeak_path);
 }
 
+static void
+peak_exec_cache_ld_library_path(void)
+{
+    const char* value = getenv("LD_LIBRARY_PATH");
+    const size_t prefix_length = sizeof("LD_LIBRARY_PATH=") - 1;
+    size_t value_length;
+    char* entry;
+
+    if (value == NULL || value[0] == '\0') {
+        peak_exec_cached_ld_library_path_ready = 1;
+        return;
+    }
+    value_length = strlen(value);
+    if (value_length > SIZE_MAX - prefix_length - 1) {
+        peak_exec_cached_ld_library_path_failed = 1;
+        return;
+    }
+    entry = malloc(prefix_length + value_length + 1);
+    if (entry == NULL) {
+        peak_exec_cached_ld_library_path_failed = 1;
+        return;
+    }
+    memcpy(entry, "LD_LIBRARY_PATH=", prefix_length);
+    memcpy(entry + prefix_length, value, value_length + 1);
+    peak_exec_cached_ld_library_path = entry;
+    peak_exec_cached_ld_library_path_ready = 1;
+}
+
+static void
+peak_exec_cache_secure_mode(void)
+{
+    peak_exec_cached_secure_mode = peak_exec_secure_mode();
+    peak_exec_cached_secure_mode_ready = 1;
+}
+
 __attribute__((constructor))
 static void
 peak_exec_prime_real_symbols(void)
 {
     peak_exec_owner_pid = getpid();
     peak_exec_cache_libpeak_path();
+    peak_exec_cache_ld_library_path();
+    peak_exec_cache_secure_mode();
     (void)peak_real_execve();
     (void)peak_real_execvpe();
     (void)peak_real_fexecve();

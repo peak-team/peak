@@ -176,6 +176,17 @@ full output and teardown behavior.
 For runtime behavior, accounting, and tuning, see
 [Heartbeat mechanism and runtime policy](docs/heartbeat.md).
 
+### Exec-Chain Profiling
+
+| Variable | Purpose |
+| --- | --- |
+| `PEAK_EXEC_CHAIN` | Keep PEAK available across eligible exec and spawn children. Default: enabled. |
+| `PEAK_EXEC_CHECKPOINT` | Write a best-effort checkpoint before direct exec calls. Default: enabled. |
+| `PEAK_EXEC_PROPAGATE_PEAK_ENV` | Copy missing parent `PEAK_*` settings into a child environment. Default: enabled. |
+
+See [Exec-chain profiling](docs/exec-chain.md) for supported API families,
+child-environment precedence, fork safety, and limitations.
+
 ### Detach and Safety
 
 | Variable | Purpose |
@@ -250,6 +261,8 @@ toolchains and host capabilities detected during configuration.
 
 - [Heartbeat mechanism and runtime policy](docs/heartbeat.md): implementation
   behavior, overhead accounting, and tuning.
+- [Exec-chain profiling](docs/exec-chain.md): child-environment behavior,
+  supported exec and spawn APIs, and fork safety limits.
 - [Physical detach controller](docs/physical-detach-controller.md): strict
   transition safety, MPI output, dynamic loading, and shutdown behavior.
 - [JIT profiling](docs/jit-profiling.md): provider guarantees, retry behavior,
