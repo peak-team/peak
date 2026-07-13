@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -58,6 +59,7 @@
 extern char** environ;
 
 typedef int (*peak_execve_fn)(const char*, char* const[], char* const[]);
+typedef int (*peak_execvp_fn)(const char*, char* const[]);
 typedef int (*peak_execvpe_fn)(const char*, char* const[], char* const[]);
 typedef int (*peak_fexecve_fn)(int, char* const[], char* const[]);
 typedef int (*peak_execveat_fn)(int,
@@ -78,6 +80,30 @@ typedef int (*peak_posix_spawnp_fn)(pid_t*,
                                     char* const[],
                                     char* const[]);
 
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+#define PEAK_EXEC_DIRECT_RAW_SUPPORTED 1
+#else
+#define PEAK_EXEC_DIRECT_RAW_SUPPORTED 0
+#endif
+
+static int peak_call_real_execve(const char*,
+                                 char* const[],
+                                 char* const[]);
+#if !PEAK_EXEC_DIRECT_RAW_SUPPORTED
+static int peak_call_real_execvp(const char*, char* const[]);
+static int peak_call_real_execvpe(const char*,
+                                  char* const[],
+                                  char* const[]);
+#endif
+static int peak_call_real_fexecve(int, char* const[], char* const[]);
+#if defined(__linux__)
+static int peak_call_real_execveat(int,
+                                   const char*,
+                                   char* const[],
+                                   char* const[],
+                                   int);
+#endif
+
 typedef struct {
     char** envp;
     char** owned_strings;
@@ -96,6 +122,276 @@ static int peak_exec_cached_ld_library_path_ready;
 static int peak_exec_cached_ld_library_path_failed;
 static int peak_exec_cached_secure_mode;
 static int peak_exec_cached_secure_mode_ready;
+/* Immutable after constructor priming; wrappers read these without libc calls. */
+static int peak_exec_startup_chain_enabled;
+static int peak_exec_startup_checkpoint_enabled;
+static int peak_exec_startup_policy_enabled;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "exec policy publication must always be lock-free");
+_Static_assert(ATOMIC_LONG_LOCK_FREE == 2,
+               "exec resolver ownership must always be lock-free");
+static atomic_int peak_exec_priming_complete = ATOMIC_VAR_INIT(0);
+#if !PEAK_EXEC_DIRECT_RAW_SUPPORTED
+/* This guard only breaks loader-time resolver recursion; it is not signal-safe. */
+static __thread int peak_exec_prepublication_execve_resolving;
+#endif
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+static int peak_exec_test_force_execvpe_fallback;
+extern void peak_test_exec_resolver_reentry_hook(void)
+    __attribute__((weak));
+#endif
+
+static int
+peak_exec_priming_is_complete(void)
+{
+    return atomic_load_explicit(&peak_exec_priming_complete,
+                                memory_order_acquire) != 0;
+}
+
+static int
+peak_exec_prepublication_execve(const char* path,
+                                char* const argv[],
+                                char* const envp[])
+{
+#if PEAK_EXEC_DIRECT_RAW_SUPPORTED && defined(SYS_execve)
+    return (int)peak_exec_raw_syscall6(
+        SYS_execve,
+        (long)(uintptr_t)path,
+        (long)(uintptr_t)argv,
+        (long)(uintptr_t)envp,
+        0,
+        0,
+        0);
+#else
+    peak_execve_fn fn;
+
+    if (peak_exec_prepublication_execve_resolving) {
+        errno = ENOSYS;
+        return -1;
+    }
+    peak_exec_prepublication_execve_resolving = 1;
+    fn = (peak_execve_fn)dlsym(RTLD_NEXT, "execve");
+    peak_exec_prepublication_execve_resolving = 0;
+    if (fn == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return fn(path, argv, envp);
+#endif
+}
+
+static size_t
+peak_exec_prepublication_strlen(const char* value, size_t limit)
+{
+    size_t length = 0;
+
+    if (value == NULL) {
+        return 0;
+    }
+    while (length < limit && value[length] != '\0') {
+        length++;
+    }
+    return length;
+}
+
+static const char*
+peak_exec_prepublication_path(void)
+{
+    static const char prefix[] = "PATH=";
+
+    if (environ != NULL) {
+        for (size_t index = 0; environ[index] != NULL; index++) {
+            const char* entry = environ[index];
+            size_t offset = 0;
+
+            while (offset + 1 < sizeof(prefix) &&
+                   entry[offset] == prefix[offset]) {
+                offset++;
+            }
+            if (offset + 1 == sizeof(prefix)) {
+                return entry + offset;
+            }
+        }
+    }
+    return PEAK_EXEC_DEFAULT_PATH;
+}
+
+static int
+peak_exec_prepublication_shell(const char* path,
+                               char* const argv[],
+                               char* const envp[])
+{
+    size_t argc = 0;
+
+    if (argv != NULL) {
+        while (argv[argc] != NULL) {
+            argc++;
+            if (argc >= PEAK_EXEC_MAX_VARARGS) {
+                errno = E2BIG;
+                return -1;
+            }
+        }
+    }
+    {
+        char* shell_argv[argc + 3U];
+
+        shell_argv[0] = (char*)"/bin/sh";
+        shell_argv[1] = (char*)path;
+        for (size_t index = 1; index < argc; index++) {
+            shell_argv[index + 1] = argv[index];
+        }
+        shell_argv[argc > 0 ? argc + 1 : 2] = NULL;
+        return peak_exec_prepublication_execve("/bin/sh", shell_argv, envp);
+    }
+}
+
+static int
+peak_exec_prepublication_path_search(const char* file,
+                                     char* const argv[],
+                                     char* const envp[])
+{
+    char candidate[PATH_MAX];
+    const char* path;
+    const char* cursor;
+    size_t file_length;
+    int saved_errno = ENOENT;
+    int saw_eacces = 0;
+
+    if (file == NULL || file[0] == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+    file_length = peak_exec_prepublication_strlen(file, PATH_MAX);
+    if (file_length == PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    for (size_t index = 0; index < file_length; index++) {
+        if (file[index] == '/') {
+            int result = peak_exec_prepublication_execve(file, argv, envp);
+
+            if (result < 0 && errno == ENOEXEC) {
+                return peak_exec_prepublication_shell(file, argv, envp);
+            }
+            return result;
+        }
+    }
+
+    path = peak_exec_prepublication_path();
+    cursor = path;
+    for (;;) {
+        const char* start = cursor;
+        size_t directory_length;
+        size_t candidate_length;
+
+        while (*cursor != '\0' && *cursor != ':') {
+            cursor++;
+        }
+        directory_length = (size_t)(cursor - start);
+        candidate_length = directory_length +
+                           (directory_length != 0 ? 1U : 0U) + file_length;
+        if (candidate_length + 1U <= sizeof(candidate)) {
+            size_t output = 0;
+
+            for (size_t index = 0; index < directory_length; index++) {
+                candidate[output++] = start[index];
+            }
+            if (directory_length != 0) {
+                candidate[output++] = '/';
+            }
+            for (size_t index = 0; index < file_length; index++) {
+                candidate[output++] = file[index];
+            }
+            candidate[output] = '\0';
+            (void)peak_exec_prepublication_execve(candidate, argv, envp);
+            saved_errno = errno;
+            if (saved_errno == ENOEXEC) {
+                return peak_exec_prepublication_shell(candidate, argv, envp);
+            }
+            if (saved_errno == EACCES) {
+                saw_eacces = 1;
+            } else if (saved_errno != ENOENT && saved_errno != ENOTDIR &&
+                       saved_errno != ESTALE && saved_errno != ENODEV &&
+                       saved_errno != ETIMEDOUT) {
+                errno = saved_errno;
+                return -1;
+            }
+        } else {
+            saved_errno = ENAMETOOLONG;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        cursor++;
+    }
+    errno = saw_eacces ? EACCES : saved_errno;
+    return -1;
+}
+
+static int
+peak_exec_prepublication_execvp(const char* file, char* const argv[])
+{
+#if PEAK_EXEC_DIRECT_RAW_SUPPORTED
+    return peak_exec_prepublication_path_search(file, argv, environ);
+#else
+    return peak_call_real_execvp(file, argv);
+#endif
+}
+
+static int
+peak_exec_prepublication_execvpe(const char* file,
+                                 char* const argv[],
+                                 char* const envp[])
+{
+#if PEAK_EXEC_DIRECT_RAW_SUPPORTED
+    return peak_exec_prepublication_path_search(file, argv, envp);
+#else
+    return peak_call_real_execvpe(file, argv, envp);
+#endif
+}
+
+static int
+peak_exec_prepublication_fexecve(int fd,
+                                 char* const argv[],
+                                 char* const envp[])
+{
+#if PEAK_EXEC_DIRECT_RAW_SUPPORTED && defined(SYS_execveat) && \
+    defined(AT_EMPTY_PATH)
+    return (int)peak_exec_raw_syscall6(
+        SYS_execveat,
+        fd,
+        (long)(uintptr_t)"",
+        (long)(uintptr_t)argv,
+        (long)(uintptr_t)envp,
+        AT_EMPTY_PATH,
+        0);
+#else
+    return peak_call_real_fexecve(fd, argv, envp);
+#endif
+}
+
+#if defined(__linux__)
+static int
+peak_exec_prepublication_execveat(int dirfd,
+                                  const char* pathname,
+                                  char* const argv[],
+                                  char* const envp[],
+                                  int flags)
+{
+#if PEAK_EXEC_DIRECT_RAW_SUPPORTED && defined(SYS_execveat)
+    return (int)peak_exec_raw_syscall6(
+        SYS_execveat,
+        dirfd,
+        (long)(uintptr_t)pathname,
+        (long)(uintptr_t)argv,
+        (long)(uintptr_t)envp,
+        flags,
+        0);
+#else
+    return peak_call_real_execveat(dirfd, pathname, argv, envp, flags);
+#endif
+}
+#endif
 
 static int
 peak_exec_in_fork_child(void)
@@ -383,7 +679,8 @@ peak_exec_child_build_env(char* const envp[],
     int propagate_peak_env;
     int chain_enabled;
 
-    if (!peak_exec_cached_secure_mode_ready || peak_exec_cached_secure_mode ||
+    if (!peak_exec_startup_chain_enabled ||
+        !peak_exec_cached_secure_mode_ready || peak_exec_cached_secure_mode ||
         !peak_exec_cached_libpeak_path_ready ||
         peak_exec_child_control_enabled(envp,
                                         PEAK_EXEC_CHAIN_ENV,
@@ -1463,8 +1760,9 @@ peak_exec_prepare(const char* path,
                   int allow_checkpoint)
 {
     int saved_errno = errno;
-    int chain_enabled =
-        peak_exec_env_default_true_for_child(envp, PEAK_EXEC_CHAIN_ENV);
+    int chain_enabled = peak_exec_startup_chain_enabled &&
+                        peak_exec_env_default_true_for_child(
+                            envp, PEAK_EXEC_CHAIN_ENV);
     int propagate_peak_env =
         peak_exec_env_default_true_for_child(
             envp,
@@ -1474,6 +1772,7 @@ peak_exec_prepare(const char* path,
     peak_exec_trace_event("exec-before", path, "", 0);
     if (allow_checkpoint &&
         peak_exec_spawn_depth == 0 &&
+        peak_exec_startup_checkpoint_enabled &&
         peak_exec_env_default_true_for_child(envp,
                                              PEAK_EXEC_CHECKPOINT_ENV)) {
         int checkpoint_result = peak_checkpoint_for_exec(path, argv);
@@ -1509,21 +1808,41 @@ peak_exec_prepare(const char* path,
 }
 
 static pthread_once_t peak_real_execve_once = PTHREAD_ONCE_INIT;
+static pthread_once_t peak_real_execvp_once = PTHREAD_ONCE_INIT;
 static pthread_once_t peak_real_execvpe_once = PTHREAD_ONCE_INIT;
 static pthread_once_t peak_real_fexecve_once = PTHREAD_ONCE_INIT;
 static pthread_once_t peak_real_execveat_once = PTHREAD_ONCE_INIT;
-static pthread_once_t peak_real_posix_spawn_once = PTHREAD_ONCE_INIT;
-static pthread_once_t peak_real_posix_spawnp_once = PTHREAD_ONCE_INIT;
 static peak_execve_fn peak_real_execve_ptr;
+static peak_execvp_fn peak_real_execvp_ptr;
 static peak_execvpe_fn peak_real_execvpe_ptr;
 static peak_fexecve_fn peak_real_fexecve_ptr;
 static peak_execveat_fn peak_real_execveat_ptr;
 static peak_posix_spawn_fn peak_real_posix_spawn_ptr;
 static peak_posix_spawnp_fn peak_real_posix_spawnp_ptr;
+enum {
+    PEAK_SPAWN_RESOLVER_UNRESOLVED = 0,
+    PEAK_SPAWN_RESOLVER_IN_PROGRESS = 1,
+    PEAK_SPAWN_RESOLVER_READY = 2,
+};
+static atomic_int peak_real_posix_spawn_state = ATOMIC_VAR_INIT(0);
+static atomic_int peak_real_posix_spawnp_state = ATOMIC_VAR_INIT(0);
+static atomic_long peak_real_posix_spawn_owner_pid = ATOMIC_VAR_INIT(0);
+static atomic_long peak_real_posix_spawnp_owner_pid = ATOMIC_VAR_INIT(0);
+static __thread int peak_posix_spawn_resolving;
 
 static void peak_lookup_execve(void)
 {
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (peak_test_exec_resolver_reentry_hook != NULL) {
+        peak_test_exec_resolver_reentry_hook();
+    }
+#endif
     peak_real_execve_ptr = (peak_execve_fn)dlsym(RTLD_NEXT, "execve");
+}
+
+static void peak_lookup_execvp(void)
+{
+    peak_real_execvp_ptr = (peak_execvp_fn)dlsym(RTLD_NEXT, "execvp");
 }
 
 static void peak_lookup_execvpe(void)
@@ -1541,16 +1860,32 @@ static void peak_lookup_execveat(void)
     peak_real_execveat_ptr = (peak_execveat_fn)dlsym(RTLD_NEXT, "execveat");
 }
 
-static void peak_lookup_posix_spawn(void)
+static peak_posix_spawn_fn
+peak_lookup_posix_spawn(void)
 {
-    peak_real_posix_spawn_ptr =
-        (peak_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    extern void peak_test_exec_spawn_resolver_reentry_hook(int)
+        __attribute__((weak));
+
+    if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
+        peak_test_exec_spawn_resolver_reentry_hook(0);
+    }
+#endif
+    return (peak_posix_spawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
 }
 
-static void peak_lookup_posix_spawnp(void)
+static peak_posix_spawnp_fn
+peak_lookup_posix_spawnp(void)
 {
-    peak_real_posix_spawnp_ptr =
-        (peak_posix_spawnp_fn)dlsym(RTLD_NEXT, "posix_spawnp");
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    extern void peak_test_exec_spawn_resolver_reentry_hook(int)
+        __attribute__((weak));
+
+    if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
+        peak_test_exec_spawn_resolver_reentry_hook(1);
+    }
+#endif
+    return (peak_posix_spawnp_fn)dlsym(RTLD_NEXT, "posix_spawnp");
 }
 
 static peak_execve_fn
@@ -1560,14 +1895,19 @@ peak_real_execve(void)
     return peak_real_execve_ptr;
 }
 
+static peak_execvp_fn
+peak_real_execvp(void)
+{
+    (void)pthread_once(&peak_real_execvp_once, peak_lookup_execvp);
+    return peak_real_execvp_ptr;
+}
+
 static peak_execvpe_fn
 peak_real_execvpe(void)
 {
     (void)pthread_once(&peak_real_execvpe_once, peak_lookup_execvpe);
 #if defined(PEAK_ENABLE_TEST_HOOKS)
-    const char* forced_fallback = getenv("PEAK_TEST_EXECVPE_FALLBACK");
-
-    if (forced_fallback != NULL && !peak_exec_env_false(forced_fallback)) {
+    if (peak_exec_test_force_execvpe_fallback) {
         return NULL;
     }
 #endif
@@ -1591,17 +1931,163 @@ peak_real_execveat(void)
 static peak_posix_spawn_fn
 peak_real_posix_spawn(void)
 {
-    (void)pthread_once(&peak_real_posix_spawn_once,
-                       peak_lookup_posix_spawn);
-    return peak_real_posix_spawn_ptr;
+    peak_posix_spawn_fn resolved;
+    const long self = (long)getpid();
+
+    for (;;) {
+        int state = atomic_load_explicit(&peak_real_posix_spawn_state,
+                                         memory_order_acquire);
+        long owner;
+
+        if (state == PEAK_SPAWN_RESOLVER_READY) {
+            return peak_real_posix_spawn_ptr;
+        }
+        if (peak_posix_spawn_resolving) {
+            return NULL;
+        }
+        owner = atomic_load_explicit(&peak_real_posix_spawn_owner_pid,
+                                     memory_order_acquire);
+        if (owner == 0) {
+            long expected = 0;
+
+            peak_posix_spawn_resolving = 1;
+            if (atomic_compare_exchange_strong_explicit(
+                    &peak_real_posix_spawn_owner_pid,
+                    &expected,
+                    self,
+                    memory_order_acq_rel,
+                    memory_order_acquire)) {
+                atomic_store_explicit(&peak_real_posix_spawn_state,
+                                      PEAK_SPAWN_RESOLVER_IN_PROGRESS,
+                                      memory_order_release);
+                resolved = peak_lookup_posix_spawn();
+                peak_real_posix_spawn_ptr = resolved;
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+                {
+                    extern void peak_test_exec_spawn_publication_hook(int)
+                        __attribute__((weak));
+
+                    if (peak_test_exec_spawn_publication_hook != NULL) {
+                        peak_test_exec_spawn_publication_hook(0);
+                    }
+                }
+#endif
+                peak_posix_spawn_resolving = 0;
+                atomic_store_explicit(&peak_real_posix_spawn_state,
+                                      PEAK_SPAWN_RESOLVER_READY,
+                                      memory_order_release);
+                return resolved;
+            }
+            peak_posix_spawn_resolving = 0;
+            continue;
+        }
+        if (owner != self) {
+            return NULL;
+        }
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+        {
+            extern void peak_test_exec_spawn_waiter_hook(int)
+                __attribute__((weak));
+
+            if (peak_test_exec_spawn_waiter_hook != NULL) {
+                peak_test_exec_spawn_waiter_hook(0);
+            }
+        }
+#endif
+        do {
+            state = atomic_load_explicit(&peak_real_posix_spawn_state,
+                                         memory_order_acquire);
+            if (state == PEAK_SPAWN_RESOLVER_READY) {
+                return peak_real_posix_spawn_ptr;
+            }
+            if (peak_posix_spawn_resolving ||
+                atomic_load_explicit(&peak_real_posix_spawn_owner_pid,
+                                     memory_order_acquire) != self) {
+                return NULL;
+            }
+        } while (state != PEAK_SPAWN_RESOLVER_READY);
+    }
 }
 
 static peak_posix_spawnp_fn
 peak_real_posix_spawnp(void)
 {
-    (void)pthread_once(&peak_real_posix_spawnp_once,
-                       peak_lookup_posix_spawnp);
-    return peak_real_posix_spawnp_ptr;
+    peak_posix_spawnp_fn resolved;
+    const long self = (long)getpid();
+
+    for (;;) {
+        int state = atomic_load_explicit(&peak_real_posix_spawnp_state,
+                                         memory_order_acquire);
+        long owner;
+
+        if (state == PEAK_SPAWN_RESOLVER_READY) {
+            return peak_real_posix_spawnp_ptr;
+        }
+        if (peak_posix_spawn_resolving) {
+            return NULL;
+        }
+        owner = atomic_load_explicit(&peak_real_posix_spawnp_owner_pid,
+                                     memory_order_acquire);
+        if (owner == 0) {
+            long expected = 0;
+
+            peak_posix_spawn_resolving = 1;
+            if (atomic_compare_exchange_strong_explicit(
+                    &peak_real_posix_spawnp_owner_pid,
+                    &expected,
+                    self,
+                    memory_order_acq_rel,
+                    memory_order_acquire)) {
+                atomic_store_explicit(&peak_real_posix_spawnp_state,
+                                      PEAK_SPAWN_RESOLVER_IN_PROGRESS,
+                                      memory_order_release);
+                resolved = peak_lookup_posix_spawnp();
+                peak_real_posix_spawnp_ptr = resolved;
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+                {
+                    extern void peak_test_exec_spawn_publication_hook(int)
+                        __attribute__((weak));
+
+                    if (peak_test_exec_spawn_publication_hook != NULL) {
+                        peak_test_exec_spawn_publication_hook(1);
+                    }
+                }
+#endif
+                peak_posix_spawn_resolving = 0;
+                atomic_store_explicit(&peak_real_posix_spawnp_state,
+                                      PEAK_SPAWN_RESOLVER_READY,
+                                      memory_order_release);
+                return resolved;
+            }
+            peak_posix_spawn_resolving = 0;
+            continue;
+        }
+        if (owner != self) {
+            return NULL;
+        }
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+        {
+            extern void peak_test_exec_spawn_waiter_hook(int)
+                __attribute__((weak));
+
+            if (peak_test_exec_spawn_waiter_hook != NULL) {
+                peak_test_exec_spawn_waiter_hook(1);
+            }
+        }
+#endif
+        do {
+            state = atomic_load_explicit(&peak_real_posix_spawnp_state,
+                                         memory_order_acquire);
+            if (state == PEAK_SPAWN_RESOLVER_READY) {
+                return peak_real_posix_spawnp_ptr;
+            }
+            if (peak_posix_spawn_resolving ||
+                atomic_load_explicit(&peak_real_posix_spawnp_owner_pid,
+                                     memory_order_acquire) != self) {
+                return NULL;
+            }
+        } while (state != PEAK_SPAWN_RESOLVER_READY);
+    }
 }
 
 static void
@@ -1660,16 +2146,36 @@ __attribute__((constructor))
 static void
 peak_exec_prime_real_symbols(void)
 {
-    peak_exec_owner_pid = getpid();
-    peak_exec_cache_libpeak_path();
-    peak_exec_cache_ld_library_path();
-    peak_exec_cache_secure_mode();
     (void)peak_real_execve();
+    (void)peak_real_execvp();
     (void)peak_real_execvpe();
     (void)peak_real_fexecve();
     (void)peak_real_execveat();
     (void)peak_real_posix_spawn();
     (void)peak_real_posix_spawnp();
+    peak_exec_owner_pid = getpid();
+    peak_exec_cache_libpeak_path();
+    peak_exec_cache_ld_library_path();
+    peak_exec_cache_secure_mode();
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    {
+        const char* forced_fallback = getenv("PEAK_TEST_EXECVPE_FALLBACK");
+
+        peak_exec_test_force_execvpe_fallback =
+            forced_fallback != NULL && !peak_exec_env_false(forced_fallback);
+    }
+#endif
+    peak_exec_startup_chain_enabled =
+        getenv(PEAK_EXEC_CHAIN_ENV) != NULL &&
+        !peak_exec_env_false(getenv(PEAK_EXEC_CHAIN_ENV));
+    peak_exec_startup_checkpoint_enabled =
+        getenv(PEAK_EXEC_CHECKPOINT_ENV) != NULL &&
+        !peak_exec_env_false(getenv(PEAK_EXEC_CHECKPOINT_ENV));
+    peak_exec_startup_policy_enabled = peak_exec_startup_chain_enabled ||
+                                       peak_exec_startup_checkpoint_enabled;
+    atomic_store_explicit(&peak_exec_priming_complete,
+                          1,
+                          memory_order_release);
 }
 
 static int
@@ -1680,15 +2186,197 @@ peak_call_real_execve(const char* path,
     peak_execve_fn fn = peak_real_execve();
 
     if (fn == NULL) {
+#if defined(__linux__) && defined(SYS_execve)
+        return (int)peak_exec_raw_syscall6(
+            SYS_execve,
+            (long)(uintptr_t)path,
+            (long)(uintptr_t)argv,
+            (long)(uintptr_t)envp,
+            0,
+            0,
+            0);
+#else
         errno = ENOSYS;
         return -1;
+#endif
     }
     return fn(path, argv, envp);
 }
 
+#if !PEAK_EXEC_DIRECT_RAW_SUPPORTED
+static int
+peak_call_real_execvp(const char* file, char* const argv[])
+{
+    peak_execvp_fn fn = peak_real_execvp();
+
+    if (fn == NULL) {
+        return peak_exec_prepublication_path_search(file, argv, environ);
+    }
+    return fn(file, argv);
+}
+
+static int
+peak_call_real_execvpe(const char* file,
+                       char* const argv[],
+                       char* const envp[])
+{
+    peak_execvpe_fn fn = peak_real_execvpe();
+
+    if (fn == NULL) {
+        return peak_exec_prepublication_path_search(file, argv, envp);
+    }
+    return fn(file, argv, envp);
+}
+#endif
+
+static int
+peak_call_primed_execve(const char* path,
+                        char* const argv[],
+                        char* const envp[])
+{
+    if (peak_real_execve_ptr == NULL) {
+#if defined(__linux__) && defined(SYS_execve)
+        return (int)peak_exec_raw_syscall6(
+            SYS_execve,
+            (long)(uintptr_t)path,
+            (long)(uintptr_t)argv,
+            (long)(uintptr_t)envp,
+            0,
+            0,
+            0);
+#else
+        errno = ENOSYS;
+        return -1;
+#endif
+    }
+    return peak_real_execve_ptr(path, argv, envp);
+}
+
+static int
+peak_call_primed_execvp(const char* file, char* const argv[])
+{
+    if (peak_real_execvp_ptr == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return peak_real_execvp_ptr(file, argv);
+}
+
+static int
+peak_call_primed_execvpe(const char* file,
+                         char* const argv[],
+                         char* const envp[])
+{
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (peak_exec_test_force_execvpe_fallback) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+    if (peak_real_execvpe_ptr == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return peak_real_execvpe_ptr(file, argv, envp);
+}
+
+static peak_execvpe_fn
+peak_primed_execvpe_for_rich_path(void)
+{
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (peak_exec_test_force_execvpe_fallback) {
+        return NULL;
+    }
+#endif
+    return peak_real_execvpe_ptr;
+}
+
+static int
+peak_call_real_fexecve(int fd, char* const argv[], char* const envp[])
+{
+    peak_fexecve_fn fn = peak_real_fexecve();
+
+    if (fn == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return fn(fd, argv, envp);
+}
+
+static int
+peak_call_primed_fexecve(int fd, char* const argv[], char* const envp[])
+{
+    if (peak_real_fexecve_ptr == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return peak_real_fexecve_ptr(fd, argv, envp);
+}
+
+#if defined(__linux__)
+static int
+peak_call_real_execveat(int dirfd,
+                        const char* pathname,
+                        char* const argv[],
+                        char* const envp[],
+                        int flags)
+{
+    peak_execveat_fn fn = peak_real_execveat();
+
+    if (fn != NULL) {
+        return fn(dirfd, pathname, argv, envp, flags);
+    }
+#if defined(SYS_execveat)
+    return (int)peak_exec_raw_syscall6(
+        SYS_execveat,
+        dirfd,
+        (long)(uintptr_t)pathname,
+        (long)(uintptr_t)argv,
+        (long)(uintptr_t)envp,
+        flags,
+        0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int
+peak_call_primed_execveat(int dirfd,
+                          const char* pathname,
+                          char* const argv[],
+                          char* const envp[],
+                          int flags)
+{
+    if (peak_real_execveat_ptr != NULL) {
+        return peak_real_execveat_ptr(dirfd, pathname, argv, envp, flags);
+    }
+#if defined(SYS_execveat)
+    return (int)peak_exec_raw_syscall6(
+        SYS_execveat,
+        dirfd,
+        (long)(uintptr_t)pathname,
+        (long)(uintptr_t)argv,
+        (long)(uintptr_t)envp,
+        flags,
+        0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+#endif
+
 PEAK_EXEC_API int
 execve(const char* path, char* const argv[], char* const envp[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_execve(path, argv, envp);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_execve(path, argv, envp);
+    }
+
     PeakExecEnv built_env = {0};
     char* const* exec_envp;
     int saved_errno;
@@ -1701,11 +2389,8 @@ execve(const char* path, char* const argv[], char* const envp[])
                                                              child_env,
                                                              child_ld_preload);
 
-        if (peak_real_execve_ptr == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return peak_real_execve_ptr(path, argv, (char* const*)child_envp);
+        return peak_call_primed_execve(
+            path, argv, (char* const*)child_envp);
     }
     if (peak_exec_wrapper_depth > 0 || peak_exec_spawn_depth > 0) {
         return peak_call_real_execve(path, argv, envp);
@@ -1735,12 +2420,22 @@ peak_exec_raw_syscall_execve(const char* path,
                              char* const argv[],
                              char* const envp[])
 {
+    if (!peak_exec_priming_is_complete() ||
+        !peak_exec_startup_policy_enabled) {
+        return peak_exec_prepublication_execve(path, argv, envp);
+    }
     return execve(path, argv, envp);
 }
 
 PEAK_EXEC_API int
 execv(const char* path, char* const argv[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_execve(path, argv, environ);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_execve(path, argv, environ);
+    }
     return execve(path, argv, environ);
 }
 
@@ -1882,7 +2577,9 @@ peak_execvpe_fallback(const char* file,
 
         if (saved_errno == EACCES) {
             saw_eacces = 1;
-        } else if (saved_errno != ENOENT && saved_errno != ENOTDIR) {
+        } else if (saved_errno != ENOENT && saved_errno != ENOTDIR &&
+                   saved_errno != ESTALE && saved_errno != ENODEV &&
+                   saved_errno != ETIMEDOUT) {
             break;
         }
         if (*cursor == '\0') {
@@ -1902,6 +2599,13 @@ out:
 PEAK_EXEC_API int
 execvpe(const char* file, char* const argv[], char* const envp[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_execvpe(file, argv, envp);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_execvpe(file, argv, envp);
+    }
+
     peak_execvpe_fn fn;
     PeakExecEnv built_env = {0};
     char* const* exec_envp;
@@ -1915,7 +2619,7 @@ execvpe(const char* file, char* const argv[], char* const envp[])
                                                              child_env,
                                                              child_ld_preload);
 
-        fn = peak_real_execvpe_ptr;
+        fn = peak_primed_execvpe_for_rich_path();
         if (fn == NULL) {
             errno = ENOSYS;
             return -1;
@@ -1965,6 +2669,24 @@ execvpe(const char* file, char* const argv[], char* const envp[])
 PEAK_EXEC_API int
 execvp(const char* file, char* const argv[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_execvp(file, argv);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_execvp(file, argv);
+    }
+    if (peak_exec_in_fork_child()) {
+        char* child_env[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char child_ld_preload[PEAK_EXEC_CHILD_LD_PRELOAD_CAPACITY];
+        char* const* child_envp = peak_exec_child_build_env(
+            environ, child_env, child_ld_preload);
+        peak_execvpe_fn execvpe_fn = peak_primed_execvpe_for_rich_path();
+
+        if (child_envp != environ && execvpe_fn != NULL) {
+            return execvpe_fn(file, argv, (char* const*)child_envp);
+        }
+        return peak_call_primed_execvp(file, argv);
+    }
     return execvpe(file, argv, environ);
 }
 
@@ -2038,32 +2760,80 @@ peak_exec_collect_argv_noalloc(const char* arg,
     return 0;
 }
 
+static int
+peak_exec_count_argv(const char* arg, va_list* ap, size_t* argc)
+{
+    va_list count_ap;
+    size_t count = 0;
+
+    if (argc == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (arg != NULL) {
+        va_copy(count_ap, *ap);
+        do {
+            count++;
+            if (count >= PEAK_EXEC_MAX_VARARGS) {
+                va_end(count_ap);
+                errno = E2BIG;
+                return -1;
+            }
+        } while (va_arg(count_ap, const char*) != NULL);
+        va_end(count_ap);
+    }
+    *argc = count;
+    return 0;
+}
+
 PEAK_EXEC_API int
 execl(const char* path, const char* arg, ...)
 {
     va_list ap;
-    char* child_argv[PEAK_EXEC_MAX_VARARGS + 1];
     char** argv = NULL;
-    int noalloc_child = peak_exec_in_fork_child();
+    int priming_complete = peak_exec_priming_is_complete();
+    int direct_bypass = !priming_complete ||
+                        !peak_exec_startup_policy_enabled;
+    int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
+    size_t child_argc = 0;
 
     va_start(ap, arg);
-    if (noalloc_child) {
-        result = peak_exec_collect_argv_noalloc(
-            arg,
-            &ap,
-            child_argv,
-            sizeof(child_argv) / sizeof(child_argv[0]));
-        argv = child_argv;
-    } else {
+    if (noalloc_child && peak_exec_count_argv(arg, &ap, &child_argc) != 0) {
+        va_end(ap);
+        return -1;
+    }
+    if (!noalloc_child) {
         result = peak_exec_collect_argv(arg, &ap, &argv);
+    } else {
+        char* child_argv[child_argc + 1U];
+
+        result = peak_exec_collect_argv_noalloc(
+            arg, &ap, child_argv, child_argc + 1U);
+        if (result == 0) {
+            if (priming_complete && !direct_bypass) {
+                result = execve(path, child_argv, environ);
+            } else if (priming_complete) {
+                result = peak_call_primed_execve(path, child_argv, environ);
+            } else {
+                result = peak_exec_prepublication_execve(path,
+                                                         child_argv,
+                                                         environ);
+            }
+        }
+        saved_errno = errno;
+        va_end(ap);
+        errno = saved_errno;
+        return result;
     }
     va_end(ap);
     if (result != 0) {
         return -1;
     }
-    result = execv(path, argv);
+    if (!direct_bypass) {
+        result = execv(path, argv);
+    }
     saved_errno = errno;
     if (!noalloc_child) {
         free(argv);
@@ -2076,28 +2846,48 @@ PEAK_EXEC_API int
 execlp(const char* file, const char* arg, ...)
 {
     va_list ap;
-    char* child_argv[PEAK_EXEC_MAX_VARARGS + 1];
     char** argv = NULL;
-    int noalloc_child = peak_exec_in_fork_child();
+    int priming_complete = peak_exec_priming_is_complete();
+    int direct_bypass = !priming_complete ||
+                        !peak_exec_startup_policy_enabled;
+    int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
+    size_t child_argc = 0;
 
     va_start(ap, arg);
-    if (noalloc_child) {
-        result = peak_exec_collect_argv_noalloc(
-            arg,
-            &ap,
-            child_argv,
-            sizeof(child_argv) / sizeof(child_argv[0]));
-        argv = child_argv;
-    } else {
+    if (noalloc_child && peak_exec_count_argv(arg, &ap, &child_argc) != 0) {
+        va_end(ap);
+        return -1;
+    }
+    if (!noalloc_child) {
         result = peak_exec_collect_argv(arg, &ap, &argv);
+    } else {
+        char* child_argv[child_argc + 1U];
+
+        result = peak_exec_collect_argv_noalloc(
+            arg, &ap, child_argv, child_argc + 1U);
+        if (result == 0) {
+            if (priming_complete && !direct_bypass) {
+                result = execvp(file, child_argv);
+            } else if (priming_complete) {
+                result = peak_call_primed_execvp(file, child_argv);
+            } else {
+                result = peak_exec_prepublication_execvp(file, child_argv);
+            }
+        }
+        saved_errno = errno;
+        va_end(ap);
+        errno = saved_errno;
+        return result;
     }
     va_end(ap);
     if (result != 0) {
         return -1;
     }
-    result = execvp(file, argv);
+    if (!direct_bypass) {
+        result = execvp(file, argv);
+    }
     saved_errno = errno;
     if (!noalloc_child) {
         free(argv);
@@ -2110,23 +2900,45 @@ PEAK_EXEC_API int
 execle(const char* path, const char* arg, ...)
 {
     va_list ap;
-    char* child_argv[PEAK_EXEC_MAX_VARARGS + 1];
     char** argv = NULL;
     char* const* envp;
-    int noalloc_child = peak_exec_in_fork_child();
+    int priming_complete = peak_exec_priming_is_complete();
+    int direct_bypass = !priming_complete ||
+                        !peak_exec_startup_policy_enabled;
+    int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
+    size_t child_argc = 0;
 
     va_start(ap, arg);
-    if (noalloc_child) {
-        result = peak_exec_collect_argv_noalloc(
-            arg,
-            &ap,
-            child_argv,
-            sizeof(child_argv) / sizeof(child_argv[0]));
-        argv = child_argv;
-    } else {
+    if (noalloc_child && peak_exec_count_argv(arg, &ap, &child_argc) != 0) {
+        va_end(ap);
+        return -1;
+    }
+    if (!noalloc_child) {
         result = peak_exec_collect_argv(arg, &ap, &argv);
+    } else {
+        char* child_argv[child_argc + 1U];
+
+        result = peak_exec_collect_argv_noalloc(
+            arg, &ap, child_argv, child_argc + 1U);
+        if (result == 0) {
+            envp = va_arg(ap, char* const*);
+            if (priming_complete && !direct_bypass) {
+                result = execve(path, child_argv, (char* const*)envp);
+            } else if (priming_complete) {
+                result = peak_call_primed_execve(path,
+                                                 child_argv,
+                                                 (char* const*)envp);
+            } else {
+                result = peak_exec_prepublication_execve(
+                    path, child_argv, (char* const*)envp);
+            }
+        }
+        saved_errno = errno;
+        va_end(ap);
+        errno = saved_errno;
+        return result;
     }
     if (result == 0) {
         envp = va_arg(ap, char* const*);
@@ -2135,7 +2947,9 @@ execle(const char* path, const char* arg, ...)
     if (result != 0) {
         return -1;
     }
-    result = execve(path, argv, (char* const*)envp);
+    if (!direct_bypass) {
+        result = execve(path, argv, (char* const*)envp);
+    }
     saved_errno = errno;
     if (!noalloc_child) {
         free(argv);
@@ -2147,6 +2961,13 @@ execle(const char* path, const char* arg, ...)
 PEAK_EXEC_API int
 fexecve(int fd, char* const argv[], char* const envp[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_fexecve(fd, argv, envp);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_fexecve(fd, argv, envp);
+    }
+
     peak_fexecve_fn fn;
     PeakExecEnv built_env = {0};
     char* const* exec_envp;
@@ -2161,29 +2982,15 @@ fexecve(int fd, char* const argv[], char* const envp[])
                                                              child_env,
                                                              child_ld_preload);
 
-        fn = peak_real_fexecve_ptr;
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(fd, argv, (char* const*)child_envp);
+        return peak_call_primed_fexecve(
+            fd, argv, (char* const*)child_envp);
     }
     if (peak_exec_wrapper_depth > 0 || peak_exec_spawn_depth > 0) {
-        fn = peak_real_fexecve();
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(fd, argv, envp);
+        return peak_call_real_fexecve(fd, argv, envp);
     }
     if (peak_exec_argv_envp_readable(argv, envp) !=
         PEAK_EXEC_PREFLIGHT_VALID) {
-        fn = peak_real_fexecve();
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(fd, argv, envp);
+        return peak_call_real_fexecve(fd, argv, envp);
     }
 
     snprintf(label, sizeof(label), "<fd:%d>", fd);
@@ -2215,7 +3022,15 @@ execveat(int dirfd,
          char* const envp[],
          int flags)
 {
-    peak_execveat_fn fn;
+    if (!peak_exec_priming_is_complete()) {
+        return peak_exec_prepublication_execveat(
+            dirfd, pathname, argv, envp, flags);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        return peak_call_primed_execveat(
+            dirfd, pathname, argv, envp, flags);
+    }
+
     PeakExecEnv built_env = {0};
     char* const* exec_envp;
     int saved_errno;
@@ -2228,29 +3043,17 @@ execveat(int dirfd,
                                                              child_env,
                                                              child_ld_preload);
 
-        fn = peak_real_execveat_ptr;
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(dirfd, pathname, argv, (char* const*)child_envp, flags);
+        return peak_call_primed_execveat(
+            dirfd, pathname, argv, (char* const*)child_envp, flags);
     }
     if (peak_exec_wrapper_depth > 0 || peak_exec_spawn_depth > 0) {
-        fn = peak_real_execveat();
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(dirfd, pathname, argv, envp, flags);
+        return peak_call_real_execveat(
+            dirfd, pathname, argv, envp, flags);
     }
     if (peak_exec_args_readable(pathname, argv, envp) !=
         PEAK_EXEC_PREFLIGHT_VALID) {
-        fn = peak_real_execveat();
-        if (fn == NULL) {
-            errno = ENOSYS;
-            return -1;
-        }
-        return fn(dirfd, pathname, argv, envp, flags);
+        return peak_call_real_execveat(
+            dirfd, pathname, argv, envp, flags);
     }
 
     peak_exec_wrapper_depth++;
@@ -2260,13 +3063,9 @@ execveat(int dirfd,
     } else {
         exec_envp = peak_exec_env_to_use(&built_env, envp);
     }
-    fn = peak_real_execveat();
-    if (fn == NULL) {
-        saved_errno = ENOSYS;
-    } else {
-        (void)fn(dirfd, pathname, argv, (char* const*)exec_envp, flags);
-        saved_errno = errno;
-    }
+    (void)peak_call_real_execveat(
+        dirfd, pathname, argv, (char* const*)exec_envp, flags);
+    saved_errno = errno;
     peak_exec_env_clear(&built_env);
     peak_exec_wrapper_depth--;
     errno = saved_errno;
@@ -2274,6 +3073,7 @@ execveat(int dirfd,
 }
 #endif
 
+#if defined(__linux__)
 int
 peak_exec_raw_syscall_execveat(int dirfd,
                                const char* pathname,
@@ -2281,8 +3081,14 @@ peak_exec_raw_syscall_execveat(int dirfd,
                                char* const envp[],
                                int flags)
 {
+    if (!peak_exec_priming_is_complete() ||
+        !peak_exec_startup_policy_enabled) {
+        return peak_exec_prepublication_execveat(
+            dirfd, pathname, argv, envp, flags);
+    }
     return execveat(dirfd, pathname, argv, envp, flags);
 }
+#endif
 
 PEAK_EXEC_API int
 posix_spawn(pid_t* pid,
@@ -2292,6 +3098,25 @@ posix_spawn(pid_t* pid,
             char* const argv[],
             char* const envp[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        int entry_errno = errno;
+        peak_posix_spawn_fn fn = peak_real_posix_spawn();
+
+        if (fn == NULL) {
+            errno = entry_errno;
+            return ENOSYS;
+        }
+        errno = entry_errno;
+        return fn(pid, path, file_actions, attrp, argv, envp);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        if (peak_real_posix_spawn_ptr == NULL) {
+            return ENOSYS;
+        }
+        return peak_real_posix_spawn_ptr(
+            pid, path, file_actions, attrp, argv, envp);
+    }
+
     int entry_errno = errno;
     peak_posix_spawn_fn fn = peak_real_posix_spawn();
     PeakExecEnv built_env = {0};
@@ -2346,6 +3171,25 @@ posix_spawnp(pid_t* pid,
              char* const argv[],
              char* const envp[])
 {
+    if (!peak_exec_priming_is_complete()) {
+        int entry_errno = errno;
+        peak_posix_spawnp_fn fn = peak_real_posix_spawnp();
+
+        if (fn == NULL) {
+            errno = entry_errno;
+            return ENOSYS;
+        }
+        errno = entry_errno;
+        return fn(pid, file, file_actions, attrp, argv, envp);
+    }
+    if (!peak_exec_startup_policy_enabled) {
+        if (peak_real_posix_spawnp_ptr == NULL) {
+            return ENOSYS;
+        }
+        return peak_real_posix_spawnp_ptr(
+            pid, file, file_actions, attrp, argv, envp);
+    }
+
     int entry_errno = errno;
     peak_posix_spawnp_fn fn = peak_real_posix_spawnp();
     PeakExecEnv built_env = {0};

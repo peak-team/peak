@@ -398,6 +398,11 @@ peak_exec_args_readable(const char* path,
                         char* const argv[],
                         char* const envp[])
 {
+#if defined(PEAK_ENABLE_TEST_HOOKS)
+    if (peak_exec_test_hook_enabled("PEAK_TEST_EXEC_PREFLIGHT_TRAP")) {
+        _exit(97);
+    }
+#endif
     PeakExecPreflightResult result =
         peak_exec_user_cstr_readable(path, PATH_MAX);
 

@@ -180,9 +180,24 @@ For runtime behavior, accounting, and tuning, see
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_EXEC_CHAIN` | Keep PEAK available across eligible exec and spawn children. Default: enabled. |
-| `PEAK_EXEC_CHECKPOINT` | Write a best-effort checkpoint before direct exec calls. Default: enabled. |
+| `PEAK_EXEC_CHAIN` | Explicit startup opt-in to keep PEAK available across eligible exec and spawn children. Default: disabled. |
+| `PEAK_EXEC_CHECKPOINT` | Explicit startup opt-in to write a best-effort checkpoint before direct exec calls. Default: disabled. |
 | `PEAK_EXEC_PROPAGATE_PEAK_ENV` | Copy missing parent `PEAK_*` settings into a child environment. Default: enabled. |
+
+Enabling either startup option may enter PEAK's rich exec handling, which can
+inspect environments, allocate, trace, and checkpoint and is not
+async-signal-safe. With both options disabled, array-based wrappers bypass
+directly to primed libc functions; variadic adapters only perform their bounded
+stack-based argument scan before calling the corresponding primed libc
+function.
+
+Before constructor publication on Linux x86_64/aarch64, direct-path exec APIs
+issue raw kernel calls, while PATH-search APIs perform a bounded stack search
+whose candidates also use raw kernel calls. Unsupported architectures preserve
+native exec semantics through libc resolution in this window, so the
+resolver-free async-signal-safe guarantee does not apply there.
+Pre-constructor `posix_spawn*` retains libc resolution on every architecture to
+preserve native spawn semantics and is not async-signal-safe.
 
 See [Exec-chain profiling](docs/exec-chain.md) for supported API families,
 child-environment precedence, fork safety, and limitations.

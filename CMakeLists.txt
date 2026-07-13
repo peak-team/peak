@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
-project(peak C CXX Fortran ASM)
+project(peak C CXX Fortran)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")
@@ -63,11 +63,10 @@ message(STATUS "FRIDA_GUM_INCLUDE_DIRS = ${FRIDA_GUM_INCLUDE_DIRS}")
 message(STATUS "PEAK_GUM_PEAK_API_AVAILABLE = ${PEAK_GUM_PEAK_API_AVAILABLE}")
 message(STATUS "PEAK_GUM_PEAK_PC_API_AVAILABLE = ${PEAK_GUM_PEAK_PC_API_AVAILABLE}")
 
-set(PEAK_DETACH_HELPER_SUPPORTED OFF)
-if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
-    set(PEAK_DETACH_HELPER_SUPPORTED ON)
-endif()
+include(cmake/exec-platform.cmake)
+peak_exec_configure_platform_support()
+peak_exec_enable_raw_syscall_language()
+message(STATUS "PEAK_EXEC_RAW_SYSCALL_SUPPORTED = ${PEAK_EXEC_RAW_SYSCALL_SUPPORTED}")
 message(STATUS "PEAK_DETACH_HELPER_SUPPORTED = ${PEAK_DETACH_HELPER_SUPPORTED}")
 
 # Find or download otf2
