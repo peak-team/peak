@@ -6,6 +6,7 @@ import errno
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -16,15 +17,23 @@ from pathlib import Path
 TARGET = "peak_exec_chain_hot_target"
 
 MODE_TO_APP_ARG = {
+    "signal_handler_execve_default_bypass": "signal-handler-execve",
+    "default_disabled_family_bypass": "default-disabled-family-bypass",
     "execv_success_checkpoint": "execv-success",
     "exec_checkpoint_write_target_no_reentry": "execv-write-target-success",
     "execv_zero_call_checkpoint": "execv-zero-call",
     "exec_checkpoint_disabled": "execv-success",
     "exec_bad_stats_path_nonfatal": "execv-success",
     "execve_custom_env_injection": "execve-custom-env",
+    "execve_call_env_optin_default_bypass": (
+        "execve-call-env-optin-default-bypass"
+    ),
     "raw_syscall_execve_custom_env_injection": "raw-syscall-execve-custom-env",
     "raw_syscall_execve_backend_disabled_injection": "raw-syscall-execve-custom-env",
     "raw_syscall_execve_failure_non_destructive": "raw-syscall-execve-failure",
+    "raw_syscall_execve_observer_bypass": (
+        "raw-syscall-execve-observer-bypass"
+    ),
     "raw_syscall_nonexec_passthrough": "raw-syscall-nonexec",
     "execve_preflight_unavailable_injection": "execve-custom-env",
     "execve_child_peak_env_only_injection": "execve-child-peak-env-only",
@@ -60,9 +69,11 @@ MODE_TO_APP_ARG = {
     "execveat_bad_argv_failure_non_destructive": "execveat-bad-argv",
     "execl_success_checkpoint": "execl-success",
     "execlp_path_search": "execlp-path-search",
+    "execlp_default_bypass_without_execvpe": "execlp-path-search",
     "execle_custom_env_injection": "execle-custom-env",
     "exec_failure_non_destructive": "exec-failure",
     "execvp_path_search": "execvp-path-search",
+    "execvp_default_bypass_without_execvpe": "execvp-path-search",
     "execvp_empty_path_component": "execvp-path-search",
     "helper_named_exec_still_checkpointed": "helper-named-exec",
     "execvpe_caller_path_child_env_ignored": "execvpe-child-env-path-ignored",
@@ -81,6 +92,12 @@ MODE_TO_APP_ARG = {
     "vfork_child_failed_exec_parent_exec": (
         "vfork-child-failed-exec-parent-exec"
     ),
+    "clone_private_vm_exec": "clone-private-vm-exec",
+    "clone_vm_exec": "clone-vm-exec",
+    "clone_vfork_exec": "clone-vfork-exec",
+    "clone3_exec": "clone3-exec",
+    "raw_clone_libc_exec": "raw-clone-libc-exec",
+    "raw_clone_raw_exec": "raw-clone-raw-exec",
     "vfork_execl_parent_exec": "vfork-execl-parent-exec",
     "vfork_execlp_parent_exec": "vfork-execlp-parent-exec",
     "vfork_execle_parent_exec": "vfork-execle-parent-exec",
@@ -97,6 +114,7 @@ MODE_TO_APP_ARG = {
     "vfork_custom_env_chain_disabled": "vfork-custom-env-disabled",
     "vfork_custom_env_execvpe_chain": "vfork-custom-env-execvpe",
     "vfork_custom_env_execvp_chain": "vfork-custom-env-execvp",
+    "vfork_execvp_native_fallback": "vfork-execvp-native-fallback",
     "vfork_custom_env_execlp_chain": "vfork-custom-env-execlp",
     "vfork_custom_env_fexecve_chain": "vfork-custom-env-fexecve",
     "vfork_custom_env_execveat_chain": "vfork-custom-env-execveat",
@@ -116,6 +134,9 @@ MODE_TO_APP_ARG = {
     "no_duplicate_ld_preload_whitespace": "duplicate-preload-whitespace",
     "no_duplicate_ld_preload_env_entries": "duplicate-preload-entry",
     "posix_spawn_custom_env_injection": "posix-spawn-custom-env",
+    "posix_spawn_call_env_optin_default_bypass": (
+        "posix-spawn-call-env-optin-default-bypass"
+    ),
     "posix_spawn_env_build_failure_passthrough": "posix-spawn-custom-env",
     "posix_spawn_null_env_injection": "posix-spawn-null-env",
     "posix_spawn_bad_env_failure_non_destructive": "posix-spawn-bad-env",
@@ -185,7 +206,14 @@ SPAWN_MODES = {
 }
 
 NO_EXEC_CHECKPOINT_MODES = {
+    "signal_handler_execve_default_bypass",
+    "default_disabled_family_bypass",
+    "execlp_default_bypass_without_execvpe",
+    "execvp_default_bypass_without_execvpe",
+    "execve_call_env_optin_default_bypass",
+    "posix_spawn_call_env_optin_default_bypass",
     "raw_syscall_execve_backend_disabled_injection",
+    "raw_syscall_execve_observer_bypass",
     "exec_checkpoint_disabled",
     "exec_checkpoint_concurrent_fini_callbacks",
     "execve_child_checkpoint_disabled",
@@ -227,6 +255,15 @@ FAILURE_PATH_MODES = {
     "execvp_enoent_fallback",
     "text_output_not_corrupted",
 }
+
+CLONE_MODES = frozenset({
+    "clone_private_vm_exec",
+    "clone_vm_exec",
+    "clone_vfork_exec",
+    "clone3_exec",
+    "raw_clone_libc_exec",
+    "raw_clone_raw_exec",
+})
 
 CHECKPOINT_OPTIONAL_BASE_MODES = frozenset(
     set(CAPACITY_PASSTHROUGH_MODES) |
@@ -331,7 +368,8 @@ NO_LOADER_MODE_EXPECTATIONS = {
     },
     "execve_loader_path_secure_skip": {
         "marker": "loader-path-secure",
-        "peak_exec_chain": "<missing>",
+        "peak_exec_chain": "1",
+        "peak_exec_checkpoint": "1",
         "peak_target": TARGET,
         "peak_statslog": "peak_stats",
         "secure_test_hook": "1",
@@ -342,7 +380,8 @@ NO_LOADER_MODE_EXPECTATIONS = {
     },
     "execve_loader_path_preload_present": {
         "marker": "loader-path-preload-present",
-        "peak_exec_chain": "<missing>",
+        "peak_exec_chain": "1",
+        "peak_exec_checkpoint": "1",
         "peak_target": TARGET,
         "peak_statslog": "peak_stats",
         "secure_test_hook": "<missing>",
@@ -375,7 +414,8 @@ NO_LOADER_MODE_EXPECTATIONS = {
     },
     "vfork_loader_path_preload_present": {
         "marker": "loader-path-preload-present",
-        "peak_exec_chain": "<missing>",
+        "peak_exec_chain": "1",
+        "peak_exec_checkpoint": "1",
         "peak_target": TARGET,
         "peak_statslog": "peak_stats",
         "secure_test_hook": "<missing>",
@@ -438,6 +478,7 @@ def child_loader_test_value():
     return f"/tmp/child-loader{os.pathsep}{original}" if original else "/tmp/child-loader"
 
 NATIVE_REFERENCE_MODES = {
+    "default_disabled_family_bypass",
     "execve_bad_env_failure_non_destructive",
     "execve_bad_env_preflight_unknown_non_destructive",
     "execve_bad_argv_failure_non_destructive",
@@ -502,6 +543,19 @@ FALLBACK_EXECVP_MODES = {
     "execvp_enotdir_enoent_fallback",
     "execvp_eacces_fallback",
     "execvp_enoent_fallback",
+    "execlp_default_bypass_without_execvpe",
+    "execvp_default_bypass_without_execvpe",
+    "vfork_execvp_native_fallback",
+}
+
+CALL_ENV_DEFAULT_BYPASS_MODES = {
+    "execve_call_env_optin_default_bypass",
+    "posix_spawn_call_env_optin_default_bypass",
+}
+
+EXECVP_DEFAULT_BYPASS_MODES = {
+    "execlp_default_bypass_without_execvpe",
+    "execvp_default_bypass_without_execvpe",
 }
 
 
@@ -510,6 +564,8 @@ def parse_args():
     parser.add_argument("--mode", required=True, choices=sorted(MODE_TO_APP_ARG))
     parser.add_argument("--exe", required=True)
     parser.add_argument("--libpeak", required=True)
+    parser.add_argument("--execve-observer")
+    parser.add_argument("--expected-default-bypass-cases", required=True)
     return parser.parse_args()
 
 
@@ -518,11 +574,28 @@ def require(condition, message):
         raise AssertionError(message)
 
 
+def parse_default_bypass_cases(output):
+    matches = re.findall(
+        r"^default_bypass_case=(\w+) result=(-?\d+) errno=(\d+)$",
+        output,
+        re.MULTILINE,
+    )
+    results = {}
+    for name, result, error_number in matches:
+        require(name not in results,
+                f"duplicate default-bypass case {name}\n{output}")
+        results[name] = (int(result), int(error_number))
+    require(results, f"missing default-bypass cases\n{output}")
+    return results
+
+
 def require_native_reference(args, proc):
     require(proc.returncode == 0,
             f"native reference failed with {proc.returncode}\n{proc.stdout}")
     mode = args.mode
     output = proc.stdout
+    if mode == "default_disabled_family_bypass":
+        return parse_default_bypass_cases(output)
     if mode in SPAWN_OBSERVATION_MODES:
         observation = parse_spawn_observation(output)
         require_valid_spawn_observation(observation, "native")
@@ -811,10 +884,43 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
         env["PEAK_STATSLOG_PATH"] = "peak_stats"
         env["PEAK_HEARTBEAT_INTERVAL"] = "0"
         env["PEAK_TEXT_OUTPUT"] = "0"
+        env["PEAK_EXEC_CHAIN"] = "1"
+        env["PEAK_EXEC_CHECKPOINT"] = "1"
     else:
         env.pop("LD_PRELOAD", None)
     if args.mode == "raw_syscall_execve_backend_disabled_injection":
         env.pop("PEAK_TARGET", None)
+    if args.mode == "raw_syscall_execve_observer_bypass":
+        require(args.execve_observer is not None,
+                "raw execve observer test requires --execve-observer")
+        env["LD_PRELOAD"] = os.pathsep.join(
+            (str(Path(args.libpeak).resolve()),
+             str(Path(args.execve_observer).resolve()))
+        )
+        env["PEAK_EXEC_CHAIN"] = "0"
+        env["PEAK_EXEC_CHECKPOINT"] = "0"
+        env["PEAK_EXEC_TRACE_PATH"] = str(tmpdir / "unexpected-exec-trace")
+        env["PEAK_TEST_EXEC_PREFLIGHT_TRAP"] = "1"
+    if args.mode == "signal_handler_execve_default_bypass":
+        env.pop("PEAK_EXEC_CHAIN", None)
+        env.pop("PEAK_EXEC_CHECKPOINT", None)
+        env["PEAK_EXEC_TRACE_PATH"] = str(tmpdir / "unexpected-exec-trace")
+        env["PEAK_TEST_EXEC_PREFLIGHT_TRAP"] = "1"
+    if args.mode == "default_disabled_family_bypass":
+        env["PEAK_EXEC_CHAIN"] = "0"
+        env["PEAK_EXEC_CHECKPOINT"] = "0"
+        env["PEAK_EXEC_TRACE_PATH"] = str(tmpdir / "unexpected-exec-trace")
+        env["PEAK_TEST_EXEC_PREFLIGHT_TRAP"] = "1"
+    if args.mode in CALL_ENV_DEFAULT_BYPASS_MODES:
+        env["PEAK_EXEC_CHAIN"] = "0"
+        env["PEAK_EXEC_CHECKPOINT"] = "0"
+        env["PEAK_EXEC_TRACE_PATH"] = str(tmpdir / "unexpected-exec-trace")
+        env["PEAK_TEST_EXEC_PREFLIGHT_TRAP"] = "1"
+    if args.mode in EXECVP_DEFAULT_BYPASS_MODES:
+        env["PEAK_EXEC_CHAIN"] = "0"
+        env["PEAK_EXEC_CHECKPOINT"] = "0"
+        env["PEAK_EXEC_TRACE_PATH"] = str(tmpdir / "unexpected-exec-trace")
+        env["PEAK_TEST_EXEC_PREFLIGHT_TRAP"] = "1"
 
     old_path = env.get("PATH", "/bin:/usr/bin")
     env["PATH"] = f"{bindir}{os.pathsep}{old_path}"
@@ -917,6 +1023,37 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
     return env
 
 
+def run_process_group(command, cwd, env, timeout):
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as timeout_error:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            output, _ = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired as cleanup_error:
+            raise RuntimeError(
+                f"fixture process group did not terminate: {command}"
+            ) from cleanup_error
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=output,
+        ) from timeout_error
+    return subprocess.CompletedProcess(command, proc.returncode, output)
+
+
 def run_fixture(args, tmpdir: Path, preload=True):
     exe = Path(args.exe).resolve()
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -926,15 +1063,7 @@ def run_fixture(args, tmpdir: Path, preload=True):
     command = [str(exe), app_arg]
     if preload and args.mode in CHECKPOINT_ONLY_MODES:
         command.append("--quiesce-controller")
-    return subprocess.run(
-        command,
-        cwd=tmpdir,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-    )
+    return run_process_group(command, tmpdir, env, timeout=20)
 
 
 def csv_files(tmpdir: Path):
@@ -984,6 +1113,13 @@ def run_checkpoint_contract_self_test():
         require_parent_checkpoint_calls("fork_child_exec_parent_exec", [])
         require_parent_checkpoint_calls("fork_child_exec_parent_exec", [valid])
         try:
+            require_parent_checkpoint_calls("clone_vm_exec", [])
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("clone mode accepted a missing checkpoint")
+        require_parent_checkpoint_calls("clone_vm_exec", [valid])
+        try:
             malformed = workdir / "peak_stats-p1-exec2.csv"
             malformed.write_text(
                 "function,count\npeak_exec_chain_hot_target,4\n",
@@ -997,6 +1133,29 @@ def run_checkpoint_contract_self_test():
             raise AssertionError(
                 "active-controller malformed checkpoint was accepted")
     print("exec_chain_checkpoint_contract_ok")
+
+
+def run_timeout_contract_self_test():
+    child_script = (
+        "import os, time; "
+        "os.fork(); "
+        "print('timeout_process_ready', flush=True); "
+        "time.sleep(60)"
+    )
+    try:
+        run_process_group(
+            [sys.executable, "-c", child_script],
+            os.getcwd(),
+            os.environ.copy(),
+            timeout=1,
+        )
+    except subprocess.TimeoutExpired as timeout_error:
+        output = timeout_error.output or ""
+        require(output.count("timeout_process_ready") == 2,
+                f"timeout contract did not start both processes\n{output}")
+    else:
+        raise AssertionError("timeout contract fixture unexpectedly completed")
+    print("exec_chain_timeout_contract_ok")
 
 
 def require_bad_env_artifacts(mode, final_files, exec_files, operation):
@@ -1196,11 +1355,81 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
                 f"capacity fallback parent exec did not retain native success\n{output}")
         return
 
+    if args.mode == "clone3_exec" and "clone3_skip_" in output:
+        skip_lines = [
+            line for line in output.splitlines()
+            if line.startswith("clone3_skip_")
+        ]
+        require(skip_lines == ["clone3_skip_enosys=1"],
+                f"invalid clone3 runtime skip marker\n{output}")
+        require(not exec_files,
+                f"clone3 ENOSYS skip wrote a checkpoint: {exec_files}")
+        return
+
     if args.mode in CHECKPOINT_REQUIRED_MODES:
         require(exec_files, f"missing exec checkpoint for {args.mode}\n{output}")
     elif args.mode in NO_EXEC_CHECKPOINT_MODES:
         require(not exec_files,
                 f"unexpected exec checkpoint for {args.mode}: {exec_files}\n{output}")
+
+    if args.mode == "signal_handler_execve_default_bypass":
+        require("signal_handler_execve_default_bypass=1" in output,
+                f"signal-handler execve did not preserve native ENOENT\n{output}")
+        require(not (tmpdir / "unexpected-exec-trace").exists(),
+                "default bypass entered exec trace handling")
+        require(not exec_files,
+                f"default bypass entered checkpoint handling: {exec_files}")
+
+    if args.mode == "default_disabled_family_bypass":
+        observation = parse_default_bypass_cases(output)
+        expected_cases = set(args.expected_default_bypass_cases.split(","))
+        dedicated_cases = {"execve", "execvp", "execlp", "posix_spawn"}
+        require(not (expected_cases & dedicated_cases),
+                "family bypass cases duplicate dedicated coverage: "
+                f"{sorted(expected_cases & dedicated_cases)}")
+        require(set(observation) == expected_cases,
+                "default-disabled family case set changed: "
+                f"expected={sorted(expected_cases)} "
+                f"actual={sorted(observation)}\n{output}")
+        require(observation == native_observation,
+                "default-disabled wrappers diverged from native behavior\n"
+                f"native={native_observation}\npeak={observation}\n{output}")
+        require("default_disabled_family_bypass=1" in output,
+                f"default-disabled family marker missing\n{output}")
+        require(not (tmpdir / "unexpected-exec-trace").exists(),
+                "default-disabled family entered trace handling")
+        require(not exec_files,
+                f"default-disabled family checkpointed: {exec_files}")
+
+    if args.mode in CALL_ENV_DEFAULT_BYPASS_MODES:
+        marker = {
+            "execve_call_env_optin_default_bypass": "call-env-optin-execve",
+            "posix_spawn_call_env_optin_default_bypass": "call-env-optin-spawn",
+        }[args.mode]
+        require_ld_count(output, 0)
+        require(f"marker={marker}" in output,
+                f"call-specific envp was not passed through unchanged\n{output}")
+        require("peak_exec_chain=1" in output,
+                f"call-specific chain option was not preserved\n{output}")
+        require("peak_exec_checkpoint=1" in output,
+                f"call-specific checkpoint option was not preserved\n{output}")
+        require("peak_target=<missing>" in output,
+                f"default bypass propagated the parent PEAK target\n{output}")
+        require(not (tmpdir / "unexpected-exec-trace").exists(),
+                "call-specific opt-in entered exec trace handling")
+        require(not exec_files,
+                f"call-specific opt-in entered checkpoint handling: {exec_files}")
+        if args.mode == "posix_spawn_call_env_optin_default_bypass":
+            require("posix_spawn_call_env_optin_default_bypass=1" in output,
+                    f"spawn bypass parent marker missing\n{output}")
+
+    if args.mode in EXECVP_DEFAULT_BYPASS_MODES:
+        require("exec_child_ok" in output,
+                f"native execvp path did not run the child\n{output}")
+        require(not (tmpdir / "unexpected-exec-trace").exists(),
+                "default execvp path entered exec trace handling")
+        require(not exec_files,
+                f"default execvp path checkpointed: {exec_files}")
 
     if args.mode == "execv_zero_call_checkpoint":
         require(target_count(exec_files) == 0,
@@ -1218,6 +1447,47 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(output.count("exec_child_ok") == 2,
                 "fork child exec and parent exec did not both complete\n"
                 f"{output}")
+
+    if args.mode in CLONE_MODES:
+        require(output.count("exec_child_ok") == 2,
+                "clone child exec and parent exec did not both complete\n"
+                f"{output}")
+        match = re.search(
+            r"clone_parent_environment_invariant=1 "
+            r"environ_pointer_unchanged=1 entries=(\d+) bytes=(\d+) "
+            r"fingerprint=([0-9a-f]{16}) mode=(\S+) parent_pid=(\d+)",
+            output,
+        )
+        require(match is not None,
+                f"clone parent environment invariant was not proven\n{output}")
+        parent_pid = match.group(5)
+        parent_exec_files = [
+            path for path in exec_files
+            if f"-p{parent_pid}-exec" in path.name
+        ]
+        parent_final_files = [
+            path for path in final_files
+            if f"-p{parent_pid}.csv" in path.name
+        ]
+        require(parent_exec_files,
+                f"clone parent wrote no exec checkpoint: {exec_files}")
+        require(target_count(parent_exec_files) >= 5,
+                "clone parent checkpoint missed post-child target calls")
+        require(parent_final_files,
+                f"clone parent wrote no continued final output: {final_files}")
+        require(target_count(parent_final_files) >= 7,
+                "clone parent PEAK output did not continue after child path")
+        if args.mode in {
+            "clone_private_vm_exec",
+            "clone3_exec",
+            "raw_clone_libc_exec",
+            "raw_clone_raw_exec",
+        }:
+            require(output.count("clone_private_failed_exec_enoent=1") == 1,
+                    f"private clone did not prove ENOENT before exec\n{output}")
+        else:
+            require("clone_private_failed_exec_enoent" not in output,
+                    f"shared-VM clone ran a failed-exec path\n{output}")
 
     if args.mode in {
         "execve_env_build_failure_passthrough",
@@ -1336,7 +1606,9 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
             "peak_statslog": mode_expected["peak_statslog"],
             "marker": mode_expected["marker"],
             "peak_exec_chain": mode_expected["peak_exec_chain"],
-            "peak_exec_checkpoint": "<missing>",
+            "peak_exec_checkpoint": mode_expected.get(
+                "peak_exec_checkpoint", "<missing>"
+            ),
             "peak_exec_propagate": mode_expected.get(
                 "peak_exec_propagate", "<missing>"
             ),
@@ -1392,6 +1664,15 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
                 f"post-fork explicit PEAK_TARGET was overwritten\n{output}")
         require("postfork_api_parent_env_unchanged=1" in output,
                 f"post-fork wrapper changed parent environ\n{output}")
+
+    if args.mode == "vfork_execvp_native_fallback":
+        require_ld_count(output, 0)
+        require("marker=postfork-api-custom" in output,
+                f"native execvp did not preserve the child environment\n{output}")
+        require("peak_target=explicit_child_target" in output,
+                f"native execvp changed the explicit child target\n{output}")
+        require("postfork_api_parent_env_unchanged=1" in output,
+                f"native execvp fallback changed parent environ\n{output}")
 
     if args.mode in {
         "fork_bad_env_vector_efault",
@@ -1513,6 +1794,13 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(final_files, "missing final CSV after failed raw syscall exec")
         require(target_count(final_files) >= 6,
                 "normal final CSV missed calls after raw syscall exec failure")
+
+    if args.mode == "raw_syscall_execve_observer_bypass":
+        require("raw_execve_observer_bypass=1 result=-1 "
+                f"errno={errno.ENOENT} observed_execve_calls=0" in output,
+                "raw SYS_execve reached another execve interposer\n" + output)
+        require(not (tmpdir / "unexpected-exec-trace").exists(),
+                "raw default bypass entered exec trace handling")
 
     if args.mode == "raw_syscall_nonexec_passthrough":
         match = re.search(r"raw_syscall_getpid=(\d+) expected=(\d+) errno=(\d+)",
@@ -1646,6 +1934,8 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
 def main():
     if sys.argv[1:] == ["--self-test-checkpoint-contract"]:
         return run_checkpoint_contract_self_test()
+    if sys.argv[1:] == ["--self-test-timeout-contract"]:
+        return run_timeout_contract_self_test()
     args = parse_args()
     with tempfile.TemporaryDirectory(
         prefix=f"peak-exec-chain-{args.mode}-",

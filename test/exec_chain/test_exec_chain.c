@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/sched.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -32,6 +33,92 @@ extern char** environ;
 #define CONTROLLER_QUIESCE_ARG "--quiesce-controller"
 
 static volatile unsigned long peak_exec_chain_sink;
+static const char* peak_signal_exec_path;
+static const char* peak_signal_exec_command;
+static char* const peak_signal_exec_argv[] = {(char*)"missing-exec", NULL};
+static char* const peak_signal_exec_envp[] = {NULL};
+static unsigned char peak_signal_stack[16384];
+static volatile sig_atomic_t peak_signal_exec_seen;
+static volatile sig_atomic_t peak_signal_exec_result;
+static volatile sig_atomic_t peak_signal_exec_errno;
+
+static int wait_for_child(pid_t pid);
+
+static void
+print_default_bypass_case(const char* name, int result, int error_number)
+{
+    printf("default_bypass_case=%s result=%d errno=%d\n",
+           name, result, error_number);
+}
+
+static int
+run_default_disabled_family_bypass(void)
+{
+    static const char missing_path[] =
+        "/definitely/missing/peak-default-bypass";
+    static const char missing_command[] =
+        "peak-default-bypass-command-does-not-exist";
+    char* const argv[] = {(char*)missing_command, NULL};
+    char* const opt_in_env[] = {
+        (char*)"PEAK_EXEC_CHAIN=1",
+        (char*)"PEAK_EXEC_CHECKPOINT=1",
+        NULL,
+    };
+    pid_t pid = -1;
+    int result;
+
+#define RUN_DEFAULT_BYPASS_CASE(name, expression) \
+    do { \
+        errno = EALREADY; \
+        result = (expression); \
+        print_default_bypass_case((name), result, errno); \
+    } while (0)
+
+    RUN_DEFAULT_BYPASS_CASE("execv", execv(missing_path, argv));
+    RUN_DEFAULT_BYPASS_CASE(
+        "execvpe", execvpe(missing_command, argv, opt_in_env));
+    RUN_DEFAULT_BYPASS_CASE(
+        "execl", execl(missing_path, missing_command, (char*)NULL));
+    RUN_DEFAULT_BYPASS_CASE(
+        "execle",
+        execle(missing_path,
+               missing_command,
+               (char*)NULL,
+               opt_in_env));
+    RUN_DEFAULT_BYPASS_CASE(
+        "fexecve", fexecve(INT_MAX, argv, opt_in_env));
+#if defined(PEAK_TEST_HAVE_EXECVEAT)
+    RUN_DEFAULT_BYPASS_CASE(
+        "execveat",
+        execveat(AT_FDCWD, missing_path, argv, opt_in_env, 0));
+#endif
+    RUN_DEFAULT_BYPASS_CASE(
+        "posix_spawnp",
+        posix_spawnp(&pid,
+                     missing_command,
+                     NULL,
+                     NULL,
+                     argv,
+                     opt_in_env));
+#if defined(PEAK_TEST_EXEC_RAW_SYSCALL_SUPPORTED)
+    RUN_DEFAULT_BYPASS_CASE(
+        "raw_execve",
+        (int)syscall(SYS_execve, missing_path, argv, opt_in_env));
+#if defined(PEAK_TEST_HAVE_EXECVEAT)
+    RUN_DEFAULT_BYPASS_CASE(
+        "raw_execveat",
+        (int)syscall(SYS_execveat,
+                     AT_FDCWD,
+                     missing_path,
+                     argv,
+                     opt_in_env,
+                     0));
+#endif
+#endif
+#undef RUN_DEFAULT_BYPASS_CASE
+    puts("default_disabled_family_bypass=1");
+    return 0;
+}
 
 typedef struct {
     char* name;
@@ -56,6 +143,124 @@ call_hot_target(int loops)
     for (int i = 0; i < loops; i++) {
         peak_exec_chain_hot_target(i);
     }
+}
+
+static void
+signal_handler_execve_missing(int signal_number)
+{
+    int saved_errno = errno;
+    int result;
+    int exec_errno;
+
+    (void)signal_number;
+    result = execve(peak_signal_exec_path,
+                    peak_signal_exec_argv,
+                    peak_signal_exec_envp);
+    exec_errno = errno;
+    if (result == -1 && exec_errno == ENOENT) {
+        result = execl(peak_signal_exec_path,
+                       peak_signal_exec_path,
+                       (char*)NULL);
+        exec_errno = errno;
+    }
+    if (result == -1 && exec_errno == ENOENT) {
+        result = execlp(peak_signal_exec_command,
+                        peak_signal_exec_command,
+                        (char*)NULL);
+        exec_errno = errno;
+    }
+    if (result == -1 && exec_errno == ENOENT) {
+        result = execle(peak_signal_exec_path,
+                        peak_signal_exec_path,
+                        (char*)NULL,
+                        peak_signal_exec_envp);
+        exec_errno = errno;
+    }
+    peak_signal_exec_result = (sig_atomic_t)result;
+    peak_signal_exec_errno = (sig_atomic_t)exec_errno;
+    peak_signal_exec_seen = 1;
+    errno = saved_errno;
+}
+
+static int
+run_signal_handler_execve_default_bypass(void)
+{
+    struct sigaction action;
+    struct sigaction old_action;
+    sigset_t blocked;
+    sigset_t old_mask;
+    sigset_t wait_mask;
+    int signal_error;
+    int result = 0;
+    stack_t signal_stack;
+    stack_t old_signal_stack;
+
+    peak_signal_exec_path = "/definitely/missing/peak-signal-exec";
+    peak_signal_exec_command = "peak-signal-exec-command-does-not-exist";
+    peak_signal_exec_seen = 0;
+    peak_signal_exec_result = 0;
+    peak_signal_exec_errno = 0;
+    signal_stack.ss_sp = peak_signal_stack;
+    signal_stack.ss_size = sizeof(peak_signal_stack);
+    signal_stack.ss_flags = 0;
+    if (syscall(SYS_sigaltstack, &signal_stack, &old_signal_stack) != 0) {
+        perror("sigaltstack");
+        return 219;
+    }
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &blocked, &old_mask) != 0) {
+        perror("sigprocmask-block");
+        (void)syscall(SYS_sigaltstack, &old_signal_stack, NULL);
+        return 220;
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = signal_handler_execve_missing;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART | SA_ONSTACK;
+    if (sigaction(SIGUSR1, &action, &old_action) != 0) {
+        perror("sigaction");
+        (void)sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        (void)syscall(SYS_sigaltstack, &old_signal_stack, NULL);
+        return 221;
+    }
+    signal_error = pthread_kill(pthread_self(), SIGUSR1);
+    if (signal_error != 0) {
+        errno = signal_error;
+        perror("pthread-kill-self");
+        result = 222;
+        goto out;
+    }
+    wait_mask = old_mask;
+    sigdelset(&wait_mask, SIGUSR1);
+    while (!peak_signal_exec_seen) {
+        (void)sigsuspend(&wait_mask);
+    }
+    if (peak_signal_exec_result != -1 ||
+        peak_signal_exec_errno != ENOENT) {
+        fprintf(stderr,
+                "signal_handler_execve_result=%d errno=%d\n",
+                (int)peak_signal_exec_result,
+                (int)peak_signal_exec_errno);
+        result = 223;
+        goto out;
+    }
+    printf("signal_handler_execve_default_bypass=1\n");
+
+out:
+    if (sigaction(SIGUSR1, &old_action, NULL) != 0 && result == 0) {
+        perror("sigaction-restore");
+        result = 224;
+    }
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) != 0 && result == 0) {
+        perror("sigprocmask-restore");
+        result = 225;
+    }
+    if (syscall(SYS_sigaltstack, &old_signal_stack, NULL) != 0 && result == 0) {
+        perror("sigaltstack-restore");
+        result = 226;
+    }
+    return result;
 }
 
 static void
@@ -179,6 +384,16 @@ make_child_control_env(const char* marker)
 
     envp[2] = make_env_entry("PEAK_EXEC_CHAIN", "1");
     envp[3] = make_env_entry("PEAK_EXEC_PROPAGATE_PEAK_ENV", "1");
+    return envp;
+}
+
+static char**
+make_call_specific_optin_env(const char* marker)
+{
+    char** envp = make_minimal_child_env_without_loader(marker);
+
+    envp[2] = make_env_entry("PEAK_EXEC_CHAIN", "1");
+    envp[3] = make_env_entry("PEAK_EXEC_CHECKPOINT", "1");
     return envp;
 }
 
@@ -829,6 +1044,17 @@ run_execve_custom_env(const char* self)
 }
 
 static int
+run_execve_call_env_optin_default_bypass(const char* self)
+{
+    char* const argv[] = {(char*)self, (char*)"child-print-ld", NULL};
+    char** envp = make_call_specific_optin_env("call-env-optin-execve");
+
+    execve(self, argv, envp);
+    perror("execve-call-env-optin-default-bypass");
+    return 226;
+}
+
+static int
 run_raw_syscall_execve_custom_env(const char* self)
 {
     char* const argv[] = {(char*)self, (char*)"child-print-ld", NULL};
@@ -858,6 +1084,41 @@ run_raw_syscall_execve_failure(void)
            peak_exec_chain_sink);
     fflush(stdout);
     return saved_errno == ENOENT ? 0 : 217;
+}
+
+static int
+run_raw_syscall_execve_observer_bypass(void)
+{
+    static const char missing_path[] =
+        "/definitely/missing/peak-raw-observer-exec";
+    char* const argv[] = {(char*)missing_path, NULL};
+    typedef int (*observer_count_fn)(void);
+    observer_count_fn observer_count;
+    void* observer_symbol;
+    long result;
+    int saved_errno;
+    int observed_calls;
+
+    errno = EALREADY;
+    result = syscall(SYS_execve, missing_path, argv, environ);
+    saved_errno = errno;
+    observer_symbol = dlsym(RTLD_DEFAULT,
+                            "peak_test_execve_observer_count");
+    if (observer_symbol == NULL) {
+        fputs("missing execve observer\n", stderr);
+        return 230;
+    }
+    memcpy(&observer_count, &observer_symbol, sizeof(observer_count));
+    observed_calls = observer_count();
+    printf("raw_execve_observer_bypass=%d result=%ld errno=%d "
+           "observed_execve_calls=%d\n",
+           result == -1 && saved_errno == ENOENT && observed_calls == 0,
+           result,
+           saved_errno,
+           observed_calls);
+    return result == -1 && saved_errno == ENOENT && observed_calls == 0 ?
+               0 :
+               231;
 }
 
 static int
@@ -1429,6 +1690,40 @@ run_posix_spawn_custom_env(const char* self)
         return 130;
     }
     return wait_for_child(pid);
+}
+
+static int
+run_posix_spawn_call_env_optin_default_bypass(const char* self)
+{
+    pid_t pid = -1;
+    char* const argv[] = {(char*)self, (char*)"child-print-ld", NULL};
+    char** envp = make_call_specific_optin_env("call-env-optin-spawn");
+    int result;
+    int child_status;
+
+    errno = EDOM;
+    result = posix_spawn(&pid, self, NULL, NULL, argv, envp);
+    if (result != 0) {
+        fprintf(stderr,
+                "posix_spawn_call_env_optin_default_bypass_failed=%d\n",
+                result);
+        return 227;
+    }
+    if (errno != EDOM) {
+        fprintf(stderr,
+                "posix_spawn_call_env_optin_default_bypass_errno=%d\n",
+                errno);
+        return 228;
+    }
+    child_status = wait_for_child(pid);
+    if (child_status != 0) {
+        fprintf(stderr,
+                "posix_spawn_call_env_optin_default_bypass_status=%d\n",
+                child_status);
+        return 229;
+    }
+    printf("posix_spawn_call_env_optin_default_bypass=1\n");
+    return 0;
 }
 
 static int
@@ -2046,6 +2341,306 @@ run_vfork_child_failed_exec_parent_exec(const char* self)
     perror("vfork-failed-child-parent-exec");
     return 185;
 }
+
+typedef struct {
+    const char* self;
+} CloneExecContext;
+
+typedef struct {
+    char** environ_pointer;
+    char* entry_bytes;
+    size_t entry_count;
+    size_t byte_count;
+    uint64_t fingerprint;
+} ParentEnvironmentSnapshot;
+
+static int
+snapshot_parent_environment(ParentEnvironmentSnapshot* snapshot)
+{
+    static const uint64_t fnv_offset = UINT64_C(1469598103934665603);
+    static const uint64_t fnv_prime = UINT64_C(1099511628211);
+    char* output;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->environ_pointer = environ;
+    snapshot->fingerprint = fnv_offset;
+    if (environ == NULL) {
+        return 0;
+    }
+    while (environ[snapshot->entry_count] != NULL) {
+        size_t length = strlen(environ[snapshot->entry_count]) + 1;
+
+        if (snapshot->byte_count > SIZE_MAX - length) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        snapshot->byte_count += length;
+        snapshot->entry_count++;
+    }
+    snapshot->entry_bytes = malloc(snapshot->byte_count == 0 ?
+                                       1 : snapshot->byte_count);
+    if (snapshot->entry_bytes == NULL) {
+        return -1;
+    }
+    output = snapshot->entry_bytes;
+    for (size_t index = 0; index < snapshot->entry_count; index++) {
+        size_t length = strlen(environ[index]) + 1;
+
+        memcpy(output, environ[index], length);
+        for (size_t byte = 0; byte < length; byte++) {
+            snapshot->fingerprint ^= (unsigned char)output[byte];
+            snapshot->fingerprint *= fnv_prime;
+        }
+        output += length;
+    }
+    return 0;
+}
+
+static int
+parent_environment_matches(const ParentEnvironmentSnapshot* snapshot)
+{
+    const char* expected = snapshot->entry_bytes;
+
+    if (environ != snapshot->environ_pointer) {
+        return 0;
+    }
+    if (environ == NULL) {
+        return snapshot->entry_count == 0;
+    }
+    for (size_t index = 0; index < snapshot->entry_count; index++) {
+        size_t length;
+
+        if (environ[index] == NULL) {
+            return 0;
+        }
+        length = strlen(expected) + 1;
+        if (strlen(environ[index]) + 1 != length ||
+            memcmp(environ[index], expected, length) != 0) {
+            return 0;
+        }
+        expected += length;
+    }
+    return environ[snapshot->entry_count] == NULL &&
+           (size_t)(expected - snapshot->entry_bytes) == snapshot->byte_count;
+}
+
+static void
+destroy_parent_environment_snapshot(ParentEnvironmentSnapshot* snapshot)
+{
+    free(snapshot->entry_bytes);
+    snapshot->entry_bytes = NULL;
+}
+
+static int
+clone_private_child_exec(void* data)
+{
+    const CloneExecContext* context = data;
+    char* const missing_argv[] = {
+        (char*)"/definitely/not/found/peak-clone-exec",
+        NULL
+    };
+    char* const success_argv[] = {
+        (char*)context->self,
+        (char*)"child-clone-private-success",
+        NULL
+    };
+
+    if (execv(missing_argv[0], missing_argv) != -1 || errno != ENOENT) {
+        _exit(241);
+    }
+    execv(context->self, success_argv);
+    _exit(242);
+}
+
+static int
+clone_shared_vm_child_raw_exec(void* data)
+{
+    const CloneExecContext* context = data;
+    char* const argv[] = {(char*)context->self, (char*)"child-basic", NULL};
+
+    (void)syscall(SYS_execve, context->self, argv, environ);
+    (void)syscall(SYS_exit, 243);
+    __builtin_unreachable();
+}
+
+static int
+finish_clone_parent(const char* self,
+                    pid_t pid,
+                    const ParentEnvironmentSnapshot* snapshot,
+                    const char* mode)
+{
+    char* const parent_argv[] = {(char*)self, (char*)"child-basic", NULL};
+    int child_status = wait_for_child(pid);
+
+    if (child_status != 0) {
+        fprintf(stderr, "clone_child_status=%d mode=%s\n", child_status, mode);
+        return 244;
+    }
+    if (!parent_environment_matches(snapshot)) {
+        fprintf(stderr,
+                "clone_parent_environment_invariant=0 mode=%s\n",
+                mode);
+        return 245;
+    }
+    printf("clone_parent_environment_invariant=1 "
+           "environ_pointer_unchanged=1 entries=%zu bytes=%zu "
+           "fingerprint=%016llx mode=%s parent_pid=%ld\n",
+           snapshot->entry_count,
+           snapshot->byte_count,
+           (unsigned long long)snapshot->fingerprint,
+           mode,
+           (long)getpid());
+    fflush(stdout);
+    call_hot_target(5);
+    execv(self, parent_argv);
+    perror("clone-parent-exec");
+    return 246;
+}
+
+static int
+run_libc_clone_exec(const char* self, int flags)
+{
+    enum { clone_stack_size = 64 * 1024 };
+    _Alignas(16) char stack[clone_stack_size];
+    ParentEnvironmentSnapshot snapshot;
+    CloneExecContext context = {self};
+    int shared_vm = (flags & CLONE_VM) != 0;
+    pid_t pid;
+    int result;
+
+    if (snapshot_parent_environment(&snapshot) != 0) {
+        perror("clone-parent-environment-snapshot");
+        return 247;
+    }
+    pid = clone(shared_vm ? clone_shared_vm_child_raw_exec :
+                            clone_private_child_exec,
+                stack + sizeof(stack), flags | SIGCHLD, &context);
+    if (pid < 0) {
+        perror("libc-clone");
+        destroy_parent_environment_snapshot(&snapshot);
+        return 248;
+    }
+    result = finish_clone_parent(self,
+                                 pid,
+                                 &snapshot,
+                                 (flags & CLONE_VFORK) != 0 ? "clone-vfork" :
+                                     (shared_vm ? "clone-vm" :
+                                                  "clone-private-vm"));
+    destroy_parent_environment_snapshot(&snapshot);
+    return result;
+}
+
+#if defined(SYS_clone)
+static int
+run_raw_clone_exec(const char* self, int raw_exec)
+{
+    ParentEnvironmentSnapshot snapshot;
+    char* const missing_argv[] = {
+        (char*)"/definitely/not/found/peak-raw-clone-exec",
+        NULL
+    };
+    char* const success_argv[] = {
+        (char*)self,
+        (char*)"child-clone-private-success",
+        NULL
+    };
+    long result;
+    int finish_result;
+
+    if (snapshot_parent_environment(&snapshot) != 0) {
+        perror("raw-clone-parent-environment-snapshot");
+        return 251;
+    }
+    result = syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0);
+    if (result < 0) {
+        perror("raw-clone");
+        destroy_parent_environment_snapshot(&snapshot);
+        return 252;
+    }
+    if (result == 0) {
+        if (raw_exec) {
+            if (syscall(SYS_execve,
+                        missing_argv[0],
+                        missing_argv,
+                        environ) != -1 || errno != ENOENT) {
+                _exit(253);
+            }
+            (void)syscall(SYS_execve, self, success_argv, environ);
+            (void)syscall(SYS_exit, 254);
+        } else {
+            if (execv(missing_argv[0], missing_argv) != -1 ||
+                errno != ENOENT) {
+                _exit(255);
+            }
+            execv(self, success_argv);
+            _exit(256);
+        }
+        __builtin_unreachable();
+    }
+    finish_result = finish_clone_parent(
+        self,
+        (pid_t)result,
+        &snapshot,
+        raw_exec ? "raw-clone-raw-exec" : "raw-clone-libc-exec");
+    destroy_parent_environment_snapshot(&snapshot);
+    return finish_result;
+}
+#endif
+
+#if defined(PEAK_TEST_HAVE_SYS_CLONE3) && defined(SYS_clone3)
+static int
+run_clone3_exec(const char* self)
+{
+    struct clone_args args;
+    ParentEnvironmentSnapshot snapshot;
+    char* const missing_argv[] = {
+        (char*)"/definitely/not/found/peak-clone3-exec",
+        NULL
+    };
+    char* const success_argv[] = {
+        (char*)self,
+        (char*)"child-clone-private-success",
+        NULL
+    };
+    long result;
+    int finish_result;
+
+    if (snapshot_parent_environment(&snapshot) != 0) {
+        perror("clone3-parent-environment-snapshot");
+        return 257;
+    }
+    memset(&args, 0, sizeof(args));
+    args.exit_signal = SIGCHLD;
+    result = syscall(SYS_clone3, &args, sizeof(args));
+    if (result < 0 && errno == ENOSYS) {
+        puts("clone3_skip_enosys=1");
+        destroy_parent_environment_snapshot(&snapshot);
+        return 0;
+    }
+    if (result < 0) {
+        perror("clone3");
+        destroy_parent_environment_snapshot(&snapshot);
+        return 258;
+    }
+    if (result == 0) {
+        if (syscall(SYS_execve,
+                    missing_argv[0],
+                    missing_argv,
+                    environ) != -1 || errno != ENOENT) {
+            _exit(259);
+        }
+        (void)syscall(SYS_execve, self, success_argv, environ);
+        (void)syscall(SYS_exit, 260);
+        __builtin_unreachable();
+    }
+    finish_result = finish_clone_parent(self,
+                                        (pid_t)result,
+                                        &snapshot,
+                                        "clone3");
+    destroy_parent_environment_snapshot(&snapshot);
+    return finish_result;
+}
+#endif
 
 static int
 run_vfork_varargs_exec_parent_exec(const char* self, int mode)
@@ -2922,6 +3517,10 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "child-basic") == 0) {
         return run_child_basic();
     }
+    if (strcmp(argv[1], "child-clone-private-success") == 0) {
+        puts("clone_private_failed_exec_enoent=1");
+        return run_child_basic();
+    }
     if (strcmp(argv[1], "child-print-ld") == 0) {
         return run_child_print_ld();
     }
@@ -2934,6 +3533,12 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "execv-success") == 0) {
         return run_execv_success(argv[0]);
     }
+    if (strcmp(argv[1], "signal-handler-execve") == 0) {
+        return run_signal_handler_execve_default_bypass();
+    }
+    if (strcmp(argv[1], "default-disabled-family-bypass") == 0) {
+        return run_default_disabled_family_bypass();
+    }
     if (strcmp(argv[1], "execv-zero-call") == 0) {
         return run_execv_zero_call_checkpoint(argv[0]);
     }
@@ -2943,11 +3548,17 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "execve-custom-env") == 0) {
         return run_execve_custom_env(argv[0]);
     }
+    if (strcmp(argv[1], "execve-call-env-optin-default-bypass") == 0) {
+        return run_execve_call_env_optin_default_bypass(argv[0]);
+    }
     if (strcmp(argv[1], "raw-syscall-execve-custom-env") == 0) {
         return run_raw_syscall_execve_custom_env(argv[0]);
     }
     if (strcmp(argv[1], "raw-syscall-execve-failure") == 0) {
         return run_raw_syscall_execve_failure();
+    }
+    if (strcmp(argv[1], "raw-syscall-execve-observer-bypass") == 0) {
+        return run_raw_syscall_execve_observer_bypass();
     }
     if (strcmp(argv[1], "raw-syscall-nonexec") == 0) {
         return run_raw_syscall_nonexec_passthrough();
@@ -3085,6 +3696,28 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "vfork-child-failed-exec-parent-exec") == 0) {
         return run_vfork_child_failed_exec_parent_exec(argv[0]);
     }
+    if (strcmp(argv[1], "clone-private-vm-exec") == 0) {
+        return run_libc_clone_exec(argv[0], 0);
+    }
+    if (strcmp(argv[1], "clone-vm-exec") == 0) {
+        return run_libc_clone_exec(argv[0], CLONE_VM);
+    }
+    if (strcmp(argv[1], "clone-vfork-exec") == 0) {
+        return run_libc_clone_exec(argv[0], CLONE_VM | CLONE_VFORK);
+    }
+#if defined(SYS_clone)
+    if (strcmp(argv[1], "raw-clone-libc-exec") == 0) {
+        return run_raw_clone_exec(argv[0], 0);
+    }
+    if (strcmp(argv[1], "raw-clone-raw-exec") == 0) {
+        return run_raw_clone_exec(argv[0], 1);
+    }
+#endif
+#if defined(PEAK_TEST_HAVE_SYS_CLONE3) && defined(SYS_clone3)
+    if (strcmp(argv[1], "clone3-exec") == 0) {
+        return run_clone3_exec(argv[0]);
+    }
+#endif
     if (strcmp(argv[1], "vfork-execl-parent-exec") == 0) {
         return run_vfork_varargs_exec_parent_exec(argv[0], 0);
     }
@@ -3139,6 +3772,9 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "vfork-custom-env-execvp") == 0) {
         return run_vfork_custom_env_api(argv[0], POSTFORK_EXECVP);
     }
+    if (strcmp(argv[1], "vfork-execvp-native-fallback") == 0) {
+        return run_vfork_custom_env_api(argv[0], POSTFORK_EXECVP);
+    }
     if (strcmp(argv[1], "vfork-custom-env-execlp") == 0) {
         return run_vfork_custom_env_api(argv[0], POSTFORK_EXECLP);
     }
@@ -3185,6 +3821,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "posix-spawn-custom-env") == 0) {
         return run_posix_spawn_custom_env(argv[0]);
+    }
+    if (strcmp(argv[1], "posix-spawn-call-env-optin-default-bypass") == 0) {
+        return run_posix_spawn_call_env_optin_default_bypass(argv[0]);
     }
     if (strcmp(argv[1], "posix-spawn-null-env") == 0) {
         return run_posix_spawn_null_env(argv[0]);
