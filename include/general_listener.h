@@ -185,6 +185,8 @@ PEAK_API int peak_general_listener_test_mpi_uint64_type_size(void);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
                                                           uint64_t rhs);
+PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_hold(void);
+PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_release(void);
 #endif
 
 /**

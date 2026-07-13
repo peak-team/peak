@@ -29,6 +29,7 @@ extern char** environ;
 #define EXTRA_PRELOAD_TOKEN_A "/tmp/peak_exec_chain_extra_preload_a.so"
 #define EXTRA_PRELOAD_TOKEN_B "/tmp/peak_exec_chain_extra_preload_b.so"
 #define LOADER_OBSERVER_ENV "EXEC_CHAIN_TEST_LOADER_OBSERVER"
+#define CONTROLLER_QUIESCE_ARG "--quiesce-controller"
 
 static volatile unsigned long peak_exec_chain_sink;
 
@@ -55,6 +56,20 @@ call_hot_target(int loops)
     for (int i = 0; i < loops; i++) {
         peak_exec_chain_hot_target(i);
     }
+}
+
+static void
+quiesce_controller_for_required_checkpoint(void)
+{
+    void (*controller_stop)(void);
+
+    controller_stop = (void (*)(void))dlsym(
+        RTLD_DEFAULT, "peak_general_listener_controller_stop");
+    if (controller_stop == NULL) {
+        fprintf(stderr, "general controller stop API unavailable\n");
+        exit(101);
+    }
+    controller_stop();
 }
 
 static const char*
@@ -1947,7 +1962,12 @@ run_fork_child_exec_parent_exec(const char* self)
             (char*)"child-basic",
             NULL
         };
-        call_hot_target(2);
+        /*
+         * The fork child inherits a multithreaded runtime with arbitrary
+         * library locks held.  Until exec, do not call instrumented ordinary
+         * functions: entering Gum may acquire an inherited allocator lock and
+         * deadlock permanently.
+         */
         execv(self, child_argv);
         _exit(175);
     }
@@ -2662,6 +2682,108 @@ run_exec_checkpoint_concurrent_fini_callbacks(const char* self)
 }
 
 static int
+run_exec_checkpoint_snapshot_lock_contention(const char* self)
+{
+    PeakTestReadyFn hold = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT,
+        "peak_general_listener_test_checkpoint_snapshot_lock_hold");
+    PeakTestReadyFn release = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT,
+        "peak_general_listener_test_checkpoint_snapshot_lock_release");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    char* const missing_argv[] = {(char*)"missing-exec", NULL};
+    char* const child_argv[] = {(char*)self, (char*)"child-basic", NULL};
+    int failure = 0;
+    int hold_rc;
+    int release_rc;
+
+    if (hold == NULL || release == NULL || checkpoint == NULL) {
+        fprintf(stderr, "checkpoint snapshot-lock test hooks unavailable\n");
+        return 187;
+    }
+
+    call_hot_target(5);
+    hold_rc = hold();
+    if (hold_rc != 0) {
+        fprintf(stderr,
+                "checkpoint snapshot-lock holder failed: %s\n",
+                strerror(hold_rc));
+        return 188;
+    }
+
+    errno = EALREADY;
+    if (checkpoint(self, child_argv) != -1 || errno != EALREADY) {
+        fprintf(stderr,
+                "checkpoint snapshot contention did not fail open: errno=%d\n",
+                errno);
+        failure = 189;
+        goto release_holder;
+    }
+
+    errno = EALREADY;
+    if (execv("/definitely/missing/peak-checkpoint-lock", missing_argv) != -1 ||
+        errno != ENOENT) {
+        fprintf(stderr,
+                "missing exec under checkpoint contention failed: errno=%d\n",
+                errno);
+        failure = 190;
+    }
+
+release_holder:
+    release_rc = release();
+    if (release_rc != 0) {
+        fprintf(stderr,
+                "checkpoint snapshot-lock release failed: %s\n",
+                strerror(release_rc));
+        return 191;
+    }
+    if (failure != 0) {
+        return failure;
+    }
+
+    errno = ERANGE;
+    if (checkpoint(self, child_argv) != 0 || errno != ERANGE) {
+        fprintf(stderr,
+                "checkpoint after snapshot-lock release failed: errno=%d\n",
+                errno);
+        return 192;
+    }
+
+    hold_rc = hold();
+    if (hold_rc != 0) {
+        fprintf(stderr,
+                "second checkpoint snapshot-lock hold failed: %s\n",
+                strerror(hold_rc));
+        return 193;
+    }
+    errno = EALREADY;
+    if (checkpoint(self, child_argv) != -1 || errno != EALREADY) {
+        fprintf(stderr,
+                "second checkpoint snapshot contention did not fail open: errno=%d\n",
+                errno);
+        failure = 194;
+    }
+    release_rc = release();
+    if (release_rc != 0) {
+        fprintf(stderr,
+                "second checkpoint snapshot-lock release failed: %s\n",
+                strerror(release_rc));
+        return 195;
+    }
+    if (failure != 0) {
+        return failure;
+    }
+
+    printf("checkpoint_snapshot_lock_contention=1 errno_preserved=1 "
+           "missing_exec_enoent=1 cleanup=1 repeatable=1 success=1\n");
+    fflush(stdout);
+    execv(self, child_argv);
+    perror("exec-checkpoint-snapshot-lock-contention");
+    return 196;
+}
+
+static int
 run_exec_checkpoint_fork_child_fini(const char* self)
 {
     pthread_t checkpoint_thread;
@@ -2792,6 +2914,9 @@ main(int argc, char** argv)
     if (argc < 2) {
         fprintf(stderr, "usage: %s <mode>\n", argv[0]);
         return 2;
+    }
+    if (argc >= 3 && strcmp(argv[argc - 1], CONTROLLER_QUIESCE_ARG) == 0) {
+        quiesce_controller_for_required_checkpoint();
     }
 
     if (strcmp(argv[1], "child-basic") == 0) {
@@ -3117,6 +3242,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "exec-concurrent-fini-callbacks") == 0) {
         return run_exec_checkpoint_concurrent_fini_callbacks(argv[0]);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-snapshot-lock-contention") == 0) {
+        return run_exec_checkpoint_snapshot_lock_contention(argv[0]);
     }
     if (strcmp(argv[1], "exec-checkpoint-fork-child-fini") == 0) {
         return run_exec_checkpoint_fork_child_fini(argv[0]);

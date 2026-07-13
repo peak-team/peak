@@ -9,7 +9,7 @@ replace themselves with a later program image.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PEAK_EXEC_CHAIN` | enabled | Keep PEAK available to an eligible child by carrying or adding PEAK's library to the child's `LD_PRELOAD`. Set to `0` to leave the child environment unchanged by exec-chain handling. |
-| `PEAK_EXEC_CHECKPOINT` | enabled | Write a best-effort profiling checkpoint before a direct exec. Set to `0` when that pre-exec snapshot is not wanted. This does not disable exec-chain environment handling. |
+| `PEAK_EXEC_CHECKPOINT` | enabled | Write a best-effort profiling checkpoint before a direct exec. The checkpoint performs allocation and I/O; set to `0` to avoid it. This does not disable exec-chain environment handling. |
 | `PEAK_EXEC_PROPAGATE_PEAK_ENV` | enabled | Copy missing `PEAK_*` settings from the parent environment into a child environment. Set to `0` to require each child environment to provide its own PEAK settings. |
 
 The explicit child environment is authoritative. Its values, including a
@@ -38,6 +38,11 @@ handles `posix_spawn` and `posix_spawnp`.
 
 The checkpoint applies to direct exec-family calls, not `posix_spawn` calls.
 `posix_spawn` can still receive the exec-chain child environment.
+
+The optional checkpoint is not async-signal-safe and is best-effort: an
+unavailable snapshot simply does not produce a checkpoint. Disabling
+`PEAK_EXEC_CHECKPOINT` avoids that checkpoint; it does not make broader
+exec-chain interposition async-signal-safe.
 
 ## Forked Children and Internal Helpers
 
