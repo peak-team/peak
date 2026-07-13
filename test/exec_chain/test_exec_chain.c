@@ -28,6 +28,7 @@
 extern char** environ;
 #define EXTRA_PRELOAD_TOKEN_A "/tmp/peak_exec_chain_extra_preload_a.so"
 #define EXTRA_PRELOAD_TOKEN_B "/tmp/peak_exec_chain_extra_preload_b.so"
+#define LOADER_OBSERVER_ENV "EXEC_CHAIN_TEST_LOADER_OBSERVER"
 
 static volatile unsigned long peak_exec_chain_sink;
 
@@ -713,6 +714,9 @@ run_child_print_ld(void)
     const char* peak_exec_chain = getenv("PEAK_EXEC_CHAIN");
     const char* peak_exec_checkpoint = getenv("PEAK_EXEC_CHECKPOINT");
     const char* peak_exec_propagate = getenv("PEAK_EXEC_PROPAGATE_PEAK_ENV");
+    const char* path = getenv("PATH");
+    const char* loader_observer = getenv(LOADER_OBSERVER_ENV);
+    const char* secure_test_hook = getenv("PEAK_TEST_EXEC_AT_SECURE");
     const char* loader_path_0 = ld_library_path_env_value(0);
     const char* loader_path_1 = ld_library_path_env_value(1);
 
@@ -721,7 +725,8 @@ run_child_print_ld(void)
            "ld_preload_extra_count=%d peak_target=%s peak_statslog=%s "
            "marker=%s peak_exec_chain=%s peak_exec_checkpoint=%s "
            "peak_exec_propagate=%s ld_library_path_env_entries=%d "
-           "ld_library_path_0=%s ld_library_path_1=%s\n",
+           "ld_library_path_0=%s ld_library_path_1=%s path=%s "
+           "loader_observer=%s secure_test_hook=%s\n",
            count_libpeak_preload_entries(),
            count_ld_preload_env_entries(),
            count_extra_preload_entries(),
@@ -733,7 +738,10 @@ run_child_print_ld(void)
            peak_exec_propagate != NULL ? peak_exec_propagate : "<missing>",
            count_ld_library_path_env_entries(),
            loader_path_0 != NULL ? loader_path_0 : "<missing>",
-           loader_path_1 != NULL ? loader_path_1 : "<missing>");
+           loader_path_1 != NULL ? loader_path_1 : "<missing>",
+           path != NULL ? path : "<missing>",
+           loader_observer != NULL ? loader_observer : "<missing>",
+           secure_test_hook != NULL ? secure_test_hook : "<missing>");
     fflush(stdout);
     return 0;
 }
@@ -895,7 +903,8 @@ run_execve_loader_path_env(const char* self,
                            const char* second_value,
                            int disable_chain)
 {
-    const char* child = self;
+    const char* observer = getenv(LOADER_OBSERVER_ENV);
+    const char* child = observer != NULL && observer[0] != '\0' ? observer : self;
     char* argv[] = {(char*)self, (char*)"child-print-ld", NULL};
     char** envp = make_loader_path_child_env(marker, value, second_value);
     size_t index = 0;
@@ -903,13 +912,8 @@ run_execve_loader_path_env(const char* self,
     while (envp[index] != NULL) {
         index++;
     }
+    argv[0] = (char*)child;
     if (disable_chain) {
-        const char* observer = getenv("EXEC_CHAIN_TEST_CHAIN_DISABLED_OBSERVER");
-
-        if (observer != NULL && observer[0] != '\0') {
-            child = observer;
-            argv[0] = (char*)child;
-        }
         envp[index++] = make_env_entry("PEAK_EXEC_CHAIN", "0");
         envp[index] = NULL;
     }
@@ -2070,8 +2074,10 @@ run_postfork_custom_env(const char* self,
                         int use_raw_syscall,
                         int omit_loader_path)
 {
+    const char* observer = getenv(LOADER_OBSERVER_ENV);
+    const char* child = observer != NULL && observer[0] != '\0' ? observer : self;
     char* const child_argv[] = {
-        (char*)self,
+        (char*)child,
         (char*)"child-print-ld",
         NULL
     };
@@ -2106,15 +2112,15 @@ run_postfork_custom_env(const char* self,
     }
     if (pid == 0) {
         if (use_execle) {
-            execle(self,
-                   self,
+            execle(child,
+                   child,
                    "child-print-ld",
                    (char*)NULL,
                    child_env);
         } else if (use_raw_syscall) {
-            (void)syscall(SYS_execve, self, child_argv, child_env);
+            (void)syscall(SYS_execve, child, child_argv, child_env);
         } else {
-            execve(self, child_argv, child_env);
+            execve(child, child_argv, child_env);
         }
         _exit(193);
     }
@@ -2174,7 +2180,9 @@ run_vfork_preloaded_env(const char* self)
 static int
 run_fork_parent_env_exhaustion(const char* self)
 {
-    char* const child_argv[] = {(char*)self, (char*)"child-print-ld", NULL};
+    const char* observer = getenv(LOADER_OBSERVER_ENV);
+    const char* child = observer != NULL && observer[0] != '\0' ? observer : self;
+    char* const child_argv[] = {(char*)child, (char*)"child-print-ld", NULL};
     char* const parent_argv[] = {(char*)self, (char*)"child-basic", NULL};
     char** child_env = make_child_control_env("parent-env-exhaustion");
     pid_t pid = fork();
@@ -2186,7 +2194,7 @@ run_fork_parent_env_exhaustion(const char* self)
     }
     if (pid == 0) {
         environ = make_unterminated_nonpeak_env();
-        execve(self, child_argv, child_env);
+        execve(child, child_argv, child_env);
         _exit(232);
     }
     child_status = wait_for_child(pid);
@@ -2337,7 +2345,12 @@ run_postfork_bad_env(const char* self, int use_vfork, int bad_string)
 static int
 run_vfork_child_env_capacity_fallback(const char* self, int long_preload)
 {
-    char* const child_argv[] = {(char*)self, (char*)"child-print-ld", NULL};
+    const char* observer = getenv(LOADER_OBSERVER_ENV);
+    const char* child = observer != NULL && observer[0] != '\0' ? observer : self;
+    const char* child_mode = child == self ?
+        "child-print-ld" :
+        (long_preload ? "capacity-long-preload" : "capacity-env-slots");
+    char* const child_argv[] = {(char*)child, (char*)child_mode, NULL};
     char* const parent_argv[] = {(char*)self, (char*)"child-basic", NULL};
     char** envp = long_preload ? make_long_preload_child_env() :
                                 make_large_child_env();
@@ -2349,7 +2362,7 @@ run_vfork_child_env_capacity_fallback(const char* self, int long_preload)
         return 219;
     }
     if (pid == 0) {
-        execve(self, child_argv, envp);
+        execve(child, child_argv, envp);
         _exit(220);
     }
     child_status = wait_for_child(pid);
@@ -2357,8 +2370,72 @@ run_vfork_child_env_capacity_fallback(const char* self, int long_preload)
         fprintf(stderr, "postfork_capacity_child_status=%d\n", child_status);
         return 221;
     }
-    printf("postfork_capacity_passthrough=1 kind=%s\n",
-           long_preload ? "long-preload" : "env-slots");
+    const size_t bounded_entries = long_preload ? 3 : 514;
+    size_t input_entries = 0;
+    size_t input_pad_validated_count = 0;
+    size_t input_pad_mismatch_count = 0;
+    size_t input_preload_entries = 0;
+    size_t input_preload_length = 0;
+    int input_preload_all_x = 1;
+    size_t input_path_entries = 0;
+    size_t input_loader_path_entries = 0;
+
+    for (size_t index = 0; index < bounded_entries; index++) {
+        const char* entry = envp[index];
+
+        if (entry == NULL) {
+            continue;
+        }
+        input_entries++;
+        if (strncmp(entry, "LD_PRELOAD=", strlen("LD_PRELOAD=")) == 0) {
+            const char* value = entry + strlen("LD_PRELOAD=");
+
+            input_preload_entries++;
+            input_preload_length += strlen(value);
+            for (const char* scan = value; *scan != '\0'; scan++) {
+                if (*scan != 'x') {
+                    input_preload_all_x = 0;
+                }
+            }
+        } else if (strncmp(entry, "PATH=", strlen("PATH=")) == 0) {
+            input_path_entries++;
+        } else if (strncmp(entry,
+                           "LD_LIBRARY_PATH=",
+                           strlen("LD_LIBRARY_PATH=")) == 0) {
+            input_loader_path_entries++;
+        }
+    }
+    if (!long_preload) {
+        char expected[64];
+
+        for (size_t index = 0; index < 512; index++) {
+            snprintf(expected,
+                     sizeof(expected),
+                     "CHILD_PAD_%04zu=x",
+                     index);
+            if (envp[index + 2] != NULL &&
+                strcmp(envp[index + 2], expected) == 0) {
+                input_pad_validated_count++;
+            } else {
+                input_pad_mismatch_count++;
+            }
+        }
+    }
+    printf("postfork_capacity_passthrough=1 kind=%s input_entries=%zu "
+           "input_pad_validated_count=%zu input_pad_mismatch_count=%zu "
+           "input_preload_entries=%zu input_preload_length=%zu "
+           "input_preload_all_x=%d input_path_entries=%zu "
+           "input_loader_path_entries=%zu input_terminator_null=%d\n",
+           long_preload ? "long-preload" : "env-slots",
+           input_entries,
+           input_pad_validated_count,
+           input_pad_mismatch_count,
+           input_preload_entries,
+           input_preload_length,
+           input_preload_all_x,
+           input_path_entries,
+           input_loader_path_entries,
+           envp[bounded_entries] == NULL ? 1 : 0);
     fflush(stdout);
     call_hot_target(5);
     execv(self, parent_argv);
@@ -2369,7 +2446,11 @@ run_vfork_child_env_capacity_fallback(const char* self, int long_preload)
 static int
 run_vfork_preload_entries_fallback(const char* self)
 {
-    char* const child_argv[] = {(char*)self, (char*)"child-print-ld", NULL};
+    const char* observer = getenv(LOADER_OBSERVER_ENV);
+    const char* child = observer != NULL && observer[0] != '\0' ? observer : self;
+    const char* child_mode = child == self ?
+        "child-print-ld" : "capacity-preload-entries";
+    char* const child_argv[] = {(char*)child, (char*)child_mode, NULL};
     char* const parent_argv[] = {(char*)self, (char*)"child-basic", NULL};
     char** envp = make_preload_entries_without_terminator();
     pid_t pid = vfork();
@@ -2380,7 +2461,7 @@ run_vfork_preload_entries_fallback(const char* self)
         return 223;
     }
     if (pid == 0) {
-        execve(self, child_argv, envp);
+        execve(child, child_argv, envp);
         _exit(224);
     }
     child_status = wait_for_child(pid);
@@ -2388,7 +2469,43 @@ run_vfork_preload_entries_fallback(const char* self)
         fprintf(stderr, "postfork_preload_entries_child_status=%d\n", child_status);
         return 225;
     }
-    printf("postfork_preload_entries_passthrough=1\n");
+    const size_t bounded_entries = 256;
+    size_t input_entries = 0;
+    size_t input_preload_entries = 0;
+    size_t input_nonempty_preload_entries = 0;
+    size_t input_path_entries = 0;
+    size_t input_loader_path_entries = 0;
+
+    for (size_t index = 0; index < bounded_entries; index++) {
+        const char* entry = envp[index];
+
+        if (entry == NULL) {
+            continue;
+        }
+        input_entries++;
+        if (strncmp(entry, "LD_PRELOAD=", strlen("LD_PRELOAD=")) == 0) {
+            input_preload_entries++;
+            if (entry[strlen("LD_PRELOAD=")] != '\0') {
+                input_nonempty_preload_entries++;
+            }
+        } else if (strncmp(entry, "PATH=", strlen("PATH=")) == 0) {
+            input_path_entries++;
+        } else if (strncmp(entry,
+                           "LD_LIBRARY_PATH=",
+                           strlen("LD_LIBRARY_PATH=")) == 0) {
+            input_loader_path_entries++;
+        }
+    }
+    printf("postfork_preload_entries_passthrough=1 input_entries=%zu "
+           "input_preload_entries=%zu input_nonempty_preload_entries=%zu "
+           "input_path_entries=%zu "
+           "input_loader_path_entries=%zu input_terminator_null=%d\n",
+           input_entries,
+           input_preload_entries,
+           input_nonempty_preload_entries,
+           input_path_entries,
+           input_loader_path_entries,
+           envp[bounded_entries] == NULL ? 1 : 0);
     fflush(stdout);
     call_hot_target(5);
     execv(self, parent_argv);
