@@ -23,6 +23,7 @@ MODE_TO_APP_ARG = {
     "exec_checkpoint_write_target_no_reentry": "execv-write-target-success",
     "execv_zero_call_checkpoint": "execv-zero-call",
     "exec_checkpoint_disabled": "execv-success",
+    "exec_checkpoint_direct_disabled": "exec-checkpoint-direct-disabled",
     "exec_bad_stats_path_nonfatal": "execv-success",
     "execve_custom_env_injection": "execve-custom-env",
     "execve_call_env_optin_default_bypass": (
@@ -177,6 +178,12 @@ MODE_TO_APP_ARG = {
     "posix_spawn_explicit_peak_env_preserved": "posix-spawn-explicit-peak-env",
     "exec_checkpoint_concurrent_fini_callbacks": "exec-concurrent-fini-callbacks",
     "exec_checkpoint_snapshot_lock_contention": "exec-checkpoint-snapshot-lock-contention",
+    "exec_checkpoint_statistics_snapshot_contention": (
+        "exec-checkpoint-statistics-snapshot-contention"
+    ),
+    "exec_checkpoint_statistics_shadow_invalidation": (
+        "exec-checkpoint-statistics-shadow-invalidation"
+    ),
     "exec_checkpoint_fork_child_fini": "exec-checkpoint-fork-child-fini",
     "text_output_not_corrupted": "exec-failure",
 }
@@ -215,7 +222,9 @@ NO_EXEC_CHECKPOINT_MODES = {
     "raw_syscall_execve_backend_disabled_injection",
     "raw_syscall_execve_observer_bypass",
     "exec_checkpoint_disabled",
+    "exec_checkpoint_direct_disabled",
     "exec_checkpoint_concurrent_fini_callbacks",
+    "exec_checkpoint_statistics_shadow_invalidation",
     "execve_child_checkpoint_disabled",
     "exec_bad_stats_path_nonfatal",
     "raw_syscall_nonexec_passthrough",
@@ -288,6 +297,8 @@ CHECKPOINT_ONLY_MODES = CHECKPOINT_REQUIRED_MODES
 PARENT_CALL_COUNT_EXEMPT_MODES = frozenset({
     "execv_zero_call_checkpoint",
     "exec_checkpoint_write_target_no_reentry",
+    "exec_checkpoint_statistics_snapshot_contention",
+    "exec_checkpoint_statistics_shadow_invalidation",
 })
 
 POSTFORK_FALLBACK_OBSERVER_MODES = frozenset({
@@ -938,6 +949,8 @@ def base_env(args, tmpdir: Path, bindir: Path, blocked_dir: Path, preload: bool)
         env["EXEC_CHAIN_CHILD_STATS_PREFIX"] = "peak_stats"
     if args.mode == "exec_checkpoint_disabled":
         env["PEAK_EXEC_CHECKPOINT"] = "0"
+    if args.mode == "exec_checkpoint_direct_disabled":
+        env["PEAK_EXEC_CHECKPOINT"] = "0"
     if args.mode == "execve_propagate_disabled":
         env["PEAK_EXEC_PROPAGATE_PEAK_ENV"] = "0"
     if args.mode in {"execve_chain_disabled", "posix_spawn_chain_disabled"}:
@@ -1435,6 +1448,10 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(target_count(exec_files) == 0,
                 f"zero-call checkpoint recorded target calls: {exec_files}")
 
+    if args.mode == "exec_checkpoint_direct_disabled":
+        require("checkpoint_direct_disabled=1 errno_preserved=1 success=1" in output,
+                f"direct disabled checkpoint did not fail closed\n{output}")
+
     if args.mode == "exec_checkpoint_write_target_no_reentry":
         require("parent_write_before_exec" in output,
                 f"missing parent write marker\n{output}")
@@ -1780,6 +1797,31 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require("checkpoint_snapshot_lock_contention=1 errno_preserved=1 "
                 "missing_exec_enoent=1 cleanup=1 repeatable=1 success=1" in output,
                 f"checkpoint contention did not skip and clean up\n{output}")
+
+    if args.mode == "exec_checkpoint_statistics_snapshot_contention":
+        require("checkpoint_statistics_contention=1 busy_observed=1 "
+                "coherent_tuple=1 success=1" in output,
+                f"checkpoint statistics contention was not observed\n{output}")
+        rows = []
+        for path in exec_files:
+            rows.extend(csv.DictReader(path.open(encoding="utf-8")))
+        target_rows = [row for row in rows if row.get("function") == TARGET]
+        require(target_rows,
+                f"missing statistics contention checkpoint row: {exec_files}")
+        for row in target_rows:
+            require(int(row["count"]) == 1 and
+                    float(row["call_max_s"]) == 10.0 and
+                    float(row["call_min_s"]) == 10.0 and
+                    float(row["total_s"]) == 170.0 and
+                    float(row["exclusive_s"]) == 85.0,
+                    f"checkpoint accepted an incoherent statistics tuple: {row}")
+
+    if args.mode == "exec_checkpoint_statistics_shadow_invalidation":
+        require("checkpoint_shadow_invalidation=1 contender_returned=1 "
+                "errno_preserved=1 no_artifact=1 success=1" in output,
+                f"checkpoint shadow invalidation was not observed\n{output}")
+        require(not exec_files,
+                f"invalid shadow checkpoint left artifacts: {exec_files}")
 
     if args.mode == "exec_failure_non_destructive":
         require(f"exec_failure_errno={errno.ENOENT}" in output,

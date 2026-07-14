@@ -26,6 +26,7 @@ PEAK_EXEC_API int peak_runtime_is_active_for_checkpoint(void);
  *
  * This API is intentionally non-destructive: it must not call peak_fini(),
  * detach or reattach hooks, stop PEAK background workers, or use MPI.
+ * It requires PEAK_EXEC_CHECKPOINT to be enabled at startup.
  *
  * @return 0 when a checkpoint artifact was written, -1 otherwise.
  */

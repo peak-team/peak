@@ -160,6 +160,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         exec_checkpoint_write_target_no_reentry
         execv_zero_call_checkpoint
         exec_checkpoint_disabled
+        exec_checkpoint_direct_disabled
         exec_bad_stats_path_nonfatal
         execve_custom_env_injection
         execve_call_env_optin_default_bypass
@@ -274,6 +275,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         posix_spawn_explicit_peak_env_preserved
         exec_checkpoint_concurrent_fini_callbacks
         exec_checkpoint_snapshot_lock_contention
+        exec_checkpoint_statistics_snapshot_contention
+        exec_checkpoint_statistics_shadow_invalidation
         exec_checkpoint_fork_child_fini
         signal_handler_execve_default_bypass
         default_disabled_family_bypass

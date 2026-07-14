@@ -71,6 +71,8 @@ application signal handlers. With both startup options disabled, the direct
 array-based wrappers take the primed bypass described above; variadic adapters
 still perform their bounded stack scan.
 
+Checkpoint CSV rows count completed calls only and omit calls that are still in flight.
+
 ## Forked Children and Internal Helpers
 
 After `fork()` or `vfork()`, PEAK uses a bounded, allocation-free child path

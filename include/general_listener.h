@@ -36,6 +36,27 @@
 
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
+#if defined(__GNUC__) || defined(__clang__)
+typedef struct __attribute__((aligned(64))) {
+#else
+typedef struct {
+#endif
+    _Atomic gulong sequence;
+    _Atomic int invalid;
+    gulong completed_calls;
+    gdouble total_time;
+    gdouble exclusive_time;
+    gfloat max_time;
+    gfloat min_time;
+} PeakGeneralListenerCheckpointShadow;
+
+#if defined(__GNUC__) || defined(__clang__)
+_Static_assert(sizeof(PeakGeneralListenerCheckpointShadow) == 64,
+               "checkpoint shadow slot must occupy one cache line");
+_Static_assert(__alignof__(PeakGeneralListenerCheckpointShadow) == 64,
+               "checkpoint shadow slot must be cache-line aligned");
+#endif
+
 #define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type())
 G_DECLARE_FINAL_TYPE(PeakGeneralListener, peak_general_listener, PEAKGENERAL, LISTENER, GObject)
 
@@ -73,6 +94,7 @@ struct _PeakGeneralListener {
     gfloat* max_time;
     gfloat* min_time;
     gboolean* target_thread_called;
+    PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
 };
 
 typedef struct {
@@ -187,6 +209,13 @@ uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
                                                           uint64_t rhs);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_hold(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_release(void);
+PEAK_API int peak_general_listener_test_checkpoint_mutation_begin(void);
+PEAK_API void peak_general_listener_test_checkpoint_mutation_release(void);
+PEAK_API int peak_general_listener_test_checkpoint_mutation_contend(void);
+PEAK_API int peak_general_listener_test_checkpoint_mutation_contender_invalidated(void);
+PEAK_API void peak_general_listener_test_checkpoint_busy_pause_enable(void);
+PEAK_API int peak_general_listener_test_checkpoint_busy_is_held(void);
+PEAK_API void peak_general_listener_test_checkpoint_busy_release(void);
 #endif
 
 /**
