@@ -1,7 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-double rfftwnd_print_plan() {
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_TEST_NOINLINE __attribute__((noinline))
+#else
+#define PEAK_TEST_NOINLINE
+#endif
+
+PEAK_TEST_NOINLINE double rfftwnd_print_plan() {
     printf("Calling dfftw_destroy_plan_\n");
     double sum = 0;
     for (int i = 0; i < 1000000; i++) {
@@ -11,7 +17,7 @@ double rfftwnd_print_plan() {
     return sum;
 }
 
-double rfftwnd_threads_one_complex_to_real() {
+PEAK_TEST_NOINLINE double rfftwnd_threads_one_complex_to_real() {
     printf("Calling rfftwnd_threads_one_complex_to_real\n");
     double product = 1;
     for (int i = 1; i <= 100000; i++) {

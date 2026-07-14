@@ -67,6 +67,17 @@ set(_DLOPEN_DRAIN_SCRIPT
 add_test(NAME test_dynamic_dlopen
   COMMAND ${Python3_EXECUTABLE} -c "${_DLOPEN_DRAIN_SCRIPT}"
 )
+
+add_test(NAME test_dynamic_dlopen_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic()"
+)
+set_tests_properties(test_dynamic_dlopen_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_first_call_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+)
 set_tests_properties(test_dynamic_dlopen
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}

@@ -15,6 +15,7 @@ typedef void (*fn_void)(void);
 #define PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY 256U
 #define PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET 64U
 #define PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS 5000L
+#define PEAK_DLOPEN_RETURN_ATTACH_TIMEOUT_MS 1000L
 #define PEAK_DLOPEN_ENTRY_GUARD_BYTES 256U
 #define PEAK_DLOPEN_PREPARE_RETRY_ATTEMPTS 50U
 #define PEAK_DLOPEN_PREPARE_RETRY_SLEEP_NS 1000000L
@@ -387,6 +388,29 @@ dlopen_interceptor_wait_for_dynamic_attach_idle(void)
     return idle;
 }
 
+static void
+dlopen_interceptor_wait_for_queued_attach_before_return(void)
+{
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    dlopen_interceptor_add_milliseconds(&deadline,
+                                        PEAK_DLOPEN_RETURN_ATTACH_TIMEOUT_MS);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    while (dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN &&
+           (dynamic_attach_queue_length > 0 || dynamic_attach_drain_active)) {
+        int wait_status =
+            pthread_cond_timedwait(&dynamic_attach_gate_cond,
+                                   &dynamic_attach_gate_mutex,
+                                   &deadline);
+        if (wait_status == ETIMEDOUT) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
 static gboolean
 dlopen_interceptor_wait_for_replacement_idle(void)
 {
@@ -508,10 +532,7 @@ dlopen_interceptor_end_dynamic_attach_drain(void)
     if (active_dynamic_attach_count > 0) {
         active_dynamic_attach_count--;
     }
-    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN &&
-        active_dynamic_attach_count == 0) {
-        pthread_cond_broadcast(&dynamic_attach_gate_cond);
-    }
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
 
@@ -1089,7 +1110,9 @@ peak_dlopen(const char *filename, int flags) {
         return handle;
     }
 
-    if (!dlopen_interceptor_enqueue_dynamic_attach_request(filename, binding_flags)) {
+    gboolean attach_enqueued =
+        dlopen_interceptor_enqueue_dynamic_attach_request(filename, binding_flags);
+    if (!attach_enqueued) {
         gboolean should_report_overflow = FALSE;
 
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
@@ -1107,6 +1130,9 @@ peak_dlopen(const char *filename, int flags) {
     }
 
     dlopen_interceptor_end_replacement_call();
+    if (attach_enqueued) {
+        dlopen_interceptor_wait_for_queued_attach_before_return();
+    }
     return handle;
 }
 
