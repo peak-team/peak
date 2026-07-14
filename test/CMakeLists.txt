@@ -1290,12 +1290,13 @@ if(BUILD_TESTING)
             ENVIRONMENT "PEAK_TARGET=functionA,functionB;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
 
-    # Add test of fftw
+    # Verify that the built-in FFTW target group profiles FFTW symbols.
     add_subdirectory(fftw)
     add_test(NAME test_fftw COMMAND ${PROJECT_BINARY_DIR}/test/fftw/test_fftw)
     set_tests_properties(test_fftw
-        PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_CONFIG=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "rfftwnd_print_plan\\|[ \t]+1\\|.*rfftwnd_threads_one_complex_to_real\\|[ \t]+1\\|"
     )
     
     if(MPI_FOUND)
