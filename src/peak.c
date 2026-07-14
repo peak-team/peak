@@ -17,6 +17,7 @@
 #include "general_listener.h"
 #include "detach_controller.h"
 #include "exec_interceptor.h"
+#include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
 #include "internal/jit_provider.h"
 #include "logging.h"
@@ -912,7 +913,8 @@ peak_checkpoint_for_exec(const char* path, char* const argv[])
     (void)path;
     (void)argv;
 
-    if (!peak_runtime_is_active_for_checkpoint()) {
+    if (!peak_exec_checkpoint_enabled_at_startup() ||
+        !peak_runtime_is_active_for_checkpoint()) {
         errno = saved_errno;
         return -1;
     }

@@ -14,6 +14,169 @@ peak_general_listener_note_mpi_finalize_requested(void)
                           memory_order_release);
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_checkpoint_test_mutation_contender_invalidated;
+#endif
+
+static void
+peak_general_listener_checkpoint_shadow_update(
+    PeakGeneralListenerCheckpointShadow* shadow,
+    gdouble duration,
+    gdouble exclusive_duration)
+{
+    if (atomic_load_explicit(&shadow->invalid, memory_order_relaxed)) {
+        return;
+    }
+    gulong observed = atomic_load_explicit(&shadow->sequence,
+                                           memory_order_acquire);
+
+    for (unsigned int attempt = 0; attempt < 2; attempt++) {
+        if (atomic_load_explicit(&shadow->invalid, memory_order_relaxed)) {
+            return;
+        }
+        if ((observed & 1UL) != 0) {
+            break;
+        }
+        if (atomic_compare_exchange_strong_explicit(&shadow->sequence,
+                                                    &observed,
+                                                    observed + 1UL,
+                                                    memory_order_acquire,
+                                                    memory_order_relaxed)) {
+            shadow->completed_calls++;
+            shadow->total_time += duration;
+            shadow->exclusive_time += exclusive_duration;
+            if (shadow->completed_calls == 1) {
+                shadow->max_time = (gfloat)duration;
+                shadow->min_time = (gfloat)duration;
+            } else {
+                if (duration > shadow->max_time) {
+                    shadow->max_time = (gfloat)duration;
+                }
+                if (duration < shadow->min_time) {
+                    shadow->min_time = (gfloat)duration;
+                }
+            }
+            atomic_store_explicit(&shadow->sequence,
+                                  observed + 2UL,
+                                  memory_order_release);
+            return;
+        }
+        if ((observed & 1UL) != 0) {
+            break;
+        }
+    }
+    int expected_invalid = 0;
+    if (!atomic_compare_exchange_strong_explicit(&shadow->invalid,
+                                                 &expected_invalid,
+                                                 1,
+                                                 memory_order_release,
+                                                 memory_order_relaxed)) {
+        return;
+    }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_store_explicit(&peak_checkpoint_test_mutation_contender_invalidated,
+                          1,
+                          memory_order_release);
+#endif
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static PeakGeneralListener* peak_checkpoint_test_mutation_listener;
+static size_t peak_checkpoint_test_mutation_index;
+static gulong peak_checkpoint_test_mutation_sequence;
+
+PEAK_API int
+peak_general_listener_test_checkpoint_mutation_begin(void)
+{
+    PeakGeneralListener* listener;
+    PeakGeneralListenerCheckpointShadow* shadow;
+
+    if (array_listener == NULL || peak_hook_address_count == 0 ||
+        array_listener[0] == NULL || peak_max_num_threads == 0 ||
+        peak_checkpoint_test_mutation_listener != NULL) {
+        return EINVAL;
+    }
+    listener = PEAKGENERAL_LISTENER(array_listener[0]);
+    for (size_t index = 0; index < peak_max_num_threads; index++) {
+        if (peak_general_listener_num_calls_load(&listener->num_calls[index]) != 0) {
+            peak_checkpoint_test_mutation_index = index;
+            break;
+        }
+    }
+    if (peak_general_listener_num_calls_load(
+            &listener->num_calls[peak_checkpoint_test_mutation_index]) == 0) {
+        return EINVAL;
+    }
+    if (listener->checkpoint_shadow == NULL) {
+        return EINVAL;
+    }
+    for (size_t index = 0; index < peak_max_num_threads; index++) {
+        PeakGeneralListenerCheckpointShadow* current =
+            &listener->checkpoint_shadow[index];
+
+        atomic_store_explicit(&current->sequence, 0, memory_order_relaxed);
+        atomic_store_explicit(&current->invalid, 0, memory_order_relaxed);
+        current->completed_calls = 0;
+        current->total_time = 0.0;
+        current->exclusive_time = 0.0;
+        current->max_time = 0.0f;
+        current->min_time = 0.0f;
+    }
+    shadow = &listener->checkpoint_shadow[peak_checkpoint_test_mutation_index];
+    peak_checkpoint_test_mutation_sequence = 0;
+    if (!atomic_compare_exchange_strong_explicit(&shadow->sequence,
+                                                 &peak_checkpoint_test_mutation_sequence,
+                                                 1,
+                                                 memory_order_acquire,
+                                                 memory_order_relaxed)) {
+        return EAGAIN;
+    }
+    shadow->total_time = 170.0;
+    shadow->exclusive_time = 85.0;
+    shadow->max_time = 10.0f;
+    shadow->min_time = 10.0f;
+    shadow->completed_calls = 1;
+    peak_checkpoint_test_mutation_listener = listener;
+    atomic_store_explicit(&peak_checkpoint_test_mutation_contender_invalidated,
+                          0,
+                          memory_order_release);
+    return 0;
+}
+
+PEAK_API void
+peak_general_listener_test_checkpoint_mutation_release(void)
+{
+    if (peak_checkpoint_test_mutation_listener != NULL) {
+        atomic_store_explicit(
+            &peak_checkpoint_test_mutation_listener->checkpoint_shadow[
+                peak_checkpoint_test_mutation_index].sequence,
+            peak_checkpoint_test_mutation_sequence + 2UL,
+            memory_order_release);
+        peak_checkpoint_test_mutation_listener = NULL;
+    }
+}
+
+PEAK_API int
+peak_general_listener_test_checkpoint_mutation_contend(void)
+{
+    PeakGeneralListener* listener = peak_checkpoint_test_mutation_listener;
+    size_t index = peak_checkpoint_test_mutation_index;
+    if (listener == NULL) {
+        return EINVAL;
+    }
+    peak_general_listener_checkpoint_shadow_update(
+        &listener->checkpoint_shadow[index], 20.0, 10.0);
+    return 0;
+}
+
+PEAK_API int
+peak_general_listener_test_checkpoint_mutation_contender_invalidated(void)
+{
+    return atomic_load_explicit(&peak_checkpoint_test_mutation_contender_invalidated,
+                                memory_order_acquire);
+}
+#endif
+
 static void
 peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
                                                  gboolean use_pause_guard)
@@ -246,6 +409,12 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
             peak_general_listener_exclusive_duration(
                 end_time,
                 child_duration);
+        if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
+            peak_general_listener_checkpoint_shadow_update(
+                &self->checkpoint_shadow[index],
+                end_time,
+                peak_general_listener_exclusive_duration(end_time, child_duration));
+        }
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;
@@ -305,6 +474,12 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
             peak_general_listener_exclusive_duration(
                 end_time,
                 child_duration);
+        if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
+            peak_general_listener_checkpoint_shadow_update(
+                &self->checkpoint_shadow[index],
+                end_time,
+                peak_general_listener_exclusive_duration(end_time, child_duration));
+        }
         if (thread_data.level == 0) {
             void* tmp_ptr = thread_data.child_time;
             thread_data.child_time = NULL;
@@ -342,6 +517,17 @@ peak_general_listener_init(PeakGeneralListener* self)
     self->exclusive_time = g_new0(gdouble, total_count);
     self->max_time = g_new0(gfloat, total_count);
     self->min_time = g_new0(gfloat, total_count);
+    if (peak_exec_checkpoint_enabled_at_startup != NULL &&
+        peak_exec_checkpoint_enabled_at_startup()) {
+        self->checkpoint_shadow = g_aligned_alloc0(
+            total_count,
+            sizeof(*self->checkpoint_shadow),
+            64);
+        for (size_t index = 0; index < total_count; index++) {
+            atomic_init(&self->checkpoint_shadow[index].sequence, 0);
+            atomic_init(&self->checkpoint_shadow[index].invalid, 0);
+        }
+    }
     self->target_thread_called = g_new0(gboolean, total_count);
     // g_print ("total count %lu self->num_calls %lu\n", total_count, self->num_calls[0]);
 }
@@ -354,6 +540,7 @@ peak_general_listener_free(PeakGeneralListener* self)
     g_free(self->exclusive_time);
     g_free(self->max_time);
     g_free(self->min_time);
+    g_aligned_free(self->checkpoint_shadow);
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;
 }

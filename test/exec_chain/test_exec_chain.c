@@ -3145,6 +3145,7 @@ fini_thread_main(void* data)
 typedef struct {
     const char* self;
     PeakCheckpointFn checkpoint;
+    int result;
 } CheckpointThreadArgs;
 
 static void*
@@ -3153,7 +3154,21 @@ checkpoint_thread_main(void* data)
     CheckpointThreadArgs* args = data;
     char* const argv[] = {(char*)args->self, (char*)"child-basic", NULL};
 
-    (void)args->checkpoint(args->self, argv);
+    args->result = args->checkpoint(args->self, argv);
+    return NULL;
+}
+
+typedef struct {
+    PeakTestReadyFn function;
+    int result;
+} TestHookThreadArgs;
+
+static void*
+test_hook_thread_main(void* data)
+{
+    TestHookThreadArgs* args = data;
+
+    args->result = args->function();
     return NULL;
 }
 
@@ -3376,6 +3391,149 @@ release_holder:
     execv(self, child_argv);
     perror("exec-checkpoint-snapshot-lock-contention");
     return 196;
+}
+
+static int
+run_exec_checkpoint_statistics_snapshot_contention(const char* self)
+{
+    PeakTestReadyFn mutation_begin = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_mutation_begin");
+    PeakTestVoidFn mutation_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_mutation_release");
+    PeakTestVoidFn pause_enable = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_busy_pause_enable");
+    PeakTestReadyFn busy_is_held = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_busy_is_held");
+    PeakTestVoidFn busy_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_busy_release");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    CheckpointThreadArgs args = {.self = self, .checkpoint = checkpoint, .result = -1};
+    pthread_t checkpoint_thread;
+
+    if (mutation_begin == NULL || mutation_release == NULL || pause_enable == NULL ||
+        busy_is_held == NULL || busy_release == NULL || checkpoint == NULL) {
+        fprintf(stderr, "checkpoint statistics test hooks unavailable\n");
+        return 197;
+    }
+    call_hot_target(1);
+    if (mutation_begin() != 0) {
+        fprintf(stderr, "checkpoint statistics mutation setup failed\n");
+        return 198;
+    }
+    pause_enable();
+    int rc = pthread_create(&checkpoint_thread, NULL, checkpoint_thread_main, &args);
+    if (rc != 0) {
+        mutation_release();
+        fprintf(stderr, "pthread_create statistics checkpoint failed: %s\n", strerror(rc));
+        return 199;
+    }
+    if (wait_for_test_hook(busy_is_held, "checkpoint statistics contention") != 0) {
+        mutation_release();
+        busy_release();
+        return join_test_thread(checkpoint_thread, "statistics checkpoint") == 0 ?
+                   200 : 201;
+    }
+    mutation_release();
+    busy_release();
+    if (join_test_thread(checkpoint_thread, "statistics checkpoint") != 0 ||
+        args.result != 0) {
+        fprintf(stderr, "checkpoint statistics snapshot did not retry successfully\n");
+        return 201;
+    }
+    printf("checkpoint_statistics_contention=1 busy_observed=1 "
+           "coherent_tuple=1 success=1\n");
+    fflush(stdout);
+    char* const argv[] = {(char*)self, (char*)"child-basic", NULL};
+    execv(self, argv);
+    perror("exec-checkpoint-statistics-snapshot-contention");
+    return 202;
+}
+
+static int
+run_exec_checkpoint_statistics_shadow_invalidation(const char* self)
+{
+    PeakTestReadyFn mutation_begin = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_mutation_begin");
+    PeakTestVoidFn mutation_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_mutation_release");
+    PeakTestReadyFn mutation_contend = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_general_listener_test_checkpoint_mutation_contend");
+    PeakTestReadyFn contender_invalidated = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT,
+        "peak_general_listener_test_checkpoint_mutation_contender_invalidated");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    TestHookThreadArgs contender_args = {.function = mutation_contend, .result = 0};
+    pthread_t contender_thread;
+
+    if (mutation_begin == NULL || mutation_release == NULL || mutation_contend == NULL ||
+        contender_invalidated == NULL || checkpoint == NULL) {
+        fprintf(stderr, "checkpoint shadow invalidation test hooks unavailable\n");
+        return 203;
+    }
+    call_hot_target(1);
+    if (mutation_begin() != 0) {
+        fprintf(stderr, "checkpoint shadow invalidation mutation setup failed\n");
+        return 204;
+    }
+    int rc = pthread_create(&contender_thread,
+                            NULL,
+                            test_hook_thread_main,
+                            &contender_args);
+    if (rc != 0) {
+        mutation_release();
+        fprintf(stderr, "pthread_create shadow contender failed: %s\n", strerror(rc));
+        return 205;
+    }
+    if (wait_for_test_hook(contender_invalidated, "checkpoint shadow invalidation") != 0) {
+        mutation_release();
+        return join_test_thread(contender_thread, "shadow contender") == 0 ? 206 : 207;
+    }
+    if (join_test_thread(contender_thread, "shadow contender") != 0 ||
+        contender_args.result != 0) {
+        mutation_release();
+        fprintf(stderr, "checkpoint shadow contender did not return promptly\n");
+        return 208;
+    }
+    errno = ERANGE;
+    char* const argv[] = {(char*)self, (char*)"child-basic", NULL};
+    if (checkpoint(self, argv) != -1 || errno != ERANGE) {
+        mutation_release();
+        fprintf(stderr, "checkpoint shadow invalidation did not fail closed errno=%d\n",
+                errno);
+        return 209;
+    }
+    mutation_release();
+    printf("checkpoint_shadow_invalidation=1 contender_returned=1 "
+           "errno_preserved=1 no_artifact=1 success=1\n");
+    fflush(stdout);
+    execv(self, argv);
+    perror("exec-checkpoint-statistics-shadow-invalidation");
+    return 210;
+}
+
+static int
+run_exec_checkpoint_direct_disabled(const char* self)
+{
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    char* const argv[] = {(char*)self, (char*)"child-basic", NULL};
+
+    if (checkpoint == NULL) {
+        fprintf(stderr, "direct disabled checkpoint hook unavailable\n");
+        return 212;
+    }
+    errno = ERANGE;
+    if (checkpoint(self, argv) != -1 || errno != ERANGE) {
+        fprintf(stderr, "direct disabled checkpoint did not preserve errno=%d\n", errno);
+        return 213;
+    }
+    printf("checkpoint_direct_disabled=1 errno_preserved=1 success=1\n");
+    fflush(stdout);
+    execv(self, argv);
+    perror("exec-checkpoint-direct-disabled");
+    return 214;
 }
 
 static int
@@ -3884,6 +4042,15 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "exec-checkpoint-snapshot-lock-contention") == 0) {
         return run_exec_checkpoint_snapshot_lock_contention(argv[0]);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-statistics-snapshot-contention") == 0) {
+        return run_exec_checkpoint_statistics_snapshot_contention(argv[0]);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-statistics-shadow-invalidation") == 0) {
+        return run_exec_checkpoint_statistics_shadow_invalidation(argv[0]);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-direct-disabled") == 0) {
+        return run_exec_checkpoint_direct_disabled(argv[0]);
     }
     if (strcmp(argv[1], "exec-checkpoint-fork-child-fini") == 0) {
         return run_exec_checkpoint_fork_child_fini(argv[0]);

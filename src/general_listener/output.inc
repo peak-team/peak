@@ -374,12 +374,64 @@ typedef struct {
 } PeakExecCheckpointRecord;
 
 typedef struct {
-    gulong* num_calls;
-    gdouble* total_time;
-    gdouble* exclusive_time;
-    gfloat* max_time;
-    gfloat* min_time;
+    PeakGeneralListenerCheckpointShadow* shadows;
+    gulong* sequences;
+    int* invalid;
 } PeakExecCheckpointThreadSnapshot;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_checkpoint_test_busy_pause = 0;
+static _Atomic int peak_checkpoint_test_busy_held = 0;
+static _Atomic int peak_checkpoint_test_busy_released = 0;
+
+PEAK_API void
+peak_general_listener_test_checkpoint_busy_pause_enable(void)
+{
+    atomic_store_explicit(&peak_checkpoint_test_busy_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_checkpoint_test_busy_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_checkpoint_test_busy_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_checkpoint_busy_is_held(void)
+{
+    return atomic_load_explicit(&peak_checkpoint_test_busy_held,
+                                memory_order_acquire);
+}
+
+PEAK_API void
+peak_general_listener_test_checkpoint_busy_release(void)
+{
+    atomic_store_explicit(&peak_checkpoint_test_busy_released,
+                          1,
+                          memory_order_release);
+}
+
+static void
+peak_general_listener_test_checkpoint_busy_pause(void)
+{
+    if (atomic_load_explicit(&peak_checkpoint_test_busy_pause,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+    atomic_store_explicit(&peak_checkpoint_test_busy_held,
+                          1,
+                          memory_order_release);
+    while (atomic_load_explicit(&peak_checkpoint_test_busy_released,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    atomic_store_explicit(&peak_checkpoint_test_busy_pause,
+                          0,
+                          memory_order_release);
+}
+#endif
 
 static gboolean
 peak_exec_checkpoint_copy_listener(
@@ -388,33 +440,65 @@ peak_exec_checkpoint_copy_listener(
     size_t thread_count)
 {
 #if defined(__linux__) && defined(SYS_process_vm_readv)
-    struct iovec local[5] = {
-        { snapshot->num_calls, thread_count * sizeof(gulong) },
-        { snapshot->total_time, thread_count * sizeof(gdouble) },
-        { snapshot->exclusive_time, thread_count * sizeof(gdouble) },
-        { snapshot->max_time, thread_count * sizeof(gfloat) },
-        { snapshot->min_time, thread_count * sizeof(gfloat) }
-    };
-    struct iovec remote[5] = {
-        { listener->num_calls, thread_count * sizeof(gulong) },
-        { listener->total_time, thread_count * sizeof(gdouble) },
-        { listener->exclusive_time, thread_count * sizeof(gdouble) },
-        { listener->max_time, thread_count * sizeof(gfloat) },
-        { listener->min_time, thread_count * sizeof(gfloat) }
-    };
-    size_t expected = thread_count *
-        (sizeof(gulong) + sizeof(gdouble) + sizeof(gdouble) +
-         sizeof(gfloat) + sizeof(gfloat));
-    long copied = peak_exec_checkpoint_raw_syscall6(
-        SYS_process_vm_readv,
-        (long)getpid(),
-        (long)local,
-        5,
-        (long)remote,
-        5,
-        0);
+    if (listener->checkpoint_shadow == NULL) {
+        errno = EOPNOTSUPP;
+        return FALSE;
+    }
+    struct iovec local = { snapshot->shadows,
+                           thread_count * sizeof(*snapshot->shadows) };
+    struct iovec remote = { listener->checkpoint_shadow,
+                            thread_count * sizeof(*listener->checkpoint_shadow) };
+    size_t expected = thread_count * sizeof(*snapshot->shadows);
+    for (unsigned int attempt = 0; attempt < 8; attempt++) {
+        gboolean busy = FALSE;
 
-    return copied >= 0 && (size_t)copied == expected;
+        for (size_t index = 0; index < thread_count; index++) {
+            snapshot->sequences[index] = atomic_load_explicit(
+                &listener->checkpoint_shadow[index].sequence, memory_order_acquire);
+            snapshot->invalid[index] = atomic_load_explicit(
+                &listener->checkpoint_shadow[index].invalid, memory_order_acquire);
+            if ((snapshot->sequences[index] & 1UL) != 0 ||
+                snapshot->invalid[index] != 0) {
+                busy = TRUE;
+                break;
+            }
+        }
+        if (busy) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            peak_general_listener_test_checkpoint_busy_pause();
+#endif
+            continue;
+        }
+
+        long copied = peak_exec_checkpoint_raw_syscall6(
+            SYS_process_vm_readv,
+            (long)getpid(),
+            (long)&local,
+            1,
+            (long)&remote,
+            1,
+            0);
+        if (copied < 0 || (size_t)copied != expected) {
+            return FALSE;
+        }
+        for (size_t index = 0; index < thread_count; index++) {
+            gulong current = atomic_load_explicit(
+                &listener->checkpoint_shadow[index].sequence, memory_order_acquire);
+            int invalid = atomic_load_explicit(
+                &listener->checkpoint_shadow[index].invalid, memory_order_acquire);
+            if (current != snapshot->sequences[index] ||
+                invalid != snapshot->invalid[index] || invalid != 0 ||
+                (current & 1UL) != 0) {
+                busy = TRUE;
+                break;
+            }
+        }
+        if (!busy) {
+            return TRUE;
+        }
+    }
+    errno = EAGAIN;
+    return FALSE;
 #else
     (void)listener;
     (void)snapshot;
@@ -618,7 +702,6 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
     size_t hook_count;
     size_t thread_count;
     size_t name_bytes = 0;
-    size_t thread_bytes;
     size_t thread_storage_bytes;
     PeakExecCheckpointRecord* records = NULL;
     size_t* name_lengths = NULL;
@@ -687,7 +770,8 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
 
     if (thread_count != 0 &&
         thread_count > SIZE_MAX /
-            (sizeof(gulong) + 2 * sizeof(gdouble) + 2 * sizeof(gfloat))) {
+            (sizeof(PeakGeneralListenerCheckpointShadow) + sizeof(gulong) +
+             sizeof(int))) {
         peak_exec_checkpoint_free_snapshot(records,
                                            name_lengths,
                                            NULL,
@@ -695,27 +779,33 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
         errno = EOVERFLOW;
         return FALSE;
     }
-    thread_bytes = thread_count * sizeof(gdouble);
     thread_storage_bytes = thread_count *
-        (sizeof(gulong) + 2 * sizeof(gdouble) + 2 * sizeof(gfloat));
+        (sizeof(PeakGeneralListenerCheckpointShadow) + sizeof(gulong) +
+         sizeof(int));
     names = malloc(name_bytes != 0 ? name_bytes : 1);
-    thread_storage = malloc(thread_storage_bytes != 0 ?
-                                thread_storage_bytes : 1);
-    if (names == NULL || thread_storage == NULL) {
+    int thread_storage_error = posix_memalign(
+        &thread_storage,
+        64,
+        thread_storage_bytes != 0 ? thread_storage_bytes : 1);
+    if (thread_storage_error != 0) {
+        thread_storage = NULL;
+        peak_exec_checkpoint_free_snapshot(records,
+                                           name_lengths,
+                                           names,
+                                           thread_storage);
+        errno = thread_storage_error;
+        return FALSE;
+    }
+    if (names == NULL) {
         peak_exec_checkpoint_free_snapshot(records,
                                            name_lengths,
                                            names,
                                            thread_storage);
         return FALSE;
     }
-    threads.num_calls = thread_storage;
-    threads.total_time = (gdouble*)((char*)thread_storage +
-                                    thread_count * sizeof(gulong));
-    threads.exclusive_time = (gdouble*)((char*)threads.total_time +
-                                        thread_bytes);
-    threads.max_time = (gfloat*)((char*)threads.exclusive_time +
-                                 thread_bytes);
-    threads.min_time = threads.max_time + thread_count;
+    threads.shadows = thread_storage;
+    threads.sequences = (gulong*)(threads.shadows + thread_count);
+    threads.invalid = (int*)(threads.sequences + thread_count);
 
     if (!peak_general_listener_checkpoint_snapshot_lock()) {
         peak_exec_checkpoint_free_snapshot(records,
@@ -759,26 +849,28 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
         name_offset += name_lengths[i];
 
         for (size_t j = 0; j < thread_count; j++) {
-            gulong calls = threads.num_calls[j];
+            const PeakGeneralListenerCheckpointShadow* shadow =
+                &threads.shadows[j];
+            gulong calls = shadow->completed_calls;
 
             records[i].num_calls += calls;
-            records[i].total_time += threads.total_time[j];
-            records[i].exclusive_time += threads.exclusive_time[j];
+            records[i].total_time += shadow->total_time;
+            records[i].exclusive_time += shadow->exclusive_time;
             if (calls != 0) {
                 records[i].threads_seen++;
-                if (threads.total_time[j] > records[i].max_total_time) {
-                    records[i].max_total_time = threads.total_time[j];
+                if (shadow->total_time > records[i].max_total_time) {
+                    records[i].max_total_time = shadow->total_time;
                 }
-                if (threads.total_time[j] < records[i].min_total_time ||
+                if (shadow->total_time < records[i].min_total_time ||
                     records[i].threads_seen == 1) {
-                    records[i].min_total_time = threads.total_time[j];
+                    records[i].min_total_time = shadow->total_time;
                 }
-                if (threads.max_time[j] > records[i].max_time) {
-                    records[i].max_time = threads.max_time[j];
+                if (shadow->max_time > records[i].max_time) {
+                    records[i].max_time = shadow->max_time;
                 }
-                if (threads.min_time[j] < records[i].min_time ||
+                if (shadow->min_time < records[i].min_time ||
                     records[i].threads_seen == 1) {
-                    records[i].min_time = threads.min_time[j];
+                    records[i].min_time = shadow->min_time;
                 }
             }
         }

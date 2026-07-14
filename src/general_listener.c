@@ -27,6 +27,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+extern int peak_exec_checkpoint_enabled_at_startup(void) __attribute__((weak));
+#endif
+
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 

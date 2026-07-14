@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "exec_interceptor.h"
+#include "internal/exec_interceptor_internal.h"
 #include "internal/exec_memory.h"
 #include "internal/exec_raw_syscall.h"
 #include "utils/utils.h"
@@ -131,6 +132,12 @@ _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
 _Static_assert(ATOMIC_LONG_LOCK_FREE == 2,
                "exec resolver ownership must always be lock-free");
 static atomic_int peak_exec_priming_complete = ATOMIC_VAR_INIT(0);
+
+PEAK_EXEC_INTERNAL int
+peak_exec_checkpoint_enabled_at_startup(void)
+{
+    return peak_exec_startup_checkpoint_enabled;
+}
 #if !PEAK_EXEC_DIRECT_RAW_SUPPORTED
 /* This guard only breaks loader-time resolver recursion; it is not signal-safe. */
 static __thread int peak_exec_prepublication_execve_resolving;
