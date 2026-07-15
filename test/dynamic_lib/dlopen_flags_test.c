@@ -41,6 +41,24 @@ int main(void) {
     void *now_handle = dlopen("./libB.so", RTLD_NOW);
     failures += expect_handle("RTLD_NOW load", now_handle);
 
+    /*
+     * This DSO has an unresolved function relocation that is never called.
+     * RTLD_LAZY must defer it, while RTLD_NOW must reject the load.  This
+     * makes the test sensitive to a wrapper changing the caller's binding
+     * mode during the real load.
+     */
+    void *lazy_unresolved_handle =
+        dlopen("./libLazyUnresolved.so", RTLD_LAZY);
+    failures += expect_handle("RTLD_LAZY unresolved load",
+                              lazy_unresolved_handle);
+    if (lazy_unresolved_handle != NULL) {
+        dlclose(lazy_unresolved_handle);
+    }
+
+    dlerror();
+    failures += expect_null("RTLD_NOW unresolved load",
+                            dlopen("./libLazyUnresolved.so", RTLD_NOW));
+
 #ifdef RTLD_DEEPBIND
     void *deepbind_handle = dlopen("./libB.so", RTLD_NOW | RTLD_DEEPBIND);
     failures += expect_handle("RTLD_DEEPBIND load", deepbind_handle);

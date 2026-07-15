@@ -5,21 +5,23 @@
  * @file syscall_interceptor.h
  * @brief Header file for system call interception functionality.
  *
- * Provides functions to attach and detach an interceptor for 
- * system calls such as `close`.
+ * Provides lifecycle control for PEAK's loader-level `close` interposition.
  */
 
-#include "frida-gum.h"
-
-#include <unistd.h>
+/**
+ * @brief Resolve the next `close` implementation before application startup.
+ *
+ * Early initialization preserves the platform's normal `close` semantics even
+ * when no PEAK profiling target is requested. Calls made reentrantly during
+ * symbol resolution use the raw close syscall fallback.
+ */
+void syscall_interceptor_initialize(void);
 
 /**
  * @brief Attaches the system call interceptor.
  *
- * This function initializes and attaches a system call interceptor 
- * for the `close` function. It obtains a GumInterceptor instance, 
- * locates the `close` function's memory address, and replaces it with 
- * a custom implementation. 
+ * This function enables stderr protection in the loader-interposed `close`
+ * wrapper. It does not modify libc code.
  *
  * @return 0 on success, or an error code indicating failure.
  */
@@ -28,8 +30,8 @@ int syscall_interceptor_attach(void);
 /**
  * @brief Detaches the system call interceptor.
  *
- * This function reverts the replacement of the intercepted system call
- * (e.g., `close`) and releases the resources associated with the interceptor.
+ * This function disables stderr protection. The loader-level wrapper remains
+ * present and transparently forwards to the next `close` implementation.
  */
 void syscall_interceptor_dettach(void);
 

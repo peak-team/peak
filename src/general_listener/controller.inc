@@ -1230,8 +1230,8 @@ peak_general_listener_controller_is_ready(void)
     return ready;
 }
 
-static void
-peak_general_controller_start(void)
+void
+peak_general_listener_controller_start(void)
 {
     pthread_mutex_lock(&general_controller_wake_mutex);
     if (!general_controller_thread_started) {

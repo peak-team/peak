@@ -198,17 +198,6 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     return TRUE;
 }
 
-gboolean
-peak_general_listener_support_attach_target_is_supported(const char* symbol_name,
-                                                         gpointer address)
-{
-    peak_general_listener_init_attach_policy();
-
-    (void)symbol_name;
-    (void)address;
-    return TRUE;
-}
-
 GumAttachReturn
 peak_general_listener_attach_exact(GumInterceptor* target_interceptor,
                                    gpointer address,

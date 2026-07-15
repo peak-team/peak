@@ -60,11 +60,17 @@ typedef struct PeakDlopenDynamicAttachRequest {
     void* handle;
     char* filename;
     GumAddress module_address;
+    int binding_flags;
     pthread_mutex_t completion_mutex;
     pthread_cond_t completion_cond;
     PeakDlopenRequestState state;
     gboolean caller_waits;
     gboolean retain_handle;
+    const char* resolution_provider_name;
+    const char* resolution_symbol_name;
+    GumAddress resolution_address;
+    gboolean resolution_requested;
+    gboolean resolution_complete;
 } PeakDlopenDynamicAttachRequest;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -93,6 +99,7 @@ static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_tail = NULL;
 static size_t dynamic_attach_queue_length = 0;
 static GPtrArray* dynamic_attach_retained_handles = NULL;
 static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
+static __thread gboolean dynamic_attach_resolution_reentrant = FALSE;
 /*
  * A dynamic attach stops the other application threads while Gum mutates its
  * interceptor metadata.  Do not let that stop window freeze another thread
@@ -552,6 +559,51 @@ dlopen_interceptor_wait_for_dynamic_attach_request(
 
     pthread_mutex_lock(&request->completion_mutex);
     while (request->state == PEAK_DLOPEN_REQUEST_PENDING) {
+        if (request->resolution_requested &&
+            !request->resolution_complete) {
+            const char* provider_name = request->resolution_provider_name;
+            const char* symbol_name = request->resolution_symbol_name;
+            GumAddress resolved_address = 0;
+
+            pthread_mutex_unlock(&request->completion_mutex);
+#ifdef RTLD_NOLOAD
+            if (provider_name != NULL && symbol_name != NULL) {
+                gboolean was_resolving = dynamic_attach_resolution_reentrant;
+                void* provider_handle;
+                void* address = NULL;
+
+                /*
+                 * The caller may still own the dynamic linker's recursive
+                 * load lock when this dlopen originated in a DSO
+                 * constructor.  Resolve on that same thread.  Resolving on
+                 * the controller would invert the loader-lock/controller
+                 * handshake and deadlock both threads.
+                 */
+                dynamic_attach_resolution_reentrant = TRUE;
+                provider_handle = original_dlopen(
+                    provider_name,
+                    request->binding_flags | RTLD_NOLOAD);
+                if (provider_handle != NULL) {
+                    dlerror();
+                    address = dlsym(provider_handle, symbol_name);
+                    if (dlerror() != NULL) {
+                        address = NULL;
+                    }
+                    dlclose(provider_handle);
+                }
+                dynamic_attach_resolution_reentrant = was_resolving;
+                resolved_address = (GumAddress)(guintptr)address;
+            }
+#else
+            (void)provider_name;
+            (void)symbol_name;
+#endif
+            pthread_mutex_lock(&request->completion_mutex);
+            request->resolution_address = resolved_address;
+            request->resolution_complete = TRUE;
+            pthread_cond_broadcast(&request->completion_cond);
+            continue;
+        }
         pthread_cond_wait(&request->completion_cond,
                           &request->completion_mutex);
     }
@@ -866,6 +918,7 @@ dlopen_interceptor_test_trace_counters(const char* event)
 
 typedef struct {
     PeakDlopenDynamicAttachRequest* request;
+    GumModule* module;
     const char* provider_name;
     gboolean matched;
     gboolean retry;
@@ -884,24 +937,18 @@ dlopen_interceptor_string_equal(gconstpointer left, gconstpointer right)
 }
 
 static gboolean
-dlopen_interceptor_scan_export(const GumExportDetails* details,
-                               gpointer user_data)
+dlopen_interceptor_attach_scanned_symbol(PeakDlopenExportScan* scan,
+                                         const char* symbol_name,
+                                         GumAddress symbol_address,
+                                         gsize symbol_size)
 {
-    PeakDlopenExportScan* scan = user_data;
     PeakDynamicAttachResult result;
-
-    if (details->type != GUM_EXPORT_FUNCTION ||
-        !peak_general_listener_dynamic_symbol_matches_any_target(
-            details->name,
-            scan->provider_name)) {
-        return TRUE;
-    }
 
     scan->matched = TRUE;
     result = peak_general_listener_dynamic_attach_symbol(
-        details->name,
-        GSIZE_TO_POINTER(details->address),
-        details->size > 0 ? (gsize)details->size : 0,
+        symbol_name,
+        GSIZE_TO_POINTER(symbol_address),
+        symbol_size,
         scan->provider_name);
     if (result == PEAK_DYNAMIC_ATTACH_ATTACHED) {
         scan->request->retain_handle = TRUE;
@@ -912,6 +959,116 @@ dlopen_interceptor_scan_export(const GumExportDetails* details,
     }
     return TRUE;
 }
+
+static gboolean
+dlopen_interceptor_scan_export(const GumExportDetails* details,
+                               gpointer user_data)
+{
+    PeakDlopenExportScan* scan = user_data;
+
+    if (details->type != GUM_EXPORT_FUNCTION ||
+        !peak_general_listener_dynamic_symbol_matches_any_target(
+            details->name,
+            scan->provider_name)) {
+        return TRUE;
+    }
+
+    return dlopen_interceptor_attach_scanned_symbol(
+        scan,
+        details->name,
+        details->address,
+        details->size > 0 ? (gsize)details->size : 0);
+}
+
+#if defined(__linux__)
+static GumAddress
+dlopen_interceptor_resolve_symbol_on_waiting_caller(
+    PeakDlopenDynamicAttachRequest* request,
+    const char* provider_name,
+    const char* symbol_name)
+{
+    GumAddress resolved_address;
+
+    if (!request->caller_waits) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&request->completion_mutex);
+    if (request->state != PEAK_DLOPEN_REQUEST_PENDING) {
+        pthread_mutex_unlock(&request->completion_mutex);
+        return 0;
+    }
+
+    request->resolution_provider_name = provider_name;
+    request->resolution_symbol_name = symbol_name;
+    request->resolution_address = 0;
+    request->resolution_complete = FALSE;
+    request->resolution_requested = TRUE;
+    pthread_cond_broadcast(&request->completion_cond);
+
+    while (!request->resolution_complete &&
+           request->state == PEAK_DLOPEN_REQUEST_PENDING) {
+        pthread_cond_wait(&request->completion_cond,
+                          &request->completion_mutex);
+    }
+    resolved_address = request->resolution_address;
+    request->resolution_provider_name = NULL;
+    request->resolution_symbol_name = NULL;
+    request->resolution_address = 0;
+    request->resolution_requested = FALSE;
+    request->resolution_complete = FALSE;
+    pthread_mutex_unlock(&request->completion_mutex);
+
+    return resolved_address;
+}
+
+/*
+ * Gum's ELF export enumeration intentionally emits only STT_FUNC and
+ * STT_OBJECT.  Callable STT_GNU_IFUNC and STT_NOTYPE symbols therefore need
+ * a second path.  Symbol enumeration establishes that the exact provider
+ * defines a global executable symbol.  The original dlopen caller performs
+ * provider-scoped lookup because it may still own the dynamic linker's lock;
+ * this also delegates IFUNC selection to the linker and returns the callable
+ * entry point, not the resolver stub recorded in the ELF symbol table.
+ */
+static gboolean
+dlopen_interceptor_scan_callable_unknown_symbol(
+    const GumSymbolDetails* details,
+    gpointer user_data)
+{
+    PeakDlopenExportScan* scan = user_data;
+    GumAddress resolved_address;
+
+    if (!details->is_global ||
+        details->type != GUM_SYMBOL_UNKNOWN ||
+        details->section == NULL ||
+        (details->section->protection & GUM_PAGE_EXECUTE) == 0 ||
+        details->address == 0 ||
+        !peak_general_listener_dynamic_symbol_matches_any_target(
+            details->name,
+            scan->provider_name)) {
+        return TRUE;
+    }
+
+    resolved_address = dlopen_interceptor_resolve_symbol_on_waiting_caller(
+        scan->request,
+        scan->provider_name,
+        details->name);
+    if (resolved_address == 0 && !scan->request->caller_waits) {
+        resolved_address = gum_module_find_export_by_name(scan->module,
+                                                           details->name);
+    }
+    if (resolved_address == 0) {
+        return TRUE;
+    }
+
+    return dlopen_interceptor_attach_scanned_symbol(
+        scan,
+        details->name,
+        resolved_address,
+        details->size > 0 ? (gsize)details->size : 0);
+}
+#endif
 
 static void
 dlopen_interceptor_add_scan_module(PeakDlopenDependencyScan* scan,
@@ -1002,12 +1159,19 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         const char* provider_name = gum_module_get_path(module);
         PeakDlopenExportScan export_scan = {
             .request = request,
+            .module = module,
             .provider_name = provider_name
         };
 
         gum_module_enumerate_exports(module,
                                      dlopen_interceptor_scan_export,
                                      &export_scan);
+#if defined(__linux__)
+        gum_module_enumerate_symbols(
+            module,
+            dlopen_interceptor_scan_callable_unknown_symbol,
+            &export_scan);
+#endif
         gum_module_enumerate_dependencies(module,
                                           dlopen_interceptor_scan_dependency,
                                           &dependency_scan);
@@ -1179,6 +1343,7 @@ peak_dlopen(const char *filename, int flags) {
                                            memory_order_acquire);
     if ((owner_pid != 0 && owner_pid != getpid()) ||
         dynamic_attach_drain_reentrant ||
+        dynamic_attach_resolution_reentrant ||
         peak_general_listener_controller_is_current_thread()) {
         return original_dlopen(filename, flags);
     }
@@ -1208,6 +1373,7 @@ peak_dlopen(const char *filename, int flags) {
     if (binding_flags == 0) {
         binding_flags = RTLD_LAZY;
     }
+    request->binding_flags = binding_flags;
     request->handle = original_dlopen(filename, binding_flags | RTLD_NOLOAD);
 #endif
     if (request->handle != NULL) {

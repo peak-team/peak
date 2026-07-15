@@ -79,17 +79,6 @@ EXPECTED = {
         "flush": 1,
         "revert": 10,
     },
-    ("support-init", "src/syscall_interceptor.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "replace_fast": 1,
-    },
-    ("support-shutdown-debt", "src/syscall_interceptor.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "flush": 1,
-        "revert": 1,
-    },
     ("support-init", "src/peak.c"): {
         "begin_transaction": 1,
         "end_transaction": 1,
@@ -128,10 +117,6 @@ FUNCTION_ANCHORS = {
         "mpi_interceptor_attach": "support-init",
         "mpi_interceptor_restore_finalize_for_direct_call": "support-shutdown-debt",
         "mpi_interceptor_dettach": "support-shutdown-debt",
-    },
-    "src/syscall_interceptor.c": {
-        "syscall_interceptor_attach": "support-init",
-        "syscall_interceptor_dettach": "support-shutdown-debt",
     },
     "src/cuda_interceptor.cpp": {
         "cuda_interceptor_attach": "support-init",

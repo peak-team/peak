@@ -32,7 +32,7 @@ jobs:
     - name: Install test dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install --yes libopenblas-dev
+        sudo apt-get install --yes libfftw3-dev libopenblas-dev
 
     - name: Set reusable strings
       # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.

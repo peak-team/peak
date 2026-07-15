@@ -24,7 +24,7 @@
  * @param env_var The environment variable to parse.
  * @param a_delim A pointer to a char to be used as the delimiter.
  * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @return 0 if the env does not exist, or the number of strings in the array.
+ * @return 0 if the env is unset or empty, or the number of strings in the array.
  */
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
 
@@ -37,7 +37,7 @@ size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result
  * @param config_file The environment variable to parse.
  * @param result A pointer to an array of strings to be allocated and filled by this function.
  * @param existing_count The current size of the resulting array.
- * @return 0 if the env does not exist, or the number of lines read from the configuration file.
+ * @return 0 if the env is unset or empty, or the number of lines read from the configuration file.
  */
 size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count);
 

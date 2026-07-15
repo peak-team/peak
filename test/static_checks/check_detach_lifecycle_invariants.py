@@ -92,7 +92,6 @@ def check_safe_pc_alignment(repo_root):
 def check_support_hook_lifetimes(repo_root):
     checks = [
         ("src/mpi_interceptor.c", "mpi_interceptor_dettach", "mpi_interceptor"),
-        ("src/syscall_interceptor.c", "syscall_interceptor_dettach", "syscall_interceptor"),
         ("src/peak.c", "exit_interceptor_detach", "exit_interceptor"),
     ]
     for rel, function, object_name in checks:
@@ -965,13 +964,14 @@ def check_stop_window_accounting_sidecar(repo_root):
             "task_count > 1" in startup_skip and
             "return task_count == 1;" in startup_skip,
             "startup attach stop-skip must be proven by single-thread /proc task count")
+    require("peak_detach_controller_count_proc_threads" not in source and
+            "proc_threads" not in source and
+            "proc_ok" not in source,
+            "mutation preparation must not perform an unused /proc task enumeration")
     require("startup_attach_can_skip_stop" in general_listener_attach and
             "!startup_attach_can_skip_stop &&" in general_listener_attach,
             "initial attach must skip the stop backend only after a single-thread proof")
 
-    support_attach_supported = extract_function(
-        general, "peak_general_listener_support_attach_target_is_supported"
-    )
     syscall = (repo_root / "src/syscall_interceptor.c").read_text(
         encoding="utf-8"
     )
@@ -982,20 +982,26 @@ def check_stop_window_accounting_sidecar(repo_root):
     dlopen_dynamic = extract_function(
         general, "peak_general_listener_dynamic_attach_symbol"
     )
-    require("peak_unsafe_gum_prologue_check" not in support_attach_supported and
-            "peak_unsafe_gum_support_prologue_check" not in support_attach_supported and
-            "peak_gum_prologue_too_short_for_attach" not in support_attach_supported,
-            "support replacements must not apply user-target prologue guards")
-    require("peak_general_listener_support_attach_target_is_supported" in syscall,
-            "close support replacement must call the support attach predicate")
+    peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    require("gum_interceptor_" not in syscall,
+            "close interposition must never rewrite a libc entry")
+    require('__attribute__((visibility("default")))' in syscall and
+            "dlsym(RTLD_NEXT, \"close\")" in syscall,
+            "close interposition must use an exported loader wrapper and RTLD_NEXT")
+    require("syscall(SYS_close, fd)" in syscall,
+            "close interposition must retain a recursion-safe raw fallback")
+    libc_start = peak.find("int __libc_start_main(")
+    close_initialize = peak.find("syscall_interceptor_initialize();",
+                                 libc_start)
+    real_main_assignment = peak.find("real_main = main;", libc_start)
+    require(libc_start != -1 and close_initialize != -1 and
+            real_main_assignment != -1 and
+            libc_start < close_initialize < real_main_assignment,
+            "the next close implementation must be resolved before application startup")
     require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
-            "dlopen replacement must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
-    require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
-            "dlopen replacement must not use support-only prologue policy")
+            "dlopen replacement must use the profiling-target prologue policy")
     require("peak_general_listener_attach_target_is_supported" in dlopen_dynamic,
-            "dynamic dlopen user targets must use normal target prologue policy")
-    require("peak_general_listener_support_attach_target_is_supported" not in dlopen_dynamic,
-            "dynamic dlopen user targets must not use support prologue policy")
+            "dynamic dlopen user targets must use the profiling-target prologue policy")
 
 
 def check_mpi_startup_helper_warmup(repo_root):
@@ -1217,6 +1223,16 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     complete = extract_function(
         dlopen, "dlopen_interceptor_complete_dynamic_attach_request"
     )
+    wait_for_request = extract_function(
+        dlopen, "dlopen_interceptor_wait_for_dynamic_attach_request"
+    )
+    require("pthread_cond_wait" in wait_for_request and
+            "pthread_cond_timedwait" not in wait_for_request,
+            "dlopen return must wait for exact request completion without a "
+            "correctness timeout")
+    require("PEAK_DLOPEN_RETURN_ATTACH_TIMEOUT" not in dlopen,
+            "dlopen return-side attach completion must not regain a fixed "
+            "timeout knob")
     ownership_snapshot = complete.find(
         "caller_waits = request->caller_waits"
     )
@@ -1251,11 +1267,26 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     require("peak_general_listener_controller_is_ready" in enable and
             "return FALSE" in enable,
             "dlopen admission must fail closed without a running drainer")
-    require("peak_general_listener_controller_is_ready" in init and
-            init.find("peak_general_listener_controller_is_ready") <
-            init.find("dlopen_interceptor_attach"),
-            "PEAK startup must prove controller readiness before installing "
-            "the dlopen handshake")
+    listener_attach = init.find("peak_general_listener_attach();")
+    dynamic_needed = init.find("peak_general_listener_needs_dynamic_attach();")
+    dlopen_attach = init.find("dlopen_interceptor_attach()")
+    controller_start = init.find("peak_general_listener_controller_start();")
+    controller_ready = init.find("peak_general_listener_controller_is_ready()")
+    dynamic_enable = init.find("dlopen_interceptor_enable_dynamic_attach()")
+    require(listener_attach != -1 and dynamic_needed != -1 and
+            dlopen_attach != -1 and controller_start != -1 and
+            controller_ready != -1 and dynamic_enable != -1 and
+            listener_attach < dynamic_needed < dlopen_attach <
+            controller_start < controller_ready < dynamic_enable,
+            "PEAK startup must install the closed dlopen replacement before "
+            "starting its controller, then open admission only after readiness")
+    general_listener_attach_body = extract_function(
+        general, "peak_general_listener_attach"
+    )
+    require("peak_general_listener_controller_start" not in
+            general_listener_attach_body,
+            "general listener attach must not start the controller before "
+            "startup support hooks are installed")
     require("dlopen_interceptor_shutdown_dynamic_attach" in stop and
             stop.find("dlopen_interceptor_shutdown_dynamic_attach") <
             stop.find("general_controller_running = FALSE"),

@@ -1,74 +1,104 @@
+#define _GNU_SOURCE
 #include "syscall_interceptor.h"
-#include "general_listener.h"
 #include "logging.h"
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
-static GumInterceptor* syscall_interceptor;
+typedef int (*PeakCloseFunction)(int fd);
 
-static gpointer hook_address;
+static _Atomic(PeakCloseFunction) peak_original_close = NULL;
+static atomic_bool peak_close_interceptor_active = ATOMIC_VAR_INIT(false);
 
-static int (*original_close)(int);
+void
+syscall_interceptor_initialize(void)
+{
+    PeakCloseFunction resolved_close = NULL;
+    PeakCloseFunction expected = NULL;
+    void* address;
 
-/**
- * @brief Custom implementation of the `close` function.
- *
- * This function overrides the default `close` behavior to perform specific actions 
- * when the file descriptor being closed matches certain conditions. In particular, 
- * it ensures that closing `STDERR_FILENO` does not proceed further by returning 0.
- * For all other file descriptors, it delegates the operation to the original 
- * `close` function, `original_close`.
- *
- * @param fd The file descriptor to be closed.
- * 
- * @return 0 if the file descriptor is `STDERR_FILENO`, otherwise the return value of the `original_close` function.
+    if (atomic_load_explicit(&peak_original_close, memory_order_acquire) != NULL) {
+        return;
+    }
+
+    dlerror();
+    address = dlsym(RTLD_NEXT, "close");
+    if (address == NULL || dlerror() != NULL ||
+        sizeof(resolved_close) != sizeof(address)) {
+        return;
+    }
+    memcpy(&resolved_close, &address, sizeof(resolved_close));
+    if (resolved_close == NULL || resolved_close == close) {
+        return;
+    }
+
+    (void)atomic_compare_exchange_strong_explicit(
+        &peak_original_close,
+        &expected,
+        resolved_close,
+        memory_order_release,
+        memory_order_relaxed);
+}
+
+/*
+ * Interpose through the ELF loader instead of rewriting libc's close entry.
+ * Older glibc releases expose __close_nocancel from the middle of close's
+ * first instruction stream, so a Gum entry patch can corrupt that alternate
+ * entry even when the public close symbol itself appears large enough.
  */
-static int
-peak_close(int fd) {
-    //g_printerr ("close called on %d\n", fd);
-    if (fd == STDERR_FILENO) {
+__attribute__((visibility("default")))
+int
+close(int fd)
+{
+    PeakCloseFunction original_close;
+
+    if (atomic_load_explicit(&peak_close_interceptor_active,
+                             memory_order_acquire) &&
+        fd == STDERR_FILENO) {
         return 0;
     }
-    return original_close(fd);
-    //return 0;
+
+    original_close = atomic_load_explicit(&peak_original_close,
+                                           memory_order_acquire);
+    if (original_close != NULL) {
+        return original_close(fd);
+    }
+
+#ifdef SYS_close
+    return (int)syscall(SYS_close, fd);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
-
-int syscall_interceptor_attach()
+int
+syscall_interceptor_attach(void)
 {
-    GumReplaceReturn replace_check = -1;
-    syscall_interceptor = gum_interceptor_obtain();
-
-    gum_interceptor_begin_transaction(syscall_interceptor);
-    hook_address = peak_general_listener_find_function("close");
-    if (hook_address) {
-        if (peak_general_listener_support_attach_target_is_supported(
-                "close", hook_address)) {
-            replace_check = gum_interceptor_replace_fast(syscall_interceptor,
-                                         hook_address, (gpointer)&peak_close,
-                                         (gpointer*)(&original_close),
-                                         NULL);
-        } else {
-            hook_address = NULL;
-        }
+    syscall_interceptor_initialize();
+    if (atomic_load_explicit(&peak_original_close, memory_order_acquire) == NULL) {
+        g_printerr("[peak] close interposition could not resolve the next close implementation\n");
+        return -1;
     }
-    gum_interceptor_end_transaction(syscall_interceptor);
-    return replace_check;
+
+    atomic_store_explicit(&peak_close_interceptor_active,
+                          true,
+                          memory_order_release);
+    return 0;
 }
 
-void syscall_interceptor_dettach()
+void
+syscall_interceptor_dettach(void)
 {
-    if (syscall_interceptor == NULL || hook_address == NULL) {
-        return;
-    }
-
-    gum_interceptor_begin_transaction(syscall_interceptor);
-    gum_interceptor_revert(syscall_interceptor, hook_address);
-    gum_interceptor_end_transaction(syscall_interceptor);
-    if (!gum_interceptor_flush(syscall_interceptor)) {
-        g_printerr("[peak] syscall interceptor teardown did not flush; leaving syscall interceptor state alive\n");
-        return;
-    }
-    hook_address = NULL;
+    atomic_store_explicit(&peak_close_interceptor_active,
+                          false,
+                          memory_order_release);
 }

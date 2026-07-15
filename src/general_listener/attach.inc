@@ -430,5 +430,4 @@ void peak_general_listener_attach()
         }
         peak_need_detach[0] = false;
     }
-    peak_general_controller_start();
 }

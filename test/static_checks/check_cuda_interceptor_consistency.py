@@ -128,7 +128,6 @@ def main():
         "src/mpi_interceptor.c": ["PMPI_Finalize"],
         "src/peak.c": ["exit"],
         "src/pthread_listener.c": ["pthread_create", "pthread_join"],
-        "src/syscall_interceptor.c": ["close"],
     }
 
     require("peak_resolve_function" not in general,
@@ -152,6 +151,14 @@ def main():
                     f"{relpath} must use Frida-native support lookup for {symbol}")
             require(f'gum_find_function("{symbol}")' not in source,
                     f"{relpath} must not broad-scan support hook {symbol}")
+
+    syscall = (repo_root / "src" / "syscall_interceptor.c").read_text(
+        encoding="utf-8")
+    require('dlsym(RTLD_NEXT, "close")' in syscall,
+            "close must resolve through the loader interposition chain")
+    require('peak_general_listener_find_function("close")' not in syscall and
+            'gum_find_function("close")' not in syscall,
+            "close interposition must not mutate a potentially overlapping libc entry")
 
     require('gum_find_function("' not in cuda,
             "CUDA support hooks must use the Frida-native lookup helper")

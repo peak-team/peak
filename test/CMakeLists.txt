@@ -1250,6 +1250,28 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
     )
+
+    # The close wrapper must protect stderr without patching libc. This is a
+    # regression for glibc layouts where __close_nocancel begins inside close's
+    # entry instruction stream.
+    add_subdirectory(syscall_interceptor)
+    add_test(NAME test_close_loader_interposition
+        COMMAND ${PROJECT_BINARY_DIR}/test/syscall_interceptor/test_close_interposition)
+    set_tests_properties(test_close_loader_interposition
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_close_interposition_target;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "close_interposition_active_ok"
+            TIMEOUT 30
+    )
+    add_test(NAME test_close_loader_interposition_inactive
+        COMMAND ${PROJECT_BINARY_DIR}/test/syscall_interceptor/test_close_interposition
+                inactive)
+    set_tests_properties(test_close_loader_interposition_inactive
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "close_interposition_inactive_ok"
+            TIMEOUT 30
+    )
     add_test(NAME test_rank_local_mpi_env_suppresses_text COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
     set_tests_properties(test_rank_local_mpi_env_suppresses_text
         PROPERTIES
@@ -1277,7 +1299,7 @@ if(BUILD_TESTING)
         set_tests_properties(test_initial_attach_strict_stock_gum
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=my_sleep_func;PEAK_REQUIRE_SAFE_DETACH=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_initial_attach_strict_statslog;${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "skipping initial Gum attach.*my_sleep_func.*missing-gum-api"
+                PASS_REGULAR_EXPRESSION "refusing profiling attach.*lacks exact-entry support.*Gum initial attach failed.*my_sleep_func"
                 FAIL_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+[1-9][0-9]*\\|"
         )
     endif()
@@ -1295,10 +1317,26 @@ if(BUILD_TESTING)
     add_test(NAME test_fftw COMMAND ${PROJECT_BINARY_DIR}/test/fftw/test_fftw)
     set_tests_properties(test_fftw
         PROPERTIES
-            ENVIRONMENT "PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
             PASS_REGULAR_EXPRESSION "rfftwnd_print_plan\\|[ \t]+1\\|.*rfftwnd_threads_one_complex_to_real\\|[ \t]+1\\|"
     )
     
+    # Exercise a real FFTW provider that is loaded after PEAK initialization.
+    # The first FFTW call occurs immediately after dlopen() returns, so this
+    # catches asynchronous dynamic-attach races without a warm-up delay.
+    if(PEAK_GUM_PEAK_API_AVAILABLE AND TARGET test_fftw_runtime_dlopen)
+        add_test(NAME test_fftw_runtime_dlopen_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    ${PEAK_TEST_FFTW3_LIBRARY}
+        )
+        set_tests_properties(test_fftw_runtime_dlopen_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_execute[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_plan_dft_1d[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_destroy_plan[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_malloc[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|.*fftw_free[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|"
+                TIMEOUT 30
+        )
+    endif()
+
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
         set(_PEAK_MPI_TEST_NPROCS 2)

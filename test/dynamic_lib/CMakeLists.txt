@@ -3,8 +3,21 @@ cmake_minimum_required(VERSION 3.16)
 # ----- find 'make' to run your Makefile -----
 find_program(MAKE_EXE NAMES make gmake REQUIRED)
 
-# ----- find Python interpreter and development config used by the Makefile -----
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+# Request both components together so CMake cannot pair one interpreter with
+# another installation's development headers.  ctypes tests require the
+# interpreter; development files gate only the CPython extension matrix.
+find_package(Python3 COMPONENTS Interpreter Development)
+if(NOT Python3_Interpreter_FOUND)
+  message(FATAL_ERROR "Python3 interpreter is required for dynamic dlopen tests")
+endif()
+
+if(Python3_Development_FOUND)
+  set(_BUILD_PYTHON_EXTENSIONS 1)
+else()
+  set(_BUILD_PYTHON_EXTENSIONS 0)
+  message(STATUS
+    "Python3 development headers unavailable; skipping dynamic CPython extension fixtures")
+endif()
 
 set(_PY_INCLUDE_FLAGS)
 foreach(_py_include_dir IN LISTS Python3_INCLUDE_DIRS)
@@ -26,6 +39,7 @@ set(_MAKE_ENV
   PY_INCLUDE=${_PY_INCLUDE_FLAGS_STR}
   PY_LDFLAGS=
   PY_EXT_SUFFIX=${_PY_EXT_SUFFIX}
+  BUILD_PYTHON_EXTENSIONS=${_BUILD_PYTHON_EXTENSIONS}
 )
 
 # Keep generated shared libraries, executables, objects, and Python extensions
@@ -44,6 +58,10 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/dlopen_flags_test.c
           ${DL_SRC_DIR}/concurrent_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
+          ${DL_SRC_DIR}/nested_ifunc_outer.c
+          ${DL_SRC_DIR}/ifunc_target.c
+          ${DL_SRC_DIR}/notype_target.S
+          ${DL_SRC_DIR}/lazy_unresolved.c
           ${DL_SRC_DIR}/multiple_providers.py
           ${DL_SRC_DIR}/fork_child_dlopen.py
           ${DL_SRC_DIR}/dlopen_own_library.py
@@ -52,18 +70,19 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_DIR}/
   COMMAND ${CMAKE_COMMAND} -E env ${_MAKE_ENV} ${MAKE_EXE} -f ${DL_DIR}/Makefile -j
   WORKING_DIRECTORY ${DL_DIR}
-  COMMENT "Building dynamic_lib (libA/libB/main + Python extensions) via Makefile"
+  COMMENT "Building dynamic_lib fixtures via Makefile"
   VERBATIM
 )
 
-# After building everything, pick the self-contained module as the canonical import name:
-#   make use_staA_staB   (copies customCpackage_staA_staB<EXT> -> customCpackage<EXT>)
-add_custom_command(TARGET dynamic_lib_build POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E env ${_MAKE_ENV} ${MAKE_EXE} -f ${DL_DIR}/Makefile use_staA_staB
-  WORKING_DIRECTORY ${DL_DIR}
-  COMMENT "Selecting Python module variant: staA_staB (self-contained)"
-  VERBATIM
-)
+if(Python3_Development_FOUND)
+  # Pick the self-contained module as the canonical import name.
+  add_custom_command(TARGET dynamic_lib_build POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E env ${_MAKE_ENV} ${MAKE_EXE} -f ${DL_DIR}/Makefile use_staA_staB
+    WORKING_DIRECTORY ${DL_DIR}
+    COMMENT "Selecting Python module variant: staA_staB (self-contained)"
+    VERBATIM
+  )
+endif()
 
 set(_DLOPEN_DRAIN_SCRIPT
   "import ctypes, time; lib = ctypes.CDLL('./libB.so'); deadline = time.time() + 1.0\nwhile time.time() < deadline:\n    lib.b_dynamic()"
@@ -77,6 +96,44 @@ add_test(NAME test_dynamic_dlopen_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic()"
 )
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+add_test(NAME test_dynamic_dlopen_ifunc_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libIfuncTarget.so'); lib.peak_ifunc_target()"
+)
+set_tests_properties(test_dynamic_dlopen_ifunc_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_ifunc_target;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_ifunc_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "peak_ifunc_target[*]*\\|[ \t]+1\\|"
+)
+
+add_test(NAME test_dynamic_nested_ifunc_constructor_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; ctypes.CDLL('./libNestedIfuncOuter.so')"
+)
+set_tests_properties(test_dynamic_nested_ifunc_constructor_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_ifunc_target;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_nested_ifunc_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "peak_ifunc_target[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_dlopen_notype_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libNotypeTarget.so'); lib.peak_notype_target()"
+)
+set_tests_properties(test_dynamic_dlopen_notype_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_notype_target;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_notype_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "peak_notype_target[*]*\\|[ \t]+1\\|"
+)
+endif()
+
 set_tests_properties(test_dynamic_dlopen_first_call
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
@@ -183,16 +240,18 @@ set_tests_properties(test_dynamic_dlopen
 )
 endif()
 
-add_test(NAME test_dynamic_customCpackage_script
-  COMMAND ${CMAKE_COMMAND} -E env
-          PYTHON_BIN=${Python3_EXECUTABLE}
-          ${DL_DIR}/test_customCpackage_script.sh
-)
-set_tests_properties(test_dynamic_customCpackage_script
-  PROPERTIES
-    WORKING_DIRECTORY ${DL_DIR}
-    PASS_REGULAR_EXPRESSION "Imported customCpackage OK"
-)
+if(Python3_Development_FOUND)
+  add_test(NAME test_dynamic_customCpackage_script
+    COMMAND ${CMAKE_COMMAND} -E env
+            PYTHON_BIN=${Python3_EXECUTABLE}
+            ${DL_DIR}/test_customCpackage_script.sh
+  )
+  set_tests_properties(test_dynamic_customCpackage_script
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      PASS_REGULAR_EXPRESSION "Imported customCpackage OK"
+  )
+endif()
 
 if(NOT PEAK_GUM_PEAK_API_AVAILABLE)
   add_test(NAME test_dynamic_dlopen_strict_stock_gum
@@ -238,21 +297,23 @@ else()
     )
   endforeach()
 
-  foreach(_py_variant IN ITEMS dynA_dynB dynA_staB staA_dynB staA_staB)
-    add_test(NAME test_dynamic_customCpackage_${_py_variant}_strict_patched_gum
-      COMMAND ${Python3_EXECUTABLE}
-              ${DL_DIR}/import_customCpackage_variant.py
-              customCpackage_${_py_variant}
-              1.0
-    )
-    set_tests_properties(test_dynamic_customCpackage_${_py_variant}_strict_patched_gum
-      PROPERTIES
-        WORKING_DIRECTORY ${DL_DIR}
-        ENVIRONMENT "${_DYNAMIC_STRICT_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_customCpackage_${_py_variant}_strict_statslog"
-        PASS_REGULAR_EXPRESSION "b_dynamic[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
-        TIMEOUT 60
-    )
-  endforeach()
+  if(Python3_Development_FOUND)
+    foreach(_py_variant IN ITEMS dynA_dynB dynA_staB staA_dynB staA_staB)
+      add_test(NAME test_dynamic_customCpackage_${_py_variant}_strict_patched_gum
+        COMMAND ${Python3_EXECUTABLE}
+                ${DL_DIR}/import_customCpackage_variant.py
+                customCpackage_${_py_variant}
+                1.0
+      )
+      set_tests_properties(test_dynamic_customCpackage_${_py_variant}_strict_patched_gum
+        PROPERTIES
+          WORKING_DIRECTORY ${DL_DIR}
+          ENVIRONMENT "${_DYNAMIC_STRICT_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_customCpackage_${_py_variant}_strict_statslog"
+          PASS_REGULAR_EXPRESSION "b_dynamic[*][*]*\\|[ \t]+[1-9][0-9]*\\|"
+          TIMEOUT 60
+      )
+    endforeach()
+  endif()
 endif()
 
 # Optional: expose a `make-clean` helper in the CMake build

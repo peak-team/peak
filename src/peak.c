@@ -501,10 +501,21 @@ void peak_init()
     peak_general_listener_attach();
     syscall_interceptor_attach();
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
+    gboolean dynamic_attach_hook_installed = FALSE;
+    if (need_dynamic_attach) {
+        /*
+         * Install the Gum replacement before starting the controller thread.
+         * A strict stop window must never suspend that thread while it owns a
+         * Gum allocator lock and then mutate Gum from this startup thread.
+         * Admission remains closed until the controller is running.
+         */
+        dynamic_attach_hook_installed = dlopen_interceptor_attach() == 0;
+    }
+    peak_general_listener_controller_start();
     if (need_dynamic_attach) {
         if (!peak_general_listener_controller_is_ready()) {
             g_printerr("[peak] dynamic target loading disabled because the general listener controller is unavailable\n");
-        } else if (dlopen_interceptor_attach() == 0 &&
+        } else if (dynamic_attach_hook_installed &&
                    !dlopen_interceptor_enable_dynamic_attach()) {
             g_printerr("[peak] dynamic target loading failed closed before admission opened\n");
         }
@@ -1083,6 +1094,7 @@ int __libc_start_main(main_fn main, int argc, char** argv,
             _exit(1);
         }
     }
+    syscall_interceptor_initialize();
 
     // Store the original main function pointer
     real_main = main;

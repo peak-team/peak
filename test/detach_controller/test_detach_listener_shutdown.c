@@ -1,4 +1,5 @@
 #include "general_listener.h"
+#include "internal/general_listener_internal.h"
 #include "detach_controller.h"
 #include "pthread_listener.h"
 
@@ -327,6 +328,7 @@ setup_public_listener_fixture(char* log_template,
 
     pthread_listener_attach();
     peak_general_listener_attach();
+    peak_general_listener_controller_start();
     strict_helper_target();
 
     check_true("public listener fixture resolved target",
