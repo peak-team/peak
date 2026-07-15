@@ -302,13 +302,12 @@ dlopen_interceptor_trace_counters(const char* event)
     }
 }
 
-static gboolean
+gboolean
 dlopen_interceptor_dynamic_attach_prepare_is_retryable(PeakDetachStatus status)
 {
     switch (status) {
         case PEAK_DETACH_STATUS_TIMEOUT:
         case PEAK_DETACH_STATUS_CLASSIFY_FAILED:
-        case PEAK_DETACH_STATUS_ERROR:
             return TRUE;
         case PEAK_DETACH_STATUS_SAFE:
         case PEAK_DETACH_STATUS_COMPATIBILITY_ALLOWED:
@@ -316,6 +315,7 @@ dlopen_interceptor_dynamic_attach_prepare_is_retryable(PeakDetachStatus status)
         case PEAK_DETACH_STATUS_UNSUPPORTED:
         case PEAK_DETACH_STATUS_MISSING_GUM_API:
         case PEAK_DETACH_STATUS_PERMISSION_DENIED:
+        case PEAK_DETACH_STATUS_ERROR:
         default:
             return FALSE;
     }
@@ -324,8 +324,10 @@ dlopen_interceptor_dynamic_attach_prepare_is_retryable(PeakDetachStatus status)
 static gboolean
 dlopen_interceptor_revert_prepare_is_retryable(PeakDetachStatus status)
 {
+    /* Preserve the existing interceptor-teardown retry policy. */
     return dlopen_interceptor_dynamic_attach_prepare_is_retryable(status) ||
-           status == PEAK_DETACH_STATUS_PERMISSION_DENIED;
+           status == PEAK_DETACH_STATUS_PERMISSION_DENIED ||
+           status == PEAK_DETACH_STATUS_ERROR;
 }
 
 static gboolean
@@ -1192,6 +1194,102 @@ typedef struct {
     GHashTable* seen_modules;
 } PeakDlopenDependencyScan;
 
+#if defined(__linux__) && defined(RTLD_NOLOAD)
+typedef struct {
+    const char* provider_name;
+    gboolean matched;
+} PeakDlopenLoadedModuleProbe;
+
+typedef struct {
+    gchar* path;
+    GumAddress address;
+} PeakDlopenLoadedModuleSnapshot;
+
+static void
+dlopen_interceptor_free_loaded_module_snapshot(gpointer value)
+{
+    PeakDlopenLoadedModuleSnapshot* snapshot = value;
+
+    if (snapshot == NULL) {
+        return;
+    }
+    g_free(snapshot->path);
+    g_free(snapshot);
+}
+
+static gboolean
+dlopen_interceptor_probe_loaded_export(const GumExportDetails* details,
+                                       gpointer user_data)
+{
+    PeakDlopenLoadedModuleProbe* probe = user_data;
+
+    if (details->type == GUM_EXPORT_FUNCTION &&
+        peak_general_listener_dynamic_symbol_matches_any_target(
+            details->name,
+            probe->provider_name)) {
+        probe->matched = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+dlopen_interceptor_probe_loaded_callable_unknown(
+    const GumSymbolDetails* details,
+    gpointer user_data)
+{
+    PeakDlopenLoadedModuleProbe* probe = user_data;
+
+    if (details->is_global &&
+        details->type == GUM_SYMBOL_UNKNOWN &&
+        details->section != NULL &&
+        (details->section->protection & GUM_PAGE_EXECUTE) != 0 &&
+        details->address != 0 &&
+        peak_general_listener_dynamic_symbol_matches_any_target(
+            details->name,
+            probe->provider_name)) {
+        probe->matched = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+dlopen_interceptor_collect_loaded_matching_module(GumModule* module,
+                                                  gpointer user_data)
+{
+    GPtrArray* snapshots = user_data;
+    const char* path = gum_module_get_path(module);
+    const GumMemoryRange* range = gum_module_get_range(module);
+    PeakDlopenLoadedModuleProbe probe = {
+        .provider_name = path,
+        .matched = FALSE
+    };
+
+    if (path == NULL || path[0] == '\0' || range == NULL) {
+        return TRUE;
+    }
+
+    gum_module_enumerate_exports(module,
+                                 dlopen_interceptor_probe_loaded_export,
+                                 &probe);
+    if (!probe.matched) {
+        gum_module_enumerate_symbols(
+            module,
+            dlopen_interceptor_probe_loaded_callable_unknown,
+            &probe);
+    }
+    if (probe.matched) {
+        PeakDlopenLoadedModuleSnapshot* snapshot =
+            g_new0(PeakDlopenLoadedModuleSnapshot, 1);
+        snapshot->path = g_strdup(path);
+        snapshot->address = range->base_address;
+        g_ptr_array_add(snapshots, snapshot);
+    }
+    return TRUE;
+}
+#endif
+
 static gboolean
 dlopen_interceptor_string_equal(gconstpointer left, gconstpointer right)
 {
@@ -1564,6 +1662,79 @@ dlopen_interceptor_drain_dynamic_attach_queue(void)
 
     dlopen_interceptor_drain_dynamic_attach_queue_with_budget(
         PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET);
+}
+
+gboolean
+dlopen_interceptor_rescan_loaded_modules(void)
+{
+#if defined(__linux__) && defined(RTLD_NOLOAD)
+    GPtrArray* snapshots;
+    gboolean success = TRUE;
+    gboolean admission_open;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    admission_open =
+        dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN &&
+        original_dlopen != NULL;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    if (!admission_open) {
+        return FALSE;
+    }
+
+    snapshots = g_ptr_array_new_with_free_func(
+        dlopen_interceptor_free_loaded_module_snapshot);
+    gum_process_enumerate_modules(
+        dlopen_interceptor_collect_loaded_matching_module,
+        snapshots);
+
+    for (guint i = 0; i < snapshots->len; i++) {
+        PeakDlopenLoadedModuleSnapshot* snapshot =
+            g_ptr_array_index(snapshots, i);
+        PeakDlopenDynamicAttachRequest* request;
+        PeakDlopenRequestState request_state;
+        void* handle;
+
+        /*
+         * The startup constructor may still own the loader's recursive lock.
+         * Keep controller lifecycle/JIT mutations outside this exact scan and
+         * let any IFUNC resolution run on this original caller below.
+         */
+        dlopen_interceptor_begin_load_transaction();
+        handle = original_dlopen(snapshot->path, RTLD_LAZY | RTLD_NOLOAD);
+        if (handle == NULL) {
+            dlopen_interceptor_end_load_transaction();
+            continue;
+        }
+
+        request = dlopen_interceptor_new_dynamic_attach_request(TRUE);
+        request->filename = g_strdup(snapshot->path);
+        request->handle = handle;
+        request->module_address = snapshot->address;
+        request->binding_flags = RTLD_LAZY;
+        if (!dlopen_interceptor_enqueue_dynamic_attach_request(request)) {
+            dlopen_interceptor_destroy_dynamic_attach_request(request);
+            dlopen_interceptor_end_load_transaction();
+            success = FALSE;
+            break;
+        }
+
+        request_state =
+            dlopen_interceptor_wait_for_dynamic_attach_request(request);
+        dlopen_interceptor_destroy_dynamic_attach_request(request);
+        dlopen_interceptor_end_load_transaction();
+
+        if (request_state == PEAK_DLOPEN_REQUEST_FAILED ||
+            request_state == PEAK_DLOPEN_REQUEST_CANCELLED) {
+            success = FALSE;
+            break;
+        }
+    }
+
+    g_ptr_array_free(snapshots, TRUE);
+    return success;
+#else
+    return TRUE;
+#endif
 }
 
 gboolean

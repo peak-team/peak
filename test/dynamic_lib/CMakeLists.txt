@@ -70,6 +70,8 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/startup_unloadable_target.c
           ${DL_SRC_DIR}/startup_loader.c
           ${DL_SRC_DIR}/startup_provider_retention_test.c
+          ${DL_SRC_DIR}/startup_local_callable_loader.c
+          ${DL_SRC_DIR}/startup_local_callable_test.c
           ${DL_SRC_DIR}/lazy_unresolved.c
           ${DL_SRC_DIR}/multiple_providers.py
           ${DL_SRC_DIR}/fork_child_dlopen.py
@@ -174,6 +176,17 @@ set_tests_properties(test_startup_resolver_nested_dlopen_first_call
     PASS_REGULAR_EXPRESSION "startup_resolver_nested_ifunc_ok.*peak_startup_resolver_ifunc[*]*\\|[ \t]+1\\|.*b_dynamic[*]*\\|[ \t]+1\\|"
     TIMEOUT 30
 )
+
+add_test(NAME test_startup_rtld_local_callable_rescan
+  COMMAND ${DL_DIR}/startup_local_callable_test
+)
+set_tests_properties(test_startup_rtld_local_callable_rescan
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_ifunc_target,peak_notype_target;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_local_callable_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "startup_local_callable_ok.*peak_ifunc_target[*]*\\|[ \t]+1\\|.*peak_notype_target[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
+)
 endif()
 
 set_tests_properties(test_dynamic_dlopen_first_call
@@ -192,6 +205,18 @@ set_tests_properties(test_dynamic_dlopen_first_call_waits_for_completion
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_DLOPEN_ATTACH_DELAY_MS=1500;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_completion_wait_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 10
+)
+
+add_test(NAME test_dynamic_dlopen_terminal_prepare_error_returns
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; ctypes.CDLL('./libB.so'); print('dynamic_attach_terminal_error_returned')"
+)
+set_tests_properties(test_dynamic_dlopen_terminal_prepare_error_returns
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_DYNAMIC_ATTACH_PREPARE_ERROR=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_terminal_prepare_error_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dynamic attach permanently failed.*dynamic attach reached a permanent failure.*dynamic_attach_terminal_error_returned"
     TIMEOUT 10
 )
 
@@ -278,6 +303,18 @@ set_tests_properties(test_dynamic_fork_inflight_dlopen_no_deadlock
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_test(NAME test_dynamic_dlopen_provider_after_startup_match
+    COMMAND ${Python3_EXECUTABLE} -c
+            "import ctypes; first = ctypes.CDLL('./libB.so'); first.b_dynamic(); second = ctypes.CDLL('./libBSecond.so'); second.b_dynamic()"
+  )
+  set_tests_properties(test_dynamic_dlopen_provider_after_startup_match
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_provider_after_startup_statslog;LD_PRELOAD=${DL_DIR}/libB.so:${PROJECT_BINARY_DIR}/src/libpeak.so"
+      PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|.*b_dynamic[*]*\\|[ \t]+1\\|"
+      TIMEOUT 30
+  )
+
   add_test(NAME test_startup_provider_retained_until_hook_detach
     COMMAND ${DL_DIR}/startup_provider_retention_test
   )

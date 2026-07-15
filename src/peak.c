@@ -17,6 +17,7 @@
 #include "general_listener.h"
 #include "detach_controller.h"
 #include "exec_interceptor.h"
+#include "internal/dlopen_interceptor_internal.h"
 #include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
 #include "internal/jit_provider.h"
@@ -528,9 +529,12 @@ void peak_init()
     if (need_dynamic_attach) {
         if (!peak_general_listener_controller_is_ready()) {
             g_printerr("[peak] dynamic target loading disabled because the general listener controller is unavailable\n");
-        } else if (dynamic_attach_hook_installed &&
-                   !dlopen_interceptor_enable_dynamic_attach()) {
-            g_printerr("[peak] dynamic target loading failed closed before admission opened\n");
+        } else if (dynamic_attach_hook_installed) {
+            if (!dlopen_interceptor_enable_dynamic_attach()) {
+                g_printerr("[peak] dynamic target loading failed closed before admission opened\n");
+            } else if (!dlopen_interceptor_rescan_loaded_modules()) {
+                g_printerr("[peak] startup loaded-provider rescan reached a permanent dynamic attach failure\n");
+            }
         }
     }
     peak_main_time = peak_second();

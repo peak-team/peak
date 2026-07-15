@@ -3,7 +3,12 @@ peak_general_overhead_bootstrapping()
 {
     GumInvocationListener* listener_bootstrapping =
         g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-    PEAKGENERAL_LISTENER(listener_bootstrapping)->hook_id = 0;
+    /*
+     * Calibration invokes this listener thousands of times before runtime
+     * admission.  It is not a published target and must never submit a
+     * detach-count request on behalf of real hook 0.
+     */
+    PEAKGENERAL_LISTENER(listener_bootstrapping)->hook_id = (size_t)-1;
 
     PeakDetachRequest mutation_request = {
         .hook_id = 0,
@@ -282,6 +287,13 @@ void peak_general_listener_attach()
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
+            /*
+             * An ordinary target that is satisfied at startup can still be
+             * defined by a provider loaded later. Keep dynamic discovery
+             * enabled so every provider generation is profiled, not only the
+             * first address found during initialization.
+             */
+            peak_dynamic_attach_needed = TRUE;
             gpointer ptr = peak_general_listener_find_function(peak_hook_strings[i]);
             if (ptr) {
                 hook_address[i] = ptr;
@@ -328,9 +340,6 @@ void peak_general_listener_attach()
                             }
                         }
                     }
-                }
-                if (hook_address[i] == NULL) {
-                    peak_dynamic_attach_needed = TRUE;
                 }
             }
         }

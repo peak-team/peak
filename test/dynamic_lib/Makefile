@@ -34,6 +34,8 @@ NOTYPE_EXECUTABLE_SRC := notype_executable_test.c
 STARTUP_UNLOADABLE_TARGET_SRC := startup_unloadable_target.c
 STARTUP_LOADER_SRC := startup_loader.c
 STARTUP_PROVIDER_TEST_SRC := startup_provider_retention_test.c
+STARTUP_LOCAL_CALLABLE_LOADER_SRC := startup_local_callable_loader.c
+STARTUP_LOCAL_CALLABLE_TEST_SRC := startup_local_callable_test.c
 LAZY_UNRESOLVED_SRC := lazy_unresolved.c
 LAZY_UNRESOLVED_O := lazy_unresolved.pic.o
 NOTYPE_EXECUTABLE_O := notype_target.exec.o
@@ -49,7 +51,7 @@ DL_LIBS := -ldl
 ELF_LAZY_FIXTURES := libLazyUnresolved.so
 ELF_LIFECYCLE_FIXTURES := libStartupUnloadableTarget.so libStartupLoader.so startup_provider_retention_test
 ifneq ($(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)),)
-ELF_CALLABLE_FIXTURES := libIfuncTarget.so libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test
+ELF_CALLABLE_FIXTURES := libIfuncTarget.so libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test libStartupLocalCallableLoader.so startup_local_callable_test
 endif
 endif
 
@@ -71,7 +73,7 @@ PY_O     := customCpackage.pic.o
 # Top-level
 # --------------------------------------------------------------------
 .PHONY: all clean explain
-all: libB.so libB.a libA_dynB.so libA_staB.so libA.a \
+all: libB.so libBSecond.so libB.a libA_dynB.so libA_staB.so libA.a \
      main_dynA_dynB main_dynA_staB main_staA_dynB main_staA_staB \
      dlopen_flags_test \
      concurrent_dlopen_test \
@@ -116,6 +118,9 @@ $(PY_O): $(PY_SRC)
 # --------------------------------------------------------------------
 libB.so: $(LIBB_O)
 	$(CC) $(LDSO) -o $@ $^ $(DL_LIBS) -Wl,-soname,libB.so
+
+libBSecond.so: $(LIBB_O)
+	$(CC) $(LDSO) -o $@ $^ $(DL_LIBS) -Wl,-soname,libBSecond.so
 
 libB.a: $(LIBB_O)
 	$(AR) rcs $@ $^
@@ -192,6 +197,12 @@ libStartupLoader.so: $(STARTUP_LOADER_SRC) libStartupUnloadableTarget.so
 startup_provider_retention_test: $(STARTUP_PROVIDER_TEST_SRC) libStartupLoader.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< -L. -lStartupLoader $(DL_LIBS) $(RPATH)
 
+libStartupLocalCallableLoader.so: $(STARTUP_LOCAL_CALLABLE_LOADER_SRC) libIfuncTarget.so libNotypeTarget.so
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-soname,libStartupLocalCallableLoader.so
+
+startup_local_callable_test: $(STARTUP_LOCAL_CALLABLE_TEST_SRC) libStartupLocalCallableLoader.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< -L. -lStartupLocalCallableLoader $(DL_LIBS) $(RPATH)
+
 $(LAZY_UNRESOLVED_O): $(LAZY_UNRESOLVED_SRC)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -233,4 +244,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so

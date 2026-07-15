@@ -256,7 +256,7 @@ GumAttachReturn peak_general_listener_attach_exact(
 gpointer peak_general_listener_find_function(const char* symbol);
 
 /**
- * @brief Returns whether unresolved requested targets require dlopen rescans.
+ * @brief Returns whether ordinary requested targets require provider rescans.
  */
 gboolean peak_general_listener_needs_dynamic_attach(void);
 

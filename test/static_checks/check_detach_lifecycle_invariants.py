@@ -1396,13 +1396,17 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     controller_start = init.find("peak_general_listener_controller_start();")
     controller_ready = init.find("peak_general_listener_controller_is_ready()")
     dynamic_enable = init.find("dlopen_interceptor_enable_dynamic_attach()")
+    loaded_rescan = init.find("dlopen_interceptor_rescan_loaded_modules()")
     require(listener_attach != -1 and dynamic_needed != -1 and
             dlopen_attach != -1 and controller_start != -1 and
             controller_ready != -1 and dynamic_enable != -1 and
+            loaded_rescan != -1 and
             listener_attach < dynamic_needed < dlopen_attach <
-            controller_start < controller_ready < dynamic_enable,
+            controller_start < controller_ready < dynamic_enable <
+            loaded_rescan,
             "PEAK startup must install the closed dlopen replacement before "
-            "starting its controller, then open admission only after readiness")
+            "starting its controller, then open admission and rescan providers "
+            "only after readiness")
     general_listener_attach_body = extract_function(
         general, "peak_general_listener_attach"
     )
@@ -1458,6 +1462,24 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "resolver-time nested dlopen must be serviced recursively, not bypassed")
 
     startup_attach = extract_function(general, "peak_general_listener_attach")
+    overhead_bootstrap = extract_function(
+        general, "peak_general_overhead_bootstrapping"
+    )
+    dynamic_attach_symbol = extract_function(
+        general, "peak_general_listener_dynamic_attach_symbol"
+    )
+    dynamic_retryable = extract_function(
+        dlopen, "dlopen_interceptor_dynamic_attach_prepare_is_retryable"
+    )
+    revert_retryable = extract_function(
+        dlopen, "dlopen_interceptor_revert_prepare_is_retryable"
+    )
+    loaded_rescan_body = extract_function(
+        dlopen, "dlopen_interceptor_rescan_loaded_modules"
+    )
+    loaded_module_collect = extract_function(
+        dlopen, "dlopen_interceptor_collect_loaded_matching_module"
+    )
     pin_provider = extract_function(
         dlopen, "dlopen_interceptor_pin_loaded_provider"
     )
@@ -1483,6 +1505,45 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     require("dlsym(RTLD_DEFAULT, symbol)" in find_function,
             "startup lookup must fall back to the loader for executable "
             "STT_NOTYPE and IFUNC symbols")
+    require("listener_bootstrapping)->hook_id = (size_t)-1" in
+            overhead_bootstrap,
+            "overhead calibration must not submit detach-count requests for "
+            "a published target hook")
+    generic_dynamic = startup_attach.find("peak_dynamic_attach_needed = TRUE;")
+    generic_lookup = startup_attach.find(
+        "peak_general_listener_find_function(peak_hook_strings[i])"
+    )
+    require(generic_dynamic != -1 and generic_lookup != -1 and
+            generic_dynamic < generic_lookup,
+            "ordinary startup-resolved targets must still enable later "
+            "provider discovery")
+    require("case PEAK_DETACH_STATUS_TIMEOUT:" in dynamic_retryable and
+            "case PEAK_DETACH_STATUS_CLASSIFY_FAILED:" in dynamic_retryable and
+            "case PEAK_DETACH_STATUS_ERROR:" in dynamic_retryable and
+            dynamic_retryable.find("case PEAK_DETACH_STATUS_ERROR:") >
+            dynamic_retryable.find("return TRUE;") and
+            "dlopen_interceptor_dynamic_attach_prepare_is_retryable" in
+            dynamic_attach_symbol,
+            "a persistent dynamic-attach ERROR must terminate its exact "
+            "dlopen waiter instead of requeueing forever")
+    require("status == PEAK_DETACH_STATUS_ERROR" in revert_retryable,
+            "exact-request terminal errors must not alter the existing "
+            "dlopen interceptor teardown retry policy")
+    require("gum_module_enumerate_symbols" in loaded_module_collect and
+            "dlopen_interceptor_probe_loaded_callable_unknown" in
+            loaded_module_collect,
+            "startup loaded-provider discovery must prefilter callable "
+            "IFUNC/STT_NOTYPE symbols")
+    for token in (
+        "gum_process_enumerate_modules",
+        "original_dlopen(snapshot->path, RTLD_LAZY | RTLD_NOLOAD)",
+        "dlopen_interceptor_begin_load_transaction",
+        "dlopen_interceptor_enqueue_dynamic_attach_request",
+        "dlopen_interceptor_wait_for_dynamic_attach_request",
+    ):
+        require(token in loaded_rescan_body,
+                "startup loaded-provider rescan must use the exact dynamic "
+                f"attach handshake; missing {token}")
 
     dynamic_tests = (
         repo_root / "test/dynamic_lib/CMakeLists.txt"
@@ -1494,6 +1555,9 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         "test_dynamic_concurrent_dlopen_with_heartbeat",
         "test_dynamic_fork_inflight_dlopen_no_deadlock",
         "test_startup_provider_retained_until_hook_detach",
+        "test_dynamic_dlopen_terminal_prepare_error_returns",
+        "test_dynamic_dlopen_provider_after_startup_match",
+        "test_startup_rtld_local_callable_rescan",
     ):
         require(test_name in dynamic_tests,
                 f"missing dynamic loader lifecycle regression {test_name}")

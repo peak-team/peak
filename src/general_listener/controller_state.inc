@@ -1105,10 +1105,24 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             .operation = PEAK_DETACH_OPERATION_ATTACH
         };
         PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+        gboolean prepare_ok;
 
-        if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
-                                                          &detach_status)) {
-            result = peak_general_controller_status_is_retryable(detach_status) ?
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (peak_env_truthy_general(
+                g_getenv("PEAK_TEST_DYNAMIC_ATTACH_PREPARE_ERROR"))) {
+            prepare_ok = FALSE;
+            detach_status = PEAK_DETACH_STATUS_ERROR;
+        } else
+#endif
+        {
+            prepare_ok = peak_detach_controller_prepare_hook_mutation(
+                &mutation_request,
+                &detach_status);
+        }
+        if (!prepare_ok) {
+            result =
+                dlopen_interceptor_dynamic_attach_prepare_is_retryable(
+                    detach_status) ?
                          PEAK_DYNAMIC_ATTACH_RETRY :
                          PEAK_DYNAMIC_ATTACH_FAILED;
             peak_log_debug("[peak] %s JIT attach for hook %lu (%s) from %s: %s\n",

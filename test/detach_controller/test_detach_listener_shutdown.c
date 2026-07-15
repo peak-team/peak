@@ -54,6 +54,14 @@ dlopen_interceptor_end_controller_mutation(void)
 }
 
 gboolean
+dlopen_interceptor_dynamic_attach_prepare_is_retryable(
+    PeakDetachStatus status)
+{
+    return status == PEAK_DETACH_STATUS_TIMEOUT ||
+           status == PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+}
+
+gboolean
 dlopen_interceptor_shutdown_dynamic_attach(void)
 {
     return TRUE;
