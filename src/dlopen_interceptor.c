@@ -151,7 +151,7 @@ static unsigned long long dynamic_attach_partial_success_count = 0;
 static unsigned long long dynamic_attach_retained_handle_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static _Atomic pid_t dynamic_attach_owner_pid = 0;
-static __thread pid_t dynamic_attach_fork_warning_pid = 0;
+static _Atomic pid_t dynamic_attach_fork_warning_pid = 0;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
 static __thread gboolean dynamic_attach_test_explicit_drain = FALSE;
@@ -162,6 +162,8 @@ static atomic_bool dynamic_load_test_pause_consumed = ATOMIC_VAR_INIT(false);
 static atomic_bool dynamic_load_test_replacement_paused =
     ATOMIC_VAR_INIT(false);
 static atomic_bool dynamic_load_test_replacement_released =
+    ATOMIC_VAR_INIT(false);
+static atomic_bool dynamic_load_test_entry_physically_restored =
     ATOMIC_VAR_INIT(false);
 static _Atomic unsigned long long
     dynamic_load_test_controller_mutation_deferrals = 0;
@@ -554,6 +556,20 @@ dlopen_interceptor_test_release_replacement_body(void)
                           memory_order_release);
     pthread_cond_broadcast(&dynamic_load_test_pause_cond);
     pthread_mutex_unlock(&dynamic_load_test_pause_mutex);
+}
+
+gboolean
+dlopen_interceptor_test_entry_physically_restored(void)
+{
+    return atomic_load_explicit(
+        &dynamic_load_test_entry_physically_restored,
+        memory_order_acquire);
+}
+
+gboolean
+dlopen_interceptor_test_dettach(void)
+{
+    return dlopen_interceptor_dettach();
 }
 
 unsigned long long
@@ -1921,12 +1937,6 @@ dlopen_interceptor_shutdown_dynamic_attach(void)
         dlopen_interceptor_trace_counters("shutdown-dynamic-timeout");
         return FALSE;
     }
-    if (!dlopen_interceptor_wait_for_replacement_idle()) {
-        g_printerr("[peak] dlopen replacement body drain timed out with %u active replacement calls; leaving dlopen interceptor state alive\n",
-                   dlopen_interceptor_active_replacement_count());
-        dlopen_interceptor_trace_counters("shutdown-replacement-timeout");
-        return FALSE;
-    }
 
     dlopen_interceptor_trace_counters("shutdown");
     return TRUE;
@@ -1962,8 +1972,9 @@ peak_dlopen(const char *filename, int flags) {
     pid_t owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
                                            memory_order_acquire);
     if (owner_pid != 0 && owner_pid != current_pid) {
-        if (dynamic_attach_fork_warning_pid != current_pid) {
-            dynamic_attach_fork_warning_pid = current_pid;
+        if (atomic_exchange_explicit(&dynamic_attach_fork_warning_pid,
+                                     current_pid,
+                                     memory_order_relaxed) != current_pid) {
             (void)write(STDERR_FILENO,
                         fork_warning,
                         sizeof(fork_warning) - 1);
@@ -2061,6 +2072,11 @@ peak_dlopen(const char *filename, int flags) {
 int dlopen_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_store_explicit(&dynamic_load_test_entry_physically_restored,
+                          FALSE,
+                          memory_order_release);
+#endif
     dlopen_interceptor = gum_interceptor_obtain();
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
 
@@ -2149,6 +2165,14 @@ gboolean dlopen_interceptor_dettach()
         }
         entry_physically_restored =
             peak_detach_controller_current_mutation_uses_physical_patch();
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (entry_physically_restored) {
+            atomic_store_explicit(
+                &dynamic_load_test_entry_physically_restored,
+                TRUE,
+                memory_order_release);
+        }
+#endif
         if (!entry_physically_restored) {
             gum_interceptor_begin_transaction(dlopen_interceptor);
             gum_interceptor_revert(dlopen_interceptor, dlopen_hook_address);
@@ -2159,6 +2183,21 @@ gboolean dlopen_interceptor_dettach()
             peak_detach_controller_abort_after_failed_finish("dlopen revert finish",
                                                             detach_status);
         }
+    }
+
+    /*
+     * In strict mode the first guarded REVERT above restores the real entry
+     * bytes without releasing Gum's replacement metadata.  Only now is the
+     * active count closed against new peak_dlopen entrants, so waiting for
+     * already-entered bodies cannot race a later admission.  Compatibility
+     * mode performs Gum's single-phase revert above for the same entry-first
+     * ordering, without claiming the strict stop-the-world proof.
+     */
+    if (!dlopen_interceptor_wait_for_replacement_idle()) {
+        g_printerr("[peak] dlopen replacement body drain timed out with %u active replacement calls; leaving dlopen interceptor state alive\n",
+                   dlopen_interceptor_active_replacement_count());
+        dlopen_interceptor_trace_counters("shutdown-replacement-timeout");
+        return FALSE;
     }
 
     if (entry_physically_restored &&

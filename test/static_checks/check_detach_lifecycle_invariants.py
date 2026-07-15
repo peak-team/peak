@@ -106,6 +106,9 @@ def check_support_hook_lifetimes(repo_root):
 def check_dlopen_revert_transactions(repo_root):
     source = (repo_root / "src/dlopen_interceptor.c").read_text(encoding="utf-8")
     body = extract_function(source, "dlopen_interceptor_dettach")
+    shutdown = extract_function(
+        source, "dlopen_interceptor_shutdown_dynamic_attach"
+    )
     for match in re.finditer(r"gum_interceptor_revert\s*\(\s*dlopen_interceptor", body):
         before = body[max(0, match.start() - 180):match.start()]
         after = body[match.end():match.end() + 180]
@@ -113,6 +116,32 @@ def check_dlopen_revert_transactions(repo_root):
                 "dlopen revert is missing nearby begin_transaction")
         require("gum_interceptor_end_transaction(dlopen_interceptor)" in after,
                 "dlopen revert is missing nearby end_transaction")
+
+    shutdown_call = body.find("dlopen_interceptor_shutdown_dynamic_attach()")
+    first_prepare = body.find(
+        "dlopen_interceptor_prepare_hook_mutation_with_retry"
+    )
+    physical_restore = body.find(
+        "peak_detach_controller_current_mutation_uses_physical_patch"
+    )
+    first_finish = body.find(
+        "peak_detach_controller_finish_hook_mutation", physical_restore
+    )
+    replacement_drain = body.find(
+        "dlopen_interceptor_wait_for_replacement_idle"
+    )
+    metadata_revert = body.find("if (entry_physically_restored &&")
+    require("dlopen_interceptor_wait_for_replacement_idle" not in shutdown,
+            "controller shutdown must not wait for replacement bodies while "
+            "the patched dlopen entry can still admit new callers")
+    require(shutdown_call != -1 and first_prepare != -1 and
+            physical_restore != -1 and first_finish != -1 and
+            replacement_drain != -1 and metadata_revert != -1 and
+            shutdown_call < first_prepare < physical_restore < first_finish <
+            replacement_drain < metadata_revert,
+            "strict dlopen teardown must restore the real entry, release the "
+            "first stop window, drain entered replacement bodies, and only "
+            "then revert Gum metadata")
 
 
 def check_peak_init_heartbeat_order(repo_root):
@@ -1466,6 +1495,9 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         dlopen, "dlopen_interceptor_end_controller_mutation"
     )
     peak_dlopen = extract_function(dlopen, "peak_dlopen")
+    fork_child_test = (
+        repo_root / "test/dynamic_lib/fork_child_dlopen.py"
+    ).read_text(encoding="utf-8")
     require("dynamic_attach_resolution_reentrant" not in dlopen and
             "dynamic_attach_resolution_wait_request" in caller_wait and
             "dlopen_interceptor_service_resolution_nested_request" in
@@ -1497,6 +1529,18 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             peak_dlopen.find(
                 "dlopen_interceptor_new_dynamic_attach_request(TRUE)"),
             "unrelated handles must bypass exact request allocation and scan")
+    require("static _Atomic pid_t dynamic_attach_fork_warning_pid" in dlopen and
+            "static __thread pid_t dynamic_attach_fork_warning_pid" not in
+            dlopen and
+            "atomic_exchange_explicit(&dynamic_attach_fork_warning_pid" in
+            peak_dlopen,
+            "fork-child dlopen warning ownership must be process-global and "
+            "atomically claimed, not once per TLS thread")
+    require("threading.Barrier" in fork_child_test and
+            "warning_count != 1" in fork_child_test and
+            "fork_child_dlopen_warning_count=1" in fork_child_test,
+            "fork-child regression must race multiple child threads and "
+            "assert exactly one process warning")
 
     startup_attach = extract_function(general, "peak_general_listener_attach")
     overhead_bootstrap = extract_function(
@@ -1662,6 +1706,7 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         "test_dynamic_dlopen_controller_mutation_fairness",
         "test_dynamic_fork_child_dlopen_warns_unsupported",
         "test_dynamic_fork_inflight_dlopen_no_deadlock",
+        "test_dynamic_dlopen_teardown_restores_entry_before_drain",
         "test_startup_provider_retained_until_hook_detach",
         "test_dynamic_dlopen_terminal_prepare_error_returns",
         "test_dynamic_dlopen_retryable_prepare_failure_fails_open",

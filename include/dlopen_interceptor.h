@@ -68,14 +68,16 @@ gboolean dlopen_interceptor_enable_dynamic_attach(void);
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
 
 /**
- * @brief Closes and releases dynamic attach work before listener teardown.
+ * @brief Closes and releases dynamic attach work before controller teardown.
  *
- * After this call succeeds, `peak_dlopen` continues to forward to the real
- * dlopen but will not touch general-listener-owned state. Queued requests that
- * were not drained by the controller are cancelled, their waiters are released,
- * and their private handles are closed unless an installed hook needs them.
+ * Queued requests that were not drained by the controller are cancelled,
+ * their waiters are released, and their private handles are closed unless an
+ * installed hook needs them. This closes dynamic-listener admission, but it
+ * deliberately does not wait for every `peak_dlopen` replacement body: final
+ * interceptor teardown must first restore the real entry so no later body can
+ * enter while the active-body count is being drained.
  *
- * @return TRUE when active dynamic attach and replacement bodies drained.
+ * @return TRUE when active dynamic attach work drained.
  */
 gboolean dlopen_interceptor_shutdown_dynamic_attach(void);
 
@@ -120,6 +122,9 @@ PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_replacement_body_is_paused(void);
 PEAK_DLOPEN_API void
 dlopen_interceptor_test_release_replacement_body(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_entry_physically_restored(void);
+PEAK_DLOPEN_API gboolean dlopen_interceptor_test_dettach(void);
 PEAK_DLOPEN_API unsigned long long
 dlopen_interceptor_test_controller_mutation_deferrals(void);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_retryable_prepare_status(

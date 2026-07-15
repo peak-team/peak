@@ -850,9 +850,12 @@ Final `dlopen` replacement teardown is two-phase in strict mode. PEAK first
 uses the helper guarded `REVERT` operation to restore the real `dlopen` entry
 bytes without freeing Gum's replacement metadata. That closes admission so hot
 `dlopen` loops cannot keep entering `peak_dlopen`. PEAK then resumes threads,
-waits for already-entered `peak_dlopen` replacement bodies and dynamic attach
-drains to leave, and performs the Gum metadata revert under a second helper
-guard. If the replacement body does not drain within the bounded shutdown
+waits for already-entered `peak_dlopen` replacement bodies to leave, and
+performs the Gum metadata revert under a second helper guard. Dynamic attach
+admission and controller-owned drains are closed separately before the
+controller thread exits; that lifecycle step deliberately does not wait for
+replacement bodies while the patched entry can still admit new callers. If a
+replacement body does not drain within the bounded shutdown
 window, teardown fails closed and leaves the interceptor state alive. The start
 of the `peak_dlopen` replacement body is also registered as a blocked PC range
 for strict revert. If a thread is stopped in that uncounted entry window, PEAK
@@ -928,6 +931,8 @@ The test and benchmark suite includes intentionally hostile cases:
 - many threads hot-looping on one target while heartbeat repeatedly detaches;
 - many threads hot-looping while controller reattaches;
 - dynamic `dlopen` while heartbeat detach is active;
+- final `dlopen` entry restore while an in-flight replacement body is paused,
+  followed by a late real-loader call before that body is released;
 - process exit while worker threads are still near target functions;
 - memory profiling with forced memlog growth and allocator teardown quiescence;
 - CUDA host-thread launches if CUDA is available.

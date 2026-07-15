@@ -60,6 +60,7 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/concurrent_dlopen.c
           ${DL_SRC_DIR}/dlopen_mutation_guard.c
           ${DL_SRC_DIR}/dlopen_mutation_fairness.c
+          ${DL_SRC_DIR}/dlopen_teardown_hot.c
           ${DL_SRC_DIR}/fork_inflight_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
           ${DL_SRC_DIR}/nested_ifunc_outer.c
@@ -339,6 +340,17 @@ set_tests_properties(test_dynamic_fork_inflight_dlopen_no_deadlock
     TIMEOUT 10
 )
 
+add_test(NAME test_dynamic_dlopen_teardown_restores_entry_before_drain
+  COMMAND ${DL_DIR}/dlopen_teardown_hot_test
+)
+set_tests_properties(test_dynamic_dlopen_teardown_restores_entry_before_drain
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_dlopen_teardown_unresolved_target;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_TEST_DLOPEN_BODY_PAUSE_MATCH=./libB.so;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_teardown_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dlopen_teardown_entry_first_ok"
+    TIMEOUT 30
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_test(NAME test_dynamic_dlopen_provider_after_startup_match
     COMMAND ${Python3_EXECUTABLE} -c
@@ -378,7 +390,7 @@ set_tests_properties(test_dynamic_fork_child_dlopen_warns_unsupported
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_fork_child_statslog;${PRELOAD_VAR}"
-    PASS_REGULAR_EXPRESSION "fork child dynamic dlopen profiling is unsupported until exec.*fork_child_dlopen_unsupported_ok"
+    PASS_REGULAR_EXPRESSION "fork child dynamic dlopen profiling is unsupported until exec.*fork_child_dlopen_warning_count=1.*fork_child_dlopen_unsupported_ok"
     FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
     TIMEOUT 10
 )
