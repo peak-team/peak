@@ -3,6 +3,7 @@
 # to python-config.
 CC      ?= gcc
 AR      ?= ar
+LD      ?= ld
 CFLAGS  ?= -O2 -fPIC -Wall -Wextra -fvisibility=hidden
 LDSO    ?= -shared
 RPATH   := -Wl,-rpath,'$$ORIGIN'
@@ -26,6 +27,7 @@ CONCURRENT_DLOPEN_SRC := concurrent_dlopen.c
 IFUNC_TARGET_SRC := ifunc_target.c
 NOTYPE_TARGET_SRC := notype_target.S
 LAZY_UNRESOLVED_SRC := lazy_unresolved.c
+LAZY_UNRESOLVED_O := lazy_unresolved.pic.o
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -149,8 +151,16 @@ libIfuncTarget.so: $(IFUNC_TARGET_SRC)
 libNotypeTarget.so: $(NOTYPE_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libNotypeTarget.so
 
-libLazyUnresolved.so: $(LAZY_UNRESOLVED_SRC)
-	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,--allow-shlib-undefined -Wl,-soname,libLazyUnresolved.so
+$(LAZY_UNRESOLVED_O): $(LAZY_UNRESOLVED_SRC)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# This fixture specifically requires lazy binding.  Some MPI compiler wrappers
+# (Intel MPI in particular) append -Wl,-z,now after every caller-supplied link
+# option, which makes RTLD_LAZY invalid for a deliberately unresolved PLT
+# relocation.  Compile with the configured compiler, but link this non-MPI DSO
+# directly so the wrapper cannot silently add DF_BIND_NOW.
+libLazyUnresolved.so: $(LAZY_UNRESOLVED_O)
+	$(LD) -shared -o $@ $< --allow-shlib-undefined -soname libLazyUnresolved.so
 
 # --------------------------------------------------------------------
 # Python extension modules: four combinations
