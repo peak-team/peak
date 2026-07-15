@@ -988,8 +988,12 @@ def check_stop_window_accounting_sidecar(repo_root):
     require('__attribute__((visibility("default")))' in syscall and
             "dlsym(RTLD_NEXT, \"close\")" in syscall,
             "close interposition must use an exported loader wrapper and RTLD_NEXT")
-    require("syscall(SYS_close, fd)" in syscall,
-            "close interposition must retain a recursion-safe raw fallback")
+    require('#include "internal/exec_raw_syscall.h"' in syscall and
+            "defined(__x86_64__) || defined(__aarch64__)" in syscall and
+            "peak_exec_raw_syscall6(SYS_close" in syscall and
+            syscall.find("peak_exec_raw_syscall6(SYS_close") <
+            syscall.find("syscall(SYS_close"),
+            "close interposition startup fallback must bypass PEAK's syscall interposer")
     libc_start = peak.find("int __libc_start_main(")
     close_initialize = peak.find("syscall_interceptor_initialize();",
                                  libc_start)

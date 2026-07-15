@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "syscall_interceptor.h"
+#include "internal/exec_raw_syscall.h"
 #include "logging.h"
 
 #include <dlfcn.h>
@@ -72,7 +73,14 @@ close(int fd)
         return original_close(fd);
     }
 
-#ifdef SYS_close
+#if defined(SYS_close) && defined(__linux__) && \
+    (defined(__x86_64__) || defined(__aarch64__))
+    return (int)peak_exec_raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+#elif defined(SYS_close)
+    /*
+     * PEAK only exports its syscall trampoline on the Linux architectures
+     * above. Other supported platforms can safely use libc's syscall entry.
+     */
     return (int)syscall(SYS_close, fd);
 #else
     errno = ENOSYS;

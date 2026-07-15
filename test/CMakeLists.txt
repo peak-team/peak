@@ -50,7 +50,7 @@ if(BUILD_TESTING)
         SYMBOLS ${FORTRAN_FUNCTIONS}
     )
 
-    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    if(PEAK_EXEC_RAW_SYSCALL_SUPPORTED)
         set(PRELOAD_VAR "LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so")
     elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
         set(PRELOAD_VAR "DYLD_INSERT_LIBRARIES=${PROJECT_BINARY_DIR}/src/libpeak.dylib")
@@ -1272,6 +1272,15 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "close_interposition_inactive_ok"
             TIMEOUT 30
     )
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_test(NAME test_close_loader_raw_fallback
+            COMMAND $<TARGET_FILE:test_close_raw_fallback>)
+        set_tests_properties(test_close_loader_raw_fallback
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "close_raw_fallback_ok"
+                TIMEOUT 30
+        )
+    endif()
     add_test(NAME test_rank_local_mpi_env_suppresses_text COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
     set_tests_properties(test_rank_local_mpi_env_suppresses_text
         PROPERTIES
