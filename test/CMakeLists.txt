@@ -1263,6 +1263,14 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "close_interposition_active_ok"
             TIMEOUT 30
     )
+    add_test(NAME test_close_target_profiling
+        COMMAND ${PROJECT_BINARY_DIR}/test/syscall_interceptor/test_close_interposition)
+    set_tests_properties(test_close_target_profiling
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=close;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_close_target_statslog;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "close_interposition_active_ok.*close[*]*\\|[ \t]+2\\|"
+            TIMEOUT 30
+    )
     add_test(NAME test_close_loader_interposition_inactive
         COMMAND ${PROJECT_BINARY_DIR}/test/syscall_interceptor/test_close_interposition
                 inactive)

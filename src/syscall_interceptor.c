@@ -50,14 +50,15 @@ syscall_interceptor_initialize(void)
 }
 
 /*
- * Interpose through the ELF loader instead of rewriting libc's close entry.
- * Older glibc releases expose __close_nocancel from the middle of close's
- * first instruction stream, so a Gum entry patch can corrupt that alternate
- * entry even when the public close symbol itself appears large enough.
+ * Keep the implementation in a PEAK-owned, exported function so an explicit
+ * close profiling target never patches libc. Older glibc releases expose
+ * __close_nocancel from the middle of close's first instruction stream, so a
+ * Gum entry patch can corrupt that alternate entry even when the public close
+ * symbol itself appears large enough.
  */
-__attribute__((visibility("default")))
+__attribute__((visibility("default"), noinline, used))
 int
-close(int fd)
+peak_close(int fd)
 {
     PeakCloseFunction original_close;
 
@@ -86,6 +87,14 @@ close(int fd)
     errno = ENOSYS;
     return -1;
 #endif
+}
+
+/* Interpose at the ELF loader boundary and forward through the profile hook. */
+__attribute__((visibility("default")))
+int
+close(int fd)
+{
+    return peak_close(fd);
 }
 
 int

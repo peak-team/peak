@@ -43,6 +43,17 @@ dlopen_interceptor_drain_dynamic_attach_queue(void)
 }
 
 gboolean
+dlopen_interceptor_try_begin_controller_mutation(void)
+{
+    return TRUE;
+}
+
+void
+dlopen_interceptor_end_controller_mutation(void)
+{
+}
+
+gboolean
 dlopen_interceptor_shutdown_dynamic_attach(void)
 {
     return TRUE;

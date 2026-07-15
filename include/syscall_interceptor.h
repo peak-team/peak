@@ -18,6 +18,14 @@
 void syscall_interceptor_initialize(void);
 
 /**
+ * @brief Profileable implementation boundary for loader-interposed close.
+ *
+ * The exported close wrapper forwards here so PEAK_TARGET=close can attach to
+ * PEAK-owned code without rewriting libc's close entry.
+ */
+int peak_close(int fd);
+
+/**
  * @brief Attaches the system call interceptor.
  *
  * This function enables stderr protection in the loader-interposed `close`

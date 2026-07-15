@@ -58,6 +58,7 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/customCpackage.c
           ${DL_SRC_DIR}/dlopen_flags_test.c
           ${DL_SRC_DIR}/concurrent_dlopen.c
+          ${DL_SRC_DIR}/dlopen_mutation_guard.c
           ${DL_SRC_DIR}/fork_inflight_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
           ${DL_SRC_DIR}/nested_ifunc_outer.c
@@ -247,6 +248,17 @@ set_tests_properties(test_dynamic_concurrent_dlopen_requests
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_concurrent_dlopen_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+16\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_dlopen_controller_mutation_guard
+  COMMAND ${DL_DIR}/dlopen_mutation_guard_test
+)
+set_tests_properties(test_dynamic_dlopen_controller_mutation_guard
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_dlopen_mutation_guard_target,b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_SAFE_DETACH_MODE=compatibility;PEAK_TEST_DLOPEN_BODY_PAUSE_MATCH=./libB.so;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_mutation_guard_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dlopen_mutation_guard_ok.*peak_dlopen_mutation_guard_target[*]*\\|[ \t]+2\\|.*b_dynamic[*]*\\|[ \t]+1\\|"
     TIMEOUT 30
 )
 

@@ -143,6 +143,16 @@ static _Atomic pid_t dynamic_attach_owner_pid = 0;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
 static __thread gboolean dynamic_attach_test_explicit_drain = FALSE;
+static pthread_mutex_t dynamic_load_test_pause_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dynamic_load_test_pause_cond = PTHREAD_COND_INITIALIZER;
+static atomic_bool dynamic_load_test_pause_consumed = ATOMIC_VAR_INIT(false);
+static atomic_bool dynamic_load_test_replacement_paused =
+    ATOMIC_VAR_INIT(false);
+static atomic_bool dynamic_load_test_replacement_released =
+    ATOMIC_VAR_INIT(false);
+static _Atomic unsigned long long
+    dynamic_load_test_controller_mutation_deferrals = 0;
 #endif
 
 static gboolean
@@ -436,6 +446,106 @@ dlopen_interceptor_active_replacement_count(void)
 
     return count;
 }
+
+gboolean
+dlopen_interceptor_try_begin_controller_mutation(void)
+{
+    if (pthread_mutex_trylock(&dynamic_load_transaction_mutex) != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_fetch_add_explicit(
+            &dynamic_load_test_controller_mutation_deferrals,
+            1,
+            memory_order_relaxed);
+#endif
+        return FALSE;
+    }
+
+    /*
+     * A replacement caller publishes itself before trying to enter the load
+     * transaction. If it won that race, release the transaction and defer;
+     * otherwise a caller arriving after this check blocks before entering the
+     * real loader until the controller finishes its mutation.
+     */
+    if (dlopen_interceptor_active_replacement_count() != 0) {
+        pthread_mutex_unlock(&dynamic_load_transaction_mutex);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_fetch_add_explicit(
+            &dynamic_load_test_controller_mutation_deferrals,
+            1,
+            memory_order_relaxed);
+#endif
+        return FALSE;
+    }
+
+    /* Allow a same-thread loader call made by the guarded mutation to nest. */
+    dynamic_load_transaction_depth = 1;
+    return TRUE;
+}
+
+void
+dlopen_interceptor_end_controller_mutation(void)
+{
+    dlopen_interceptor_end_load_transaction();
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static void
+dlopen_interceptor_test_pause_replacement_body(const char* filename)
+{
+    const char* match = g_getenv("PEAK_TEST_DLOPEN_BODY_PAUSE_MATCH");
+    _Bool expected = 0;
+
+    if (match == NULL || filename == NULL || g_strcmp0(match, filename) != 0 ||
+        !atomic_compare_exchange_strong_explicit(
+            &dynamic_load_test_pause_consumed,
+            &expected,
+            1,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        return;
+    }
+
+    pthread_mutex_lock(&dynamic_load_test_pause_mutex);
+    atomic_store_explicit(&dynamic_load_test_replacement_paused,
+                          TRUE,
+                          memory_order_release);
+    while (!atomic_load_explicit(&dynamic_load_test_replacement_released,
+                                 memory_order_acquire)) {
+        pthread_cond_wait(&dynamic_load_test_pause_cond,
+                          &dynamic_load_test_pause_mutex);
+    }
+    atomic_store_explicit(&dynamic_load_test_replacement_paused,
+                          FALSE,
+                          memory_order_release);
+    pthread_mutex_unlock(&dynamic_load_test_pause_mutex);
+}
+
+gboolean
+dlopen_interceptor_test_replacement_body_is_paused(void)
+{
+    return atomic_load_explicit(&dynamic_load_test_replacement_paused,
+                                memory_order_acquire);
+}
+
+void
+dlopen_interceptor_test_release_replacement_body(void)
+{
+    pthread_mutex_lock(&dynamic_load_test_pause_mutex);
+    atomic_store_explicit(&dynamic_load_test_replacement_released,
+                          TRUE,
+                          memory_order_release);
+    pthread_cond_broadcast(&dynamic_load_test_pause_cond);
+    pthread_mutex_unlock(&dynamic_load_test_pause_mutex);
+}
+
+unsigned long long
+dlopen_interceptor_test_controller_mutation_deferrals(void)
+{
+    return atomic_load_explicit(
+        &dynamic_load_test_controller_mutation_deferrals,
+        memory_order_relaxed);
+}
+#endif
 
 static gboolean
 dlopen_interceptor_wait_for_dynamic_attach_idle(void)
@@ -1545,6 +1655,9 @@ peak_dlopen(const char *filename, int flags) {
 
     dlopen_interceptor_begin_replacement_call();
     dlopen_interceptor_begin_load_transaction();
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    dlopen_interceptor_test_pause_replacement_body(filename);
+#endif
     handle = original_dlopen(filename, flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {

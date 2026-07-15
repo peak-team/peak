@@ -116,6 +116,12 @@ dlopen_interceptor_test_record_partial_success_with_retained_handle(void);
 PEAK_DLOPEN_API void
 dlopen_interceptor_test_release_retained_dynamic_handles(void);
 PEAK_DLOPEN_API size_t dlopen_interceptor_test_retained_handle_slots(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_replacement_body_is_paused(void);
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_release_replacement_body(void);
+PEAK_DLOPEN_API unsigned long long
+dlopen_interceptor_test_controller_mutation_deferrals(void);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_retryable_prepare_status(
     int status);
 PEAK_DLOPEN_API void dlopen_interceptor_test_trace_counters(const char* event);

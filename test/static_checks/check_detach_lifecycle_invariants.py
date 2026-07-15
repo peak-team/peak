@@ -1042,6 +1042,12 @@ def check_stop_window_accounting_sidecar(repo_root):
     require('__attribute__((visibility("default")))' in syscall and
             "dlsym(RTLD_NEXT, \"close\")" in syscall,
             "close interposition must use an exported loader wrapper and RTLD_NEXT")
+    peak_close = extract_function(syscall, "peak_close")
+    close_wrapper = extract_function(syscall, "close")
+    require("PeakCloseFunction original_close" in peak_close and
+            "return peak_close(fd);" in close_wrapper,
+            "the exported close wrapper must forward through the profileable "
+            "PEAK-owned peak_close boundary")
     require('#include "internal/exec_raw_syscall.h"' in syscall and
             "defined(__x86_64__) || defined(__aarch64__)" in syscall and
             "peak_exec_raw_syscall6(SYS_close" in syscall and
@@ -1244,7 +1250,16 @@ def check_heartbeat_state_machine_boundary(repo_root):
 
 def check_general_controller_dlopen_drain_order(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
+    dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
+        encoding="utf-8"
+    )
     body = extract_function(source, "peak_general_controller_thread_main")
+    guard = extract_function(
+        dlopen, "dlopen_interceptor_try_begin_controller_mutation"
+    )
+    synchronous_drain = extract_function(
+        source, "peak_general_listener_controller_drain"
+    )
     process_positions = [
         match.start()
         for match in re.finditer(
@@ -1264,11 +1279,47 @@ def check_general_controller_dlopen_drain_order(repo_root):
             "general controller thread must process pending target hooks")
     require(drain_positions,
             "general controller thread must drain dynamic dlopen attach queue")
-    for position in drain_positions:
-        require(any(process_position < position
-                    for process_position in process_positions),
-                "general controller must process pending target hooks before "
-                "draining dynamic dlopen attach work")
+    require(drain_positions[0] < process_positions[0],
+            "general controller must drain exact dlopen attach work before "
+            "ordinary target hook mutations")
+    process_context = body[max(0, process_positions[0] - 500):
+                           process_positions[0] + 700]
+    require("dlopen_interceptor_try_begin_controller_mutation()" in
+            process_context and
+            "dlopen_interceptor_end_controller_mutation();" in
+            process_context,
+            "ordinary controller target mutations must hold the dlopen "
+            "transaction guard")
+    jit_position = body.find("peak_jit_provider_drain_pending();",
+                             process_positions[0])
+    guard_end = body.find("dlopen_interceptor_end_controller_mutation();",
+                          process_positions[0])
+    require(jit_position != -1 and guard_end != -1 and
+            process_positions[0] < jit_position < guard_end,
+            "ordinary JIT mutations must share the dlopen transaction guard")
+    require("pthread_mutex_trylock(&dynamic_load_transaction_mutex)" in guard and
+            "dlopen_interceptor_active_replacement_count() != 0" in guard and
+            "dynamic_load_transaction_depth = 1;" in guard,
+            "controller mutation guard must exclude both an owned load "
+            "transaction and a published replacement caller while preserving "
+            "same-thread loader reentrancy")
+    synchronous_process = synchronous_drain.find(
+        "peak_general_controller_process_pending_unlocked"
+    )
+    synchronous_begin = synchronous_drain.rfind(
+        "dlopen_interceptor_try_begin_controller_mutation()",
+        0,
+        synchronous_process,
+    )
+    synchronous_end = synchronous_drain.find(
+        "dlopen_interceptor_end_controller_mutation();",
+        synchronous_process,
+    )
+    require(synchronous_process != -1 and synchronous_begin != -1 and
+            synchronous_end != -1 and
+            synchronous_begin < synchronous_process < synchronous_end,
+            "synchronous controller drain mutations must hold the dlopen "
+            "transaction guard")
 
 
 def check_dlopen_request_completion_and_readiness(repo_root):

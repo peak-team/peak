@@ -1114,14 +1114,23 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     for (;;) {
         gboolean pending;
 
-        pthread_mutex_lock(&lock);
-        (void)peak_general_controller_process_pending_unlocked(controller_tid,
-                                                               tid_keys,
-                                                               mapped_ids,
-                                                               pause_session_ids,
-                                                               pause_status);
-        pending = peak_general_controller_has_pending_unlocked();
-        pthread_mutex_unlock(&lock);
+        if (dlopen_interceptor_try_begin_controller_mutation()) {
+            pthread_mutex_lock(&lock);
+            (void)peak_general_controller_process_pending_unlocked(
+                controller_tid,
+                tid_keys,
+                mapped_ids,
+                pause_session_ids,
+                pause_status);
+            pending = peak_general_controller_has_pending_unlocked();
+            pthread_mutex_unlock(&lock);
+            dlopen_interceptor_end_controller_mutation();
+        } else {
+            /* Inspect only; the controller must not mutate Gum this cycle. */
+            pthread_mutex_lock(&lock);
+            pending = peak_general_controller_has_pending_unlocked();
+            pthread_mutex_unlock(&lock);
+        }
 
         if (!pending) {
             drained = TRUE;
@@ -1171,9 +1180,21 @@ peak_general_controller_thread_main(void* arg)
             double deadline =
                 peak_second() +
                 ((double)peak_general_controller_shutdown_drain_ms() / 1000.0);
-            while (peak_jit_provider_drain_pending()) {
+            for (;;) {
+                gboolean pending = TRUE;
+
+                if (dlopen_interceptor_try_begin_controller_mutation()) {
+                    pending = peak_jit_provider_drain_pending();
+                    dlopen_interceptor_end_controller_mutation();
+                }
+                if (!pending) {
+                    break;
+                }
                 if (peak_second() >= deadline) {
-                    (void)peak_jit_provider_drain_pending_force_not_exec_timeout();
+                    if (dlopen_interceptor_try_begin_controller_mutation()) {
+                        (void)peak_jit_provider_drain_pending_force_not_exec_timeout();
+                        dlopen_interceptor_end_controller_mutation();
+                    }
                     break;
                 }
                 usleep(1000);
@@ -1181,16 +1202,25 @@ peak_general_controller_thread_main(void* arg)
             break;
         }
 
-        pthread_mutex_lock(&lock);
-        (void)peak_general_controller_process_pending_unlocked(controller_tid,
-                                                               tid_keys,
-                                                               mapped_ids,
-                                                               pause_session_ids,
-                                                               pause_status);
-        pthread_mutex_unlock(&lock);
-
+        /*
+         * Exact dlopen requests come first because their caller owns the load
+         * transaction while waiting. Ordinary lifecycle and JIT mutations are
+         * deferred until no replacement body can be inside the loader.
+         */
         dlopen_interceptor_drain_dynamic_attach_queue();
-        peak_jit_provider_drain_pending();
+        if (dlopen_interceptor_try_begin_controller_mutation()) {
+            pthread_mutex_lock(&lock);
+            (void)peak_general_controller_process_pending_unlocked(
+                controller_tid,
+                tid_keys,
+                mapped_ids,
+                pause_session_ids,
+                pause_status);
+            pthread_mutex_unlock(&lock);
+
+            peak_jit_provider_drain_pending();
+            dlopen_interceptor_end_controller_mutation();
+        }
 
         pthread_mutex_lock(&general_controller_wake_mutex);
         if (general_controller_running) {
