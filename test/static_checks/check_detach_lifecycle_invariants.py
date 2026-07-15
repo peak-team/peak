@@ -1358,6 +1358,12 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     )
     general = read_source(repo_root, "src/general_listener.c")
     peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    replace_failure_test = (
+        repo_root / "test/dynamic_lib/dlopen_replace_failure.c"
+    ).read_text(encoding="utf-8")
+    dynamic_tests_cmake = (
+        repo_root / "test/dynamic_lib/CMakeLists.txt"
+    ).read_text(encoding="utf-8")
 
     complete = extract_function(
         dlopen, "dlopen_interceptor_complete_dynamic_attach_request"
@@ -1395,6 +1401,12 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     dlopen_attach_body = extract_function(
         dlopen, "dlopen_interceptor_attach"
     )
+    dlopen_detach_body = extract_function(
+        dlopen, "dlopen_interceptor_dettach"
+    )
+    release_uninstalled = extract_function(
+        dlopen, "dlopen_interceptor_release_uninstalled_replacement"
+    )
     ready = extract_function(
         general, "peak_general_listener_controller_is_ready"
     )
@@ -1420,6 +1432,44 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "dlopen fork ownership must be visible before the replacement is published")
     require("dynamic_attach_owner_pid" not in enable,
             "fork ownership publication must not be deferred until dynamic admission")
+    require("dlopen_replacement_installed_by_peak" in enable,
+            "dynamic attach admission must require a confirmed PEAK-owned dlopen replacement")
+    replacement_owned = dlopen_attach_body.find(
+        "atomic_store_explicit(&dlopen_replacement_installed_by_peak"
+    )
+    existing_ownership_guard = dlopen_attach_body.find(
+        "if (atomic_load_explicit(&dlopen_replacement_installed_by_peak"
+    )
+    transaction_publish = dlopen_attach_body.find(
+        "gum_interceptor_end_transaction"
+    )
+    replace_failure = dlopen_attach_body.find(
+        "if (replace_check != GUM_REPLACE_OK)"
+    )
+    cleanup_failure = dlopen_attach_body.find(
+        "dlopen_interceptor_release_uninstalled_replacement()",
+        replace_failure,
+    )
+    require(existing_ownership_guard != -1 and
+            existing_ownership_guard < replacement_publish and
+            "return GUM_REPLACE_ALREADY_REPLACED" in
+            dlopen_attach_body[existing_ownership_guard:replacement_publish] and
+            replacement_publish < replacement_owned < transaction_publish and
+            transaction_publish < replace_failure < cleanup_failure,
+            "dlopen replacement ownership must preserve an existing PEAK install, "
+            "be recorded only after Gum success before publication, and clean "
+            "failed new installs after the stop window")
+    require("dlopen_replacement_installed_by_peak" in dlopen_detach_body and
+            dlopen_detach_body.find("dlopen_replacement_installed_by_peak") <
+            dlopen_detach_body.find(
+                "dlopen_interceptor_prepare_hook_mutation_with_retry"),
+            "dlopen teardown must never revert an entry PEAK did not replace")
+    require("original_dlopen = NULL" in release_uninstalled and
+            "dlopen_hook_address = NULL" in release_uninstalled and
+            "dynamic_attach_owner_pid, 0" in release_uninstalled and
+            "g_object_unref(dlopen_interceptor)" in release_uninstalled and
+            "dlopen_interceptor = NULL" in release_uninstalled,
+            "failed dlopen replacement installation must release every unowned resource")
     listener_attach = init.find("peak_general_listener_attach();")
     dynamic_needed = init.find("peak_general_listener_needs_dynamic_attach();")
     dlopen_attach = init.find("dlopen_interceptor_attach()")
@@ -1495,6 +1545,12 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         dlopen, "dlopen_interceptor_end_controller_mutation"
     )
     peak_dlopen = extract_function(dlopen, "peak_dlopen")
+    end_replacement = extract_function(
+        dlopen, "dlopen_interceptor_end_replacement_call"
+    )
+    wait_replacement = extract_function(
+        dlopen, "dlopen_interceptor_wait_for_replacement_idle"
+    )
     fork_child_test = (
         repo_root / "test/dynamic_lib/fork_child_dlopen.py"
     ).read_text(encoding="utf-8")
@@ -1529,6 +1585,28 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             peak_dlopen.find(
                 "dlopen_interceptor_new_dynamic_attach_request(TRUE)"),
             "unrelated handles must bypass exact request allocation and scan")
+    entry_registration = peak_dlopen.find(
+        "atomic_fetch_add_explicit(&active_dlopen_replacement_count"
+    )
+    require("static _Atomic unsigned int active_dlopen_replacement_count" in
+            dlopen and
+            "_Static_assert(ATOMIC_INT_LOCK_FREE == 2" in dlopen and
+            entry_registration != -1 and
+            entry_registration < peak_dlopen.find("current_pid = getpid()") and
+            entry_registration < peak_dlopen.find(
+                "peak_general_listener_controller_is_current_thread()") and
+            entry_registration < peak_dlopen.find("pthread_setcancelstate") and
+            "dlopen_interceptor_begin_replacement_call" not in dlopen,
+            "peak_dlopen must register itself with a direct lock-free atomic as "
+            "its first executable operation, before any call can leave the guarded entry")
+    require("atomic_fetch_sub_explicit" in end_replacement and
+            "&active_dlopen_replacement_count" in end_replacement and
+            "atomic_load_explicit" in wait_replacement and
+            "&active_dlopen_replacement_count" in wait_replacement and
+            peak_dlopen.count("dlopen_interceptor_end_replacement_call();") ==
+            peak_dlopen.count("return handle;"),
+            "every dlopen replacement return must release atomic entry ownership, "
+            "and teardown must drain that same atomic counter")
     require("static _Atomic pid_t dynamic_attach_fork_warning_pid" in dlopen and
             "static __thread pid_t dynamic_attach_fork_warning_pid" not in
             dlopen and
@@ -1541,6 +1619,19 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "fork_child_dlopen_warning_count=1" in fork_child_test,
             "fork-child regression must race multiple child threads and "
             "assert exactly one process warning")
+    require("dlopen_interceptor_test_uninstalled_replacement_state_is_clean" in
+            replace_failure_test and
+            "dlopen_interceptor_test_dettach" in replace_failure_test and
+            "set(_replace_failure_name wrong_signature)" in
+            dynamic_tests_cmake and
+            "set(_replace_failure_name already_replaced)" in
+            dynamic_tests_cmake and
+            "PEAK_TEST_DLOPEN_REPLACE_RESULT=${_replace_failure}" in
+            dynamic_tests_cmake and
+            "test_dynamic_dlopen_duplicate_peak_attach_preserves_ownership" in
+            dynamic_tests_cmake,
+            "replace-fast failure regressions must cover cleanup, safe teardown, "
+            "the pre-existing replacement result, and duplicate PEAK ownership")
 
     startup_attach = extract_function(general, "peak_general_listener_attach")
     overhead_bootstrap = extract_function(

@@ -856,11 +856,24 @@ admission and controller-owned drains are closed separately before the
 controller thread exits; that lifecycle step deliberately does not wait for
 replacement bodies while the patched entry can still admit new callers. If a
 replacement body does not drain within the bounded shutdown
-window, teardown fails closed and leaves the interceptor state alive. The start
-of the `peak_dlopen` replacement body is also registered as a blocked PC range
-for strict revert. If a thread is stopped in that uncounted entry window, PEAK
-refuses the revert and stops subsequent teardown so callback-visible state is
-not freed while `dlopen` may still be interposed.
+window, teardown fails closed and leaves the interceptor state alive. The first
+executable operation in `peak_dlopen` is a compile-time-proven lock-free atomic
+entry registration. It executes before `getpid()`, TLS lookup, controller
+queries, cancellation control, or any other call that could leave the guarded
+entry range. A stopped thread is therefore either still inside the blocked
+entry range or already represented by the replacement-body count; zero cannot
+become nonzero after strict entry restoration.
+
+PEAK records `dlopen` replacement ownership only when
+`gum_interceptor_replace_fast()` returns `GUM_REPLACE_OK`, before ending the Gum
+transaction can publish the patch. Every failed result, including
+`GUM_REPLACE_ALREADY_REPLACED`, clears the original-call trampoline, hook
+address, fork-owner metadata, and interceptor reference after the guarded
+mutation window finishes. Final teardown checks that ownership flag before any
+revert, so PEAK never reverts another Gum client's existing `dlopen`
+replacement. A duplicate PEAK attach request is rejected before obtaining a new
+interceptor reference or changing ownership, so it likewise cannot misclassify
+and clean up PEAK's already-live replacement.
 
 The final `dlopen` revert prepares are retried for a short bounded window on
 transient helper statuses, including temporary `ptrace` permission denial seen
@@ -933,6 +946,10 @@ The test and benchmark suite includes intentionally hostile cases:
 - dynamic `dlopen` while heartbeat detach is active;
 - final `dlopen` entry restore while an in-flight replacement body is paused,
   followed by a late real-loader call before that body is released;
+- forced `replace_fast` wrong-signature and already-replaced failures, requiring
+  zero PEAK ownership, complete install-state cleanup, and successful teardown;
+- a duplicate PEAK attach request, requiring the existing owned replacement to
+  remain active through a later runtime target's first call;
 - process exit while worker threads are still near target functions;
 - memory profiling with forced memlog growth and allocator teardown quiescence;
 - CUDA host-thread launches if CUDA is available.
@@ -1266,3 +1283,9 @@ Completed in this branch:
     listener attached to two functions and two stale batch requests that both
     resolve to one canonical function, preventing hash-order-dependent patch
     selection and duplicate-write coalescing from masking unsafe batches.
+49. Closed the final `dlopen` replacement entry/teardown race by making
+    replacement-body registration the first lock-free executable operation and
+    draining that atomic count only after physical entry restoration. Added
+    explicit successful-install ownership so failed `replace_fast` calls clean
+    all unowned state immediately and final teardown cannot revert another Gum
+    client's pre-existing replacement.

@@ -91,6 +91,27 @@ static char peak_dlopen_test_retained_handle_marker;
     ((void*)&peak_dlopen_test_retry_handle_marker)
 #define PEAK_DLOPEN_TEST_RETAINED_HANDLE \
     ((void*)&peak_dlopen_test_retained_handle_marker)
+
+static gboolean
+dlopen_interceptor_test_forced_replace_failure(
+    GumReplaceReturn* result_out)
+{
+    const char* value = g_getenv("PEAK_TEST_DLOPEN_REPLACE_RESULT");
+    char* end = NULL;
+    gint64 parsed;
+
+    if (value == NULL || value[0] == '\0' || result_out == NULL) {
+        return FALSE;
+    }
+    parsed = g_ascii_strtoll(value, &end, 10);
+    if (end == value || *end != '\0' ||
+        parsed < GUM_REPLACE_WRONG_TYPE ||
+        parsed > GUM_REPLACE_WRONG_SIGNATURE) {
+        return FALSE;
+    }
+    *result_out = (GumReplaceReturn)parsed;
+    return TRUE;
+}
 #endif
 
 typedef enum {
@@ -110,7 +131,9 @@ static pthread_mutex_t dynamic_attach_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dynamic_attach_gate_cond = PTHREAD_COND_INITIALIZER;
 static PeakDlopenControllerState dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
 static unsigned int active_dynamic_attach_count = 0;
-static unsigned int active_dlopen_replacement_count = 0;
+static _Atomic unsigned int active_dlopen_replacement_count = 0;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "dlopen replacement entry accounting must be lock-free");
 static gboolean dynamic_attach_drain_active = FALSE;
 static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_head = NULL;
 static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_tail = NULL;
@@ -152,6 +175,8 @@ static unsigned long long dynamic_attach_retained_handle_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static _Atomic pid_t dynamic_attach_owner_pid = 0;
 static _Atomic pid_t dynamic_attach_fork_warning_pid = 0;
+static atomic_bool dlopen_replacement_installed_by_peak =
+    ATOMIC_VAR_INIT(false);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
 static __thread gboolean dynamic_attach_test_explicit_drain = FALSE;
@@ -409,14 +434,6 @@ dlopen_interceptor_queue_can_accept_unlocked(void)
 }
 
 static void
-dlopen_interceptor_begin_replacement_call(void)
-{
-    pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    active_dlopen_replacement_count++;
-    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-}
-
-static void
 dlopen_interceptor_begin_load_transaction(void)
 {
     if (dynamic_load_transaction_depth == 0) {
@@ -448,26 +465,30 @@ dlopen_interceptor_end_load_transaction(void)
 static void
 dlopen_interceptor_end_replacement_call(void)
 {
-    pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    if (active_dlopen_replacement_count > 0) {
-        active_dlopen_replacement_count--;
+    unsigned int previous = atomic_fetch_sub_explicit(
+        &active_dlopen_replacement_count,
+        1,
+        memory_order_acq_rel);
+
+    if (previous == 0) {
+        /* Keep an unmatched release fail-closed instead of wrapping to UINT_MAX. */
+        atomic_fetch_add_explicit(&active_dlopen_replacement_count,
+                                  1,
+                                  memory_order_relaxed);
+        return;
     }
-    if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN) {
+    if (previous == 1) {
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
         pthread_cond_broadcast(&dynamic_attach_gate_cond);
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
     }
-    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
 
 static unsigned int
 dlopen_interceptor_active_replacement_count(void)
 {
-    unsigned int count;
-
-    pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    count = active_dlopen_replacement_count;
-    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-
-    return count;
+    return atomic_load_explicit(&active_dlopen_replacement_count,
+                                memory_order_acquire);
 }
 
 gboolean
@@ -567,6 +588,31 @@ dlopen_interceptor_test_entry_physically_restored(void)
 }
 
 gboolean
+dlopen_interceptor_test_replacement_installed_by_peak(void)
+{
+    return atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                                memory_order_acquire);
+}
+
+gboolean
+dlopen_interceptor_test_uninstalled_replacement_state_is_clean(void)
+{
+    return !atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                                 memory_order_acquire) &&
+           dlopen_interceptor == NULL &&
+           dlopen_hook_address == NULL &&
+           original_dlopen == NULL &&
+           atomic_load_explicit(&dynamic_attach_owner_pid,
+                                memory_order_acquire) == 0;
+}
+
+int
+dlopen_interceptor_test_attach(void)
+{
+    return dlopen_interceptor_attach();
+}
+
+gboolean
 dlopen_interceptor_test_dettach(void)
 {
     return dlopen_interceptor_dettach();
@@ -618,7 +664,8 @@ dlopen_interceptor_wait_for_replacement_idle(void)
                                         PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    while (active_dlopen_replacement_count > 0) {
+    while (atomic_load_explicit(&active_dlopen_replacement_count,
+                                memory_order_acquire) > 0) {
         int wait_status =
             pthread_cond_timedwait(&dynamic_attach_gate_cond,
                                    &dynamic_attach_gate_mutex,
@@ -1071,7 +1118,9 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_state =
         open ? PEAK_DLOPEN_CONTROLLER_OPEN : PEAK_DLOPEN_CONTROLLER_CLOSED;
     active_dynamic_attach_count = 0;
-    active_dlopen_replacement_count = 0;
+    atomic_store_explicit(&active_dlopen_replacement_count,
+                          0,
+                          memory_order_release);
     dynamic_attach_drain_active = FALSE;
     dynamic_load_controller_mutation_pending = FALSE;
     dynamic_attach_queue_head = NULL;
@@ -1912,6 +1961,8 @@ dlopen_interceptor_enable_dynamic_attach(void)
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN &&
+        atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                             memory_order_acquire) &&
         dlopen_interceptor != NULL &&
         dlopen_hook_address != NULL &&
         original_dlopen != NULL) {
@@ -1964,13 +2015,31 @@ dlopen_interceptor_release_retained_dynamic_handles(void)
     dlopen_interceptor_trace_counters("release-retained-handles");
 }
 
-static void*
+static void* __attribute__((noinline, no_instrument_function))
 peak_dlopen(const char *filename, int flags) {
     static const char fork_warning[] =
         "[peak] fork child dynamic dlopen profiling is unsupported until exec; using the real dlopen without inherited PEAK controller state\n";
-    pid_t current_pid = getpid();
-    pid_t owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
-                                           memory_order_acquire);
+    pid_t current_pid;
+    pid_t owner_pid;
+    int old_cancel_state;
+    void *handle;
+    PeakDlopenDynamicAttachRequest* request = NULL;
+    PeakDlopenRequestState request_state = PEAK_DLOPEN_REQUEST_NO_MATCH;
+
+    /*
+     * This must remain the first executable statement.  Strict teardown
+     * restores the real dlopen entry while peers are stopped, then waits for
+     * this count before releasing Gum's trampoline metadata.  The compile-time
+     * lock-free assertion above ensures registration cannot leave the guarded
+     * entry range through a helper call before the body becomes visible.
+     */
+    atomic_fetch_add_explicit(&active_dlopen_replacement_count,
+                              1,
+                              memory_order_acq_rel);
+
+    current_pid = getpid();
+    owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
+                                     memory_order_acquire);
     if (owner_pid != 0 && owner_pid != current_pid) {
         if (atomic_exchange_explicit(&dynamic_attach_fork_warning_pid,
                                      current_pid,
@@ -1979,21 +2048,19 @@ peak_dlopen(const char *filename, int flags) {
                         fork_warning,
                         sizeof(fork_warning) - 1);
         }
-        return original_dlopen(filename, flags);
+        handle = original_dlopen(filename, flags);
+        dlopen_interceptor_end_replacement_call();
+        return handle;
     }
     if (dynamic_attach_drain_reentrant ||
         peak_general_listener_controller_is_current_thread()) {
-        return original_dlopen(filename, flags);
+        handle = original_dlopen(filename, flags);
+        dlopen_interceptor_end_replacement_call();
+        return handle;
     }
-
-    int old_cancel_state;
-    void *handle;
-    PeakDlopenDynamicAttachRequest* request = NULL;
-    PeakDlopenRequestState request_state = PEAK_DLOPEN_REQUEST_NO_MATCH;
 
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
 
-    dlopen_interceptor_begin_replacement_call();
     dlopen_interceptor_begin_load_transaction();
 #ifdef PEAK_ENABLE_TEST_HOOKS
     dlopen_interceptor_test_pause_replacement_body(filename);
@@ -2069,9 +2136,33 @@ peak_dlopen(const char *filename, int flags) {
     return handle;
 }
 
+static void
+dlopen_interceptor_release_uninstalled_replacement(void)
+{
+    atomic_store_explicit(&dlopen_replacement_installed_by_peak,
+                          false,
+                          memory_order_release);
+    atomic_store_explicit(&dynamic_attach_owner_pid, 0, memory_order_release);
+    atomic_store_explicit(&dynamic_attach_fork_warning_pid,
+                          0,
+                          memory_order_relaxed);
+    original_dlopen = NULL;
+    dlopen_hook_address = NULL;
+    if (dlopen_interceptor != NULL) {
+        g_object_unref(dlopen_interceptor);
+        dlopen_interceptor = NULL;
+    }
+}
+
 int dlopen_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
+
+    if (atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                             memory_order_acquire)) {
+        g_printerr("[peak] dlopen Gum replacement is already installed by PEAK, preserving existing ownership\n");
+        return GUM_REPLACE_ALREADY_REPLACED;
+    }
 #ifdef PEAK_ENABLE_TEST_HOOKS
     atomic_store_explicit(&dynamic_load_test_entry_physically_restored,
                           FALSE,
@@ -2081,14 +2172,13 @@ int dlopen_interceptor_attach()
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
 
     if (dlopen_hook_address == NULL) {
+        dlopen_interceptor_release_uninstalled_replacement();
         return replace_check;
     }
     if (!peak_general_listener_attach_target_is_supported("dlopen",
                                                           dlopen_hook_address)) {
         g_printerr("[peak] skipping dlopen Gum replace: unsupported target prologue\n");
-        g_object_unref(dlopen_interceptor);
-        dlopen_interceptor = NULL;
-        dlopen_hook_address = NULL;
+        dlopen_interceptor_release_uninstalled_replacement();
         return replace_check;
     }
 
@@ -2106,9 +2196,7 @@ int dlopen_interceptor_attach()
                                                       &detach_status)) {
         g_printerr("[peak] skipping dlopen Gum replace: %s\n",
                    peak_detach_controller_status_string(detach_status));
-        g_object_unref(dlopen_interceptor);
-        dlopen_interceptor = NULL;
-        dlopen_hook_address = NULL;
+        dlopen_interceptor_release_uninstalled_replacement();
         return replace_check;
     }
 
@@ -2121,16 +2209,37 @@ int dlopen_interceptor_attach()
                           getpid(),
                           memory_order_release);
     gum_interceptor_begin_transaction(dlopen_interceptor);
-    replace_check = gum_interceptor_replace_fast(dlopen_interceptor,
-                                                 dlopen_hook_address,
-                                                 (gpointer)&peak_dlopen,
-                                                 (gpointer*)(&original_dlopen),
-                                                 NULL);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (!dlopen_interceptor_test_forced_replace_failure(&replace_check))
+#endif
+    {
+        replace_check = gum_interceptor_replace_fast(
+            dlopen_interceptor,
+            dlopen_hook_address,
+            (gpointer)&peak_dlopen,
+            (gpointer*)(&original_dlopen),
+            NULL);
+    }
+    if (replace_check == GUM_REPLACE_OK) {
+        /*
+         * Record ownership before ending the Gum transaction can publish the
+         * replacement to another application thread.
+         */
+        atomic_store_explicit(&dlopen_replacement_installed_by_peak,
+                              true,
+                              memory_order_release);
+    }
     gum_interceptor_end_transaction(dlopen_interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish("dlopen replace finish",
                                                         detach_status);
+    }
+    if (replace_check != GUM_REPLACE_OK) {
+        g_printerr("[peak] skipping dlopen Gum replace: replace-fast-failed-%d\n",
+                   replace_check);
+        dlopen_interceptor_release_uninstalled_replacement();
+        return replace_check;
     }
     return replace_check;
 }
@@ -2143,7 +2252,9 @@ gboolean dlopen_interceptor_dettach()
         return FALSE;
     }
 
-    if (dlopen_interceptor != NULL && dlopen_hook_address != NULL) {
+    if (atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                             memory_order_acquire) &&
+        dlopen_interceptor != NULL && dlopen_hook_address != NULL) {
         PeakDetachRequest mutation_request = {
             .hook_id = 0,
             .symbol_name = "dlopen",
@@ -2201,6 +2312,8 @@ gboolean dlopen_interceptor_dettach()
     }
 
     if (entry_physically_restored &&
+        atomic_load_explicit(&dlopen_replacement_installed_by_peak,
+                             memory_order_acquire) &&
         dlopen_interceptor != NULL &&
         dlopen_hook_address != NULL) {
         PeakDetachRequest mutation_request = {
@@ -2239,6 +2352,15 @@ gboolean dlopen_interceptor_dettach()
     if (dlopen_interceptor != NULL) {
         g_object_unref(dlopen_interceptor);
     }
+
+    atomic_store_explicit(&dlopen_replacement_installed_by_peak,
+                          false,
+                          memory_order_release);
+    atomic_store_explicit(&dynamic_attach_owner_pid, 0, memory_order_release);
+    atomic_store_explicit(&dynamic_attach_fork_warning_pid,
+                          0,
+                          memory_order_relaxed);
+    original_dlopen = NULL;
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;

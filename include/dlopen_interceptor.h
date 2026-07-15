@@ -124,6 +124,11 @@ PEAK_DLOPEN_API void
 dlopen_interceptor_test_release_replacement_body(void);
 PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_entry_physically_restored(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_replacement_installed_by_peak(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_uninstalled_replacement_state_is_clean(void);
+PEAK_DLOPEN_API int dlopen_interceptor_test_attach(void);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_dettach(void);
 PEAK_DLOPEN_API unsigned long long
 dlopen_interceptor_test_controller_mutation_deferrals(void);

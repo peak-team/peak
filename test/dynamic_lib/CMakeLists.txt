@@ -61,6 +61,7 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/dlopen_mutation_guard.c
           ${DL_SRC_DIR}/dlopen_mutation_fairness.c
           ${DL_SRC_DIR}/dlopen_teardown_hot.c
+          ${DL_SRC_DIR}/dlopen_replace_failure.c
           ${DL_SRC_DIR}/fork_inflight_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
           ${DL_SRC_DIR}/nested_ifunc_outer.c
@@ -348,6 +349,39 @@ set_tests_properties(test_dynamic_dlopen_teardown_restores_entry_before_drain
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=peak_dlopen_teardown_unresolved_target;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_TEST_DLOPEN_BODY_PAUSE_MATCH=./libB.so;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_teardown_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "dlopen_teardown_entry_first_ok"
+    TIMEOUT 30
+)
+
+foreach(_replace_failure IN ITEMS -1 -2)
+  if(_replace_failure EQUAL -1)
+    set(_replace_failure_name wrong_signature)
+  else()
+    set(_replace_failure_name already_replaced)
+  endif()
+  add_test(NAME test_dynamic_dlopen_replace_failure_${_replace_failure_name}
+    COMMAND ${DL_DIR}/dlopen_replace_failure_test
+  )
+  set_tests_properties(
+    test_dynamic_dlopen_replace_failure_${_replace_failure_name}
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=peak_dlopen_replace_failure_target,b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_SAFE_DETACH_MODE=compatibility;PEAK_TEST_DLOPEN_REPLACE_RESULT=${_replace_failure};${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_replace_failure_${_replace_failure_name}_statslog;${PRELOAD_VAR}"
+      PASS_REGULAR_EXPRESSION "replace-fast-failed-${_replace_failure}.*peak_dlopen_replace_failure_target[*]*\\|[ \t]+2\\|.*dlopen_replace_failure_cleanup_ok"
+      FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\||Skipping remaining PEAK teardown"
+      TIMEOUT 30
+  )
+endforeach()
+
+add_test(NAME test_dynamic_dlopen_duplicate_peak_attach_preserves_ownership
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; peak = ctypes.CDLL(None); peak.dlopen_interceptor_test_replacement_installed_by_peak.restype = ctypes.c_int; peak.dlopen_interceptor_test_attach.restype = ctypes.c_int; assert peak.dlopen_interceptor_test_replacement_installed_by_peak() == 1; assert peak.dlopen_interceptor_test_attach() == -2; assert peak.dlopen_interceptor_test_replacement_installed_by_peak() == 1; library = ctypes.CDLL('./libB.so'); library.b_dynamic()"
+)
+set_tests_properties(
+  test_dynamic_dlopen_duplicate_peak_attach_preserves_ownership
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_duplicate_peak_attach_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dlopen Gum replacement is already installed by PEAK, preserving existing ownership.*b_dynamic[*]*\\|[ \t]+1\\|"
     TIMEOUT 30
 )
 
