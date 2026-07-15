@@ -48,6 +48,28 @@ dlopen_interceptor_shutdown_dynamic_attach(void)
     return TRUE;
 }
 
+gboolean
+dlopen_interceptor_pin_loaded_provider(gpointer address, void** handle_out)
+{
+    if (address == NULL || handle_out == NULL) {
+        return FALSE;
+    }
+    *handle_out = NULL;
+    return TRUE;
+}
+
+void
+dlopen_interceptor_commit_pinned_provider(void* handle)
+{
+    (void)handle;
+}
+
+void
+dlopen_interceptor_release_pinned_provider(void* handle)
+{
+    (void)handle;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_TEST_EXPORT __attribute__((visibility("default")))
 #else

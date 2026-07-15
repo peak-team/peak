@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
+#include "internal/dlopen_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
 #include "internal/jit_provider.h"
 #include "detach_controller.h"
@@ -9,6 +10,7 @@
 #include "internal/unsafe_gum_prologue.h"
 #include <errno.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>

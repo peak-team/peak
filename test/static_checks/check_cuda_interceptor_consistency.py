@@ -134,21 +134,23 @@ def main():
             "general listener must not use a loader-first resolver")
     require("peak_symbol_resolver" not in general,
             "general listener must not include the removed symbol resolver")
-    require("dlsym(" not in general and "RTLD_" not in general,
-            "general listener generic lookup must remain Frida-native")
     require("peak_general_listener_find_function(peak_hook_strings[i])" in general,
-            "generic target lookup must use the Frida-native helper")
+            "generic target lookup must use the shared lookup helper")
     generic_lookup = function_body(general,
                                    "peak_general_listener_find_function")
-    require("gum_find_function(symbol)" in generic_lookup,
-            "generic target lookup must keep Gum dynamic-binary resolution")
+    gum_lookup = generic_lookup.find("gum_find_function(symbol)")
+    loader_fallback = generic_lookup.find("dlsym(RTLD_DEFAULT, symbol)")
+    require(gum_lookup != -1 and loader_fallback != -1 and
+            gum_lookup < loader_fallback and general.count("dlsym(") == 1,
+            "generic target lookup must remain Gum-first with one exact "
+            "loader fallback for callable symbols Gum omits")
     require("gum_module_find_global_export_by_name" not in generic_lookup,
             "generic target lookup must not switch MPI ranks to export-only resolution")
     for relpath, symbols in support_sources.items():
         source = (repo_root / relpath).read_text(encoding="utf-8")
         for symbol in symbols:
             require(f'peak_general_listener_find_function("{symbol}")' in source,
-                    f"{relpath} must use Frida-native support lookup for {symbol}")
+                    f"{relpath} must use shared support lookup for {symbol}")
             require(f'gum_find_function("{symbol}")' not in source,
                     f"{relpath} must not broad-scan support hook {symbol}")
 
@@ -161,13 +163,13 @@ def main():
             "close interposition must not mutate a potentially overlapping libc entry")
 
     require('gum_find_function("' not in cuda,
-            "CUDA support hooks must use the Frida-native lookup helper")
+            "CUDA support hooks must use the shared lookup helper")
     require('gum_find_function("' not in general,
-            "general listener special cases must use the Frida-native lookup helper")
+            "general listener special cases must use the shared lookup helper")
 
     for hook in CUDA_HOOKS:
         require(f'peak_general_listener_find_function("{hook}")' in cuda,
-                f"missing Frida-native support CUDA hook lookup: {hook}")
+                f"missing shared support CUDA hook lookup: {hook}")
 
     require("PEAK_CUDA_WRAPPER_EXPORT extern \"C\" __attribute__((visibility(\"default\")))" in cuda,
             "CUDA wrapper export macro must use C linkage and default visibility")

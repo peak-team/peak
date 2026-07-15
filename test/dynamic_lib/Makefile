@@ -23,22 +23,32 @@ PY_SRC   := customCpackage.c
 FLAGS_TEST_SRC := dlopen_flags_test.c
 NESTED_OUTER_SRC := nested_dlopen_outer.c
 NESTED_IFUNC_OUTER_SRC := nested_ifunc_outer.c
+RESOLVER_NESTED_IFUNC_SRC := resolver_nested_ifunc.c
+STARTUP_RESOLVER_NESTED_IFUNC_SRC := startup_resolver_nested_ifunc.c
 CONCURRENT_DLOPEN_SRC := concurrent_dlopen.c
+FORK_INFLIGHT_DLOPEN_SRC := fork_inflight_dlopen.c
 IFUNC_TARGET_SRC := ifunc_target.c
 NOTYPE_TARGET_SRC := notype_target.S
+NOTYPE_EXECUTABLE_SRC := notype_executable_test.c
+STARTUP_UNLOADABLE_TARGET_SRC := startup_unloadable_target.c
+STARTUP_LOADER_SRC := startup_loader.c
+STARTUP_PROVIDER_TEST_SRC := startup_provider_retention_test.c
 LAZY_UNRESOLVED_SRC := lazy_unresolved.c
 LAZY_UNRESOLVED_O := lazy_unresolved.pic.o
+NOTYPE_EXECUTABLE_O := notype_target.exec.o
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DL_LIBS :=
 ELF_LAZY_FIXTURES :=
 ELF_CALLABLE_FIXTURES :=
+ELF_LIFECYCLE_FIXTURES :=
 ifeq ($(UNAME_S),Linux)
 DL_LIBS := -ldl
 ELF_LAZY_FIXTURES := libLazyUnresolved.so
+ELF_LIFECYCLE_FIXTURES := libStartupUnloadableTarget.so libStartupLoader.so startup_provider_retention_test
 ifneq ($(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)),)
-ELF_CALLABLE_FIXTURES := libIfuncTarget.so libNotypeTarget.so libNestedIfuncOuter.so
+ELF_CALLABLE_FIXTURES := libIfuncTarget.so libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test
 endif
 endif
 
@@ -64,9 +74,11 @@ all: libB.so libB.a libA_dynB.so libA_staB.so libA.a \
      main_dynA_dynB main_dynA_staB main_staA_dynB main_staA_staB \
      dlopen_flags_test \
      concurrent_dlopen_test \
+     fork_inflight_dlopen_test \
      libNestedOuter.so \
      $(ELF_LAZY_FIXTURES) \
      $(ELF_CALLABLE_FIXTURES) \
+     $(ELF_LIFECYCLE_FIXTURES) \
      $(PYTHON_EXTENSION_TARGETS)
 
 explain:
@@ -139,17 +151,41 @@ dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
 concurrent_dlopen_test: $(CONCURRENT_DLOPEN_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS) -pthread
 
+fork_inflight_dlopen_test: $(FORK_INFLIGHT_DLOPEN_SRC) libB.so libA_staB.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS) -pthread
+
 libNestedOuter.so: $(NESTED_OUTER_SRC) libB.so
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-soname,libNestedOuter.so
 
 libNestedIfuncOuter.so: $(NESTED_IFUNC_OUTER_SRC) libIfuncTarget.so
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-soname,libNestedIfuncOuter.so
 
+libResolverNestedIfunc.so: $(RESOLVER_NESTED_IFUNC_SRC) libB.so
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-soname,libResolverNestedIfunc.so
+
 libIfuncTarget.so: $(IFUNC_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libIfuncTarget.so
 
 libNotypeTarget.so: $(NOTYPE_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libNotypeTarget.so
+
+$(NOTYPE_EXECUTABLE_O): $(NOTYPE_TARGET_SRC)
+	$(CC) -O2 -Wall -Wextra -c $< -o $@
+
+notype_executable_test: $(NOTYPE_EXECUTABLE_SRC) $(NOTYPE_EXECUTABLE_O)
+	$(CC) -O2 -Wall -Wextra -Wl,--export-dynamic -o $@ $^
+
+startup_resolver_nested_ifunc_test: $(STARTUP_RESOLVER_NESTED_IFUNC_SRC) libB.so
+	$(CC) -O2 -Wall -Wextra -Wl,--export-dynamic -o $@ $< $(DL_LIBS)
+
+libStartupUnloadableTarget.so: $(STARTUP_UNLOADABLE_TARGET_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-soname,libStartupUnloadableTarget.so
+
+libStartupLoader.so: $(STARTUP_LOADER_SRC) libStartupUnloadableTarget.so
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-soname,libStartupLoader.so
+
+startup_provider_retention_test: $(STARTUP_PROVIDER_TEST_SRC) libStartupLoader.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< -L. -lStartupLoader $(DL_LIBS) $(RPATH)
 
 $(LAZY_UNRESOLVED_O): $(LAZY_UNRESOLVED_SRC)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -192,4 +228,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test customCpackage*.so

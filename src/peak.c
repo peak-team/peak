@@ -499,6 +499,15 @@ void peak_init()
     peak_detached = g_new0(gboolean, peak_hook_address_count);
     peak_jit_provider_enable();
     peak_general_listener_attach();
+    /*
+     * Dynamic target discovery may grow every hook-indexed table as soon as
+     * the dlopen replacement is published.  Create the global heartbeat table
+     * first so the controller grows it under the same listener lock instead
+     * of racing a later, independently sized allocation.
+     */
+    if (heartbeat_time != 0) {
+        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
+    }
     syscall_interceptor_attach();
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
     gboolean dynamic_attach_hook_installed = FALSE;
@@ -510,6 +519,10 @@ void peak_init()
          * Admission remains closed until the controller is running.
          */
         dynamic_attach_hook_installed = dlopen_interceptor_attach() == 0;
+    }
+    /* Finish every startup Gum mutation before the controller may stop peers. */
+    if (peak_memory_profile) {
+        malloc_interceptor_attach();
     }
     peak_general_listener_controller_start();
     if (need_dynamic_attach) {
@@ -523,7 +536,6 @@ void peak_init()
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
-        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
         args = g_new0(PeakHeartbeatArgs, 1);
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
@@ -544,9 +556,6 @@ void peak_init()
             heartbeat_overhead = NULL;
             exit(EXIT_FAILURE);
         }
-    }
-    if (peak_memory_profile) {
-        malloc_interceptor_attach();
     }
 }
 

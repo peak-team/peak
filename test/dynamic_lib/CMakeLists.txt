@@ -58,10 +58,17 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/customCpackage.c
           ${DL_SRC_DIR}/dlopen_flags_test.c
           ${DL_SRC_DIR}/concurrent_dlopen.c
+          ${DL_SRC_DIR}/fork_inflight_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
           ${DL_SRC_DIR}/nested_ifunc_outer.c
+          ${DL_SRC_DIR}/resolver_nested_ifunc.c
           ${DL_SRC_DIR}/ifunc_target.c
           ${DL_SRC_DIR}/notype_target.S
+          ${DL_SRC_DIR}/notype_executable_test.c
+          ${DL_SRC_DIR}/startup_resolver_nested_ifunc.c
+          ${DL_SRC_DIR}/startup_unloadable_target.c
+          ${DL_SRC_DIR}/startup_loader.c
+          ${DL_SRC_DIR}/startup_provider_retention_test.c
           ${DL_SRC_DIR}/lazy_unresolved.c
           ${DL_SRC_DIR}/multiple_providers.py
           ${DL_SRC_DIR}/fork_child_dlopen.py
@@ -115,6 +122,18 @@ add_test(NAME test_dynamic_nested_ifunc_constructor_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; ctypes.CDLL('./libNestedIfuncOuter.so')"
 )
+
+add_test(NAME test_dynamic_resolver_nested_dlopen_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; ctypes.CDLL('./libResolverNestedIfunc.so')"
+)
+set_tests_properties(test_dynamic_resolver_nested_dlopen_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_resolver_nested_ifunc,b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_resolver_nested_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
+)
 set_tests_properties(test_dynamic_nested_ifunc_constructor_first_call
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
@@ -132,6 +151,27 @@ set_tests_properties(test_dynamic_dlopen_notype_first_call
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=peak_notype_target;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_notype_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "peak_notype_target[*]*\\|[ \t]+1\\|"
+)
+
+add_test(NAME test_startup_executable_notype_target
+  COMMAND ${DL_DIR}/notype_executable_test
+)
+set_tests_properties(test_startup_executable_notype_target
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_notype_target;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_executable_notype_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "peak_notype_target[*]*\\|[ \t]+1\\|"
+)
+
+add_test(NAME test_startup_resolver_nested_dlopen_first_call
+  COMMAND ${DL_DIR}/startup_resolver_nested_ifunc_test
+)
+set_tests_properties(test_startup_resolver_nested_dlopen_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_startup_resolver_ifunc,b_dynamic;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_resolver_nested_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "startup_resolver_nested_ifunc_ok.*peak_startup_resolver_ifunc[*]*\\|[ \t]+1\\|.*b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
 )
 endif()
 
@@ -191,6 +231,17 @@ set_tests_properties(test_dynamic_dlopen_multiple_providers
 add_test(NAME test_dynamic_concurrent_dlopen_requests
   COMMAND ${DL_DIR}/concurrent_dlopen_test
 )
+
+add_test(NAME test_dynamic_concurrent_dlopen_with_heartbeat
+  COMMAND ${DL_DIR}/concurrent_dlopen_test
+)
+set_tests_properties(test_dynamic_concurrent_dlopen_with_heartbeat
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_concurrent_heartbeat_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+16\\|"
+    TIMEOUT 30
+)
 set_tests_properties(test_dynamic_concurrent_dlopen_requests
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
@@ -202,6 +253,30 @@ set_tests_properties(test_dynamic_concurrent_dlopen_requests
 add_test(NAME test_dynamic_fork_child_dlopen_no_deadlock
   COMMAND ${Python3_EXECUTABLE} ${DL_DIR}/fork_child_dlopen.py
 )
+
+add_test(NAME test_dynamic_fork_inflight_dlopen_no_deadlock
+  COMMAND ${DL_DIR}/fork_inflight_dlopen_test
+)
+set_tests_properties(test_dynamic_fork_inflight_dlopen_no_deadlock
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_DLOPEN_ATTACH_DELAY_MS=1500;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_fork_inflight_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "fork_inflight_dlopen_ok"
+    TIMEOUT 10
+)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_test(NAME test_startup_provider_retained_until_hook_detach
+    COMMAND ${DL_DIR}/startup_provider_retention_test
+  )
+  set_tests_properties(test_startup_provider_retained_until_hook_detach
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=peak_startup_unloadable_target,peak_startup_unloadable_target_second;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_provider_retention_statslog;${PRELOAD_VAR}"
+      PASS_REGULAR_EXPRESSION "startup_provider_retained_ok.*peak_startup_unloadable_target[*]*\\|[ \t]+2\\|.*peak_startup_unloadable_target_second[*]*\\|[ \t]+2\\|"
+      TIMEOUT 30
+  )
+endif()
 set_tests_properties(test_dynamic_fork_child_dlopen_no_deadlock
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}

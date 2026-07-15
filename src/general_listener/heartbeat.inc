@@ -299,22 +299,32 @@ void* peak_heartbeat_monitor(void* arg) {
     unsigned int heartbeat_counter = 0;
     const unsigned int local_mpi_ranks =
         peak_general_listener_local_mpi_ranks();
+    size_t heartbeat_capacity;
 
     gum_interceptor_ignore_current_thread(interceptor);
 
-    OverheadEntry* entries = g_new0(OverheadEntry, peak_hook_address_count);
+    /*
+     * Take one coherent capacity snapshot.  Dynamic provider discovery can
+     * append hook generations concurrently, but it never shrinks them; the
+     * normal growth path below will catch anything appended after this lock.
+     */
+    pthread_mutex_lock(&lock);
+    heartbeat_capacity = peak_hook_address_count;
+    pthread_mutex_unlock(&lock);
 
-    gulong* calls_snapshot = g_new0(gulong, peak_hook_address_count);
-    double* profile_seconds_snapshot = g_new0(double, peak_hook_address_count);
-    double* lifetime_snapshot = g_new0(double, peak_hook_address_count);
-    double* ratio_snapshot = g_new0(double, peak_hook_address_count);
-    double* rate_snapshot = g_new0(double, peak_hook_address_count);
-    gulong* previous_calls = g_new0(gulong, peak_hook_address_count);
-    double* previous_time = g_new0(double, peak_hook_address_count);
-    gboolean* recent_baseline_ready = g_new0(gboolean, peak_hook_address_count);
+    OverheadEntry* entries = g_new0(OverheadEntry, heartbeat_capacity);
+
+    gulong* calls_snapshot = g_new0(gulong, heartbeat_capacity);
+    double* profile_seconds_snapshot = g_new0(double, heartbeat_capacity);
+    double* lifetime_snapshot = g_new0(double, heartbeat_capacity);
+    double* ratio_snapshot = g_new0(double, heartbeat_capacity);
+    double* rate_snapshot = g_new0(double, heartbeat_capacity);
+    gulong* previous_calls = g_new0(gulong, heartbeat_capacity);
+    double* previous_time = g_new0(double, heartbeat_capacity);
+    gboolean* recent_baseline_ready = g_new0(gboolean, heartbeat_capacity);
 
     double now0 = peak_second();
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
+    for (size_t i = 0; i < heartbeat_capacity; i++) {
         calls_snapshot[i] = 0;
         profile_seconds_snapshot[i] = 0.0;
         lifetime_snapshot[i] = 0.0;
@@ -331,7 +341,6 @@ void* peak_heartbeat_monitor(void* arg) {
     double prev_global_overhead = 0.0;
     double prev_global_time     = now0;
     double ema_global_rate      = 0.0;
-    size_t heartbeat_capacity = peak_hook_address_count;
     double min_detach_observation_time =
         (double)MAX(MAX(heartbeat_time, hb_min_us),
                     PEAK_HEARTBEAT_MIN_OBSERVATION_US) / 1e6;

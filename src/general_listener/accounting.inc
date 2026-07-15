@@ -546,9 +546,27 @@ peak_symbol_should_use_cpp_map(const char* symbol)
 gpointer
 peak_general_listener_find_function(const char* symbol)
 {
+    gpointer address;
+
     if (symbol == NULL) {
         return NULL;
     }
 
-    return gum_find_function(symbol);
+    address = gum_find_function(symbol);
+    if (address != NULL) {
+        return address;
+    }
+
+    /*
+     * Gum's ELF export walk intentionally excludes callable STT_NOTYPE (and
+     * may omit IFUNC entries).  Let the platform loader resolve the exact
+     * globally visible symbol so startup targets use the same callable entry
+     * semantics as runtime provider-scoped resolution.
+     */
+    dlerror();
+    address = dlsym(RTLD_DEFAULT, symbol);
+    if (dlerror() != NULL) {
+        return NULL;
+    }
+    return address;
 }

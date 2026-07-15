@@ -117,8 +117,13 @@ def check_dlopen_revert_transactions(repo_root):
 
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    malloc_source = (
+        repo_root / "src/malloc_interceptor.c"
+    ).read_text(encoding="utf-8")
+    general = read_source(repo_root, "src/general_listener.c")
     body = extract_function(source, "peak_init")
     fini = extract_function(source, "peak_fini_impl")
+    monitor = extract_function(general, "peak_heartbeat_monitor")
 
     main_time_position = body.find("peak_main_time = peak_second();")
     runtime_start_position = body.find("peak_general_listener_note_runtime_start")
@@ -132,6 +137,55 @@ def check_peak_init_heartbeat_order(repo_root):
             "peak_init must create the heartbeat thread explicitly")
     require(runtime_start_position < heartbeat_position,
             "runtime start timestamp must be initialized before heartbeat thread startup")
+    heartbeat_storage_position = body.find(
+        "heartbeat_overhead = g_new0(gdouble, peak_hook_address_count)"
+    )
+    dlopen_attach_position = body.find("dlopen_interceptor_attach()")
+    malloc_attach_position = body.find("malloc_interceptor_attach()")
+    controller_start_position = body.find(
+        "peak_general_listener_controller_start()"
+    )
+    require(heartbeat_storage_position != -1 and
+            dlopen_attach_position != -1 and
+            malloc_attach_position != -1 and
+            controller_start_position != -1 and
+            heartbeat_storage_position < dlopen_attach_position <
+            malloc_attach_position < controller_start_position,
+            "heartbeat storage and all startup Gum mutations must finish "
+            "before the controller can admit dynamic work")
+
+    capacity_snapshot = monitor.find(
+        "heartbeat_capacity = peak_hook_address_count"
+    )
+    snapshot_lock = monitor.rfind(
+        "pthread_mutex_lock(&lock)", 0, capacity_snapshot
+    )
+    snapshot_unlock = monitor.find(
+        "pthread_mutex_unlock(&lock)", capacity_snapshot
+    )
+    first_local_allocation = monitor.find(
+        "g_new0(OverheadEntry, heartbeat_capacity)"
+    )
+    require(snapshot_lock != -1 and capacity_snapshot != -1 and
+            snapshot_unlock != -1 and first_local_allocation != -1 and
+            snapshot_lock < capacity_snapshot < snapshot_unlock <
+            first_local_allocation,
+            "heartbeat local arrays must use one listener-locked capacity snapshot")
+    require("g_new0(OverheadEntry, peak_hook_address_count)" not in monitor and
+            "g_new0(gulong, peak_hook_address_count)" not in monitor and
+            "g_new0(double, peak_hook_address_count)" not in monitor and
+            "g_new0(gboolean, peak_hook_address_count)" not in monitor,
+            "heartbeat startup must not independently size local arrays from "
+            "a concurrently growing hook count")
+    malloc_attach = extract_function(
+        malloc_source, "malloc_interceptor_attach"
+    )
+    malloc_state_init = malloc_attach.find("init_table()")
+    malloc_hook_publish = malloc_attach.find("gum_interceptor_begin_transaction")
+    require(malloc_state_init != -1 and malloc_hook_publish != -1 and
+            malloc_state_init < malloc_hook_publish,
+            "malloc hook state must be initialized before allocator replacements "
+            "become visible to existing threads")
     elapsed_position = fini.find("peak_main_time = peak_second() - peak_runtime_start_time")
     controller_stop_position = fini.find("peak_general_listener_controller_stop()")
     require(elapsed_position != -1 and controller_stop_position != -1 and
@@ -1257,6 +1311,9 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     enable = extract_function(
         dlopen, "dlopen_interceptor_enable_dynamic_attach"
     )
+    dlopen_attach_body = extract_function(
+        dlopen, "dlopen_interceptor_attach"
+    )
     ready = extract_function(
         general, "peak_general_listener_controller_is_ready"
     )
@@ -1271,6 +1328,17 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     require("peak_general_listener_controller_is_ready" in enable and
             "return FALSE" in enable,
             "dlopen admission must fail closed without a running drainer")
+    owner_publish = dlopen_attach_body.find(
+        "atomic_store_explicit(&dynamic_attach_owner_pid"
+    )
+    replacement_publish = dlopen_attach_body.find(
+        "gum_interceptor_replace_fast"
+    )
+    require(owner_publish != -1 and replacement_publish != -1 and
+            owner_publish < replacement_publish,
+            "dlopen fork ownership must be visible before the replacement is published")
+    require("dynamic_attach_owner_pid" not in enable,
+            "fork ownership publication must not be deferred until dynamic admission")
     listener_attach = init.find("peak_general_listener_attach();")
     dynamic_needed = init.find("peak_general_listener_needs_dynamic_attach();")
     dlopen_attach = init.find("dlopen_interceptor_attach()")
@@ -1322,6 +1390,62 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             attach_request,
             "dynamic attach module-name fallback must handle relative and "
             "absolute dlopen paths")
+
+    resolver_wait = extract_function(
+        dlopen, "dlopen_interceptor_resolve_symbol_on_waiting_caller"
+    )
+    caller_wait = extract_function(
+        dlopen, "dlopen_interceptor_wait_for_dynamic_attach_request"
+    )
+    peak_dlopen = extract_function(dlopen, "peak_dlopen")
+    require("dynamic_attach_resolution_reentrant" not in dlopen and
+            "dynamic_attach_resolution_wait_request" in caller_wait and
+            "dlopen_interceptor_service_resolution_nested_request" in
+            resolver_wait and
+            "resolution_nested_generation" in resolver_wait and
+            "dynamic_attach_resolution_wait_request" not in peak_dlopen,
+            "resolver-time nested dlopen must be serviced recursively, not bypassed")
+
+    startup_attach = extract_function(general, "peak_general_listener_attach")
+    pin_provider = extract_function(
+        dlopen, "dlopen_interceptor_pin_loaded_provider"
+    )
+    find_function = extract_function(
+        general, "peak_general_listener_find_function"
+    )
+    require("dlopen_interceptor_pin_loaded_provider" in startup_attach and
+            "dlopen_interceptor_commit_pinned_provider" in startup_attach and
+            startup_attach.find("dlopen_interceptor_pin_loaded_provider") <
+            startup_attach.find(
+                "peak_general_listener_attach_target_is_supported") <
+            startup_attach.find("peak_general_listener_attach_exact") <
+            startup_attach.find("dlopen_interceptor_commit_pinned_provider"),
+            "startup hooks must pin an unloadable provider before inspecting "
+            "or patching its code")
+    require("gum_process_get_main_module" in pin_provider and
+            "g_object_unref(main_module)" not in pin_provider and
+            "dladdr(address, &provider_info)" in pin_provider and
+            "dynamic_attach_retained_provider_paths" in pin_provider and
+            "g_hash_table_contains" in pin_provider,
+            "provider pinning must preserve Gum's borrowed main-module "
+            "reference and deduplicate loader references by provider")
+    require("dlsym(RTLD_DEFAULT, symbol)" in find_function,
+            "startup lookup must fall back to the loader for executable "
+            "STT_NOTYPE and IFUNC symbols")
+
+    dynamic_tests = (
+        repo_root / "test/dynamic_lib/CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+    for test_name in (
+        "test_dynamic_resolver_nested_dlopen_first_call",
+        "test_startup_resolver_nested_dlopen_first_call",
+        "test_startup_executable_notype_target",
+        "test_dynamic_concurrent_dlopen_with_heartbeat",
+        "test_dynamic_fork_inflight_dlopen_no_deadlock",
+        "test_startup_provider_retained_until_hook_detach",
+    ):
+        require(test_name in dynamic_tests,
+                f"missing dynamic loader lifecycle regression {test_name}")
 
 
 def check_exclusive_time_nonnegative(repo_root):

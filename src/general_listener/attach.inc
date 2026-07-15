@@ -337,12 +337,28 @@ void peak_general_listener_attach()
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
             gpointer resolved_hook_address = hook_address[i];
+            void* pinned_provider = NULL;
+            if (!dlopen_interceptor_pin_loaded_provider(
+                    resolved_hook_address,
+                    &pinned_provider)) {
+                g_printerr("[peak] skipping initial Gum attach for hook %lu (%s): unable to retain its loaded provider\n",
+                           (unsigned long)i,
+                           peak_hook_strings[i] != NULL
+                               ? peak_hook_strings[i]
+                               : "<unknown>");
+                hook_address[i] = NULL;
+                g_free(peak_demangled_strings[i]);
+                peak_demangled_strings[i] = NULL;
+                continue;
+            }
             if (!peak_general_listener_attach_target_is_supported(
                     peak_hook_strings[i],
                     resolved_hook_address)) {
                 hook_address[i] = NULL;
                 g_free(peak_demangled_strings[i]);
                 peak_demangled_strings[i] = NULL;
+                dlopen_interceptor_release_pinned_provider(
+                    pinned_provider);
                 continue;
             }
             GumInvocationListener* new_listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
@@ -368,6 +384,8 @@ void peak_general_listener_attach()
                 peak_demangled_strings[i] = NULL;
                 peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
                 g_object_unref(new_listener);
+                dlopen_interceptor_release_pinned_provider(
+                    pinned_provider);
                 continue;
             }
             gum_interceptor_begin_transaction(interceptor);
@@ -388,6 +406,8 @@ void peak_general_listener_attach()
                 array_listener_gum_detached[i] = FALSE;
                 array_listener_gum_detach_flushed[i] = TRUE;
                 peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
+                dlopen_interceptor_commit_pinned_provider(
+                    pinned_provider);
             } else {
                 g_printerr("[peak] Gum initial attach failed for hook %lu (%s), status=%d\n",
                            (unsigned long)i,
@@ -397,6 +417,8 @@ void peak_general_listener_attach()
                 g_object_unref(new_listener);
                 g_free(peak_demangled_strings[i]);
                 peak_demangled_strings[i] = NULL;
+                dlopen_interceptor_release_pinned_provider(
+                    pinned_provider);
             }
         }
     }

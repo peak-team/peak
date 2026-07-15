@@ -651,6 +651,10 @@ static void memory_usage_log_print(void) {
     } while (0)
 
 int malloc_interceptor_attach(void) {
+    /* Publish fully initialized hook state before any allocator entry is patched. */
+    init_table();
+    peak_memlog_open();
+
     malloc_interceptor = gum_interceptor_obtain();
     gum_interceptor_begin_transaction(malloc_interceptor);
 
@@ -669,9 +673,6 @@ int malloc_interceptor_attach(void) {
     DO_REPLACE_FAST(posix_memalign_addr,custom_posix_memalign,original_posix_memalign,"posix_memalign");
 
     gum_interceptor_end_transaction(malloc_interceptor);
-
-    init_table();
-    peak_memlog_open();
 
     peak_log_info("[peak] Memory allocation functions intercepted successfully\n");
     return 0;
