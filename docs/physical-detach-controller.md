@@ -856,19 +856,22 @@ admission and controller-owned drains are closed separately before the
 controller thread exits; that lifecycle step deliberately does not wait for
 replacement bodies while the patched entry can still admit new callers. If a
 replacement body does not drain within the bounded shutdown
-window, teardown fails closed and leaves the interceptor state alive. The first
-executable operation in `peak_dlopen` is a lock-free atomic entry registration.
-On Arm64 it is an explicitly inline `LDAXR`/`STLXR` retry loop, rather than a C
-atomic that the compiler may lower to an out-of-line `__aarch64_*` helper. It
-executes before `getpid()`, TLS lookup, controller queries, cancellation
-control, or any other call that could leave the guarded entry range. A
-cross-code-generation test enables outline atomics deliberately, rejects
-branch-and-link instructions before publication, and requires the
-store-exclusive to remain inside the 256-byte entry guard. Native Arm64 builds
-also disassemble the production `peak_dlopen` body and enforce the same
-properties. A stopped thread is therefore either still inside the blocked
-entry range or already represented by the replacement-body count; zero cannot
-become nonzero after strict entry restoration.
+window, teardown fails closed and leaves the interceptor state alive. The
+`peak_dlopen` replacement entry is a small assembly stub, so compiler-added
+sanitizer coverage, function profiling, split-stack, or similar prologues cannot
+run before ownership is published. The x86_64 stub uses a locked increment; the
+Arm64 stub uses an `LDAXR`/`STLXR` retry loop. Both then tail-branch to the C
+replacement body, which owns the matching decrement on every return. This
+publication therefore precedes `getpid()`, TLS lookup, controller queries,
+cancellation control, and every compiler-generated call that could leave the
+guarded entry range. A cross-assembly test deliberately enables outline atomics
+and hostile instrumentation flags. Native x86_64 and Arm64 builds disassemble
+both the production entry and an actually instrumented C fixture, reject any
+entry call or pre-publication control transfer, and require publication and the
+tail branch to remain inside the 256-byte entry guard. A stopped thread is
+therefore either still inside the blocked entry range or already represented by
+the replacement-body count; zero cannot become nonzero after strict entry
+restoration.
 
 PEAK records `dlopen` replacement ownership only when
 `gum_interceptor_replace_fast()` returns `GUM_REPLACE_OK`, before ending the Gum

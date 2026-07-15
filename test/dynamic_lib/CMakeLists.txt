@@ -114,8 +114,9 @@ add_test(NAME test_dynamic_dlopen_first_call
           "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic()"
 )
 
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _PEAK_DYNAMIC_TEST_PROCESSOR)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+   _PEAK_DYNAMIC_TEST_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
 add_test(NAME test_dynamic_dlopen_ifunc_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libIfuncTarget.so'); lib.peak_ifunc_target()"

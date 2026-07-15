@@ -20,6 +20,13 @@ set(sources_peak
     exec_raw_syscall.c
 )
 
+# Strict dlopen teardown needs a compiler-proof entry stub.  The shared
+# detach-helper predicate covers the Linux x86_64/AArch64 platforms for which
+# the assembler language was enabled at the project root.
+if(PEAK_DETACH_HELPER_SUPPORTED)
+    list(APPEND sources_peak dlopen_entry_stub.S)
+endif()
+
 # The C dispatcher is portable. Its assembly syscall interposer is selected by
 # the shared platform contract used at the project root and in platform tests.
 peak_exec_append_raw_syscall_trampoline(
@@ -80,6 +87,7 @@ if(PEAK_DETACH_HELPER_SUPPORTED)
     )
     target_compile_definitions(peak
         PRIVATE
+            PEAK_DLOPEN_ASM_ENTRY_STUB=1
             "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
             "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_PREFIX}/bin/peak_detach_helper\""
     )

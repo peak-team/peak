@@ -36,14 +36,15 @@ def main():
     platform_cmake = read(root, "cmake/exec-platform.cmake")
     source_cmake = read(root, "src/CMakeLists.txt")
     tests_cmake = read(root, "test/CMakeLists.txt")
+    dynamic_tests_cmake = read(root, "test/dynamic_lib/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
-    entry_accounting = read(root, "src/dlopen_entry_accounting.h")
+    entry_stub = read(root, "src/dlopen_entry_stub.S")
     entry_codegen = read(
         root, "test/static_checks/check_aarch64_dlopen_entry_codegen.py")
     entry_binary = read(
-        root, "test/static_checks/check_aarch64_dlopen_entry_binary.py")
+        root, "test/static_checks/check_dlopen_entry_binary.py")
     entry_fixture = read(
-        root, "test/static_checks/aarch64_dlopen_entry_codegen.c")
+        root, "test/static_checks/dlopen_entry_hostile_fixture.c")
 
     require("peak_exec_configure_platform_support()" in top_cmake and
             "set(PEAK_DETACH_HELPER_SUPPORTED" not in top_cmake,
@@ -78,24 +79,51 @@ def main():
             "shared exec/detach platform predicate failed:\n" + predicate.stdout)
     require("aarch64" in frida_cmake and "arm64" in frida_cmake,
             "Frida Gum auto-patch selection must include Linux arm64/aarch64")
-    for token in ["__aarch64__", "ldaxr", "stlxr", "cbnz", '"memory"']:
-        require(token in entry_accounting,
-                f"dlopen entry accounting missing inline Arm64 token: {token}")
-    require("PEAK_DLOPEN_REGISTER_REPLACEMENT_ENTRY" in entry_fixture and
+    for token in [
+        "__x86_64__",
+        "lock addl",
+        "__aarch64__",
+        "ldaxr",
+        "stlxr",
+        "cbnz",
+        "peak_dlopen_active_replacement_count",
+        "peak_dlopen_body",
+    ]:
+        require(token in entry_stub,
+                f"compiler-proof dlopen entry stub missing token: {token}")
+    require("list(APPEND sources_peak dlopen_entry_stub.S)" in source_cmake and
+            "PEAK_DLOPEN_ASM_ENTRY_STUB=1" in source_cmake,
+            "supported strict-detach builds must compile and select the "
+            "assembly dlopen entry stub")
+    require("peak_dlopen_body" in entry_fixture and
             "test_aarch64_dlopen_entry_codegen" in tests_cmake and
             "--target=aarch64-linux-gnu" in entry_codegen and
             '"-moutline-atomics"' in entry_codegen and
+            '"-fsanitize-coverage=trace-pc"' in entry_codegen and
+            '"-finstrument-functions"' in entry_codegen and
             "(?:bl|blr[a-z0-9]*)" in entry_codegen and
-            '"__aarch64_"' in entry_codegen and
+            '"__sanitizer_"' in entry_codegen and
+            '"__cyg_profile_"' in entry_codegen and
             "stlxr_index * 4 >= 256" in entry_codegen,
-            "Arm64 dlopen entry accounting must have a cross-codegen test that "
-            "rejects outline calls and publication outside the teardown guard")
-    require("test_aarch64_dlopen_entry_binary_codegen" in tests_cmake and
-            "--disassemble=peak_dlopen" in entry_binary and
+            "Arm64 dlopen entry accounting must cross-assemble the production "
+            "stub under hostile compiler flags and reject calls or late publication")
+    require("test_dlopen_entry_binary_codegen" in tests_cmake and
+            "test_dlopen_entry_hostile_binary_codegen" in tests_cmake and
+            "--require-body-instrumentation" in tests_cmake and
+            'f"--disassemble={symbol}"' in entry_binary and
+            'f"--disassemble-symbols={symbol}"' in entry_binary and
             'mnemonic.startswith("blr")' in entry_binary and
-            "publication_address - start >= args.guard_bytes" in entry_binary,
-            "native Arm64 builds must disassemble the production peak_dlopen "
-            "and reject calls or late publication before the teardown guard")
+            "publication_address - start >= args.guard_bytes" in entry_binary and
+            "hostile fixture body was not instrumented" in entry_binary,
+            "native x86_64/Arm64 builds must disassemble the production and "
+            "hostile entry stubs, reject calls or late publication, and prove "
+            "the hostile C body was actually instrumented")
+    require("string(TOLOWER" in tests_cmake and
+            "_PEAK_TEST_PROCESSOR" in tests_cmake and
+            "string(TOLOWER" in dynamic_tests_cmake and
+            "_PEAK_DYNAMIC_TEST_PROCESSOR" in dynamic_tests_cmake,
+            "native entry and IFUNC tests must normalize processor aliases, "
+            "including uppercase ARM64")
     require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in peak_api,
             "PEAK Gum API header must expose an Arm64 ABI fingerprint")
     require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in frida_cmake,

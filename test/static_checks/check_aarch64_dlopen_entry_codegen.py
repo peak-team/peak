@@ -15,7 +15,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--source", required=True)
-    parser.add_argument("--include", required=True)
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="peak-aarch64-entry-") as tmp:
@@ -26,12 +25,11 @@ def main():
             "-std=c11",
             "-O2",
             "-S",
-            "-nostdinc",
+            "-x",
+            "assembler-with-cpp",
             "-moutline-atomics",
-            "-fno-stack-protector",
-            "-fno-asynchronous-unwind-tables",
-            "-I",
-            args.include,
+            "-fsanitize-coverage=trace-pc",
+            "-finstrument-functions",
             args.source,
             "-o",
             str(assembly_path),
@@ -48,12 +46,12 @@ def main():
         assembly = assembly_path.read_text(encoding="utf-8")
 
     match = re.search(
-        r"(?ms)^peak_dlopen_entry_codegen_probe:\s*(.*?)"
-        r"^\s*\.size\s+peak_dlopen_entry_codegen_probe\b",
+        r"(?ms)^peak_dlopen:\s*(.*?)"
+        r"^\s*\.size\s+peak_dlopen\b",
         assembly,
     )
     if match is None:
-        fail("missing probe body in generated AArch64 assembly", assembly)
+        fail("missing entry stub in generated AArch64 assembly", assembly)
     body = match.group(1)
 
     ldaxr = body.find("ldaxr")
@@ -63,8 +61,14 @@ def main():
         fail("entry registration is not an inline LDAXR/STLXR retry loop", assembly)
     if re.search(r"(?m)^\s*(?:bl|blr[a-z0-9]*)\s", body):
         fail("entry registration emitted an out-of-line call", assembly)
-    if "__aarch64_" in body:
-        fail("entry registration references an AArch64 outline-atomic helper", assembly)
+    for forbidden in ("__aarch64_", "__sanitizer_", "__cyg_profile_",
+                      "__morestack"):
+        if forbidden in body:
+            fail("entry registration references an entry-instrumentation helper: " +
+                 forbidden, assembly)
+    if not re.search(r"(?m)^\s*b\s+peak_dlopen_body\s*$", body):
+        fail("entry stub does not tail-branch directly to peak_dlopen_body",
+             assembly)
 
     instruction_lines = [
         line

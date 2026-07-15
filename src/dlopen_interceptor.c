@@ -15,8 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "dlopen_entry_accounting.h"
-
 #if defined(__linux__)
 #include <link.h>
 #endif
@@ -130,17 +128,25 @@ static gboolean
 dlopen_interceptor_service_resolution_nested_request(void);
 static gboolean
 dlopen_interceptor_string_equal(gconstpointer left, gconstpointer right);
+#ifdef PEAK_DLOPEN_ASM_ENTRY_STUB
+__attribute__((visibility("hidden")))
+void* peak_dlopen(const char* filename, int flags);
+#endif
 
 static pthread_mutex_t dynamic_attach_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dynamic_attach_gate_cond = PTHREAD_COND_INITIALIZER;
 static PeakDlopenControllerState dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
 static unsigned int active_dynamic_attach_count = 0;
-static _Atomic unsigned int active_dlopen_replacement_count = 0;
+_Atomic unsigned int peak_dlopen_active_replacement_count
+    __attribute__((visibility("hidden"))) = 0;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "dlopen replacement entry accounting must be lock-free");
-#if defined(__aarch64__)
+#ifdef PEAK_DLOPEN_ASM_ENTRY_STUB
+_Static_assert(sizeof(unsigned int) == 4 &&
+                   sizeof(_Atomic unsigned int) == 4,
+               "assembly dlopen entry accounting requires a 32-bit counter");
 _Static_assert(_Alignof(_Atomic unsigned int) >= sizeof(unsigned int),
-               "AArch64 dlopen entry accounting requires an aligned word");
+               "assembly dlopen entry accounting requires an aligned word");
 #endif
 static gboolean dynamic_attach_drain_active = FALSE;
 static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_head = NULL;
@@ -474,13 +480,13 @@ static void
 dlopen_interceptor_end_replacement_call(void)
 {
     unsigned int previous = atomic_fetch_sub_explicit(
-        &active_dlopen_replacement_count,
+        &peak_dlopen_active_replacement_count,
         1,
         memory_order_acq_rel);
 
     if (previous == 0) {
         /* Keep an unmatched release fail-closed instead of wrapping to UINT_MAX. */
-        atomic_fetch_add_explicit(&active_dlopen_replacement_count,
+        atomic_fetch_add_explicit(&peak_dlopen_active_replacement_count,
                                   1,
                                   memory_order_relaxed);
         return;
@@ -495,7 +501,7 @@ dlopen_interceptor_end_replacement_call(void)
 static unsigned int
 dlopen_interceptor_active_replacement_count(void)
 {
-    return atomic_load_explicit(&active_dlopen_replacement_count,
+    return atomic_load_explicit(&peak_dlopen_active_replacement_count,
                                 memory_order_acquire);
 }
 
@@ -672,7 +678,7 @@ dlopen_interceptor_wait_for_replacement_idle(void)
                                         PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    while (atomic_load_explicit(&active_dlopen_replacement_count,
+    while (atomic_load_explicit(&peak_dlopen_active_replacement_count,
                                 memory_order_acquire) > 0) {
         int wait_status =
             pthread_cond_timedwait(&dynamic_attach_gate_cond,
@@ -1147,7 +1153,7 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_state =
         open ? PEAK_DLOPEN_CONTROLLER_OPEN : PEAK_DLOPEN_CONTROLLER_CLOSED;
     active_dynamic_attach_count = 0;
-    atomic_store_explicit(&active_dlopen_replacement_count,
+    atomic_store_explicit(&peak_dlopen_active_replacement_count,
                           0,
                           memory_order_release);
     dynamic_attach_drain_active = FALSE;
@@ -2088,8 +2094,10 @@ dlopen_interceptor_release_retained_dynamic_handles(void)
     dlopen_interceptor_trace_counters("release-retained-handles");
 }
 
-static void* __attribute__((noinline, no_instrument_function))
-peak_dlopen(const char *filename, int flags) {
+__attribute__((visibility("hidden"), noinline, no_instrument_function))
+void*
+peak_dlopen_body(const char *filename, int flags)
+{
     static const char fork_warning[] =
         "[peak] fork child dynamic dlopen profiling is unsupported until exec; using the real dlopen without inherited PEAK controller state\n";
     pid_t current_pid;
@@ -2098,19 +2106,6 @@ peak_dlopen(const char *filename, int flags) {
     void *handle;
     PeakDlopenDynamicAttachRequest* request = NULL;
     PeakDlopenRequestState request_state = PEAK_DLOPEN_REQUEST_NO_MATCH;
-
-    /*
-     * This must remain the first executable statement.  Strict teardown
-     * restores the real dlopen entry while peers are stopped, then waits for
-     * this count before releasing Gum's trampoline metadata.  On AArch64 the
-     * registration macro expands to an inline LDAXR/STLXR loop,
-     * because a lock-free C atomic may otherwise call an out-of-line helper.
-     * The existing x86_64 path retains its direct C11 atomic operation.
-     * Registration therefore cannot leave the guarded entry range through a
-     * helper call before the body becomes visible.
-     */
-    PEAK_DLOPEN_REGISTER_REPLACEMENT_ENTRY(
-        &active_dlopen_replacement_count);
 
     current_pid = getpid();
     owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
@@ -2210,6 +2205,18 @@ peak_dlopen(const char *filename, int flags) {
     }
     return handle;
 }
+
+#ifndef PEAK_DLOPEN_ASM_ENTRY_STUB
+static void* __attribute__((noinline, no_instrument_function))
+peak_dlopen(const char* filename, int flags)
+{
+    /* Unsupported strict-detach platforms retain best-effort C accounting. */
+    atomic_fetch_add_explicit(&peak_dlopen_active_replacement_count,
+                              1,
+                              memory_order_acq_rel);
+    return peak_dlopen_body(filename, flags);
+}
+#endif
 
 static void
 dlopen_interceptor_release_uninstalled_replacement(void)

@@ -93,23 +93,60 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/static_checks/check_aarch64_dlopen_entry_codegen.py
                     --compiler ${PEAK_AARCH64_CODEGEN_CLANG}
-                    --source ${PROJECT_SOURCE_DIR}/test/static_checks/aarch64_dlopen_entry_codegen.c
-                    --include ${PROJECT_SOURCE_DIR}/src)
+                    --source ${PROJECT_SOURCE_DIR}/src/dlopen_entry_stub.S)
         set_tests_properties(test_aarch64_dlopen_entry_codegen
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "aarch64_dlopen_entry_codegen_ok")
     endif()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _PEAK_TEST_PROCESSOR)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-        add_test(NAME test_aarch64_dlopen_entry_binary_codegen
+       _PEAK_TEST_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+        if(_PEAK_TEST_PROCESSOR MATCHES "^(x86_64|amd64)$")
+            set(_PEAK_TEST_ENTRY_ARCHITECTURE x86_64)
+        else()
+            set(_PEAK_TEST_ENTRY_ARCHITECTURE aarch64)
+        endif()
+        if(CMAKE_OBJDUMP)
+            set(_PEAK_TEST_OBJDUMP "${CMAKE_OBJDUMP}")
+        else()
+            find_program(_PEAK_TEST_OBJDUMP NAMES objdump llvm-objdump)
+        endif()
+        if(NOT _PEAK_TEST_OBJDUMP)
+            message(FATAL_ERROR
+                "A native objdump is required for dlopen entry safety checks")
+        endif()
+
+        add_test(NAME test_dlopen_entry_binary_codegen
             COMMAND ${Python3_EXECUTABLE}
-                    ${PROJECT_SOURCE_DIR}/test/static_checks/check_aarch64_dlopen_entry_binary.py
-                    --objdump ${CMAKE_OBJDUMP}
+                    ${PROJECT_SOURCE_DIR}/test/static_checks/check_dlopen_entry_binary.py
+                    --objdump ${_PEAK_TEST_OBJDUMP}
                     --binary $<TARGET_FILE:peak>
+                    --architecture ${_PEAK_TEST_ENTRY_ARCHITECTURE}
                     --guard-bytes 256)
-        set_tests_properties(test_aarch64_dlopen_entry_binary_codegen
+        set_tests_properties(test_dlopen_entry_binary_codegen
             PROPERTIES
-                PASS_REGULAR_EXPRESSION "aarch64_dlopen_entry_binary_ok")
+                PASS_REGULAR_EXPRESSION "dlopen_entry_binary_ok")
+
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            add_library(peak_dlopen_entry_hostile_codegen MODULE
+                ${PROJECT_SOURCE_DIR}/src/dlopen_entry_stub.S
+                ${PROJECT_SOURCE_DIR}/test/static_checks/dlopen_entry_hostile_fixture.c)
+            target_compile_options(peak_dlopen_entry_hostile_codegen
+                PRIVATE
+                    $<$<COMPILE_LANGUAGE:C>:-fsanitize-coverage=trace-pc>
+                    $<$<COMPILE_LANGUAGE:C>:-finstrument-functions>)
+            add_test(NAME test_dlopen_entry_hostile_binary_codegen
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/static_checks/check_dlopen_entry_binary.py
+                        --objdump ${_PEAK_TEST_OBJDUMP}
+                        --binary $<TARGET_FILE:peak_dlopen_entry_hostile_codegen>
+                        --architecture ${_PEAK_TEST_ENTRY_ARCHITECTURE}
+                        --guard-bytes 256
+                        --require-body-instrumentation)
+            set_tests_properties(test_dlopen_entry_hostile_binary_codegen
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "dlopen_entry_binary_ok")
+        endif()
     endif()
 
     add_test(NAME test_detach_lifecycle_invariants
