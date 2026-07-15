@@ -882,6 +882,71 @@ peak_general_listener_dynamic_symbol_matches_any_target(const char* symbol_name,
     return matched;
 }
 
+GPtrArray*
+peak_general_listener_snapshot_dynamic_target_names(void)
+{
+    GPtrArray* target_names;
+    GHashTable* seen_names;
+
+    target_names = g_ptr_array_new_with_free_func(g_free);
+    seen_names = g_hash_table_new(g_str_hash, str_equal_function_general);
+
+    pthread_mutex_lock(&lock);
+    if (peak_hook_strings != NULL) {
+        for (size_t i = 0; i < peak_hook_address_count; i++) {
+            const char* target_name = peak_hook_strings[i];
+
+            if (target_name == NULL || target_name[0] == '\0' ||
+                g_hash_table_contains(seen_names, target_name)) {
+                continue;
+            }
+            g_hash_table_add(seen_names, (gpointer)target_name);
+            g_ptr_array_add(target_names, g_strdup(target_name));
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    g_hash_table_destroy(seen_names);
+
+    return target_names;
+}
+
+gboolean
+peak_general_listener_dynamic_symbol_address_needs_attach(
+    const char* symbol_name,
+    gpointer symbol_address,
+    const char* provider_name)
+{
+    gboolean matched_target = FALSE;
+    gboolean duplicate_address = FALSE;
+
+    if (symbol_name == NULL || symbol_name[0] == '\0' ||
+        symbol_address == NULL) {
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&lock);
+    if (peak_hook_strings != NULL && hook_address != NULL) {
+        for (size_t hook_id = 0;
+             hook_id < peak_hook_address_count;
+             hook_id++) {
+            if (!peak_general_listener_dynamic_symbol_matches_target(
+                    peak_hook_strings[hook_id],
+                    symbol_name,
+                    provider_name)) {
+                continue;
+            }
+            matched_target = TRUE;
+            if (hook_address[hook_id] == symbol_address) {
+                duplicate_address = TRUE;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lock);
+
+    return matched_target && !duplicate_address;
+}
+
 static gboolean
 peak_general_listener_expand_dynamic_hook_tables_unlocked(
     const char* target_name,
@@ -1112,6 +1177,10 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                 g_getenv("PEAK_TEST_DYNAMIC_ATTACH_PREPARE_ERROR"))) {
             prepare_ok = FALSE;
             detach_status = PEAK_DETACH_STATUS_ERROR;
+        } else if (peak_env_truthy_general(
+                       g_getenv("PEAK_TEST_DYNAMIC_ATTACH_PREPARE_TIMEOUT"))) {
+            prepare_ok = FALSE;
+            detach_status = PEAK_DETACH_STATUS_TIMEOUT;
         } else
 #endif
         {

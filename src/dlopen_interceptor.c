@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #if defined(__linux__)
 #include <link.h>
@@ -129,6 +130,13 @@ static __thread PeakDlopenDynamicAttachRequest*
 static pthread_mutex_t dynamic_load_transaction_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 static __thread unsigned int dynamic_load_transaction_depth = 0;
+/*
+ * Once an ordinary controller mutation loses the transaction race, stop
+ * admitting new outer dlopen bodies until that controller mutation gets a
+ * turn.  Callers already inside (or already admitted to) the transaction may
+ * finish, and nested same-thread loader work remains reentrant.
+ */
+static gboolean dynamic_load_controller_mutation_pending = FALSE;
 static unsigned long long dynamic_attach_enqueue_count = 0;
 static unsigned long long dynamic_attach_drain_count = 0;
 static unsigned long long dynamic_attach_requeue_count = 0;
@@ -140,6 +148,7 @@ static unsigned long long dynamic_attach_partial_success_count = 0;
 static unsigned long long dynamic_attach_retained_handle_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static _Atomic pid_t dynamic_attach_owner_pid = 0;
+static __thread pid_t dynamic_attach_fork_warning_pid = 0;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
 static __thread gboolean dynamic_attach_test_explicit_drain = FALSE;
@@ -406,6 +415,13 @@ static void
 dlopen_interceptor_begin_load_transaction(void)
 {
     if (dynamic_load_transaction_depth == 0) {
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        while (dynamic_load_controller_mutation_pending &&
+               dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN) {
+            pthread_cond_wait(&dynamic_attach_gate_cond,
+                              &dynamic_attach_gate_mutex);
+        }
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
         pthread_mutex_lock(&dynamic_load_transaction_mutex);
     }
     dynamic_load_transaction_depth++;
@@ -452,24 +468,16 @@ dlopen_interceptor_active_replacement_count(void)
 gboolean
 dlopen_interceptor_try_begin_controller_mutation(void)
 {
-    if (pthread_mutex_trylock(&dynamic_load_transaction_mutex) != 0) {
-#ifdef PEAK_ENABLE_TEST_HOOKS
-        atomic_fetch_add_explicit(
-            &dynamic_load_test_controller_mutation_deferrals,
-            1,
-            memory_order_relaxed);
-#endif
-        return FALSE;
-    }
-
     /*
-     * A replacement caller publishes itself before trying to enter the load
-     * transaction. If it won that race, release the transaction and defer;
-     * otherwise a caller arriving after this check blocks before entering the
-     * real loader until the controller finishes its mutation.
+     * Publish writer intent before trying the transaction.  If an application
+     * thread currently owns it, later outer dlopen callers wait at admission
+     * instead of forming an endless stream ahead of heartbeat/JIT work.
      */
-    if (dlopen_interceptor_active_replacement_count() != 0) {
-        pthread_mutex_unlock(&dynamic_load_transaction_mutex);
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_load_controller_mutation_pending = TRUE;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (pthread_mutex_trylock(&dynamic_load_transaction_mutex) != 0) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         atomic_fetch_add_explicit(
             &dynamic_load_test_controller_mutation_deferrals,
@@ -488,6 +496,11 @@ void
 dlopen_interceptor_end_controller_mutation(void)
 {
     dlopen_interceptor_end_load_transaction();
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_load_controller_mutation_pending = FALSE;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -1041,6 +1054,7 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     active_dynamic_attach_count = 0;
     active_dlopen_replacement_count = 0;
     dynamic_attach_drain_active = FALSE;
+    dynamic_load_controller_mutation_pending = FALSE;
     dynamic_attach_queue_head = NULL;
     dynamic_attach_queue_tail = NULL;
     dynamic_attach_queue_length = 0;
@@ -1058,6 +1072,7 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_retained_handles = NULL;
     retained_provider_paths = dynamic_attach_retained_provider_paths;
     dynamic_attach_retained_provider_paths = NULL;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
     if (retained_handles != NULL) {
@@ -1473,6 +1488,98 @@ dlopen_interceptor_scan_dependency(const GumDependencyDetails* details,
     return TRUE;
 }
 
+static gboolean
+dlopen_interceptor_loaded_handle_may_match(void* handle,
+                                           const char* filename)
+{
+    GQueue pending_modules = G_QUEUE_INIT;
+    GHashTable* seen_modules;
+    GPtrArray* target_names;
+    GumModule* root_module = NULL;
+    GumAddress module_address = 0;
+    gboolean matched = FALSE;
+
+    if (handle == NULL || filename == NULL) {
+        return FALSE;
+    }
+
+#if defined(__linux__)
+    {
+        struct link_map* module_map = NULL;
+
+        if (dlinfo(handle, RTLD_DI_LINKMAP, &module_map) == 0 &&
+            module_map != NULL) {
+            module_address = module_map->l_addr != 0
+                ? (GumAddress)module_map->l_addr
+                : (GumAddress)module_map->l_ld;
+        }
+    }
+#endif
+    if (module_address != 0) {
+        root_module = gum_process_find_module_by_address(module_address);
+    }
+    if (root_module == NULL) {
+        root_module = gum_process_find_module_by_name(filename);
+        if (root_module == NULL) {
+            const char* basename = strrchr(filename, '/');
+
+            if (basename != NULL && basename[1] != '\0') {
+                root_module = gum_process_find_module_by_name(basename + 1);
+            }
+        }
+    }
+    if (root_module == NULL) {
+        /* Unknown module identity is not proof of no match. */
+        return TRUE;
+    }
+
+    target_names =
+        peak_general_listener_snapshot_dynamic_target_names();
+    seen_modules = g_hash_table_new_full(g_str_hash,
+                                         dlopen_interceptor_string_equal,
+                                         g_free,
+                                         NULL);
+    PeakDlopenDependencyScan dependency_scan = {
+        .pending_modules = &pending_modules,
+        .seen_modules = seen_modules
+    };
+    dlopen_interceptor_add_scan_module(&dependency_scan, root_module);
+
+    while (!matched && !g_queue_is_empty(&pending_modules)) {
+        GumModule* module = g_queue_pop_head(&pending_modules);
+        const char* provider_name = gum_module_get_path(module);
+
+        for (guint i = 0; i < target_names->len; i++) {
+            const char* target_name = g_ptr_array_index(target_names, i);
+            GumAddress symbol_address =
+                gum_module_find_symbol_by_name(module, target_name);
+
+            if (symbol_address != 0 &&
+                peak_general_listener_dynamic_symbol_address_needs_attach(
+                    target_name,
+                    GSIZE_TO_POINTER(symbol_address),
+                    provider_name)) {
+                matched = TRUE;
+                break;
+            }
+        }
+        if (!matched) {
+            gum_module_enumerate_dependencies(
+                module,
+                dlopen_interceptor_scan_dependency,
+                &dependency_scan);
+        }
+        g_object_unref(module);
+    }
+
+    while (!g_queue_is_empty(&pending_modules)) {
+        g_object_unref(g_queue_pop_head(&pending_modules));
+    }
+    g_hash_table_destroy(seen_modules);
+    g_ptr_array_free(target_names, TRUE);
+    return matched;
+}
+
 static PeakDlopenAttachResult
 dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
 {
@@ -1586,8 +1693,21 @@ dlopen_interceptor_process_dynamic_attach_request(
     dynamic_attach_drain_count++;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
     if (result == PEAK_DLOPEN_ATTACH_RETRY &&
+        !request->caller_waits &&
         dlopen_interceptor_requeue_dynamic_attach_request(request)) {
         return;
+    }
+    if (result == PEAK_DLOPEN_ATTACH_RETRY && request->caller_waits) {
+        /*
+         * TIMEOUT/CLASSIFY_FAILED means this bounded safety preparation could
+         * not prove that an initial attach is safe.  A synchronous dlopen
+         * caller must fail open at that observed result: requeueing it would
+         * create an untimed application stall with no state transition that
+         * guarantees a later attempt can succeed.  Background requests keep
+         * their existing retry behavior.
+         */
+        g_printerr("[peak] dynamic attach failed open for %s because a safe mutation could not be established; returning the original dlopen handle without waiting for a retry\n",
+                   request->filename != NULL ? request->filename : "<unknown>");
     }
     dlopen_interceptor_complete_dynamic_attach_request(
         request,
@@ -1809,10 +1929,21 @@ dlopen_interceptor_release_retained_dynamic_handles(void)
 
 static void*
 peak_dlopen(const char *filename, int flags) {
+    static const char fork_warning[] =
+        "[peak] fork child dynamic dlopen profiling is unsupported until exec; using the real dlopen without inherited PEAK controller state\n";
+    pid_t current_pid = getpid();
     pid_t owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
                                            memory_order_acquire);
-    if ((owner_pid != 0 && owner_pid != getpid()) ||
-        dynamic_attach_drain_reentrant ||
+    if (owner_pid != 0 && owner_pid != current_pid) {
+        if (dynamic_attach_fork_warning_pid != current_pid) {
+            dynamic_attach_fork_warning_pid = current_pid;
+            (void)write(STDERR_FILENO,
+                        fork_warning,
+                        sizeof(fork_warning) - 1);
+        }
+        return original_dlopen(filename, flags);
+    }
+    if (dynamic_attach_drain_reentrant ||
         peak_general_listener_controller_is_current_thread()) {
         return original_dlopen(filename, flags);
     }
@@ -1832,6 +1963,21 @@ peak_dlopen(const char *filename, int flags) {
     handle = original_dlopen(filename, flags);
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
+        dlopen_interceptor_end_load_transaction();
+        dlopen_interceptor_end_replacement_call();
+        pthread_setcancelstate(old_cancel_state, NULL);
+        return handle;
+    }
+
+    /*
+     * Most application loads do not expose a configured PEAK target.  Resolve
+     * only the configured names against the new handle first; avoid request
+     * allocation, RTLD_NOLOAD reference churn, a controller wakeup, and a
+     * complete dependency/export/symbol scan when every visible address is
+     * absent or already attached.  The controller scan remains authoritative
+     * after this conservative may-match check.
+     */
+    if (!dlopen_interceptor_loaded_handle_may_match(handle, filename)) {
         dlopen_interceptor_end_load_transaction();
         dlopen_interceptor_end_replacement_call();
         pthread_setcancelstate(old_cancel_state, NULL);
@@ -2030,9 +2176,11 @@ gboolean dlopen_interceptor_dettach()
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
+    dynamic_load_controller_mutation_pending = FALSE;
     dynamic_attach_queue_head = NULL;
     dynamic_attach_queue_tail = NULL;
     dynamic_attach_queue_length = 0;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
     dlopen_interceptor = NULL;

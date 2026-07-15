@@ -24,6 +24,15 @@ gboolean peak_general_listener_dynamic_symbol_matches_any_target(
     const char* symbol_name,
     const char* provider_name);
 
+/* Caller-owned copies of the configured dynamic target names. */
+GPtrArray* peak_general_listener_snapshot_dynamic_target_names(void);
+
+/* Whether this provider-local symbol address is not already attached. */
+gboolean peak_general_listener_dynamic_symbol_address_needs_attach(
+    const char* symbol_name,
+    gpointer symbol_address,
+    const char* provider_name);
+
 gboolean peak_general_listener_checkpoint_for_exec(
     unsigned long long checkpoint_index);
 

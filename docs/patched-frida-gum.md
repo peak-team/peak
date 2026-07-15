@@ -22,6 +22,20 @@ linked headers and archive expose the architecture-specific PEAK ABI.
 The downloaded Frida Gum 17.15.3 archives are pinned with SHA-256 hashes in
 `cmake/frida-gum-download.cmake`.
 
+The exact-entry support matrix is intentionally narrow:
+
+| Provider | Platform | Profiling listener behavior |
+| --- | --- | --- |
+| PEAK `auto-patched-devkit` | Linux x86_64, Frida Gum 17.15.3 | exact attach supported |
+| PEAK `auto-patched-devkit` | Linux Arm64, Frida Gum 17.15.3 | exact attach supported |
+| caller-managed stock Gum | any | profiling listeners fail closed; support hooks retain stock semantics |
+| PEAK `auto` on other platforms | platform stock devkit | profiling listeners fail closed when exact attach is unavailable |
+
+Both the header API version and an architecture-specific private-layout ABI
+fingerprint are compile/link checked; native builds also execute the
+fingerprint probe. A different Gum version or archive layout is unsupported
+until its overlay and fingerprint are audited explicitly.
+
 The Linux patched devkit also edits Frida's `gumelfmodule.c.o` archive member.
 Frida Gum 17.x can continue symbol scanning by treating a module base address as
 an online in-memory ELF source when the module path cannot be opened. PEAK keeps

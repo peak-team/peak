@@ -757,7 +757,10 @@ dynamic attach request:
 ```text
 peak_dlopen replacement:
     call original dlopen
-    enqueue handle for controller scan
+    prefilter configured names against the returned handle
+    if no new target address is visible, return the handle
+    enqueue a matching handle for controller scan
+    wait for this exact request to complete or fail open
     return handle
 
 controller:
@@ -766,36 +769,66 @@ controller:
     publish hook metadata only after Gum attach and helper release succeed
 ```
 
-The dynamic attach implementation queues `dlopen` work out of the replacement
-body, drains it on controller-owned paths, and retains a `RTLD_NOLOAD` handle
-for any module that receives PEAK hooks. The retained handle pins the module so
-application `dlclose()` cannot unload code while PEAK and Gum still reference
-addresses inside it. Handles are released only after general listener teardown
-has flushed.
+The caller-side prefilter performs only configured-name lookups and rejects
+addresses PEAK already attached. An unrelated load therefore avoids request
+allocation, a second `RTLD_NOLOAD` reference, controller wakeup, cross-thread
+completion, and full dependency/export/symbol enumeration. A may-match remains
+conservative: the controller performs the authoritative provider scan. It
+retains a `RTLD_NOLOAD` handle for any module that receives PEAK hooks. The
+retained handle pins the module so application `dlclose()` cannot unload code
+while PEAK and Gum still reference addresses inside it. Handles are released
+only after general listener teardown has flushed.
 
 This prevents `dlopen` from racing with heartbeat detach, reattach, and final
-teardown. Dynamic attaches remain intentionally asynchronous: a function called
-immediately after `dlopen()` may run before PEAK's controller has attached the
-new listener. Strict mode uses the selected stop backend for the eventual Gum
-attach.
+teardown. For a matching handle, `dlopen()` does not return until the exact
+request has either installed every safely attachable listener or reached a
+classified failure. This is what protects the first call after runtime loading.
+The wait has no guessed wall-clock correctness deadline. If the strict safety
+preparation itself returns a retryable `TIMEOUT` or `CLASSIFY_FAILED` result,
+however, a synchronous request fails open immediately and returns the original
+loader handle with a diagnostic. Requeueing that caller would create an
+unbounded application stall without any observed state transition that
+guarantees a later attempt can succeed. This policy does not change the
+detach/reattach state machine or its independent retry budgets.
 
-The target detach controller is serviced before dynamic attach drains in each
-controller cycle so a busy `dlopen` queue cannot starve pending target
-detach/reattach work. Dynamic attach remains a separate bounded queue rather
-than being mixed into the target-hook batch, because attach/replace work has
-different Gum metadata and publication invariants. Optional diagnostics are
+Exact `dlopen` requests are drained before ordinary lifecycle/JIT mutations
+because their callers own the serialized load-and-attach transaction. If an
+ordinary mutation loses that transaction race, it publishes writer intent;
+later outer `dlopen` calls wait at admission until the mutation gets a turn.
+Threads merely waiting outside the transaction are not treated as active loader
+bodies. This prevents sustained plugin traffic from starving heartbeat or JIT
+work while preserving same-thread constructor and IFUNC-resolver recursion.
+Dynamic attach remains a separate linked request queue rather than being mixed
+into the target-hook batch, because attach/replace work has different Gum
+metadata and publication invariants. Optional diagnostics are
 available through `PEAK_DLOPEN_DEBUG` and `PEAK_DLOPEN_TRACE_PATH`, which report
-enqueued, drained, requeued, queue-full drops, closed-queue drops, `RTLD_NOLOAD`
+enqueued, drained, requeued, closed-queue drops, `RTLD_NOLOAD`
 drops, failed requeue drops, partial successes, retained handles, and max queue
-depth, plus the current queue length, fixed queue capacity, and drain budget.
+depth, plus the current queue length and drain budget. A reported capacity of
+zero denotes the unbounded linked queue.
 Each dynamic attach drain snapshots the queue length at the start of the
 controller cycle and drains at most that snapshot size and at most the fixed
 budget. Retryable dynamic attach requests are requeued for a later controller
 cycle, so one temporarily unsafe library cannot consume the entire same-cycle
-budget by being reprocessed repeatedly. Dynamic attach prepare retries are
-limited to transient `TIMEOUT`, `CLASSIFY_FAILED`, and recoverable `ERROR`
-statuses; `PERMISSION_DENIED` is treated as terminal for queued dynamic attach
-work so persistent ptrace policy failures cannot pin queue slots indefinitely.
+budget by being reprocessed repeatedly. That requeue policy is for background
+requests only. `ERROR`, `PERMISSION_DENIED`, and all other non-transient
+preparation results are terminal; synchronous exact requests also fail open on
+the otherwise retryable results described above.
+
+After `fork()` without `exec()`, PEAK does not reuse parent-owned controller
+threads, mutex ownership, helper state, or queued requests in the child. A
+child call to the inherited `dlopen` replacement therefore delegates directly
+to the real loader and emits one explicit warning per child process. Dynamic
+profiling resumes after `exec()` reloads PEAK. Reconstructing the complete Gum
+and detach-controller state in an arbitrary multithreaded fork child is not a
+supported operation.
+
+PEAK currently interposes `dlopen()` in the process's normal ELF loader
+namespace. It does not interpose or profile providers introduced through
+`dlmopen()` in a separate link-map namespace. Provider pinning and dependency
+identity by path are valid only within that supported namespace; applications
+that require multiple loader namespaces must treat dynamic target profiling as
+unsupported.
 
 Final `dlopen` replacement teardown is two-phase in strict mode. PEAK first
 uses the helper guarded `REVERT` operation to restore the real `dlopen` entry

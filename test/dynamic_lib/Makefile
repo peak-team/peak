@@ -27,6 +27,7 @@ RESOLVER_NESTED_IFUNC_SRC := resolver_nested_ifunc.c
 STARTUP_RESOLVER_NESTED_IFUNC_SRC := startup_resolver_nested_ifunc.c
 CONCURRENT_DLOPEN_SRC := concurrent_dlopen.c
 DLOPEN_MUTATION_GUARD_SRC := dlopen_mutation_guard.c
+DLOPEN_MUTATION_FAIRNESS_SRC := dlopen_mutation_fairness.c
 FORK_INFLIGHT_DLOPEN_SRC := fork_inflight_dlopen.c
 IFUNC_TARGET_SRC := ifunc_target.c
 NOTYPE_TARGET_SRC := notype_target.S
@@ -78,6 +79,7 @@ all: libB.so libBSecond.so libB.a libA_dynB.so libA_staB.so libA.a \
      dlopen_flags_test \
      concurrent_dlopen_test \
      dlopen_mutation_guard_test \
+     dlopen_mutation_fairness_test \
      fork_inflight_dlopen_test \
      libNestedOuter.so \
      $(ELF_LAZY_FIXTURES) \
@@ -159,6 +161,9 @@ concurrent_dlopen_test: $(CONCURRENT_DLOPEN_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS) -pthread
 
 dlopen_mutation_guard_test: $(DLOPEN_MUTATION_GUARD_SRC) libB.so
+	$(CC) -O2 -Wall -Wextra -Wl,--export-dynamic -o $@ $< $(DL_LIBS) -pthread
+
+dlopen_mutation_fairness_test: $(DLOPEN_MUTATION_FAIRNESS_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -Wl,--export-dynamic -o $@ $< $(DL_LIBS) -pthread
 
 fork_inflight_dlopen_test: $(FORK_INFLIGHT_DLOPEN_SRC) libB.so libA_staB.so
@@ -244,4 +249,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test dlopen_mutation_fairness_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so

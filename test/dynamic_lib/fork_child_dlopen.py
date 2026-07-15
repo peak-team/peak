@@ -14,7 +14,7 @@ def main():
     waited, status = os.waitpid(child, 0)
     if waited != child or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
         raise RuntimeError(f"fork child failed: waited={waited} status={status}")
-    print("fork_child_dlopen_ok")
+    print("fork_child_dlopen_unsupported_ok")
     return 0
 
 

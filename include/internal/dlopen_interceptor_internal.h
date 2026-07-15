@@ -5,10 +5,11 @@
 #include "frida-gum.h"
 
 /*
- * Dynamic attach must not turn a terminal preparation error into an
- * unbounded caller-side dlopen wait.  Ordinary detach/reattach retries keep
- * their existing state-machine policy; this predicate is specific to an
- * exact dynamic-load request whose caller is blocked for completion.
+ * Classify preparation outcomes for background dynamic-attach retry and
+ * dlopen-interceptor teardown.  A synchronous exact request deliberately
+ * fails open on the first retryable outcome instead of requeueing its blocked
+ * application caller; ordinary detach/reattach state-machine policy is
+ * unchanged.
  */
 gboolean dlopen_interceptor_dynamic_attach_prepare_is_retryable(
     PeakDetachStatus status);
@@ -34,7 +35,9 @@ void dlopen_interceptor_release_pinned_provider(void* pin);
 
 /*
  * Serialize ordinary controller-owned Gum mutations against application
- * threads executing the dlopen replacement body. Dynamic-attach queue drains
+ * threads executing the dlopen replacement body. A failed try publishes
+ * writer intent so later outer loader calls wait rather than starving the
+ * controller behind a continuous caller stream. Dynamic-attach queue drains
  * deliberately do not use this gate: their waiting caller already owns the
  * load transaction and needs the controller to complete that exact request.
  */

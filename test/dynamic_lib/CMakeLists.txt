@@ -59,6 +59,7 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/dlopen_flags_test.c
           ${DL_SRC_DIR}/concurrent_dlopen.c
           ${DL_SRC_DIR}/dlopen_mutation_guard.c
+          ${DL_SRC_DIR}/dlopen_mutation_fairness.c
           ${DL_SRC_DIR}/fork_inflight_dlopen.c
           ${DL_SRC_DIR}/nested_dlopen_outer.c
           ${DL_SRC_DIR}/nested_ifunc_outer.c
@@ -220,6 +221,19 @@ set_tests_properties(test_dynamic_dlopen_terminal_prepare_error_returns
     TIMEOUT 10
 )
 
+add_test(NAME test_dynamic_dlopen_retryable_prepare_failure_fails_open
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; ctypes.CDLL('./libB.so'); print('dynamic_attach_retryable_failure_returned')"
+)
+set_tests_properties(test_dynamic_dlopen_retryable_prepare_failure_fails_open
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_DYNAMIC_ATTACH_PREPARE_TIMEOUT=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_retryable_prepare_failure_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dynamic attach failed open.*safe mutation could not be established.*dynamic_attach_retryable_failure_returned"
+    FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
+    TIMEOUT 10
+)
+
 add_test(NAME test_dynamic_dlopen_exact_tail_entry
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_tail_wrapper(); lib.b_tail_impl()"
@@ -287,7 +301,18 @@ set_tests_properties(test_dynamic_dlopen_controller_mutation_guard
     TIMEOUT 30
 )
 
-add_test(NAME test_dynamic_fork_child_dlopen_no_deadlock
+add_test(NAME test_dynamic_dlopen_controller_mutation_fairness
+  COMMAND ${DL_DIR}/dlopen_mutation_fairness_test
+)
+set_tests_properties(test_dynamic_dlopen_controller_mutation_fairness
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_dlopen_fairness_target;PEAK_PROFILE_INTERPRETERS=1;PEAK_SAFE_DETACH_MODE=compatibility;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_mutation_fairness_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dlopen_mutation_fairness_ok.*peak_dlopen_fairness_target[*]*\\|[ \t]+2\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_fork_child_dlopen_warns_unsupported
   COMMAND ${Python3_EXECUTABLE} ${DL_DIR}/fork_child_dlopen.py
 )
 
@@ -326,11 +351,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       TIMEOUT 30
   )
 endif()
-set_tests_properties(test_dynamic_fork_child_dlopen_no_deadlock
+set_tests_properties(test_dynamic_fork_child_dlopen_warns_unsupported
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_fork_child_statslog;${PRELOAD_VAR}"
-    PASS_REGULAR_EXPRESSION "fork_child_dlopen_ok"
+    PASS_REGULAR_EXPRESSION "fork child dynamic dlopen profiling is unsupported until exec.*fork_child_dlopen_unsupported_ok"
+    FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
     TIMEOUT 10
 )
 

@@ -1298,11 +1298,12 @@ def check_general_controller_dlopen_drain_order(repo_root):
             process_positions[0] < jit_position < guard_end,
             "ordinary JIT mutations must share the dlopen transaction guard")
     require("pthread_mutex_trylock(&dynamic_load_transaction_mutex)" in guard and
-            "dlopen_interceptor_active_replacement_count() != 0" in guard and
+            "dynamic_load_controller_mutation_pending = TRUE" in guard and
+            "dlopen_interceptor_active_replacement_count" not in guard and
             "dynamic_load_transaction_depth = 1;" in guard,
-            "controller mutation guard must exclude both an owned load "
-            "transaction and a published replacement caller while preserving "
-            "same-thread loader reentrancy")
+            "controller mutation guard must publish writer intent, exclude an "
+            "owned load transaction without counting mutex waiters as active "
+            "loader bodies, and preserve same-thread loader reentrancy")
     synchronous_process = synchronous_drain.find(
         "peak_general_controller_process_pending_unlocked"
     )
@@ -1452,6 +1453,18 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     caller_wait = extract_function(
         dlopen, "dlopen_interceptor_wait_for_dynamic_attach_request"
     )
+    process_request = extract_function(
+        dlopen, "dlopen_interceptor_process_dynamic_attach_request"
+    )
+    begin_load = extract_function(
+        dlopen, "dlopen_interceptor_begin_load_transaction"
+    )
+    begin_controller_mutation = extract_function(
+        dlopen, "dlopen_interceptor_try_begin_controller_mutation"
+    )
+    end_controller_mutation = extract_function(
+        dlopen, "dlopen_interceptor_end_controller_mutation"
+    )
     peak_dlopen = extract_function(dlopen, "peak_dlopen")
     require("dynamic_attach_resolution_reentrant" not in dlopen and
             "dynamic_attach_resolution_wait_request" in caller_wait and
@@ -1460,6 +1473,30 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "resolution_nested_generation" in resolver_wait and
             "dynamic_attach_resolution_wait_request" not in peak_dlopen,
             "resolver-time nested dlopen must be serviced recursively, not bypassed")
+    require("!request->caller_waits" in process_request and
+            "PEAK_DLOPEN_REQUEST_CANCELLED" in process_request and
+            process_request.find("!request->caller_waits") <
+            process_request.find(
+                "dlopen_interceptor_requeue_dynamic_attach_request"),
+            "retryable exact requests must fail open instead of requeueing "
+            "an untimed application waiter")
+    require("dynamic_load_controller_mutation_pending" in begin_load and
+            "pthread_cond_wait" in begin_load and
+            "dynamic_load_controller_mutation_pending = TRUE" in
+            begin_controller_mutation and
+            "dlopen_interceptor_active_replacement_count" not in
+            begin_controller_mutation and
+            "dynamic_load_controller_mutation_pending = FALSE" in
+            end_controller_mutation and
+            "pthread_cond_broadcast" in end_controller_mutation,
+            "controller writer intent must block new outer loader admission "
+            "without treating mutex waiters as active loader bodies")
+    require("dlopen_interceptor_loaded_handle_may_match(handle, filename)" in
+            peak_dlopen and
+            peak_dlopen.find("dlopen_interceptor_loaded_handle_may_match") <
+            peak_dlopen.find(
+                "dlopen_interceptor_new_dynamic_attach_request(TRUE)"),
+            "unrelated handles must bypass exact request allocation and scan")
 
     startup_attach = extract_function(general, "peak_general_listener_attach")
     overhead_bootstrap = extract_function(
@@ -1553,9 +1590,12 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         "test_startup_resolver_nested_dlopen_first_call",
         "test_startup_executable_notype_target",
         "test_dynamic_concurrent_dlopen_with_heartbeat",
+        "test_dynamic_dlopen_controller_mutation_fairness",
+        "test_dynamic_fork_child_dlopen_warns_unsupported",
         "test_dynamic_fork_inflight_dlopen_no_deadlock",
         "test_startup_provider_retained_until_hook_detach",
         "test_dynamic_dlopen_terminal_prepare_error_returns",
+        "test_dynamic_dlopen_retryable_prepare_failure_fails_open",
         "test_dynamic_dlopen_provider_after_startup_match",
         "test_startup_rtld_local_callable_rescan",
     ):
