@@ -19,6 +19,8 @@ LIBB_SRC := libB.c
 MAIN_SRC := main.c
 PY_SRC   := customCpackage.c
 FLAGS_TEST_SRC := dlopen_flags_test.c
+NESTED_OUTER_SRC := nested_dlopen_outer.c
+CONCURRENT_DLOPEN_SRC := concurrent_dlopen.c
 
 LIBA_O   := libA.pic.o
 LIBB_O   := libB.pic.o
@@ -32,6 +34,8 @@ PY_O     := customCpackage.pic.o
 all: libB.so libB.a libA_dynB.so libA_staB.so libA.a \
      main_dynA_dynB main_dynA_staB main_staA_dynB main_staA_staB \
      dlopen_flags_test \
+     concurrent_dlopen_test \
+     libNestedOuter.so \
      customCpackage_dynA_dynB$(PY_EXT_SUFFIX) \
      customCpackage_dynA_staB$(PY_EXT_SUFFIX) \
      customCpackage_staA_dynB$(PY_EXT_SUFFIX) \
@@ -103,6 +107,12 @@ main_staA_staB: $(MAIN_O) libA.a libB.a
 
 dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl
+
+concurrent_dlopen_test: $(CONCURRENT_DLOPEN_SRC) libB.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl -pthread
+
+libNestedOuter.so: $(NESTED_OUTER_SRC) libB.so
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -ldl -Wl,-soname,libNestedOuter.so
 
 # --------------------------------------------------------------------
 # Python extension modules: four combinations

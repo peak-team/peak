@@ -73,12 +73,17 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
     endif()
 
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(NOT CMAKE_OBJCOPY)
+        message(FATAL_ERROR
+            "Patching Frida Gum requires CMAKE_OBJCOPY for the target toolchain")
+    endif()
 
     set(_patch_command
         "${Python3_EXECUTABLE}"
         "${_source_dir}/peak-gum/patch_frida_gum_elf_module.py"
         --library "${_output_dir}/libfrida-gum.a"
         --ar "${CMAKE_AR}"
+        --objcopy "${CMAKE_OBJCOPY}"
         --work-dir "${_output_dir}/frida-gum-elf-module-patch"
     )
     if(CMAKE_RANLIB)
@@ -92,7 +97,7 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
         ERROR_VARIABLE _patch_stderr)
     if(NOT _patch_result EQUAL 0)
         message(FATAL_ERROR
-            "Failed to patch Frida Gum ELF module header guard:\n${_patch_stdout}\n${_patch_stderr}")
+            "Failed to apply the PEAK Frida Gum archive patches:\n${_patch_stdout}\n${_patch_stderr}")
     endif()
     string(STRIP "${_patch_stdout}" _patch_stdout_stripped)
     if(_patch_stdout_stripped)
@@ -240,6 +245,9 @@ function(_peak_validate_frida_gum_peak_api)
 #if !defined(GUM_PEAK_PC_API_VERSION) || GUM_PEAK_PC_API_VERSION != 1
 #error Unsupported PEAK Gum PC API version
 #endif
+#if !defined(GUM_PEAK_EXACT_ATTACH_API_VERSION) || GUM_PEAK_EXACT_ATTACH_API_VERSION != 1
+#error Unsupported PEAK Gum exact-attach API version
+#endif
 #if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64)
 #error Missing PEAK Gum x86_64 private-layout ABI fingerprint
 #endif
@@ -273,6 +281,11 @@ int main(void)
         gpointer,
         GumInvocationListener *,
         GumPeakPcDiagnostics *);
+    typedef GumAttachReturn (*PeakAttachExactFunc)(
+        GumInterceptor *,
+        gpointer,
+        GumInvocationListener *,
+        const GumAttachOptions *);
     PeakAbiFingerprintFunc abi_fingerprint =
         gum_interceptor_peak_abi_fingerprint;
     PeakClassifyPcFunc classify_pc = gum_interceptor_peak_classify_pc;
@@ -281,6 +294,7 @@ int main(void)
         gum_interceptor_peak_get_function_patch;
     PeakGetPcDiagnosticsFunc get_pc_diagnostics =
         gum_interceptor_peak_get_pc_diagnostics;
+    PeakAttachExactFunc attach_exact = gum_interceptor_peak_attach_exact;
 
     (void) GUM_PEAK_PC_API_VERSION;
     (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64;
@@ -317,6 +331,7 @@ int main(void)
     (void) safe_pc;
     (void) get_function_patch;
     (void) get_pc_diagnostics;
+    (void) attach_exact;
     return 0;
 }
 ")
@@ -338,7 +353,7 @@ int main(void)
 
     if(NOT PEAK_GUM_HAS_PEAK_PC_API)
         message(FATAL_ERROR
-            "The selected Frida Gum devkit does not expose a linkable PEAK PC classification API. "
+            "The selected Frida Gum devkit does not expose the linkable PEAK PC classification and exact-attach APIs. "
             "Use the stock prebuilt provider, or point PEAK_PATCHED_GUM_ROOT at patched headers and libfrida-gum.a.")
     endif()
 endfunction()

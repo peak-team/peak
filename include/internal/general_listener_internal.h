@@ -16,6 +16,8 @@ PeakDynamicAttachResult peak_general_listener_dynamic_attach_symbol(
     gsize symbol_size,
     const char* provider_name);
 
+gboolean peak_general_listener_controller_is_current_thread(void);
+
 gboolean peak_general_listener_dynamic_symbol_matches_any_target(
     const char* symbol_name,
     const char* provider_name);

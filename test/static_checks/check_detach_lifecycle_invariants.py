@@ -980,7 +980,7 @@ def check_stop_window_accounting_sidecar(repo_root):
     )
     dlopen_attach = extract_function(dlopen, "dlopen_interceptor_attach")
     dlopen_dynamic = extract_function(
-        dlopen, "dlopen_interceptor_attach_from_request"
+        general, "peak_general_listener_dynamic_attach_symbol"
     )
     require("peak_unsafe_gum_prologue_check" not in support_attach_supported and
             "peak_unsafe_gum_support_prologue_check" not in support_attach_supported and
@@ -1169,7 +1169,7 @@ def check_heartbeat_state_machine_boundary(repo_root):
     detach_state = batch.find("PEAK_HOOK_DETACHING", prepare)
     reattach_state = batch.find("PEAK_HOOK_REATTACHING", prepare)
     detach_gum = batch.find("gum_interceptor_detach", prepare)
-    reattach_gum = batch.find("gum_interceptor_attach", prepare)
+    reattach_gum = batch.find("peak_general_listener_attach_exact", prepare)
     require(prepare != -1 and finish != -1 and prepare < finish,
             "batch controller must preserve prepare-before-finish ordering")
     require(prepare < detach_state < finish and prepare < reattach_state < finish,

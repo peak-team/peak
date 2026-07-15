@@ -242,6 +242,20 @@ gboolean peak_general_listener_support_attach_target_is_supported(
     gpointer address);
 
 /**
+ * @brief Attaches a profiling listener to the exact requested entry point.
+ *
+ * Unlike Gum's default attach operation, the PEAK-patched path does not follow
+ * a leading branch into a PLT entry or another implementation. This preserves
+ * the requested symbol's call boundary and avoids folding wrapper calls into
+ * an internal implementation. Support hooks must continue to use Gum's stock
+ * operation.
+ */
+GumAttachReturn peak_general_listener_attach_exact(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener);
+
+/**
  * @brief Resolve a function through Frida's symbol APIs.
  *
  * This keeps PEAK on Gum's dynamic-binary lookup path for both normal and MPI

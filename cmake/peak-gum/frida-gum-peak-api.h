@@ -65,6 +65,14 @@ GUM_API gboolean gum_interceptor_peak_get_function_patch(
     guint8 * original_prologue,
     guint * prologue_len);
 
+#define GUM_PEAK_EXACT_ATTACH_API_VERSION 1
+
+GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
+    GumInterceptor * interceptor,
+    gpointer target,
+    GumInvocationListener * listener,
+    const GumAttachOptions * options);
+
 #ifdef __cplusplus
 }
 #endif

@@ -12,6 +12,8 @@ import sys
 
 
 OBJECT_NAME = "gumelfmodule.c.o"
+ARM64_INTERCEPTOR_OBJECT_NAME = "backend-arm64_guminterceptor-arm64.c.o"
+X86_INTERCEPTOR_OBJECT_NAME = "backend-x86_guminterceptor-x86.c.o"
 LOAD_SECTION = ".text.gum_elf_module_load"
 OLD_MARKER_X86_64 = b"PEAK_GUM_ELF_HEADER_GUARD_X86_64_V1\0"
 OLD_MARKER_AARCH64 = b"PEAK_GUM_ELF_HEADER_GUARD_AARCH64_V1\0"
@@ -759,6 +761,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True, type=Path)
     parser.add_argument("--ar", required=True)
+    parser.add_argument("--objcopy", required=True)
     parser.add_argument("--ranlib")
     parser.add_argument("--work-dir", required=True, type=Path)
     args = parser.parse_args()
@@ -784,6 +787,7 @@ def main() -> int:
     if result.returncode != 0 or not extracted.exists():
         fail(f"failed to extract {OBJECT_NAME}:\n{result.stdout}\n{result.stderr}")
 
+    machine = elf_machine(extracted)
     changed = patch_object(extracted)
     if changed:
         result = run([args.ar, "d", str(library), OBJECT_NAME])
@@ -798,6 +802,67 @@ def main() -> int:
             result = run([args.ranlib, str(library)])
             if result.returncode != 0:
                 fail(f"failed to index patched archive:\n{result.stdout}\n{result.stderr}")
+
+    interceptor_object_name = None
+    architecture_name = None
+    if machine == 62:  # EM_X86_64
+        interceptor_object_name = X86_INTERCEPTOR_OBJECT_NAME
+        architecture_name = "x86_64"
+    elif machine == 183:  # EM_AARCH64
+        interceptor_object_name = ARM64_INTERCEPTOR_OBJECT_NAME
+        architecture_name = "aarch64"
+
+    if interceptor_object_name is not None:
+        if members.count(interceptor_object_name) != 1:
+            fail(
+                f"expected exactly one {interceptor_object_name} in "
+                f"{library}, found {members.count(interceptor_object_name)}"
+            )
+        interceptor_object = work_dir / interceptor_object_name
+        result = run(
+            [args.ar, "x", str(library), interceptor_object_name],
+            cwd=work_dir,
+        )
+        if result.returncode != 0 or not interceptor_object.exists():
+            fail(
+                f"failed to extract {interceptor_object_name}:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        result = run([
+            args.objcopy,
+            "--redefine-sym",
+            "_gum_interceptor_backend_resolve_redirect="
+            "_gum_interceptor_backend_resolve_redirect_stock",
+            str(interceptor_object),
+        ])
+        if result.returncode != 0:
+            fail(
+                "failed to rename Gum redirect resolver:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        result = run([args.ar, "d", str(library), interceptor_object_name])
+        if result.returncode != 0:
+            fail(
+                f"failed to remove original {interceptor_object_name}:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        result = run([args.ar, "qcs", str(library), str(interceptor_object)])
+        if result.returncode != 0:
+            fail(
+                f"failed to append patched {interceptor_object_name}:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        if args.ranlib:
+            result = run([args.ranlib, str(library)])
+            if result.returncode != 0:
+                fail(
+                    "failed to index resolver-patched archive:\n"
+                    f"{result.stdout}\n{result.stderr}"
+                )
+        print(
+            f"patched {architecture_name} Gum Interceptor: "
+            "added exact-entry resolver hook"
+        )
 
     shutil.rmtree(work_dir)
     return 0

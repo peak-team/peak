@@ -209,6 +209,21 @@ peak_general_listener_support_attach_target_is_supported(const char* symbol_name
     return TRUE;
 }
 
+GumAttachReturn
+peak_general_listener_attach_exact(GumInterceptor* target_interceptor,
+                                   gpointer address,
+                                   GumInvocationListener* listener)
+{
+#ifdef GUM_PEAK_EXACT_ATTACH_API_VERSION
+    return gum_interceptor_peak_attach_exact(target_interceptor,
+                                             address,
+                                             listener,
+                                             NULL);
+#else
+    return gum_interceptor_attach(target_interceptor, address, listener, NULL);
+#endif
+}
+
 static gboolean
 peak_general_listener_startup_attach_can_skip_stop(void)
 {

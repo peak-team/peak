@@ -27,10 +27,9 @@ peak_general_overhead_bootstrapping()
 
     gum_interceptor_begin_transaction(interceptor);
     GumAttachReturn attach_status =
-        gum_interceptor_attach(interceptor,
-                               &peak_general_overhead_dummy_func,
-                               listener_bootstrapping,
-                               NULL);
+        peak_general_listener_attach_exact(interceptor,
+                                           &peak_general_overhead_dummy_func,
+                                           listener_bootstrapping);
     gum_interceptor_end_transaction(interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -373,10 +372,9 @@ void peak_general_listener_attach()
             }
             gum_interceptor_begin_transaction(interceptor);
             GumAttachReturn attach_status =
-                gum_interceptor_attach(interceptor,
-                                       resolved_hook_address,
-                                       new_listener,
-                                       NULL);
+                peak_general_listener_attach_exact(interceptor,
+                                                   resolved_hook_address,
+                                                   new_listener);
             gum_interceptor_end_transaction(interceptor);
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,

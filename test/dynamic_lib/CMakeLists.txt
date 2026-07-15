@@ -42,6 +42,10 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/main.c
           ${DL_SRC_DIR}/customCpackage.c
           ${DL_SRC_DIR}/dlopen_flags_test.c
+          ${DL_SRC_DIR}/concurrent_dlopen.c
+          ${DL_SRC_DIR}/nested_dlopen_outer.c
+          ${DL_SRC_DIR}/multiple_providers.py
+          ${DL_SRC_DIR}/fork_child_dlopen.py
           ${DL_SRC_DIR}/dlopen_own_library.py
           ${DL_SRC_DIR}/import_customCpackage_variant.py
           ${DL_SRC_DIR}/test_customCpackage_script.sh
@@ -77,6 +81,74 @@ set_tests_properties(test_dynamic_dlopen_first_call
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_first_call_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+)
+
+add_test(NAME test_dynamic_dlopen_first_call_waits_for_completion
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic()"
+)
+set_tests_properties(test_dynamic_dlopen_first_call_waits_for_completion
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_DLOPEN_ATTACH_DELAY_MS=1500;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_completion_wait_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 10
+)
+
+add_test(NAME test_dynamic_dlopen_exact_tail_entry
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_tail_wrapper(); lib.b_tail_impl()"
+)
+set_tests_properties(test_dynamic_dlopen_exact_tail_entry
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_tail_wrapper,b_tail_impl;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_exact_tail_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_tail_wrapper[*]*\\|[ \t]+1\\|.*b_tail_impl[*]*\\|[ \t]+2\\|"
+)
+
+add_test(NAME test_dynamic_nested_dlopen_constructor_first_call
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; ctypes.CDLL('./libNestedOuter.so')"
+)
+set_tests_properties(test_dynamic_nested_dlopen_constructor_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_nested_constructor_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_dlopen_multiple_providers
+  COMMAND ${Python3_EXECUTABLE} ${DL_DIR}/multiple_providers.py
+)
+set_tests_properties(test_dynamic_dlopen_multiple_providers
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_multiple_providers_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+1\\|.*b_dynamic[*]*\\|[ \t]+5\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_concurrent_dlopen_requests
+  COMMAND ${DL_DIR}/concurrent_dlopen_test
+)
+set_tests_properties(test_dynamic_concurrent_dlopen_requests
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_concurrent_dlopen_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+16\\|"
+    TIMEOUT 30
+)
+
+add_test(NAME test_dynamic_fork_child_dlopen_no_deadlock
+  COMMAND ${Python3_EXECUTABLE} ${DL_DIR}/fork_child_dlopen.py
+)
+set_tests_properties(test_dynamic_fork_child_dlopen_no_deadlock
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_fork_child_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "fork_child_dlopen_ok"
+    TIMEOUT 10
 )
 set_tests_properties(test_dynamic_dlopen
   PROPERTIES

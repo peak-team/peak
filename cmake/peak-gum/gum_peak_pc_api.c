@@ -13,6 +13,35 @@
 #include <string.h>
 #include "frida-gum.h"
 
+static _Thread_local unsigned int peak_gum_exact_attach_depth;
+
+extern gpointer _gum_interceptor_backend_resolve_redirect_stock(
+    gpointer backend,
+    gpointer address);
+
+gpointer
+_gum_interceptor_backend_resolve_redirect(gpointer backend, gpointer address)
+{
+    if (peak_gum_exact_attach_depth != 0) {
+        return NULL;
+    }
+    return _gum_interceptor_backend_resolve_redirect_stock(backend, address);
+}
+
+GumAttachReturn
+gum_interceptor_peak_attach_exact(GumInterceptor * interceptor,
+                                  gpointer target,
+                                  GumInvocationListener * listener,
+                                  const GumAttachOptions * options)
+{
+    GumAttachReturn result;
+
+    peak_gum_exact_attach_depth++;
+    result = gum_interceptor_attach(interceptor, target, listener, options);
+    peak_gum_exact_attach_depth--;
+    return result;
+}
+
 #if !defined(__linux__) || \
     !(defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
 # error "PEAK Gum PC overlay is only implemented for linux-x86_64 and linux-arm64"

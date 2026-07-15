@@ -780,8 +780,8 @@ PeakHookState peak_general_listener_hook_state(size_t hook_id)
     return state;
 }
 
-static gboolean
-peak_general_controller_is_current_thread(void)
+gboolean
+peak_general_listener_controller_is_current_thread(void)
 {
     return atomic_load(&general_controller_owner_known) &&
            pthread_equal(pthread_self(), general_controller_owner_thread);
@@ -1018,8 +1018,8 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         return PEAK_DYNAMIC_ATTACH_NO_MATCH;
     }
 
-    if (!peak_general_controller_is_current_thread()) {
-        g_printerr("[peak] refusing JIT dynamic attach outside the general listener controller thread\n");
+    if (!peak_general_listener_controller_is_current_thread()) {
+        g_printerr("[peak] refusing dynamic attach outside the general listener controller thread\n");
         return PEAK_DYNAMIC_ATTACH_FAILED;
     }
 
@@ -1085,7 +1085,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         size_t i = selected_hook_id;
         if (!peak_general_listener_attach_target_is_supported(symbol_name,
                                                               symbol_address)) {
-            g_printerr("[peak] skipping JIT attach for hook %lu (%s) from %s: unsafe Gum prologue\n",
+            g_printerr("[peak] skipping dynamic attach for hook %lu (%s) from %s: unsafe Gum prologue\n",
                        (unsigned long)i,
                        symbol_name,
                        provider_name != NULL ? provider_name : "<unknown>");
@@ -1125,7 +1125,9 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
         gum_interceptor_begin_transaction(interceptor);
         GumAttachReturn attach_status =
-            gum_interceptor_attach(interceptor, symbol_address, new_listener, NULL);
+            peak_general_listener_attach_exact(interceptor,
+                                               symbol_address,
+                                               new_listener);
         gum_interceptor_end_transaction(interceptor);
 
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
@@ -1145,7 +1147,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             peak_general_controller_set_state_unlocked(i, PEAK_HOOK_ATTACHED);
             result = PEAK_DYNAMIC_ATTACH_ATTACHED;
         } else {
-            g_printerr("[peak] Gum JIT attach failed for hook %lu (%s) from %s, status=%d\n",
+            g_printerr("[peak] Gum dynamic attach failed for hook %lu (%s) from %s, status=%d\n",
                        (unsigned long)i,
                        symbol_name,
                        provider_name != NULL ? provider_name : "<unknown>",

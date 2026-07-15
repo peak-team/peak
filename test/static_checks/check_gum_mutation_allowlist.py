@@ -10,12 +10,17 @@ MUTATION_RE = re.compile(
     r"\bgum_interceptor_(attach|detach|replace|replace_fast|revert|"
     r"begin_transaction|end_transaction|flush)\b"
 )
+EXACT_ATTACH_BOUNDARY_RE = re.compile(
+    r"\bpeak_general_listener_attach_exact\s*\("
+)
+EXACT_ATTACH_BACKEND_RE = re.compile(
+    r"\bgum_interceptor_peak_attach_exact\s*\("
+)
 
 EXPECTED = {
     ("dlopen-controller", "src/dlopen_interceptor.c"): {
-        "attach": 1,
-        "begin_transaction": 4,
-        "end_transaction": 4,
+        "begin_transaction": 3,
+        "end_transaction": 3,
         "flush": 2,
         "replace_fast": 1,
         "revert": 2,
@@ -32,7 +37,9 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 5,
+        "attach": 1,
+        "attach_exact_backend": 1,
+        "attach_exact_boundary": 6,
         "detach": 5,
         "begin_transaction": 10,
         "end_transaction": 10,
@@ -209,6 +216,24 @@ def count_mutations(repo_root):
                     )
                     continue
                 found[(category, rel)][match.group(1)] += 1
+            for match in EXACT_ATTACH_BOUNDARY_RE.finditer(line):
+                if rel != "src/general_listener.c":
+                    unclassified.append(
+                        f"{rel}:{line_number}: {match.group(0)}"
+                    )
+                    continue
+                found[("strict-controller", rel)][
+                    "attach_exact_boundary"
+                ] += 1
+            for match in EXACT_ATTACH_BACKEND_RE.finditer(line):
+                if rel != "src/general_listener.c":
+                    unclassified.append(
+                        f"{rel}:{line_number}: {match.group(0)}"
+                    )
+                    continue
+                found[("strict-controller", rel)][
+                    "attach_exact_backend"
+                ] += 1
 
     return {key: dict(counter) for key, counter in found.items()}, unclassified
 
@@ -224,7 +249,7 @@ def main():
 
     if unclassified or found != EXPECTED:
         print("Direct Gum mutation allowlist mismatch.", file=sys.stderr)
-        print("Any new gum_interceptor attach/detach/replace/revert/"
+        print("Any new Gum or PEAK exact attach/detach/replace/revert/"
               "transaction/flush site needs an explicit strict-detach review.",
               file=sys.stderr)
         if unclassified:

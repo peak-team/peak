@@ -69,37 +69,29 @@ restore_dynamic_attach_automatic(void)
 }
 
 static void
-test_queue_capacity_and_full_drop(void)
+test_queue_is_unbounded(void)
 {
     PeakDlopenDynamicAttachDiagnostics diagnostics;
+    const unsigned int request_count = 512;
 
     reset_dynamic_attach_manual(TRUE);
     diagnostics = get_diagnostics();
-    check_true("queue capacity is fixed and nonzero", diagnostics.capacity > 0);
+    check_size("zero capacity denotes unbounded queue", diagnostics.capacity, 0);
     check_true("drain budget is fixed and nonzero", diagnostics.drain_budget > 0);
 
-    for (unsigned int i = 0; i < diagnostics.capacity; i++) {
+    for (unsigned int i = 0; i < request_count; i++) {
         char filename[64];
 
         snprintf(filename, sizeof(filename), "capacity-%u", i);
-        check_true("queue accepts until capacity",
+        check_true("unbounded queue accepts request",
                    dlopen_interceptor_test_enqueue_dummy_dynamic_attach(filename));
     }
 
-    check_true("queue rejects beyond capacity",
-               !dlopen_interceptor_test_enqueue_dummy_dynamic_attach("overflow"));
-
     diagnostics = get_diagnostics();
-    check_ull("capacity enqueued count",
-              diagnostics.enqueued,
-              diagnostics.capacity);
-    check_size("capacity queue length",
-               diagnostics.queue_length,
-               diagnostics.capacity);
-    check_size("capacity max depth",
-               diagnostics.max_depth,
-               diagnostics.capacity);
-    check_ull("queue-full drop count", diagnostics.dropped_full, 1);
+    check_ull("unbounded enqueued count", diagnostics.enqueued, request_count);
+    check_size("unbounded queue length", diagnostics.queue_length, request_count);
+    check_size("unbounded max depth", diagnostics.max_depth, request_count);
+    check_ull("unbounded queue has no full drops", diagnostics.dropped_full, 0);
 }
 
 static void
@@ -125,8 +117,6 @@ test_bounded_drain_budget(void)
 
     reset_dynamic_attach_manual(TRUE);
     diagnostics = get_diagnostics();
-    check_true("capacity exceeds drain budget",
-               diagnostics.capacity > diagnostics.drain_budget + 1);
     request_count = (size_t)diagnostics.drain_budget + 2;
 
     for (size_t i = 0; i < request_count; i++) {
@@ -401,7 +391,7 @@ main(void)
 {
     gum_init_embedded();
 
-    test_queue_capacity_and_full_drop();
+    test_queue_is_unbounded();
     test_closed_queue_drop();
     test_bounded_drain_budget();
     test_retry_requeues_once_per_drain_cycle();
