@@ -7,6 +7,7 @@
 #include "detach_controller.h"
 #include "logging.h"
 #include "pthread_listener.h"
+#include "syscall_interceptor.h"
 #include "internal/unsafe_gum_prologue.h"
 #include <errno.h>
 #include <dirent.h>

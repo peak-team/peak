@@ -50,15 +50,16 @@ syscall_interceptor_initialize(void)
 }
 
 /*
- * Keep the implementation in a PEAK-owned, exported function so an explicit
- * close profiling target never patches libc. Older glibc releases expose
+ * Keep the implementation at a hidden PEAK-owned boundary so neither the
+ * loader wrapper nor profiling setup can be redirected through another
+ * DSO's process-global peak_close symbol. Older glibc releases expose
  * __close_nocancel from the middle of close's first instruction stream, so a
  * Gum entry patch can corrupt that alternate entry even when the public close
  * symbol itself appears large enough.
  */
-__attribute__((visibility("default"), noinline, used))
+__attribute__((visibility("hidden"), noinline, used))
 int
-peak_close(int fd)
+peak_close_impl(int fd)
 {
     PeakCloseFunction original_close;
 
@@ -89,12 +90,26 @@ peak_close(int fd)
 #endif
 }
 
+void*
+syscall_interceptor_profile_close_address(void)
+{
+    return (void*)peak_close_impl;
+}
+
+/* Preserve the public PEAK boundary without using it for internal binding. */
+__attribute__((visibility("default"), noinline, used))
+int
+peak_close(int fd)
+{
+    return peak_close_impl(fd);
+}
+
 /* Interpose at the ELF loader boundary and forward through the profile hook. */
 __attribute__((visibility("default")))
 int
 close(int fd)
 {
-    return peak_close(fd);
+    return peak_close_impl(fd);
 }
 
 int

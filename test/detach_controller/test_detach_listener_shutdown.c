@@ -89,6 +89,12 @@ dlopen_interceptor_release_pinned_provider(void* handle)
     (void)handle;
 }
 
+void*
+syscall_interceptor_profile_close_address(void)
+{
+    return NULL;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_TEST_EXPORT __attribute__((visibility("default")))
 #else

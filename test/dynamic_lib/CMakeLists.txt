@@ -67,6 +67,9 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/nested_ifunc_outer.c
           ${DL_SRC_DIR}/resolver_nested_ifunc.c
           ${DL_SRC_DIR}/ifunc_target.c
+          ${DL_SRC_DIR}/external_ifunc_impl.c
+          ${DL_SRC_DIR}/external_ifunc_target.c
+          ${DL_SRC_DIR}/ifunc_external_provider_retention_test.c
           ${DL_SRC_DIR}/notype_target.S
           ${DL_SRC_DIR}/notype_executable_test.c
           ${DL_SRC_DIR}/startup_resolver_nested_ifunc.c
@@ -116,6 +119,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
 add_test(NAME test_dynamic_dlopen_ifunc_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libIfuncTarget.so'); lib.peak_ifunc_target()"
+)
+
+add_test(NAME test_dynamic_ifunc_external_provider_retained
+  COMMAND ${DL_DIR}/ifunc_external_provider_retention_test
+)
+set_tests_properties(test_dynamic_ifunc_external_provider_retained
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_external_ifunc_target;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_external_ifunc_provider_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "external_ifunc_provider_retained_ok.*peak_external_ifunc_target[*]*\\|[ \t]+2\\|"
+    TIMEOUT 30
 )
 set_tests_properties(test_dynamic_dlopen_ifunc_first_call
   PROPERTIES

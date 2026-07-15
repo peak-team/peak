@@ -232,7 +232,8 @@ void peak_general_listener_attach()
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "close") == 0) {
-            hook_address[i] = peak_general_listener_find_function("peak_close");
+            hook_address[i] =
+                syscall_interceptor_profile_close_address();
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
             hook_address[i] = peak_general_listener_find_function("peak_exit");

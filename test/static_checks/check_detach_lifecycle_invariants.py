@@ -1071,12 +1071,23 @@ def check_stop_window_accounting_sidecar(repo_root):
     require('__attribute__((visibility("default")))' in syscall and
             "dlsym(RTLD_NEXT, \"close\")" in syscall,
             "close interposition must use an exported loader wrapper and RTLD_NEXT")
+    peak_close_impl = extract_function(syscall, "peak_close_impl")
     peak_close = extract_function(syscall, "peak_close")
     close_wrapper = extract_function(syscall, "close")
-    require("PeakCloseFunction original_close" in peak_close and
-            "return peak_close(fd);" in close_wrapper,
-            "the exported close wrapper must forward through the profileable "
-            "PEAK-owned peak_close boundary")
+    close_profile_address = extract_function(
+        syscall, "syscall_interceptor_profile_close_address"
+    )
+    require("PeakCloseFunction original_close" in peak_close_impl and
+            "return peak_close_impl(fd);" in peak_close and
+            "return peak_close_impl(fd);" in close_wrapper and
+            "peak_close_impl" in close_profile_address and
+            'visibility("hidden")' in syscall and
+            "syscall_interceptor_profile_close_address();" in
+            general_listener_attach and
+            'peak_general_listener_find_function("peak_close")' not in
+            general_listener_attach,
+            "close wrappers and profiling lookup must bind directly to the "
+            "non-preemptable PEAK-owned implementation")
     require('#include "internal/exec_raw_syscall.h"' in syscall and
             "defined(__x86_64__) || defined(__aarch64__)" in syscall and
             "peak_exec_raw_syscall6(SYS_close" in syscall and
@@ -1532,6 +1543,15 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     caller_wait = extract_function(
         dlopen, "dlopen_interceptor_wait_for_dynamic_attach_request"
     )
+    callable_scan = extract_function(
+        dlopen, "dlopen_interceptor_scan_callable_unknown_symbol"
+    )
+    attach_scanned = extract_function(
+        dlopen, "dlopen_interceptor_attach_scanned_symbol"
+    )
+    destroy_request = extract_function(
+        dlopen, "dlopen_interceptor_destroy_dynamic_attach_request"
+    )
     process_request = extract_function(
         dlopen, "dlopen_interceptor_process_dynamic_attach_request"
     )
@@ -1561,6 +1581,26 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "resolution_nested_generation" in resolver_wait and
             "dynamic_attach_resolution_wait_request" not in peak_dlopen,
             "resolver-time nested dlopen must be serviced recursively, not bypassed")
+    caller_dlsym = caller_wait.find("dlsym(provider_handle, symbol_name)")
+    caller_pin = caller_wait.find(
+        "dlopen_interceptor_pin_loaded_provider("
+    )
+    caller_close = caller_wait.find("dlclose(provider_handle)")
+    require(caller_dlsym != -1 and caller_pin != -1 and caller_close != -1 and
+            caller_dlsym < caller_pin < caller_close and
+            "resolution_provider_pin = resolved_provider_pin" in caller_wait and
+            "*provider_pin_out = request->resolution_provider_pin" in
+            resolver_wait and
+            "request->resolution_provider_pin = NULL" in resolver_wait and
+            "resolved_provider_pin" in callable_scan and
+            "dlopen_interceptor_commit_pinned_provider" in attach_scanned and
+            "dlopen_interceptor_release_pinned_provider" in attach_scanned and
+            "request->resolution_provider_pin" in destroy_request and
+            "test_dynamic_ifunc_external_provider_retained" in
+            dynamic_tests_cmake,
+            "callable IFUNC/STT_NOTYPE resolution must pin the actual address "
+            "owner on the waiting loader thread, transfer that pin through "
+            "attach publication, and cover external-provider unload")
     require("!request->caller_waits" in process_request and
             "PEAK_DLOPEN_REQUEST_CANCELLED" in process_request and
             process_request.find("!request->caller_waits") <

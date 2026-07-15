@@ -32,6 +32,9 @@ DLOPEN_TEARDOWN_HOT_SRC := dlopen_teardown_hot.c
 DLOPEN_REPLACE_FAILURE_SRC := dlopen_replace_failure.c
 FORK_INFLIGHT_DLOPEN_SRC := fork_inflight_dlopen.c
 IFUNC_TARGET_SRC := ifunc_target.c
+EXTERNAL_IFUNC_IMPL_SRC := external_ifunc_impl.c
+EXTERNAL_IFUNC_TARGET_SRC := external_ifunc_target.c
+EXTERNAL_IFUNC_PROVIDER_TEST_SRC := ifunc_external_provider_retention_test.c
 NOTYPE_TARGET_SRC := notype_target.S
 NOTYPE_EXECUTABLE_SRC := notype_executable_test.c
 STARTUP_UNLOADABLE_TARGET_SRC := startup_unloadable_target.c
@@ -54,7 +57,7 @@ DL_LIBS := -ldl
 ELF_LAZY_FIXTURES := libLazyUnresolved.so
 ELF_LIFECYCLE_FIXTURES := libStartupUnloadableTarget.so libStartupLoader.so startup_provider_retention_test
 ifneq ($(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)),)
-ELF_CALLABLE_FIXTURES := libIfuncTarget.so libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test libStartupLocalCallableLoader.so startup_local_callable_test
+ELF_CALLABLE_FIXTURES := libIfuncTarget.so libExternalIfuncImpl.so libExternalIfuncTarget.so ifunc_external_provider_retention_test libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test libStartupLocalCallableLoader.so startup_local_callable_test
 endif
 endif
 
@@ -191,6 +194,15 @@ libResolverNestedIfunc.so: $(RESOLVER_NESTED_IFUNC_SRC) libB.so
 libIfuncTarget.so: $(IFUNC_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libIfuncTarget.so
 
+libExternalIfuncImpl.so: $(EXTERNAL_IFUNC_IMPL_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-soname,libExternalIfuncImpl.so
+
+libExternalIfuncTarget.so: $(EXTERNAL_IFUNC_TARGET_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< $(DL_LIBS) -Wl,-s -Wl,-soname,libExternalIfuncTarget.so
+
+ifunc_external_provider_retention_test: $(EXTERNAL_IFUNC_PROVIDER_TEST_SRC) libExternalIfuncImpl.so libExternalIfuncTarget.so
+	$(CC) -O2 -Wall -Wextra -Wl,--export-dynamic -o $@ $< $(DL_LIBS)
+
 libNotypeTarget.so: $(NOTYPE_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libNotypeTarget.so
 
@@ -259,4 +271,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test dlopen_mutation_fairness_test dlopen_teardown_hot_test dlopen_replace_failure_test fork_inflight_dlopen_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test dlopen_mutation_fairness_test dlopen_teardown_hot_test dlopen_replace_failure_test fork_inflight_dlopen_test ifunc_external_provider_retention_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so

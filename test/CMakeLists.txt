@@ -1271,6 +1271,18 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "close_interposition_active_ok.*close[*]*\\|[ \t]+2\\|"
             TIMEOUT 30
     )
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_test(NAME test_close_foreign_peak_close_not_preempted
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "LD_PRELOAD=$<TARGET_FILE:test_foreign_peak_close>:$<TARGET_FILE:peak>"
+                    $<TARGET_FILE:test_close_interposition>)
+        set_tests_properties(test_close_foreign_peak_close_not_preempted
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=close;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_close_foreign_symbol_statslog"
+                PASS_REGULAR_EXPRESSION "close_interposition_active_ok.*close[*]*\\|[ \t]+2\\|"
+                TIMEOUT 30
+        )
+    endif()
     add_test(NAME test_close_loader_interposition_inactive
         COMMAND ${PROJECT_BINARY_DIR}/test/syscall_interceptor/test_close_interposition
                 inactive)

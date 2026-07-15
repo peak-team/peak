@@ -71,6 +71,8 @@ typedef struct PeakDlopenDynamicAttachRequest {
     const char* resolution_provider_name;
     const char* resolution_symbol_name;
     GumAddress resolution_address;
+    void* resolution_provider_pin;
+    gboolean resolution_provider_pin_failed;
     gboolean resolution_requested;
     gboolean resolution_complete;
     unsigned long long resolution_nested_generation;
@@ -843,6 +845,8 @@ dlopen_interceptor_destroy_dynamic_attach_request(
             dlclose(request->handle);
         }
     }
+    dlopen_interceptor_release_pinned_provider(
+        request->resolution_provider_pin);
     g_free(request->filename);
     pthread_cond_destroy(&request->completion_cond);
     pthread_mutex_destroy(&request->completion_mutex);
@@ -890,6 +894,8 @@ dlopen_interceptor_wait_for_dynamic_attach_request(
             const char* provider_name = request->resolution_provider_name;
             const char* symbol_name = request->resolution_symbol_name;
             GumAddress resolved_address = 0;
+            void* resolved_provider_pin = NULL;
+            gboolean provider_pin_failed = FALSE;
 
             pthread_mutex_unlock(&request->completion_mutex);
 #ifdef RTLD_NOLOAD
@@ -916,6 +922,20 @@ dlopen_interceptor_wait_for_dynamic_attach_request(
                     if (dlerror() != NULL) {
                         address = NULL;
                     }
+                    /*
+                     * An IFUNC may return code from an unrelated DSO.  Pin
+                     * the dladdr() owner while this loader thread can safely
+                     * take a recursive RTLD_NOLOAD reference; retaining only
+                     * provider_handle would leave Gum pointing into an
+                     * unloadable implementation mapping.
+                     */
+                    if (address != NULL &&
+                        !dlopen_interceptor_pin_loaded_provider(
+                            address,
+                            &resolved_provider_pin)) {
+                        provider_pin_failed = TRUE;
+                        address = NULL;
+                    }
                     dlclose(provider_handle);
                 }
                 dynamic_attach_resolution_wait_request =
@@ -928,6 +948,9 @@ dlopen_interceptor_wait_for_dynamic_attach_request(
 #endif
             pthread_mutex_lock(&request->completion_mutex);
             request->resolution_address = resolved_address;
+            request->resolution_provider_pin = resolved_provider_pin;
+            request->resolution_provider_pin_failed =
+                provider_pin_failed;
             request->resolution_complete = TRUE;
             pthread_cond_broadcast(&request->completion_cond);
             continue;
@@ -1383,7 +1406,8 @@ static gboolean
 dlopen_interceptor_attach_scanned_symbol(PeakDlopenExportScan* scan,
                                          const char* symbol_name,
                                          GumAddress symbol_address,
-                                         gsize symbol_size)
+                                         gsize symbol_size,
+                                         void* resolved_provider_pin)
 {
     PeakDynamicAttachResult result;
 
@@ -1394,12 +1418,17 @@ dlopen_interceptor_attach_scanned_symbol(PeakDlopenExportScan* scan,
         symbol_size,
         scan->provider_name);
     if (result == PEAK_DYNAMIC_ATTACH_ATTACHED) {
+        dlopen_interceptor_commit_pinned_provider(
+            resolved_provider_pin);
+        resolved_provider_pin = NULL;
         scan->request->retain_handle = TRUE;
     } else if (result == PEAK_DYNAMIC_ATTACH_RETRY) {
         scan->retry = TRUE;
     } else if (result == PEAK_DYNAMIC_ATTACH_FAILED) {
         scan->failed = TRUE;
     }
+    dlopen_interceptor_release_pinned_provider(
+        resolved_provider_pin);
     return TRUE;
 }
 
@@ -1420,7 +1449,8 @@ dlopen_interceptor_scan_export(const GumExportDetails* details,
         scan,
         details->name,
         details->address,
-        details->size > 0 ? (gsize)details->size : 0);
+        details->size > 0 ? (gsize)details->size : 0,
+        NULL);
 }
 
 #if defined(__linux__)
@@ -1428,9 +1458,14 @@ static GumAddress
 dlopen_interceptor_resolve_symbol_on_waiting_caller(
     PeakDlopenDynamicAttachRequest* request,
     const char* provider_name,
-    const char* symbol_name)
+    const char* symbol_name,
+    void** provider_pin_out,
+    gboolean* provider_pin_failed_out)
 {
     GumAddress resolved_address;
+
+    *provider_pin_out = NULL;
+    *provider_pin_failed_out = FALSE;
 
     if (!request->caller_waits) {
         return 0;
@@ -1445,6 +1480,8 @@ dlopen_interceptor_resolve_symbol_on_waiting_caller(
     request->resolution_provider_name = provider_name;
     request->resolution_symbol_name = symbol_name;
     request->resolution_address = 0;
+    request->resolution_provider_pin = NULL;
+    request->resolution_provider_pin_failed = FALSE;
     request->resolution_complete = FALSE;
     request->resolution_requested = TRUE;
     pthread_cond_broadcast(&request->completion_cond);
@@ -1469,9 +1506,13 @@ dlopen_interceptor_resolve_symbol_on_waiting_caller(
         }
     }
     resolved_address = request->resolution_address;
+    *provider_pin_out = request->resolution_provider_pin;
+    *provider_pin_failed_out = request->resolution_provider_pin_failed;
     request->resolution_provider_name = NULL;
     request->resolution_symbol_name = NULL;
     request->resolution_address = 0;
+    request->resolution_provider_pin = NULL;
+    request->resolution_provider_pin_failed = FALSE;
     request->resolution_requested = FALSE;
     request->resolution_complete = FALSE;
     pthread_mutex_unlock(&request->completion_mutex);
@@ -1495,6 +1536,8 @@ dlopen_interceptor_scan_callable_unknown_symbol(
 {
     PeakDlopenExportScan* scan = user_data;
     GumAddress resolved_address;
+    void* resolved_provider_pin = NULL;
+    gboolean provider_pin_failed = FALSE;
 
     if (!details->is_global ||
         details->type != GUM_SYMBOL_UNKNOWN ||
@@ -1510,12 +1553,35 @@ dlopen_interceptor_scan_callable_unknown_symbol(
     resolved_address = dlopen_interceptor_resolve_symbol_on_waiting_caller(
         scan->request,
         scan->provider_name,
-        details->name);
+        details->name,
+        &resolved_provider_pin,
+        &provider_pin_failed);
     if (resolved_address == 0 && !scan->request->caller_waits) {
         resolved_address = gum_module_find_export_by_name(scan->module,
                                                            details->name);
+        if (resolved_address != 0 &&
+            !dlopen_interceptor_pin_loaded_provider(
+                GSIZE_TO_POINTER(resolved_address),
+                &resolved_provider_pin)) {
+            provider_pin_failed = TRUE;
+            resolved_address = 0;
+        }
+    }
+    if (provider_pin_failed) {
+        scan->matched = TRUE;
+        scan->failed = TRUE;
+        g_printerr("[peak] skipping dynamic attach for %s from %s: unable to retain the provider owning its resolved address\n",
+                   details->name,
+                   scan->provider_name != NULL
+                       ? scan->provider_name
+                       : "<unknown>");
+        dlopen_interceptor_release_pinned_provider(
+            resolved_provider_pin);
+        return TRUE;
     }
     if (resolved_address == 0) {
+        dlopen_interceptor_release_pinned_provider(
+            resolved_provider_pin);
         return TRUE;
     }
 
@@ -1523,7 +1589,8 @@ dlopen_interceptor_scan_callable_unknown_symbol(
         scan,
         details->name,
         resolved_address,
-        details->size > 0 ? (gsize)details->size : 0);
+        details->size > 0 ? (gsize)details->size : 0,
+        resolved_provider_pin);
 }
 #endif
 

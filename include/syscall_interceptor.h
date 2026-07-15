@@ -26,6 +26,17 @@ void syscall_interceptor_initialize(void);
 int peak_close(int fd);
 
 /**
+ * @brief Return PEAK's non-preemptable close profiling boundary.
+ *
+ * General-listener setup uses this address directly instead of resolving the
+ * public peak_close symbol through the process-global ELF lookup scope.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+void* syscall_interceptor_profile_close_address(void);
+
+/**
  * @brief Attaches the system call interceptor.
  *
  * This function enables stderr protection in the loader-interposed `close`
