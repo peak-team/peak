@@ -94,6 +94,13 @@ static double* peak_hook_cached_sample_profile_seconds;
 static gboolean* peak_hook_cached_sample_valid;
 static unsigned int* peak_hook_retry_count;
 static PeakDetachStatus* peak_hook_last_retry_status;
+/*
+ * Only ordinary profiling targets may be rediscovered in later ELF/JIT
+ * providers.  Special targets such as main, close, exit, dlopen, MPI, and CUDA
+ * entry points deliberately stay bound to their PEAK-owned lifecycle slot,
+ * wrapper, or interceptor and must never be exact-attached to a provider.
+ */
+static gboolean* peak_hook_dynamic_provider_discoverable;
 static const char*
 peak_hook_request_source_string(PeakHookRequestSource source);
 static gboolean

@@ -234,6 +234,18 @@ set_tests_properties(test_dynamic_dlopen_retryable_prepare_failure_fails_open
     TIMEOUT 10
 )
 
+add_test(NAME test_dynamic_dlopen_support_wrapper_not_rediscovered
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; process = ctypes.CDLL(None); count = ctypes.c_size_t.in_dll(process, 'peak_hook_address_count'); assert count.value == 2, f'unexpected startup hook count: {count.value}'; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic(); assert count.value == 2, f'support wrapper was dynamically rediscovered: {count.value}'; print('support_wrapper_dynamic_eligibility_ok')"
+)
+set_tests_properties(test_dynamic_dlopen_support_wrapper_not_rediscovered
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=close,b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_support_wrapper_eligibility_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "support_wrapper_dynamic_eligibility_ok.*b_dynamic[*]*\\|[ \t]+1\\|"
+    TIMEOUT 30
+)
+
 add_test(NAME test_dynamic_dlopen_exact_tail_entry
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_tail_wrapper(); lib.b_tail_impl()"
@@ -348,6 +360,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       WORKING_DIRECTORY ${DL_DIR}
       ENVIRONMENT "PEAK_TARGET=peak_startup_unloadable_target,peak_startup_unloadable_target_second;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_provider_retention_statslog;${PRELOAD_VAR}"
       PASS_REGULAR_EXPRESSION "startup_provider_retained_ok.*peak_startup_unloadable_target[*]*\\|[ \t]+2\\|.*peak_startup_unloadable_target_second[*]*\\|[ \t]+2\\|"
+      TIMEOUT 30
+  )
+
+  add_test(NAME test_startup_rtld_local_rescan_failure_isolated
+    COMMAND ${DL_DIR}/startup_local_callable_test
+  )
+  set_tests_properties(test_startup_rtld_local_rescan_failure_isolated
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=peak_ifunc_target,peak_notype_target;PEAK_TEST_STARTUP_RESCAN_FAIL_FIRST=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_rescan_failure_isolated_statslog;${PRELOAD_VAR}"
+      PASS_REGULAR_EXPRESSION "test forcing first startup provider rescan failure.*startup_local_callable_ok.*(peak_ifunc_target|peak_notype_target)[*]*\\|[ \t]+1\\|"
       TIMEOUT 30
   )
 endif()

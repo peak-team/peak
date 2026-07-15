@@ -275,6 +275,7 @@ gboolean peak_general_listener_dettach()
     g_free(peak_hook_cached_sample_valid);
     g_free(peak_hook_retry_count);
     g_free(peak_hook_last_retry_status);
+    g_free(peak_hook_dynamic_provider_discoverable);
     g_free(array_listener);
 
     interceptor = NULL;
@@ -320,6 +321,7 @@ gboolean peak_general_listener_dettach()
     peak_hook_cached_sample_valid = NULL;
     peak_hook_retry_count = NULL;
     peak_hook_last_retry_status = NULL;
+    peak_hook_dynamic_provider_discoverable = NULL;
     array_listener = NULL;
 
     return TRUE;

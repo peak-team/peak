@@ -74,6 +74,9 @@ typedef struct PeakDlopenDynamicAttachRequest {
     gboolean resolution_requested;
     gboolean resolution_complete;
     unsigned long long resolution_nested_generation;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    gboolean test_force_attach_failure;
+#endif
 } PeakDlopenDynamicAttachRequest;
 
 typedef struct PeakDlopenProviderPin {
@@ -1602,6 +1605,13 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     if (request->handle == PEAK_DLOPEN_TEST_RETRY_HANDLE) {
         return PEAK_DLOPEN_ATTACH_RETRY;
     }
+    if (request->test_force_attach_failure) {
+        g_printerr("[peak] test forcing first startup provider rescan failure for %s\n",
+                   request->filename != NULL
+                       ? request->filename
+                       : "<unknown>");
+        return PEAK_DLOPEN_ATTACH_FAILED;
+    }
 #endif
     if (request->handle == NULL) {
         return PEAK_DLOPEN_ATTACH_FAILED;
@@ -1831,6 +1841,15 @@ dlopen_interceptor_rescan_loaded_modules(void)
         request->handle = handle;
         request->module_address = snapshot->address;
         request->binding_flags = RTLD_LAZY;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        {
+            const char* fail_first =
+                g_getenv("PEAK_TEST_STARTUP_RESCAN_FAIL_FIRST");
+            request->test_force_attach_failure =
+                i == 0 && fail_first != NULL && fail_first[0] != '\0' &&
+                strcmp(fail_first, "0") != 0;
+        }
+#endif
         if (!dlopen_interceptor_enqueue_dynamic_attach_request(request)) {
             dlopen_interceptor_destroy_dynamic_attach_request(request);
             dlopen_interceptor_end_load_transaction();
@@ -1845,8 +1864,16 @@ dlopen_interceptor_rescan_loaded_modules(void)
 
         if (request_state == PEAK_DLOPEN_REQUEST_FAILED ||
             request_state == PEAK_DLOPEN_REQUEST_CANCELLED) {
+            gboolean admission_still_open;
+
             success = FALSE;
-            break;
+            pthread_mutex_lock(&dynamic_attach_gate_mutex);
+            admission_still_open =
+                dlopen_interceptor_queue_can_accept_unlocked();
+            pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+            if (!admission_still_open) {
+                break;
+            }
         }
     }
 

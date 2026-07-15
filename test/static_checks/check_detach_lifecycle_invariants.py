@@ -1517,6 +1517,22 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     loaded_module_collect = extract_function(
         dlopen, "dlopen_interceptor_collect_loaded_matching_module"
     )
+    dynamic_matches_any = extract_function(
+        general, "peak_general_listener_dynamic_symbol_matches_any_target"
+    )
+    dynamic_target_snapshot = extract_function(
+        general, "peak_general_listener_snapshot_dynamic_target_names"
+    )
+    dynamic_address_needs_attach = extract_function(
+        general,
+        "peak_general_listener_dynamic_symbol_address_needs_attach",
+    )
+    expand_dynamic_hooks = extract_function(
+        general, "peak_general_listener_expand_dynamic_hook_tables_unlocked"
+    )
+    listener_shutdown = extract_function(
+        general, "peak_general_listener_dettach"
+    )
     pin_provider = extract_function(
         dlopen, "dlopen_interceptor_pin_loaded_provider"
     )
@@ -1554,6 +1570,42 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             generic_dynamic < generic_lookup,
             "ordinary startup-resolved targets must still enable later "
             "provider discovery")
+    eligibility_allocation = startup_attach.find(
+        "peak_hook_dynamic_provider_discoverable =\n"
+        "        g_new0(gboolean, peak_hook_address_count)"
+    )
+    eligibility_enable = startup_attach.find(
+        "peak_hook_dynamic_provider_discoverable[i] = TRUE;"
+    )
+    support_wrapper_end = startup_attach.find(
+        'strcmp(peak_hook_strings[i], "dlopen") == 0'
+    )
+    require(eligibility_allocation != -1 and eligibility_enable != -1 and
+            support_wrapper_end != -1 and
+            eligibility_allocation < support_wrapper_end <
+            eligibility_enable < generic_lookup and
+            startup_attach.count(
+                "peak_hook_dynamic_provider_discoverable[i] = TRUE;"
+            ) == 1,
+            "only the ordinary-target branch may enable dynamic provider "
+            "discovery; PEAK-owned support-wrapper slots must remain excluded")
+    for label, body in (
+        ("dynamic name prefilter", dynamic_matches_any),
+        ("startup target snapshot", dynamic_target_snapshot),
+        ("dynamic address prefilter", dynamic_address_needs_attach),
+        ("authoritative dynamic attach", dynamic_attach_symbol),
+    ):
+        require("peak_hook_dynamic_provider_discoverable" in body,
+                f"{label} must enforce support-wrapper provider eligibility")
+    require("peak_hook_dynamic_provider_discoverable[old_count] = TRUE" in
+            expand_dynamic_hooks,
+            "new ordinary provider generations must remain discoverable")
+    require("g_free(peak_hook_dynamic_provider_discoverable)" in
+            listener_shutdown and
+            "peak_hook_dynamic_provider_discoverable = NULL" in
+            listener_shutdown,
+            "dynamic provider eligibility storage must follow listener "
+            "lifetime cleanup")
     require("case PEAK_DETACH_STATUS_TIMEOUT:" in dynamic_retryable and
             "case PEAK_DETACH_STATUS_CLASSIFY_FAILED:" in dynamic_retryable and
             "case PEAK_DETACH_STATUS_ERROR:" in dynamic_retryable and
@@ -1581,6 +1633,23 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         require(token in loaded_rescan_body,
                 "startup loaded-provider rescan must use the exact dynamic "
                 f"attach handshake; missing {token}")
+    failed_snapshot_branch = re.search(
+        r"if \(request_state == PEAK_DLOPEN_REQUEST_FAILED \|\|\s*"
+        r"request_state == PEAK_DLOPEN_REQUEST_CANCELLED\) \{"
+        r"(?P<body>.*?)\n        \}",
+        loaded_rescan_body,
+        flags=re.DOTALL,
+    )
+    require(failed_snapshot_branch is not None,
+            "startup loaded-provider rescan must classify failed snapshots")
+    failed_snapshot_body = failed_snapshot_branch.group("body")
+    require("success = FALSE;" in failed_snapshot_body and
+            "dlopen_interceptor_queue_can_accept_unlocked()" in
+            failed_snapshot_body and
+            "if (!admission_still_open)" in failed_snapshot_body and
+            failed_snapshot_body.count("break;") == 1,
+            "one failed startup provider must not block later independent "
+            "providers while dynamic admission remains open")
 
     dynamic_tests = (
         repo_root / "test/dynamic_lib/CMakeLists.txt"
@@ -1598,6 +1667,8 @@ def check_dlopen_request_completion_and_readiness(repo_root):
         "test_dynamic_dlopen_retryable_prepare_failure_fails_open",
         "test_dynamic_dlopen_provider_after_startup_match",
         "test_startup_rtld_local_callable_rescan",
+        "test_dynamic_dlopen_support_wrapper_not_rediscovered",
+        "test_startup_rtld_local_rescan_failure_isolated",
     ):
         require(test_name in dynamic_tests,
                 f"missing dynamic loader lifecycle regression {test_name}")

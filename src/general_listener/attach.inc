@@ -217,6 +217,8 @@ void peak_general_listener_attach()
         g_new0(gboolean, peak_hook_address_count);
     peak_hook_retry_count = g_new0(unsigned int, peak_hook_address_count);
     peak_hook_last_retry_status = g_new0(PeakDetachStatus, peak_hook_address_count);
+    peak_hook_dynamic_provider_discoverable =
+        g_new0(gboolean, peak_hook_address_count);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     peak_demangled_strings = g_new0(char*, peak_hook_address_count);
@@ -293,6 +295,7 @@ void peak_general_listener_attach()
              * enabled so every provider generation is profiled, not only the
              * first address found during initialization.
              */
+            peak_hook_dynamic_provider_discoverable[i] = TRUE;
             peak_dynamic_attach_needed = TRUE;
             gpointer ptr = peak_general_listener_find_function(peak_hook_strings[i]);
             if (ptr) {

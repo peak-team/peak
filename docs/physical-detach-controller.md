@@ -779,6 +779,22 @@ retained handle pins the module so application `dlclose()` cannot unload code
 while PEAK and Gum still reference addresses inside it. Handles are released
 only after general listener teardown has flushed.
 
+Only ordinary profiling-target slots participate in provider discovery.
+PEAK-owned support and lifecycle targets such as `main`, `close`, `exit`,
+`dlopen`, MPI finalization, and CUDA launch entry points remain bound to their
+PEAK lifecycle slot, wrapper, or interceptor;
+the caller prefilter, startup provider snapshot, address deduplication, and
+authoritative attach all exclude those slots. Loading a later provider that
+exports the same support symbol therefore cannot bypass PEAK's wrapper safety
+or create a second listener generation for it.
+
+The startup scan treats each already-loaded matching provider independently.
+A failed or cancelled provider request marks the aggregate scan unsuccessful
+and produces the startup diagnostic, but later snapshots are still attempted
+while dynamic admission remains open. A closed admission gate stops the scan,
+because no controller can then complete additional work. Thus one malformed or
+temporarily unsafe `RTLD_LOCAL` provider cannot hide unrelated later providers.
+
 This prevents `dlopen` from racing with heartbeat detach, reattach, and final
 teardown. For a matching handle, `dlopen()` does not return until the exact
 request has either installed every safely attachable listener or reached a

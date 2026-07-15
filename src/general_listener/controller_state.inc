@@ -865,9 +865,11 @@ peak_general_listener_dynamic_symbol_matches_any_target(const char* symbol_name,
     }
 
     pthread_mutex_lock(&lock);
-    if (peak_hook_strings != NULL) {
+    if (peak_hook_strings != NULL &&
+        peak_hook_dynamic_provider_discoverable != NULL) {
         for (size_t i = 0; i < peak_hook_address_count; i++) {
-            if (peak_hook_strings[i] != NULL &&
+            if (peak_hook_dynamic_provider_discoverable[i] &&
+                peak_hook_strings[i] != NULL &&
                 peak_general_listener_dynamic_symbol_matches_target(
                     peak_hook_strings[i],
                     symbol_name,
@@ -892,11 +894,13 @@ peak_general_listener_snapshot_dynamic_target_names(void)
     seen_names = g_hash_table_new(g_str_hash, str_equal_function_general);
 
     pthread_mutex_lock(&lock);
-    if (peak_hook_strings != NULL) {
+    if (peak_hook_strings != NULL &&
+        peak_hook_dynamic_provider_discoverable != NULL) {
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             const char* target_name = peak_hook_strings[i];
 
-            if (target_name == NULL || target_name[0] == '\0' ||
+            if (!peak_hook_dynamic_provider_discoverable[i] ||
+                target_name == NULL || target_name[0] == '\0' ||
                 g_hash_table_contains(seen_names, target_name)) {
                 continue;
             }
@@ -925,11 +929,13 @@ peak_general_listener_dynamic_symbol_address_needs_attach(
     }
 
     pthread_mutex_lock(&lock);
-    if (peak_hook_strings != NULL && hook_address != NULL) {
+    if (peak_hook_strings != NULL && hook_address != NULL &&
+        peak_hook_dynamic_provider_discoverable != NULL) {
         for (size_t hook_id = 0;
              hook_id < peak_hook_address_count;
              hook_id++) {
-            if (!peak_general_listener_dynamic_symbol_matches_target(
+            if (!peak_hook_dynamic_provider_discoverable[hook_id] ||
+                !peak_general_listener_dynamic_symbol_matches_target(
                     peak_hook_strings[hook_id],
                     symbol_name,
                     provider_name)) {
@@ -1021,6 +1027,10 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
         g_renew(unsigned int, peak_hook_retry_count, new_count);
     peak_hook_last_retry_status =
         g_renew(PeakDetachStatus, peak_hook_last_retry_status, new_count);
+    peak_hook_dynamic_provider_discoverable =
+        g_renew(gboolean,
+                peak_hook_dynamic_provider_discoverable,
+                new_count);
     hook_address = g_renew(gpointer, hook_address, new_count);
     peak_demangled_strings = g_renew(char*, peak_demangled_strings, new_count);
     peak_need_detach = g_renew(gboolean, peak_need_detach, new_count);
@@ -1055,6 +1065,7 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_cached_sample_valid[old_count] = FALSE;
     peak_hook_retry_count[old_count] = 0;
     peak_hook_last_retry_status[old_count] = PEAK_DETACH_STATUS_SAFE;
+    peak_hook_dynamic_provider_discoverable[old_count] = TRUE;
     hook_address[old_count] = NULL;
     peak_demangled_strings[old_count] = NULL;
     peak_need_detach[old_count] = FALSE;
@@ -1094,7 +1105,8 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
     if (peak_hook_strings == NULL ||
         hook_address == NULL ||
         array_listener == NULL ||
-        peak_hook_states == NULL) {
+        peak_hook_states == NULL ||
+        peak_hook_dynamic_provider_discoverable == NULL) {
         pthread_mutex_unlock(&lock);
         return PEAK_DYNAMIC_ATTACH_FAILED;
     }
@@ -1105,7 +1117,8 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
     size_t selected_hook_id = (size_t)-1;
 
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (peak_hook_strings[i] == NULL) {
+        if (!peak_hook_dynamic_provider_discoverable[i] ||
+            peak_hook_strings[i] == NULL) {
             continue;
         }
         if (!peak_general_listener_dynamic_symbol_matches_target(
