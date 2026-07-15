@@ -502,8 +502,11 @@ void peak_init()
     syscall_interceptor_attach();
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
     if (need_dynamic_attach) {
-        if (dlopen_interceptor_attach() == 0) {
-            dlopen_interceptor_enable_dynamic_attach();
+        if (!peak_general_listener_controller_is_ready()) {
+            g_printerr("[peak] dynamic target loading disabled because the general listener controller is unavailable\n");
+        } else if (dlopen_interceptor_attach() == 0 &&
+                   !dlopen_interceptor_enable_dynamic_attach()) {
+            g_printerr("[peak] dynamic target loading failed closed before admission opened\n");
         }
     }
     peak_main_time = peak_second();

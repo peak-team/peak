@@ -220,7 +220,11 @@ peak_general_listener_attach_exact(GumInterceptor* target_interceptor,
                                              listener,
                                              NULL);
 #else
-    return gum_interceptor_attach(target_interceptor, address, listener, NULL);
+    (void)target_interceptor;
+    (void)address;
+    (void)listener;
+    g_printerr("[peak] refusing profiling attach because the selected Frida Gum provider lacks exact-entry support\n");
+    return GUM_ATTACH_WRONG_SIGNATURE;
 #endif
 }
 

@@ -1219,13 +1219,37 @@ peak_general_controller_thread_main(void* arg)
     return NULL;
 }
 
+gboolean
+peak_general_listener_controller_is_ready(void)
+{
+    gboolean ready;
+
+    pthread_mutex_lock(&general_controller_wake_mutex);
+    ready = general_controller_thread_started && general_controller_running;
+    pthread_mutex_unlock(&general_controller_wake_mutex);
+    return ready;
+}
+
 static void
 peak_general_controller_start(void)
 {
     pthread_mutex_lock(&general_controller_wake_mutex);
     if (!general_controller_thread_started) {
         general_controller_running = TRUE;
-        if (pthread_create(&general_controller_thread,
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        const char* force_failure =
+            g_getenv("PEAK_TEST_GENERAL_CONTROLLER_START_FAIL");
+        gboolean test_forces_failure =
+            force_failure != NULL &&
+            (g_ascii_strcasecmp(force_failure, "1") == 0 ||
+             g_ascii_strcasecmp(force_failure, "true") == 0 ||
+             g_ascii_strcasecmp(force_failure, "yes") == 0 ||
+             g_ascii_strcasecmp(force_failure, "on") == 0);
+#else
+        const gboolean test_forces_failure = FALSE;
+#endif
+        if (!test_forces_failure &&
+            pthread_create(&general_controller_thread,
                            NULL,
                            peak_general_controller_thread_main,
                            NULL) == 0) {
@@ -1248,6 +1272,15 @@ peak_general_listener_controller_stop(void)
 
     if (!peak_general_listener_controller_drain(shutdown_drain_ms)) {
         g_printerr("[peak] timed out draining pending target hook detach/reattach requests before controller shutdown\n");
+    }
+
+    /*
+     * Close dlopen admission and release exact-request waiters while the
+     * drainer still exists.  This is controller lifecycle coordination only;
+     * it does not alter any target detach/reattach state transition.
+     */
+    if (!dlopen_interceptor_shutdown_dynamic_attach()) {
+        g_printerr("[peak] dlopen dynamic attach did not drain before general controller shutdown\n");
     }
 
     pthread_mutex_lock(&general_controller_wake_mutex);

@@ -48,12 +48,11 @@ typedef struct {
 int dlopen_interceptor_attach(void);
 
 /**
- * @brief Enables dynamic attach from the dlopen replacement.
+ * @brief Opens dynamic-attach admission after the controller is running.
  *
- * This should be called only after the general listener arrays have been
- * allocated and initial hooks have been published.
+ * @return TRUE only when the interceptor and its controller are both ready.
  */
-void dlopen_interceptor_enable_dynamic_attach(void);
+gboolean dlopen_interceptor_enable_dynamic_attach(void);
 
 /**
  * @brief Drains queued dynamic attach work on the controller path.

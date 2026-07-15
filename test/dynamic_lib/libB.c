@@ -22,7 +22,7 @@ void b_tail_impl(void) {
     __asm__ __volatile__("nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
 }
 
-#if defined(__x86_64__)
+#if defined(__ELF__) && defined(__x86_64__)
 __asm__(
     ".text\n"
     ".globl b_tail_wrapper\n"
@@ -30,7 +30,7 @@ __asm__(
     "b_tail_wrapper:\n"
     "jmp b_tail_impl@PLT\n"
     ".size b_tail_wrapper, .-b_tail_wrapper\n");
-#elif defined(__aarch64__)
+#elif defined(__ELF__) && defined(__aarch64__)
 __asm__(
     ".text\n"
     ".globl b_tail_wrapper\n"
@@ -42,5 +42,8 @@ __asm__(
 __attribute__((visibility("default"), noinline))
 void b_tail_wrapper(void) {
     b_tail_impl();
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" ::: "memory");
+#endif
 }
 #endif

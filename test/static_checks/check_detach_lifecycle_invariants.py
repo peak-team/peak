@@ -1207,6 +1207,88 @@ def check_general_controller_dlopen_drain_order(repo_root):
                 "draining dynamic dlopen attach work")
 
 
+def check_dlopen_request_completion_and_readiness(repo_root):
+    dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    general = read_source(repo_root, "src/general_listener.c")
+    peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+
+    complete = extract_function(
+        dlopen, "dlopen_interceptor_complete_dynamic_attach_request"
+    )
+    ownership_snapshot = complete.find(
+        "caller_waits = request->caller_waits"
+    )
+    broadcast = complete.find("pthread_cond_broadcast")
+    completion_unlock = complete.find(
+        "pthread_mutex_unlock(&request->completion_mutex)"
+    )
+    local_ownership_branch = complete.find("if (!caller_waits)")
+    require(ownership_snapshot != -1 and
+            ownership_snapshot < broadcast < completion_unlock <
+            local_ownership_branch,
+            "dlopen request completion must snapshot ownership before waking "
+            "a waiter that may free the request")
+    require("request->caller_waits" not in complete[completion_unlock:],
+            "controller must not dereference caller-owned request state after "
+            "releasing the completion mutex")
+
+    enable = extract_function(
+        dlopen, "dlopen_interceptor_enable_dynamic_attach"
+    )
+    ready = extract_function(
+        general, "peak_general_listener_controller_is_ready"
+    )
+    stop = extract_function(
+        general, "peak_general_listener_controller_stop"
+    )
+    init = extract_function(peak, "peak_init")
+    require("general_controller_thread_started" in ready and
+            "general_controller_running" in ready and
+            "general_controller_wake_mutex" in ready,
+            "controller readiness must be published under its lifecycle lock")
+    require("peak_general_listener_controller_is_ready" in enable and
+            "return FALSE" in enable,
+            "dlopen admission must fail closed without a running drainer")
+    require("peak_general_listener_controller_is_ready" in init and
+            init.find("peak_general_listener_controller_is_ready") <
+            init.find("dlopen_interceptor_attach"),
+            "PEAK startup must prove controller readiness before installing "
+            "the dlopen handshake")
+    require("dlopen_interceptor_shutdown_dynamic_attach" in stop and
+            stop.find("dlopen_interceptor_shutdown_dynamic_attach") <
+            stop.find("general_controller_running = FALSE"),
+            "controller shutdown must close dlopen admission and release "
+            "waiters before stopping the drainer")
+
+    attach_exact = extract_function(
+        general, "peak_general_listener_attach_exact"
+    )
+    require("gum_interceptor_peak_attach_exact" in attach_exact and
+            "GUM_ATTACH_WRONG_SIGNATURE" in attach_exact and
+            "return gum_interceptor_attach" not in attach_exact,
+            "profiling attach must use exact-entry Gum or fail closed, never "
+            "silently follow a stock-Gum redirect")
+
+    require("#if defined(__linux__)" in dlopen and
+            "#include <link.h>" in dlopen and
+            "dlinfo(request->handle, RTLD_DI_LINKMAP" in dlopen,
+            "Linux link-map lookup must remain guarded from Darwin builds "
+            "without treating the RTLD_DI_LINKMAP enum as a macro")
+    attach_request = extract_function(
+        dlopen, "dlopen_interceptor_attach_from_request"
+    )
+    require("gum_process_find_module_by_name(request->filename)" in
+            attach_request,
+            "dynamic attach must have a non-ELF module lookup path")
+    require("strrchr(request->filename, '/')" in attach_request and
+            "gum_process_find_module_by_name(basename + 1)" in
+            attach_request,
+            "dynamic attach module-name fallback must handle relative and "
+            "absolute dlopen paths")
+
+
 def check_exclusive_time_nonnegative(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
     helper = extract_function(
@@ -1694,6 +1776,7 @@ def main():
     check_global_detach_overhead_selection(repo_root)
     check_heartbeat_state_machine_boundary(repo_root)
     check_general_controller_dlopen_drain_order(repo_root)
+    check_dlopen_request_completion_and_readiness(repo_root)
     check_exclusive_time_nonnegative(repo_root)
     check_dlopen_test_hook_visibility(repo_root)
     check_shutdown_fail_closed_docs(repo_root)

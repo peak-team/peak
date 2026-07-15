@@ -40,7 +40,12 @@ If a caller supplies `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` while
 leaving `PEAK_FRIDA_GUM_PROVIDER=auto`, PEAK treats that as a caller-managed
 stock-Gum build. It validates the PEAK API only when
 `PEAK_REQUIRE_GUM_PEAK_API=ON` is also set; without the PEAK API, strict runtime
-mutation fails closed with `missing-gum-api`. Selecting
+mutation fails closed with `missing-gum-api`. Profiling-listener attachment also
+fails closed when the selected headers do not expose
+`GUM_PEAK_EXACT_ATTACH_API_VERSION`; PEAK never silently falls back to Gum's
+redirect-following attach because doing so can fold wrapper symbols into their
+implementation and change call counts. Support hooks continue to use stock Gum
+semantics. Selecting
 `PEAK_FRIDA_GUM_PROVIDER=auto-patched-devkit` requires CMake to own the downloaded
 devkit so it can append the overlay.
 

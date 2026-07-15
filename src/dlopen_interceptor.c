@@ -8,13 +8,14 @@
 #include "logging.h"
 
 #include <errno.h>
-#include <link.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
-typedef void (*fn_void)(void);
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 #define PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET 64U
 #define PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS 5000L
@@ -520,17 +521,25 @@ dlopen_interceptor_complete_dynamic_attach_request(
     PeakDlopenDynamicAttachRequest* request,
     PeakDlopenRequestState state)
 {
+    gboolean caller_waits;
+
     if (request->retain_handle && request->handle != NULL) {
         dlopen_interceptor_retain_dynamic_handle(request->handle);
         request->handle = NULL;
     }
 
     pthread_mutex_lock(&request->completion_mutex);
+    caller_waits = request->caller_waits;
     request->state = state;
     pthread_cond_broadcast(&request->completion_cond);
     pthread_mutex_unlock(&request->completion_mutex);
 
-    if (!request->caller_waits) {
+    /*
+     * A caller-owned waiter may destroy request as soon as the completion
+     * mutex is released.  Never dereference request after that release on the
+     * caller-waits path; the local ownership snapshot decides who frees it.
+     */
+    if (!caller_waits) {
         dlopen_interceptor_destroy_dynamic_attach_request(request);
     }
 }
@@ -960,7 +969,18 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         return PEAK_DLOPEN_ATTACH_FAILED;
     }
 
-    root_module = gum_process_find_module_by_address(request->module_address);
+    root_module = request->module_address != 0
+        ? gum_process_find_module_by_address(request->module_address)
+        : NULL;
+    if (root_module == NULL && request->filename != NULL) {
+        root_module = gum_process_find_module_by_name(request->filename);
+        if (root_module == NULL) {
+            const char* basename = strrchr(request->filename, '/');
+            if (basename != NULL && basename[1] != '\0') {
+                root_module = gum_process_find_module_by_name(basename + 1);
+            }
+        }
+    }
     if (root_module == NULL) {
         g_printerr("[peak] dynamic attach could not identify loaded module %s\n",
                    request->filename != NULL ? request->filename : "<unknown>");
@@ -1086,9 +1106,16 @@ dlopen_interceptor_drain_dynamic_attach_queue(void)
         PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET);
 }
 
-void
+gboolean
 dlopen_interceptor_enable_dynamic_attach(void)
 {
+    gboolean enabled = FALSE;
+
+    if (!peak_general_listener_controller_is_ready()) {
+        g_printerr("[peak] refusing to enable dlopen dynamic attach without a running general listener controller\n");
+        return FALSE;
+    }
+
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN &&
         dlopen_interceptor != NULL &&
@@ -1098,8 +1125,10 @@ dlopen_interceptor_enable_dynamic_attach(void)
         atomic_store_explicit(&dynamic_attach_owner_pid,
                               getpid(),
                               memory_order_release);
+        enabled = TRUE;
     }
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return enabled;
 }
 
 gboolean
@@ -1182,6 +1211,7 @@ peak_dlopen(const char *filename, int flags) {
     request->handle = original_dlopen(filename, binding_flags | RTLD_NOLOAD);
 #endif
     if (request->handle != NULL) {
+#if defined(__linux__)
         struct link_map* module_map = NULL;
         if (dlinfo(request->handle, RTLD_DI_LINKMAP, &module_map) == 0 &&
             module_map != NULL) {
@@ -1189,6 +1219,7 @@ peak_dlopen(const char *filename, int flags) {
                 ? (GumAddress)module_map->l_addr
                 : (GumAddress)module_map->l_ld;
         }
+#endif
     } else {
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
         dynamic_attach_drop_noload_count++;
@@ -1196,7 +1227,6 @@ peak_dlopen(const char *filename, int flags) {
     }
 
     gboolean attach_enqueued = request->handle != NULL &&
-        request->module_address != 0 &&
         dlopen_interceptor_enqueue_dynamic_attach_request(request);
     if (!attach_enqueued) {
         dlopen_interceptor_destroy_dynamic_attach_request(request);

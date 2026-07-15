@@ -72,6 +72,7 @@ add_test(NAME test_dynamic_dlopen
   COMMAND ${Python3_EXECUTABLE} -c "${_DLOPEN_DRAIN_SCRIPT}"
 )
 
+if(PEAK_GUM_PEAK_API_AVAILABLE)
 add_test(NAME test_dynamic_dlopen_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic()"
@@ -150,12 +151,37 @@ set_tests_properties(test_dynamic_fork_child_dlopen_no_deadlock
     PASS_REGULAR_EXPRESSION "fork_child_dlopen_ok"
     TIMEOUT 10
 )
+
+add_test(NAME test_dynamic_dlopen_controller_start_failure_no_wait
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import ctypes; lib = ctypes.CDLL('./libB.so'); lib.b_dynamic(); print('controller_start_failure_no_wait_ok')"
+)
+set_tests_properties(test_dynamic_dlopen_controller_start_failure_no_wait
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_TEST_GENERAL_CONTROLLER_START_FAIL=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_controller_start_failure_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "dynamic target loading disabled because the general listener controller is unavailable.*controller_start_failure_no_wait_ok"
+    FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
+    TIMEOUT 10
+)
+endif()
+
+if(PEAK_GUM_PEAK_API_AVAILABLE)
 set_tests_properties(test_dynamic_dlopen
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_statslog;${PRELOAD_VAR}"
     PASS_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
 )
+else()
+set_tests_properties(test_dynamic_dlopen
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "skipping dlopen Gum replace: missing-gum-api"
+    FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
+)
+endif()
 
 add_test(NAME test_dynamic_customCpackage_script
   COMMAND ${CMAKE_COMMAND} -E env

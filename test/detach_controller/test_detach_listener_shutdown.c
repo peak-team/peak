@@ -41,6 +41,12 @@ dlopen_interceptor_drain_dynamic_attach_queue(void)
 {
 }
 
+gboolean
+dlopen_interceptor_shutdown_dynamic_attach(void)
+{
+    return TRUE;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_TEST_EXPORT __attribute__((visibility("default")))
 #else

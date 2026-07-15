@@ -37,7 +37,6 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 1,
         "attach_exact_backend": 1,
         "attach_exact_boundary": 6,
         "detach": 5,
