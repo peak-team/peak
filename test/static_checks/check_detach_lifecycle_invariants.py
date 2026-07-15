@@ -1367,6 +1367,9 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
         encoding="utf-8"
     )
+    entry_accounting = (
+        repo_root / "src/dlopen_entry_accounting.h"
+    ).read_text(encoding="utf-8")
     general = read_source(repo_root, "src/general_listener.c")
     peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     replace_failure_test = (
@@ -1626,19 +1629,26 @@ def check_dlopen_request_completion_and_readiness(repo_root):
                 "dlopen_interceptor_new_dynamic_attach_request(TRUE)"),
             "unrelated handles must bypass exact request allocation and scan")
     entry_registration = peak_dlopen.find(
-        "atomic_fetch_add_explicit(&active_dlopen_replacement_count"
+        "PEAK_DLOPEN_REGISTER_REPLACEMENT_ENTRY("
     )
     require("static _Atomic unsigned int active_dlopen_replacement_count" in
             dlopen and
             "_Static_assert(ATOMIC_INT_LOCK_FREE == 2" in dlopen and
+            '#include "dlopen_entry_accounting.h"' in dlopen and
+            "#if defined(__aarch64__)" in entry_accounting and
+            "ldaxr" in entry_accounting and
+            "stlxr" in entry_accounting and
+            "atomic_fetch_add_explicit" in entry_accounting and
             entry_registration != -1 and
             entry_registration < peak_dlopen.find("current_pid = getpid()") and
             entry_registration < peak_dlopen.find(
                 "peak_general_listener_controller_is_current_thread()") and
             entry_registration < peak_dlopen.find("pthread_setcancelstate") and
+            "atomic_fetch_add_explicit" not in peak_dlopen and
             "dlopen_interceptor_begin_replacement_call" not in dlopen,
-            "peak_dlopen must register itself with a direct lock-free atomic as "
-            "its first executable operation, before any call can leave the guarded entry")
+            "peak_dlopen must register itself inline as its first executable "
+            "operation, using an Arm64 exclusive loop rather than an outline "
+            "atomic helper before any call can leave the guarded entry")
     require("atomic_fetch_sub_explicit" in end_replacement and
             "&active_dlopen_replacement_count" in end_replacement and
             "atomic_load_explicit" in wait_replacement and

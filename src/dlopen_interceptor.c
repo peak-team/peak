@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "dlopen_entry_accounting.h"
+
 #if defined(__linux__)
 #include <link.h>
 #endif
@@ -136,6 +138,10 @@ static unsigned int active_dynamic_attach_count = 0;
 static _Atomic unsigned int active_dlopen_replacement_count = 0;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "dlopen replacement entry accounting must be lock-free");
+#if defined(__aarch64__)
+_Static_assert(_Alignof(_Atomic unsigned int) >= sizeof(unsigned int),
+               "AArch64 dlopen entry accounting requires an aligned word");
+#endif
 static gboolean dynamic_attach_drain_active = FALSE;
 static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_head = NULL;
 static PeakDlopenDynamicAttachRequest* dynamic_attach_queue_tail = NULL;
@@ -2096,13 +2102,15 @@ peak_dlopen(const char *filename, int flags) {
     /*
      * This must remain the first executable statement.  Strict teardown
      * restores the real dlopen entry while peers are stopped, then waits for
-     * this count before releasing Gum's trampoline metadata.  The compile-time
-     * lock-free assertion above ensures registration cannot leave the guarded
-     * entry range through a helper call before the body becomes visible.
+     * this count before releasing Gum's trampoline metadata.  On AArch64 the
+     * registration macro expands to an inline LDAXR/STLXR loop,
+     * because a lock-free C atomic may otherwise call an out-of-line helper.
+     * The existing x86_64 path retains its direct C11 atomic operation.
+     * Registration therefore cannot leave the guarded entry range through a
+     * helper call before the body becomes visible.
      */
-    atomic_fetch_add_explicit(&active_dlopen_replacement_count,
-                              1,
-                              memory_order_acq_rel);
+    PEAK_DLOPEN_REGISTER_REPLACEMENT_ENTRY(
+        &active_dlopen_replacement_count);
 
     current_pid = getpid();
     owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,

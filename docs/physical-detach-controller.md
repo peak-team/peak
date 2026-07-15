@@ -857,10 +857,16 @@ controller thread exits; that lifecycle step deliberately does not wait for
 replacement bodies while the patched entry can still admit new callers. If a
 replacement body does not drain within the bounded shutdown
 window, teardown fails closed and leaves the interceptor state alive. The first
-executable operation in `peak_dlopen` is a compile-time-proven lock-free atomic
-entry registration. It executes before `getpid()`, TLS lookup, controller
-queries, cancellation control, or any other call that could leave the guarded
-entry range. A stopped thread is therefore either still inside the blocked
+executable operation in `peak_dlopen` is a lock-free atomic entry registration.
+On Arm64 it is an explicitly inline `LDAXR`/`STLXR` retry loop, rather than a C
+atomic that the compiler may lower to an out-of-line `__aarch64_*` helper. It
+executes before `getpid()`, TLS lookup, controller queries, cancellation
+control, or any other call that could leave the guarded entry range. A
+cross-code-generation test enables outline atomics deliberately, rejects
+branch-and-link instructions before publication, and requires the
+store-exclusive to remain inside the 256-byte entry guard. Native Arm64 builds
+also disassemble the production `peak_dlopen` body and enforce the same
+properties. A stopped thread is therefore either still inside the blocked
 entry range or already represented by the replacement-body count; zero cannot
 become nonzero after strict entry restoration.
 

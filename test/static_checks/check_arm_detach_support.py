@@ -35,7 +35,15 @@ def main():
     helper = read(root, "src/detach_helper.c")
     platform_cmake = read(root, "cmake/exec-platform.cmake")
     source_cmake = read(root, "src/CMakeLists.txt")
+    tests_cmake = read(root, "test/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
+    entry_accounting = read(root, "src/dlopen_entry_accounting.h")
+    entry_codegen = read(
+        root, "test/static_checks/check_aarch64_dlopen_entry_codegen.py")
+    entry_binary = read(
+        root, "test/static_checks/check_aarch64_dlopen_entry_binary.py")
+    entry_fixture = read(
+        root, "test/static_checks/aarch64_dlopen_entry_codegen.c")
 
     require("peak_exec_configure_platform_support()" in top_cmake and
             "set(PEAK_DETACH_HELPER_SUPPORTED" not in top_cmake,
@@ -70,6 +78,24 @@ def main():
             "shared exec/detach platform predicate failed:\n" + predicate.stdout)
     require("aarch64" in frida_cmake and "arm64" in frida_cmake,
             "Frida Gum auto-patch selection must include Linux arm64/aarch64")
+    for token in ["__aarch64__", "ldaxr", "stlxr", "cbnz", '"memory"']:
+        require(token in entry_accounting,
+                f"dlopen entry accounting missing inline Arm64 token: {token}")
+    require("PEAK_DLOPEN_REGISTER_REPLACEMENT_ENTRY" in entry_fixture and
+            "test_aarch64_dlopen_entry_codegen" in tests_cmake and
+            "--target=aarch64-linux-gnu" in entry_codegen and
+            '"-moutline-atomics"' in entry_codegen and
+            "(?:bl|blr[a-z0-9]*)" in entry_codegen and
+            '"__aarch64_"' in entry_codegen and
+            "stlxr_index * 4 >= 256" in entry_codegen,
+            "Arm64 dlopen entry accounting must have a cross-codegen test that "
+            "rejects outline calls and publication outside the teardown guard")
+    require("test_aarch64_dlopen_entry_binary_codegen" in tests_cmake and
+            "--disassemble=peak_dlopen" in entry_binary and
+            'mnemonic.startswith("blr")' in entry_binary and
+            "publication_address - start >= args.guard_bytes" in entry_binary,
+            "native Arm64 builds must disassemble the production peak_dlopen "
+            "and reject calls or late publication before the teardown guard")
     require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in peak_api,
             "PEAK Gum API header must expose an Arm64 ABI fingerprint")
     require("GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64" in frida_cmake,

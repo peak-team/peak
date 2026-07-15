@@ -83,6 +83,35 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "arm_detach_support_ok")
 
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        set(PEAK_AARCH64_CODEGEN_CLANG "${CMAKE_C_COMPILER}")
+    else()
+        find_program(PEAK_AARCH64_CODEGEN_CLANG NAMES clang)
+    endif()
+    if(PEAK_AARCH64_CODEGEN_CLANG)
+        add_test(NAME test_aarch64_dlopen_entry_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/static_checks/check_aarch64_dlopen_entry_codegen.py
+                    --compiler ${PEAK_AARCH64_CODEGEN_CLANG}
+                    --source ${PROJECT_SOURCE_DIR}/test/static_checks/aarch64_dlopen_entry_codegen.c
+                    --include ${PROJECT_SOURCE_DIR}/src)
+        set_tests_properties(test_aarch64_dlopen_entry_codegen
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "aarch64_dlopen_entry_codegen_ok")
+    endif()
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        add_test(NAME test_aarch64_dlopen_entry_binary_codegen
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/static_checks/check_aarch64_dlopen_entry_binary.py
+                    --objdump ${CMAKE_OBJDUMP}
+                    --binary $<TARGET_FILE:peak>
+                    --guard-bytes 256)
+        set_tests_properties(test_aarch64_dlopen_entry_binary_codegen
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "aarch64_dlopen_entry_binary_ok")
+    endif()
+
     add_test(NAME test_detach_lifecycle_invariants
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_detach_lifecycle_invariants.py
