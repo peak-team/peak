@@ -856,79 +856,8 @@ dlopen_interceptor_is_fftw_symbol(const char* name)
             strncmp(name, "rfftw", 5) == 0);
 }
 
-#if defined(__linux__)
-static gboolean
-dlopen_interceptor_collect_function_export(const GumExportDetails* details,
-                                           gpointer user_data)
-{
-    GHashTable* exports = user_data;
-
-    if (details->type == GUM_EXPORT_FUNCTION &&
-        dlopen_interceptor_is_fftw_symbol(details->name) &&
-        details->address != 0 &&
-        g_hash_table_lookup(exports, details->name) == NULL) {
-        g_hash_table_insert(exports,
-                            g_strdup(details->name),
-                            GSIZE_TO_POINTER((gsize)details->address));
-    }
-    return TRUE;
-}
-
-static gboolean
-dlopen_interceptor_string_equal(gconstpointer left, gconstpointer right)
-{
-    return strcmp(left, right) == 0;
-}
-
-typedef struct {
-    GPtrArray* modules;
-    GHashTable* visited_bases;
-} PeakDlopenModuleScan;
-
-static void
-dlopen_interceptor_add_module_dependencies(PeakDlopenModuleScan* scan,
-                                           GumModule* module);
-
-static gboolean
-dlopen_interceptor_collect_dependency(const GumDependencyDetails* details,
-                                      gpointer user_data)
-{
-    PeakDlopenModuleScan* scan = user_data;
-    GumModule* dependency = gum_process_find_module_by_name(details->name);
-
-    if (dependency != NULL) {
-        dlopen_interceptor_add_module_dependencies(scan, dependency);
-        g_object_unref(dependency);
-    }
-    return TRUE;
-}
-
-static void
-dlopen_interceptor_add_module_dependencies(PeakDlopenModuleScan* scan,
-                                           GumModule* module)
-{
-    const GumMemoryRange* range = gum_module_get_range(module);
-
-    if (range == NULL || range->base_address == 0) {
-        return;
-    }
-
-    gpointer base_key = GSIZE_TO_POINTER((gsize)range->base_address);
-    if (g_hash_table_contains(scan->visited_bases, base_key)) {
-        return;
-    }
-
-    g_hash_table_add(scan->visited_bases, base_key);
-    g_ptr_array_add(scan->modules, g_object_ref(module));
-    gum_module_enumerate_dependencies(module,
-                                      dlopen_interceptor_collect_dependency,
-                                      scan);
-}
-#endif
-
 static PeakDlopenAttachResult
 dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
-                                       GHashTable* resolved_exports,
                                        gboolean stop_on_retry)
 {
     gboolean retained_handle_for_hooks = FALSE;
@@ -960,9 +889,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
             continue;
         }
 
-        gpointer dynamic_hook_address = resolved_exports != NULL
-            ? g_hash_table_lookup(resolved_exports, peak_hook_strings[i])
-            : (gpointer)(fn_void)dlsym(request->handle, peak_hook_strings[i]);
+        gpointer dynamic_hook_address =
+            (gpointer)(fn_void)dlsym(request->handle, peak_hook_strings[i]);
         if (dynamic_hook_address == NULL) {
             continue;
         }
@@ -1085,10 +1013,6 @@ dlopen_interceptor_attach_fftw_before_return(void* handle, int binding_flags)
 {
 #if defined(__linux__) && defined(RTLD_NOLOAD)
     struct link_map* map = NULL;
-    GumModule* module = NULL;
-    GPtrArray* modules = NULL;
-    GHashTable* visited_bases = NULL;
-    GHashTable* exports = NULL;
     PeakDlopenDynamicAttachRequest request = { 0 };
     gboolean request_requeued = FALSE;
 
@@ -1097,70 +1021,32 @@ dlopen_interceptor_attach_fftw_before_return(void* handle, int binding_flags)
         return;
     }
 
-    if (dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 ||
-        map == NULL || map->l_ld == NULL) {
-        goto done;
+    if (dlinfo(handle, RTLD_DI_LINKMAP, &map) != 0 || map == NULL) {
+        return;
     }
 
-    module = gum_process_find_module_by_address(
-        (GumAddress)(guintptr)map->l_ld);
-    if (module == NULL) {
-        goto done;
-    }
-
-    const char* module_path = gum_module_get_path(module);
+    const char* module_path = map->l_name;
     if (module_path == NULL || module_path[0] == '\0') {
-        goto done;
+        return;
     }
 
     request.handle = dlopen_interceptor_open_unobserved(
         module_path,
         binding_flags | RTLD_NOLOAD);
     if (request.handle == NULL) {
-        goto done;
+        return;
     }
     request.filename = g_strdup(module_path);
     request.binding_flags = binding_flags;
 
-    exports = g_hash_table_new_full(g_str_hash,
-                                    dlopen_interceptor_string_equal,
-                                    g_free,
-                                    NULL);
-    modules = g_ptr_array_new_with_free_func(g_object_unref);
-    visited_bases = g_hash_table_new(g_direct_hash, g_direct_equal);
-    PeakDlopenModuleScan scan = {
-        .modules = modules,
-        .visited_bases = visited_bases
-    };
-    dlopen_interceptor_add_module_dependencies(&scan, module);
-    for (guint i = 0; i < modules->len; i++) {
-        gum_module_enumerate_exports(g_ptr_array_index(modules, i),
-                                     dlopen_interceptor_collect_function_export,
-                                     exports);
-    }
-
     PeakDlopenAttachResult result =
-        dlopen_interceptor_attach_from_request(&request, exports, TRUE);
+        dlopen_interceptor_attach_from_request(&request, TRUE);
     if (result == PEAK_DLOPEN_ATTACH_RETRY) {
         request_requeued =
             dlopen_interceptor_requeue_dynamic_attach_request(&request);
     }
     if (!request_requeued) {
         dlopen_interceptor_release_dynamic_attach_request(&request);
-    }
-
-done:
-    if (exports != NULL) {
-        g_hash_table_destroy(exports);
-    }
-    if (visited_bases != NULL) {
-        g_hash_table_destroy(visited_bases);
-    }
-    if (modules != NULL) {
-        g_ptr_array_free(modules, TRUE);
-    }
-    if (module != NULL) {
-        g_object_unref(module);
     }
 #else
     (void)handle;
@@ -1193,7 +1079,7 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
     while (drained < drain_limit &&
            dlopen_interceptor_pop_dynamic_attach_request(&request)) {
         PeakDlopenAttachResult result =
-            dlopen_interceptor_attach_from_request(&request, NULL, FALSE);
+            dlopen_interceptor_attach_from_request(&request, FALSE);
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
         dynamic_attach_drain_count++;
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
