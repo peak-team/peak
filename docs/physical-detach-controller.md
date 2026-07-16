@@ -773,8 +773,9 @@ controller:
     publish hook metadata only after Gum attach and helper release succeed
 ```
 
-For FFTW, the listener performs the guarded attach before the real `dlopen`
-returns, so the normal immediate-first-call path is profiled. Resolution uses
+On Linux when `RTLD_NOLOAD` is available, the listener performs the guarded
+FFTW attach before the real `dlopen` returns, so the normal
+immediate-first-call path is profiled. Resolution uses
 the loader's ordinary handle-scoped `dlsym` behavior, which naturally searches
 the root module's dependency closure in loader order; PEAK does not implement a
 second dependency graph or provider-selection protocol. The synchronous scope
@@ -796,9 +797,11 @@ before the successful application `dlopen` returns.
 
 A temporarily unsafe mutation is queued for the existing asynchronous
 best-effort path, so that exceptional call may precede attachment; the
-application thread does not wait on a condition variable, retry loop, or
-PEAK-specific timeout. Calls made from DSO constructors before `dlopen` reaches
-its on-leave callback, `dlmopen` namespaces, and exact IFUNC resolver/wrapper
+application thread does not wait for an asynchronous retry or a new
+`dlopen`-specific completion timeout. Guarded mutation still uses the existing
+controller's bounded stop and classification protocol. Calls made from DSO
+constructors before `dlopen` reaches its on-leave callback, `dlmopen`
+namespaces, and exact IFUNC resolver/wrapper
 boundaries are not part of this contract. A multithreaded `fork()` child must
 still `exec` before using the profiling runtime. When Gum dispatches a fresh
 child `dlopen` callback, a PID guard makes it bypass PEAK before touching
