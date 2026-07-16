@@ -161,7 +161,7 @@ if(BUILD_TESTING AND CMAKE_SYSTEM_NAME MATCHES "Linux")
   set_tests_properties(test_dynamic_lib_dlopen_flags
     PROPERTIES
       WORKING_DIRECTORY ${DL_DIR}
-      ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+      ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
   )
 
   add_test(NAME test_dynamic_lib_dlopen_target_no_crash
