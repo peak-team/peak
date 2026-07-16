@@ -1290,13 +1290,40 @@ if(BUILD_TESTING)
             ENVIRONMENT "PEAK_TARGET=functionA,functionB;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
 
-    # Add test of fftw
+    # Verify both startup-loaded and runtime-loaded FFTW group targets.
     add_subdirectory(fftw)
     add_test(NAME test_fftw COMMAND ${PROJECT_BINARY_DIR}/test/fftw/test_fftw)
     set_tests_properties(test_fftw
-        PROPERTIES 
-            ENVIRONMENT "PEAK_TARGET_CONFIG=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "rfftwnd_print_plan\\|[ \t]+1\\|.*rfftwnd_threads_one_complex_to_real\\|[ \t]+1\\|"
     )
+
+    if(PEAK_GUM_PEAK_API_AVAILABLE AND
+       CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       TARGET test_fftw_runtime_dlopen)
+        add_test(NAME test_fftw_runtime_dlopen_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+        )
+        set_tests_properties(test_fftw_runtime_dlopen_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_dependency_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_consumer>
+        )
+        set_tests_properties(test_fftw_runtime_dependency_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+    endif()
     
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)

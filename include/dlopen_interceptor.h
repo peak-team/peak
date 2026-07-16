@@ -3,10 +3,9 @@
 
 /**
  * @file dlopen_interceptor.h
- * @brief Header file for dynamic library open interception functionality.
+ * @brief Header file for dynamic library load observation functionality.
  *
- * Provides functions to attach and detach an interceptor for 
- * `dlopen`.
+ * Provides functions to observe `dlopen` without replacing its call path.
  */
 
 #include "frida-gum.h"
@@ -36,19 +35,17 @@ typedef struct {
 } PeakDlopenDynamicAttachDiagnostics;
 
 /**
- * @brief Attaches the dlopen interceptor.
+ * @brief Attaches the dlopen invocation listener.
  *
- * This function initializes and attaches an interceptor 
- * for the `dlopen` function. It obtains a GumInterceptor instance, 
- * locates the `dlopen` function's memory address, and replaces it with 
- * a custom implementation. 
+ * This function observes the real `dlopen` entry and return so caller-sensitive
+ * loader behavior remains unchanged.
  *
  * @return 0 on success, or an error code indicating failure.
  */
 int dlopen_interceptor_attach(void);
 
 /**
- * @brief Enables dynamic attach from the dlopen replacement.
+ * @brief Enables dynamic attach from the dlopen listener.
  *
  * This should be called only after the general listener arrays have been
  * allocated and initial hooks have been published.
@@ -58,20 +55,18 @@ void dlopen_interceptor_enable_dynamic_attach(void);
 /**
  * @brief Drains queued dynamic attach work on the controller path.
  *
- * The dlopen replacement only enqueues retained handles. This function resolves
- * and attaches newly available symbols under the general listener controller
- * lock, outside the replacement body.
+ * Runtime FFTW exports are attached before `dlopen` returns. Other unresolved
+ * targets use this controller-drained fallback queue.
  */
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
 
 /**
  * @brief Closes and releases dynamic attach work before listener teardown.
  *
- * After this call succeeds, `peak_dlopen` continues to forward to the real
- * dlopen but will not touch general-listener-owned state. Queued handles that
- * were not drained by the controller are released without attaching new hooks.
+ * Queued handles that were not drained by the controller are released without
+ * attaching new hooks.
  *
- * @return TRUE when active dynamic attach and replacement bodies drained.
+ * @return TRUE when active dynamic attach work and listener callbacks drained.
  */
 gboolean dlopen_interceptor_shutdown_dynamic_attach(void);
 
@@ -117,10 +112,9 @@ PEAK_DLOPEN_API void dlopen_interceptor_test_trace_counters(const char* event);
 #endif
 
 /**
- * @brief Detaches the dlopen interceptor.
+ * @brief Detaches the dlopen invocation listener.
  *
- * This function reverts the replacement of the intercepted `dloepn`
- * and releases the resources associated with the interceptor.
+ * This function stops observing `dlopen` and releases listener resources.
  */
 gboolean dlopen_interceptor_dettach(void);
 

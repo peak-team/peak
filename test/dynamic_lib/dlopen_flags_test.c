@@ -21,6 +21,16 @@ static int expect_handle(const char *label, void *handle) {
     return 1;
 }
 
+static int expect_no_error(const char *label) {
+    const char *err = dlerror();
+    if (err == NULL) {
+        return 0;
+    }
+
+    fprintf(stderr, "%s left dlerror set: %s\n", label, err);
+    return 1;
+}
+
 int main(void) {
 #ifndef RTLD_NOLOAD
     fprintf(stderr, "RTLD_NOLOAD is unavailable on this platform\n");
@@ -30,20 +40,28 @@ int main(void) {
 
     dlerror();
     failures += expect_null("RTLD_NOLOAD before load",
-                            dlopen("./libB.so", RTLD_NOLOAD | RTLD_LAZY));
+                            dlopen("$ORIGIN/libB.so", RTLD_NOLOAD | RTLD_LAZY));
 
-    void *lazy_handle = dlopen("./libB.so", RTLD_LAZY);
+    dlerror();
+    void *lazy_handle = dlopen("$ORIGIN/libB.so", RTLD_LAZY);
     failures += expect_handle("RTLD_LAZY load", lazy_handle);
+    failures += expect_no_error("RTLD_LAZY load");
 
-    void *noload_handle = dlopen("./libB.so", RTLD_NOLOAD | RTLD_NOW);
+    dlerror();
+    void *noload_handle = dlopen("$ORIGIN/libB.so", RTLD_NOLOAD | RTLD_NOW);
     failures += expect_handle("RTLD_NOLOAD after load", noload_handle);
+    failures += expect_no_error("RTLD_NOLOAD after load");
 
-    void *now_handle = dlopen("./libB.so", RTLD_NOW);
+    dlerror();
+    void *now_handle = dlopen("$ORIGIN/libB.so", RTLD_NOW);
     failures += expect_handle("RTLD_NOW load", now_handle);
+    failures += expect_no_error("RTLD_NOW load");
 
 #ifdef RTLD_DEEPBIND
-    void *deepbind_handle = dlopen("./libB.so", RTLD_NOW | RTLD_DEEPBIND);
+    dlerror();
+    void *deepbind_handle = dlopen("$ORIGIN/libB.so", RTLD_NOW | RTLD_DEEPBIND);
     failures += expect_handle("RTLD_DEEPBIND load", deepbind_handle);
+    failures += expect_no_error("RTLD_DEEPBIND load");
 #endif
 
     return failures == 0 ? 0 : 1;
