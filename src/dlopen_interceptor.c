@@ -8,6 +8,7 @@
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
 #include "logging.h"
+#include "internal/unsafe_gum_prologue.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -999,12 +1000,15 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
             continue;
         }
 
+        GumAttachOptions attach_options;
+        peak_gum_target_attach_options(dynamic_hook_address,
+                                       &attach_options);
         gum_interceptor_begin_transaction(interceptor);
         GumAttachReturn attach_status =
             gum_interceptor_attach(interceptor,
                                    dynamic_hook_address,
                                    new_listener,
-                                   NULL);
+                                   &attach_options);
         gum_interceptor_end_transaction(interceptor);
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                          &detach_status)) {

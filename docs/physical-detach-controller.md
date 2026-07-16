@@ -784,7 +784,9 @@ that exceptional call may precede attachment; the application thread does not
 wait on a condition variable, retry loop, or PEAK-specific timeout. Calls made
 from DSO constructors before `dlopen` reaches its on-leave callback, `dlmopen`
 namespaces, and exact IFUNC resolver/wrapper boundaries are not part of this
-contract.
+contract. A multithreaded `fork()` child must `exec` before making instrumented
+calls; PEAK does not rebuild the complete profiling runtime for
+fork-without-exec children.
 
 Both paths retain a `RTLD_NOLOAD` handle using the application's original
 binding mode for any module that receives PEAK hooks. The retained root handle
@@ -866,6 +868,15 @@ checking whether `x16` or `x17` appears in the relocated operands, so the defaul
 policy defers to Gum's own attach result. The conservative PEAK policy can still
 skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
+
+The narrow exception is an exported target consisting of one unconditional
+branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`
+through `x16`/`x17`). Gum follows the branch but its checked relocation rejects
+that PLT entry because neither IP register appears free. PEAK uses Gum's public
+forced-relocation option only for this exact shape; the first relocated PLT
+instruction defines `x16`, so the trampoline scratch value is not consumed by
+the original sequence. Initial attach, runtime attach, and reattach all select
+the same option. Other Arm64 targets retain Gum's default relocation policy.
 
 Some PEAK-owned support replacements may use a separate stricter
 support-prologue guard when skipping that support hook does not remove core
