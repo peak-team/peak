@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -6,6 +7,7 @@
 
 typedef void* (*fftw_malloc_fn)(size_t size);
 typedef void (*fftw_free_fn)(void* pointer);
+typedef void (*set_manual_drain_fn)(int enabled);
 
 static void
 load_function(void* handle,
@@ -33,11 +35,24 @@ main(int argc, char** argv)
 {
     fftw_malloc_fn fftw_malloc;
     fftw_free_fn fftw_free;
+    set_manual_drain_fn set_manual_drain;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s /path/to/provider\n", argv[0]);
         return EXIT_FAILURE;
     }
+
+    load_function(RTLD_DEFAULT,
+                  "dlopen_interceptor_test_set_manual_drain",
+                  &set_manual_drain,
+                  sizeof(set_manual_drain));
+
+    /*
+     * Keep the controller fallback from hiding a broken synchronous attach.
+     * The first FFTW calls below must be visible before any queued request is
+     * drained.
+     */
+    set_manual_drain(1);
 
     void* handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
     if (handle == NULL) {
@@ -54,6 +69,7 @@ main(int argc, char** argv)
         return EXIT_FAILURE;
     }
     fftw_free(allocation);
+    set_manual_drain(0);
 
     if (dlclose(handle) != 0) {
         fprintf(stderr, "dlclose failed: %s\n", dlerror());
