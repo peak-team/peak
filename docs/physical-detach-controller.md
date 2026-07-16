@@ -776,11 +776,13 @@ For FFTW, the listener performs the guarded attach before the real `dlopen`
 returns, so the normal immediate-first-call path is profiled. Resolution uses
 the loader's ordinary handle-scoped `dlsym` behavior, which naturally searches
 the root module's dependency closure in loader order; PEAK does not implement a
-second dependency graph or provider-selection protocol. A temporarily unsafe
-mutation is queued for the existing asynchronous best-effort path, so that
-exceptional call may precede attachment; the application thread does not wait
-on a condition variable, retry loop, or PEAK-specific timeout. Calls made from
-DSO constructors before `dlopen` reaches its on-leave callback, `dlmopen`
+second dependency graph or provider-selection protocol. Symbol resolution never
+holds the general-listener mutex, avoiding a loader-lock/listener-lock inversion
+between an on-leave callback and the asynchronous controller. A temporarily
+unsafe mutation is queued for the existing asynchronous best-effort path, so
+that exceptional call may precede attachment; the application thread does not
+wait on a condition variable, retry loop, or PEAK-specific timeout. Calls made
+from DSO constructors before `dlopen` reaches its on-leave callback, `dlmopen`
 namespaces, and exact IFUNC resolver/wrapper boundaries are not part of this
 contract.
 
