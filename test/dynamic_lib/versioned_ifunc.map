@@ -1,0 +1,7 @@
+PEAK_IFUNC_1.0 {
+    global:
+        peak_versioned_ifunc;
+        peak_versioned_ifunc_calls;
+    local:
+        *;
+};

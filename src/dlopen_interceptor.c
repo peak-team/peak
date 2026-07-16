@@ -526,7 +526,9 @@ dlopen_interceptor_warn_fork_child_once(void)
     if (atomic_exchange_explicit(&dynamic_attach_fork_warning_pid,
                                  current_pid,
                                  memory_order_relaxed) != current_pid) {
-        (void)write(STDERR_FILENO, warning, sizeof(warning) - 1);
+        ssize_t bytes_written =
+            write(STDERR_FILENO, warning, sizeof(warning) - 1);
+        (void)bytes_written;
     }
 }
 
