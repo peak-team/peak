@@ -28,6 +28,15 @@ peak_gum_prologue_too_short_for_attach(gpointer address,
                                        const char** reason_out);
 
 /*
+ * Initializes options for a profiling-target attach. On Linux/AArch64 this
+ * narrowly opts canonical B-to-PLT thunks into Gum's forced relocation path;
+ * all other targets retain Gum's defaults.
+ */
+void
+peak_gum_target_attach_options(gpointer address,
+                               GumAttachOptions* options_out);
+
+/*
  * Support hooks are PEAK runtime wrappers, not user profiling targets. PEAK
  * lets Gum decide whether a support replacement can be patched and does not
  * proactively apply target relocation policy to them.

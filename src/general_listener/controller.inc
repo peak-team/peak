@@ -436,9 +436,15 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
 
     GumAttachReturn attach_status = GUM_ATTACH_OK;
     if (!helper_applied_physical_patch) {
+        GumAttachOptions attach_options;
+        peak_gum_target_attach_options(hook_address[hook_id],
+                                       &attach_options);
         gum_interceptor_begin_transaction(interceptor);
         attach_status =
-            gum_interceptor_attach(interceptor, hook_address[hook_id], array_listener[hook_id], NULL);
+            gum_interceptor_attach(interceptor,
+                                   hook_address[hook_id],
+                                   array_listener[hook_id],
+                                   &attach_options);
         gum_interceptor_end_transaction(interceptor);
     }
     PeakDetachStatus finish_status = PEAK_DETACH_STATUS_ERROR;
@@ -890,12 +896,15 @@ peak_general_controller_process_pending_batch_unlocked(void)
             peak_general_controller_set_state_unlocked(hook_id,
                                                        PEAK_HOOK_REATTACHING);
             if (!results[i].uses_physical_patch) {
+                GumAttachOptions attach_options;
+                peak_gum_target_attach_options(hook_address[hook_id],
+                                               &attach_options);
                 gum_interceptor_begin_transaction(interceptor);
                 attach_status[i] =
                     gum_interceptor_attach(interceptor,
                                            hook_address[hook_id],
                                            array_listener[hook_id],
-                                           NULL);
+                                           &attach_options);
                 gum_interceptor_end_transaction(interceptor);
                 mutation_ok[i] = attach_status[i] == GUM_ATTACH_OK;
             }

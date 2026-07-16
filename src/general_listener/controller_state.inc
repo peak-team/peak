@@ -1123,9 +1123,14 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             return result;
         }
 
+        GumAttachOptions attach_options;
+        peak_gum_target_attach_options(symbol_address, &attach_options);
         gum_interceptor_begin_transaction(interceptor);
         GumAttachReturn attach_status =
-            gum_interceptor_attach(interceptor, symbol_address, new_listener, NULL);
+            gum_interceptor_attach(interceptor,
+                                   symbol_address,
+                                   new_listener,
+                                   &attach_options);
         gum_interceptor_end_transaction(interceptor);
 
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,

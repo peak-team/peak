@@ -43,6 +43,70 @@ peak_unsafe_gum_prologue_policy_name(PeakUnsafeGumProloguePolicy policy)
     }
 }
 
+#if defined(__linux__) && defined(__aarch64__)
+static gboolean
+peak_arm64_target_branches_to_elf_plt(gpointer address)
+{
+    guint32 branch;
+    guint32 plt[4];
+    int64_t displacement;
+    const guint8* plt_address;
+    guint ldr_offset;
+    guint add_offset;
+
+    if (address == NULL) {
+        return FALSE;
+    }
+
+    memcpy(&branch, address, sizeof(branch));
+    if ((branch & UINT32_C(0xfc000000)) != UINT32_C(0x14000000)) {
+        return FALSE;
+    }
+
+    displacement = (int64_t)(branch & UINT32_C(0x03ffffff));
+    if ((displacement & (INT64_C(1) << 25)) != 0) {
+        displacement -= INT64_C(1) << 26;
+    }
+    plt_address = (const guint8*)address + displacement * 4;
+    memcpy(plt, plt_address, sizeof(plt));
+
+    /* Canonical GNU ELF AArch64 PLT entry: adrp/ldr/add/br via x16/x17. */
+    if ((plt[0] & UINT32_C(0x9f00001f)) != UINT32_C(0x90000010) ||
+        (plt[1] & UINT32_C(0xffc003ff)) != UINT32_C(0xf9400211) ||
+        (plt[2] & UINT32_C(0xffc003ff)) != UINT32_C(0x91000210) ||
+        plt[3] != UINT32_C(0xd61f0220)) {
+        return FALSE;
+    }
+
+    ldr_offset = ((plt[1] >> 10) & UINT32_C(0xfff)) * sizeof(gpointer);
+    add_offset = (plt[2] >> 10) & UINT32_C(0xfff);
+    return ldr_offset == add_offset;
+}
+#endif
+
+void
+peak_gum_target_attach_options(gpointer address,
+                               GumAttachOptions* options_out)
+{
+    g_return_if_fail(options_out != NULL);
+
+    memset(options_out, 0, sizeof(*options_out));
+#if defined(__linux__) && defined(__aarch64__)
+    /*
+     * Gum follows the leading B to the PLT entry, then its checked relocation
+     * rejects that entry because all of x16/x17 are live. The exact sequence
+     * above defines x16 before using it, so Gum's documented forced policy is
+     * safe here and avoids any private-ABI or eager-binding workaround.
+     */
+    if (peak_arm64_target_branches_to_elf_plt(address)) {
+        options_out->instrumentation.relocation_policy =
+            GUM_RELOCATION_FORCED;
+    }
+#else
+    (void)address;
+#endif
+}
+
 #if defined(__x86_64__) || defined(__amd64__)
 static gboolean
 peak_x86_match_endbr(const guint8* code, gsize available, gsize* size_out)

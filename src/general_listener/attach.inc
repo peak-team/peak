@@ -371,12 +371,15 @@ void peak_general_listener_attach()
                 g_object_unref(new_listener);
                 continue;
             }
+            GumAttachOptions attach_options;
+            peak_gum_target_attach_options(resolved_hook_address,
+                                           &attach_options);
             gum_interceptor_begin_transaction(interceptor);
             GumAttachReturn attach_status =
                 gum_interceptor_attach(interceptor,
                                        resolved_hook_address,
                                        new_listener,
-                                       NULL);
+                                       &attach_options);
             gum_interceptor_end_transaction(interceptor);
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,
