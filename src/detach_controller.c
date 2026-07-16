@@ -667,44 +667,6 @@ peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus statu
 }
 #endif
 
-static size_t
-peak_detach_controller_count_proc_threads(gboolean* ok_out)
-{
-#ifdef __linux__
-    DIR* dir = opendir("/proc/self/task");
-    size_t count = 0;
-
-    if (ok_out != NULL) {
-        *ok_out = FALSE;
-    }
-
-    if (dir == NULL) {
-        return 0;
-    }
-
-    for (;;) {
-        errno = 0;
-        struct dirent* entry = readdir(dir);
-        if (entry == NULL) {
-            break;
-        }
-
-        if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
-            count++;
-        }
-    }
-
-    if (ok_out != NULL && errno == 0) {
-        *ok_out = TRUE;
-    }
-    closedir(dir);
-    return count;
-#else
-    (void)ok_out;
-    return 0;
-#endif
-}
-
 const char*
 peak_detach_controller_operation_string(PeakDetachOperation operation)
 {
@@ -3876,12 +3838,6 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
     peak_detach_controller_init_atfork_once();
 #endif
-    gboolean proc_ok = FALSE;
-    size_t proc_threads = peak_detach_controller_count_proc_threads(&proc_ok);
-
-    (void)proc_threads;
-    (void)proc_ok;
-
     if (!peak_detach_controller_validate_request(request, status_out)) {
         return FALSE;
     }
