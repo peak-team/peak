@@ -4,7 +4,7 @@
 size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
 {
     char* a_str = getenv(env_var);
-    if (a_str == NULL) {
+    if (a_str == NULL || a_str[0] == '\0') {
         *result = NULL;
         return 0;
     }
@@ -68,7 +68,7 @@ size_t count_lines_in_file(FILE* file) {
 
 size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count) {
     char* a_str = getenv(config_file);
-    if (a_str == NULL) {
+    if (a_str == NULL || a_str[0] == '\0') {
         return 0;
     }
     FILE* file = fopen(a_str, "r");
