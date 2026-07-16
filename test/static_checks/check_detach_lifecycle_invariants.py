@@ -117,6 +117,23 @@ def check_dlopen_detach_transaction(repo_root):
             "dlopen listener detach is missing nearby end_transaction")
 
 
+def check_dlopen_resolution_lock_order(repo_root):
+    source = (repo_root / "src/dlopen_interceptor.c").read_text(encoding="utf-8")
+    body = extract_function(source, "dlopen_interceptor_attach_from_request")
+    dlsym_position = body.find("dlsym(request->handle")
+    require(dlsym_position != -1,
+            "dynamic dlopen resolution must use the request handle")
+
+    before_dlsym = body[:dlsym_position]
+    last_lock = before_dlsym.rfind("peak_general_listener_controller_lock();")
+    last_unlock = before_dlsym.rfind("peak_general_listener_controller_unlock();")
+    next_lock = body.find("peak_general_listener_controller_lock();", dlsym_position)
+    require(last_unlock > last_lock,
+            "dynamic dlsym must not hold the general-listener lock")
+    require(next_lock > dlsym_position,
+            "dynamic attach must revalidate state under the general-listener lock")
+
+
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
@@ -1686,6 +1703,7 @@ def main():
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
     check_dlopen_detach_transaction(repo_root)
+    check_dlopen_resolution_lock_order(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
     check_final_report_snapshot_order(repo_root)

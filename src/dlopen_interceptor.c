@@ -48,6 +48,11 @@ typedef struct {
     int binding_flags;
 } PeakDlopenDynamicAttachRequest;
 
+typedef struct {
+    const char* name;
+    gpointer address;
+} PeakDlopenResolvedTarget;
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static char peak_dlopen_test_retry_handle_marker;
 static char peak_dlopen_test_retained_handle_marker;
@@ -862,6 +867,10 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
 {
     gboolean retained_handle_for_hooks = FALSE;
     gboolean retry_later = FALSE;
+    gboolean needs_resolution = FALSE;
+    GumInterceptor* target_interceptor;
+    PeakDlopenResolvedTarget* resolved_targets;
+    size_t target_count;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (request->handle == PEAK_DLOPEN_TEST_RETRY_HANDLE) {
@@ -883,14 +892,63 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         return PEAK_DLOPEN_ATTACH_DONE;
     }
 
-    gum_interceptor_ignore_current_thread(interceptor);
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
+    target_interceptor = interceptor;
+    target_count = peak_hook_address_count;
+    resolved_targets = g_try_new0(PeakDlopenResolvedTarget, target_count);
+    if (resolved_targets == NULL) {
+        peak_general_listener_controller_unlock();
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+    for (size_t i = 0; i < target_count; i++) {
+        if (hook_address[i] == NULL && array_listener[i] == NULL &&
+            peak_hook_strings[i] != NULL) {
+            resolved_targets[i].name = peak_hook_strings[i];
+            needs_resolution = TRUE;
+        }
+    }
+    peak_general_listener_controller_unlock();
+
+    if (!needs_resolution) {
+        g_free(resolved_targets);
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+
+    /*
+     * Never hold the general-listener lock while entering the dynamic loader.
+     * A dlopen on-leave callback still owns the loader lock on some platforms;
+     * the controller taking these locks in the opposite order would deadlock.
+     */
+    gum_interceptor_ignore_current_thread(target_interceptor);
+    for (size_t i = 0; i < target_count; i++) {
+        if (resolved_targets[i].name != NULL) {
+            resolved_targets[i].address =
+                (gpointer)(fn_void)dlsym(request->handle,
+                                         resolved_targets[i].name);
+        }
+    }
+
+    peak_general_listener_controller_lock();
+    if (interceptor != target_interceptor ||
+        hook_address == NULL ||
+        array_listener == NULL ||
+        peak_hook_strings == NULL ||
+        peak_demangled_strings == NULL ||
+        peak_hook_address_count < target_count) {
+        peak_general_listener_controller_unlock();
+        gum_interceptor_unignore_current_thread(target_interceptor);
+        g_free(resolved_targets);
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+
+    for (size_t i = 0; i < target_count; i++) {
         if (hook_address[i] != NULL || array_listener[i] != NULL) {
             continue;
         }
+        if (peak_hook_strings[i] != resolved_targets[i].name) {
+            continue;
+        }
 
-        gpointer dynamic_hook_address =
-            (gpointer)(fn_void)dlsym(request->handle, peak_hook_strings[i]);
+        gpointer dynamic_hook_address = resolved_targets[i].address;
         if (dynamic_hook_address == NULL) {
             continue;
         }
@@ -965,8 +1023,9 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
             g_free(demangled_copy);
         }
     }
-    gum_interceptor_unignore_current_thread(interceptor);
     peak_general_listener_controller_unlock();
+    gum_interceptor_unignore_current_thread(target_interceptor);
+    g_free(resolved_targets);
 
     if (retained_handle_for_hooks && retry_later) {
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
