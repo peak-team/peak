@@ -49,6 +49,151 @@ def disassemble_symbol(objdump, binary, symbol):
     return int(match.group(1), 16), match.group(2)
 
 
+def find_symbol_address(objdump, binary, symbol):
+    attempts = (
+        [objdump, "-t", binary],
+        [objdump, "--syms", binary],
+    )
+    outputs = []
+    for command in attempts:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        outputs.append(result.stdout)
+        if result.returncode != 0:
+            continue
+        addresses = set()
+        for line in result.stdout.splitlines():
+            if not re.search(rf"\b{re.escape(symbol)}\s*$", line):
+                continue
+            match = re.match(r"^\s*([0-9a-fA-F]+)\s+", line)
+            if match is not None and "*UND*" not in line:
+                addresses.add(int(match.group(1), 16))
+        if len(addresses) == 1:
+            return addresses.pop()
+        if len(addresses) > 1:
+            fail(f"native binary contains multiple addresses for {symbol}")
+    fail(f"unable to locate {symbol} in the native symbol table:\n" +
+         "\n".join(outputs))
+
+
+def parse_instructions(body):
+    instructions = []
+    for line in body.splitlines():
+        instruction = re.match(
+            r"^\s*([0-9a-fA-F]+):\s+"
+            r"(?:(?:[0-9a-fA-F]{2}\s+)+|[0-9a-fA-F]{8}\s+)"
+            r"([a-zA-Z][a-zA-Z0-9.]*)\b\s*(.*)$",
+            line,
+        )
+        if instruction is not None:
+            instructions.append(
+                (int(instruction.group(1), 16),
+                 instruction.group(2).lower(),
+                 instruction.group(3).strip(),
+                 line)
+            )
+    return instructions
+
+
+def parse_aarch64_number(token, address=False):
+    value = token.strip().lstrip("#")
+    if value.lower().startswith("0x"):
+        return int(value, 16)
+    if address or re.search(r"[a-fA-F]", value):
+        return int(value, 16)
+    return int(value, 10)
+
+
+def validate_aarch64_publication(instructions, counter_address, body):
+    ldaxr_index = next(
+        (index for index, item in enumerate(instructions)
+         if item[1] == "ldaxr"),
+        None,
+    )
+    if ldaxr_index is None or ldaxr_index < 2:
+        fail("native peak_dlopen lacks the inline LDAXR/STLXR retry loop",
+             body)
+
+    adrp_index = ldaxr_index - 2
+    address_add_index = ldaxr_index - 1
+    increment_index = ldaxr_index + 1
+    publication_index = ldaxr_index + 2
+    retry_index = ldaxr_index + 3
+    if retry_index >= len(instructions):
+        fail("native peak_dlopen has a truncated LDAXR/STLXR retry loop", body)
+    expected_mnemonics = ("adrp", "add", "ldaxr", "add", "stlxr", "cbnz")
+    actual_mnemonics = tuple(
+        item[1] for item in instructions[adrp_index:retry_index + 1])
+    if actual_mnemonics != expected_mnemonics:
+        fail("native peak_dlopen lacks the exact inline LDAXR/ADD/STLXR "
+             "retry sequence", body)
+
+    adrp = re.fullmatch(
+        r"(x[0-9]+),\s*#?(0x[0-9a-fA-F]+|[0-9a-fA-F]+)"
+        r"(?:\s+<[^>]+>)?",
+        instructions[adrp_index][2],
+    )
+    address_add = re.fullmatch(
+        r"(x[0-9]+),\s*(x[0-9]+),\s*#(0x[0-9a-fA-F]+|[0-9]+)",
+        instructions[address_add_index][2],
+    )
+    load = re.fullmatch(
+        r"(w[0-9]+),\s*\[\s*(x[0-9]+)\s*\]",
+        instructions[ldaxr_index][2],
+    )
+    increment = re.fullmatch(
+        r"(w[0-9]+),\s*(w[0-9]+),\s*#(0x[0-9a-fA-F]+|[0-9]+)",
+        instructions[increment_index][2],
+    )
+    store = re.fullmatch(
+        r"(w[0-9]+),\s*(w[0-9]+),\s*\[\s*(x[0-9]+)\s*\]",
+        instructions[publication_index][2],
+    )
+    retry = re.fullmatch(
+        r"(w[0-9]+),\s*#?(0x[0-9a-fA-F]+|[0-9a-fA-F]+)"
+        r"(?:\s+<[^>]+>)?",
+        instructions[retry_index][2],
+    )
+    if None in (adrp, address_add, load, increment, store, retry):
+        fail("native peak_dlopen has unrecognized AArch64 entry operands", body)
+
+    address_register = adrp.group(1)
+    value_register = load.group(1)
+    status_register = store.group(1)
+    if not (
+        address_add.group(1) == address_register and
+        address_add.group(2) == address_register and
+        load.group(2) == address_register and
+        increment.group(1) == value_register and
+        increment.group(2) == value_register and
+        store.group(2) == value_register and
+        store.group(3) == address_register and
+        retry.group(1) == status_register
+    ):
+        fail("native peak_dlopen changes registers within the AArch64 "
+             "entry-publication loop", body)
+    if parse_aarch64_number(increment.group(3)) != 1:
+        fail("native peak_dlopen does not increment the active count by one",
+             body)
+
+    adrp_target = parse_aarch64_number(adrp.group(2), address=True)
+    low_offset = parse_aarch64_number(address_add.group(3))
+    if adrp_target + low_offset != counter_address:
+        fail("AArch64 entry publication does not target the active counter",
+             body)
+    retry_target = parse_aarch64_number(retry.group(2), address=True)
+    if retry_target != instructions[ldaxr_index][0]:
+        fail("native peak_dlopen does not retry from its LDAXR instruction",
+             body)
+
+    return publication_index, retry_index
+
+
 def is_call_mnemonic(architecture, mnemonic):
     if architecture == "aarch64":
         return mnemonic == "bl" or mnemonic.startswith("blr")
@@ -79,52 +224,24 @@ def main():
     start, body = disassemble_symbol(
         args.objdump, args.binary, "peak_dlopen")
 
-    instructions = []
-    for line in body.splitlines():
-        instruction = re.match(
-            r"^\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]{2,8}\s+)+"
-            r"([a-zA-Z][a-zA-Z0-9.]*)\b",
-            line,
-        )
-        if instruction is not None:
-            instructions.append(
-                (int(instruction.group(1), 16),
-                 instruction.group(2).lower(),
-                 line)
-            )
+    instructions = parse_instructions(body)
     if not instructions:
         fail("native peak_dlopen contains no parsed instructions", body)
 
     if architecture == "aarch64":
-        ldaxr_index = next(
-            (index for index, item in enumerate(instructions)
-             if item[1] == "ldaxr"),
-            None,
+        counter_address = find_symbol_address(
+            args.objdump,
+            args.binary,
+            "peak_dlopen_active_replacement_count",
         )
-        publication_index = next(
-            (index for index, item in enumerate(instructions)
-             if item[1] == "stlxr"),
-            None,
-        )
-        retry_index = next(
-            (index for index, item in enumerate(instructions)
-             if item[1] == "cbnz"),
-            None,
-        )
-        if (ldaxr_index is None or publication_index is None or
-                retry_index is None or
-                not ldaxr_index < publication_index < retry_index):
-            fail("native peak_dlopen lacks the inline LDAXR/STLXR retry loop",
-                 body)
-        if "peak_dlopen_active_replacement_count" not in body:
-            fail("AArch64 entry publication does not target the active counter",
-                 body)
+        publication_index, retry_index = validate_aarch64_publication(
+            instructions, counter_address, body)
         tail_mnemonics = ("b",)
     else:
         publication_index = None
         for index, item in enumerate(instructions):
             combined_lock = re.search(
-                r"\block\s+(?:add|inc)[a-z]*\b", item[2].lower())
+                r"\block\s+(?:add|inc)[a-z]*\b", item[3].lower())
             split_lock = (
                 index > 0 and instructions[index - 1][1] == "lock" and
                 item[1].startswith(("add", "inc"))
@@ -135,18 +252,29 @@ def main():
         if publication_index is None:
             fail("native peak_dlopen lacks an inline lock add/inc publication",
                  body)
+        publication_operation = (
+            instructions[publication_index][1] + " " +
+            instructions[publication_index][2]
+        ).lower()
+        if not (
+            re.search(r"\binc[a-z]*\s+", publication_operation) or
+            re.search(r"\badd[a-z]*\s+\$(?:0x)?0*1\s*,",
+                      publication_operation)
+        ):
+            fail("native peak_dlopen does not increment the active count by "
+                 "one", body)
         if "peak_dlopen_active_replacement_count" not in instructions[
-                publication_index][2]:
+                publication_index][3]:
             fail("x86_64 entry publication does not target the active counter",
                  body)
         retry_index = publication_index
         tail_mnemonics = ("jmp", "jmpq")
 
-    for _, mnemonic, line in instructions[:publication_index]:
+    for _, mnemonic, _, line in instructions[:publication_index]:
         if is_control_transfer(architecture, mnemonic):
             fail("native peak_dlopen transfers control before publishing entry "
                  "ownership: " + line.strip(), body)
-    for _, mnemonic, line in instructions:
+    for _, mnemonic, _, line in instructions:
         if is_call_mnemonic(architecture, mnemonic):
             fail("native peak_dlopen contains a compiler-insertable call: " +
                  line.strip(), body)
@@ -155,7 +283,7 @@ def main():
         (index for index, item in enumerate(instructions[retry_index + 1:],
                                            retry_index + 1)
          if item[1] in tail_mnemonics and
-         "<peak_dlopen_body>" in item[2]),
+         "<peak_dlopen_body>" in item[3]),
         None,
     )
     if tail_index is None:

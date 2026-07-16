@@ -98,6 +98,12 @@ if(BUILD_TESTING)
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "aarch64_dlopen_entry_codegen_ok")
     endif()
+    add_test(NAME test_dlopen_entry_binary_parser
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_dlopen_entry_binary_parser.py)
+    set_tests_properties(test_dlopen_entry_binary_parser
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "dlopen_entry_binary_parser_ok")
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _PEAK_TEST_PROCESSOR)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        _PEAK_TEST_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
