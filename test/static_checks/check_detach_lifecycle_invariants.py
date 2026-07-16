@@ -134,6 +134,77 @@ def check_dlopen_resolution_lock_order(repo_root):
             "dynamic attach must revalidate state under the general-listener lock")
 
 
+def check_dlopen_fftw_scope_and_fork_guard(repo_root):
+    source = (repo_root / "src/dlopen_interceptor.c").read_text(encoding="utf-8")
+    membership = extract_function(
+        source, "dlopen_interceptor_is_fftw_group_symbol"
+    )
+    attach = extract_function(source, "dlopen_interceptor_attach_from_request")
+    sync = extract_function(source, "dlopen_interceptor_attach_fftw_before_return")
+    admission = extract_function(source, "dlopen_interceptor_callback_is_admitted")
+    on_enter = extract_function(source, "dlopen_interceptor_on_enter")
+    on_leave = extract_function(source, "dlopen_interceptor_on_leave")
+
+    require("source_target_array_FFTW[i]" in membership and
+            "strcmp(name, source_target_array_FFTW[i]) == 0" in membership and
+            "strncmp(" not in membership,
+            "synchronous FFTW scope must use exact built-in group membership")
+    require("dlopen_interceptor_target_matches_scope_unlocked" in attach and
+            "request->scope" in attach,
+            "dynamic dlopen resolution must filter every request by scope")
+    require("request.scope = PEAK_DLOPEN_ATTACH_FFTW_ONLY" in sync and
+            "request.scope = retry_scope" in sync,
+            "synchronous resolution must remain FFTW-only and preserve one retry scope")
+    require(on_leave.count("dlopen_interceptor_enqueue_dynamic_attach_request(") == 1,
+            "one dlopen callback must have only one asynchronous enqueue site")
+    require("if (dlopen_sync_fftw_enabled)" in on_leave and
+            "Preserve the original asynchronous non-FFTW fast path" in on_leave,
+            "non-FFTW-only dlopen callbacks must not gain a synchronous target scan")
+    require("dlopen_interceptor_module_identity" in on_leave and
+            "PEAK_DLOPEN_SYNC_REQUEUED" not in on_leave,
+            "on-leave must use canonical identity and let a successful requeue suppress duplicate work")
+    require("dlerror();" in attach and "dlerror();" in on_leave,
+            "PEAK loader lookups must not leak dlerror state after successful dlopen")
+
+    pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
+    begin_callback = on_enter.find("dlopen_interceptor_begin_callback()")
+    filename_copy = on_enter.find("g_strdup(filename)")
+    require(pid_check != -1 and begin_callback != -1 and filename_copy != -1 and
+            pid_check < begin_callback < filename_copy,
+            "fork-child dlopen guard must run before PEAK mutexes and allocation")
+    require("getpid() == dlopen_listener_owner_pid" in admission and
+            "pthread_mutex" not in admission and "g_" not in admission,
+            "fork-child admission predicate must be PID-only and lock-free")
+    require("if (!invocation->callback_admitted)" in on_leave,
+            "dlopen on-leave must skip callbacks rejected by the fork PID guard")
+
+
+def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
+    unsafe = (repo_root / "src/unsafe_gum_prologue.c").read_text(
+        encoding="utf-8"
+    )
+    arm64 = extract_function(unsafe, "peak_arm64_target_branches_to_elf_plt")
+    require(arm64.count("gum_memory_read(") == 2 and
+            "UINTPTR_MAX" in arm64 and "saved_errno" in arm64,
+            "Arm64 branch-to-PLT detection must safely read both ranges and preserve errno")
+    require("memcpy(plt, plt_address" not in arm64,
+            "Arm64 branch-to-PLT detection must not directly read a computed target")
+
+    syscall = (repo_root / "src/syscall_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    overlap = extract_function(syscall, "peak_close_overlaps_nocancel_entry")
+    attach = extract_function(syscall, "syscall_interceptor_attach")
+    guard = attach.find("peak_close_overlaps_nocancel_entry(hook_address)")
+    replace = attach.find("gum_interceptor_replace_fast")
+    require("__close_nocancel" in overlap and
+            overlap.count("gum_process_find_function_range") == 2 and
+            "PEAK_GUM_X86_MAX_REDIRECT_SIZE" in overlap,
+            "close support hook must detect overlapping and nearby __close_nocancel entries")
+    require(guard != -1 and replace != -1 and guard < replace,
+            "close overlap guard must run before Gum mutates the close entry")
+
+
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
@@ -1704,6 +1775,8 @@ def main():
     check_support_hook_lifetimes(repo_root)
     check_dlopen_detach_transaction(repo_root)
     check_dlopen_resolution_lock_order(repo_root)
+    check_dlopen_fftw_scope_and_fork_guard(repo_root)
+    check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
     check_final_report_snapshot_order(repo_root)

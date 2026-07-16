@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "internal/unsafe_gum_prologue.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -50,37 +51,80 @@ peak_arm64_target_branches_to_elf_plt(gpointer address)
     guint32 branch;
     guint32 plt[4];
     int64_t displacement;
-    const guint8* plt_address;
+    int64_t byte_displacement;
+    uintptr_t source_address;
+    uintptr_t plt_address;
     guint ldr_offset;
     guint add_offset;
+    guint8* branch_copy = NULL;
+    guint8* plt_copy = NULL;
+    gsize bytes_read = 0;
+    gboolean matches = FALSE;
+    int saved_errno = errno;
 
     if (address == NULL) {
-        return FALSE;
+        goto done;
     }
 
-    memcpy(&branch, address, sizeof(branch));
+    source_address = (uintptr_t)address;
+    if (source_address > UINTPTR_MAX - (sizeof(branch) - 1)) {
+        goto done;
+    }
+    branch_copy = gum_memory_read(address, sizeof(branch), &bytes_read);
+    if (branch_copy == NULL || bytes_read != sizeof(branch)) {
+        goto done;
+    }
+    memcpy(&branch, branch_copy, sizeof(branch));
     if ((branch & UINT32_C(0xfc000000)) != UINT32_C(0x14000000)) {
-        return FALSE;
+        goto done;
     }
 
     displacement = (int64_t)(branch & UINT32_C(0x03ffffff));
     if ((displacement & (INT64_C(1) << 25)) != 0) {
         displacement -= INT64_C(1) << 26;
     }
-    plt_address = (const guint8*)address + displacement * 4;
-    memcpy(plt, plt_address, sizeof(plt));
+    byte_displacement = displacement * 4;
+    if (byte_displacement >= 0) {
+        if (source_address > UINTPTR_MAX - (uintptr_t)byte_displacement) {
+            goto done;
+        }
+        plt_address = source_address + (uintptr_t)byte_displacement;
+    } else {
+        uintptr_t magnitude = (uintptr_t)(-byte_displacement);
+        if (source_address < magnitude) {
+            goto done;
+        }
+        plt_address = source_address - magnitude;
+    }
+    if (plt_address > UINTPTR_MAX - (sizeof(plt) - 1)) {
+        goto done;
+    }
+    bytes_read = 0;
+    plt_copy = gum_memory_read((gconstpointer)plt_address,
+                               sizeof(plt),
+                               &bytes_read);
+    if (plt_copy == NULL || bytes_read != sizeof(plt)) {
+        goto done;
+    }
+    memcpy(plt, plt_copy, sizeof(plt));
 
     /* Canonical GNU ELF AArch64 PLT entry: adrp/ldr/add/br via x16/x17. */
     if ((plt[0] & UINT32_C(0x9f00001f)) != UINT32_C(0x90000010) ||
         (plt[1] & UINT32_C(0xffc003ff)) != UINT32_C(0xf9400211) ||
         (plt[2] & UINT32_C(0xffc003ff)) != UINT32_C(0x91000210) ||
         plt[3] != UINT32_C(0xd61f0220)) {
-        return FALSE;
+        goto done;
     }
 
     ldr_offset = ((plt[1] >> 10) & UINT32_C(0xfff)) * sizeof(gpointer);
     add_offset = (plt[2] >> 10) & UINT32_C(0xfff);
-    return ldr_offset == add_offset;
+    matches = ldr_offset == add_offset;
+
+done:
+    g_free(plt_copy);
+    g_free(branch_copy);
+    errno = saved_errno;
+    return matches;
 }
 #endif
 
