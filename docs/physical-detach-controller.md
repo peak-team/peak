@@ -751,33 +751,42 @@ already-recorded nonzero teardown into a collective-safe clean exit.
 
 ## Dynamic `dlopen`
 
-`dlopen` must not attach directly from the replacement body. It enqueues a
-dynamic attach request:
+PEAK observes the real `dlopen` call with a Gum invocation listener instead of
+replacing it. This keeps the application's caller-sensitive `$ORIGIN`, RUNPATH,
+and binding-mode semantics intact:
 
 ```text
-peak_dlopen replacement:
-    call original dlopen
-    enqueue handle for controller scan
-    return handle
+real dlopen:
+    execute with the application's original caller and flags
+
+listener on-leave:
+    for unresolved FFTW targets, scan ordinary function exports in the loaded
+        module and its dependency closure
+    attach those exports through the existing guarded controller path
+    enqueue the existing asynchronous fallback for other unresolved targets
+    return the real handle unchanged
 
 controller:
-    resolve requested symbols from handle
+    resolve remaining requested symbols from queued handles
     use helper stop/classification before Gum attach
     publish hook metadata only after Gum attach and helper release succeed
 ```
 
-The dynamic attach implementation queues `dlopen` work out of the replacement
-body, drains it on controller-owned paths, and retains a `RTLD_NOLOAD` handle
-for any module that receives PEAK hooks. The retained handle pins the module so
-application `dlclose()` cannot unload code while PEAK and Gum still reference
-addresses inside it. Handles are released only after general listener teardown
-has flushed.
+For FFTW, the listener performs the guarded attach before the real `dlopen`
+returns, so an immediate first call is profiled. The synchronous scan only
+accepts exports Gum identifies as ordinary functions. A temporarily unsafe
+mutation is queued for the existing asynchronous best-effort path; the
+application thread does not wait on a condition variable, retry loop, or
+PEAK-specific timeout. Calls made from DSO constructors before `dlopen` reaches
+its on-leave callback, `dlmopen` namespaces, and IFUNC-only exports are not part
+of this first-call guarantee.
 
-This prevents `dlopen` from racing with heartbeat detach, reattach, and final
-teardown. Dynamic attaches remain intentionally asynchronous: a function called
-immediately after `dlopen()` may run before PEAK's controller has attached the
-new listener. Strict mode uses the selected stop backend for the eventual Gum
-attach.
+Both paths retain a `RTLD_NOLOAD` handle using the application's original
+binding mode for any module that receives PEAK hooks. The retained root handle
+also pins its dependencies, so application `dlclose()` cannot unload code while
+PEAK and Gum still reference addresses inside it. Handles are released only
+after general listener teardown has flushed. Other unresolved dynamic targets
+continue to use the controller-owned asynchronous queue.
 
 The target detach controller is serviced before dynamic attach drains in each
 controller cycle so a busy `dlopen` queue cannot starve pending target
@@ -797,20 +806,13 @@ limited to transient `TIMEOUT`, `CLASSIFY_FAILED`, and recoverable `ERROR`
 statuses; `PERMISSION_DENIED` is treated as terminal for queued dynamic attach
 work so persistent ptrace policy failures cannot pin queue slots indefinitely.
 
-Final `dlopen` replacement teardown is two-phase in strict mode. PEAK first
-uses the helper guarded `REVERT` operation to restore the real `dlopen` entry
-bytes without freeing Gum's replacement metadata. That closes admission so hot
-`dlopen` loops cannot keep entering `peak_dlopen`. PEAK then resumes threads,
-waits for already-entered `peak_dlopen` replacement bodies and dynamic attach
-drains to leave, and performs the Gum metadata revert under a second helper
-guard. If the replacement body does not drain within the bounded shutdown
-window, teardown fails closed and leaves the interceptor state alive. The start
-of the `peak_dlopen` replacement body is also registered as a blocked PC range
-for strict revert. If a thread is stopped in that uncounted entry window, PEAK
-refuses the revert and stops subsequent teardown so callback-visible state is
-not freed while `dlopen` may still be interposed.
+Final `dlopen` listener teardown uses the existing guarded `SHUTDOWN` operation
+to detach the listener and close admission. PEAK then waits for already-entered
+listener callbacks and dynamic attach drains before flushing Gum and releasing
+listener state. If either does not drain within the bounded shutdown window,
+teardown fails closed and leaves the interceptor state alive.
 
-The final `dlopen` revert prepares are retried for a short bounded window on
+The final `dlopen` detach prepare is retried for a short bounded window on
 transient helper statuses, including temporary `ptrace` permission denial seen
 under hostile concurrent stress. Persistent failure still fails closed.
 
@@ -978,7 +980,7 @@ Completed in this branch:
 5. Added a patched-Gum provider path with linked PC API validation.
 6. Added the Linux x86_64 auto-patched devkit overlay and external helper for
    stop/read-PC/evacuate/resume.
-7. Wired target attach/detach/reattach/shutdown and dlopen replace/revert
+7. Wired target attach/detach/reattach/shutdown and the dlopen listener lifecycle
    through the strict controller guard.
 8. Made strict helper release failures fatal after any STOP window, added a
    `RELEASE_FAILED` helper status for unproven STOP cleanup, and sends one
@@ -1006,13 +1008,13 @@ Completed in this branch:
     locking, inherited file descriptors, target-PID binding, signal-mask reset,
     stale build-tree helper lookup, nonblocking fatal logging, and
     post-evacuation verification.
-17. Added two-phase strict `dlopen` revert and a bounded replacement-body drain,
-    plus skipped the global C++ symbol scan for unresolved plain C targets to
-    avoid a large startup tax on dynamic-symbol workloads.
-18. Added an explicit blocked-PC range for the `peak_dlopen` entry window,
-    propagated `dlopen` teardown failure to `peak_fini()` so remaining state is
-    left alive on unsafe revert, cleaned up failed idle helper shutdowns, and
-    expanded fake-helper coverage for post-STOP evacuation/resume failures.
+17. Added a bounded `dlopen` listener-callback drain, plus skipped the global
+    C++ symbol scan for unresolved plain C targets to avoid a large startup tax
+    on dynamic-symbol workloads.
+18. Propagated `dlopen` listener teardown failure to `peak_fini()` so remaining
+    state is left alive on unsafe detach, cleaned up failed idle helper
+    shutdowns, and expanded fake-helper coverage for post-STOP
+    evacuation/resume failures.
 19. Kept support-hook Gum interceptor state pinned after successful physical
     revert for MPI, syscall, and exit hooks, matching the target/CUDA lifetime
     rule that trampoline/Gum metadata is not freed while late callbacks may

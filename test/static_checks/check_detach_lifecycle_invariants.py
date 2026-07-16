@@ -104,16 +104,17 @@ def check_support_hook_lifetimes(repo_root):
                 f"{function} must keep Gum state pinned after revert")
 
 
-def check_dlopen_revert_transactions(repo_root):
+def check_dlopen_detach_transaction(repo_root):
     source = (repo_root / "src/dlopen_interceptor.c").read_text(encoding="utf-8")
     body = extract_function(source, "dlopen_interceptor_dettach")
-    for match in re.finditer(r"gum_interceptor_revert\s*\(\s*dlopen_interceptor", body):
-        before = body[max(0, match.start() - 180):match.start()]
-        after = body[match.end():match.end() + 180]
-        require("gum_interceptor_begin_transaction(dlopen_interceptor)" in before,
-                "dlopen revert is missing nearby begin_transaction")
-        require("gum_interceptor_end_transaction(dlopen_interceptor)" in after,
-                "dlopen revert is missing nearby end_transaction")
+    match = re.search(r"gum_interceptor_detach\s*\(\s*dlopen_interceptor", body)
+    require(match is not None, "dlopen listener teardown must detach its listener")
+    before = body[max(0, match.start() - 180):match.start()]
+    after = body[match.end():match.end() + 180]
+    require("gum_interceptor_begin_transaction(dlopen_interceptor)" in before,
+            "dlopen listener detach is missing nearby begin_transaction")
+    require("gum_interceptor_end_transaction(dlopen_interceptor)" in after,
+            "dlopen listener detach is missing nearby end_transaction")
 
 
 def check_peak_init_heartbeat_order(repo_root):
@@ -989,9 +990,9 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("peak_general_listener_support_attach_target_is_supported" in syscall,
             "close support replacement must call the support attach predicate")
     require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
-            "dlopen replacement must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
+            "dlopen listener must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
-            "dlopen replacement must not use support-only prologue policy")
+            "dlopen listener must not use support-only prologue policy")
     require("peak_general_listener_attach_target_is_supported" in dlopen_dynamic,
             "dynamic dlopen user targets must use normal target prologue policy")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_dynamic,
@@ -1684,7 +1685,7 @@ def main():
     check_shutdown_order(repo_root)
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
-    check_dlopen_revert_transactions(repo_root)
+    check_dlopen_detach_transaction(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
     check_final_report_snapshot_order(repo_root)

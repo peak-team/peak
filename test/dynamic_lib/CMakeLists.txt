@@ -93,7 +93,7 @@ if(NOT PEAK_GUM_PEAK_API_AVAILABLE)
     PROPERTIES
       WORKING_DIRECTORY ${DL_DIR}
       ENVIRONMENT "PEAK_TARGET=b_dynamic;PEAK_PROFILE_INTERPRETERS=1;PEAK_REQUIRE_SAFE_DETACH=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_dlopen_strict_statslog;${PRELOAD_VAR}"
-      PASS_REGULAR_EXPRESSION "skipping dlopen Gum replace: missing-gum-api"
+      PASS_REGULAR_EXPRESSION "skipping dlopen Gum listener: missing-gum-api"
       FAIL_REGULAR_EXPRESSION "b_dynamic[*]*\\|[ \t]+[1-9][0-9]*\\|"
   )
 else()

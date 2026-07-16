@@ -672,7 +672,7 @@ peak_fini_impl(void)
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
     if (!dlopen_shutdown_flushed) {
-        g_printerr("[peak] Skipping remaining PEAK teardown because dlopen replacement teardown was not proven safe\n");
+        g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
     }
 #ifdef HAVE_MPI

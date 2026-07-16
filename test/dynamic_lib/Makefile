@@ -102,7 +102,7 @@ main_staA_staB: $(MAIN_O) libA.a libB.a
 	$(CC) -o $@ $(MAIN_O) -Wl,-Bstatic -L. -lA -lB -Wl,-Bdynamic $(RPATH)
 
 dlopen_flags_test: $(FLAGS_TEST_SRC) libB.so
-	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl
+	$(CC) -O2 -Wall -Wextra -o $@ $< -ldl $(RPATH)
 
 # --------------------------------------------------------------------
 # Python extension modules: four combinations
