@@ -25,7 +25,7 @@ after a STOP request is still fail-stop because the controller cannot prove
 whether the helper already stopped target threads. `PEAK_SAFE_DETACH_MODE=helper`
 / `debugger` force ptrace-helper behavior; `PEAK_SAFE_DETACH_MODE=signal` or
 `PEAK_DETACH_BACKEND=signal` forces the in-process signal backend. `dlopen`
-replace/revert is also guarded because it changes a
+listener attach/detach is also guarded because it changes a
 process-wide Gum patch site. With stock Gum, startup target hooks are skipped,
 already-attached target hooks remain attached, and PEAK logs why target
 mutation was skipped. Process-lifetime support hooks keep explicit startup/shutdown
@@ -62,8 +62,9 @@ outside the code and state being mutated.
 1. Only one in-process controller performs steady-state target-hook lifecycle
    operations. Target-function `gum_interceptor_attach`,
    `gum_interceptor_detach`, Gum transactions, listener allocation/free, and
-   dynamic target attach publication are controller-owned. `dlopen` replace and
-   revert also go through the controller guard. JIT metadata providers publish
+   dynamic target attach publication are controller-owned. `dlopen` listener
+   attach and detach also go through the controller guard. JIT metadata
+   providers publish
    only name/address/size candidates; the controller performs any resulting Gum
    attach. Process-lifetime support hooks are allowed to use direct Gum calls
    only when they cannot overlap the active target-controller mutation window.
@@ -760,9 +761,8 @@ real dlopen:
     execute with the application's original caller and flags
 
 listener on-leave:
-    for unresolved FFTW targets, scan ordinary function exports in the loaded
-        module and its dependency closure
-    attach those exports through the existing guarded controller path
+    resolve unresolved FFTW targets through the returned handle
+    attach resolved targets through the existing guarded controller path
     enqueue the existing asynchronous fallback for other unresolved targets
     return the real handle unchanged
 
@@ -773,13 +773,16 @@ controller:
 ```
 
 For FFTW, the listener performs the guarded attach before the real `dlopen`
-returns, so an immediate first call is profiled. The synchronous scan only
-accepts exports Gum identifies as ordinary functions. A temporarily unsafe
-mutation is queued for the existing asynchronous best-effort path; the
-application thread does not wait on a condition variable, retry loop, or
-PEAK-specific timeout. Calls made from DSO constructors before `dlopen` reaches
-its on-leave callback, `dlmopen` namespaces, and IFUNC-only exports are not part
-of this first-call guarantee.
+returns, so the normal immediate-first-call path is profiled. Resolution uses
+the loader's ordinary handle-scoped `dlsym` behavior, which naturally searches
+the root module's dependency closure in loader order; PEAK does not implement a
+second dependency graph or provider-selection protocol. A temporarily unsafe
+mutation is queued for the existing asynchronous best-effort path, so that
+exceptional call may precede attachment; the application thread does not wait
+on a condition variable, retry loop, or PEAK-specific timeout. Calls made from
+DSO constructors before `dlopen` reaches its on-leave callback, `dlmopen`
+namespaces, and exact IFUNC resolver/wrapper boundaries are not part of this
+contract.
 
 Both paths retain a `RTLD_NOLOAD` handle using the application's original
 binding mode for any module that receives PEAK hooks. The retained root handle
@@ -868,7 +871,7 @@ profiling coverage. The `close` support hook uses this path to avoid relocating
 early-return x86 libc wrapper prologues during shutdown-sensitive runs. The
 support guard intentionally scans a conservative 32-byte x86 prefix and fails
 closed if that small decoder cannot prove the prefix is free of early-return
-control flow. The top-level `dlopen` replacement and dynamic `dlopen` user
+control flow. The top-level `dlopen` listener and dynamic `dlopen` user
 targets remain governed by the default or `conservative` user-target policy so
 dynamic attach is not disabled by support-only early-return checks.
 
