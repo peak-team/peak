@@ -55,8 +55,9 @@ void dlopen_interceptor_enable_dynamic_attach(void);
 /**
  * @brief Drains queued dynamic attach work on the controller path.
  *
- * Runtime FFTW exports are attached before `dlopen` returns. Other unresolved
- * targets use this controller-drained fallback queue.
+ * On Linux with `RTLD_NOLOAD`, runtime FFTW exports are attached before
+ * `dlopen` returns. Other unresolved targets, and FFTW when that synchronous
+ * path is unavailable, use this controller-drained fallback queue.
  */
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
 
