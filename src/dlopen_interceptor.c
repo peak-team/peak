@@ -9,10 +9,15 @@
 #include "logging.h"
 
 #include <errno.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -68,14 +73,10 @@ typedef struct PeakDlopenDynamicAttachRequest {
     PeakDlopenRequestState state;
     gboolean caller_waits;
     gboolean retain_handle;
-    const char* resolution_provider_name;
-    const char* resolution_symbol_name;
-    GumAddress resolution_address;
-    void* resolution_provider_pin;
-    gboolean resolution_provider_pin_failed;
-    gboolean resolution_requested;
-    gboolean resolution_complete;
-    unsigned long long resolution_nested_generation;
+    char* direct_symbol_name;
+    char* direct_provider_name;
+    GumAddress direct_symbol_address;
+    void* direct_provider_pin;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     gboolean test_force_attach_failure;
 #endif
@@ -124,10 +125,12 @@ typedef enum {
 
 static PeakDlopenAttachResult
 dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request);
-static gboolean
-dlopen_interceptor_service_resolution_nested_request(void);
+static PeakDlopenAttachResult
+dlopen_interceptor_ensure_symbol_lookup_listener(void);
 static gboolean
 dlopen_interceptor_string_equal(gconstpointer left, gconstpointer right);
+static void dlopen_interceptor_dlsym_listener_iface_init(gpointer g_iface,
+                                                         gpointer iface_data);
 #ifdef PEAK_DLOPEN_ASM_ENTRY_STUB
 __attribute__((visibility("hidden")))
 void* peak_dlopen(const char* filename, int flags);
@@ -155,8 +158,10 @@ static size_t dynamic_attach_queue_length = 0;
 static GPtrArray* dynamic_attach_retained_handles = NULL;
 static GHashTable* dynamic_attach_retained_provider_paths = NULL;
 static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
-static __thread PeakDlopenDynamicAttachRequest*
-    dynamic_attach_resolution_wait_request = NULL;
+static GumInvocationListener* dynamic_symbol_lookup_listener = NULL;
+static gpointer dlsym_hook_address = NULL;
+static gpointer dlvsym_hook_address = NULL;
+static gboolean dynamic_symbol_lookup_listener_attached = FALSE;
 /*
  * A dynamic attach stops the other application threads while Gum mutates its
  * interceptor metadata.  Do not let that stop window freeze another thread
@@ -189,6 +194,32 @@ static unsigned long long dynamic_attach_retained_handle_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static _Atomic pid_t dynamic_attach_owner_pid = 0;
 static _Atomic pid_t dynamic_attach_fork_warning_pid = 0;
+static atomic_bool dynamic_symbol_lookup_listener_required =
+    ATOMIC_VAR_INIT(false);
+
+#define PEAK_DLSYM_TYPE_LISTENER \
+    (dlopen_interceptor_dlsym_listener_get_type())
+G_DECLARE_FINAL_TYPE(PeakDlsymListener,
+                     dlopen_interceptor_dlsym_listener,
+                     PEAK_DLSYM,
+                     LISTENER,
+                     GObject)
+struct _PeakDlsymListener {
+    GObject parent_instance;
+};
+G_DEFINE_TYPE_EXTENDED(
+    PeakDlsymListener,
+    dlopen_interceptor_dlsym_listener,
+    G_TYPE_OBJECT,
+    0,
+    G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
+                          dlopen_interceptor_dlsym_listener_iface_init))
+
+typedef struct {
+    const char* symbol_name;
+    pid_t entry_pid;
+    gboolean transaction_started;
+} PeakDlsymInvocationData;
 static atomic_bool dlopen_replacement_installed_by_peak =
     ATOMIC_VAR_INIT(false);
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -473,6 +504,60 @@ dlopen_interceptor_end_load_transaction(void)
     dynamic_load_transaction_depth--;
     if (dynamic_load_transaction_depth == 0) {
         pthread_mutex_unlock(&dynamic_load_transaction_mutex);
+    }
+}
+
+static gboolean
+dlopen_interceptor_is_inherited_fork_child(void)
+{
+    pid_t owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
+                                           memory_order_acquire);
+
+    return owner_pid != 0 && owner_pid != getpid();
+}
+
+static void
+dlopen_interceptor_warn_fork_child_once(void)
+{
+    static const char warning[] =
+        "[peak] fork child dynamic dlopen profiling is unsupported until exec; using the real loader result without inherited PEAK controller state\n";
+    pid_t current_pid = getpid();
+
+    if (atomic_exchange_explicit(&dynamic_attach_fork_warning_pid,
+                                 current_pid,
+                                 memory_order_relaxed) != current_pid) {
+        (void)write(STDERR_FILENO, warning, sizeof(warning) - 1);
+    }
+}
+
+static void
+dlopen_interceptor_end_replacement_call_without_inherited_locks(void)
+{
+    /*
+     * Every other parent thread vanished at fork. Its copied entry count is
+     * therefore stale, not merely one too large. Reset the lock-free child
+     * copy without signaling any inherited condition variable.
+     */
+    atomic_store_explicit(&peak_dlopen_active_replacement_count,
+                          0,
+                          memory_order_release);
+}
+
+static void
+dlopen_interceptor_quarantine_inherited_fork_child(
+    gboolean end_replacement_call)
+{
+    /*
+     * The fork caller may have owned this process-private transaction mutex.
+     * Its copied pthread owner identity is not valid in the child, so never
+     * unlock or signal any inherited synchronization primitive. All future
+     * child loader lookups bypass dynamic attach until exec; dropping only the
+     * caller's TLS depth is therefore sufficient to abandon the copied state.
+     */
+    dynamic_load_transaction_depth = 0;
+    dlopen_interceptor_warn_fork_child_once();
+    if (end_replacement_call) {
+        dlopen_interceptor_end_replacement_call_without_inherited_locks();
     }
 }
 
@@ -858,7 +943,9 @@ dlopen_interceptor_destroy_dynamic_attach_request(
         }
     }
     dlopen_interceptor_release_pinned_provider(
-        request->resolution_provider_pin);
+        request->direct_provider_pin);
+    g_free(request->direct_symbol_name);
+    g_free(request->direct_provider_name);
     g_free(request->filename);
     pthread_cond_destroy(&request->completion_cond);
     pthread_mutex_destroy(&request->completion_mutex);
@@ -901,72 +988,6 @@ dlopen_interceptor_wait_for_dynamic_attach_request(
 
     pthread_mutex_lock(&request->completion_mutex);
     while (request->state == PEAK_DLOPEN_REQUEST_PENDING) {
-        if (request->resolution_requested &&
-            !request->resolution_complete) {
-            const char* provider_name = request->resolution_provider_name;
-            const char* symbol_name = request->resolution_symbol_name;
-            GumAddress resolved_address = 0;
-            void* resolved_provider_pin = NULL;
-            gboolean provider_pin_failed = FALSE;
-
-            pthread_mutex_unlock(&request->completion_mutex);
-#ifdef RTLD_NOLOAD
-            if (provider_name != NULL && symbol_name != NULL) {
-                PeakDlopenDynamicAttachRequest* previous_resolution_request =
-                    dynamic_attach_resolution_wait_request;
-                void* provider_handle;
-                void* address = NULL;
-
-                /*
-                 * The caller may still own the dynamic linker's recursive
-                 * load lock when this dlopen originated in a DSO
-                 * constructor.  Resolve on that same thread.  Resolving on
-                 * the controller would invert the loader-lock/controller
-                 * handshake and deadlock both threads.
-                 */
-                dynamic_attach_resolution_wait_request = request;
-                provider_handle = original_dlopen(
-                    provider_name,
-                    request->binding_flags | RTLD_NOLOAD);
-                if (provider_handle != NULL) {
-                    dlerror();
-                    address = dlsym(provider_handle, symbol_name);
-                    if (dlerror() != NULL) {
-                        address = NULL;
-                    }
-                    /*
-                     * An IFUNC may return code from an unrelated DSO.  Pin
-                     * the dladdr() owner while this loader thread can safely
-                     * take a recursive RTLD_NOLOAD reference; retaining only
-                     * provider_handle would leave Gum pointing into an
-                     * unloadable implementation mapping.
-                     */
-                    if (address != NULL &&
-                        !dlopen_interceptor_pin_loaded_provider(
-                            address,
-                            &resolved_provider_pin)) {
-                        provider_pin_failed = TRUE;
-                        address = NULL;
-                    }
-                    dlclose(provider_handle);
-                }
-                dynamic_attach_resolution_wait_request =
-                    previous_resolution_request;
-                resolved_address = (GumAddress)(guintptr)address;
-            }
-#else
-            (void)provider_name;
-            (void)symbol_name;
-#endif
-            pthread_mutex_lock(&request->completion_mutex);
-            request->resolution_address = resolved_address;
-            request->resolution_provider_pin = resolved_provider_pin;
-            request->resolution_provider_pin_failed =
-                provider_pin_failed;
-            request->resolution_complete = TRUE;
-            pthread_cond_broadcast(&request->completion_cond);
-            continue;
-        }
         pthread_cond_wait(&request->completion_cond,
                           &request->completion_mutex);
     }
@@ -1120,20 +1141,6 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
     }
     pthread_cond_signal(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-
-    /*
-     * The controller may currently be waiting for this same caller to finish
-     * an IFUNC lookup.  Wake that outer request so it can service the nested
-     * dlopen before the resolver makes its first call into the new provider.
-     */
-    PeakDlopenDynamicAttachRequest* resolution_request =
-        dynamic_attach_resolution_wait_request;
-    if (resolution_request != NULL) {
-        pthread_mutex_lock(&resolution_request->completion_mutex);
-        resolution_request->resolution_nested_generation++;
-        pthread_cond_broadcast(&resolution_request->completion_cond);
-        pthread_mutex_unlock(&resolution_request->completion_mutex);
-    }
 
     peak_general_listener_controller_wake();
 
@@ -1303,6 +1310,7 @@ typedef struct {
     GumModule* module;
     const char* provider_name;
     gboolean matched;
+    gboolean needs_symbol_lookup_listener;
     gboolean retry;
     gboolean failed;
 } PeakDlopenExportScan;
@@ -1466,80 +1474,228 @@ dlopen_interceptor_scan_export(const GumExportDetails* details,
 }
 
 #if defined(__linux__)
-static GumAddress
-dlopen_interceptor_resolve_symbol_on_waiting_caller(
-    PeakDlopenDynamicAttachRequest* request,
-    const char* provider_name,
-    const char* symbol_name,
-    void** provider_pin_out,
-    gboolean* provider_pin_failed_out)
+static gboolean
+dlopen_interceptor_mapped_range_is_valid(size_t file_size,
+                                         size_t offset,
+                                         size_t length)
 {
-    GumAddress resolved_address;
+    return offset <= file_size && length <= file_size - offset;
+}
 
-    *provider_pin_out = NULL;
-    *provider_pin_failed_out = FALSE;
+static int
+dlopen_interceptor_elf64_symbol_type(const unsigned char* contents,
+                                    size_t file_size,
+                                    const char* symbol_name)
+{
+    const Elf64_Ehdr* header;
+    const Elf64_Shdr* sections;
 
-    if (!request->caller_waits) {
-        return 0;
+    if (!dlopen_interceptor_mapped_range_is_valid(
+            file_size,
+            0,
+            sizeof(Elf64_Ehdr))) {
+        return -1;
     }
-
-    pthread_mutex_lock(&request->completion_mutex);
-    if (request->state != PEAK_DLOPEN_REQUEST_PENDING) {
-        pthread_mutex_unlock(&request->completion_mutex);
-        return 0;
+    header = (const Elf64_Ehdr*)contents;
+    if (header->e_ident[EI_MAG0] != ELFMAG0 ||
+        header->e_ident[EI_MAG1] != ELFMAG1 ||
+        header->e_ident[EI_MAG2] != ELFMAG2 ||
+        header->e_ident[EI_MAG3] != ELFMAG3 ||
+        header->e_ident[EI_CLASS] != ELFCLASS64 ||
+        header->e_ident[EI_DATA] != ELFDATA2LSB ||
+        header->e_shentsize != sizeof(Elf64_Shdr) ||
+        header->e_shnum == 0 ||
+        !dlopen_interceptor_mapped_range_is_valid(
+            file_size,
+            (size_t)header->e_shoff,
+            (size_t)header->e_shnum * sizeof(Elf64_Shdr))) {
+        return -1;
     }
+    sections = (const Elf64_Shdr*)(contents + header->e_shoff);
 
-    request->resolution_provider_name = provider_name;
-    request->resolution_symbol_name = symbol_name;
-    request->resolution_address = 0;
-    request->resolution_provider_pin = NULL;
-    request->resolution_provider_pin_failed = FALSE;
-    request->resolution_complete = FALSE;
-    request->resolution_requested = TRUE;
-    pthread_cond_broadcast(&request->completion_cond);
+    for (size_t pass = 0; pass < 2; pass++) {
+        Elf64_Word desired_type = pass == 0 ? SHT_DYNSYM : SHT_SYMTAB;
 
-    while (!request->resolution_complete &&
-           request->state == PEAK_DLOPEN_REQUEST_PENDING) {
-        unsigned long long observed_nested_generation =
-            request->resolution_nested_generation;
-        gboolean serviced_nested_request;
+        for (size_t section_index = 0;
+             section_index < header->e_shnum;
+             section_index++) {
+            const Elf64_Shdr* symbol_section = &sections[section_index];
+            const Elf64_Shdr* string_section;
+            const Elf64_Sym* symbols;
+            const char* strings;
+            size_t symbol_count;
 
-        pthread_mutex_unlock(&request->completion_mutex);
-        serviced_nested_request =
-            dlopen_interceptor_service_resolution_nested_request();
-        pthread_mutex_lock(&request->completion_mutex);
-        if (!request->resolution_complete &&
-            request->state == PEAK_DLOPEN_REQUEST_PENDING &&
-            !serviced_nested_request &&
-            request->resolution_nested_generation ==
-                observed_nested_generation) {
-            pthread_cond_wait(&request->completion_cond,
-                              &request->completion_mutex);
+            if (symbol_section->sh_type != desired_type ||
+                symbol_section->sh_entsize != sizeof(Elf64_Sym) ||
+                symbol_section->sh_link >= header->e_shnum ||
+                !dlopen_interceptor_mapped_range_is_valid(
+                    file_size,
+                    (size_t)symbol_section->sh_offset,
+                    (size_t)symbol_section->sh_size)) {
+                continue;
+            }
+            string_section = &sections[symbol_section->sh_link];
+            if (!dlopen_interceptor_mapped_range_is_valid(
+                    file_size,
+                    (size_t)string_section->sh_offset,
+                    (size_t)string_section->sh_size)) {
+                continue;
+            }
+            symbols = (const Elf64_Sym*)(
+                contents + symbol_section->sh_offset);
+            strings = (const char*)(contents + string_section->sh_offset);
+            symbol_count = symbol_section->sh_size / sizeof(Elf64_Sym);
+
+            for (size_t symbol_index = 0;
+                 symbol_index < symbol_count;
+                 symbol_index++) {
+                const Elf64_Sym* symbol = &symbols[symbol_index];
+                unsigned char binding = ELF64_ST_BIND(symbol->st_info);
+                size_t name_offset = symbol->st_name;
+
+                if ((binding != STB_GLOBAL && binding != STB_WEAK) ||
+                    symbol->st_shndx == SHN_UNDEF ||
+                    name_offset >= string_section->sh_size ||
+                    memchr(strings + name_offset,
+                           '\0',
+                           string_section->sh_size - name_offset) == NULL ||
+                    strcmp(strings + name_offset, symbol_name) != 0) {
+                    continue;
+                }
+                return (int)ELF64_ST_TYPE(symbol->st_info);
+            }
         }
     }
-    resolved_address = request->resolution_address;
-    *provider_pin_out = request->resolution_provider_pin;
-    *provider_pin_failed_out = request->resolution_provider_pin_failed;
-    request->resolution_provider_name = NULL;
-    request->resolution_symbol_name = NULL;
-    request->resolution_address = 0;
-    request->resolution_provider_pin = NULL;
-    request->resolution_provider_pin_failed = FALSE;
-    request->resolution_requested = FALSE;
-    request->resolution_complete = FALSE;
-    pthread_mutex_unlock(&request->completion_mutex);
+    return -1;
+}
 
-    return resolved_address;
+static int
+dlopen_interceptor_elf_symbol_type_from_file(const char* provider_path,
+                                             const char* symbol_name)
+{
+    struct stat file_stat;
+    unsigned char* contents;
+    size_t file_size;
+    int fd;
+    int symbol_type = -1;
+
+    if (provider_path == NULL || provider_path[0] == '\0' ||
+        symbol_name == NULL || symbol_name[0] == '\0') {
+        return -1;
+    }
+    fd = open(provider_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &file_stat) != 0 || file_stat.st_size <= 0 ||
+        (uintmax_t)file_stat.st_size > SIZE_MAX) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    file_size = (size_t)file_stat.st_size;
+    contents = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (contents == MAP_FAILED) {
+        return -1;
+    }
+    symbol_type = dlopen_interceptor_elf64_symbol_type(contents,
+                                                       file_size,
+                                                       symbol_name);
+    munmap(contents, file_size);
+    return symbol_type;
+}
+
+typedef struct {
+    const char* symbol_name;
+    const char* provider_path;
+    gpointer non_ifunc_address;
+    gboolean ifunc_found;
+} PeakLoadedUnknownCallableLookup;
+
+static gboolean
+dlopen_interceptor_find_unknown_callable_symbol(
+    const GumSymbolDetails* details,
+    gpointer user_data)
+{
+    PeakLoadedUnknownCallableLookup* lookup = user_data;
+    int elf_symbol_type;
+
+    if (!details->is_global ||
+        details->type != GUM_SYMBOL_UNKNOWN ||
+        details->section == NULL ||
+        (details->section->protection & GUM_PAGE_EXECUTE) == 0 ||
+        details->address == 0 ||
+        strcmp(details->name, lookup->symbol_name) != 0) {
+        return TRUE;
+    }
+
+    elf_symbol_type = dlopen_interceptor_elf_symbol_type_from_file(
+        lookup->provider_path,
+        details->name);
+#ifdef STT_GNU_IFUNC
+    if (elf_symbol_type == STT_GNU_IFUNC) {
+        lookup->ifunc_found = TRUE;
+        return FALSE;
+    }
+#endif
+    if (elf_symbol_type == STT_NOTYPE) {
+        lookup->non_ifunc_address = GSIZE_TO_POINTER(details->address);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+dlopen_interceptor_find_unknown_callable_module(GumModule* module,
+                                                gpointer user_data)
+{
+    PeakLoadedUnknownCallableLookup* lookup = user_data;
+
+    lookup->provider_path = gum_module_get_path(module);
+    gum_module_enumerate_symbols(
+        module,
+        dlopen_interceptor_find_unknown_callable_symbol,
+        lookup);
+    lookup->provider_path = NULL;
+    return lookup->non_ifunc_address == NULL && !lookup->ifunc_found;
+}
+
+gpointer
+dlopen_interceptor_find_loaded_unknown_callable(const char* symbol_name,
+                                                gboolean* ifunc_found_out)
+{
+    PeakLoadedUnknownCallableLookup lookup = {
+        .symbol_name = symbol_name
+    };
+
+    if (ifunc_found_out != NULL) {
+        *ifunc_found_out = FALSE;
+    }
+    if (symbol_name == NULL || symbol_name[0] == '\0') {
+        return NULL;
+    }
+
+    gum_process_enumerate_modules(
+        dlopen_interceptor_find_unknown_callable_module,
+        &lookup);
+    if (lookup.ifunc_found) {
+        atomic_store_explicit(&dynamic_symbol_lookup_listener_required,
+                              true,
+                              memory_order_release);
+    }
+    if (ifunc_found_out != NULL) {
+        *ifunc_found_out = lookup.ifunc_found;
+    }
+    return lookup.non_ifunc_address;
 }
 
 /*
  * Gum's ELF export enumeration intentionally emits only STT_FUNC and
- * STT_OBJECT.  Callable STT_GNU_IFUNC and STT_NOTYPE symbols therefore need
- * a second path.  Symbol enumeration establishes that the exact provider
- * defines a global executable symbol.  The original dlopen caller performs
- * provider-scoped lookup because it may still own the dynamic linker's lock;
- * this also delegates IFUNC selection to the linker and returns the callable
- * entry point, not the resolver stub recorded in the ELF symbol table.
+ * STT_OBJECT. Callable STT_NOTYPE symbols can be attached at the executable
+ * address reported by the ELF symbol table. STT_GNU_IFUNC is different: that
+ * address is the resolver, and calling dlsym() here would execute application
+ * code before the application's own lookup. Defer IFUNC attachment to the
+ * dlsym/dlvsym invocation listener, which observes the exact address selected
+ * by the application's lookup and completes its attach before returning it.
  */
 static gboolean
 dlopen_interceptor_scan_callable_unknown_symbol(
@@ -1547,9 +1703,7 @@ dlopen_interceptor_scan_callable_unknown_symbol(
     gpointer user_data)
 {
     PeakDlopenExportScan* scan = user_data;
-    GumAddress resolved_address;
-    void* resolved_provider_pin = NULL;
-    gboolean provider_pin_failed = FALSE;
+    int elf_symbol_type;
 
     if (!details->is_global ||
         details->type != GUM_SYMBOL_UNKNOWN ||
@@ -1562,47 +1716,52 @@ dlopen_interceptor_scan_callable_unknown_symbol(
         return TRUE;
     }
 
-    resolved_address = dlopen_interceptor_resolve_symbol_on_waiting_caller(
-        scan->request,
+    scan->matched = TRUE;
+    elf_symbol_type = dlopen_interceptor_elf_symbol_type_from_file(
         scan->provider_name,
-        details->name,
-        &resolved_provider_pin,
-        &provider_pin_failed);
-    if (resolved_address == 0 && !scan->request->caller_waits) {
-        resolved_address = gum_module_find_export_by_name(scan->module,
-                                                           details->name);
-        if (resolved_address != 0 &&
-            !dlopen_interceptor_pin_loaded_provider(
-                GSIZE_TO_POINTER(resolved_address),
-                &resolved_provider_pin)) {
-            provider_pin_failed = TRUE;
-            resolved_address = 0;
-        }
-    }
-    if (provider_pin_failed) {
-        scan->matched = TRUE;
-        scan->failed = TRUE;
-        g_printerr("[peak] skipping dynamic attach for %s from %s: unable to retain the provider owning its resolved address\n",
+        details->name);
+#ifdef STT_GNU_IFUNC
+    if (elf_symbol_type == STT_GNU_IFUNC) {
+        scan->needs_symbol_lookup_listener = TRUE;
+        atomic_store_explicit(&dynamic_symbol_lookup_listener_required,
+                              true,
+                              memory_order_release);
+        g_printerr("[peak] deferring IFUNC target %s from %s until the application's actual dlsym/dlvsym lookup; pointers resolved before PEAK initialization cannot be recovered without re-executing the resolver\n",
                    details->name,
                    scan->provider_name != NULL
                        ? scan->provider_name
                        : "<unknown>");
-        dlopen_interceptor_release_pinned_provider(
-            resolved_provider_pin);
         return TRUE;
     }
-    if (resolved_address == 0) {
-        dlopen_interceptor_release_pinned_provider(
-            resolved_provider_pin);
+#endif
+    if (elf_symbol_type != STT_NOTYPE) {
+        peak_log_debug("[peak] deferring unknown callable symbol %s from %s until an application symbol lookup returns its callable address\n",
+                       details->name,
+                       scan->provider_name != NULL
+                           ? scan->provider_name
+                           : "<unknown>");
         return TRUE;
     }
 
     return dlopen_interceptor_attach_scanned_symbol(
         scan,
         details->name,
-        resolved_address,
+        details->address,
         details->size > 0 ? (gsize)details->size : 0,
-        resolved_provider_pin);
+        NULL);
+}
+#endif
+
+#if !defined(__linux__)
+gpointer
+dlopen_interceptor_find_loaded_unknown_callable(const char* symbol_name,
+                                                gboolean* ifunc_found_out)
+{
+    (void)symbol_name;
+    if (ifunc_found_out != NULL) {
+        *ifunc_found_out = FALSE;
+    }
+    return NULL;
 }
 #endif
 
@@ -1734,6 +1893,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     GHashTable* seen_modules;
     GumModule* root_module;
     gboolean matched = FALSE;
+    gboolean needs_symbol_lookup_listener = FALSE;
     gboolean retry = FALSE;
     gboolean failed = FALSE;
 
@@ -1757,6 +1917,30 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         return PEAK_DLOPEN_ATTACH_FAILED;
     }
 #endif
+    if (request->direct_symbol_address != 0 &&
+        request->direct_symbol_name != NULL) {
+        PeakDynamicAttachResult direct_result =
+            peak_general_listener_dynamic_attach_symbol(
+                request->direct_symbol_name,
+                GSIZE_TO_POINTER(request->direct_symbol_address),
+                0,
+                request->direct_provider_name);
+
+        if (direct_result == PEAK_DYNAMIC_ATTACH_ATTACHED) {
+            dlopen_interceptor_commit_pinned_provider(
+                request->direct_provider_pin);
+            request->direct_provider_pin = NULL;
+            request->retain_handle = TRUE;
+            return PEAK_DLOPEN_ATTACH_DONE;
+        }
+        if (direct_result == PEAK_DYNAMIC_ATTACH_RETRY) {
+            return PEAK_DLOPEN_ATTACH_RETRY;
+        }
+        if (direct_result == PEAK_DYNAMIC_ATTACH_FAILED) {
+            return PEAK_DLOPEN_ATTACH_FAILED;
+        }
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
     if (request->handle == NULL) {
         return PEAK_DLOPEN_ATTACH_FAILED;
     }
@@ -1811,11 +1995,24 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                                           dlopen_interceptor_scan_dependency,
                                           &dependency_scan);
         matched |= export_scan.matched;
+        needs_symbol_lookup_listener |=
+            export_scan.needs_symbol_lookup_listener;
         retry |= export_scan.retry;
         failed |= export_scan.failed;
         g_object_unref(module);
     }
     g_hash_table_destroy(seen_modules);
+
+    if (needs_symbol_lookup_listener) {
+        PeakDlopenAttachResult listener_result =
+            dlopen_interceptor_ensure_symbol_lookup_listener();
+
+        if (listener_result == PEAK_DLOPEN_ATTACH_RETRY) {
+            retry = TRUE;
+        } else if (listener_result == PEAK_DLOPEN_ATTACH_FAILED) {
+            failed = TRUE;
+        }
+    }
 
     if (request->retain_handle && retry) {
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
@@ -1860,8 +2057,12 @@ dlopen_interceptor_process_dynamic_attach_request(
          * guarantees a later attempt can succeed.  Background requests keep
          * their existing retry behavior.
          */
-        g_printerr("[peak] dynamic attach failed open for %s because a safe mutation could not be established; returning the original dlopen handle without waiting for a retry\n",
-                   request->filename != NULL ? request->filename : "<unknown>");
+        g_printerr("[peak] dynamic attach failed open for %s because a safe mutation could not be established; returning the real loader result without waiting for a retry\n",
+                   request->direct_symbol_name != NULL
+                       ? request->direct_symbol_name
+                       : (request->filename != NULL
+                              ? request->filename
+                              : "<unknown>"));
     }
     dlopen_interceptor_complete_dynamic_attach_request(
         request,
@@ -1874,17 +2075,271 @@ dlopen_interceptor_process_dynamic_attach_request(
                           : PEAK_DLOPEN_REQUEST_NO_MATCH)));
 }
 
-static gboolean
-dlopen_interceptor_service_resolution_nested_request(void)
+static void
+dlopen_interceptor_dlsym_listener_on_enter(GumInvocationListener* listener,
+                                           GumInvocationContext* ic)
 {
-    PeakDlopenDynamicAttachRequest* request =
-        dlopen_interceptor_pop_dynamic_attach_request();
+    PeakDlsymInvocationData* data =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakDlsymInvocationData);
+    const char* symbol_name;
+    gboolean admission_open;
 
-    if (request == NULL) {
+    (void)listener;
+    memset(data, 0, sizeof(*data));
+    if (dlopen_interceptor_is_inherited_fork_child()) {
+        dlopen_interceptor_warn_fork_child_once();
+        return;
+    }
+    if (dynamic_attach_drain_reentrant ||
+        peak_general_listener_controller_is_current_thread()) {
+        return;
+    }
+
+    symbol_name = gum_invocation_context_get_nth_argument(ic, 1);
+    if (symbol_name == NULL || symbol_name[0] == '\0' ||
+        !peak_general_listener_dynamic_symbol_matches_any_target(
+            symbol_name,
+            NULL)) {
+        return;
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    admission_open = dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    if (!admission_open) {
+        return;
+    }
+
+    data->symbol_name = symbol_name;
+    data->entry_pid = getpid();
+    dlopen_interceptor_begin_load_transaction();
+    data->transaction_started = TRUE;
+}
+
+static void
+dlopen_interceptor_dlsym_listener_on_leave(GumInvocationListener* listener,
+                                           GumInvocationContext* ic)
+{
+    PeakDlsymInvocationData* data =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakDlsymInvocationData);
+    gpointer address;
+    Dl_info provider_info;
+    void* provider_pin = NULL;
+    PeakDlopenDynamicAttachRequest* request = NULL;
+    PeakDlopenRequestState request_state = PEAK_DLOPEN_REQUEST_NO_MATCH;
+    gboolean provider_pinned;
+    int saved_errno;
+
+    (void)listener;
+    if (!data->transaction_started) {
+        return;
+    }
+
+    if (data->entry_pid != getpid() ||
+        dlopen_interceptor_is_inherited_fork_child()) {
+        dlopen_interceptor_quarantine_inherited_fork_child(FALSE);
+        return;
+    }
+
+    saved_errno = errno;
+    address = gum_invocation_context_get_return_value(ic);
+    memset(&provider_info, 0, sizeof(provider_info));
+    if (address == NULL ||
+        dladdr(address, &provider_info) == 0 ||
+        !peak_general_listener_dynamic_symbol_address_needs_attach(
+            data->symbol_name,
+            address,
+            provider_info.dli_fname)) {
+        dlopen_interceptor_end_load_transaction();
+        errno = saved_errno;
+        return;
+    }
+
+    provider_pinned =
+        dlopen_interceptor_pin_loaded_provider(address, &provider_pin);
+    if (dlopen_interceptor_is_inherited_fork_child()) {
+        /* A loader audit callback may have forked during RTLD_NOLOAD. */
+        dlopen_interceptor_quarantine_inherited_fork_child(FALSE);
+        errno = saved_errno;
+        return;
+    }
+    if (!provider_pinned) {
+        g_printerr("[peak] skipping dynamic attach for %s: unable to retain the provider owning the application's resolved address\n",
+                   data->symbol_name);
+        /* Discard an internal RTLD_NOLOAD failure after a successful dlsym. */
+        (void)dlerror();
+        dlopen_interceptor_end_load_transaction();
+        errno = saved_errno;
+        return;
+    }
+    request = dlopen_interceptor_new_dynamic_attach_request(TRUE);
+    request->filename = g_strdup(provider_info.dli_fname);
+    request->direct_symbol_name = g_strdup(data->symbol_name);
+    request->direct_provider_name = g_strdup(provider_info.dli_fname);
+    request->direct_symbol_address = (GumAddress)(guintptr)address;
+    request->direct_provider_pin = provider_pin;
+    provider_pin = NULL;
+
+    if (dlopen_interceptor_enqueue_dynamic_attach_request(request)) {
+        request_state =
+            dlopen_interceptor_wait_for_dynamic_attach_request(request);
+    }
+    dlopen_interceptor_destroy_dynamic_attach_request(request);
+    dlopen_interceptor_end_load_transaction();
+
+    if (request_state == PEAK_DLOPEN_REQUEST_FAILED) {
+        g_printerr("[peak] dynamic attach reached a permanent failure before returning %s from the application's symbol lookup\n",
+                   data->symbol_name);
+    }
+    errno = saved_errno;
+}
+
+static void
+dlopen_interceptor_dlsym_listener_class_init(PeakDlsymListenerClass* klass)
+{
+    (void)klass;
+    (void)PEAK_DLSYM_IS_LISTENER;
+    (void)glib_autoptr_cleanup_PeakDlsymListener;
+}
+
+static void
+dlopen_interceptor_dlsym_listener_init(PeakDlsymListener* self)
+{
+    (void)self;
+}
+
+static void
+dlopen_interceptor_dlsym_listener_iface_init(gpointer g_iface,
+                                             gpointer iface_data)
+{
+    GumInvocationListenerInterface* iface = g_iface;
+
+    (void)iface_data;
+    iface->on_enter = dlopen_interceptor_dlsym_listener_on_enter;
+    iface->on_leave = dlopen_interceptor_dlsym_listener_on_leave;
+}
+
+/*
+ * The caller owns a prepared Gum mutation window and an open interceptor
+ * transaction. Keep dlsym and dlvsym atomic: a partial installation cannot
+ * satisfy the first-lookup contract and is reverted before publication.
+ */
+static gboolean
+dlopen_interceptor_attach_symbol_lookup_listener_in_transaction(
+    GumAttachReturn* dlsym_status_out,
+    GumAttachReturn* dlvsym_status_out)
+{
+    GumAttachReturn dlsym_status = GUM_ATTACH_WRONG_TYPE;
+    GumAttachReturn dlvsym_status = GUM_ATTACH_OK;
+
+    if (dlopen_interceptor == NULL ||
+        dynamic_symbol_lookup_listener == NULL ||
+        dlsym_hook_address == NULL
+#if defined(__linux__)
+        || dlvsym_hook_address == NULL
+#endif
+    ) {
+        if (dlsym_status_out != NULL) {
+            *dlsym_status_out = dlsym_status;
+        }
+        if (dlvsym_status_out != NULL) {
+            *dlvsym_status_out = GUM_ATTACH_WRONG_TYPE;
+        }
         return FALSE;
     }
-    dlopen_interceptor_process_dynamic_attach_request(request);
-    return TRUE;
+
+    dlsym_status = gum_interceptor_attach(
+        dlopen_interceptor,
+        dlsym_hook_address,
+        dynamic_symbol_lookup_listener,
+        NULL);
+    if (dlsym_status == GUM_ATTACH_OK &&
+        dlvsym_hook_address != NULL &&
+        dlvsym_hook_address != dlsym_hook_address) {
+        dlvsym_status = gum_interceptor_attach(
+            dlopen_interceptor,
+            dlvsym_hook_address,
+            dynamic_symbol_lookup_listener,
+            NULL);
+    }
+
+    if (dlsym_status == GUM_ATTACH_OK &&
+        dlvsym_status != GUM_ATTACH_OK) {
+        gum_interceptor_detach(dlopen_interceptor,
+                               dynamic_symbol_lookup_listener);
+    }
+    if (dlsym_status_out != NULL) {
+        *dlsym_status_out = dlsym_status;
+    }
+    if (dlvsym_status_out != NULL) {
+        *dlvsym_status_out = dlvsym_status;
+    }
+    return dlsym_status == GUM_ATTACH_OK &&
+           dlvsym_status == GUM_ATTACH_OK;
+}
+
+static PeakDlopenAttachResult
+dlopen_interceptor_ensure_symbol_lookup_listener(void)
+{
+    PeakDetachRequest mutation_request;
+    PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+    GumAttachReturn dlsym_status = GUM_ATTACH_WRONG_TYPE;
+    GumAttachReturn dlvsym_status = GUM_ATTACH_WRONG_TYPE;
+    gboolean attached;
+
+    if (dynamic_symbol_lookup_listener_attached) {
+        return PEAK_DLOPEN_ATTACH_DONE;
+    }
+    if (dlopen_interceptor == NULL ||
+        dynamic_symbol_lookup_listener == NULL ||
+        dlsym_hook_address == NULL
+#if defined(__linux__)
+        || dlvsym_hook_address == NULL
+#endif
+    ) {
+        g_printerr("[peak] cannot observe application IFUNC resolution: dlsym/dlvsym interception is unavailable\n");
+        return PEAK_DLOPEN_ATTACH_FAILED;
+    }
+
+    mutation_request = (PeakDetachRequest) {
+        .hook_id = 0,
+        .symbol_name = "dlsym/dlvsym",
+        .function_address = dlsym_hook_address,
+        .interceptor = dlopen_interceptor,
+        .listener = dynamic_symbol_lookup_listener,
+        .operation = PEAK_DETACH_OPERATION_ATTACH
+    };
+    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+                                                       &detach_status)) {
+        return dlopen_interceptor_dynamic_attach_prepare_is_retryable(
+                   detach_status)
+            ? PEAK_DLOPEN_ATTACH_RETRY
+            : PEAK_DLOPEN_ATTACH_FAILED;
+    }
+
+    gum_interceptor_begin_transaction(dlopen_interceptor);
+    attached =
+        dlopen_interceptor_attach_symbol_lookup_listener_in_transaction(
+            &dlsym_status,
+            &dlvsym_status);
+    if (attached) {
+        dynamic_symbol_lookup_listener_attached = TRUE;
+    }
+    gum_interceptor_end_transaction(dlopen_interceptor);
+    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                      &detach_status)) {
+        peak_detach_controller_abort_after_failed_finish(
+            "dlsym/dlvsym listener attach finish",
+            detach_status);
+    }
+
+    if (!attached) {
+        g_printerr("[peak] cannot observe application IFUNC resolution: dlsym attach status=%d dlvsym attach status=%d\n",
+                   dlsym_status,
+                   dlvsym_status);
+        return PEAK_DLOPEN_ATTACH_FAILED;
+    }
+    return PEAK_DLOPEN_ATTACH_DONE;
 }
 
 static void
@@ -1971,10 +2426,15 @@ dlopen_interceptor_rescan_loaded_modules(void)
         /*
          * The startup constructor may still own the loader's recursive lock.
          * Keep controller lifecycle/JIT mutations outside this exact scan and
-         * let any IFUNC resolution run on this original caller below.
+         * preserve loader ordering. IFUNC resolver execution is deliberately
+         * deferred to the application's actual dlsym/dlvsym call.
          */
         dlopen_interceptor_begin_load_transaction();
         handle = original_dlopen(snapshot->path, RTLD_LAZY | RTLD_NOLOAD);
+        if (dlopen_interceptor_is_inherited_fork_child()) {
+            dlopen_interceptor_quarantine_inherited_fork_child(FALSE);
+            return FALSE;
+        }
         if (handle == NULL) {
             dlopen_interceptor_end_load_transaction();
             continue;
@@ -2098,34 +2558,25 @@ __attribute__((visibility("hidden"), noinline, no_instrument_function))
 void*
 peak_dlopen_body(const char *filename, int flags)
 {
-    static const char fork_warning[] =
-        "[peak] fork child dynamic dlopen profiling is unsupported until exec; using the real dlopen without inherited PEAK controller state\n";
-    pid_t current_pid;
-    pid_t owner_pid;
     int old_cancel_state;
     void *handle;
     PeakDlopenDynamicAttachRequest* request = NULL;
     PeakDlopenRequestState request_state = PEAK_DLOPEN_REQUEST_NO_MATCH;
 
-    current_pid = getpid();
-    owner_pid = atomic_load_explicit(&dynamic_attach_owner_pid,
-                                     memory_order_acquire);
-    if (owner_pid != 0 && owner_pid != current_pid) {
-        if (atomic_exchange_explicit(&dynamic_attach_fork_warning_pid,
-                                     current_pid,
-                                     memory_order_relaxed) != current_pid) {
-            (void)write(STDERR_FILENO,
-                        fork_warning,
-                        sizeof(fork_warning) - 1);
-        }
+    if (dlopen_interceptor_is_inherited_fork_child()) {
+        dlopen_interceptor_warn_fork_child_once();
         handle = original_dlopen(filename, flags);
-        dlopen_interceptor_end_replacement_call();
+        dlopen_interceptor_end_replacement_call_without_inherited_locks();
         return handle;
     }
     if (dynamic_attach_drain_reentrant ||
         peak_general_listener_controller_is_current_thread()) {
         handle = original_dlopen(filename, flags);
-        dlopen_interceptor_end_replacement_call();
+        if (dlopen_interceptor_is_inherited_fork_child()) {
+            dlopen_interceptor_quarantine_inherited_fork_child(TRUE);
+        } else {
+            dlopen_interceptor_end_replacement_call();
+        }
         return handle;
     }
 
@@ -2136,6 +2587,11 @@ peak_dlopen_body(const char *filename, int flags)
     dlopen_interceptor_test_pause_replacement_body(filename);
 #endif
     handle = original_dlopen(filename, flags);
+    if (dlopen_interceptor_is_inherited_fork_child()) {
+        dlopen_interceptor_quarantine_inherited_fork_child(TRUE);
+        pthread_setcancelstate(old_cancel_state, NULL);
+        return handle;
+    }
     // If dlopen failed or no filename, don’t do rescan
     if (handle == NULL || filename == NULL) {
         dlopen_interceptor_end_load_transaction();
@@ -2168,6 +2624,12 @@ peak_dlopen_body(const char *filename, int flags)
     }
     request->binding_flags = binding_flags;
     request->handle = original_dlopen(filename, binding_flags | RTLD_NOLOAD);
+    if (dlopen_interceptor_is_inherited_fork_child()) {
+        /* Abandon the child copy; destroying it would touch inherited locks. */
+        dlopen_interceptor_quarantine_inherited_fork_child(TRUE);
+        pthread_setcancelstate(old_cancel_state, NULL);
+        return handle;
+    }
 #endif
     if (request->handle != NULL) {
 #if defined(__linux__)
@@ -2192,6 +2654,11 @@ peak_dlopen_body(const char *filename, int flags)
         request = NULL;
     } else {
         request_state = dlopen_interceptor_wait_for_dynamic_attach_request(request);
+        if (dlopen_interceptor_is_inherited_fork_child()) {
+            dlopen_interceptor_quarantine_inherited_fork_child(TRUE);
+            pthread_setcancelstate(old_cancel_state, NULL);
+            return handle;
+        }
         dlopen_interceptor_destroy_dynamic_attach_request(request);
         request = NULL;
     }
@@ -2230,6 +2697,13 @@ dlopen_interceptor_release_uninstalled_replacement(void)
                           memory_order_relaxed);
     original_dlopen = NULL;
     dlopen_hook_address = NULL;
+    dlsym_hook_address = NULL;
+    dlvsym_hook_address = NULL;
+    dynamic_symbol_lookup_listener_attached = FALSE;
+    if (dynamic_symbol_lookup_listener != NULL) {
+        g_object_unref(dynamic_symbol_lookup_listener);
+        dynamic_symbol_lookup_listener = NULL;
+    }
     if (dlopen_interceptor != NULL) {
         g_object_unref(dlopen_interceptor);
         dlopen_interceptor = NULL;
@@ -2239,6 +2713,10 @@ dlopen_interceptor_release_uninstalled_replacement(void)
 int dlopen_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
+    GumAttachReturn dlsym_attach_check = GUM_ATTACH_WRONG_TYPE;
+    GumAttachReturn dlvsym_attach_check = GUM_ATTACH_OK;
+    gboolean symbol_lookup_listener_required;
+    gboolean setup_ok = FALSE;
 
     if (atomic_load_explicit(&dlopen_replacement_installed_by_peak,
                              memory_order_acquire)) {
@@ -2252,8 +2730,21 @@ int dlopen_interceptor_attach()
 #endif
     dlopen_interceptor = gum_interceptor_obtain();
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
+    dlsym_hook_address = peak_general_listener_find_function("dlsym");
+#if defined(__linux__)
+    dlvsym_hook_address = peak_general_listener_find_function("dlvsym");
+#endif
+    symbol_lookup_listener_required = atomic_load_explicit(
+        &dynamic_symbol_lookup_listener_required,
+        memory_order_acquire);
 
-    if (dlopen_hook_address == NULL) {
+    if (dlopen_hook_address == NULL ||
+        (symbol_lookup_listener_required && dlsym_hook_address == NULL)
+#if defined(__linux__)
+        || (symbol_lookup_listener_required && dlvsym_hook_address == NULL)
+#endif
+    ) {
+        g_printerr("[peak] skipping dynamic loader interception: required dlopen/dlsym/dlvsym entry discovery was incomplete\n");
         dlopen_interceptor_release_uninstalled_replacement();
         return replace_check;
     }
@@ -2290,6 +2781,8 @@ int dlopen_interceptor_attach()
     atomic_store_explicit(&dynamic_attach_owner_pid,
                           getpid(),
                           memory_order_release);
+    dynamic_symbol_lookup_listener =
+        g_object_new(PEAK_DLSYM_TYPE_LISTENER, NULL);
     gum_interceptor_begin_transaction(dlopen_interceptor);
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (!dlopen_interceptor_test_forced_replace_failure(&replace_check))
@@ -2302,14 +2795,28 @@ int dlopen_interceptor_attach()
             (gpointer*)(&original_dlopen),
             NULL);
     }
-    if (replace_check == GUM_REPLACE_OK) {
+    setup_ok = replace_check == GUM_REPLACE_OK;
+    if (setup_ok && symbol_lookup_listener_required) {
+        setup_ok =
+            dlopen_interceptor_attach_symbol_lookup_listener_in_transaction(
+                &dlsym_attach_check,
+                &dlvsym_attach_check);
+    }
+    if (setup_ok) {
         /*
          * Record ownership before ending the Gum transaction can publish the
-         * replacement to another application thread.
+         * replacement/listeners to another application thread.
          */
         atomic_store_explicit(&dlopen_replacement_installed_by_peak,
                               true,
                               memory_order_release);
+        dynamic_symbol_lookup_listener_attached =
+            symbol_lookup_listener_required;
+    } else {
+        if (replace_check == GUM_REPLACE_OK) {
+            gum_interceptor_revert(dlopen_interceptor,
+                                   dlopen_hook_address);
+        }
     }
     gum_interceptor_end_transaction(dlopen_interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
@@ -2317,7 +2824,14 @@ int dlopen_interceptor_attach()
         peak_detach_controller_abort_after_failed_finish("dlopen replace finish",
                                                         detach_status);
     }
-    if (replace_check != GUM_REPLACE_OK) {
+    if (!setup_ok) {
+        if (replace_check == GUM_REPLACE_OK &&
+            symbol_lookup_listener_required) {
+            g_printerr("[peak] skipping dynamic loader interception: dlsym attach status=%d dlvsym attach status=%d\n",
+                       dlsym_attach_check,
+                       dlvsym_attach_check);
+            replace_check = GUM_REPLACE_WRONG_TYPE;
+        }
         g_printerr("[peak] skipping dlopen Gum replace: replace-fast-failed-%d\n",
                    replace_check);
         dlopen_interceptor_release_uninstalled_replacement();
@@ -2368,8 +2882,21 @@ gboolean dlopen_interceptor_dettach()
 #endif
         if (!entry_physically_restored) {
             gum_interceptor_begin_transaction(dlopen_interceptor);
+            if (dynamic_symbol_lookup_listener_attached &&
+                dynamic_symbol_lookup_listener != NULL) {
+                gum_interceptor_detach(dlopen_interceptor,
+                                       dynamic_symbol_lookup_listener);
+                dynamic_symbol_lookup_listener_attached = FALSE;
+            }
             gum_interceptor_revert(dlopen_interceptor, dlopen_hook_address);
             gum_interceptor_end_transaction(dlopen_interceptor);
+        } else if (dynamic_symbol_lookup_listener_attached &&
+                   dynamic_symbol_lookup_listener != NULL) {
+            gum_interceptor_begin_transaction(dlopen_interceptor);
+            gum_interceptor_detach(dlopen_interceptor,
+                                   dynamic_symbol_lookup_listener);
+            gum_interceptor_end_transaction(dlopen_interceptor);
+            dynamic_symbol_lookup_listener_attached = FALSE;
         }
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                          &detach_status)) {
@@ -2434,6 +2961,9 @@ gboolean dlopen_interceptor_dettach()
     if (dlopen_interceptor != NULL) {
         g_object_unref(dlopen_interceptor);
     }
+    if (dynamic_symbol_lookup_listener != NULL) {
+        g_object_unref(dynamic_symbol_lookup_listener);
+    }
 
     atomic_store_explicit(&dlopen_replacement_installed_by_peak,
                           false,
@@ -2455,5 +2985,9 @@ gboolean dlopen_interceptor_dettach()
 
     dlopen_interceptor = NULL;
     dlopen_hook_address = NULL;
+    dynamic_symbol_lookup_listener = NULL;
+    dlsym_hook_address = NULL;
+    dlvsym_hook_address = NULL;
+    dynamic_symbol_lookup_listener_attached = FALSE;
     return TRUE;
 }

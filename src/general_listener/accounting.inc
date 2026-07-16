@@ -547,6 +547,7 @@ gpointer
 peak_general_listener_find_function(const char* symbol)
 {
     gpointer address;
+    gboolean ifunc_found = FALSE;
 
     if (symbol == NULL) {
         return NULL;
@@ -558,11 +559,21 @@ peak_general_listener_find_function(const char* symbol)
     }
 
     /*
-     * Gum's ELF export walk intentionally excludes callable STT_NOTYPE (and
-     * may omit IFUNC entries).  Let the platform loader resolve the exact
-     * globally visible symbol so startup targets use the same callable entry
-     * semantics as runtime provider-scoped resolution.
+     * Gum's export walk intentionally excludes callable STT_NOTYPE and IFUNC
+     * entries. STT_NOTYPE can be attached at its executable ELF address.
+     * Never call dlsym() proactively for an IFUNC: that executes application
+     * resolver code and may select a different implementation from the
+     * application's later lookup. The dynamic symbol-lookup listener attaches
+     * the exact dlsym/dlvsym return value before it reaches the application.
      */
+    address = dlopen_interceptor_find_loaded_unknown_callable(
+        symbol,
+        &ifunc_found);
+    if (address != NULL || ifunc_found) {
+        return address;
+    }
+
+    /* Preserve the loader fallback for ordinary symbols omitted by Gum. */
     dlerror();
     address = dlsym(RTLD_DEFAULT, symbol);
     if (dlerror() != NULL) {

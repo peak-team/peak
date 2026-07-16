@@ -795,6 +795,22 @@ while dynamic admission remains open. A closed admission gate stops the scan,
 because no controller can then complete additional work. Thus one malformed or
 temporarily unsafe `RTLD_LOCAL` provider cannot hide unrelated later providers.
 
+Callable symbols that Gum reports as `STT_NOTYPE` or `STT_GNU_IFUNC` are
+classified from an inert, read-only mapping of the provider's ELF file. The
+controller never calls `dlsym()` merely to discover an IFUNC address, because
+doing so would execute application resolver code speculatively and a stateful
+resolver could select a different implementation from the application's later
+lookup. `STT_NOTYPE` can use its executable ELF address directly. Finding an
+IFUNC instead installs a lazy listener on `dlsym()` and `dlvsym()` before the
+matching `dlopen()` returns. The application then performs its real lookup and
+resolver invocation exactly as it would without PEAK; PEAK observes that
+lookup's returned address, pins the DSO that actually owns the implementation,
+and completes the exact attach request before returning the pointer to the
+application. A pointer that was already resolved and stored before PEAK
+initialization cannot in general be recovered without executing the resolver
+again, so PEAK reports that startup limitation instead of guessing or changing
+resolver semantics.
+
 This prevents `dlopen` from racing with heartbeat detach, reattach, and final
 teardown. For a matching handle, `dlopen()` does not return until the exact
 request has either installed every safely attachable listener or reached a

@@ -110,8 +110,8 @@ def check_dlopen_revert_transactions(repo_root):
         source, "dlopen_interceptor_shutdown_dynamic_attach"
     )
     for match in re.finditer(r"gum_interceptor_revert\s*\(\s*dlopen_interceptor", body):
-        before = body[max(0, match.start() - 180):match.start()]
-        after = body[match.end():match.end() + 180]
+        before = body[max(0, match.start() - 700):match.start()]
+        after = body[match.end():match.end() + 300]
         require("gum_interceptor_begin_transaction(dlopen_interceptor)" in before,
                 "dlopen revert is missing nearby begin_transaction")
         require("gum_interceptor_end_transaction(dlopen_interceptor)" in after,
@@ -1460,9 +1460,7 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     transaction_publish = dlopen_attach_body.find(
         "gum_interceptor_end_transaction"
     )
-    replace_failure = dlopen_attach_body.find(
-        "if (replace_check != GUM_REPLACE_OK)"
-    )
+    replace_failure = dlopen_attach_body.find("if (!setup_ok)")
     cleanup_failure = dlopen_attach_body.find(
         "dlopen_interceptor_release_uninstalled_replacement()",
         replace_failure,
@@ -1473,9 +1471,10 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             dlopen_attach_body[existing_ownership_guard:replacement_publish] and
             replacement_publish < replacement_owned < transaction_publish and
             transaction_publish < replace_failure < cleanup_failure,
-            "dlopen replacement ownership must preserve an existing PEAK install, "
-            "be recorded only after Gum success before publication, and clean "
-            "failed new installs after the stop window")
+            "dlopen/dlsym/dlvsym interception ownership must preserve an "
+            "existing PEAK install, be recorded only after every Gum hook "
+            "succeeds and before publication, and clean failed atomic installs "
+            "after the stop window")
     require("dlopen_replacement_installed_by_peak" in dlopen_detach_body and
             dlopen_detach_body.find("dlopen_replacement_installed_by_peak") <
             dlopen_detach_body.find(
@@ -1543,9 +1542,6 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "dynamic attach module-name fallback must handle relative and "
             "absolute dlopen paths")
 
-    resolver_wait = extract_function(
-        dlopen, "dlopen_interceptor_resolve_symbol_on_waiting_caller"
-    )
     caller_wait = extract_function(
         dlopen, "dlopen_interceptor_wait_for_dynamic_attach_request"
     )
@@ -1557,6 +1553,28 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     )
     destroy_request = extract_function(
         dlopen, "dlopen_interceptor_destroy_dynamic_attach_request"
+    )
+    symbol_lookup_enter = extract_function(
+        dlopen, "dlopen_interceptor_dlsym_listener_on_enter"
+    )
+    symbol_lookup_leave = extract_function(
+        dlopen, "dlopen_interceptor_dlsym_listener_on_leave"
+    )
+    ensure_symbol_lookup_listener = extract_function(
+        dlopen, "dlopen_interceptor_ensure_symbol_lookup_listener"
+    )
+    attach_symbol_lookup_listener = extract_function(
+        dlopen,
+        "dlopen_interceptor_attach_symbol_lookup_listener_in_transaction",
+    )
+    classify_elf_symbol = extract_function(
+        dlopen, "dlopen_interceptor_elf_symbol_type_from_file"
+    )
+    find_unknown_callable = extract_function(
+        dlopen, "dlopen_interceptor_find_loaded_unknown_callable"
+    )
+    quarantine_fork_child = extract_function(
+        dlopen, "dlopen_interceptor_quarantine_inherited_fork_child"
     )
     process_request = extract_function(
         dlopen, "dlopen_interceptor_process_dynamic_attach_request"
@@ -1581,33 +1599,75 @@ def check_dlopen_request_completion_and_readiness(repo_root):
     fork_child_test = (
         repo_root / "test/dynamic_lib/fork_child_dlopen.py"
     ).read_text(encoding="utf-8")
-    require("dynamic_attach_resolution_reentrant" not in dlopen and
-            "dynamic_attach_resolution_wait_request" in caller_wait and
-            "dlopen_interceptor_service_resolution_nested_request" in
-            resolver_wait and
-            "resolution_nested_generation" in resolver_wait and
-            "dynamic_attach_resolution_wait_request" not in peak_dlopen,
-            "resolver-time nested dlopen must be serviced recursively, not bypassed")
-    caller_dlsym = caller_wait.find("dlsym(provider_handle, symbol_name)")
-    caller_pin = caller_wait.find(
-        "dlopen_interceptor_pin_loaded_provider("
-    )
-    caller_close = caller_wait.find("dlclose(provider_handle)")
-    require(caller_dlsym != -1 and caller_pin != -1 and caller_close != -1 and
-            caller_dlsym < caller_pin < caller_close and
-            "resolution_provider_pin = resolved_provider_pin" in caller_wait and
-            "*provider_pin_out = request->resolution_provider_pin" in
-            resolver_wait and
-            "request->resolution_provider_pin = NULL" in resolver_wait and
-            "resolved_provider_pin" in callable_scan and
-            "dlopen_interceptor_commit_pinned_provider" in attach_scanned and
-            "dlopen_interceptor_release_pinned_provider" in attach_scanned and
-            "request->resolution_provider_pin" in destroy_request and
-            "test_dynamic_ifunc_external_provider_retained" in
-            dynamic_tests_cmake,
-            "callable IFUNC/STT_NOTYPE resolution must pin the actual address "
-            "owner on the waiting loader thread, transfer that pin through "
-            "attach publication, and cover external-provider unload")
+    require("dynamic_attach_resolution_wait_request" not in dlopen and
+            "dlopen_interceptor_resolve_symbol_on_waiting_caller" not in
+            dlopen and
+            "dlsym(" not in callable_scan and
+            "STT_GNU_IFUNC" in callable_scan and
+            "STT_NOTYPE" in callable_scan and
+            "dlopen_interceptor_elf_symbol_type_from_file" in callable_scan,
+            "module scans must classify IFUNC from ELF metadata without "
+            "executing a resolver; only STT_NOTYPE may attach directly")
+    require("peak_general_listener_dynamic_symbol_matches_any_target" in
+            symbol_lookup_enter and
+            "dlopen_interceptor_begin_load_transaction" in
+            symbol_lookup_enter and
+            "gum_invocation_context_get_return_value" in symbol_lookup_leave and
+            "peak_general_listener_dynamic_symbol_address_needs_attach" in
+            symbol_lookup_leave and
+            "dlopen_interceptor_pin_loaded_provider" in symbol_lookup_leave and
+            "request->direct_symbol_address" in symbol_lookup_leave and
+            "dlopen_interceptor_enqueue_dynamic_attach_request" in
+            symbol_lookup_leave and
+            "dlopen_interceptor_wait_for_dynamic_attach_request" in
+            symbol_lookup_leave and
+            "dlopen_interceptor_end_load_transaction" in symbol_lookup_leave and
+            "request->direct_provider_pin" in destroy_request and
+            "request->direct_symbol_address" in attach_request and
+            "dlopen_interceptor_commit_pinned_provider" in attach_request and
+            "gum_interceptor_attach" in attach_symbol_lookup_listener and
+            "dlsym_hook_address" in attach_symbol_lookup_listener and
+            "dlvsym_hook_address" in attach_symbol_lookup_listener and
+            "test_dynamic_stateful_ifunc_uses_application_lookup" in
+            dynamic_tests_cmake and
+            "test_dynamic_blocking_ifunc_does_not_block_dlopen" in
+            dynamic_tests_cmake and
+            "test_dynamic_versioned_ifunc_dlvsym_first_call" in
+            dynamic_tests_cmake and
+            "lib.peak_resolver_nested_ifunc()" in dynamic_tests_cmake,
+            "IFUNC attachment must observe the application's actual "
+            "dlsym/dlvsym result, pin its real owner, complete before lookup "
+            "return, and cover stateful, blocking, versioned, and nested cases")
+    require("dynamic_symbol_lookup_listener_required" in callable_scan and
+            "scan->needs_symbol_lookup_listener = TRUE" in callable_scan and
+            "dynamic_symbol_lookup_listener_required" in
+            find_unknown_callable and
+            "if (lookup.ifunc_found)" in find_unknown_callable and
+            "dlopen_interceptor_ensure_symbol_lookup_listener" in
+            attach_request and
+            attach_request.find(
+                "dlopen_interceptor_ensure_symbol_lookup_listener") >
+            attach_request.find("g_hash_table_destroy(seen_modules)") and
+            "peak_detach_controller_prepare_hook_mutation" in
+            ensure_symbol_lookup_listener and
+            "dlopen_interceptor_dynamic_attach_prepare_is_retryable" in
+            ensure_symbol_lookup_listener and
+            "symbol_lookup_listener_required" in dlopen_attach_body and
+            "if (setup_ok && symbol_lookup_listener_required)" in
+            dlopen_attach_body and
+            "dynamic_symbol_lookup_listener_attached =\n"
+            "            symbol_lookup_listener_required" in
+            dlopen_attach_body,
+            "dlsym/dlvsym interception must be installed only after startup "
+            "or runtime ELF classification finds an IFUNC, while runtime "
+            "installation remains inside a prepared mutation and completes "
+            "before the matching dlopen returns")
+    require("open(provider_path, O_RDONLY | O_CLOEXEC)" in
+            classify_elf_symbol and
+            "mmap(" in classify_elf_symbol and
+            "dladdr" not in classify_elf_symbol,
+            "controller-side IFUNC classification must read inert ELF "
+            "metadata without acquiring the dynamic loader lock")
     require("!request->caller_waits" in process_request and
             "PEAK_DLOPEN_REQUEST_CANCELLED" in process_request and
             process_request.find("!request->caller_waits") <
@@ -1669,15 +1729,29 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "&peak_dlopen_active_replacement_count" in end_replacement and
             "atomic_load_explicit" in wait_replacement and
             "&peak_dlopen_active_replacement_count" in wait_replacement and
-            peak_dlopen.count("dlopen_interceptor_end_replacement_call();") ==
-            peak_dlopen.count("return handle;"),
-            "every dlopen replacement return must release atomic entry ownership, "
-            "and teardown must drain that same atomic counter")
+            "dlopen_interceptor_end_replacement_call();" in peak_dlopen and
+            "dlopen_interceptor_end_replacement_call_without_inherited_locks" in
+            peak_dlopen and
+            "dynamic_load_transaction_depth = 0" in quarantine_fork_child and
+            "atomic_store_explicit(&peak_dlopen_active_replacement_count" in
+            extract_function(
+                dlopen,
+                "dlopen_interceptor_end_replacement_call_without_inherited_locks",
+            ) and
+            "0," in extract_function(
+                dlopen,
+                "dlopen_interceptor_end_replacement_call_without_inherited_locks",
+            ) and
+            "pthread_mutex_unlock" not in quarantine_fork_child,
+            "ordinary dlopen returns must release atomic entry ownership, "
+            "while an inherited fork child must abandon copied transaction "
+            "state without touching parent-owned synchronization")
     require("static _Atomic pid_t dynamic_attach_fork_warning_pid" in dlopen and
             "static __thread pid_t dynamic_attach_fork_warning_pid" not in
             dlopen and
             "atomic_exchange_explicit(&dynamic_attach_fork_warning_pid" in
-            peak_dlopen,
+            extract_function(
+                dlopen, "dlopen_interceptor_warn_fork_child_once"),
             "fork-child dlopen warning ownership must be process-global and "
             "atomically claimed, not once per TLS thread")
     require("threading.Barrier" in fork_child_test and
@@ -1685,6 +1759,13 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "fork_child_dlopen_warning_count=1" in fork_child_test,
             "fork-child regression must race multiple child threads and "
             "assert exactly one process warning")
+    require(peak_dlopen.count(
+                "dlopen_interceptor_is_inherited_fork_child()") >= 4 and
+            "test_dynamic_fork_inside_dlopen_constructor_no_deadlock" in
+            dynamic_tests_cmake and
+            "fork_constructor_child_returned" in dynamic_tests_cmake,
+            "already-entered dlopen bodies must recheck fork ownership after "
+            "loader callbacks and cover a constructor that forks")
     require("dlopen_interceptor_test_uninstalled_replacement_state_is_clean" in
             replace_failure_test and
             "dlopen_interceptor_test_dettach" in replace_failure_test and
@@ -1756,9 +1837,14 @@ def check_dlopen_request_completion_and_readiness(repo_root):
             "g_hash_table_contains" in pin_provider,
             "provider pinning must preserve Gum's borrowed main-module "
             "reference and deduplicate loader references by provider")
-    require("dlsym(RTLD_DEFAULT, symbol)" in find_function,
-            "startup lookup must fall back to the loader for executable "
-            "STT_NOTYPE and IFUNC symbols")
+    require("dlopen_interceptor_find_loaded_unknown_callable" in
+            find_function and
+            "if (address != NULL || ifunc_found)" in find_function and
+            find_function.find(
+                "dlopen_interceptor_find_loaded_unknown_callable") <
+            find_function.find("dlsym(RTLD_DEFAULT, symbol)"),
+            "startup lookup must resolve STT_NOTYPE from ELF metadata and "
+            "short-circuit IFUNC before the ordinary loader fallback")
     require("listener_bootstrapping)->hook_id = (size_t)-1" in
             overhead_bootstrap,
             "overhead calibration must not submit detach-count requests for "

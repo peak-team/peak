@@ -77,6 +77,17 @@ dlopen_interceptor_pin_loaded_provider(gpointer address, void** handle_out)
     return TRUE;
 }
 
+gpointer
+dlopen_interceptor_find_loaded_unknown_callable(const char* symbol_name,
+                                                gboolean* ifunc_found_out)
+{
+    (void)symbol_name;
+    if (ifunc_found_out != NULL) {
+        *ifunc_found_out = FALSE;
+    }
+    return NULL;
+}
+
 void
 dlopen_interceptor_commit_pinned_provider(void* handle)
 {

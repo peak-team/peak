@@ -17,11 +17,21 @@ gboolean dlopen_interceptor_dynamic_attach_prepare_is_retryable(
 /*
  * Once the controller and dlopen admission are live, synchronously scan
  * matching providers that were already loaded during earlier constructors.
- * This uses the same exact per-request handshake as a runtime dlopen, so
- * provider-local IFUNC/STT_NOTYPE lookup remains on the original loader
- * caller.
+ * This uses the same exact per-request handshake as a runtime dlopen.
+ * STT_NOTYPE entries are obtained from inert ELF metadata; IFUNC resolution
+ * is deferred to the application's actual dlsym/dlvsym call.
  */
 gboolean dlopen_interceptor_rescan_loaded_modules(void);
+
+/*
+ * Resolve callable STT_NOTYPE symbols directly from loaded ELF metadata and
+ * report when the only matching unknown callable is STT_GNU_IFUNC. The latter
+ * must be deferred to the application's real dlsym/dlvsym lookup so PEAK does
+ * not execute an IFUNC resolver speculatively.
+ */
+gpointer dlopen_interceptor_find_loaded_unknown_callable(
+    const char* symbol_name,
+    gboolean* ifunc_found_out);
 
 /*
  * Pin the loaded provider containing address before publishing a startup Gum

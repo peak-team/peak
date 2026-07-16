@@ -32,6 +32,13 @@ DLOPEN_TEARDOWN_HOT_SRC := dlopen_teardown_hot.c
 DLOPEN_REPLACE_FAILURE_SRC := dlopen_replace_failure.c
 FORK_INFLIGHT_DLOPEN_SRC := fork_inflight_dlopen.c
 IFUNC_TARGET_SRC := ifunc_target.c
+STATEFUL_IFUNC_TARGET_SRC := stateful_ifunc_target.c
+STATEFUL_IFUNC_TEST_SRC := stateful_ifunc_test.c
+BLOCKING_IFUNC_TARGET_SRC := blocking_ifunc_target.c
+BLOCKING_IFUNC_TEST_SRC := blocking_ifunc_test.c
+VERSIONED_IFUNC_TARGET_SRC := versioned_ifunc_target.c
+VERSIONED_IFUNC_TEST_SRC := versioned_ifunc_test.c
+VERSIONED_IFUNC_MAP := versioned_ifunc.map
 EXTERNAL_IFUNC_IMPL_SRC := external_ifunc_impl.c
 EXTERNAL_IFUNC_TARGET_SRC := external_ifunc_target.c
 EXTERNAL_IFUNC_PROVIDER_TEST_SRC := ifunc_external_provider_retention_test.c
@@ -42,6 +49,8 @@ STARTUP_LOADER_SRC := startup_loader.c
 STARTUP_PROVIDER_TEST_SRC := startup_provider_retention_test.c
 STARTUP_LOCAL_CALLABLE_LOADER_SRC := startup_local_callable_loader.c
 STARTUP_LOCAL_CALLABLE_TEST_SRC := startup_local_callable_test.c
+FORK_CONSTRUCTOR_TARGET_SRC := fork_constructor_target.c
+FORK_CONSTRUCTOR_TEST_SRC := fork_constructor_test.c
 LAZY_UNRESOLVED_SRC := lazy_unresolved.c
 LAZY_UNRESOLVED_O := lazy_unresolved.pic.o
 NOTYPE_EXECUTABLE_O := notype_target.exec.o
@@ -55,9 +64,9 @@ ELF_LIFECYCLE_FIXTURES :=
 ifeq ($(UNAME_S),Linux)
 DL_LIBS := -ldl
 ELF_LAZY_FIXTURES := libLazyUnresolved.so
-ELF_LIFECYCLE_FIXTURES := libStartupUnloadableTarget.so libStartupLoader.so startup_provider_retention_test
+ELF_LIFECYCLE_FIXTURES := libStartupUnloadableTarget.so libStartupLoader.so startup_provider_retention_test libForkConstructorTarget.so fork_constructor_test
 ifneq ($(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)),)
-ELF_CALLABLE_FIXTURES := libIfuncTarget.so libExternalIfuncImpl.so libExternalIfuncTarget.so ifunc_external_provider_retention_test libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test libStartupLocalCallableLoader.so startup_local_callable_test
+ELF_CALLABLE_FIXTURES := libIfuncTarget.so libStatefulIfuncTarget.so stateful_ifunc_test libBlockingIfuncTarget.so blocking_ifunc_test libVersionedIfuncTarget.so versioned_ifunc_test libExternalIfuncImpl.so libExternalIfuncTarget.so ifunc_external_provider_retention_test libNotypeTarget.so libNestedIfuncOuter.so libResolverNestedIfunc.so notype_executable_test startup_resolver_nested_ifunc_test libStartupLocalCallableLoader.so startup_local_callable_test
 endif
 endif
 
@@ -194,6 +203,24 @@ libResolverNestedIfunc.so: $(RESOLVER_NESTED_IFUNC_SRC) libB.so
 libIfuncTarget.so: $(IFUNC_TARGET_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libIfuncTarget.so
 
+libStatefulIfuncTarget.so: $(STATEFUL_IFUNC_TARGET_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libStatefulIfuncTarget.so
+
+stateful_ifunc_test: $(STATEFUL_IFUNC_TEST_SRC) libStatefulIfuncTarget.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS)
+
+libBlockingIfuncTarget.so: $(BLOCKING_IFUNC_TARGET_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-s -Wl,-soname,libBlockingIfuncTarget.so
+
+blocking_ifunc_test: $(BLOCKING_IFUNC_TEST_SRC) libBlockingIfuncTarget.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS)
+
+libVersionedIfuncTarget.so: $(VERSIONED_IFUNC_TARGET_SRC) $(VERSIONED_IFUNC_MAP)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $(VERSIONED_IFUNC_TARGET_SRC) -Wl,--version-script=$(VERSIONED_IFUNC_MAP) -Wl,-s -Wl,-soname,libVersionedIfuncTarget.so
+
+versioned_ifunc_test: $(VERSIONED_IFUNC_TEST_SRC) libVersionedIfuncTarget.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS)
+
 libExternalIfuncImpl.so: $(EXTERNAL_IFUNC_IMPL_SRC)
 	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-soname,libExternalIfuncImpl.so
 
@@ -229,6 +256,12 @@ libStartupLocalCallableLoader.so: $(STARTUP_LOCAL_CALLABLE_LOADER_SRC) libIfuncT
 
 startup_local_callable_test: $(STARTUP_LOCAL_CALLABLE_TEST_SRC) libStartupLocalCallableLoader.so
 	$(CC) -O2 -Wall -Wextra -o $@ $< -L. -lStartupLocalCallableLoader $(DL_LIBS) $(RPATH)
+
+libForkConstructorTarget.so: $(FORK_CONSTRUCTOR_TARGET_SRC)
+	$(CC) $(CFLAGS) $(LDSO) -o $@ $< -Wl,-soname,libForkConstructorTarget.so
+
+fork_constructor_test: $(FORK_CONSTRUCTOR_TEST_SRC) libForkConstructorTarget.so
+	$(CC) -O2 -Wall -Wextra -o $@ $< $(DL_LIBS)
 
 $(LAZY_UNRESOLVED_O): $(LAZY_UNRESOLVED_SRC)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -271,4 +304,4 @@ use_staA_staB: customCpackage_staA_staB$(PY_EXT_SUFFIX)
 # Cleanup
 # --------------------------------------------------------------------
 clean:
-	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test dlopen_mutation_fairness_test dlopen_teardown_hot_test dlopen_replace_failure_test fork_inflight_dlopen_test ifunc_external_provider_retention_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so
+	rm -f *.o *.so *.a main_* dlopen_flags_test concurrent_dlopen_test dlopen_mutation_guard_test dlopen_mutation_fairness_test dlopen_teardown_hot_test dlopen_replace_failure_test fork_inflight_dlopen_test fork_constructor_test stateful_ifunc_test blocking_ifunc_test versioned_ifunc_test ifunc_external_provider_retention_test notype_executable_test startup_resolver_nested_ifunc_test startup_provider_retention_test startup_local_callable_test customCpackage*.so

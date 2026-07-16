@@ -19,11 +19,13 @@ EXACT_ATTACH_BACKEND_RE = re.compile(
 
 EXPECTED = {
     ("dlopen-controller", "src/dlopen_interceptor.c"): {
-        "begin_transaction": 3,
-        "end_transaction": 3,
+        "attach": 2,
+        "begin_transaction": 5,
+        "detach": 3,
+        "end_transaction": 5,
         "flush": 2,
         "replace_fast": 1,
-        "revert": 2,
+        "revert": 3,
     },
     ("support-init", "src/malloc_interceptor.c"): {
         "begin_transaction": 1,

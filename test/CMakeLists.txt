@@ -1433,7 +1433,7 @@ if(BUILD_TESTING)
         set_tests_properties(test_fftw_runtime_dlopen_first_call
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "fftw_execute[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_plan_dft_1d[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_destroy_plan[*]*\\|[ \t]+[1-9][0-9]*\\|.*fftw_malloc[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|.*fftw_free[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|"
+                PASS_REGULAR_EXPRESSION "fftw_execute[*]*\\|[ \t]+1\\|.*fftw_plan_dft_1d[*]*\\|[ \t]+1\\|.*fftw_destroy_plan[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|.*fftw_free[*]*\\|[ \t]+([2-9]|[1-9][0-9]+)\\|"
                 TIMEOUT 30
         )
     endif()

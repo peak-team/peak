@@ -67,6 +67,13 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/nested_ifunc_outer.c
           ${DL_SRC_DIR}/resolver_nested_ifunc.c
           ${DL_SRC_DIR}/ifunc_target.c
+          ${DL_SRC_DIR}/stateful_ifunc_target.c
+          ${DL_SRC_DIR}/stateful_ifunc_test.c
+          ${DL_SRC_DIR}/blocking_ifunc_target.c
+          ${DL_SRC_DIR}/blocking_ifunc_test.c
+          ${DL_SRC_DIR}/versioned_ifunc_target.c
+          ${DL_SRC_DIR}/versioned_ifunc_test.c
+          ${DL_SRC_DIR}/versioned_ifunc.map
           ${DL_SRC_DIR}/external_ifunc_impl.c
           ${DL_SRC_DIR}/external_ifunc_target.c
           ${DL_SRC_DIR}/ifunc_external_provider_retention_test.c
@@ -78,6 +85,8 @@ add_custom_target(dynamic_lib_build ALL
           ${DL_SRC_DIR}/startup_provider_retention_test.c
           ${DL_SRC_DIR}/startup_local_callable_loader.c
           ${DL_SRC_DIR}/startup_local_callable_test.c
+          ${DL_SRC_DIR}/fork_constructor_target.c
+          ${DL_SRC_DIR}/fork_constructor_test.c
           ${DL_SRC_DIR}/lazy_unresolved.c
           ${DL_SRC_DIR}/multiple_providers.py
           ${DL_SRC_DIR}/fork_child_dlopen.py
@@ -139,6 +148,39 @@ set_tests_properties(test_dynamic_dlopen_ifunc_first_call
     PASS_REGULAR_EXPRESSION "peak_ifunc_target[*]*\\|[ \t]+1\\|"
 )
 
+add_test(NAME test_dynamic_stateful_ifunc_uses_application_lookup
+  COMMAND ${DL_DIR}/stateful_ifunc_test
+)
+set_tests_properties(test_dynamic_stateful_ifunc_uses_application_lookup
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_stateful_ifunc;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_stateful_ifunc_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "stateful_ifunc_exact_lookup_ok.*peak_stateful_ifunc[*]*\\|[ \t]+1\\|"
+    TIMEOUT 10
+)
+
+add_test(NAME test_dynamic_blocking_ifunc_does_not_block_dlopen
+  COMMAND ${DL_DIR}/blocking_ifunc_test
+)
+set_tests_properties(test_dynamic_blocking_ifunc_does_not_block_dlopen
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_blocking_ifunc;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_blocking_ifunc_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "blocking_ifunc_after_dlopen_ok.*peak_blocking_ifunc[*]*\\|[ \t]+1\\|"
+    TIMEOUT 10
+)
+
+add_test(NAME test_dynamic_versioned_ifunc_dlvsym_first_call
+  COMMAND ${DL_DIR}/versioned_ifunc_test
+)
+set_tests_properties(test_dynamic_versioned_ifunc_dlvsym_first_call
+  PROPERTIES
+    WORKING_DIRECTORY ${DL_DIR}
+    ENVIRONMENT "PEAK_TARGET=peak_versioned_ifunc;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_versioned_ifunc_statslog;${PRELOAD_VAR}"
+    PASS_REGULAR_EXPRESSION "versioned_ifunc_dlvsym_ok.*peak_versioned_ifunc[*]*\\|[ \t]+1\\|"
+    TIMEOUT 10
+)
+
 add_test(NAME test_dynamic_nested_ifunc_constructor_first_call
   COMMAND ${Python3_EXECUTABLE} -c
           "import ctypes; ctypes.CDLL('./libNestedIfuncOuter.so')"
@@ -146,7 +188,7 @@ add_test(NAME test_dynamic_nested_ifunc_constructor_first_call
 
 add_test(NAME test_dynamic_resolver_nested_dlopen_first_call
   COMMAND ${Python3_EXECUTABLE} -c
-          "import ctypes; ctypes.CDLL('./libResolverNestedIfunc.so')"
+          "import ctypes; lib = ctypes.CDLL('./libResolverNestedIfunc.so'); lib.peak_resolver_nested_ifunc()"
 )
 set_tests_properties(test_dynamic_resolver_nested_dlopen_first_call
   PROPERTIES
@@ -202,7 +244,8 @@ set_tests_properties(test_startup_rtld_local_callable_rescan
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
     ENVIRONMENT "PEAK_TARGET=peak_ifunc_target,peak_notype_target;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_local_callable_statslog;${PRELOAD_VAR}"
-    PASS_REGULAR_EXPRESSION "startup_local_callable_ok.*peak_ifunc_target[*]*\\|[ \t]+1\\|.*peak_notype_target[*]*\\|[ \t]+1\\|"
+    PASS_REGULAR_EXPRESSION "deferring IFUNC target peak_ifunc_target.*pointers resolved before PEAK initialization cannot be recovered.*startup_local_callable_ok.*peak_notype_target[*]*\\|[ \t]+1\\|"
+    FAIL_REGULAR_EXPRESSION "peak_ifunc_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
     TIMEOUT 30
 )
 endif()
@@ -348,6 +391,19 @@ add_test(NAME test_dynamic_fork_child_dlopen_warns_unsupported
 add_test(NAME test_dynamic_fork_inflight_dlopen_no_deadlock
   COMMAND ${DL_DIR}/fork_inflight_dlopen_test
 )
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_test(NAME test_dynamic_fork_inside_dlopen_constructor_no_deadlock
+    COMMAND ${DL_DIR}/fork_constructor_test
+  )
+  set_tests_properties(test_dynamic_fork_inside_dlopen_constructor_no_deadlock
+    PROPERTIES
+      WORKING_DIRECTORY ${DL_DIR}
+      ENVIRONMENT "PEAK_TARGET=peak_fork_constructor_target;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_dynamic_fork_constructor_statslog;${PRELOAD_VAR}"
+      PASS_REGULAR_EXPRESSION "fork child dynamic dlopen profiling is unsupported until exec.*fork_constructor_child_returned.*fork_constructor_parent_ok"
+      TIMEOUT 10
+  )
+endif()
 set_tests_properties(test_dynamic_fork_inflight_dlopen_no_deadlock
   PROPERTIES
     WORKING_DIRECTORY ${DL_DIR}
@@ -431,7 +487,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     PROPERTIES
       WORKING_DIRECTORY ${DL_DIR}
       ENVIRONMENT "PEAK_TARGET=peak_ifunc_target,peak_notype_target;PEAK_TEST_STARTUP_RESCAN_FAIL_FIRST=1;${HEARTBEAT_OFF_ENV};PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_startup_rescan_failure_isolated_statslog;${PRELOAD_VAR}"
-      PASS_REGULAR_EXPRESSION "test forcing first startup provider rescan failure.*startup_local_callable_ok.*(peak_ifunc_target|peak_notype_target)[*]*\\|[ \t]+1\\|"
+      PASS_REGULAR_EXPRESSION "test forcing first startup provider rescan failure.*startup_local_callable_ok.*peak_notype_target[*]*\\|[ \t]+1\\|"
+      FAIL_REGULAR_EXPRESSION "peak_ifunc_target[*]*\\|[ \t]+[1-9][0-9]*\\|"
       TIMEOUT 30
   )
 endif()

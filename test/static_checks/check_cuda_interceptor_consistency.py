@@ -139,11 +139,16 @@ def main():
     generic_lookup = function_body(general,
                                    "peak_general_listener_find_function")
     gum_lookup = generic_lookup.find("gum_find_function(symbol)")
+    unknown_callable_lookup = generic_lookup.find(
+        "dlopen_interceptor_find_loaded_unknown_callable")
     loader_fallback = generic_lookup.find("dlsym(RTLD_DEFAULT, symbol)")
-    require(gum_lookup != -1 and loader_fallback != -1 and
-            gum_lookup < loader_fallback and general.count("dlsym(") == 1,
-            "generic target lookup must remain Gum-first with one exact "
-            "loader fallback for callable symbols Gum omits")
+    require(gum_lookup != -1 and unknown_callable_lookup != -1 and
+            loader_fallback != -1 and
+            gum_lookup < unknown_callable_lookup < loader_fallback and
+            generic_lookup.count("dlsym(RTLD_DEFAULT, symbol)") == 1,
+            "generic target lookup must remain Gum-first, classify unknown "
+            "ELF callables without executing IFUNC resolvers, and retain one "
+            "exact loader fallback for ordinary symbols Gum omits")
     require("gum_module_find_global_export_by_name" not in generic_lookup,
             "generic target lookup must not switch MPI ranks to export-only resolution")
     for relpath, symbols in support_sources.items():
