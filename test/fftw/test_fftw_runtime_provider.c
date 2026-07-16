@@ -17,3 +17,9 @@ void fftw_free(void* pointer)
     free(pointer);
     provider_call_count++;
 }
+
+__attribute__((visibility("default"), noinline))
+void peak_runtime_non_fftw_target(void)
+{
+    provider_call_count++;
+}

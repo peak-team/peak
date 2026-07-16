@@ -1323,6 +1323,53 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
                 TIMEOUT 30
         )
+
+        add_test(NAME test_fftw_runtime_mixed_scope
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    mixed
+        )
+        set_tests_properties(test_fftw_runtime_mixed_scope
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_runtime_non_fftw_target;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                FAIL_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_sync_timeout_fallback
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    retry
+        )
+        set_tests_properties(test_fftw_runtime_sync_timeout_fallback
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_runtime_non_fftw_target;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                FAIL_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_selected_targets_fast_path
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    fast
+        )
+        set_tests_properties(test_fftw_runtime_selected_targets_fast_path
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=fftw_malloc,fftw_free;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_dlopen_fork_child_pid_guard
+            COMMAND $<TARGET_FILE:test_dlopen_fork_child_pid_guard>)
+        set_tests_properties(test_dlopen_fork_child_pid_guard
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "dlopen_fork_child_pid_guard_ok"
+                TIMEOUT 15
+        )
     endif()
     
     if(MPI_FOUND)

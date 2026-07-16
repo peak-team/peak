@@ -92,6 +92,12 @@ PEAK_DLOPEN_API void dlopen_interceptor_get_dynamic_attach_diagnostics(
 #ifdef PEAK_ENABLE_TEST_HOOKS
 PEAK_DLOPEN_API void dlopen_interceptor_test_reset_dynamic_attach(gboolean open);
 PEAK_DLOPEN_API void dlopen_interceptor_test_set_manual_drain(gboolean enabled);
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_force_sync_prepare_timeout_once(void);
+PEAK_DLOPEN_API unsigned long long
+dlopen_interceptor_test_sync_scan_count(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_callback_is_admitted(void);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
     const char* filename);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_retry_dynamic_attach(

@@ -761,9 +761,10 @@ real dlopen:
     execute with the application's original caller and flags
 
 listener on-leave:
-    resolve unresolved FFTW targets through the returned handle
+    classify unresolved targets using exact built-in FFTW group membership
+    resolve only unresolved FFTW targets through the returned handle
     attach resolved targets through the existing guarded controller path
-    enqueue the existing asynchronous fallback for other unresolved targets
+    enqueue at most one canonical asynchronous request when fallback is needed
     return the real handle unchanged
 
 controller:
@@ -776,17 +777,35 @@ For FFTW, the listener performs the guarded attach before the real `dlopen`
 returns, so the normal immediate-first-call path is profiled. Resolution uses
 the loader's ordinary handle-scoped `dlsym` behavior, which naturally searches
 the root module's dependency closure in loader order; PEAK does not implement a
-second dependency graph or provider-selection protocol. Symbol resolution never
-holds the general-listener mutex, avoiding a loader-lock/listener-lock inversion
-between an on-leave callback and the asynchronous controller. A temporarily
-unsafe mutation is queued for the existing asynchronous best-effort path, so
-that exceptional call may precede attachment; the application thread does not
-wait on a condition variable, retry loop, or PEAK-specific timeout. Calls made
-from DSO constructors before `dlopen` reaches its on-leave callback, `dlmopen`
-namespaces, and exact IFUNC resolver/wrapper boundaries are not part of this
-contract. A multithreaded `fork()` child must `exec` before making instrumented
-calls; PEAK does not rebuild the complete profiling runtime for
-fork-without-exec children.
+second dependency graph or provider-selection protocol. The synchronous scope
+is an immutable per-target bit derived from exact membership in PEAK's built-in
+FFTW list; a similarly prefixed user target is not included, and mixed
+non-FFTW `PEAK_TARGET`/`PEAK_TARGET_FILE` entries remain on the asynchronous
+path. Symbol resolution never holds the general-listener mutex, avoiding a
+loader-lock/listener-lock inversion between an on-leave callback and the
+asynchronous controller.
+
+PEAK prefers the loader-reported module identity from the successful returned
+handle, falling back to the caller's filename if that identity is unavailable,
+and uses the result for both synchronous retention and any queued fallback. A
+successful synchronous FFTW attach does not enqueue the same FFTW work again.
+If guarded mutation must be retried, the same canonical request is queued once;
+mixed non-FFTW work is folded into that retry instead of creating a second
+request. Internal loader and symbol lookups clear their own `dlerror` state
+before the successful application `dlopen` returns.
+
+A temporarily unsafe mutation is queued for the existing asynchronous
+best-effort path, so that exceptional call may precede attachment; the
+application thread does not wait on a condition variable, retry loop, or
+PEAK-specific timeout. Calls made from DSO constructors before `dlopen` reaches
+its on-leave callback, `dlmopen` namespaces, and exact IFUNC resolver/wrapper
+boundaries are not part of this contract. A multithreaded `fork()` child must
+still `exec` before using the profiling runtime. When Gum dispatches a fresh
+child `dlopen` callback, a PID guard makes it bypass PEAK before touching
+PEAK-owned mutexes or allocation. It does not make the loader or Gum generally
+fork-safe, rebuild the runtime, or promise profiling in a fork-without-exec
+child. Forking from inside an already-entered `dlopen` callback remains outside
+the supported contract.
 
 Both paths retain a `RTLD_NOLOAD` handle using the application's original
 binding mode for any module that receives PEAK hooks. The retained root handle
@@ -876,17 +895,23 @@ that PLT entry because neither IP register appears free. PEAK uses Gum's public
 forced-relocation option only for this exact shape; the first relocated PLT
 instruction defines `x16`, so the trampoline scratch value is not consumed by
 the original sequence. Initial attach, runtime attach, and reattach all select
-the same option. Other Arm64 targets retain Gum's default relocation policy.
+the same option. Both the exported branch and computed PLT destination are read
+with Gum's safe memory API and integer overflow checks; an unreadable, partially
+unreadable cross-page, or malformed destination keeps the default relocation policy.
+Other Arm64 targets retain Gum's default relocation policy. This exception
+provides first-call visibility, but does not claim that every Arm64 loader thunk
+is attributed at the exact four-byte exported-wrapper boundary.
 
-Some PEAK-owned support replacements may use a separate stricter
-support-prologue guard when skipping that support hook does not remove core
-profiling coverage. The `close` support hook uses this path to avoid relocating
-early-return x86 libc wrapper prologues during shutdown-sensitive runs. The
-support guard intentionally scans a conservative 32-byte x86 prefix and fails
-closed if that small decoder cannot prove the prefix is free of early-return
-control flow. The top-level `dlopen` listener and dynamic `dlopen` user
-targets remain governed by the default or `conservative` user-target policy so
-dynamic attach is not disabled by support-only early-return checks.
+PEAK's optional `close` support replacement is skipped on Linux x86 when Gum's
+symbol ranges show `close` and `__close_nocancel` overlapping in either
+direction, or when the alternate entry lies inside Gum 17.15.3's maximum
+16-byte x86 entry redirect. Such layouts exist on older glibc: a normal short
+redirect may happen not to reach the alternate entry, while Gum's wider fallback
+redirect could overwrite it. The startup-only check therefore preserves
+application correctness by leaving stderr protection disabled on that layout.
+It adds no `close` invocation cost and does not affect user-target attachment.
+The top-level `dlopen` listener and dynamic `dlopen` user targets remain governed
+by the default or `conservative` user-target policy.
 
 `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1` is a diagnostic override, not a safety mode.
 

@@ -2,6 +2,12 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#if defined(__aarch64__) && defined(__linux__)
+#include <errno.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int
 expect_policy(const char* name,
@@ -227,6 +233,70 @@ main(void)
         0x20, 0x40, 0x04, 0x91,       /* add x0, x1, #0x110 */
         0xc0, 0x03, 0x5f, 0xd6
     };
+#if defined(__linux__)
+    static const guint32 branch_to_canonical_plt[] = {
+        UINT32_C(0x14000001),          /* b +4 */
+        UINT32_C(0x90000010),          /* adrp x16, ... */
+        UINT32_C(0xf9400211),          /* ldr x17, [x16] */
+        UINT32_C(0x91000210),          /* add x16, x16, #0 */
+        UINT32_C(0xd61f0220)           /* br x17 */
+    };
+    GumAttachOptions attach_options;
+    long page_size;
+    guint8* pages;
+    guint32 cross_page_branch = UINT32_C(0x14000001);
+
+    gum_init_embedded();
+    peak_gum_target_attach_options((gpointer)branch_to_canonical_plt,
+                                   &attach_options);
+    if (attach_options.instrumentation.relocation_policy !=
+        GUM_RELOCATION_FORCED) {
+        fprintf(stderr, "canonical Arm64 PLT branch did not select forced relocation\n");
+        gum_deinit_embedded();
+        return 1;
+    }
+
+    page_size = sysconf(_SC_PAGESIZE);
+    pages = page_size > 0
+        ? mmap(NULL,
+               (size_t)page_size * 2,
+               PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS,
+               -1,
+               0)
+        : MAP_FAILED;
+    if (pages == MAP_FAILED) {
+        perror("mmap Arm64 unreadable-target test");
+        gum_deinit_embedded();
+        return 1;
+    }
+    memcpy(pages + page_size - sizeof(cross_page_branch),
+           &cross_page_branch,
+           sizeof(cross_page_branch));
+    if (mprotect(pages + page_size, (size_t)page_size, PROT_NONE) != 0) {
+        perror("mprotect Arm64 unreadable-target test");
+        munmap(pages, (size_t)page_size * 2);
+        gum_deinit_embedded();
+        return 1;
+    }
+    errno = EDOM;
+    peak_gum_target_attach_options(
+        pages + page_size - sizeof(cross_page_branch),
+        &attach_options);
+    if (attach_options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_DEFAULT || errno != EDOM) {
+        fprintf(stderr,
+                "unreadable Arm64 branch target did not fail safe or changed errno\n");
+        mprotect(pages + page_size, (size_t)page_size,
+                 PROT_READ | PROT_WRITE);
+        munmap(pages, (size_t)page_size * 2);
+        gum_deinit_embedded();
+        return 1;
+    }
+    mprotect(pages + page_size, (size_t)page_size,
+             PROT_READ | PROT_WRITE);
+    munmap(pages, (size_t)page_size * 2);
+#endif
 
     if (expect_policy("arm64-x16-default", x16_only,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, FALSE) ||
@@ -238,8 +308,14 @@ main(void)
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, TRUE) ||
         expect_policy("arm64-add-imm-ip-bits-conservative", add_imm_ip_bits,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE, FALSE)) {
+#if defined(__linux__)
+        gum_deinit_embedded();
+#endif
         return 1;
     }
+#if defined(__linux__)
+    gum_deinit_embedded();
+#endif
 #endif
 
     printf("unsafe_gum_prologue_policy_unit_ok\n");
