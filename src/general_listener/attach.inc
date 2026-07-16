@@ -279,7 +279,7 @@ void peak_general_listener_attach()
                 peak_general_listener_find_function("peak_cu_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
-            peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen wrapper used for dynamic attach\n");
+            peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen listener used for dynamic attach\n");
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
