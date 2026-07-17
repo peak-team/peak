@@ -226,8 +226,8 @@ See [Physical detach controller](docs/physical-detach-controller.md) and
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_DLOPEN_DEBUG` | Enable dynamic-load queue diagnostics on stderr. |
-| `PEAK_DLOPEN_TRACE_PATH` | Optional CSV path for dynamic-load queue diagnostics. |
+| `PEAK_DLOPEN_DEBUG` | Enable cumulative dynamic-load diagnostics at shutdown/release/timeout lifecycle points; stderr output also requires `PEAK_VERBOSITY=debug`. |
+| `PEAK_DLOPEN_TRACE_PATH` | Optional CSV path for those dynamic-load lifecycle snapshots. |
 | `PEAK_JIT_ENABLE` | Enable JIT metadata providers; matching `PEAK_TARGET` names are still required. |
 | `PEAK_JIT_PROVIDER` | Comma-separated providers. The current provider is `perfmap` / `perf-map`. |
 | `PEAK_JIT_MAP_PATH` | Override the Linux `/tmp/perf-<pid>.map` path. |
@@ -237,6 +237,10 @@ See [Physical detach controller](docs/physical-detach-controller.md) and
 
 See [JIT profiling](docs/jit-profiling.md) for provider guarantees and code
 lifetime requirements.
+
+See [Runtime `dlopen` profiling](docs/dlopen-profiling.md) for dynamic target
+discovery, FFTW first-call behavior, exact exported-entry attribution, queue
+semantics, module lifetime, and supported boundaries.
 
 ### GPU and Memory
 
@@ -279,7 +283,9 @@ toolchains and host capabilities detected during configuration.
 - [Exec-chain profiling](docs/exec-chain.md): child-environment behavior,
   supported exec and spawn APIs, and fork safety limits.
 - [Physical detach controller](docs/physical-detach-controller.md): strict
-  transition safety, MPI output, dynamic loading, and shutdown behavior.
+  transition safety, MPI output, and shutdown behavior.
+- [Runtime `dlopen` profiling](docs/dlopen-profiling.md): synchronous FFTW
+  first-call attachment, asynchronous dynamic targets, and module lifetime.
 - [JIT profiling](docs/jit-profiling.md): provider guarantees, retry behavior,
   and metadata lifetime limits.
 - [Patched Frida Gum](docs/patched-frida-gum.md): PEAK-specific Gum APIs and
