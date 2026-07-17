@@ -763,7 +763,7 @@ real dlopen:
     execute with the application's original caller and flags
 
 listener on-leave:
-    classify unresolved targets using exact built-in FFTW group membership
+    read atomic unresolved-target hints without the controller lock
     resolve only unresolved FFTW targets through the returned handle
     attach distinct resolved addresses in bounded strict ATTACH batches
     enqueue at most one canonical asynchronous request when fallback is needed
@@ -786,7 +786,8 @@ FFTW list; a similarly prefixed user target is not included, and mixed
 non-FFTW `PEAK_TARGET`/`PEAK_TARGET_FILE` entries remain on the asynchronous
 path. Symbol resolution never holds the general-listener mutex, avoiding a
 loader-lock/listener-lock inversion between an on-leave callback and the
-asynchronous controller.
+asynchronous controller. Target classification in the on-leave path reads two
+atomic hints and does not take the controller lock or scan the target array.
 
 Before computing a module identity or taking an `RTLD_NOLOAD` reference, PEAK
 probes a fixed set of public FFTW ABI anchors on the application's returned
@@ -800,12 +801,13 @@ filename argument only until the intercepted call returns, so this fast path
 does not allocate merely to copy a still-live call argument.
 
 After a primary module has published at least one new listener, PEAK retains
-that module's loader handle. If the completed scan also leaves none of that
-module's resolved targets pending, later `dlopen` calls returning the same
-pinned primary module skip the full target scan. The cache uses the primary
-loader module, not a shared FFTW anchor address: an MPI or threads extension
-that resolves an anchor through its core dependency is therefore still scanned
-as a distinct module. Retryable and partial scans are never cached.
+that module's loader handle. A complete scan with no retryable controller
+outcome is cached even if one of that provider's symbols has a terminal Gum
+signature failure, so reopening the same pinned primary module does not repeat
+the scan. That failure is not marked globally resolved: a later MPI or threads
+extension may export a different implementation and is still scanned as a
+distinct module. The cache uses the primary loader module, not a shared FFTW
+anchor address. Retryable and partial scans are never cached.
 
 PEAK prefers the loader-reported module identity from the successful returned
 handle, falling back to the caller's filename if that identity is unavailable,
@@ -851,10 +853,12 @@ drops, failed requeue drops, partial successes, retained handles, and max queue
 depth, plus the current queue length, fixed queue capacity, and drain budget.
 Each dynamic attach drain snapshots the queue length at the start of the
 controller cycle and drains at most that snapshot size and at most the fixed
-budget. Retryable dynamic attach requests are requeued for a later controller
-cycle, so one temporarily unsafe library cannot consume the entire same-cycle
-budget by being reprocessed repeatedly. Dynamic attach prepare retries are
-limited to transient `TIMEOUT` and `CLASSIFY_FAILED` statuses. Generic `ERROR`
+budget. Retryable dynamic attach requests are requeued without self-waking the
+controller; the existing controller cadence or an independent event starts the
+later attempt. One temporarily unsafe library therefore cannot consume the
+entire same-cycle budget or create an immediate retry loop. Dynamic attach
+prepare retries are limited to transient `TIMEOUT` and `CLASSIFY_FAILED`
+statuses. Generic `ERROR`
 and `PERMISSION_DENIED` are terminal for queued dynamic attach work so fatal
 controller or persistent ptrace-policy failures cannot pin queue slots
 indefinitely.

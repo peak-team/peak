@@ -174,8 +174,28 @@ main(int argc, char** argv)
     }
 
     if (strcmp(mode, "mixed") == 0) {
+        PeakDlopenDynamicAttachDiagnostics post_drain_before;
+        PeakDlopenDynamicAttachDiagnostics post_drain_after;
+        void* second_handle;
+
         explicit_drain();
         non_fftw_target();
+        get_diagnostics(&post_drain_before);
+        second_handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
+        if (second_handle == NULL) {
+            fprintf(stderr, "post-drain dlopen failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        get_diagnostics(&post_drain_after);
+        if (post_drain_after.enqueued != post_drain_before.enqueued) {
+            fputs("resolved mixed targets kept the dlopen callback armed\n",
+                  stderr);
+            return EXIT_FAILURE;
+        }
+        if (dlclose(second_handle) != 0) {
+            fprintf(stderr, "post-drain dlclose failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
     } else if (strcmp(mode, "retry") == 0) {
         explicit_drain();
         non_fftw_target();
