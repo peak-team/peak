@@ -158,14 +158,17 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     unresolved_counts = extract_function(
         source, "dlopen_interceptor_unresolved_counts"
     )
-    resolved_mark = extract_function(
-        source, "dlopen_interceptor_mark_target_resolved_unlocked"
-    )
     completed_scan = extract_function(
         source, "dlopen_interceptor_fftw_module_scan_completed"
     )
     retain_handle = extract_function(
         source, "dlopen_interceptor_retain_dynamic_handle"
+    )
+    enqueue = extract_function(
+        source, "dlopen_interceptor_enqueue_dynamic_attach_request"
+    )
+    requeue = extract_function(
+        source, "dlopen_interceptor_requeue_dynamic_attach_request"
     )
 
     require("source_target_array_FFTW[i]" in membership and
@@ -191,9 +194,9 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "synchronous resolution must remain FFTW-only and preserve one retry scope")
     require(on_leave.count("dlopen_interceptor_enqueue_dynamic_attach_request(") == 1,
             "one dlopen callback must have only one asynchronous enqueue site")
-    require("if (dlopen_sync_fftw_enabled)" in on_leave and
-            "Preserve the original asynchronous non-FFTW fast path" in on_leave,
-            "non-FFTW-only dlopen callbacks must not gain a synchronous target scan")
+    require("unresolved = dlopen_interceptor_unresolved_counts();" in on_leave and
+            "if (dlopen_sync_fftw_enabled)" not in on_leave,
+            "all dlopen callbacks must use atomic unresolved hints without a target scan")
     require("dlopen_interceptor_module_identity" in on_leave and
             "PEAK_DLOPEN_SYNC_REQUEUED" not in on_leave,
             "on-leave must use canonical identity and let a successful requeue suppress duplicate work")
@@ -214,20 +217,22 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             '"fftw_create_plan"' not in provider_probe and
             "strstr(" not in provider_probe,
             "FFTW dlopen must use filename-independent ABI probes before module reopen and full scan")
-    maybe_load = unresolved_counts.find(
-        "atomic_load_explicit(&dlopen_may_have_unresolved_non_fftw"
-    )
-    early_return = unresolved_counts.find("return result;", maybe_load)
-    mixed_lock = unresolved_counts.find(
-        "peak_general_listener_controller_lock();"
-    )
     require(unresolved_counts.count("atomic_load_explicit(") == 2 and
-            maybe_load != -1 and early_return != -1 and mixed_lock != -1 and
-            maybe_load < early_return < mixed_lock and
-            "for (" in unresolved_counts and
-            "dlopen_unresolved_non_fftw_count" not in source and
-            "dlopen_unresolved_non_fftw_count" not in resolved_mark,
-            "pure FFTW callbacks must use the atomic fast path while mixed targets are classified from live listener state")
+            "peak_general_listener_controller_lock" not in unresolved_counts and
+            "for (" not in unresolved_counts and
+            attach.count("dlopen_interceptor_refresh_unresolved_non_fftw_unlocked()") == 1 and
+            "atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw" in attach,
+            "dlopen callbacks must read only atomic unresolved hints while controller work refreshes mixed-target state")
+    require("resolved_count > 1" in attach and
+            "max_batch_capacity > 1" in attach and
+            "resolved_count < max_batch_capacity" in attach,
+            "single-symbol attaches must stay scalar and batch workspaces must be capped by resolved targets")
+    require("peak_general_listener_controller_wake();" in enqueue and
+            "peak_general_listener_controller_wake();" in sync and
+            "peak_general_listener_controller_wake();" not in requeue and
+            "pthread_cond_signal" not in enqueue and
+            "pthread_cond_signal" not in requeue,
+            "new and first-fallback work must wake the controller while controller retry requeues must not self-wake")
 
     pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
     cancel_disable = on_enter.find("pthread_setcancelstate(PTHREAD_CANCEL_DISABLE")
@@ -279,7 +284,7 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require("dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN" in begin_callback_body and
             "atomic_load_explicit(&dlopen_listener_owner_pid" in begin_callback_body and
             "active_dlopen_callback_count++" in begin_callback_body,
-            "callback count admission must be revalidated under the gate mutex")
+            "callback count admission must revalidate owner and OPEN under the gate mutex")
     owner_close = detach.find(
         "atomic_store_explicit(&dlopen_listener_owner_pid"
     )

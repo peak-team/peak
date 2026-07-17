@@ -246,41 +246,32 @@ dlopen_interceptor_target_matches_scope_unlocked(
 static PeakDlopenUnresolvedCounts
 dlopen_interceptor_unresolved_counts(void)
 {
-    PeakDlopenUnresolvedCounts result = {
+    return (PeakDlopenUnresolvedCounts) {
         .fftw = atomic_load_explicit(&dlopen_unresolved_fftw_count,
                                      memory_order_relaxed),
-        .non_fftw = 0
+        .non_fftw = atomic_load_explicit(
+            &dlopen_may_have_unresolved_non_fftw,
+            memory_order_relaxed) ? 1 : 0
     };
+}
 
-    /* Pure FFTW configurations never take the general-listener lock here. */
-    if (!atomic_load_explicit(&dlopen_may_have_unresolved_non_fftw,
-                              memory_order_relaxed)) {
-        return result;
-    }
+static void
+dlopen_interceptor_refresh_unresolved_non_fftw_unlocked(void)
+{
+    gboolean unresolved_non_fftw = FALSE;
 
-    peak_general_listener_controller_lock();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (dlopen_interceptor_target_is_unresolved_unlocked(i) &&
             dlopen_interceptor_target_matches_scope_unlocked(
                 i,
                 PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY)) {
-            result.non_fftw = 1;
+            unresolved_non_fftw = TRUE;
             break;
         }
     }
-    peak_general_listener_controller_unlock();
-
-    if (result.non_fftw == 0) {
-        /*
-         * JIT-created targets have their own attach/retry path. Once the
-         * initial non-FFTW set is resolved, future dlopen callbacks need not
-         * keep rescanning it.
-         */
-        atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
-                              FALSE,
-                              memory_order_relaxed);
-    }
-    return result;
+    atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
+                          unresolved_non_fftw,
+                          memory_order_relaxed);
 }
 
 static void
@@ -887,7 +878,6 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
         if (dynamic_attach_queue_length > dynamic_attach_queue_max_depth) {
             dynamic_attach_queue_max_depth = dynamic_attach_queue_length;
         }
-        pthread_cond_signal(&dynamic_attach_gate_cond);
         request->handle = NULL;
         request->filename = NULL;
         requeued = TRUE;
@@ -896,9 +886,6 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
     }
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
-    if (requeued) {
-        peak_general_listener_controller_wake();
-    }
     return requeued;
 }
 
@@ -977,7 +964,6 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
     if (dynamic_attach_queue_length > dynamic_attach_queue_max_depth) {
         dynamic_attach_queue_max_depth = dynamic_attach_queue_length;
     }
-    pthread_cond_signal(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
     peak_general_listener_controller_wake();
@@ -1510,6 +1496,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
     size_t batch_capacity;
     size_t candidate_count = 0;
     size_t resolved_count = 0;
+    gboolean unresolved_non_fftw = FALSE;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (request->handle == PEAK_DLOPEN_TEST_RETRY_HANDLE) {
@@ -1539,14 +1526,24 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         return PEAK_DLOPEN_ATTACH_DONE;
     }
     for (size_t i = 0; i < target_count; i++) {
-        if (dlopen_interceptor_target_is_unresolved_unlocked(i) &&
-            dlopen_interceptor_target_matches_scope_unlocked(
+        if (!dlopen_interceptor_target_is_unresolved_unlocked(i)) {
+            continue;
+        }
+        if (dlopen_interceptor_target_matches_scope_unlocked(
+                i,
+                PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY)) {
+            unresolved_non_fftw = TRUE;
+        }
+        if (dlopen_interceptor_target_matches_scope_unlocked(
                 i,
                 request->scope)) {
             resolved_targets[i].name = peak_hook_strings[i];
             needs_resolution = TRUE;
         }
     }
+    atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
+                          unresolved_non_fftw,
+                          memory_order_relaxed);
     peak_general_listener_controller_unlock();
 
     if (!needs_resolution) {
@@ -1595,13 +1592,18 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         return PEAK_DLOPEN_ATTACH_DONE;
     }
 
-    use_batch = peak_detach_controller_strict_batch_supported();
-    batch_capacity = use_batch
-        ? peak_detach_controller_max_batch_requests()
-        : 1;
-    if (batch_capacity == 0) {
-        batch_capacity = 1;
-        use_batch = FALSE;
+    use_batch = FALSE;
+    batch_capacity = 1;
+    if (resolved_count > 1 &&
+        peak_detach_controller_strict_batch_supported()) {
+        size_t max_batch_capacity =
+            peak_detach_controller_max_batch_requests();
+        if (max_batch_capacity > 1) {
+            use_batch = TRUE;
+            batch_capacity = resolved_count < max_batch_capacity
+                ? resolved_count
+                : max_batch_capacity;
+        }
     }
     attach_candidates =
         g_try_new0(PeakDlopenAttachCandidate, batch_capacity);
@@ -1736,6 +1738,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
          */
         completed_fftw_scan = TRUE;
     }
+    dlopen_interceptor_refresh_unresolved_non_fftw_unlocked();
     peak_general_listener_controller_unlock();
     gum_interceptor_unignore_current_thread(target_interceptor);
     g_free(attach_statuses);
@@ -1814,6 +1817,7 @@ dlopen_interceptor_attach_fftw_before_return(const char* module_identity,
     if (result == PEAK_DLOPEN_ATTACH_RETRY) {
         request.scope = retry_scope;
         if (dlopen_interceptor_requeue_dynamic_attach_request(&request)) {
+            peak_general_listener_controller_wake();
             return PEAK_DLOPEN_SYNC_REQUEUED;
         }
     }
@@ -2038,12 +2042,7 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
         gboolean enqueue_failed = FALSE;
         char* module_identity = NULL;
 
-        if (dlopen_sync_fftw_enabled) {
-            unresolved = dlopen_interceptor_unresolved_counts();
-        } else {
-            /* Preserve the original asynchronous non-FFTW fast path. */
-            unresolved.non_fftw = 1;
-        }
+        unresolved = dlopen_interceptor_unresolved_counts();
         if (unresolved.fftw > 0) {
             gum_interceptor_ignore_current_thread(dlopen_interceptor);
             gboolean may_resolve_fftw =
