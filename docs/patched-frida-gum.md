@@ -72,7 +72,9 @@ Selecting `patched-devkit` fails configuration unless the selected headers and
 `libfrida-gum.a` expose a linkable PEAK PC-classification API. On Linux x86_64,
 the devkit must also expose the exact-entry attach API shown below; otherwise
 Gum can follow an exported tail jump and attribute wrapper calls to the
-downstream implementation.
+downstream implementation. See
+[Runtime `dlopen` profiling](dlopen-profiling.md#exact-exported-entry-attribution)
+for the profiling-level contract.
 
 ```c
 #define GUM_PEAK_PC_API_VERSION 1
@@ -139,8 +141,10 @@ the PEAK API.
 ## Runtime Behavior
 
 PEAK wires the selected Gum provider into runtime capability checks. Strict
-mode is the default, so PEAK refuses target Gum mutation if the selected Gum
-headers do not expose the PEAK API.
+mode is the default, so PEAK refuses guarded target Gum mutation if the selected
+Gum headers do not expose the PEAK API. The only unguarded target mutation is
+the initial pre-controller attach when `/proc/self/task` confirms exactly one
+task; detach, reattach, runtime attach, and shutdown never use that exception.
 On Linux x86_64, requesting PEAK API validation also requires the exact-entry
 API and fails at configure time if it is absent. `PEAK_DETACH_BACKEND=helper`
 forces the external ptrace helper,

@@ -13,10 +13,11 @@ Gum-defined safe regions.
 
 ## Implemented Split
 
-PEAK now runs the strict physical-detach controller by default. It refuses
-target-function Gum attach, detach, reattach, and shutdown detach unless PEAK
-can use patched-Gum PC classification plus a strict stop backend. The default
-backend selection is `auto`: PEAK uses the external helper unless Linux
+PEAK now runs the strict physical-detach controller by default. After the
+controller starts, it refuses target-function Gum attach, detach, reattach, and
+shutdown detach unless PEAK can use patched-Gum PC classification plus a strict
+stop backend. The default backend selection is `auto`: PEAK uses the external
+helper unless Linux
 `ptrace_scope` is already known to block helper attachment, in which case it
 selects the signal backend up front. Auto also falls back to the signal backend
 when helper startup is unavailable or a structured helper STOP response reports
@@ -26,15 +27,18 @@ whether the helper already stopped target threads. `PEAK_SAFE_DETACH_MODE=helper
 / `debugger` force ptrace-helper behavior; `PEAK_SAFE_DETACH_MODE=signal` or
 `PEAK_DETACH_BACKEND=signal` forces the in-process signal backend. `dlopen`
 listener attach/detach is also guarded because it changes a
-process-wide Gum patch site. With stock Gum, startup target hooks are skipped,
-already-attached target hooks remain attached, and PEAK logs why target
-mutation was skipped. Process-lifetime support hooks keep explicit startup/shutdown
+process-wide Gum patch site. Initial startup attach has one narrow exception:
+before the controller exists, PEAK may attach directly when `/proc/self/task`
+confirms that the process has exactly one task. Outside that single-task startup
+case, stock Gum causes startup target hooks to be skipped; already-attached
+target hooks remain attached, and PEAK logs why later target mutation was
+skipped. Process-lifetime support hooks keep explicit startup/shutdown
 ordering outside steady-state target detach. Startup target hooks and the
-process-lifetime `close`, allocator, and inert `dlopen` hooks are installed
-before the target controller starts. Runtime `dlopen` callback admission opens
-only after that start, and the heartbeat thread starts last. Shutdown stops the
-target controller before malloc detach so allocator Gum mutations do not
-overlap target physical detach/reattach windows.
+process-lifetime `close`, allocator, and inert `dlopen` hooks, when enabled or
+needed, are installed before the target controller starts. Runtime `dlopen`
+callback admission opens only after that start, and the heartbeat thread starts
+last. Shutdown stops the target controller before malloc detach so allocator
+Gum mutations do not overlap target physical detach/reattach windows.
 
 The legacy cooperative signal pause path is not considered strict-safe. It
 cannot classify program counters, cannot advance only audited PEAK/Gum safe
@@ -61,20 +65,31 @@ outside the code and state being mutated.
 
 ## Core Invariants
 
-1. Only one in-process controller performs steady-state target-hook lifecycle
-   operations. Target-function `gum_interceptor_attach`,
-   `gum_interceptor_detach`, Gum transactions, listener allocation/free, and
-   dynamic target attach publication are controller-owned. `dlopen` listener
+1. Except for the initial single-task startup attach described above, all
+   target-hook mutation is serialized by the controller API and strict mutation
+   guard. The startup exception ends before the controller starts and does not
+   apply to detach, reattach, dynamic/JIT attach, or shutdown. The controller
+   thread owns steady-state detach/reattach transitions, queued dynamic and JIT
+   attaches, and deferred destruction. The
+   synchronous FFTW `dlopen` path is an intentional execution-context
+   exception, but not a guard exception: the application callback thread
+   performs its initial ATTACH while holding the same mutation guard and
+   general-listener publication lock. It
+   does not introduce another detach/reattach state machine. `dlopen` listener
    attach and detach also go through the controller guard. JIT metadata
-   providers publish
-   only name/address/size candidates; the controller performs any resulting Gum
-   attach. Process-lifetime support hooks are allowed to use direct Gum calls
-   only when they cannot overlap the active target-controller mutation window.
+   providers publish only name/address/size candidates; the controller thread
+   performs any resulting Gum attach. Process-lifetime support hooks are
+   allowed to use direct Gum calls only when they cannot overlap an active
+   target mutation window.
    Malloc detach is ordered after controller stop and before `dlopen`/Gum
    teardown so the memory profiler does not observe Gum teardown allocations.
+   After the controller thread stops, the teardown owner performs final
+   general-listener and `dlopen` shutdown through the same controller API and
+   strict mutation guard.
 
-2. Hot callbacks never call Gum lifecycle APIs. They may request detach or
-   reattach by setting atomic state or enqueueing a controller request.
+2. Hot target-function callbacks never call Gum lifecycle APIs. They may
+   request detach or reattach by setting atomic state or enqueueing a
+   controller request.
 
 3. Physical detach does not require `in_flight == 0`. Active samples can be
    abandoned. Gum already keeps trampoline memory alive until its internal usage
@@ -91,14 +106,20 @@ outside the code and state being mutated.
 
 ### In-process controller
 
-The controller is the only PEAK component allowed to mutate Gum hooks. It owns:
+The controller thread owns steady-state target lifecycle and queued attach
+work. The controller API and strict mutation guard remain the serialization
+authority for the synchronous FFTW before-return exception. The controller
+thread owns:
 
-- hook state transitions;
-- Gum transactions;
-- `array_listener`, `hook_address`, and demangled-name publication;
+- steady-state detach/reattach hook-state transitions;
+- Gum transactions for controller-thread work;
+- listener and name publication for controller-thread work;
 - deferred listener destruction;
-- dynamic symbol attaches after `dlopen` or JIT metadata arrival;
-- final shutdown order.
+- queued dynamic symbol attaches after `dlopen` and all JIT attaches.
+
+Final shutdown is not controller-thread work: after that thread has stopped,
+the teardown owner removes the remaining hooks through the controller API and
+strict mutation guard, then completes general-listener and `dlopen` teardown.
 
 Per-hook states:
 
@@ -115,7 +136,8 @@ typedef enum {
 } PeakHookState;
 ```
 
-Callbacks and heartbeat only request transitions. The controller executes them.
+Target callbacks and heartbeat only request detach/reattach transitions. The
+controller executes those transitions.
 
 ### External helper
 
@@ -754,149 +776,23 @@ already-recorded nonzero teardown into a collective-safe clean exit.
 
 ## Dynamic `dlopen`
 
-PEAK observes the real `dlopen` call with a Gum invocation listener instead of
-replacing it. This keeps the application's caller-sensitive `$ORIGIN`, RUNPATH,
-and binding-mode semantics intact:
+Runtime target discovery is documented separately in
+[Runtime `dlopen` profiling](dlopen-profiling.md). The controller-relevant
+invariants are:
 
-```text
-real dlopen:
-    execute with the application's original caller and flags
+- the real loader call is observed, not replaced;
+- synchronous FFTW and queued dynamic attaches both use the existing guarded
+  ATTACH operation and publish metadata only after successful release;
+- target detach/reattach work is serviced before the separate bounded dynamic
+  queue, so loader activity cannot change or starve the lifecycle state
+  machine;
+- dynamic module handles remain pinned until target teardown has flushed; and
+- shutdown closes admission and drains callbacks before any reachable listener
+  state is released.
 
-listener on-leave:
-    read atomic unresolved-target hints without the controller lock
-    resolve only unresolved FFTW targets through the returned handle
-    attach distinct resolved addresses in bounded strict ATTACH batches
-    enqueue at most one canonical asynchronous request when fallback is needed
-    return the real handle unchanged
-
-controller:
-    resolve remaining requested symbols from queued handles
-    use helper stop/classification before Gum attach
-    publish hook metadata only after Gum attach and helper release succeed
-```
-
-On Linux when `RTLD_NOLOAD` is available, the listener performs the guarded
-FFTW attach before the real `dlopen` returns, so the normal
-immediate-first-call path is profiled. Resolution uses
-the loader's ordinary handle-scoped `dlsym` behavior, which naturally searches
-the root module's dependency closure in loader order; PEAK does not implement a
-second dependency graph or provider-selection protocol. The synchronous scope
-is an immutable per-target bit derived from exact membership in PEAK's built-in
-FFTW list; a similarly prefixed user target is not included, and mixed
-non-FFTW `PEAK_TARGET`/`PEAK_TARGET_FILE` entries remain on the asynchronous
-path. Symbol resolution never holds the general-listener mutex, avoiding a
-loader-lock/listener-lock inversion between an on-leave callback and the
-asynchronous controller. Target classification in the on-leave path reads two
-atomic hints and does not take the controller lock or scan the target array.
-
-Before computing a module identity or taking an `RTLD_NOLOAD` reference, PEAK
-probes a fixed set of public FFTW ABI anchors on the application's returned
-handle. Handle-scoped lookup includes loaded dependencies, so standard FFTW2,
-FFTW3 precision, MPI, and Fortran DSOs are recognized without filename or
-SONAME guessing. Separate FFTW2 complex-thread and real-thread anchors cover
-the official standalone thread libraries, which need not depend on the FFTW2
-core DSO. An unrelated `dlopen` therefore avoids both the full FFTW target scan
-and a second loader reference cycle. The listener also borrows the application's
-filename argument only until the intercepted call returns, so this fast path
-does not allocate merely to copy a still-live call argument.
-
-After a primary module has published at least one new listener, PEAK retains
-that module's loader handle. A complete scan with no retryable controller
-outcome is cached even if one of that provider's symbols has a terminal Gum
-signature failure, so reopening the same pinned primary module does not repeat
-the scan. That failure is not marked globally resolved: a later MPI or threads
-extension may export a different implementation and is still scanned as a
-distinct module. The cache uses the primary loader module, not a shared FFTW
-anchor address. Retryable and partial scans are never cached.
-
-PEAK prefers the loader-reported module identity from the successful returned
-handle, falling back to the caller's filename if that identity is unavailable,
-and uses the result for both synchronous retention and any queued fallback. A
-successful synchronous FFTW attach does not enqueue the same FFTW work again.
-If guarded mutation must be retried, the same canonical request is queued once;
-mixed non-FFTW work is folded into that retry instead of creating a second
-request. Internal loader and symbol lookups clear their own `dlerror` state
-before the successful application `dlopen` returns.
-
-A temporarily unsafe mutation is queued for the existing asynchronous
-best-effort path, so that exceptional call may precede attachment; the
-application thread does not wait for an asynchronous retry or a new
-`dlopen`-specific completion timeout. Guarded mutation still uses the existing
-controller's bounded stop and classification protocol. Calls made from DSO
-constructors before `dlopen` reaches its on-leave callback, `dlmopen`
-namespaces, and exact IFUNC resolver/wrapper
-boundaries are not part of this contract. A constructor that exits the loader
-thread with `pthread_exit()` or bypasses on-leave with a non-local jump is also
-unsupported because callback cleanup cannot run. A multithreaded `fork()` child must
-still `exec` before using the profiling runtime. When Gum dispatches a fresh
-child `dlopen` callback, a PID guard makes it bypass PEAK before touching
-PEAK-owned mutexes or allocation. It does not make the loader or Gum generally
-fork-safe, rebuild the runtime, or promise profiling in a fork-without-exec
-child. Forking from inside an already-entered `dlopen` callback remains outside
-the supported contract.
-
-Both paths retain a `RTLD_NOLOAD` handle using the application's original
-binding mode for any module that receives PEAK hooks. The retained root handle
-also pins its dependencies, so application `dlclose()` cannot unload code while
-PEAK and Gum still reference addresses inside it. Handles are released only
-after general listener teardown has flushed. Other unresolved dynamic targets
-continue to use the controller-owned asynchronous queue.
-
-The target detach controller is serviced before dynamic attach drains in each
-controller cycle so a busy `dlopen` queue cannot starve pending target
-detach/reattach work. Dynamic attach remains a separate bounded queue rather
-than being mixed into the target-hook batch, because attach/replace work has
-different Gum metadata and publication invariants. Optional diagnostics are
-available through `PEAK_DLOPEN_DEBUG` and `PEAK_DLOPEN_TRACE_PATH`, which report
-enqueued, drained, requeued, queue-full drops, closed-queue drops, `RTLD_NOLOAD`
-drops, failed requeue drops, partial successes, retained handles, and max queue
-depth, plus the current queue length, fixed queue capacity, and drain budget.
-Each dynamic attach drain snapshots the queue length at the start of the
-controller cycle and drains at most that snapshot size and at most the fixed
-budget. Retryable dynamic attach requests are requeued without self-waking the
-controller; the existing controller cadence or an independent event starts the
-later attempt. One temporarily unsafe library therefore cannot consume the
-entire same-cycle budget or create an immediate retry loop. Dynamic attach
-prepare retries are limited to transient `TIMEOUT` and `CLASSIFY_FAILED`
-statuses. Generic `ERROR`
-and `PERMISSION_DENIED` are terminal for queued dynamic attach work so fatal
-controller or persistent ptrace-policy failures cannot pin queue slots
-indefinitely.
-
-Final `dlopen` listener teardown uses the existing guarded `SHUTDOWN` operation
-to detach the listener and close admission. PEAK then waits for already-entered
-listener callbacks and dynamic attach drains before flushing Gum and releasing
-listener state. If either does not drain within the bounded shutdown window,
-teardown fails closed and leaves the interceptor state alive.
-
-On the MPI finalizer path where Gum listeners must remain physically pinned,
-PEAK performs the same admission close and callback/drain wait before report
-metadata can be released, but skips the physical listener detach. The pinned
-listener is therefore logically inert during the real MPI finalizer and later
-process cleanup.
-
-The final `dlopen` detach prepare is retried for a short bounded window on
-transient helper statuses, including temporary `ptrace` permission denial seen
-under hostile concurrent stress. Persistent failure still fails closed.
-
-Unresolved plain C symbol names do not trigger Gum's expensive global C++
-demangled-symbol scan. Dynamic C symbols are instead resolved by the queued
-`dlopen` path when their library appears. Set `PEAK_ENABLE_CXX_SYMBOL_SCAN=1`
-to restore the legacy broad scan for short C++ target names that do not include
-obvious C++ spelling such as `::`, `(`, `<`, or `operator`.
-
-PEAK resolves ordinary user targets and PEAK support-hook target addresses
-through Gum's `gum_find_function()` dynamic-binary lookup in both normal and
-MPI-launched processes. The PEAK-patched Frida Gum devkit keeps Gum's newer
-online in-memory ELF fallback, but guards the inlined ELF-header load before Gum
-parses a module base address as fallback ELF metadata. Normal online modules
-whose file path was opened successfully keep Gum's original live-memory parsing
-path. Invalid or unreadable memory-fallback sources fail with Gum's normal
-invalid-header error so the caller can skip that module without changing PEAK's
-resolver semantics. The guard validates the ELF ident, native little-endian
-encoding, `e_version`, class-specific ELF header size, non-empty program and
-section table entry sizes, table offset lower bounds, and offset-plus-table-size
-overflow before letting Gum parse fallback module memory.
+The final guarded `dlopen` listener shutdown-detach prepare may retry transient
+helper failures for a short bounded window. Persistent failure remains
+fail-closed.
 
 PEAK also refuses known or conservative trampoline-scratch prologue classes
 before static, dynamic `dlopen`, or JIT target attach. Tiny x86_64 leaf loops
@@ -1119,9 +1015,9 @@ Completed in this branch:
     strict-physical `safe` success rows.
 26. Moved target-hook shutdown Gum bookkeeping detach inside the helper-held
     mutation window and made idle helper shutdown I/O failure fail closed.
-27. Added bounded retry around final strict `dlopen` revert prepare so transient
-    helper/ptrace denial under high stress does not skip otherwise safe
-    teardown.
+27. Added bounded retry around final strict `dlopen` listener shutdown-detach
+    prepare so transient helper/ptrace denial under high stress does not skip
+    otherwise safe teardown.
 28. Batched retry-ready target-hook detach/reattach requests into one strict
     STOP window, with per-candidate Gum snapshots captured before STOP,
     independent classification against one helper PC snapshot, partial success
