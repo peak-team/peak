@@ -12,6 +12,8 @@ target_link_libraries(test_fftw PRIVATE ${BLAS_LIBRARIES})
 if(UNIX)
     add_library(test_fftw_runtime_provider SHARED
         test_fftw_runtime_provider.c)
+    add_library(test_fftw_runtime_tail_jump_provider SHARED
+        test_fftw_runtime_tail_jump_provider.c)
     add_library(test_fftw_runtime_unrelated SHARED
         test_fftw_runtime_unrelated.c)
     add_library(test_fftw2_runtime_threads_provider SHARED

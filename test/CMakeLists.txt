@@ -1404,6 +1404,22 @@ if(BUILD_TESTING)
                     $<TARGET_FILE:test_fftw_runtime_provider>
                     fast
         )
+
+        if(PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE AND
+           CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+            add_test(NAME test_fftw_runtime_tail_jump_exact_entry
+                COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                        $<TARGET_FILE:test_fftw_runtime_tail_jump_provider>
+                        tail
+            )
+            set_tests_properties(test_fftw_runtime_tail_jump_exact_entry
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                    FAIL_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+[2-9][0-9]*\\||fftw_free[*]*\\|[ \t]+[2-9][0-9]*\\|"
+                    TIMEOUT 30
+            )
+        endif()
         set_tests_properties(test_fftw_runtime_group_provider_cache
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"

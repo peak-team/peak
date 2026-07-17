@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch Frida Gum 17.15.3's online ELF memory fallback safety checks."""
+"""Patch Frida Gum 17.15.3 for PEAK's ELF guard and exact-entry APIs."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ import sys
 
 
 OBJECT_NAME = "gumelfmodule.c.o"
+REDIRECT_RESOLVER = "_gum_interceptor_backend_resolve_redirect"
+RENAMED_REDIRECT_RESOLVER = (
+    "_gum_interceptor_backend_resolve_redirect_peak_dispatch"
+)
+INTERCEPTOR_OBJECT_NAME = "guminterceptor.c.o"
 LOAD_SECTION = ".text.gum_elf_module_load"
 OLD_MARKER_X86_64 = b"PEAK_GUM_ELF_HEADER_GUARD_X86_64_V1\0"
 OLD_MARKER_AARCH64 = b"PEAK_GUM_ELF_HEADER_GUARD_AARCH64_V1\0"
@@ -33,6 +38,87 @@ def run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedP
 def fail(message: str) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(1)
+
+
+def symbol_kinds(nm: str, object_path: Path) -> set[tuple[str, str]]:
+    result = run([nm, str(object_path)])
+    if result.returncode != 0:
+        fail(f"failed to inspect {object_path}:\n{result.stdout}\n{result.stderr}")
+
+    symbols: set[tuple[str, str]] = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            symbols.add((fields[-2], fields[-1]))
+    return symbols
+
+
+def replace_archive_member(ar: str, library: Path, object_path: Path) -> None:
+    result = run([ar, "d", str(library), object_path.name])
+    if result.returncode != 0:
+        fail(
+            f"failed to remove original {object_path.name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    result = run([ar, "qcs", str(library), str(object_path)])
+    if result.returncode != 0:
+        fail(
+            f"failed to append patched {object_path.name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+
+def route_redirect_resolver_through_overlay(
+    library: Path,
+    members: list[str],
+    ar: str,
+    nm: str,
+    objcopy: str,
+    work_dir: Path,
+) -> None:
+    object_name = INTERCEPTOR_OBJECT_NAME
+    if members.count(object_name) != 1:
+        fail(
+            f"expected exactly one {object_name} in {library}, "
+            f"found {members.count(object_name)}"
+        )
+
+    extracted = work_dir / object_name
+    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+    if result.returncode != 0 or not extracted.exists():
+        fail(f"failed to extract {object_name}:\n{result.stdout}\n{result.stderr}")
+
+    before = symbol_kinds(nm, extracted)
+    if (("U", REDIRECT_RESOLVER) not in before or
+            ("U", RENAMED_REDIRECT_RESOLVER) in before):
+        fail(
+            f"unexpected redirect resolver symbols in {object_name}: "
+            f"original_undefined={(('U', REDIRECT_RESOLVER) in before)} "
+            f"dispatch_undefined={(('U', RENAMED_REDIRECT_RESOLVER) in before)}"
+        )
+
+    result = run([
+        objcopy,
+        "--redefine-sym",
+        f"{REDIRECT_RESOLVER}={RENAMED_REDIRECT_RESOLVER}",
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to rename redirect resolver in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    after = symbol_kinds(nm, extracted)
+    if (("U", REDIRECT_RESOLVER) in after or
+            ("U", RENAMED_REDIRECT_RESOLVER) not in after):
+        fail(
+            f"redirect resolver rename did not take effect in {object_name}"
+        )
+
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed exact-entry attach resolver dispatch")
 
 
 def find_all(data: bytes | bytearray, needle: bytes) -> list[int]:
@@ -759,6 +845,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True, type=Path)
     parser.add_argument("--ar", required=True)
+    parser.add_argument("--nm")
+    parser.add_argument("--objcopy")
     parser.add_argument("--ranlib")
     parser.add_argument("--work-dir", required=True, type=Path)
     args = parser.parse_args()
@@ -784,20 +872,27 @@ def main() -> int:
     if result.returncode != 0 or not extracted.exists():
         fail(f"failed to extract {OBJECT_NAME}:\n{result.stdout}\n{result.stderr}")
 
+    machine = elf_machine(extracted)
     changed = patch_object(extracted)
     if changed:
-        result = run([args.ar, "d", str(library), OBJECT_NAME])
-        if result.returncode != 0:
-            fail(f"failed to remove original {OBJECT_NAME}:\n{result.stdout}\n{result.stderr}")
+        replace_archive_member(args.ar, library, extracted)
 
-        result = run([args.ar, "qcs", str(library), str(extracted)])
-        if result.returncode != 0:
-            fail(f"failed to append patched {OBJECT_NAME}:\n{result.stdout}\n{result.stderr}")
+    if machine == 62:  # EM_X86_64
+        if args.nm is None or args.objcopy is None:
+            fail("x86_64 exact-entry patch requires --nm and --objcopy")
+        route_redirect_resolver_through_overlay(
+            library,
+            members,
+            args.ar,
+            args.nm,
+            args.objcopy,
+            work_dir,
+        )
 
-        if args.ranlib:
-            result = run([args.ranlib, str(library)])
-            if result.returncode != 0:
-                fail(f"failed to index patched archive:\n{result.stdout}\n{result.stderr}")
+    if args.ranlib:
+        result = run([args.ranlib, str(library)])
+        if result.returncode != 0:
+            fail(f"failed to index patched archive:\n{result.stdout}\n{result.stderr}")
 
     shutil.rmtree(work_dir)
     return 0

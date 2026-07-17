@@ -5,6 +5,75 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(__linux__) && \
+    (defined(__x86_64__) || defined(__amd64__)) && \
+    defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
+#define PEAK_X86_NEAR_REDIRECT_SIZE 5u
+#define PEAK_X86_REL32_JUMP_SIZE 5u
+#define PEAK_X86_RIP_INDIRECT_JUMP_SIZE 6u
+
+static GumRedirectWriteResult
+peak_x86_write_near_redirect(const GumRedirectWriteDetails* details,
+                             gpointer user_data)
+{
+    GumX86Writer* writer;
+
+    (void)user_data;
+    if (details == NULL || details->writer == NULL ||
+        details->capacity < PEAK_X86_NEAR_REDIRECT_SIZE) {
+        return GUM_REDIRECT_DECLINED;
+    }
+
+    writer = (GumX86Writer*)details->writer;
+    if (!gum_x86_writer_can_branch_directly_between(writer->pc,
+                                                     (GumAddress)details->target) ||
+        !gum_x86_writer_put_jmp_address(writer,
+                                        (GumAddress)details->target)) {
+        return GUM_REDIRECT_DECLINED;
+    }
+
+    return GUM_REDIRECT_WRITTEN;
+}
+
+static gsize
+peak_x86_target_redirect_size(gpointer address)
+{
+    guint8* code = NULL;
+    gsize bytes_read = 0;
+    gsize redirect_size = 0;
+    int saved_errno = errno;
+
+    if (address != NULL &&
+        (uintptr_t)address <= UINTPTR_MAX -
+                              (PEAK_X86_REL32_JUMP_SIZE - 1)) {
+        code = gum_memory_read(address,
+                               PEAK_X86_REL32_JUMP_SIZE,
+                               &bytes_read);
+        if (code != NULL && bytes_read == PEAK_X86_REL32_JUMP_SIZE) {
+            if (code[0] == 0xe9) {
+                redirect_size = PEAK_X86_REL32_JUMP_SIZE;
+            } else if (code[0] == 0xff && code[1] == 0x25 &&
+                       (uintptr_t)address <= UINTPTR_MAX -
+                           (PEAK_X86_RIP_INDIRECT_JUMP_SIZE - 1)) {
+                g_free(code);
+                code = gum_memory_read(address,
+                                       PEAK_X86_RIP_INDIRECT_JUMP_SIZE,
+                                       &bytes_read);
+                if (code != NULL &&
+                    bytes_read == PEAK_X86_RIP_INDIRECT_JUMP_SIZE &&
+                    code[0] == 0xff && code[1] == 0x25) {
+                    redirect_size = PEAK_X86_RIP_INDIRECT_JUMP_SIZE;
+                }
+            }
+        }
+    }
+
+    g_free(code);
+    errno = saved_errno;
+    return redirect_size;
+}
+#endif
+
 PeakUnsafeGumProloguePolicy
 peak_unsafe_gum_prologue_policy_from_env(const char* value,
                                          gboolean* valid_out)
@@ -141,6 +210,28 @@ peak_gum_target_attach_plan(gpointer address,
 
     memset(plan_out, 0, sizeof(*plan_out));
     plan_out->mutation_address = address;
+#if defined(__linux__) && \
+    (defined(__x86_64__) || defined(__amd64__)) && \
+    defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
+    gsize redirect_size = peak_x86_target_redirect_size(address);
+
+    /*
+     * Gum normally follows exported rel32 and RIP-indirect tail jumps before
+     * attaching.  That can turn an FFTW wrapper into an allocator-wide hook.
+     * Each recognized jump is a complete relocatable entry, so keep the
+     * listener at the exported boundary and require a directly reachable
+     * trampoline. If Gum cannot allocate one, the custom writer declines
+     * safely.
+     */
+    if (redirect_size > 0) {
+        plan_out->options.instrumentation.write_redirect =
+            peak_x86_write_near_redirect;
+        plan_out->options.instrumentation.redirect_space_hint =
+            (guint)redirect_size;
+        plan_out->mutation_guard_size = redirect_size;
+        plan_out->attach_exact_entry = TRUE;
+    }
+#endif
 #if defined(__linux__) && defined(__aarch64__) && \
     defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
     gpointer plt_address = NULL;
@@ -162,15 +253,25 @@ peak_gum_target_attach_plan(gpointer address,
 #endif
 }
 
-void
-peak_gum_target_attach_options(gpointer address,
-                               GumAttachOptions* options_out)
+GumAttachReturn
+peak_gum_interceptor_attach_target(GumInterceptor* interceptor,
+                                   gpointer address,
+                                   GumInvocationListener* listener,
+                                   const PeakGumTargetAttachPlan* plan)
 {
-    PeakGumTargetAttachPlan plan;
+#if defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
+    if (plan != NULL && plan->attach_exact_entry) {
+        return gum_interceptor_peak_attach_exact(interceptor,
+                                                 address,
+                                                 listener,
+                                                 &plan->options);
+    }
+#endif
 
-    g_return_if_fail(options_out != NULL);
-    peak_gum_target_attach_plan(address, &plan);
-    *options_out = plan.options;
+    return gum_interceptor_attach(interceptor,
+                                  address,
+                                  listener,
+                                  plan != NULL ? &plan->options : NULL);
 }
 
 #if defined(__x86_64__) || defined(__amd64__)

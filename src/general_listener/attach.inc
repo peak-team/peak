@@ -398,10 +398,10 @@ void peak_general_listener_attach()
             }
             gum_interceptor_begin_transaction(interceptor);
             GumAttachReturn attach_status =
-                gum_interceptor_attach(interceptor,
-                                       resolved_hook_address,
-                                       new_listener,
-                                       &attach_plan.options);
+                peak_gum_interceptor_attach_target(interceptor,
+                                                   resolved_hook_address,
+                                                   new_listener,
+                                                   &attach_plan);
             gum_interceptor_end_transaction(interceptor);
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,

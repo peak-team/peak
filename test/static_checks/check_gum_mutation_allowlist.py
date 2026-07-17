@@ -13,7 +13,7 @@ MUTATION_RE = re.compile(
 
 EXPECTED = {
     ("dlopen-controller", "src/dlopen_interceptor.c"): {
-        "attach": 3,
+        "attach": 1,
         "begin_transaction": 4,
         "detach": 1,
         "end_transaction": 4,
@@ -31,11 +31,17 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 5,
+        "attach": 1,
         "detach": 5,
         "begin_transaction": 10,
         "end_transaction": 10,
         "flush": 2,
+    },
+    ("strict-target-attach", "src/unsafe_gum_prologue.c"): {
+        "attach": 1,
+    },
+    ("strict-target-attach", "cmake/peak-gum/gum_peak_pc_api.c"): {
+        "attach": 1,
     },
     ("support-init", "src/mpi_interceptor.c"): {
         "begin_transaction": 1,
@@ -134,6 +140,12 @@ FUNCTION_ANCHORS = {
         "exit_interceptor_attach": "support-init",
         "exit_interceptor_detach": "support-shutdown-debt",
     },
+    "src/unsafe_gum_prologue.c": {
+        "peak_gum_interceptor_attach_target": "strict-target-attach",
+    },
+    "cmake/peak-gum/gum_peak_pc_api.c": {
+        "gum_interceptor_peak_attach_exact": "strict-target-attach",
+    },
 }
 
 
@@ -192,6 +204,18 @@ def count_mutations(repo_root):
                         function_starts[rel].append(
                             (line_number, function_name)
                         )
+
+    for rel in ("cmake/peak-gum/gum_peak_pc_api.c",):
+        path = repo_root / rel
+        source = read_source(repo_root, rel, path)
+        source_paths.append((rel, source))
+        anchors = FUNCTION_ANCHORS[rel]
+        for line_number, line in enumerate(source.splitlines(), 1):
+            for function_name in anchors:
+                if function_name in line:
+                    function_starts[rel].append(
+                        (line_number, function_name)
+                    )
 
     found = collections.defaultdict(collections.Counter)
     unclassified = []

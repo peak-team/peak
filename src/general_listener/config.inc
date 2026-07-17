@@ -358,6 +358,7 @@ typedef struct {
     size_t hook_id;
     GumInvocationListener* listener;
     PeakDetachOperation operation;
+    PeakGumTargetAttachPlan attach_plan;
     PeakHookState stable_state;
     unsigned int retry_count;
     PeakDetachStatus last_retry_status;

@@ -65,6 +65,17 @@ GUM_API gboolean gum_interceptor_peak_get_function_patch(
     guint8 * original_prologue,
     guint * prologue_len);
 
+#if defined(__x86_64__) || defined(__amd64__)
+# define GUM_PEAK_EXACT_ATTACH_API_VERSION 1
+
+/* Attach to the supplied entry without following its leading redirect. */
+GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener,
+    const GumAttachOptions * options);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

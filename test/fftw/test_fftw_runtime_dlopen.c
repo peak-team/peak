@@ -76,11 +76,12 @@ main(int argc, char** argv)
         (strcmp(mode, "default") != 0 && strcmp(mode, "mixed") != 0 &&
          strcmp(mode, "retry") != 0 && strcmp(mode, "fast") != 0 &&
          strcmp(mode, "retry-fast") != 0 &&
+         strcmp(mode, "tail") != 0 &&
          strcmp(mode, "probe") != 0 && strcmp(mode, "single") != 0 &&
          strcmp(mode, "extension") != 0) ||
         mode_has_argument != (argc == 4)) {
         fprintf(stderr,
-                "usage: %s /path/to/provider [default|mixed|retry|retry-fast|fast|probe /path/to/unrelated|single symbol|extension /path/to/extension]\n",
+                "usage: %s /path/to/provider [default|mixed|retry|retry-fast|fast|tail|probe /path/to/unrelated|single symbol|extension /path/to/extension]\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -161,6 +162,14 @@ main(int argc, char** argv)
 
         if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
             return EXIT_FAILURE;
+        }
+        if (strcmp(mode, "tail") == 0) {
+            plain_target_fn direct_implementation_calls;
+            load_function(handle,
+                          "peak_tail_jump_call_implementations_directly",
+                          &direct_implementation_calls,
+                          sizeof(direct_implementation_calls));
+            direct_implementation_calls();
         }
     }
 
@@ -259,6 +268,7 @@ main(int argc, char** argv)
     }
     if ((strcmp(mode, "default") == 0 || strcmp(mode, "fast") == 0 ||
          strcmp(mode, "probe") == 0 || strcmp(mode, "single") == 0 ||
+         strcmp(mode, "tail") == 0 ||
          strcmp(mode, "extension") == 0) &&
         after.enqueued != before.enqueued) {
         fputs("FFTW-only synchronous success queued duplicate work\n", stderr);
