@@ -148,7 +148,25 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     begin_callback_body = extract_function(
         source, "dlopen_interceptor_begin_callback"
     )
+    shutdown = extract_function(
+        source, "dlopen_interceptor_shutdown_dynamic_attach"
+    )
     detach = extract_function(source, "dlopen_interceptor_dettach")
+    provider_probe = extract_function(
+        source, "dlopen_interceptor_handle_may_resolve_fftw"
+    )
+    unresolved_counts = extract_function(
+        source, "dlopen_interceptor_unresolved_counts"
+    )
+    resolved_mark = extract_function(
+        source, "dlopen_interceptor_mark_target_resolved_unlocked"
+    )
+    completed_scan = extract_function(
+        source, "dlopen_interceptor_fftw_module_scan_completed"
+    )
+    retain_handle = extract_function(
+        source, "dlopen_interceptor_retain_dynamic_handle"
+    )
 
     require("source_target_array_FFTW[i]" in membership and
             "strcmp(name, source_target_array_FFTW[i]) == 0" in membership and
@@ -181,15 +199,64 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "on-leave must use canonical identity and let a successful requeue suppress duplicate work")
     require("dlerror();" in attach and "dlerror();" in on_leave,
             "PEAK loader lookups must not leak dlerror state after successful dlopen")
+    probe_position = on_leave.find(
+        "dlopen_interceptor_handle_may_resolve_fftw(handle)"
+    )
+    identity_position = on_leave.find(
+        "dlopen_interceptor_module_identity("
+    )
+    require(probe_position != -1 and identity_position != -1 and
+            probe_position < identity_position and
+            all(name in provider_probe for name in (
+                "fftw_malloc", "fftwf_malloc", "fftwl_malloc",
+                "fftwq_malloc", "rfftw_create_plan", "fftw_threads",
+                "rfftw_threads")) and
+            '"fftw_create_plan"' not in provider_probe and
+            "strstr(" not in provider_probe,
+            "FFTW dlopen must use filename-independent ABI probes before module reopen and full scan")
+    maybe_load = unresolved_counts.find(
+        "atomic_load_explicit(&dlopen_may_have_unresolved_non_fftw"
+    )
+    early_return = unresolved_counts.find("return result;", maybe_load)
+    mixed_lock = unresolved_counts.find(
+        "peak_general_listener_controller_lock();"
+    )
+    require(unresolved_counts.count("atomic_load_explicit(") == 2 and
+            maybe_load != -1 and early_return != -1 and mixed_lock != -1 and
+            maybe_load < early_return < mixed_lock and
+            "for (" in unresolved_counts and
+            "dlopen_unresolved_non_fftw_count" not in source and
+            "dlopen_unresolved_non_fftw_count" not in resolved_mark,
+            "pure FFTW callbacks must use the atomic fast path while mixed targets are classified from live listener state")
 
     pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
     cancel_disable = on_enter.find("pthread_setcancelstate(PTHREAD_CANCEL_DISABLE")
     begin_callback_position = on_enter.find("dlopen_interceptor_begin_callback()")
-    filename_copy = on_enter.find("g_strdup(filename)")
+    filename_capture = on_enter.find("invocation->filename = filename")
     require(pid_check != -1 and cancel_disable != -1 and
-            begin_callback_position != -1 and filename_copy != -1 and
-            pid_check < cancel_disable < begin_callback_position < filename_copy,
+            begin_callback_position != -1 and filename_capture != -1 and
+            pid_check < cancel_disable < begin_callback_position < filename_capture,
             "fork-child guard and cancellation disable must precede callback state")
+    require("g_strdup(filename)" not in on_enter and
+            "g_free(invocation->filename)" not in on_leave,
+            "unrelated dlopen callbacks must not allocate merely to preserve a live call argument")
+    completed_lookup = on_leave.find(
+        "dlopen_interceptor_fftw_module_scan_completed(handle)"
+    )
+    require(completed_lookup != -1 and
+            completed_lookup < identity_position and
+            "dlopen_interceptor_primary_module_token(handle)" in completed_scan and
+            "g_hash_table_contains(dlopen_completed_fftw_modules" in completed_scan,
+            "only an identical completed primary FFTW module may skip a full scan")
+    require("request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY" in attach and
+            "request->scope == PEAK_DLOPEN_ATTACH_ALL" in attach and
+            "resolved_fftw_from_handle" in attach and
+            "peak_hook_address_count == target_count" in attach and
+            "resolved_targets[i].address != NULL" in attach and
+            "dlopen_interceptor_target_is_unresolved_unlocked(i)" in attach and
+            "completed_fftw_scan" in retain_handle and
+            "g_hash_table_add(dlopen_completed_fftw_modules, module_token)" in retain_handle,
+            "FFTW module cache publication must require a complete scan and a retained primary handle")
     require("atomic_load_explicit(&dlopen_listener_owner_pid" in admission and
             "getpid() == owner" in admission and
             "pthread_mutex" not in admission and "g_" not in admission,
@@ -228,6 +295,32 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require(owner_close != -1 and close_lock != -1 and close_unlock != -1 and
             close_lock < owner_close < close_unlock,
             "teardown must close callback admission under the gate mutex")
+    pinned_owner_close = shutdown.find(
+        "atomic_store_explicit(&dlopen_listener_owner_pid"
+    )
+    pinned_state_close = shutdown.find(
+        "dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN"
+    )
+    pinned_unlock = shutdown.find(
+        "pthread_mutex_unlock(&dynamic_attach_gate_mutex)"
+    )
+    require(pinned_owner_close != -1 and pinned_state_close != -1 and
+            pinned_unlock != -1 and
+            pinned_owner_close < pinned_state_close < pinned_unlock,
+            "pinned dlopen shutdown must make the listener inert under the gate mutex")
+
+    peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    fini = extract_function(peak_source, "peak_fini_impl")
+    pinned_shutdown = fini.find(
+        "dlopen_interceptor_shutdown_dynamic_attach()"
+    )
+    shutdown_failure = fini.find(
+        "if (!dlopen_shutdown_flushed)", pinned_shutdown
+    )
+    report = fini.find("peak_general_listener_print(", pinned_shutdown)
+    require(pinned_shutdown != -1 and shutdown_failure != -1 and report != -1 and
+            pinned_shutdown < shutdown_failure < report,
+            "MPI pinned-listener path must drain dlopen callbacks before report metadata is freed")
     require("if (!invocation->callback_admitted)" in on_leave,
             "dlopen on-leave must skip callbacks rejected by the fork PID guard")
     end_callback = on_leave.find("dlopen_interceptor_end_callback()")
@@ -251,7 +344,8 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
             "Arm64 branch-to-PLT detection must not directly read a computed target")
     plan = extract_function(unsafe, "peak_gum_target_attach_plan")
     require("plan_out->mutation_address = plt_address" in plan and
-            "plan_out->mutation_guard_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in plan,
+            "plan_out->mutation_guard_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in plan and
+            "defined(GUM_PEAK_MAX_PROLOGUE_SIZE)" in plan,
             "Arm64 B-to-PLT attach plan must guard Gum's real mutation address")
 
     general = read_source(repo_root, "src/general_listener.c")

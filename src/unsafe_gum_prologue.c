@@ -44,7 +44,8 @@ peak_unsafe_gum_prologue_policy_name(PeakUnsafeGumProloguePolicy policy)
     }
 }
 
-#if defined(__linux__) && defined(__aarch64__)
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
 static gboolean
 peak_arm64_target_branches_to_elf_plt(gpointer address,
                                       gpointer* plt_address_out)
@@ -140,7 +141,8 @@ peak_gum_target_attach_plan(gpointer address,
 
     memset(plan_out, 0, sizeof(*plan_out));
     plan_out->mutation_address = address;
-#if defined(__linux__) && defined(__aarch64__)
+#if defined(__linux__) && defined(__aarch64__) && \
+    defined(GUM_PEAK_MAX_PROLOGUE_SIZE)
     gpointer plt_address = NULL;
 
     /*
@@ -681,8 +683,7 @@ peak_arm64_note_prefix_operands(guint32 insn,
         return;
     }
 
-    if ((insn & 0x1f000000u) == 0x11000000u ||
-        (insn & 0x1f000000u) == 0x51000000u) {
+    if ((insn & 0x1f000000u) == 0x11000000u) {
         peak_arm64_note_ip(rd, seen_x16, seen_x17);
         peak_arm64_note_ip(rn, seen_x16, seen_x17);
         return;

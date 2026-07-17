@@ -33,6 +33,8 @@ static GumInvocationListener* dlopen_listener;
 static gboolean dlopen_sync_fftw_enabled = FALSE;
 static gboolean* dlopen_sync_fftw_targets = NULL;
 static size_t dlopen_sync_fftw_target_count = 0;
+static _Atomic size_t dlopen_unresolved_fftw_count = 0;
+static _Atomic gboolean dlopen_may_have_unresolved_non_fftw = FALSE;
 static _Atomic pid_t dlopen_listener_owner_pid = 0;
 extern GumInterceptor* interceptor;
 extern GumInvocationListener** array_listener;
@@ -104,6 +106,7 @@ static size_t dynamic_attach_queue_tail = 0;
 static size_t dynamic_attach_queue_length = 0;
 static gboolean dynamic_attach_queue_overflow_reported = FALSE;
 static GPtrArray* dynamic_attach_retained_handles = NULL;
+static GHashTable* dlopen_completed_fftw_modules = NULL;
 static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
 static unsigned long long dynamic_attach_enqueue_count = 0;
 static unsigned long long dynamic_attach_drain_count = 0;
@@ -153,6 +156,9 @@ dlopen_interceptor_is_fftw_group_symbol(const char* name)
     return FALSE;
 }
 
+static gboolean
+dlopen_interceptor_target_is_unresolved_unlocked(size_t index);
+
 static void
 dlopen_interceptor_reset_fftw_target_scope(void)
 {
@@ -160,6 +166,12 @@ dlopen_interceptor_reset_fftw_target_scope(void)
     dlopen_sync_fftw_targets = NULL;
     dlopen_sync_fftw_target_count = 0;
     dlopen_sync_fftw_enabled = FALSE;
+    atomic_store_explicit(&dlopen_unresolved_fftw_count,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
+                          FALSE,
+                          memory_order_relaxed);
 }
 
 static void
@@ -170,12 +182,29 @@ dlopen_interceptor_initialize_fftw_target_scope(void)
     dlopen_sync_fftw_target_count = peak_hook_address_count;
     dlopen_sync_fftw_targets =
         g_new0(gboolean, dlopen_sync_fftw_target_count);
+    size_t unresolved_fftw = 0;
+    size_t unresolved_non_fftw = 0;
     for (size_t i = 0; i < dlopen_sync_fftw_target_count; i++) {
-        if (dlopen_interceptor_is_fftw_group_symbol(peak_hook_strings[i])) {
+        gboolean is_fftw =
+            dlopen_interceptor_is_fftw_group_symbol(peak_hook_strings[i]);
+        if (is_fftw) {
             dlopen_sync_fftw_targets[i] = TRUE;
             dlopen_sync_fftw_enabled = TRUE;
         }
+        if (dlopen_interceptor_target_is_unresolved_unlocked(i)) {
+            if (is_fftw) {
+                unresolved_fftw++;
+            } else {
+                unresolved_non_fftw++;
+            }
+        }
     }
+    atomic_store_explicit(&dlopen_unresolved_fftw_count,
+                          unresolved_fftw,
+                          memory_order_relaxed);
+    atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
+                          unresolved_non_fftw > 0,
+                          memory_order_relaxed);
 }
 
 static gboolean
@@ -217,26 +246,61 @@ dlopen_interceptor_target_matches_scope_unlocked(
 static PeakDlopenUnresolvedCounts
 dlopen_interceptor_unresolved_counts(void)
 {
-    PeakDlopenUnresolvedCounts counts = { 0 };
+    PeakDlopenUnresolvedCounts result = {
+        .fftw = atomic_load_explicit(&dlopen_unresolved_fftw_count,
+                                     memory_order_relaxed),
+        .non_fftw = 0
+    };
+
+    /* Pure FFTW configurations never take the general-listener lock here. */
+    if (!atomic_load_explicit(&dlopen_may_have_unresolved_non_fftw,
+                              memory_order_relaxed)) {
+        return result;
+    }
 
     peak_general_listener_controller_lock();
-    if (hook_address != NULL && array_listener != NULL &&
-        peak_hook_strings != NULL && peak_demangled_strings != NULL) {
-        for (size_t i = 0; i < peak_hook_address_count; i++) {
-            if (!dlopen_interceptor_target_is_unresolved_unlocked(i)) {
-                continue;
-            }
-            if (i < dlopen_sync_fftw_target_count &&
-                dlopen_sync_fftw_targets != NULL &&
-                dlopen_sync_fftw_targets[i]) {
-                counts.fftw++;
-            } else {
-                counts.non_fftw++;
-            }
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (dlopen_interceptor_target_is_unresolved_unlocked(i) &&
+            dlopen_interceptor_target_matches_scope_unlocked(
+                i,
+                PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY)) {
+            result.non_fftw = 1;
+            break;
         }
     }
     peak_general_listener_controller_unlock();
-    return counts;
+
+    if (result.non_fftw == 0) {
+        /*
+         * JIT-created targets have their own attach/retry path. Once the
+         * initial non-FFTW set is resolved, future dlopen callbacks need not
+         * keep rescanning it.
+         */
+        atomic_store_explicit(&dlopen_may_have_unresolved_non_fftw,
+                              FALSE,
+                              memory_order_relaxed);
+    }
+    return result;
+}
+
+static void
+dlopen_interceptor_mark_target_resolved_unlocked(size_t hook_id)
+{
+    if (hook_id >= dlopen_sync_fftw_target_count) {
+        return;
+    }
+
+    if (dlopen_sync_fftw_targets == NULL ||
+        !dlopen_sync_fftw_targets[hook_id]) {
+        return;
+    }
+
+    if (atomic_load_explicit(&dlopen_unresolved_fftw_count,
+                             memory_order_relaxed) > 0) {
+        atomic_fetch_sub_explicit(&dlopen_unresolved_fftw_count,
+                                  1,
+                                  memory_order_relaxed);
+    }
 }
 
 static char*
@@ -254,6 +318,77 @@ dlopen_interceptor_module_identity(void* handle, const char* fallback)
 #endif
 
     return g_strdup(fallback);
+}
+
+static gpointer
+dlopen_interceptor_primary_module_token(void* handle)
+{
+#if defined(__linux__)
+    struct link_map* map = NULL;
+
+    if (handle != NULL && dlinfo(handle, RTLD_DI_LINKMAP, &map) == 0) {
+        return map;
+    }
+#else
+    (void)handle;
+#endif
+    return NULL;
+}
+
+static gboolean
+dlopen_interceptor_fftw_module_scan_completed(void* handle)
+{
+    gpointer token = dlopen_interceptor_primary_module_token(handle);
+    gboolean completed = FALSE;
+
+    if (token == NULL) {
+        return FALSE;
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dlopen_completed_fftw_modules != NULL) {
+        completed = g_hash_table_contains(dlopen_completed_fftw_modules,
+                                          token);
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return completed;
+}
+
+static gboolean
+dlopen_interceptor_handle_may_resolve_fftw(void* handle)
+{
+    /*
+     * Probe ABI anchors instead of rescanning the full FFTW group after every
+     * unrelated dlopen.  The handle lookup includes dependencies, so this also
+     * recognizes consumers and FFTW extension DSOs without relying on their
+     * filenames. The precision anchors cover FFTW3 core libraries and their
+     * MPI/Fortran dependents. FFTW2 real transforms and the two standalone
+     * thread libraries need separate anchors because the latter need not have
+     * a loader dependency on the FFTW2 core library.
+     */
+    static const char* const probes[] = {
+        "fftw_malloc",
+        "fftwf_malloc",
+        "fftwl_malloc",
+        "fftwq_malloc",
+        "rfftw_create_plan",
+        "fftw_threads",
+        "rfftw_threads"
+    };
+
+    if (handle == NULL) {
+        return FALSE;
+    }
+
+    for (size_t i = 0; i < G_N_ELEMENTS(probes); i++) {
+        if (dlsym(handle, probes[i]) != NULL) {
+            dlerror();
+            return TRUE;
+        }
+    }
+
+    dlerror();
+    return FALSE;
 }
 
 static void
@@ -577,18 +712,31 @@ dlopen_interceptor_wait_for_callbacks_idle(void)
 }
 
 static void
-dlopen_interceptor_retain_dynamic_handle(void* handle)
+dlopen_interceptor_retain_dynamic_handle(void* handle,
+                                         gboolean completed_fftw_scan)
 {
+    gpointer module_token;
+
     if (handle == NULL) {
         return;
     }
 
+    module_token = completed_fftw_scan
+        ? dlopen_interceptor_primary_module_token(handle)
+        : NULL;
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     if (dynamic_attach_retained_handles == NULL) {
         dynamic_attach_retained_handles =
             g_ptr_array_new_with_free_func(dlopen_interceptor_close_retained_handle);
     }
     g_ptr_array_add(dynamic_attach_retained_handles, handle);
+    if (module_token != NULL) {
+        if (dlopen_completed_fftw_modules == NULL) {
+            dlopen_completed_fftw_modules =
+                g_hash_table_new(g_direct_hash, g_direct_equal);
+        }
+        g_hash_table_add(dlopen_completed_fftw_modules, module_token);
+    }
     dynamic_attach_retained_handle_count++;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 }
@@ -847,6 +995,9 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
 void
 dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
 {
+    GPtrArray* retained_handles;
+    GHashTable* completed_fftw_modules;
+
     dlopen_interceptor_discard_dynamic_attach_queue();
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
@@ -871,19 +1022,20 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_queue_max_depth = 0;
     dynamic_attach_test_force_sync_timeout = 0;
     dynamic_attach_test_sync_scan_count = 0;
+    atomic_store_explicit(&dlopen_listener_owner_pid,
+                          open ? getpid() : 0,
+                          memory_order_release);
+    retained_handles = dynamic_attach_retained_handles;
+    dynamic_attach_retained_handles = NULL;
+    completed_fftw_modules = dlopen_completed_fftw_modules;
+    dlopen_completed_fftw_modules = NULL;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
-    if (dynamic_attach_retained_handles != NULL) {
-        GPtrArray* retained_handles;
-
-        pthread_mutex_lock(&dynamic_attach_gate_mutex);
-        retained_handles = dynamic_attach_retained_handles;
-        dynamic_attach_retained_handles = NULL;
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-
-        if (retained_handles != NULL) {
-            g_ptr_array_free(retained_handles, TRUE);
-        }
+    if (completed_fftw_modules != NULL) {
+        g_hash_table_unref(completed_fftw_modules);
+    }
+    if (retained_handles != NULL) {
+        g_ptr_array_free(retained_handles, TRUE);
     }
 }
 
@@ -1003,7 +1155,9 @@ dlopen_interceptor_test_record_partial_success_with_retained_handle(void)
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     dynamic_attach_partial_success_count++;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-    dlopen_interceptor_retain_dynamic_handle(PEAK_DLOPEN_TEST_RETAINED_HANDLE);
+    dlopen_interceptor_retain_dynamic_handle(
+        PEAK_DLOPEN_TEST_RETAINED_HANDLE,
+        FALSE);
 }
 
 void
@@ -1141,6 +1295,7 @@ dlopen_interceptor_publish_attach_candidate(
     hook_address[hook_id] = mutation_request->function_address;
     peak_demangled_strings[hook_id] = candidate->demangled_name;
     array_listener[hook_id] = candidate->listener;
+    dlopen_interceptor_mark_target_resolved_unlocked(hook_id);
     peak_general_listener_controller_mark_attached_unlocked(hook_id);
     candidate->demangled_name = NULL;
     candidate->listener = NULL;
@@ -1322,6 +1477,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
 {
     gboolean retained_handle_for_hooks = FALSE;
     gboolean retry_later = FALSE;
+    gboolean completed_fftw_scan = FALSE;
+    gboolean resolved_fftw_from_handle = FALSE;
     gboolean needs_resolution = FALSE;
     gboolean use_batch;
     GumInterceptor* target_interceptor;
@@ -1490,6 +1647,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         }
         if (duplicate_address) {
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+            dlopen_interceptor_mark_target_resolved_unlocked(i);
             peak_log_debug("[peak] skipping duplicate dynamic target %s at %p\n",
                            peak_hook_strings[i],
                            dynamic_hook_address);
@@ -1541,6 +1699,27 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
             &retry_later);
         candidate_count = 0;
     }
+    if ((request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY ||
+         request->scope == PEAK_DLOPEN_ATTACH_ALL) &&
+        !retry_later &&
+        peak_hook_address_count == target_count) {
+        completed_fftw_scan = TRUE;
+        for (size_t i = 0; i < target_count; i++) {
+            if (i >= dlopen_sync_fftw_target_count ||
+                dlopen_sync_fftw_targets == NULL ||
+                !dlopen_sync_fftw_targets[i] ||
+                resolved_targets[i].address == NULL) {
+                continue;
+            }
+            resolved_fftw_from_handle = TRUE;
+            if (dlopen_interceptor_target_is_unresolved_unlocked(i)) {
+                completed_fftw_scan = FALSE;
+                break;
+            }
+        }
+        completed_fftw_scan = completed_fftw_scan &&
+                              resolved_fftw_from_handle;
+    }
     peak_general_listener_controller_unlock();
     gum_interceptor_unignore_current_thread(target_interceptor);
     g_free(attach_statuses);
@@ -1558,18 +1737,20 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
                 request->filename,
                 request->binding_flags);
         if (hook_lifetime_handle != NULL) {
-            dlopen_interceptor_retain_dynamic_handle(hook_lifetime_handle);
+            dlopen_interceptor_retain_dynamic_handle(hook_lifetime_handle,
+                                                     FALSE);
         } else {
             g_printerr("[peak] dynamic attach partially succeeded but could not duplicate handle for retry; keeping attached hook lifetime and dropping retry for unresolved hooks\n");
             pthread_mutex_lock(&dynamic_attach_gate_mutex);
             dynamic_attach_drop_requeue_count++;
             pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-            dlopen_interceptor_retain_dynamic_handle(request->handle);
+            dlopen_interceptor_retain_dynamic_handle(request->handle, FALSE);
             request->handle = NULL;
             retry_later = FALSE;
         }
     } else if (retained_handle_for_hooks) {
-        dlopen_interceptor_retain_dynamic_handle(request->handle);
+        dlopen_interceptor_retain_dynamic_handle(request->handle,
+                                                 completed_fftw_scan);
         request->handle = NULL;
     }
     if (retry_later) {
@@ -1711,6 +1892,9 @@ gboolean
 dlopen_interceptor_shutdown_dynamic_attach(void)
 {
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    atomic_store_explicit(&dlopen_listener_owner_pid,
+                          0,
+                          memory_order_release);
     dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN;
     pthread_cond_broadcast(&dynamic_attach_gate_cond);
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
@@ -1736,12 +1920,18 @@ void
 dlopen_interceptor_release_retained_dynamic_handles(void)
 {
     GPtrArray* retained_handles = NULL;
+    GHashTable* completed_fftw_modules = NULL;
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     retained_handles = dynamic_attach_retained_handles;
     dynamic_attach_retained_handles = NULL;
+    completed_fftw_modules = dlopen_completed_fftw_modules;
+    dlopen_completed_fftw_modules = NULL;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
+    if (completed_fftw_modules != NULL) {
+        g_hash_table_unref(completed_fftw_modules);
+    }
     if (retained_handles != NULL) {
         g_ptr_array_free(retained_handles, TRUE);
     }
@@ -1749,7 +1939,7 @@ dlopen_interceptor_release_retained_dynamic_handles(void)
 }
 
 typedef struct {
-    char* filename;
+    const char* filename;
     int binding_flags;
     gboolean callback_admitted;
     int previous_cancel_state;
@@ -1768,6 +1958,12 @@ gboolean
 dlopen_interceptor_test_callback_is_admitted(void)
 {
     return dlopen_interceptor_callback_is_admitted();
+}
+
+gboolean
+dlopen_interceptor_test_shutdown_dynamic_attach(void)
+{
+    return dlopen_interceptor_shutdown_dynamic_attach();
 }
 #endif
 
@@ -1798,7 +1994,8 @@ dlopen_interceptor_on_enter(GumInvocationContext* context, gpointer user_data)
         return;
     }
     invocation->callback_admitted = TRUE;
-    invocation->filename = g_strdup(filename);
+    /* The application must keep the dlopen argument valid until it returns. */
+    invocation->filename = filename;
     invocation->binding_flags = flags & (RTLD_LAZY | RTLD_NOW);
     if (invocation->binding_flags == 0) {
         invocation->binding_flags = RTLD_LAZY;
@@ -1830,6 +2027,16 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
         } else {
             /* Preserve the original asynchronous non-FFTW fast path. */
             unresolved.non_fftw = 1;
+        }
+        if (unresolved.fftw > 0) {
+            gum_interceptor_ignore_current_thread(dlopen_interceptor);
+            gboolean may_resolve_fftw =
+                dlopen_interceptor_handle_may_resolve_fftw(handle);
+            gum_interceptor_unignore_current_thread(dlopen_interceptor);
+            if (!may_resolve_fftw ||
+                dlopen_interceptor_fftw_module_scan_completed(handle)) {
+                unresolved.fftw = 0;
+            }
         }
         if (unresolved.fftw > 0 || unresolved.non_fftw > 0) {
             module_identity = dlopen_interceptor_module_identity(
@@ -1889,7 +2096,6 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
         }
     }
 
-    g_free(invocation->filename);
     invocation->filename = NULL;
     invocation->callback_admitted = FALSE;
     dlopen_interceptor_end_callback();
