@@ -5,8 +5,10 @@ devkit exposing the PC classification and safe-point hooks described in
 `docs/physical-detach-controller.md`. On Linux x86_64 and Linux Arm64 the
 default `auto` provider now downloads the Frida Gum devkit, copies it to a
 PEAK-patched devkit directory, guards Gum's online in-memory ELF fallback, and
-appends PEAK's Gum PC API implementation to the archive. Other platforms keep
-using the stock prebuilt devkit unless a patched devkit is selected explicitly.
+appends PEAK's Gum PC API implementation to the archive. On x86_64 it also
+routes attach-time redirect resolution through PEAK's exact-entry API. Other
+platforms keep using the stock prebuilt devkit unless a patched devkit is
+selected explicitly.
 
 ## Default Provider
 
@@ -67,7 +69,10 @@ cmake -S . -B build-patched-gum \
 ```
 
 Selecting `patched-devkit` fails configuration unless the selected headers and
-`libfrida-gum.a` expose a linkable PEAK PC-classification API:
+`libfrida-gum.a` expose a linkable PEAK PC-classification API. On Linux x86_64,
+the devkit must also expose the exact-entry attach API shown below; otherwise
+Gum can follow an exported tail jump and attribute wrapper calls to the
+downstream implementation.
 
 ```c
 #define GUM_PEAK_PC_API_VERSION 1
@@ -114,6 +119,16 @@ gboolean gum_interceptor_peak_get_function_patch(
     guint * prologue_len);
 
 guint gum_interceptor_peak_abi_fingerprint(void);
+
+#if defined(__x86_64__) || defined(__amd64__)
+#define GUM_PEAK_EXACT_ATTACH_API_VERSION 1
+
+GumAttachReturn gum_interceptor_peak_attach_exact(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener,
+    const GumAttachOptions * options);
+#endif
 ```
 
 For custom Gum paths that are not selected through `patched-devkit`, set both
@@ -126,7 +141,9 @@ the PEAK API.
 PEAK wires the selected Gum provider into runtime capability checks. Strict
 mode is the default, so PEAK refuses target Gum mutation if the selected Gum
 headers do not expose the PEAK API.
-`PEAK_DETACH_BACKEND=helper` forces the external ptrace helper,
+On Linux x86_64, requesting PEAK API validation also requires the exact-entry
+API and fails at configure time if it is absent. `PEAK_DETACH_BACKEND=helper`
+forces the external ptrace helper,
 `PEAK_DETACH_BACKEND=signal` forces the in-process strict signal backend, and
 plain unset/`strict`/`auto` uses `auto`: helper by default, with signal selected
 up front when Linux `ptrace_scope` is detected as blocking helper attachment.

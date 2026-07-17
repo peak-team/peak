@@ -9,7 +9,7 @@ set(PEAK_PATCHED_GUM_INCLUDE_DIR "" CACHE PATH
 set(PEAK_PATCHED_GUM_LIBRARY "" CACHE FILEPATH
     "Static library for a PEAK-patched Frida Gum devkit")
 option(PEAK_REQUIRE_GUM_PEAK_API
-    "Require the selected Frida Gum headers to expose PEAK PC classification APIs"
+    "Require the selected Frida Gum headers to expose PEAK PC classification and x86 exact-entry APIs"
     OFF)
 
 macro(fetch_frida_gum _download_module_path _download_root)
@@ -366,6 +366,15 @@ int main(void)
     unset(PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API CACHE)
     check_c_source_compiles("${_peak_gum_exact_attach_probe_source}"
         PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API)
+
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_processor)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       _peak_processor MATCHES "^(x86_64|amd64)$" AND
+       NOT PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API)
+        message(FATAL_ERROR
+            "The selected PEAK-patched Frida Gum devkit does not expose the x86 exact-entry attach API. "
+            "Use the current auto-patched devkit, or rebuild the caller-provided devkit with GUM_PEAK_EXACT_ATTACH_API_VERSION=1 and gum_interceptor_peak_attach_exact().")
+    endif()
 
     set(CMAKE_REQUIRED_INCLUDES "${_saved_required_includes}")
     set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")

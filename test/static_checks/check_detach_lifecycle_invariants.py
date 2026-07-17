@@ -434,6 +434,25 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
             "close overlap guard must run before Gum mutates the close entry")
 
 
+def check_x86_patched_gum_requires_exact_attach(repo_root):
+    cmake = (repo_root / "cmake/frida-gum.cmake").read_text(encoding="utf-8")
+    match = re.search(
+        r"function\(_peak_validate_frida_gum_peak_api\).*?endfunction\(\)",
+        cmake,
+        flags=re.DOTALL,
+    )
+    require(match is not None, "missing patched Gum API validation function")
+    validate = match.group(0)
+    exact_probe = validate.find("PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API")
+    x86_guard = validate.find('MATCHES "^(x86_64|amd64)$"', exact_probe)
+    fatal = validate.find("message(FATAL_ERROR", x86_guard)
+    require(exact_probe != -1 and x86_guard != -1 and fatal != -1 and
+            exact_probe < x86_guard < fatal and
+            "NOT PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API" in
+            validate[x86_guard:fatal],
+            "Linux x86 PEAK-patched Gum must fail configuration without exact-entry attach")
+
+
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
@@ -2033,6 +2052,7 @@ def main():
     check_dlopen_resolution_lock_order(repo_root)
     check_dlopen_fftw_scope_and_fork_guard(repo_root)
     check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root)
+    check_x86_patched_gum_requires_exact_attach(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
     check_final_report_snapshot_order(repo_root)
