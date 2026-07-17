@@ -15,6 +15,7 @@ typedef struct {
     GumAttachOptions options;
     gpointer mutation_address;
     gsize mutation_guard_size;
+    gboolean attach_exact_entry;
 } PeakGumTargetAttachPlan;
 
 PeakUnsafeGumProloguePolicy
@@ -34,20 +35,22 @@ peak_gum_prologue_too_short_for_attach(gpointer address,
                                        const char** reason_out);
 
 /*
- * Plans a profiling-target attach. On Linux/AArch64 this narrowly opts
- * canonical B-to-PLT thunks into Gum's forced relocation path only when Gum
- * exposes the exact maximum patch range, and reports the PLT entry that Gum
- * will actually mutate. Otherwise the target retains Gum's checked default so
- * strict attach cannot perform an unguarded mutation.
+ * Plans a profiling-target attach. Linux/x86-64 exact-entry support keeps
+ * rel32 and RIP-indirect tail jumps at their exported boundaries.
+ * Linux/AArch64 narrowly opts canonical B-to-PLT thunks into Gum's forced
+ * relocation path and reports the PLT entry that Gum will actually mutate.
+ * Other targets retain Gum's checked default.
  */
 void
 peak_gum_target_attach_plan(gpointer address,
                             PeakGumTargetAttachPlan* plan_out);
 
-/* Initializes only the Gum options when no first-attach guard is needed. */
-void
-peak_gum_target_attach_options(gpointer address,
-                               GumAttachOptions* options_out);
+/* Applies a target plan, including exact-entry semantics when available. */
+GumAttachReturn
+peak_gum_interceptor_attach_target(GumInterceptor* interceptor,
+                                   gpointer address,
+                                   GumInvocationListener* listener,
+                                   const PeakGumTargetAttachPlan* plan);
 
 /*
  * Support hooks are PEAK runtime wrappers, not user profiling targets. PEAK

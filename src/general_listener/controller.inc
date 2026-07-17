@@ -85,6 +85,7 @@ static gboolean
 peak_general_controller_prepare_hook_mutation(size_t hook_id,
                                               GumInvocationListener* listener,
                                               PeakDetachOperation operation,
+                                              const PeakGumTargetAttachPlan* attach_plan,
                                               PeakDetachStatus* status_out)
 {
     PeakDetachRequest request = {
@@ -95,6 +96,12 @@ peak_general_controller_prepare_hook_mutation(size_t hook_id,
         .listener = listener,
         .operation = operation
     };
+    if (operation == PEAK_DETACH_OPERATION_REATTACH && attach_plan != NULL) {
+        request.blocked_pc_start = attach_plan->mutation_guard_size > 0
+            ? attach_plan->mutation_address
+            : NULL;
+        request.blocked_pc_size = attach_plan->mutation_guard_size;
+    }
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
     gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
 
@@ -213,6 +220,7 @@ static gboolean peak_general_controller_detach_if_requested_unlocked(
         if (!peak_general_controller_prepare_hook_mutation(hook_id,
                                                            listener,
                                                            PEAK_DETACH_OPERATION_DETACH,
+                                                           NULL,
                                                            &prepare_status)) {
             peak_general_controller_handle_prepare_failure_unlocked(hook_id,
                                                                     PEAK_HOOK_ATTACHED,
@@ -360,11 +368,14 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
         return FALSE;
     }
 
+    PeakGumTargetAttachPlan attach_plan;
+    peak_gum_target_attach_plan(hook_address[hook_id], &attach_plan);
     {
         PeakDetachStatus prepare_status = PEAK_DETACH_STATUS_ERROR;
         if (!peak_general_controller_prepare_hook_mutation(hook_id,
                                                            array_listener[hook_id],
                                                            PEAK_DETACH_OPERATION_REATTACH,
+                                                           &attach_plan,
                                                            &prepare_status)) {
             peak_general_controller_handle_prepare_failure_unlocked(hook_id,
                                                                     PEAK_HOOK_DETACHED,
@@ -436,15 +447,12 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
 
     GumAttachReturn attach_status = GUM_ATTACH_OK;
     if (!helper_applied_physical_patch) {
-        GumAttachOptions attach_options;
-        peak_gum_target_attach_options(hook_address[hook_id],
-                                       &attach_options);
         gum_interceptor_begin_transaction(interceptor);
         attach_status =
-            gum_interceptor_attach(interceptor,
-                                   hook_address[hook_id],
-                                   array_listener[hook_id],
-                                   &attach_options);
+            peak_gum_interceptor_attach_target(interceptor,
+                                               hook_address[hook_id],
+                                               array_listener[hook_id],
+                                               &attach_plan);
         gum_interceptor_end_transaction(interceptor);
     }
     PeakDetachStatus finish_status = PEAK_DETACH_STATUS_ERROR;
@@ -533,6 +541,7 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
         if (!peak_general_controller_prepare_hook_mutation(hook_id,
                                                            array_listener[hook_id],
                                                            PEAK_DETACH_OPERATION_SHUTDOWN,
+                                                           NULL,
                                                            &prepare_status)) {
             peak_general_shutdown_failure_note(
                 failure,
@@ -591,6 +600,7 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
         if (!peak_general_controller_prepare_hook_mutation(hook_id,
                                                            array_listener[hook_id],
                                                            PEAK_DETACH_OPERATION_SHUTDOWN,
+                                                           NULL,
                                                            &prepare_status)) {
             peak_general_shutdown_failure_note(
                 failure,
@@ -822,6 +832,17 @@ peak_general_controller_collect_batch_unlocked(
             .listener = array_listener[i],
             .operation = operation
         };
+        if (operation == PEAK_DETACH_OPERATION_REATTACH &&
+            requests[count].function_address != NULL) {
+            peak_gum_target_attach_plan(requests[count].function_address,
+                                        &candidates[count].attach_plan);
+            requests[count].blocked_pc_start =
+                candidates[count].attach_plan.mutation_guard_size > 0
+                    ? candidates[count].attach_plan.mutation_address
+                    : NULL;
+            requests[count].blocked_pc_size =
+                candidates[count].attach_plan.mutation_guard_size;
+        }
         last_selected = i;
         selected_any = TRUE;
         count++;
@@ -896,15 +917,13 @@ peak_general_controller_process_pending_batch_unlocked(void)
             peak_general_controller_set_state_unlocked(hook_id,
                                                        PEAK_HOOK_REATTACHING);
             if (!results[i].uses_physical_patch) {
-                GumAttachOptions attach_options;
-                peak_gum_target_attach_options(hook_address[hook_id],
-                                               &attach_options);
                 gum_interceptor_begin_transaction(interceptor);
                 attach_status[i] =
-                    gum_interceptor_attach(interceptor,
-                                           hook_address[hook_id],
-                                           array_listener[hook_id],
-                                           &attach_options);
+                    peak_gum_interceptor_attach_target(
+                        interceptor,
+                        hook_address[hook_id],
+                        array_listener[hook_id],
+                        &candidates[i].attach_plan);
                 gum_interceptor_end_transaction(interceptor);
                 mutation_ok[i] = attach_status[i] == GUM_ATTACH_OK;
             }

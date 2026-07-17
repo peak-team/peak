@@ -81,6 +81,11 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
         --ar "${CMAKE_AR}"
         --work-dir "${_output_dir}/frida-gum-elf-module-patch"
     )
+    if(_peak_processor MATCHES "^(x86_64|amd64)$")
+        list(APPEND _patch_command
+            --nm "${CMAKE_NM}"
+            --objcopy "${CMAKE_OBJCOPY}")
+    endif()
     if(CMAKE_RANLIB)
         list(APPEND _patch_command --ranlib "${CMAKE_RANLIB}")
     endif()
@@ -92,7 +97,7 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
         ERROR_VARIABLE _patch_stderr)
     if(NOT _patch_result EQUAL 0)
         message(FATAL_ERROR
-            "Failed to patch Frida Gum ELF module header guard:\n${_patch_stdout}\n${_patch_stderr}")
+            "Failed to patch Frida Gum archive:\n${_patch_stdout}\n${_patch_stderr}")
     endif()
     string(STRIP "${_patch_stdout}" _patch_stdout_stripped)
     if(_patch_stdout_stripped)
@@ -332,20 +337,45 @@ int main(void)
             PEAK_GUM_HAS_PEAK_PC_API)
     endif()
 
-    set(CMAKE_REQUIRED_INCLUDES "${_saved_required_includes}")
-    set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
-    set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_saved_try_compile_target_type}")
-
     if(NOT PEAK_GUM_HAS_PEAK_PC_API)
         message(FATAL_ERROR
             "The selected Frida Gum devkit does not expose a linkable PEAK PC classification API. "
             "Use the stock prebuilt provider, or point PEAK_PATCHED_GUM_ROOT at patched headers and libfrida-gum.a.")
     endif()
+
+    set(_peak_gum_exact_attach_probe_source "
+#include <frida-gum.h>
+
+#if !defined(GUM_PEAK_EXACT_ATTACH_API_VERSION) || \
+    GUM_PEAK_EXACT_ATTACH_API_VERSION != 1
+#error Missing PEAK exact-attach API
+#endif
+
+int main(void)
+{
+    typedef GumAttachReturn (*PeakAttachExactFunc)(
+        GumInterceptor *,
+        gpointer,
+        GumInvocationListener *,
+        const GumAttachOptions *);
+    PeakAttachExactFunc volatile attach_exact =
+        gum_interceptor_peak_attach_exact;
+    return attach_exact == NULL;
+}
+")
+    unset(PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API CACHE)
+    check_c_source_compiles("${_peak_gum_exact_attach_probe_source}"
+        PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API)
+
+    set(CMAKE_REQUIRED_INCLUDES "${_saved_required_includes}")
+    set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_saved_try_compile_target_type}")
 endfunction()
 
 macro(configure_frida_gum _download_module_path _download_root)
     set(PEAK_GUM_PEAK_API_AVAILABLE OFF)
     set(PEAK_GUM_PEAK_PC_API_AVAILABLE OFF)
+    set(PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE OFF)
     set(_peak_using_peak_patched_gum_api OFF)
 
     if(NOT PEAK_FRIDA_GUM_PROVIDER STREQUAL "auto" AND
@@ -414,5 +444,8 @@ macro(configure_frida_gum _download_module_path _download_root)
         _peak_validate_frida_gum_peak_api()
         set(PEAK_GUM_PEAK_API_AVAILABLE ON)
         set(PEAK_GUM_PEAK_PC_API_AVAILABLE ON)
+        if(PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API)
+            set(PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE ON)
+        endif()
     endif()
 endmacro()

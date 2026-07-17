@@ -1318,6 +1318,19 @@ dlopen_interceptor_log_attach_prepare_result(
 }
 
 static void
+dlopen_interceptor_log_gum_attach_failure(
+    const PeakDetachRequest* mutation_request,
+    GumAttachReturn status)
+{
+    g_printerr("[peak] dynamic Gum attach failed for hook %lu (%s), status=%d\n",
+               (unsigned long)mutation_request->hook_id,
+               mutation_request->symbol_name != NULL
+                   ? mutation_request->symbol_name
+                   : "<unknown>",
+               status);
+}
+
+static void
 dlopen_interceptor_attach_candidate_scalar(
     PeakDlopenAttachCandidate* candidate,
     PeakDetachRequest* mutation_request,
@@ -1343,10 +1356,10 @@ dlopen_interceptor_attach_candidate_scalar(
 
     gum_interceptor_begin_transaction(mutation_request->interceptor);
     GumAttachReturn attach_status =
-        gum_interceptor_attach(mutation_request->interceptor,
-                               mutation_request->function_address,
-                               candidate->listener,
-                               &candidate->attach_plan.options);
+        peak_gum_interceptor_attach_target(mutation_request->interceptor,
+                                           mutation_request->function_address,
+                                           candidate->listener,
+                                           &candidate->attach_plan);
     gum_interceptor_end_transaction(mutation_request->interceptor);
     if (!peak_detach_controller_finish_hook_mutation(mutation_request,
                                                      &detach_status)) {
@@ -1359,6 +1372,8 @@ dlopen_interceptor_attach_candidate_scalar(
                                                     mutation_request,
                                                     retained_handle_for_hooks);
     } else {
+        dlopen_interceptor_log_gum_attach_failure(mutation_request,
+                                                  attach_status);
         dlopen_interceptor_release_attach_candidate(candidate);
     }
 }
@@ -1393,10 +1408,11 @@ dlopen_interceptor_attach_candidate_batch(
                 continue;
             }
             attach_statuses[i] =
-                gum_interceptor_attach(mutation_requests[i].interceptor,
-                                       mutation_requests[i].function_address,
-                                       candidates[i].listener,
-                                       &candidates[i].attach_plan.options);
+                peak_gum_interceptor_attach_target(
+                    mutation_requests[i].interceptor,
+                    mutation_requests[i].function_address,
+                    candidates[i].listener,
+                    &candidates[i].attach_plan);
         }
         gum_interceptor_end_transaction(mutation_requests[0].interceptor);
         if (!peak_detach_controller_finish_hook_mutation_batch(
@@ -1415,6 +1431,9 @@ dlopen_interceptor_attach_candidate_batch(
                     &mutation_requests[i],
                     retained_handle_for_hooks);
             } else {
+                dlopen_interceptor_log_gum_attach_failure(
+                    &mutation_requests[i],
+                    attach_statuses[i]);
                 dlopen_interceptor_release_attach_candidate(&candidates[i]);
             }
             continue;
@@ -1561,6 +1580,11 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
                 resolved_targets[i].address = NULL;
             } else if (resolved_targets[i].address != NULL) {
                 resolved_count++;
+                if (i < dlopen_sync_fftw_target_count &&
+                    dlopen_sync_fftw_targets != NULL &&
+                    dlopen_sync_fftw_targets[i]) {
+                    resolved_fftw_from_handle = TRUE;
+                }
             }
         }
     }
@@ -1702,23 +1726,15 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
     if ((request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY ||
          request->scope == PEAK_DLOPEN_ATTACH_ALL) &&
         !retry_later &&
-        peak_hook_address_count == target_count) {
+        peak_hook_address_count == target_count &&
+        resolved_fftw_from_handle) {
+        /*
+         * This provider's complete scan reached terminal outcomes.  A Gum
+         * signature failure remains unresolved globally so another provider
+         * may satisfy it, but reopening this same primary module need not
+         * repeat the scan.  Retryable controller outcomes never get here.
+         */
         completed_fftw_scan = TRUE;
-        for (size_t i = 0; i < target_count; i++) {
-            if (i >= dlopen_sync_fftw_target_count ||
-                dlopen_sync_fftw_targets == NULL ||
-                !dlopen_sync_fftw_targets[i] ||
-                resolved_targets[i].address == NULL) {
-                continue;
-            }
-            resolved_fftw_from_handle = TRUE;
-            if (dlopen_interceptor_target_is_unresolved_unlocked(i)) {
-                completed_fftw_scan = FALSE;
-                break;
-            }
-        }
-        completed_fftw_scan = completed_fftw_scan &&
-                              resolved_fftw_from_handle;
     }
     peak_general_listener_controller_unlock();
     gum_interceptor_unignore_current_thread(target_interceptor);

@@ -150,6 +150,64 @@ main(void)
         0x0f, 0x1f, 0x00,             /* nopl (%rax) */
         0xc3                          /* ret */
     };
+    static const guint8 rel32_tail_jump[] = {
+        0xe9, 0x00, 0x00, 0x00, 0x00 /* jmp next instruction */
+    };
+    static const guint8 rip_indirect_tail_jump[] = {
+        0xff, 0x25, 0x00, 0x00, 0x00, 0x00 /* jmpq *(%rip) */
+    };
+    PeakGumTargetAttachPlan attach_plan;
+
+    gum_init_embedded();
+    peak_gum_target_attach_plan((gpointer)rel32_tail_jump, &attach_plan);
+#ifdef GUM_PEAK_EXACT_ATTACH_API_VERSION
+    if (!attach_plan.attach_exact_entry ||
+        attach_plan.mutation_address != (gpointer)rel32_tail_jump ||
+        attach_plan.mutation_guard_size != 5 ||
+        attach_plan.options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_DEFAULT ||
+        attach_plan.options.instrumentation.write_redirect == NULL ||
+        attach_plan.options.instrumentation.redirect_space_hint != 5) {
+        fputs("x86 rel32 tail jump did not produce an exact-entry attach plan\n",
+              stderr);
+        gum_deinit_embedded();
+        return 1;
+    }
+    peak_gum_target_attach_plan((gpointer)rip_indirect_tail_jump,
+                                &attach_plan);
+    if (!attach_plan.attach_exact_entry ||
+        attach_plan.mutation_address != (gpointer)rip_indirect_tail_jump ||
+        attach_plan.mutation_guard_size != 6 ||
+        attach_plan.options.instrumentation.write_redirect == NULL ||
+        attach_plan.options.instrumentation.redirect_space_hint != 6) {
+        fputs("x86 RIP-indirect tail jump did not produce an exact-entry attach plan\n",
+              stderr);
+        gum_deinit_embedded();
+        return 1;
+    }
+#else
+    if (attach_plan.attach_exact_entry ||
+        attach_plan.mutation_address != (gpointer)rel32_tail_jump ||
+        attach_plan.mutation_guard_size != 0 ||
+        attach_plan.options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_DEFAULT) {
+        fputs("stock Gum unexpectedly changed x86 tail-jump semantics\n",
+              stderr);
+        gum_deinit_embedded();
+        return 1;
+    }
+    peak_gum_target_attach_plan((gpointer)rip_indirect_tail_jump,
+                                &attach_plan);
+    if (attach_plan.attach_exact_entry ||
+        attach_plan.mutation_address != (gpointer)rip_indirect_tail_jump ||
+        attach_plan.mutation_guard_size != 0) {
+        fputs("stock Gum unexpectedly changed x86 indirect-jump semantics\n",
+              stderr);
+        gum_deinit_embedded();
+        return 1;
+    }
+#endif
+    gum_deinit_embedded();
 
     if (expect_policy("rdx-prefix-default", rdx_prefix,
                       PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT, TRUE) ||

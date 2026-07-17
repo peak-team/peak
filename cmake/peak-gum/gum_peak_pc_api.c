@@ -31,6 +31,52 @@ typedef guint8 PeakGumInterceptorType17;
 typedef struct _PeakGumInterceptorBackend17 PeakGumInterceptorBackend17;
 typedef struct _PeakGumFunctionContext17 PeakGumFunctionContext17;
 typedef union _PeakGumFunctionContextBackendData17 PeakGumFunctionContextBackendData17;
+#if defined(__x86_64__) || defined(__amd64__)
+typedef struct _GumInterceptorBackend GumInterceptorBackend;
+
+G_GNUC_INTERNAL gpointer
+_gum_interceptor_backend_resolve_redirect(
+    GumInterceptorBackend * backend,
+    gpointer address);
+
+static _Thread_local gpointer peak_gum_exact_attach_target;
+
+/*
+ * The devkit patch routes guminterceptor.c's one backend-resolver reference
+ * through this dispatch.  Gum's backend implementation remains untouched.
+ * Only the thread performing peak_attach_exact suppresses the first redirect
+ * at the requested entry; this is attach-time only and adds no profiled-call
+ * cost.
+ */
+G_GNUC_INTERNAL gpointer
+_gum_interceptor_backend_resolve_redirect_peak_dispatch(
+    GumInterceptorBackend * backend,
+    gpointer address)
+{
+    if (address == peak_gum_exact_attach_target) {
+        return NULL;
+    }
+
+    return _gum_interceptor_backend_resolve_redirect(backend, address);
+}
+
+GumAttachReturn
+gum_interceptor_peak_attach_exact(GumInterceptor * interceptor,
+                                  gpointer function_address,
+                                  GumInvocationListener * listener,
+                                  const GumAttachOptions * options)
+{
+    gpointer previous_target = peak_gum_exact_attach_target;
+
+    peak_gum_exact_attach_target = function_address;
+    GumAttachReturn result = gum_interceptor_attach(interceptor,
+                                                    function_address,
+                                                    listener,
+                                                    options);
+    peak_gum_exact_attach_target = previous_target;
+    return result;
+}
+#endif
 
 #if defined(__x86_64__) || defined(__amd64__)
 #define PEAK_GUM_PC_ABI_FINGERPRINT \

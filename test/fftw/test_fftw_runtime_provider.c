@@ -3,6 +3,18 @@
 
 static volatile size_t provider_call_count;
 
+#if defined(__ELF__) && (defined(__x86_64__) || defined(__amd64__))
+/* A terminal PEAK prologue rejection used to verify per-provider scan cache. */
+__asm__(
+    ".pushsection .text\n"
+    ".globl fftw_alignment_of\n"
+    ".type fftw_alignment_of,@function\n"
+    "fftw_alignment_of:\n"
+    "ret\n"
+    ".size fftw_alignment_of, .-fftw_alignment_of\n"
+    ".popsection\n");
+#endif
+
 __attribute__((visibility("default"), noinline))
 void* fftw_malloc(size_t size)
 {

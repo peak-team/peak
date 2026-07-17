@@ -3333,6 +3333,11 @@ peak_detach_controller_canonical_function_address(
         return snapshot->diagnostics.function_address;
     }
 
+    if (request != NULL && request->blocked_pc_start != NULL &&
+        request->blocked_pc_size > 0) {
+        return request->blocked_pc_start;
+    }
+
     return request != NULL ? request->function_address : NULL;
 }
 
