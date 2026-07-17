@@ -23,4 +23,7 @@ gboolean peak_general_listener_dynamic_symbol_matches_any_target(
 gboolean peak_general_listener_checkpoint_for_exec(
     unsigned long long checkpoint_index);
 
+/* Starts target lifecycle processing after startup-only Gum hooks are ready. */
+void peak_general_listener_controller_start(void);
+
 #endif /* __PEAK_GENERAL_LISTENER_INTERNAL_H */

@@ -29,10 +29,12 @@ listener attach/detach is also guarded because it changes a
 process-wide Gum patch site. With stock Gum, startup target hooks are skipped,
 already-attached target hooks remain attached, and PEAK logs why target
 mutation was skipped. Process-lifetime support hooks keep explicit startup/shutdown
-  ordering outside steady-state target detach. Malloc profiling still attaches
-  after PEAK initialization so it does not profile PEAK setup allocations, but
-  shutdown stops the target controller before malloc detach so allocator Gum
-  mutations do not overlap target physical detach/reattach windows.
+ordering outside steady-state target detach. Startup target hooks and the
+process-lifetime `close`, allocator, and inert `dlopen` hooks are installed
+before the target controller starts. Runtime `dlopen` callback admission opens
+only after that start, and the heartbeat thread starts last. Shutdown stops the
+target controller before malloc detach so allocator Gum mutations do not
+overlap target physical detach/reattach windows.
 
 The legacy cooperative signal pause path is not considered strict-safe. It
 cannot classify program counters, cannot advance only audited PEAK/Gum safe
@@ -763,7 +765,7 @@ real dlopen:
 listener on-leave:
     classify unresolved targets using exact built-in FFTW group membership
     resolve only unresolved FFTW targets through the returned handle
-    attach resolved targets through the existing guarded controller path
+    attach distinct resolved addresses in bounded strict ATTACH batches
     enqueue at most one canonical asynchronous request when fallback is needed
     return the real handle unchanged
 
@@ -802,7 +804,9 @@ application thread does not wait for an asynchronous retry or a new
 controller's bounded stop and classification protocol. Calls made from DSO
 constructors before `dlopen` reaches its on-leave callback, `dlmopen`
 namespaces, and exact IFUNC resolver/wrapper
-boundaries are not part of this contract. A multithreaded `fork()` child must
+boundaries are not part of this contract. A constructor that exits the loader
+thread with `pthread_exit()` or bypasses on-leave with a non-local jump is also
+unsupported because callback cleanup cannot run. A multithreaded `fork()` child must
 still `exec` before using the profiling runtime. When Gum dispatches a fresh
 child `dlopen` callback, a PID guard makes it bypass PEAK before touching
 PEAK-owned mutexes or allocation. It does not make the loader or Gum generally
@@ -831,9 +835,10 @@ controller cycle and drains at most that snapshot size and at most the fixed
 budget. Retryable dynamic attach requests are requeued for a later controller
 cycle, so one temporarily unsafe library cannot consume the entire same-cycle
 budget by being reprocessed repeatedly. Dynamic attach prepare retries are
-limited to transient `TIMEOUT`, `CLASSIFY_FAILED`, and recoverable `ERROR`
-statuses; `PERMISSION_DENIED` is treated as terminal for queued dynamic attach
-work so persistent ptrace policy failures cannot pin queue slots indefinitely.
+limited to transient `TIMEOUT` and `CLASSIFY_FAILED` statuses. Generic `ERROR`
+and `PERMISSION_DENIED` are terminal for queued dynamic attach work so fatal
+controller or persistent ptrace-policy failures cannot pin queue slots
+indefinitely.
 
 Final `dlopen` listener teardown uses the existing guarded `SHUTDOWN` operation
 to detach the listener and close admission. PEAK then waits for already-entered

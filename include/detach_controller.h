@@ -69,6 +69,9 @@ gboolean peak_detach_controller_prepare_hook_mutation(
 
 gboolean peak_detach_controller_strict_batch_supported(void);
 
+/* Larger mutation sets must be split into chunks no larger than this value. */
+size_t peak_detach_controller_max_batch_requests(void);
+
 void peak_detach_controller_warmup_backend(void);
 
 gboolean peak_detach_controller_prepare_hook_mutation_batch(

@@ -1096,13 +1096,19 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
         PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
 
+        PeakGumTargetAttachPlan attach_plan;
+        peak_gum_target_attach_plan(symbol_address, &attach_plan);
         PeakDetachRequest mutation_request = {
             .hook_id = i,
             .symbol_name = peak_hook_strings[i],
             .function_address = symbol_address,
             .interceptor = interceptor,
             .listener = new_listener,
-            .operation = PEAK_DETACH_OPERATION_ATTACH
+            .operation = PEAK_DETACH_OPERATION_ATTACH,
+            .blocked_pc_start = attach_plan.mutation_guard_size > 0
+                ? attach_plan.mutation_address
+                : NULL,
+            .blocked_pc_size = attach_plan.mutation_guard_size
         };
         PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
@@ -1123,14 +1129,12 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             return result;
         }
 
-        GumAttachOptions attach_options;
-        peak_gum_target_attach_options(symbol_address, &attach_options);
         gum_interceptor_begin_transaction(interceptor);
         GumAttachReturn attach_status =
             gum_interceptor_attach(interceptor,
                                    symbol_address,
                                    new_listener,
-                                   &attach_options);
+                                   &attach_plan.options);
         gum_interceptor_end_transaction(interceptor);
 
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,

@@ -338,6 +338,25 @@ void peak_general_listener_attach()
         if (hook_address[i]) {
             // g_printerr ("%s address = %p\n", peak_hook_strings[i], hook_address[i]);
             gpointer resolved_hook_address = hook_address[i];
+            gboolean duplicate_address = FALSE;
+            for (size_t j = 0; j < i; j++) {
+                if (hook_address[j] == resolved_hook_address &&
+                    array_listener[j] != NULL) {
+                    duplicate_address = TRUE;
+                    break;
+                }
+            }
+            if (duplicate_address) {
+                hook_address[i] = NULL;
+                if (peak_demangled_strings[i] == NULL) {
+                    peak_demangled_strings[i] =
+                        g_strdup(peak_hook_strings[i]);
+                }
+                peak_log_debug("[peak] skipping duplicate startup target %s at %p\n",
+                               peak_hook_strings[i],
+                               resolved_hook_address);
+                continue;
+            }
             if (!peak_general_listener_attach_target_is_supported(
                     peak_hook_strings[i],
                     resolved_hook_address)) {
@@ -349,13 +368,19 @@ void peak_general_listener_attach()
             GumInvocationListener* new_listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
             PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
             hook_address[i] = NULL;
+            PeakGumTargetAttachPlan attach_plan;
+            peak_gum_target_attach_plan(resolved_hook_address, &attach_plan);
             PeakDetachRequest mutation_request = {
                 .hook_id = i,
                 .symbol_name = peak_hook_strings[i],
                 .function_address = resolved_hook_address,
                 .interceptor = interceptor,
                 .listener = new_listener,
-                .operation = PEAK_DETACH_OPERATION_ATTACH
+                .operation = PEAK_DETACH_OPERATION_ATTACH,
+                .blocked_pc_start = attach_plan.mutation_guard_size > 0
+                    ? attach_plan.mutation_address
+                    : NULL,
+                .blocked_pc_size = attach_plan.mutation_guard_size
             };
             PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
             if (!startup_attach_can_skip_stop &&
@@ -371,15 +396,12 @@ void peak_general_listener_attach()
                 g_object_unref(new_listener);
                 continue;
             }
-            GumAttachOptions attach_options;
-            peak_gum_target_attach_options(resolved_hook_address,
-                                           &attach_options);
             gum_interceptor_begin_transaction(interceptor);
             GumAttachReturn attach_status =
                 gum_interceptor_attach(interceptor,
                                        resolved_hook_address,
                                        new_listener,
-                                       &attach_options);
+                                       &attach_plan.options);
             gum_interceptor_end_transaction(interceptor);
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,
@@ -435,5 +457,4 @@ void peak_general_listener_attach()
         }
         peak_need_detach[0] = false;
     }
-    peak_general_controller_start();
 }

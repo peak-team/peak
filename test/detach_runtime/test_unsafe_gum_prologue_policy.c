@@ -241,17 +241,19 @@ main(void)
         UINT32_C(0x91000210),          /* add x16, x16, #0 */
         UINT32_C(0xd61f0220)           /* br x17 */
     };
-    GumAttachOptions attach_options;
+    PeakGumTargetAttachPlan attach_plan;
     long page_size;
     guint8* pages;
     guint32 cross_page_branch = UINT32_C(0x14000001);
 
     gum_init_embedded();
-    peak_gum_target_attach_options((gpointer)branch_to_canonical_plt,
-                                   &attach_options);
-    if (attach_options.instrumentation.relocation_policy !=
-        GUM_RELOCATION_FORCED) {
-        fprintf(stderr, "canonical Arm64 PLT branch did not select forced relocation\n");
+    peak_gum_target_attach_plan((gpointer)branch_to_canonical_plt,
+                                &attach_plan);
+    if (attach_plan.options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_FORCED ||
+        attach_plan.mutation_address != (gpointer)&branch_to_canonical_plt[1] ||
+        attach_plan.mutation_guard_size != GUM_PEAK_MAX_PROLOGUE_SIZE) {
+        fprintf(stderr, "canonical Arm64 PLT branch did not produce the expected attach plan\n");
         gum_deinit_embedded();
         return 1;
     }
@@ -280,11 +282,14 @@ main(void)
         return 1;
     }
     errno = EDOM;
-    peak_gum_target_attach_options(
+    peak_gum_target_attach_plan(
         pages + page_size - sizeof(cross_page_branch),
-        &attach_options);
-    if (attach_options.instrumentation.relocation_policy !=
-            GUM_RELOCATION_DEFAULT || errno != EDOM) {
+        &attach_plan);
+    if (attach_plan.options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_DEFAULT ||
+        attach_plan.mutation_address !=
+            pages + page_size - sizeof(cross_page_branch) ||
+        attach_plan.mutation_guard_size != 0 || errno != EDOM) {
         fprintf(stderr,
                 "unreadable Arm64 branch target did not fail safe or changed errno\n");
         mprotect(pages + page_size, (size_t)page_size,

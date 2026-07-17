@@ -11,6 +11,11 @@ void* fftw_malloc(size_t size)
     return pointer;
 }
 
+#if defined(__ELF__)
+void* fftw_alloc_real(size_t size)
+    __attribute__((alias("fftw_malloc"), visibility("default")));
+#endif
+
 __attribute__((visibility("default"), noinline))
 void fftw_free(void* pointer)
 {
