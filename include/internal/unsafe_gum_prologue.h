@@ -35,9 +35,10 @@ peak_gum_prologue_too_short_for_attach(gpointer address,
 
 /*
  * Plans a profiling-target attach. On Linux/AArch64 this narrowly opts
- * canonical B-to-PLT thunks into Gum's forced relocation path and reports the
- * PLT entry that Gum will actually mutate. All other targets retain Gum's
- * defaults and need no additional mutation guard.
+ * canonical B-to-PLT thunks into Gum's forced relocation path only when Gum
+ * exposes the exact maximum patch range, and reports the PLT entry that Gum
+ * will actually mutate. Otherwise the target retains Gum's checked default so
+ * strict attach cannot perform an unguarded mutation.
  */
 void
 peak_gum_target_attach_plan(gpointer address,

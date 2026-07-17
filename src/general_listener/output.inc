@@ -1384,6 +1384,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
         g_free(peak_demangled_strings[i]);
     }
     g_free(peak_demangled_strings);
+    peak_demangled_strings = NULL;
     free(argv_o);
     free(row_separator);
 }

@@ -62,10 +62,12 @@ void dlopen_interceptor_enable_dynamic_attach(void);
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
 
 /**
- * @brief Closes and releases dynamic attach work before listener teardown.
+ * @brief Closes callback admission and releases dynamic attach work.
  *
- * Queued handles that were not drained by the controller are released without
- * attaching new hooks.
+ * Active callbacks and controller drains are allowed to finish. Queued handles
+ * are then released without attaching new hooks. The Gum listener itself is
+ * not detached, so this also makes a process-lifetime pinned listener inert
+ * before report metadata is released.
  *
  * @return TRUE when active dynamic attach work and listener callbacks drained.
  */
@@ -99,6 +101,8 @@ PEAK_DLOPEN_API unsigned long long
 dlopen_interceptor_test_sync_scan_count(void);
 PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_callback_is_admitted(void);
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_shutdown_dynamic_attach(void);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
     const char* filename);
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_retry_dynamic_attach(

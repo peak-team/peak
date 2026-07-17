@@ -1386,6 +1386,82 @@ if(BUILD_TESTING)
                 TIMEOUT 30
         )
 
+        add_test(NAME test_fftw_runtime_unrelated_probe_fast_path
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    probe
+                    $<TARGET_FILE:test_fftw_runtime_unrelated>
+        )
+        set_tests_properties(test_fftw_runtime_unrelated_probe_fast_path
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_group_provider_cache
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    fast
+        )
+        set_tests_properties(test_fftw_runtime_group_provider_cache
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_extension_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    extension
+                    $<TARGET_FILE:test_fftw_runtime_extension>
+        )
+        set_tests_properties(test_fftw_runtime_extension_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|.*fftw_mpi_init[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_runtime_retry_not_cached
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    retry-fast
+        )
+        set_tests_properties(test_fftw_runtime_retry_not_cached
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw2_runtime_threads_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw2_runtime_threads_provider>
+                    single
+                    fftw_threads
+        )
+        set_tests_properties(test_fftw2_runtime_threads_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_threads[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_rfftw2_runtime_threads_first_call
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_rfftw2_runtime_threads_provider>
+                    single
+                    rfftw_threads
+        )
+        set_tests_properties(test_rfftw2_runtime_threads_first_call
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "rfftw_threads[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
         add_test(NAME test_dlopen_fork_child_pid_guard
             COMMAND $<TARGET_FILE:test_dlopen_fork_child_pid_guard>)
         set_tests_properties(test_dlopen_fork_child_pid_guard

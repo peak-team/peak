@@ -698,7 +698,15 @@ peak_fini_impl(void)
     }
     gboolean dlopen_shutdown_flushed = TRUE;
 #ifdef HAVE_MPI
-    if (!mpi_finalize_path)
+    if (mpi_finalize_path) {
+        /*
+         * PMPI_Finalize may load DSOs after PEAK writes its report. Keep the
+         * Gum listener physically pinned, but close admission and drain every
+         * callback before report metadata is released.
+         */
+        dlopen_shutdown_flushed =
+            dlopen_interceptor_shutdown_dynamic_attach();
+    } else
 #endif
     {
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();

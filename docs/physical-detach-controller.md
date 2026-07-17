@@ -788,6 +788,25 @@ path. Symbol resolution never holds the general-listener mutex, avoiding a
 loader-lock/listener-lock inversion between an on-leave callback and the
 asynchronous controller.
 
+Before computing a module identity or taking an `RTLD_NOLOAD` reference, PEAK
+probes a fixed set of public FFTW ABI anchors on the application's returned
+handle. Handle-scoped lookup includes loaded dependencies, so standard FFTW2,
+FFTW3 precision, MPI, and Fortran DSOs are recognized without filename or
+SONAME guessing. Separate FFTW2 complex-thread and real-thread anchors cover
+the official standalone thread libraries, which need not depend on the FFTW2
+core DSO. An unrelated `dlopen` therefore avoids both the full FFTW target scan
+and a second loader reference cycle. The listener also borrows the application's
+filename argument only until the intercepted call returns, so this fast path
+does not allocate merely to copy a still-live call argument.
+
+After a primary module has published at least one new listener, PEAK retains
+that module's loader handle. If the completed scan also leaves none of that
+module's resolved targets pending, later `dlopen` calls returning the same
+pinned primary module skip the full target scan. The cache uses the primary
+loader module, not a shared FFTW anchor address: an MPI or threads extension
+that resolves an anchor through its core dependency is therefore still scanned
+as a distinct module. Retryable and partial scans are never cached.
+
 PEAK prefers the loader-reported module identity from the successful returned
 handle, falling back to the caller's filename if that identity is unavailable,
 and uses the result for both synchronous retention and any queued fallback. A
@@ -845,6 +864,12 @@ to detach the listener and close admission. PEAK then waits for already-entered
 listener callbacks and dynamic attach drains before flushing Gum and releasing
 listener state. If either does not drain within the bounded shutdown window,
 teardown fails closed and leaves the interceptor state alive.
+
+On the MPI finalizer path where Gum listeners must remain physically pinned,
+PEAK performs the same admission close and callback/drain wait before report
+metadata can be released, but skips the physical listener detach. The pinned
+listener is therefore logically inert during the real MPI finalizer and later
+process cleanup.
 
 The final `dlopen` detach prepare is retried for a short bounded window on
 transient helper statuses, including temporary `ptrace` permission denial seen

@@ -396,6 +396,21 @@ test_retryable_prepare_statuses(void)
                !dlopen_interceptor_test_retryable_prepare_status(999));
 }
 
+static void
+test_pinned_shutdown_makes_listener_inert(void)
+{
+    reset_dynamic_attach_manual(TRUE);
+    check_true("open callback admission",
+               dlopen_interceptor_test_callback_is_admitted());
+    check_true("pinned shutdown drains dynamic attach",
+               dlopen_interceptor_test_shutdown_dynamic_attach());
+    check_true("pinned shutdown closes callback admission",
+               !dlopen_interceptor_test_callback_is_admitted());
+    check_true("pinned shutdown rejects later queue work",
+               !dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
+                   "after-pinned-shutdown"));
+}
+
 int
 main(void)
 {
@@ -410,6 +425,7 @@ main(void)
     test_extended_drop_and_retained_handle_diagnostics();
     test_trace_contains_queue_shape();
     test_retryable_prepare_statuses();
+    test_pinned_shutdown_makes_listener_inert();
     restore_dynamic_attach_automatic();
 
     int result = failures == 0 ? 0 : 1;

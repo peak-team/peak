@@ -64,15 +64,23 @@ main(int argc, char** argv)
     get_diagnostics_fn get_diagnostics;
     PeakDlopenDynamicAttachDiagnostics before = { 0 };
     PeakDlopenDynamicAttachDiagnostics after = { 0 };
-    const char* mode = argc == 3 ? argv[2] : "default";
+    const char* mode = argc >= 3 ? argv[2] : "default";
+    int mode_has_argument;
     unsigned long long scans_before;
     unsigned long long scans_after_load;
 
-    if ((argc != 2 && argc != 3) ||
+    mode_has_argument = strcmp(mode, "probe") == 0 ||
+                        strcmp(mode, "single") == 0 ||
+                        strcmp(mode, "extension") == 0;
+    if ((argc != 2 && argc != 3 && argc != 4) ||
         (strcmp(mode, "default") != 0 && strcmp(mode, "mixed") != 0 &&
-         strcmp(mode, "retry") != 0 && strcmp(mode, "fast") != 0)) {
+         strcmp(mode, "retry") != 0 && strcmp(mode, "fast") != 0 &&
+         strcmp(mode, "retry-fast") != 0 &&
+         strcmp(mode, "probe") != 0 && strcmp(mode, "single") != 0 &&
+         strcmp(mode, "extension") != 0) ||
+        mode_has_argument != (argc == 4)) {
         fprintf(stderr,
-                "usage: %s /path/to/provider [default|mixed|retry|fast]\n",
+                "usage: %s /path/to/provider [default|mixed|retry|retry-fast|fast|probe /path/to/unrelated|single symbol|extension /path/to/extension]\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -106,8 +114,24 @@ main(int argc, char** argv)
     set_manual_drain(1);
     get_diagnostics(&before);
     scans_before = sync_scan_count();
-    if (strcmp(mode, "retry") == 0) {
+    if (strcmp(mode, "retry") == 0 || strcmp(mode, "retry-fast") == 0) {
         force_sync_timeout();
+    }
+
+    if (strcmp(mode, "probe") == 0) {
+        void* unrelated_handle = dlopen(argv[3], RTLD_LAZY | RTLD_LOCAL);
+        if (unrelated_handle == NULL) {
+            fprintf(stderr, "unrelated dlopen failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        if (sync_scan_count() != scans_before) {
+            fputs("unrelated DSO triggered a full FFTW scan\n", stderr);
+            return EXIT_FAILURE;
+        }
+        if (dlclose(unrelated_handle) != 0) {
+            fprintf(stderr, "unrelated dlclose failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
     }
 
     void* handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
@@ -117,18 +141,27 @@ main(int argc, char** argv)
     }
     scans_after_load = sync_scan_count();
 
-    load_function(handle, "fftw_malloc", &fftw_malloc, sizeof(fftw_malloc));
-    load_function(handle, "fftw_free", &fftw_free, sizeof(fftw_free));
-    if (strcmp(mode, "mixed") == 0 || strcmp(mode, "retry") == 0) {
+    if (strcmp(mode, "single") == 0) {
+        plain_target_fn single_target;
+        load_function(handle, argv[3], &single_target, sizeof(single_target));
+        single_target();
+    } else {
         load_function(handle,
-                      "peak_runtime_non_fftw_target",
-                      &non_fftw_target,
-                      sizeof(non_fftw_target));
-        non_fftw_target();
-    }
+                      "fftw_malloc",
+                      &fftw_malloc,
+                      sizeof(fftw_malloc));
+        load_function(handle, "fftw_free", &fftw_free, sizeof(fftw_free));
+        if (strcmp(mode, "mixed") == 0 || strcmp(mode, "retry") == 0) {
+            load_function(handle,
+                          "peak_runtime_non_fftw_target",
+                          &non_fftw_target,
+                          sizeof(non_fftw_target));
+            non_fftw_target();
+        }
 
-    if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
-        return EXIT_FAILURE;
+        if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
+            return EXIT_FAILURE;
+        }
     }
 
     if (strcmp(mode, "mixed") == 0) {
@@ -137,6 +170,40 @@ main(int argc, char** argv)
     } else if (strcmp(mode, "retry") == 0) {
         explicit_drain();
         non_fftw_target();
+        if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
+            return EXIT_FAILURE;
+        }
+        void* second_handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
+        if (second_handle == NULL) {
+            fprintf(stderr, "post-retry dlopen failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        if (sync_scan_count() != scans_after_load) {
+            fputs("completed mixed retry did not cache the FFTW provider\n",
+                  stderr);
+            return EXIT_FAILURE;
+        }
+        if (dlclose(second_handle) != 0) {
+            fprintf(stderr, "post-retry dlclose failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+    } else if (strcmp(mode, "retry-fast") == 0) {
+        void* second_handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
+        if (second_handle == NULL) {
+            fprintf(stderr, "retry dlopen failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        if (sync_scan_count() != scans_after_load + 1) {
+            fputs("retryable FFTW scan was cached before completion\n",
+                  stderr);
+            return EXIT_FAILURE;
+        }
+        if (dlclose(second_handle) != 0) {
+            fprintf(stderr, "retry dlclose failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        scans_after_load = sync_scan_count();
+        explicit_drain();
         if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
             return EXIT_FAILURE;
         }
@@ -154,17 +221,45 @@ main(int argc, char** argv)
             fprintf(stderr, "second dlclose failed: %s\n", dlerror());
             return EXIT_FAILURE;
         }
+    } else if (strcmp(mode, "extension") == 0) {
+        plain_target_fn extension_target;
+        void* extension_handle = dlopen(argv[3], RTLD_LAZY | RTLD_LOCAL);
+        if (extension_handle == NULL) {
+            fprintf(stderr, "extension dlopen failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        if (sync_scan_count() != scans_after_load + 1) {
+            fputs("FFTW extension was hidden by the core provider cache\n",
+                  stderr);
+            return EXIT_FAILURE;
+        }
+        load_function(extension_handle,
+                      "fftw_mpi_init",
+                      &extension_target,
+                      sizeof(extension_target));
+        extension_target();
+        if (dlclose(extension_handle) != 0) {
+            fprintf(stderr, "extension dlclose failed: %s\n", dlerror());
+            return EXIT_FAILURE;
+        }
+        scans_after_load = sync_scan_count();
     }
 
     get_diagnostics(&after);
-    if (scans_after_load != scans_before + 1) {
+    unsigned long long expected_scan_delta =
+        (strcmp(mode, "extension") == 0 ||
+         strcmp(mode, "retry-fast") == 0) ? 2 : 1;
+    if (scans_after_load != scans_before + expected_scan_delta) {
         fprintf(stderr,
-                "expected one synchronous scan, before=%llu after=%llu\n",
+                "unexpected synchronous scan count, before=%llu after=%llu expected_delta=%llu\n",
                 scans_before,
-                scans_after_load);
+                scans_after_load,
+                expected_scan_delta);
         return EXIT_FAILURE;
     }
-    if ((strcmp(mode, "default") == 0 || strcmp(mode, "fast") == 0) &&
+    if ((strcmp(mode, "default") == 0 || strcmp(mode, "fast") == 0 ||
+         strcmp(mode, "probe") == 0 || strcmp(mode, "single") == 0 ||
+         strcmp(mode, "extension") == 0) &&
         after.enqueued != before.enqueued) {
         fputs("FFTW-only synchronous success queued duplicate work\n", stderr);
         return EXIT_FAILURE;
@@ -176,7 +271,8 @@ main(int argc, char** argv)
               stderr);
         return EXIT_FAILURE;
     }
-    if (strcmp(mode, "retry") == 0 &&
+    if ((strcmp(mode, "retry") == 0 ||
+         strcmp(mode, "retry-fast") == 0) &&
         (after.enqueued != before.enqueued ||
          after.requeued != before.requeued + 1 ||
          after.drained != before.drained + 1)) {

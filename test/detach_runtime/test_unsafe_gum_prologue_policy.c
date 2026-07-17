@@ -249,6 +249,7 @@ main(void)
     gum_init_embedded();
     peak_gum_target_attach_plan((gpointer)branch_to_canonical_plt,
                                 &attach_plan);
+#ifdef GUM_PEAK_MAX_PROLOGUE_SIZE
     if (attach_plan.options.instrumentation.relocation_policy !=
             GUM_RELOCATION_FORCED ||
         attach_plan.mutation_address != (gpointer)&branch_to_canonical_plt[1] ||
@@ -257,6 +258,16 @@ main(void)
         gum_deinit_embedded();
         return 1;
     }
+#else
+    if (attach_plan.options.instrumentation.relocation_policy !=
+            GUM_RELOCATION_DEFAULT ||
+        attach_plan.mutation_address != (gpointer)branch_to_canonical_plt ||
+        attach_plan.mutation_guard_size != 0) {
+        fprintf(stderr, "stock Gum must not force an unguarded Arm64 PLT attach\n");
+        gum_deinit_embedded();
+        return 1;
+    }
+#endif
 
     page_size = sysconf(_SC_PAGESIZE);
     pages = page_size > 0
