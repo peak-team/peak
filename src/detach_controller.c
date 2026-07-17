@@ -717,8 +717,7 @@ peak_detach_controller_validate_request(const PeakDetachRequest* request,
         }
         return FALSE;
     }
-    if (request->operation != PEAK_DETACH_OPERATION_ATTACH &&
-        request->operation != PEAK_DETACH_OPERATION_REPLACE &&
+    if (request->operation != PEAK_DETACH_OPERATION_REPLACE &&
         request->operation != PEAK_DETACH_OPERATION_REVERT &&
         request->listener == NULL) {
         if (status_out != NULL) {
@@ -4076,6 +4075,12 @@ peak_detach_controller_strict_batch_supported(void)
 #endif
 }
 
+size_t
+peak_detach_controller_max_batch_requests(void)
+{
+    return PEAK_DETACH_CONTROLLER_MAX_BATCH_REQUESTS;
+}
+
 void
 peak_detach_controller_warmup_backend(void)
 {
@@ -4218,7 +4223,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
             results[i].status = request_status;
             continue;
         }
-        if (requests[i].operation != PEAK_DETACH_OPERATION_DETACH &&
+        if (requests[i].operation != PEAK_DETACH_OPERATION_ATTACH &&
+            requests[i].operation != PEAK_DETACH_OPERATION_DETACH &&
             requests[i].operation != PEAK_DETACH_OPERATION_REATTACH) {
             results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
             continue;

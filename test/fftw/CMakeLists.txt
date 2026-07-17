@@ -26,4 +26,9 @@ if(UNIX)
         test_dlopen_fork_child_pid_guard.c)
     target_link_libraries(test_dlopen_fork_child_pid_guard PRIVATE
         ${CMAKE_DL_LIBS})
+    add_executable(test_fftw_dlopen_cancellation
+        test_fftw_dlopen_cancellation.c)
+    target_link_libraries(test_fftw_dlopen_cancellation PRIVATE
+        ${CMAKE_DL_LIBS}
+        Threads::Threads)
 endif()

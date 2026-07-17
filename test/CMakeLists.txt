@@ -1313,6 +1313,30 @@ if(BUILD_TESTING)
                 TIMEOUT 30
         )
 
+        add_test(NAME test_fftw_runtime_duplicate_target_group
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+        )
+        set_tests_properties(test_fftw_runtime_duplicate_target_group
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=fftw_malloc;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                FAIL_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+1\\|"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_fftw_startup_alias_single_listener
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+        )
+        set_tests_properties(test_fftw_startup_alias_single_listener
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};LD_PRELOAD=$<TARGET_FILE:test_fftw_runtime_provider>:${PROJECT_BINARY_DIR}/src/libpeak.so"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                FAIL_REGULAR_EXPRESSION "fftw_alloc_real[*]*\\|[ \t]+[1-9][0-9]*\\|"
+                TIMEOUT 30
+        )
+
         add_test(NAME test_fftw_runtime_dependency_first_call
             COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
                     $<TARGET_FILE:test_fftw_runtime_consumer>
@@ -1370,6 +1394,15 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "dlopen_fork_child_pid_guard_ok"
                 TIMEOUT 15
         )
+
+        add_test(NAME test_fftw_dlopen_cancellation_cleanup
+            COMMAND $<TARGET_FILE:test_fftw_dlopen_cancellation>
+                    $<TARGET_FILE:test_fftw_runtime_provider>)
+        set_tests_properties(test_fftw_dlopen_cancellation_cleanup
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_TEST_ENABLE_STRICT_GATE_DELAY=1;PEAK_TEST_STRICT_GATE_DELAY_US=250000;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_dlopen_cancellation_cleanup_ok"
+                TIMEOUT 15)
     endif()
     
     if(MPI_FOUND)

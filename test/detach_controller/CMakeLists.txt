@@ -3,6 +3,7 @@ add_executable(test_detach_controller
   ${PROJECT_SOURCE_DIR}/src/detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/logging.c
   ${PROJECT_SOURCE_DIR}/src/signal_policy.c
+  ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
   ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall.c
   $<TARGET_OBJECTS:utils_c>
 )
@@ -370,6 +371,20 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_fake_helper_shutdown_sequence
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>")
+
+  add_test(NAME test_detach_controller_fake_helper_batch_attach
+    COMMAND test_detach_controller fake-helper-batch-attach)
+  set_tests_properties(test_detach_controller_fake_helper_batch_attach
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=success-zero")
+
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_test(NAME test_detach_controller_fake_helper_arm64_attach_plan
+      COMMAND test_detach_controller fake-helper-arm64-attach-plan)
+    set_tests_properties(test_detach_controller_fake_helper_arm64_attach_plan
+      PROPERTIES
+        ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>")
+  endif()
 
   add_test(NAME test_detach_controller_fake_helper_batch_detach
     COMMAND test_detach_controller fake-helper-batch-detach)

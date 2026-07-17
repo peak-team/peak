@@ -46,7 +46,8 @@ peak_unsafe_gum_prologue_policy_name(PeakUnsafeGumProloguePolicy policy)
 
 #if defined(__linux__) && defined(__aarch64__)
 static gboolean
-peak_arm64_target_branches_to_elf_plt(gpointer address)
+peak_arm64_target_branches_to_elf_plt(gpointer address,
+                                      gpointer* plt_address_out)
 {
     guint32 branch;
     guint32 plt[4];
@@ -119,6 +120,9 @@ peak_arm64_target_branches_to_elf_plt(gpointer address)
     ldr_offset = ((plt[1] >> 10) & UINT32_C(0xfff)) * sizeof(gpointer);
     add_offset = (plt[2] >> 10) & UINT32_C(0xfff);
     matches = ldr_offset == add_offset;
+    if (matches && plt_address_out != NULL) {
+        *plt_address_out = (gpointer)plt_address;
+    }
 
 done:
     g_free(plt_copy);
@@ -129,26 +133,42 @@ done:
 #endif
 
 void
-peak_gum_target_attach_options(gpointer address,
-                               GumAttachOptions* options_out)
+peak_gum_target_attach_plan(gpointer address,
+                            PeakGumTargetAttachPlan* plan_out)
 {
-    g_return_if_fail(options_out != NULL);
+    g_return_if_fail(plan_out != NULL);
 
-    memset(options_out, 0, sizeof(*options_out));
+    memset(plan_out, 0, sizeof(*plan_out));
+    plan_out->mutation_address = address;
 #if defined(__linux__) && defined(__aarch64__)
+    gpointer plt_address = NULL;
+
     /*
      * Gum follows the leading B to the PLT entry, then its checked relocation
      * rejects that entry because all of x16/x17 are live. The exact sequence
      * above defines x16 before using it, so Gum's documented forced policy is
      * safe here and avoids any private-ABI or eager-binding workaround.
      */
-    if (peak_arm64_target_branches_to_elf_plt(address)) {
-        options_out->instrumentation.relocation_policy =
+    if (peak_arm64_target_branches_to_elf_plt(address, &plt_address)) {
+        plan_out->options.instrumentation.relocation_policy =
             GUM_RELOCATION_FORCED;
+        plan_out->mutation_address = plt_address;
+        plan_out->mutation_guard_size = GUM_PEAK_MAX_PROLOGUE_SIZE;
     }
 #else
     (void)address;
 #endif
+}
+
+void
+peak_gum_target_attach_options(gpointer address,
+                               GumAttachOptions* options_out)
+{
+    PeakGumTargetAttachPlan plan;
+
+    g_return_if_fail(options_out != NULL);
+    peak_gum_target_attach_plan(address, &plan);
+    *options_out = plan.options;
 }
 
 #if defined(__x86_64__) || defined(__amd64__)

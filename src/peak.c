@@ -401,6 +401,28 @@ peak_output_aggregation_mode(void)
 
 #endif
 
+static size_t
+peak_deduplicate_target_names(char** targets, size_t count)
+{
+    size_t unique_count = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        gboolean duplicate = FALSE;
+        for (size_t j = 0; j < unique_count; j++) {
+            if (strcmp(targets[i], targets[j]) == 0) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) {
+            free(targets[i]);
+        } else {
+            targets[unique_count++] = targets[i];
+        }
+    }
+    return unique_count;
+}
+
 void peak_init()
 {
 
@@ -411,6 +433,9 @@ void peak_init()
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);
+    peak_hook_address_count = peak_deduplicate_target_names(
+        peak_hook_strings,
+        peak_hook_address_count);
     peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
     peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     // TODO: add pre-defined kernels in the future: CUBLAS
@@ -501,10 +526,9 @@ void peak_init()
     peak_general_listener_attach();
     syscall_interceptor_attach();
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
+    gboolean dynamic_attach_listener_ready = FALSE;
     if (need_dynamic_attach) {
-        if (dlopen_interceptor_attach() == 0) {
-            dlopen_interceptor_enable_dynamic_attach();
-        }
+        dynamic_attach_listener_ready = dlopen_interceptor_attach() == 0;
     }
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
@@ -518,11 +542,22 @@ void peak_init()
         args->hb_k_err = hb_k_err;
         args->hb_k_rate = hb_k_rate;
         args->hb_ema_a = hb_ema_a;
+    }
+    if (peak_memory_profile) {
+        malloc_interceptor_attach();
+    }
+    peak_general_listener_controller_start();
+    if (dynamic_attach_listener_ready) {
+        dlopen_interceptor_enable_dynamic_attach();
+    }
+    if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
-        // create heartbeat thread
-        if (pthread_create(&heartbeat_thread, NULL, peak_heartbeat_monitor, args) != 0) {
+        if (pthread_create(&heartbeat_thread,
+                           NULL,
+                           peak_heartbeat_monitor,
+                           args) != 0) {
             perror("Failed to create heartbeat thread");
             g_free(args);
             args = NULL;
@@ -530,9 +565,6 @@ void peak_init()
             heartbeat_overhead = NULL;
             exit(EXIT_FAILURE);
         }
-    }
-    if (peak_memory_profile) {
-        malloc_interceptor_attach();
     }
 }
 

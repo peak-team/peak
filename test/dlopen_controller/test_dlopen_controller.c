@@ -370,8 +370,8 @@ test_retryable_prepare_statuses(void)
     check_true("classify-failed is retryable",
                dlopen_interceptor_test_retryable_prepare_status(
                    PEAK_DETACH_STATUS_CLASSIFY_FAILED));
-    check_true("error is retryable",
-               dlopen_interceptor_test_retryable_prepare_status(
+    check_true("error is terminal",
+               !dlopen_interceptor_test_retryable_prepare_status(
                    PEAK_DETACH_STATUS_ERROR));
     check_true("permission-denied is terminal",
                !dlopen_interceptor_test_retryable_prepare_status(

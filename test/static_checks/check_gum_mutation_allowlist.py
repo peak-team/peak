@@ -13,10 +13,10 @@ MUTATION_RE = re.compile(
 
 EXPECTED = {
     ("dlopen-controller", "src/dlopen_interceptor.c"): {
-        "attach": 2,
-        "begin_transaction": 3,
+        "attach": 3,
+        "begin_transaction": 4,
         "detach": 1,
-        "end_transaction": 3,
+        "end_transaction": 4,
         "flush": 2,
     },
     ("support-init", "src/malloc_interceptor.c"): {

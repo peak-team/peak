@@ -1227,8 +1227,8 @@ peak_general_controller_thread_main(void* arg)
     return NULL;
 }
 
-static void
-peak_general_controller_start(void)
+void
+peak_general_listener_controller_start(void)
 {
     pthread_mutex_lock(&general_controller_wake_mutex);
     if (!general_controller_thread_started) {

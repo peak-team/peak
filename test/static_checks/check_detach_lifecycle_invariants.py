@@ -144,6 +144,11 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     admission = extract_function(source, "dlopen_interceptor_callback_is_admitted")
     on_enter = extract_function(source, "dlopen_interceptor_on_enter")
     on_leave = extract_function(source, "dlopen_interceptor_on_leave")
+    enable = extract_function(source, "dlopen_interceptor_enable_dynamic_attach")
+    begin_callback_body = extract_function(
+        source, "dlopen_interceptor_begin_callback"
+    )
+    detach = extract_function(source, "dlopen_interceptor_dettach")
 
     require("source_target_array_FFTW[i]" in membership and
             "strcmp(name, source_target_array_FFTW[i]) == 0" in membership and
@@ -152,6 +157,17 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require("dlopen_interceptor_target_matches_scope_unlocked" in attach and
             "request->scope" in attach,
             "dynamic dlopen resolution must filter every request by scope")
+    duplicate_check = attach.find("if (duplicate_address)")
+    duplicate_mark = attach.find("peak_demangled_strings[i] = g_strdup(",
+                                 duplicate_check)
+    candidate_init = attach.find(
+        "dlopen_interceptor_initialize_attach_candidate(",
+        duplicate_check,
+    )
+    require(duplicate_check != -1 and duplicate_mark != -1 and
+            candidate_init != -1 and
+            duplicate_check < duplicate_mark < candidate_init,
+            "duplicate dynamic addresses must be terminal-skipped before attach")
     require("request.scope = PEAK_DLOPEN_ATTACH_FFTW_ONLY" in sync and
             "request.scope = retry_scope" in sync,
             "synchronous resolution must remain FFTW-only and preserve one retry scope")
@@ -167,16 +183,60 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "PEAK loader lookups must not leak dlerror state after successful dlopen")
 
     pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
-    begin_callback = on_enter.find("dlopen_interceptor_begin_callback()")
+    cancel_disable = on_enter.find("pthread_setcancelstate(PTHREAD_CANCEL_DISABLE")
+    begin_callback_position = on_enter.find("dlopen_interceptor_begin_callback()")
     filename_copy = on_enter.find("g_strdup(filename)")
-    require(pid_check != -1 and begin_callback != -1 and filename_copy != -1 and
-            pid_check < begin_callback < filename_copy,
-            "fork-child dlopen guard must run before PEAK mutexes and allocation")
-    require("getpid() == dlopen_listener_owner_pid" in admission and
+    require(pid_check != -1 and cancel_disable != -1 and
+            begin_callback_position != -1 and filename_copy != -1 and
+            pid_check < cancel_disable < begin_callback_position < filename_copy,
+            "fork-child guard and cancellation disable must precede callback state")
+    require("atomic_load_explicit(&dlopen_listener_owner_pid" in admission and
+            "getpid() == owner" in admission and
             "pthread_mutex" not in admission and "g_" not in admission,
             "fork-child admission predicate must be PID-only and lock-free")
+    require("atomic_store_explicit(&dlopen_listener_owner_pid" in enable and
+            "getpid()" in enable,
+            "dlopen callback admission must open only with dynamic attach")
+    owner_open = enable.find(
+        "atomic_store_explicit(&dlopen_listener_owner_pid"
+    )
+    state_open = enable.find(
+        "dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_OPEN"
+    )
+    enable_unlock = enable.find(
+        "pthread_mutex_unlock(&dynamic_attach_gate_mutex)"
+    )
+    require(owner_open != -1 and state_open != -1 and enable_unlock != -1 and
+            owner_open < state_open < enable_unlock,
+            "owner PID must publish before OPEN while holding the gate mutex")
+    require("dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN" in begin_callback_body and
+            "atomic_load_explicit(&dlopen_listener_owner_pid" in begin_callback_body and
+            "active_dlopen_callback_count++" in begin_callback_body,
+            "callback count admission must be revalidated under the gate mutex")
+    owner_close = detach.find(
+        "atomic_store_explicit(&dlopen_listener_owner_pid"
+    )
+    close_lock = detach.rfind(
+        "pthread_mutex_lock(&dynamic_attach_gate_mutex)",
+        0,
+        owner_close,
+    )
+    close_unlock = detach.find(
+        "pthread_mutex_unlock(&dynamic_attach_gate_mutex)",
+        owner_close,
+    )
+    require(owner_close != -1 and close_lock != -1 and close_unlock != -1 and
+            close_lock < owner_close < close_unlock,
+            "teardown must close callback admission under the gate mutex")
     require("if (!invocation->callback_admitted)" in on_leave,
             "dlopen on-leave must skip callbacks rejected by the fork PID guard")
+    end_callback = on_leave.find("dlopen_interceptor_end_callback()")
+    cancel_restore = on_leave.find(
+        "pthread_setcancelstate(invocation->previous_cancel_state"
+    )
+    require(end_callback != -1 and cancel_restore != -1 and
+            end_callback < cancel_restore,
+            "dlopen cancellation must be restored only after callback cleanup")
 
 
 def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
@@ -189,6 +249,65 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
             "Arm64 branch-to-PLT detection must safely read both ranges and preserve errno")
     require("memcpy(plt, plt_address" not in arm64,
             "Arm64 branch-to-PLT detection must not directly read a computed target")
+    plan = extract_function(unsafe, "peak_gum_target_attach_plan")
+    require("plan_out->mutation_address = plt_address" in plan and
+            "plan_out->mutation_guard_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in plan,
+            "Arm64 B-to-PLT attach plan must guard Gum's real mutation address")
+
+    general = read_source(repo_root, "src/general_listener.c")
+    initial_attach = extract_function(general, "peak_general_listener_attach")
+    jit_attach = extract_function(
+        general, "peak_general_listener_dynamic_attach_symbol"
+    )
+    dlopen_source = (repo_root / "src/dlopen_interceptor.c").read_text(
+        encoding="utf-8"
+    )
+    dlopen_plan = extract_function(
+        dlopen_source, "dlopen_interceptor_initialize_attach_candidate"
+    )
+    normalized_dlopen_plan = re.sub(r"\s+", " ", dlopen_plan)
+    for label, body in (
+        ("initial", initial_attach),
+        ("JIT", jit_attach),
+    ):
+        normalized = re.sub(r"\s+", " ", body)
+        plan_position = body.find("peak_gum_target_attach_plan(")
+        blocked_position = body.find(".blocked_pc_start =")
+        prepare_position = body.find("peak_detach_controller_prepare_hook_mutation")
+        require(plan_position != -1 and blocked_position != -1 and
+                prepare_position != -1 and
+                plan_position < blocked_position < prepare_position,
+                f"{label} first attach must guard its planned mutation range")
+        require(
+            ".blocked_pc_start = attach_plan.mutation_guard_size > 0 ? "
+            "attach_plan.mutation_address : NULL" in normalized and
+            ".blocked_pc_size = attach_plan.mutation_guard_size" in normalized and
+            "&attach_plan.options" in normalized,
+            f"{label} attach must use one plan for both strict guard and Gum options",
+        )
+    require(
+        "peak_gum_target_attach_plan(" in dlopen_plan and
+        ".blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0 ? "
+        "candidate->attach_plan.mutation_address : NULL" in normalized_dlopen_plan and
+        ".blocked_pc_size = candidate->attach_plan.mutation_guard_size" in normalized_dlopen_plan,
+        "dlopen first attach must put the exact planned mutation range in the request",
+    )
+    dlopen_scalar_attach = extract_function(
+        dlopen_source, "dlopen_interceptor_attach_candidate_scalar"
+    )
+    dlopen_batch_attach = extract_function(
+        dlopen_source, "dlopen_interceptor_attach_candidate_batch"
+    )
+    require("&candidate->attach_plan.options" in dlopen_scalar_attach and
+            "&candidates[i].attach_plan.options" in dlopen_batch_attach,
+            "dlopen Gum attach must use the same plan options as its strict guard")
+    dlopen_attach = extract_function(
+        dlopen_source, "dlopen_interceptor_attach_from_request"
+    )
+    require(dlopen_attach.find(
+                "dlopen_interceptor_initialize_attach_candidate(") != -1 and
+            dlopen_attach.find("dlopen_interceptor_attach_candidates(") != -1,
+            "dlopen mutation requests must be planned and processed through the guarded helpers")
 
     syscall = (repo_root / "src/syscall_interceptor.c").read_text(
         encoding="utf-8"
@@ -210,6 +329,12 @@ def check_peak_init_heartbeat_order(repo_root):
     body = extract_function(source, "peak_init")
     fini = extract_function(source, "peak_fini_impl")
 
+    group_load_position = body.find("load_symbols_from_array(PEAK_TARGET_GROUP_ENV")
+    deduplicate_position = body.find("peak_deduplicate_target_names(")
+    require(group_load_position != -1 and deduplicate_position != -1 and
+            group_load_position < deduplicate_position,
+            "explicit and group target names must be deduplicated before setup")
+
     main_time_position = body.find("peak_main_time = peak_second();")
     runtime_start_position = body.find("peak_general_listener_note_runtime_start")
     heartbeat_position = body.find("pthread_create(&heartbeat_thread")
@@ -222,6 +347,27 @@ def check_peak_init_heartbeat_order(repo_root):
             "peak_init must create the heartbeat thread explicitly")
     require(runtime_start_position < heartbeat_position,
             "runtime start timestamp must be initialized before heartbeat thread startup")
+
+    general = read_source(repo_root, "src/general_listener.c")
+    general_attach = extract_function(general, "peak_general_listener_attach")
+    require("peak_general_listener_controller_start" not in general_attach,
+            "general listener attach must not start mutation processing")
+    general_attach_position = body.find("peak_general_listener_attach()")
+    syscall_attach_position = body.find("syscall_interceptor_attach()")
+    dlopen_attach_position = body.find("dlopen_interceptor_attach()")
+    malloc_attach_position = body.find("malloc_interceptor_attach()")
+    controller_start_position = body.find(
+        "peak_general_listener_controller_start()"
+    )
+    dynamic_enable_position = body.find("dlopen_interceptor_enable_dynamic_attach()")
+    require(-1 not in (general_attach_position, syscall_attach_position,
+                       dlopen_attach_position, malloc_attach_position,
+                       controller_start_position, dynamic_enable_position) and
+            general_attach_position < syscall_attach_position <
+            dlopen_attach_position < malloc_attach_position <
+            controller_start_position < dynamic_enable_position <
+            heartbeat_position,
+            "startup Gum hooks must finish before controller and dlopen admission")
     elapsed_position = fini.find("peak_main_time = peak_second() - peak_runtime_start_time")
     controller_stop_position = fini.find("peak_general_listener_controller_stop()")
     require(elapsed_position != -1 and controller_stop_position != -1 and
@@ -1069,7 +1215,7 @@ def check_stop_window_accounting_sidecar(repo_root):
     )
     dlopen_attach = extract_function(dlopen, "dlopen_interceptor_attach")
     dlopen_dynamic = extract_function(
-        dlopen, "dlopen_interceptor_attach_from_request"
+        dlopen, "dlopen_interceptor_initialize_attach_candidate"
     )
     require("peak_unsafe_gum_prologue_check" not in support_attach_supported and
             "peak_unsafe_gum_support_prologue_check" not in support_attach_supported and

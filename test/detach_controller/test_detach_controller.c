@@ -1,4 +1,6 @@
 #include "detach_controller.h"
+#include "detach_helper_protocol.h"
+#include "internal/unsafe_gum_prologue.h"
 #include "signal_policy.h"
 
 #include <dirent.h>
@@ -231,8 +233,7 @@ valid_request(PeakDetachOperation operation)
         .symbol_name = "test_symbol",
         .function_address = (gpointer)0x1,
         .interceptor = (GumInterceptor*)0x2,
-        .listener = (operation == PEAK_DETACH_OPERATION_ATTACH ||
-                     operation == PEAK_DETACH_OPERATION_REPLACE ||
+        .listener = (operation == PEAK_DETACH_OPERATION_REPLACE ||
                      operation == PEAK_DETACH_OPERATION_REVERT)
                         ? NULL
                         : (GumInvocationListener*)0x3,
@@ -1268,6 +1269,221 @@ run_fake_helper_shutdown_sequence(void)
 }
 
 static int
+run_fake_helper_batch_attach(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "fake-helper-batch-attach requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_batch_attach_log_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener_one;
+    GumInvocationListener* listener_two;
+    GumAttachReturn attach_one;
+    GumAttachReturn attach_two;
+    PeakDetachBatchResult results[2];
+    size_t prepared_count = 0;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (set_fake_helper_env_default("success-zero", log_template) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener_one = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    listener_two = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+
+    PeakDetachRequest requests[2] = {
+        {
+            .hook_id = 39,
+            .symbol_name = "strict_helper_target",
+            .function_address = (gpointer)strict_helper_target,
+            .interceptor = interceptor,
+            .listener = listener_one,
+            .operation = PEAK_DETACH_OPERATION_ATTACH
+        },
+        {
+            .hook_id = 40,
+            .symbol_name = "strict_helper_target_two",
+            .function_address = (gpointer)strict_helper_target_two,
+            .interceptor = interceptor,
+            .listener = listener_two,
+            .operation = PEAK_DETACH_OPERATION_ATTACH
+        }
+    };
+
+    check_true("batch attach capacity covers focused test",
+               peak_detach_controller_max_batch_requests() >= 2);
+    check_true("batch attach prepare",
+               peak_detach_controller_prepare_hook_mutation_batch(
+                   requests,
+                   2,
+                   results,
+                   &prepared_count,
+                   &status) == TRUE);
+    check_status("batch attach status", status, PEAK_DETACH_STATUS_SAFE);
+    check_int("batch attach prepared count", (int)prepared_count, 2);
+    check_true("first batch attach prepared", results[0].prepared == TRUE);
+    check_true("second batch attach prepared", results[1].prepared == TRUE);
+    check_true("first batch attach is not physical",
+               results[0].uses_physical_patch == FALSE);
+    check_true("second batch attach is not physical",
+               results[1].uses_physical_patch == FALSE);
+    check_true("batch attach holds helper threads",
+               peak_detach_controller_threads_are_held() == TRUE);
+    check_true("batch attach does not report a physical mutation",
+               peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
+
+    gum_interceptor_begin_transaction(interceptor);
+    attach_one = gum_interceptor_attach(interceptor,
+                                        (gpointer)strict_helper_target,
+                                        listener_one,
+                                        NULL);
+    attach_two = gum_interceptor_attach(interceptor,
+                                        (gpointer)strict_helper_target_two,
+                                        listener_two,
+                                        NULL);
+    gum_interceptor_end_transaction(interceptor);
+    check_true("first Gum batch attach", attach_one == GUM_ATTACH_OK);
+    check_true("second Gum batch attach", attach_two == GUM_ATTACH_OK);
+
+    check_true("batch attach finish",
+               peak_detach_controller_finish_hook_mutation_batch(&status) == TRUE);
+    check_status("batch attach finish status", status, PEAK_DETACH_STATUS_SAFE);
+    check_true("batch attach released helper threads",
+               peak_detach_controller_threads_are_held() == FALSE);
+
+    gum_interceptor_flush(interceptor);
+    strict_helper_target();
+    strict_helper_target_two();
+    if (attach_one == GUM_ATTACH_OK) {
+        gum_interceptor_detach(interceptor, listener_one);
+    }
+    if (attach_two == GUM_ATTACH_OK) {
+        gum_interceptor_detach(interceptor, listener_two);
+    }
+    gum_interceptor_flush(interceptor);
+    check_true("batch attach helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+
+    check_helper_log_count(log_template, "START", 1);
+    check_helper_log_count(log_template, "STOP", 1);
+    check_helper_log_count(log_template, "EVACUATE", 0);
+    check_helper_log_count(log_template, "RESUME", 1);
+    check_helper_log_count(log_template, "SHUTDOWN", 1);
+
+    g_object_unref(listener_one);
+    g_object_unref(listener_two);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_fake_helper_arm64_attach_plan(void)
+{
+#if !defined(PEAK_HAVE_GUM_PEAK_PC_API) || !defined(__aarch64__)
+    fprintf(stderr,
+            "fake-helper-arm64-attach-plan requires AArch64 and PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    char log_template[] = "/tmp/peak_fake_helper_arm64_attach_plan_XXXXXX";
+    int log_fd = mkstemp(log_template);
+    guint32 branch_to_canonical_plt[20] = {
+        [0] = UINT32_C(0x14000010),  /* b +64 */
+        [16] = UINT32_C(0x90000010), /* adrp x16, ... */
+        [17] = UINT32_C(0xf9400211), /* ldr x17, [x16, #0] */
+        [18] = UINT32_C(0x91000210), /* add x16, x16, #0 */
+        [19] = UINT32_C(0xd61f0220)  /* br x17 */
+    };
+    GumInterceptor* interceptor;
+    GumInvocationListener* listener;
+    PeakGumTargetAttachPlan plan;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (log_fd < 0) {
+        perror("mkstemp");
+        return EXIT_FAILURE;
+    }
+    close(log_fd);
+    if (set_fake_helper_env_default("synthetic-stop", log_template) != 0 ||
+        setenv("FAKE_DETACH_HELPER_STOP_TID", "target-pid", 1) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    peak_gum_target_attach_plan((gpointer)branch_to_canonical_plt, &plan);
+    check_true("Arm64 attach plan selects forced relocation",
+               plan.options.instrumentation.relocation_policy ==
+                   GUM_RELOCATION_FORCED);
+    check_true("Arm64 attach plan points at PLT entry",
+               plan.mutation_address ==
+                   (gpointer)&branch_to_canonical_plt[16]);
+    check_true("Arm64 attach plan has a mutation guard",
+               plan.mutation_guard_size == GUM_PEAK_MAX_PROLOGUE_SIZE);
+    if (set_fake_helper_pointer_env("FAKE_DETACH_HELPER_STOP_PC",
+                                    plan.mutation_address) != 0) {
+        perror("setenv");
+        unlink(log_template);
+        return EXIT_FAILURE;
+    }
+
+    gum_init_embedded();
+    interceptor = gum_interceptor_obtain();
+    listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+    PeakDetachRequest request = {
+        .hook_id = 41,
+        .symbol_name = "arm64_branch_to_plt",
+        .function_address = (gpointer)branch_to_canonical_plt,
+        .interceptor = interceptor,
+        .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_ATTACH,
+        .blocked_pc_start = plan.mutation_address,
+        .blocked_pc_size = plan.mutation_guard_size
+    };
+
+    check_prepare("Arm64 PLT mutation live PC",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+    const PeakDetachFailureDetail* detail =
+        peak_detach_controller_last_failure_detail();
+    check_true("Arm64 attach rejects the planned PLT range",
+               detail != NULL && detail->reason != NULL &&
+               strcmp(detail->reason, "blocked-pc") == 0);
+    check_true("Arm64 rejected attach leaves no held mutation",
+               peak_detach_controller_threads_are_held() == FALSE);
+    check_true("Arm64 attach-plan helper shutdown",
+               peak_detach_controller_shutdown_helper(&status) == TRUE);
+    check_status("Arm64 attach-plan helper shutdown status",
+                 status,
+                 PEAK_DETACH_STATUS_SAFE);
+    check_helper_log_count(log_template, "STOP", 1);
+    check_helper_log_count(log_template, "EVACUATE", 0);
+    check_helper_log_count(log_template, "RESUME", 1);
+
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    unlink(log_template);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_fake_helper_batch_detach(void)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
@@ -2292,15 +2508,39 @@ run_batch_guards(void)
 
     gum_init_embedded();
 
-    PeakDetachRequest unsupported_requests[4] = {
-        {
-            .hook_id = 71,
-            .symbol_name = "unsupported_attach",
-            .function_address = (gpointer)(uintptr_t)0x7100,
-            .interceptor = (GumInterceptor*)(uintptr_t)0x7110,
-            .listener = NULL,
-            .operation = PEAK_DETACH_OPERATION_ATTACH
-        },
+    check_true("batch capacity matches helper protocol",
+               peak_detach_controller_max_batch_requests() ==
+                   PEAK_DETACH_HELPER_MAX_BATCH_WRITES);
+
+    PeakDetachRequest invalid_attach_request = {
+        .hook_id = 71,
+        .symbol_name = "invalid_attach_listener",
+        .function_address = (gpointer)(uintptr_t)0x7100,
+        .interceptor = (GumInterceptor*)(uintptr_t)0x7110,
+        .listener = NULL,
+        .operation = PEAK_DETACH_OPERATION_ATTACH
+    };
+
+    memset(results, 0xff, sizeof(results));
+    check_true("attach batch without listener rejected",
+               peak_detach_controller_prepare_hook_mutation_batch(
+                   &invalid_attach_request,
+                   1,
+                   results,
+                   &prepared_count,
+                   &status) == FALSE);
+    check_int("invalid attach prepared count", (int)prepared_count, 0);
+    check_status("invalid attach aggregate status",
+                 status,
+                 PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+    check_true("invalid attach not prepared", results[0].prepared == FALSE);
+    check_true("invalid attach not physical",
+               results[0].uses_physical_patch == FALSE);
+    check_status("invalid attach status",
+                 results[0].status,
+                 PEAK_DETACH_STATUS_ERROR);
+
+    PeakDetachRequest unsupported_requests[3] = {
         {
             .hook_id = 72,
             .symbol_name = "unsupported_shutdown",
@@ -2327,11 +2567,13 @@ run_batch_guards(void)
         }
     };
 
+    status = PEAK_DETACH_STATUS_SAFE;
+    prepared_count = 99;
     memset(results, 0xff, sizeof(results));
     check_true("unsupported batch rejected",
                peak_detach_controller_prepare_hook_mutation_batch(
                    unsupported_requests,
-                   4,
+                   3,
                    results,
                    &prepared_count,
                    &status) == FALSE);
@@ -2339,7 +2581,7 @@ run_batch_guards(void)
     check_status("unsupported batch aggregate status",
                  status,
                  PEAK_DETACH_STATUS_UNSUPPORTED);
-    for (size_t i = 0; i < 4; i++) {
+    for (size_t i = 0; i < 3; i++) {
         char label[96];
         snprintf(label, sizeof(label), "unsupported result %zu prepared", i);
         check_true(label, results[i].prepared == FALSE);
@@ -2515,6 +2757,13 @@ run_invalid(void)
     request = valid_request(PEAK_DETACH_OPERATION_DETACH);
     request.listener = NULL;
     check_prepare("missing detach listener",
+                  &request,
+                  FALSE,
+                  PEAK_DETACH_STATUS_ERROR);
+
+    request = valid_request(PEAK_DETACH_OPERATION_ATTACH);
+    request.listener = NULL;
+    check_prepare("missing attach listener",
                   &request,
                   FALSE,
                   PEAK_DETACH_STATUS_ERROR);
@@ -3571,7 +3820,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -3594,6 +3843,12 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-shutdown-sequence") == 0) {
         return run_fake_helper_shutdown_sequence();
+    }
+    if (strcmp(argv[1], "fake-helper-batch-attach") == 0) {
+        return run_fake_helper_batch_attach();
+    }
+    if (strcmp(argv[1], "fake-helper-arm64-attach-plan") == 0) {
+        return run_fake_helper_arm64_attach_plan();
     }
     if (strcmp(argv[1], "fake-helper-batch-detach") == 0) {
         return run_fake_helper_batch_detach();
