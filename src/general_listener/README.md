@@ -7,8 +7,8 @@ included elsewhere.
 
 This layout temporarily preserves private state and the established
 detach/reattach ordering while explicit interfaces are introduced. Code that
-does not require that shared state belongs in a normal, independently compiled
-module:
+does not require access to that shared state belongs in a normal, independently
+compiled module:
 
 - implementations live in `src/general_listener/*.c`;
 - private interfaces live in `include/internal/general_listener/*.h`;
