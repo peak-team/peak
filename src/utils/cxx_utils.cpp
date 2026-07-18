@@ -5,6 +5,8 @@
 
 extern bool peak_truncate_function_name;
 
+namespace {
+
 /**
  * Removes the function parameter list from the symbol.
  * Properly handles nested parentheses.
@@ -76,6 +78,8 @@ char* extractFinalFunctionName(const char* s) {
     const char* lastColon = strrchr(s, ':');
     return lastColon ? strdup(lastColon + 1) : strdup(s);
 }
+
+} // namespace
 
 extern "C" void removeTrailingOffset(char *func) {
     char *p = strchr(func, '+');
