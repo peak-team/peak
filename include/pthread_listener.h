@@ -1,5 +1,5 @@
-#ifndef __PTHREAD_LISTENER_H
-#define __PTHREAD_LISTENER_H
+#ifndef PEAK_PTHREAD_LISTENER_H
+#define PEAK_PTHREAD_LISTENER_H
 
 /**
  * @file pthread_listener.h
@@ -101,4 +101,4 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
                                          size_t capacity,
                                          gboolean* complete);
 
-#endif /* __PTHREAD_LISTENER_H */
+#endif /* PEAK_PTHREAD_LISTENER_H */

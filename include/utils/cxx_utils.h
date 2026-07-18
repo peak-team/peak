@@ -1,5 +1,5 @@
-#ifndef CXX_UTILS_H
-#define CXX_UTILS_H
+#ifndef PEAK_CXX_UTILS_H
+#define PEAK_CXX_UTILS_H
 
 /**
  * @file cxx_utils.h
@@ -87,4 +87,4 @@ char* truncate_string(const char* s, int max_len);
 }
 #endif
 
-#endif // CXX_UTILS_H
+#endif /* PEAK_CXX_UTILS_H */

@@ -1,5 +1,5 @@
-#ifndef PEAK_INTERNAL_EXEC_RAW_SYSCALL_H
-#define PEAK_INTERNAL_EXEC_RAW_SYSCALL_H
+#ifndef PEAK_EXEC_RAW_SYSCALL_H
+#define PEAK_EXEC_RAW_SYSCALL_H
 
 /**
  * @file exec_raw_syscall.h
@@ -182,4 +182,4 @@ peak_exec_raw_syscall6(long number,
 
 /** @} */
 
-#endif /* PEAK_INTERNAL_EXEC_RAW_SYSCALL_H */
+#endif /* PEAK_EXEC_RAW_SYSCALL_H */

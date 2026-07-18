@@ -61,4 +61,4 @@ gboolean
 peak_unsafe_gum_support_prologue_check(gpointer address,
                                        const char** reason_out);
 
-#endif
+#endif /* PEAK_UNSAFE_GUM_PROLOGUE_H */

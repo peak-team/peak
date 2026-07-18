@@ -61,4 +61,4 @@ void peak_log_message(PeakVerbosity level,
 }
 #endif
 
-#endif
+#endif /* PEAK_LOGGING_H */

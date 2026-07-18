@@ -1,5 +1,5 @@
-#ifndef __PEAK_DETACH_HELPER_PROTOCOL_H
-#define __PEAK_DETACH_HELPER_PROTOCOL_H
+#ifndef PEAK_DETACH_HELPER_PROTOCOL_H
+#define PEAK_DETACH_HELPER_PROTOCOL_H
 
 #include <stdint.h>
 
@@ -75,4 +75,4 @@ typedef struct {
     uint8_t bytes[PEAK_DETACH_HELPER_MAX_PATCH_BYTES];
 } PeakDetachHelperInstruction;
 
-#endif /* __PEAK_DETACH_HELPER_PROTOCOL_H */
+#endif /* PEAK_DETACH_HELPER_PROTOCOL_H */

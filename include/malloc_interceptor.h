@@ -1,5 +1,5 @@
-#ifndef __MALLOC_INTERCEPTOR_H
-#define __MALLOC_INTERCEPTOR_H
+#ifndef PEAK_MALLOC_INTERCEPTOR_H
+#define PEAK_MALLOC_INTERCEPTOR_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,4 +123,4 @@ void malloc_interceptor_detach();
 }
 #endif
 
-#endif /* __MALLOC_INTERCEPTOR_H */
+#endif /* PEAK_MALLOC_INTERCEPTOR_H */

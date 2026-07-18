@@ -1,5 +1,5 @@
-#ifndef __PEAK_EXEC_INTERCEPTOR_INTERNAL_H
-#define __PEAK_EXEC_INTERCEPTOR_INTERNAL_H
+#ifndef PEAK_EXEC_INTERCEPTOR_INTERNAL_H
+#define PEAK_EXEC_INTERCEPTOR_INTERNAL_H
 
 /**
  * @file exec_interceptor_internal.h
@@ -38,4 +38,4 @@ PEAK_EXEC_INTERNAL int peak_exec_checkpoint_enabled_at_startup(void);
 }
 #endif
 
-#endif /* __PEAK_EXEC_INTERCEPTOR_INTERNAL_H */
+#endif /* PEAK_EXEC_INTERCEPTOR_INTERNAL_H */

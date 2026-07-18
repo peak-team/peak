@@ -1,5 +1,5 @@
-#ifndef __PEAK_GENERAL_LISTENER_INTERNAL_H
-#define __PEAK_GENERAL_LISTENER_INTERNAL_H
+#ifndef PEAK_GENERAL_LISTENER_INTERNAL_H
+#define PEAK_GENERAL_LISTENER_INTERNAL_H
 
 #include "general_listener.h"
 
@@ -26,4 +26,4 @@ gboolean peak_general_listener_checkpoint_for_exec(
 /* Starts target lifecycle processing after startup-only Gum hooks are ready. */
 void peak_general_listener_controller_start(void);
 
-#endif /* __PEAK_GENERAL_LISTENER_INTERNAL_H */
+#endif /* PEAK_GENERAL_LISTENER_INTERNAL_H */
