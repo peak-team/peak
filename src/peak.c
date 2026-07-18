@@ -34,7 +34,6 @@
 #define PEAK_TARGET_GROUP_ENV                  "PEAK_TARGET_GROUP"
 #define PEAK_GPU_TARGET_ENV                    "PEAK_GPU_TARGET"
 #define PEAK_GPU_TARGET_FILE_ENV               "PEAK_GPU_TARGET_FILE"
-// #define PEAK_GPU_TARGET_GROUP_ENV           "PEAK_GPU_TARGET_GROUP"
 #define PEAK_GPU_MONITOR_ALL                   "PEAK_GPU_MONITOR_ALL"
 #define PEAK_NAME_TRUNCATE                     "PEAK_NAME_TRUNCATE"
 #define PEAK_TARGET_DELIM                     ','
@@ -240,16 +239,6 @@ peak_exec_checkpoint_reader_release(void)
 }
 
 static gboolean
-peak_env_value_truthy(const char* value)
-{
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "1") == 0 ||
-            g_ascii_strcasecmp(value, "true") == 0 ||
-            g_ascii_strcasecmp(value, "yes") == 0 ||
-            g_ascii_strcasecmp(value, "on") == 0);
-}
-
-static gboolean
 peak_has_requested_work(void)
 {
     return peak_hook_address_count > 0 ||
@@ -259,6 +248,16 @@ peak_has_requested_work(void)
 }
 
 #ifdef HAVE_MPI
+static gboolean
+peak_env_value_truthy(const char* value)
+{
+    return value != NULL &&
+           (g_ascii_strcasecmp(value, "1") == 0 ||
+            g_ascii_strcasecmp(value, "true") == 0 ||
+            g_ascii_strcasecmp(value, "yes") == 0 ||
+            g_ascii_strcasecmp(value, "on") == 0);
+}
+
 static PeakOutputAggregationMode
 peak_output_aggregation_mode_from_value(const char* name,
                                         const char* value,
@@ -438,8 +437,6 @@ void peak_init()
         peak_hook_address_count);
     peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
     peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
-    // TODO: add pre-defined kernels in the future: CUBLAS
-    // peak_gpu_hook_address_count += load_symbols_from_array(PEAK_GPU_TARGET_GROUP, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
     peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
     peak_gpu_monitor_all = parse_env_to_bool(PEAK_GPU_MONITOR_ALL);
     peak_truncate_function_name = parse_env_to_bool(PEAK_NAME_TRUNCATE);
@@ -480,8 +477,6 @@ void peak_init()
                           memory_order_release);
     atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
 
-    //gum_init_embedded();
-
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
     if (found_MPI) {
@@ -514,7 +509,7 @@ void peak_init()
 #ifdef HAVE_CUDA
     cuda_interceptor_attach();
 #endif
-    // general listener needs to be after pthread and mpi ones
+    /* General-listener hooks depend on pthread and MPI interception setup. */
     peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
     peak_target_thread_called_count = peak_hook_address_count;
     for (gint i = 0; i < peak_hook_address_count; i++) {
@@ -986,8 +981,6 @@ peak_checkpoint_for_exec(const char* path, char* const argv[])
 __attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_init;
 __attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
 #elif defined(__ELF__)
-//__attribute__((section(".init_array"))) void* __init = peak_init;
-//__attribute__((section(".fini_array"))) void* __fini = peak_fini;
 typedef int (*main_fn)(int, char**, char**);
 typedef int (*libc_start_main_fn)(main_fn, int, char**, 
                                   int (*)(int, char**, char**),
@@ -1002,7 +995,7 @@ peak_should_wrap_main(int argc, char** argv)
     return peak_should_profile_command(argc, argv);
 }
 
-// Original function pointer for `exit`
+/* Original function pointer for exit(). */
 static void (*original_exit)(int) = NULL;
 static GumInterceptor* exit_interceptor = NULL;
 static gpointer exit_address = NULL;
@@ -1010,7 +1003,6 @@ void exit_interceptor_detach();
 
 static void
 peak_exit(int status) {
-    //g_printerr("Custom exit called with status: %d\n", status);
 
     if (peak_runtime_is_fork_child()) {
         original_exit(status);
@@ -1045,7 +1037,7 @@ peak_exit(int status) {
         peak_log_warn("[peak] failed to register deferred exit interceptor teardown\n");
     }
 
-    // Call the original `exit` function to terminate the process
+    /* Terminate through the original exit(). */
     original_exit(status);
     __builtin_unreachable();
 }
@@ -1097,8 +1089,7 @@ void exit_interceptor_detach() {
 }
 
 static int main_wrapper(int argc, char** argv, char** envp) {
-    // Call peak_init before main
-    // fprintf(stderr, "[LD_PRELOAD] main started. Running my code now.\n");
+    /* Initialize PEAK immediately before the application main(). */
     if (!exit_interceptor_attach()) {
         peak_init();
     }
@@ -1112,7 +1103,6 @@ __attribute__((visibility("default")))
 int __libc_start_main(main_fn main, int argc, char** argv,
                       int (*init)(int, char**, char**),
                       void (*fini)(void), void (*rtld_fini)(void), void* stack_end) {
-    // fprintf(stderr, "Running my code now.\n");
     if (!real___libc_start_main) {
         real___libc_start_main = (libc_start_main_fn)dlsym(RTLD_NEXT, "__libc_start_main");
         if (!real___libc_start_main) {
@@ -1121,10 +1111,10 @@ int __libc_start_main(main_fn main, int argc, char** argv,
         }
     }
 
-    // Store the original main function pointer
+    /* Retain the application entry point for main_wrapper(). */
     real_main = main;
 
-    // Decide whether to use the main wrapper based on argv and requested work.
+    /* Install main_wrapper() only when the command requests PEAK work. */
     int requested_work = peak_process_requests_work();
     gboolean should_wrap = peak_should_wrap_main(argc, argv) && requested_work;
     peak_set_process_profile_enabled(should_wrap);

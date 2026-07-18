@@ -1,6 +1,11 @@
 #ifndef PEAK_SOCKET_REPORT_TRANSPORT_H
 #define PEAK_SOCKET_REPORT_TRANSPORT_H
 
+/**
+ * @file socket_report_transport.h
+ * @brief Aggregate immutable final-report snapshots through PEAK wire-v9.
+ */
+
 #include "internal/general_listener/report_snapshot.h"
 
 #include <stdbool.h>
@@ -36,7 +41,8 @@ typedef struct PeakSocketReportSession PeakSocketReportSession;
  * The function blocks peers until root commits or aborts the prepared report.
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
  * snapshot. ROOT_PREPARED also returns an owned session through @p session_out.
- * Other outcomes leave both outputs NULL.
+ * Both output pointers are required. Other outcomes, including a missing
+ * output pointer, clear every provided output to NULL.
  */
 PeakSocketReportStatus peak_socket_report_transport_begin(
     const PeakReportSnapshot* local,

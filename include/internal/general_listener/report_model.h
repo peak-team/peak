@@ -1,6 +1,11 @@
 #ifndef PEAK_REPORT_MODEL_H
 #define PEAK_REPORT_MODEL_H
 
+/**
+ * @file report_model.h
+ * @brief Define and validate transport-neutral final-report metrics.
+ */
+
 #include "internal/general_listener/report_maxima.h"
 
 #include <stdbool.h>

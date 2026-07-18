@@ -1,6 +1,11 @@
 #ifndef PEAK_EXEC_CHECKPOINT_WRITER_H
 #define PEAK_EXEC_CHECKPOINT_WRITER_H
 
+/**
+ * @file exec_checkpoint_writer.h
+ * @brief Write immutable exec-checkpoint rows without listener-state access.
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 

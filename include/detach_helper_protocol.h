@@ -1,6 +1,11 @@
 #ifndef PEAK_DETACH_HELPER_PROTOCOL_H
 #define PEAK_DETACH_HELPER_PROTOCOL_H
 
+/**
+ * @file detach_helper_protocol.h
+ * @brief Define the fixed-width protocol shared with the detach helper.
+ */
+
 #include <stdint.h>
 
 #define PEAK_DETACH_HELPER_MAGIC 0x50444a48u

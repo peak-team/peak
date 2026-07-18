@@ -3,7 +3,7 @@
 
 /**
  * @file pthread_listener.h
- * @brief Header file for pthread_listener.c
+ * @brief Track PEAK thread IDs through pthread_create and pthread_join hooks.
  */
 
 #include "frida-gum.h"
@@ -44,31 +44,27 @@ struct _PthreadState {
 };
 
 /**
- * @brief Attaches a PthreadListener to intercept calls to pthread_create and tracks newly created threads
+ * @brief Attaches pthread creation/join hooks and starts thread-ID tracking.
  *
- * This function initializes a new thread id mapping hash table, inserts the main thread into the hash table,
- * creates a GumInterceptor object and a PthreadListener object, and attaches the listener to the pthread_create function
- * with the GumInterceptor object. Once this function is called, newly created threads will be tracked by PthreadListener
- * until the pthread_listener_dettach function is called.
- * 
- * When a new thread is created by pthread_create, the listener intercepts the call and assigns a new unique 
- * ID to the child thread, adds the ID to the hash table, and increments the counter for the next unique ID. 
- * The hash table is later used to retrieve the ID of a thread given its pthread_t identifier, allowing other 
- * parts of the program to keep track of the created threads.
- *
- * @return void
+ * The function initializes the thread-ID map, registers the main thread, and
+ * installs Gum hooks for pthread_create and pthread_join. Created threads
+ * receive compact PEAK IDs when their wrapped start routine begins; IDs may be
+ * reused after cleanup or a successful join. The hooks are removed by
+ * pthread_listener_dettach(), but the mapping remains available because
+ * wrapped start routines may finish after interception has stopped.
  */
 void pthread_listener_attach();
 
 /**
- * @brief Detaches the PthreadListener and cleans up related resources
+ * @brief Attempts to remove pthread hooks and release Gum listener objects.
  *
- * This function detaches the PthreadListener from the pthread_create function and releases related resources
- * including the thread id mapping hash table, the GumInterceptor object, and the PthreadListener object.
+ * A successful flush releases the Gum listener and interceptor. The thread-ID
+ * map and mutex intentionally remain alive for wrapped thread cleanup. If Gum
+ * cannot flush safely, all listener state remains alive until process exit.
  *
- * @return TRUE when Gum teardown flushed and pthread listener state was freed.
- *         FALSE means PEAK intentionally left state alive because callbacks may
- *         still be reachable.
+ * @return TRUE when Gum hook teardown flushed and its listener objects were
+ *         released. FALSE means PEAK intentionally retained them because
+ *         callbacks may still be reachable.
  */
 gboolean pthread_listener_dettach();
 

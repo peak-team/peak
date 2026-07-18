@@ -28,6 +28,8 @@
 #define PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_DEFAULT 5000U
 #define PEAK_TEST_MPI_REDUCER_FAIL_LABEL_ENV \
     "PEAK_TEST_MPI_REDUCER_FAIL_LABEL"
+#define PEAK_TEST_MPI_REDUCER_ABANDON_LABEL_ENV \
+    "PEAK_TEST_MPI_REDUCER_ABANDON_LABEL"
 
 _Static_assert(sizeof(uint64_t) * CHAR_BIT == 64,
                "PEAK MPI reporting requires an exact 64-bit uint64_t");
@@ -44,30 +46,102 @@ _Static_assert(SIZE_MAX <= ULONG_MAX,
 #error No exact MPI datatype fallback is available for uint64_t
 #endif
 
-static _Atomic bool peak_mpi_report_transport_poisoned = false;
+typedef enum {
+    PEAK_MPI_COLLECTIVE_ALLREDUCE = 0,
+    PEAK_MPI_COLLECTIVE_REDUCE,
+    PEAK_MPI_COLLECTIVE_BCAST,
+} PeakMpiCollectiveKind;
+
+typedef struct PeakMpiPendingCollective PeakMpiPendingCollective;
+struct PeakMpiPendingCollective {
+    MPI_Request request;
+    void* send_buffer;
+    void* receive_buffer;
+    size_t buffer_size;
+    PeakMpiPendingCollective* next;
+};
+
+typedef enum {
+    PEAK_MPI_TRANSPORT_HEALTHY = 0,
+    PEAK_MPI_TRANSPORT_SOFT_POISONED,
+    PEAK_MPI_TRANSPORT_HARD_POISONED,
+} PeakMpiTransportState;
+
+static _Atomic int peak_mpi_report_transport_state =
+    PEAK_MPI_TRANSPORT_HEALTHY;
+static _Atomic(PeakMpiPendingCollective*)
+    peak_mpi_report_transport_quarantine = NULL;
+static _Atomic size_t peak_mpi_report_transport_quarantine_count = 0;
+
+static void*
+peak_mpi_report_transport_allocate(size_t count, size_t element_size);
+
+#if defined(PEAK_ENABLE_TEST_HOOKS) && \
+    (defined(__GNUC__) || defined(__clang__))
+extern void peak_mpi_report_transport_test_observe_collective(
+    const char* label,
+    int kind,
+    int count,
+    MPI_Datatype datatype,
+    MPI_Op op,
+    int root,
+    const void* original_send,
+    void* original_receive,
+    const void* staged_send,
+    void* staged_receive,
+    size_t buffer_size) __attribute__((weak));
+#endif
 
 static void
 peak_mpi_report_transport_mark_failed_closed(void)
 {
-    atomic_store_explicit(&peak_mpi_report_transport_poisoned,
-                          true,
+    int expected = PEAK_MPI_TRANSPORT_HEALTHY;
+
+    (void)atomic_compare_exchange_strong_explicit(
+        &peak_mpi_report_transport_state,
+        &expected,
+        PEAK_MPI_TRANSPORT_SOFT_POISONED,
+        memory_order_release,
+        memory_order_relaxed);
+}
+
+static void
+peak_mpi_report_transport_mark_hard_failed_closed(void)
+{
+    atomic_store_explicit(&peak_mpi_report_transport_state,
+                          PEAK_MPI_TRANSPORT_HARD_POISONED,
                           memory_order_release);
 }
 
 bool
 peak_mpi_report_transport_failed_closed(void)
 {
-    return atomic_load_explicit(&peak_mpi_report_transport_poisoned,
-                                memory_order_acquire);
+    return atomic_load_explicit(&peak_mpi_report_transport_state,
+                                memory_order_acquire) !=
+           PEAK_MPI_TRANSPORT_HEALTHY;
 }
 
 void
 peak_mpi_report_transport_reset_failed_closed(void)
 {
-    atomic_store_explicit(&peak_mpi_report_transport_poisoned,
-                          false,
-                          memory_order_release);
+    int expected = PEAK_MPI_TRANSPORT_SOFT_POISONED;
+
+    (void)atomic_compare_exchange_strong_explicit(
+        &peak_mpi_report_transport_state,
+        &expected,
+        PEAK_MPI_TRANSPORT_HEALTHY,
+        memory_order_acq_rel,
+        memory_order_acquire);
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+size_t
+peak_mpi_report_transport_quarantined_request_count(void)
+{
+    return atomic_load_explicit(&peak_mpi_report_transport_quarantine_count,
+                                memory_order_acquire);
+}
+#endif
 
 static unsigned int
 peak_mpi_output_collective_timeout_ms(void)
@@ -97,7 +171,161 @@ peak_mpi_reducer_forced_failure(const char* label)
 }
 
 static bool
-peak_mpi_wait_collective_request(MPI_Request* request, const char* label)
+peak_mpi_reducer_forced_abandon(const char* label)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* value = getenv(PEAK_TEST_MPI_REDUCER_ABANDON_LABEL_ENV);
+
+    if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+    return strcmp(value, "*") == 0 || strcmp(value, label) == 0;
+#else
+    (void)label;
+    return false;
+#endif
+}
+
+static bool
+peak_mpi_collective_buffer_size(int count,
+                                MPI_Datatype datatype,
+                                const char* label,
+                                size_t* size_out)
+{
+    MPI_Aint lower_bound = 0;
+    MPI_Aint extent = 0;
+    size_t extent_size;
+
+    if (count < 0 || size_out == NULL ||
+        MPI_Type_get_extent(datatype, &lower_bound, &extent) != MPI_SUCCESS ||
+        lower_bound != 0 || extent < 0) {
+        peak_log_warn("[peak] MPI datatype extent for %s is unsupported; abandoning MPI reducer without touching MPI again\n",
+                      label);
+        peak_mpi_report_transport_mark_failed_closed();
+        return false;
+    }
+    extent_size = (size_t)extent;
+    if ((MPI_Aint)extent_size != extent ||
+        (count > 0 && extent_size == 0) ||
+        (count > 0 && extent_size > SIZE_MAX / (size_t)count)) {
+        peak_log_warn("[peak] MPI buffer size for %s is invalid; abandoning MPI reducer without touching MPI again\n",
+                      label);
+        peak_mpi_report_transport_mark_failed_closed();
+        return false;
+    }
+    *size_out = extent_size * (size_t)count;
+    return true;
+}
+
+static PeakMpiPendingCollective*
+peak_mpi_pending_collective_create(size_t buffer_size,
+                                   const void* send_source,
+                                   const void* receive_source)
+{
+    PeakMpiPendingCollective* pending =
+        peak_mpi_report_transport_allocate(1, sizeof(*pending));
+
+    pending->request = MPI_REQUEST_NULL;
+    pending->buffer_size = buffer_size;
+    if (send_source != NULL) {
+        pending->send_buffer =
+            peak_mpi_report_transport_allocate(buffer_size, 1);
+        if (buffer_size != 0) {
+            memcpy(pending->send_buffer, send_source, buffer_size);
+        }
+    }
+    pending->receive_buffer =
+        peak_mpi_report_transport_allocate(buffer_size, 1);
+    if (receive_source != NULL && buffer_size != 0) {
+        memcpy(pending->receive_buffer, receive_source, buffer_size);
+    }
+    return pending;
+}
+
+static void
+peak_mpi_pending_collective_destroy(PeakMpiPendingCollective* pending)
+{
+    if (pending == NULL) {
+        return;
+    }
+    free(pending->send_buffer);
+    free(pending->receive_buffer);
+    free(pending);
+}
+
+static void
+peak_mpi_pending_collective_quarantine(PeakMpiPendingCollective* pending)
+{
+    PeakMpiPendingCollective* head;
+
+    if (pending == NULL) {
+        return;
+    }
+    head = atomic_load_explicit(&peak_mpi_report_transport_quarantine,
+                                memory_order_acquire);
+    do {
+        pending->next = head;
+    } while (!atomic_compare_exchange_weak_explicit(
+        &peak_mpi_report_transport_quarantine,
+        &head,
+        pending,
+        memory_order_release,
+        memory_order_acquire));
+    atomic_fetch_add_explicit(&peak_mpi_report_transport_quarantine_count,
+                              1,
+                              memory_order_release);
+}
+
+static void
+peak_mpi_pending_collective_abandon(PeakMpiPendingCollective* pending)
+{
+    peak_mpi_report_transport_mark_hard_failed_closed();
+    peak_mpi_pending_collective_quarantine(pending);
+}
+
+static void
+peak_mpi_observe_collective(const char* label,
+                            PeakMpiCollectiveKind kind,
+                            int count,
+                            MPI_Datatype datatype,
+                            MPI_Op op,
+                            int root,
+                            const void* original_send,
+                            void* original_receive,
+                            const PeakMpiPendingCollective* pending)
+{
+#if defined(PEAK_ENABLE_TEST_HOOKS) && \
+    (defined(__GNUC__) || defined(__clang__))
+    if (peak_mpi_report_transport_test_observe_collective != NULL) {
+        peak_mpi_report_transport_test_observe_collective(
+            label,
+            (int)kind,
+            count,
+            datatype,
+            op,
+            root,
+            original_send,
+            original_receive,
+            pending != NULL ? pending->send_buffer : NULL,
+            pending != NULL ? pending->receive_buffer : NULL,
+            pending != NULL ? pending->buffer_size : 0);
+    }
+#else
+    (void)label;
+    (void)kind;
+    (void)count;
+    (void)datatype;
+    (void)op;
+    (void)root;
+    (void)original_send;
+    (void)original_receive;
+    (void)pending;
+#endif
+}
+
+static bool
+peak_mpi_wait_collective_request(PeakMpiPendingCollective* pending,
+                                 const char* label)
 {
     MPI_Status status;
     int done = 0;
@@ -105,26 +333,22 @@ peak_mpi_wait_collective_request(MPI_Request* request, const char* label)
     double deadline = peak_second() + (double)timeout_ms / 1000.0;
 
     while (1) {
-        int mpi_result = MPI_Test(request, &done, &status);
+        int mpi_result = MPI_Test(&pending->request, &done, &status);
 
         if (mpi_result != MPI_SUCCESS) {
             peak_log_warn("[peak] MPI_Test for %s failed; abandoning MPI reducer without touching MPI again\n",
                           label);
-            peak_mpi_report_transport_mark_failed_closed();
+            peak_mpi_pending_collective_abandon(pending);
             return false;
         }
         if (done) {
             return true;
         }
         if (peak_second() >= deadline) {
-            /*
-             * Active nonblocking collectives have no portable cancellation
-             * path. Leave the request owned by MPI and poison this transport.
-             */
             peak_log_warn("[peak] MPI %s timed out after %u ms; abandoning MPI reducer without touching MPI again\n",
                           label,
                           timeout_ms);
-            peak_mpi_report_transport_mark_failed_closed();
+            peak_mpi_pending_collective_abandon(pending);
             return false;
         }
         sched_yield();
@@ -139,7 +363,8 @@ peak_mpi_allreduce_checked(const void* sendbuf,
                            MPI_Op op,
                            const char* label)
 {
-    MPI_Request request = MPI_REQUEST_NULL;
+    PeakMpiPendingCollective* pending;
+    size_t buffer_size;
     int mpi_result;
 
     if (peak_mpi_report_transport_failed_closed()) {
@@ -152,20 +377,49 @@ peak_mpi_allreduce_checked(const void* sendbuf,
         return false;
     }
 
-    mpi_result = MPI_Iallreduce(sendbuf,
+    if ((count > 0 && (sendbuf == NULL || recvbuf == NULL)) ||
+        !peak_mpi_collective_buffer_size(
+            count, datatype, label, &buffer_size)) {
+        peak_mpi_report_transport_mark_failed_closed();
+        return false;
+    }
+    pending = peak_mpi_pending_collective_create(buffer_size, sendbuf, NULL);
+    peak_mpi_observe_collective(label,
+                                PEAK_MPI_COLLECTIVE_ALLREDUCE,
+                                count,
+                                datatype,
+                                op,
+                                -1,
+                                sendbuf,
                                 recvbuf,
+                                pending);
+    mpi_result = MPI_Iallreduce(pending->send_buffer,
+                                pending->receive_buffer,
                                 count,
                                 datatype,
                                 op,
                                 MPI_COMM_WORLD,
-                                &request);
+                                &pending->request);
     if (mpi_result != MPI_SUCCESS) {
         peak_log_warn("[peak] MPI_Iallreduce for %s failed; abandoning MPI reducer\n",
                       label);
-        peak_mpi_report_transport_mark_failed_closed();
+        peak_mpi_pending_collective_abandon(pending);
         return false;
     }
-    return peak_mpi_wait_collective_request(&request, label);
+    if (peak_mpi_reducer_forced_abandon(label)) {
+        peak_log_warn("[peak] MPI reducer test hook abandoned active request for %s\n",
+                      label);
+        peak_mpi_pending_collective_abandon(pending);
+        return false;
+    }
+    if (!peak_mpi_wait_collective_request(pending, label)) {
+        return false;
+    }
+    if (buffer_size != 0) {
+        memcpy(recvbuf, pending->receive_buffer, buffer_size);
+    }
+    peak_mpi_pending_collective_destroy(pending);
+    return true;
 }
 
 static bool
@@ -175,9 +429,11 @@ peak_mpi_reduce_checked(const void* sendbuf,
                         MPI_Datatype datatype,
                         MPI_Op op,
                         int root,
+                        bool receive_result,
                         const char* label)
 {
-    MPI_Request request = MPI_REQUEST_NULL;
+    PeakMpiPendingCollective* pending;
+    size_t buffer_size;
     int mpi_result;
 
     if (peak_mpi_report_transport_failed_closed()) {
@@ -190,21 +446,50 @@ peak_mpi_reduce_checked(const void* sendbuf,
         return false;
     }
 
-    mpi_result = MPI_Ireduce(sendbuf,
-                             recvbuf,
+    if ((count > 0 && (sendbuf == NULL || recvbuf == NULL)) ||
+        !peak_mpi_collective_buffer_size(
+            count, datatype, label, &buffer_size)) {
+        peak_mpi_report_transport_mark_failed_closed();
+        return false;
+    }
+    pending = peak_mpi_pending_collective_create(buffer_size, sendbuf, NULL);
+    peak_mpi_observe_collective(label,
+                                PEAK_MPI_COLLECTIVE_REDUCE,
+                                count,
+                                datatype,
+                                op,
+                                root,
+                                sendbuf,
+                                recvbuf,
+                                pending);
+    mpi_result = MPI_Ireduce(pending->send_buffer,
+                             pending->receive_buffer,
                              count,
                              datatype,
                              op,
                              root,
                              MPI_COMM_WORLD,
-                             &request);
+                             &pending->request);
     if (mpi_result != MPI_SUCCESS) {
         peak_log_warn("[peak] MPI_Ireduce for %s failed; abandoning MPI reducer\n",
                       label);
-        peak_mpi_report_transport_mark_failed_closed();
+        peak_mpi_pending_collective_abandon(pending);
         return false;
     }
-    return peak_mpi_wait_collective_request(&request, label);
+    if (peak_mpi_reducer_forced_abandon(label)) {
+        peak_log_warn("[peak] MPI reducer test hook abandoned active request for %s\n",
+                      label);
+        peak_mpi_pending_collective_abandon(pending);
+        return false;
+    }
+    if (!peak_mpi_wait_collective_request(pending, label)) {
+        return false;
+    }
+    if (receive_result && buffer_size != 0) {
+        memcpy(recvbuf, pending->receive_buffer, buffer_size);
+    }
+    peak_mpi_pending_collective_destroy(pending);
+    return true;
 }
 
 static bool
@@ -214,7 +499,8 @@ peak_mpi_bcast_checked(void* buffer,
                        int root,
                        const char* label)
 {
-    MPI_Request request = MPI_REQUEST_NULL;
+    PeakMpiPendingCollective* pending;
+    size_t buffer_size;
     int mpi_result;
 
     if (peak_mpi_report_transport_failed_closed()) {
@@ -227,19 +513,48 @@ peak_mpi_bcast_checked(void* buffer,
         return false;
     }
 
-    mpi_result = MPI_Ibcast(buffer,
+    if ((count > 0 && buffer == NULL) ||
+        !peak_mpi_collective_buffer_size(
+            count, datatype, label, &buffer_size)) {
+        peak_mpi_report_transport_mark_failed_closed();
+        return false;
+    }
+    pending = peak_mpi_pending_collective_create(buffer_size, NULL, buffer);
+    peak_mpi_observe_collective(label,
+                                PEAK_MPI_COLLECTIVE_BCAST,
+                                count,
+                                datatype,
+                                MPI_OP_NULL,
+                                root,
+                                buffer,
+                                buffer,
+                                pending);
+    mpi_result = MPI_Ibcast(pending->receive_buffer,
                             count,
                             datatype,
                             root,
                             MPI_COMM_WORLD,
-                            &request);
+                            &pending->request);
     if (mpi_result != MPI_SUCCESS) {
         peak_log_warn("[peak] MPI_Ibcast for %s failed; abandoning MPI reducer\n",
                       label);
-        peak_mpi_report_transport_mark_failed_closed();
+        peak_mpi_pending_collective_abandon(pending);
         return false;
     }
-    return peak_mpi_wait_collective_request(&request, label);
+    if (peak_mpi_reducer_forced_abandon(label)) {
+        peak_log_warn("[peak] MPI reducer test hook abandoned active request for %s\n",
+                      label);
+        peak_mpi_pending_collective_abandon(pending);
+        return false;
+    }
+    if (!peak_mpi_wait_collective_request(pending, label)) {
+        return false;
+    }
+    if (buffer_size != 0) {
+        memcpy(buffer, pending->receive_buffer, buffer_size);
+    }
+    peak_mpi_pending_collective_destroy(pending);
+    return true;
 }
 
 static bool
@@ -349,6 +664,7 @@ peak_mpi_reduce_report_rank_tuples(
                                  MPI_DOUBLE_INT,
                                  MPI_MAXLOC,
                                  0,
+                                 rank == 0,
                                  "profile-control-ratio-maxloc")) {
         return false;
     }
@@ -660,6 +976,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_SUM,
                                  0,
+                                 rank == 0,
                                  "profile-seconds") ||
         !peak_mpi_allreduce_checked(&local_failed_stop_window_count,
                                     &mpi_max_failed_stop_window_count,
@@ -678,6 +995,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                         PEAK_MPI_UINT64_DATATYPE,
                                         MPI_SUM,
                                         0,
+                                        rank == 0,
                                         "failed-stop-window-count")) {
         return peak_mpi_report_transport_collective_failure();
     }
@@ -687,6 +1005,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_MIN,
                                  0,
+                                 rank == 0,
                                  "elapsed-min") ||
         !peak_mpi_reduce_checked(&local_elapsed_seconds,
                                  &mpi_max_elapsed_seconds,
@@ -694,6 +1013,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "elapsed-max")) {
         return peak_mpi_report_transport_collective_failure();
     }
@@ -709,6 +1029,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_UNSIGNED_LONG,
                                  MPI_SUM,
                                  0,
+                                 rank == 0,
                                  "sum-num-calls") ||
         !peak_mpi_reduce_checked(local->total_time,
                                  aggregate->total_time,
@@ -716,6 +1037,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_SUM,
                                  0,
+                                 rank == 0,
                                  "sum-total-time") ||
         !peak_mpi_reduce_checked(local->max_total_time,
                                  aggregate->max_total_time,
@@ -723,6 +1045,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "max-total-time") ||
         !peak_mpi_reduce_checked(local->min_total_time,
                                  aggregate->min_total_time,
@@ -730,6 +1053,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_MIN,
                                  0,
+                                 rank == 0,
                                  "min-total-time") ||
         !peak_mpi_reduce_checked(local->exclusive_time,
                                  aggregate->exclusive_time,
@@ -737,6 +1061,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_DOUBLE,
                                  MPI_SUM,
                                  0,
+                                 rank == 0,
                                  "sum-exclusive-time") ||
         !peak_mpi_reduce_checked(local->max_time,
                                  aggregate->max_time,
@@ -744,6 +1069,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_FLOAT,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "sum-max-time") ||
         !peak_mpi_reduce_checked(local->min_time,
                                  aggregate->min_time,
@@ -751,6 +1077,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_FLOAT,
                                  MPI_MIN,
                                  0,
+                                 rank == 0,
                                  "sum-min-time") ||
         !peak_mpi_reduce_checked(local->thread_count,
                                  aggregate->thread_count,
@@ -758,6 +1085,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_UNSIGNED_LONG,
                                  MPI_SUM,
                                  0,
+                                 rank == 0,
                                  "thread-count") ||
         !peak_mpi_reduce_checked(local->detached,
                                  aggregate->detached,
@@ -765,6 +1093,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_INT,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "detached-marker") ||
         !peak_mpi_reduce_checked(local->reattached,
                                  aggregate->reattached,
@@ -772,6 +1101,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_INT,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "reattached-marker") ||
         !peak_mpi_reduce_checked(local->revisited,
                                  aggregate->revisited,
@@ -779,6 +1109,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                  MPI_INT,
                                  MPI_MAX,
                                  0,
+                                 rank == 0,
                                  "revisited-marker")) {
         peak_report_snapshot_destroy(aggregate);
         return peak_mpi_report_transport_collective_failure();

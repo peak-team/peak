@@ -1,6 +1,11 @@
 #ifndef PEAK_GENERAL_LISTENER_INTERNAL_H
 #define PEAK_GENERAL_LISTENER_INTERNAL_H
 
+/**
+ * @file general_listener_internal.h
+ * @brief Internal entry points for listener startup and dynamic attachment.
+ */
+
 #include "general_listener.h"
 
 typedef enum {

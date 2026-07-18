@@ -1,6 +1,11 @@
 #ifndef PEAK_REPORT_SNAPSHOT_H
 #define PEAK_REPORT_SNAPSHOT_H
 
+/**
+ * @file report_snapshot.h
+ * @brief Own immutable data captured for PEAK's final report.
+ */
+
 #include "internal/general_listener/report_model.h"
 
 #include <stdbool.h>

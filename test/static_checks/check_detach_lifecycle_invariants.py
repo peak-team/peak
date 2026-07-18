@@ -12,22 +12,7 @@ def require(condition, message):
 
 
 def read_source(repo_root, rel):
-    source = (repo_root / rel).read_text(encoding="utf-8")
-    if rel != "src/general_listener.c":
-        return source
-
-    def include_fragment(match):
-        fragment = match.group(1)
-        return (
-            repo_root / "src/general_listener" / fragment
-        ).read_text(encoding="utf-8")
-
-    return re.sub(
-        r'^#include "general_listener/([^"]+\.inc)"$',
-        include_fragment,
-        source,
-        flags=re.MULTILINE,
-    )
+    return (repo_root / rel).read_text(encoding="utf-8")
 
 
 def extract_function(source, name):
@@ -1089,14 +1074,15 @@ def check_stop_window_accounting_sidecar(repo_root):
             "peak_general_listener_heartbeat_control_baseline_valid" in general,
             "heartbeat accounting baseline must be shared with trace through atomics")
     per_target_detach = heartbeat[
-        heartbeat.find("// 1) Per-target DETACH"):
-        heartbeat.find("// 2) Global DETACH")
+        heartbeat.find("/* 1) Per-target detach. */"):
+        heartbeat.find("/* 2) Global detach. */")
     ]
     global_detach_for_budget = heartbeat[
-        heartbeat.find("// 2) Global DETACH"):
-        heartbeat.find("// 3) Reattach")
+        heartbeat.find("/* 2) Global detach. */"):
+        heartbeat.find("/* 3) Reattach. */")
     ]
-    adaptive_sleep_start = heartbeat.find("// Adaptive heartbeat sleep")
+    adaptive_sleep_start = heartbeat.find(
+        "/* Adapt the next heartbeat sleep interval. */")
     adaptive_sleep = heartbeat[
         adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
     ]
@@ -1179,7 +1165,8 @@ def check_stop_window_accounting_sidecar(repo_root):
             "risk" not in adaptive_sleep and
             "local_mpi_ranks" not in adaptive_sleep,
             "adaptive heartbeat sleep must use only the immutable hybrid global overhead")
-    reattach_section = heartbeat[heartbeat.find("// 3) Reattach"):]
+    reattach_section = heartbeat[
+        heartbeat.find("/* 3) Reattach. */"):]
     require("value >= 0.0" in nonnegative_finite and
             "value == value" in nonnegative_finite and
             "value <= DBL_MAX" in nonnegative_finite and
@@ -1332,6 +1319,7 @@ def check_stop_window_accounting_sidecar(repo_root):
     revisit_reduce = re.search(
         r"peak_mpi_reduce_checked\(\s*local->revisited,\s*"
         r"aggregate->revisited,\s*hook_count,\s*MPI_INT,\s*MPI_MAX,\s*0,\s*"
+        r"rank\s*==\s*0,\s*"
         r"\"revisited-marker\"\s*\)",
         reduce_result,
     )
@@ -1528,8 +1516,8 @@ def check_global_detach_overhead_selection(repo_root):
     comparator = extract_function(source, "compare_ratio_de")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
 
-    global_detach_marker = "// 2) Global DETACH"
-    reattach_marker = "// 3) Reattach"
+    global_detach_marker = "/* 2) Global detach. */"
+    reattach_marker = "/* 3) Reattach. */"
     start = heartbeat.find(global_detach_marker)
     end = heartbeat.find(reattach_marker, start)
     require(start != -1 and end != -1,

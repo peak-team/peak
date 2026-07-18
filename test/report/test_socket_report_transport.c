@@ -332,6 +332,31 @@ check_single_process_clone(void)
 }
 
 static int
+check_invalid_output_pointers_are_cleared(void)
+{
+    PeakSocketReportSession* session =
+        (PeakSocketReportSession*)(uintptr_t)1;
+    PeakReportSnapshot* aggregate = (PeakReportSnapshot*)(uintptr_t)1;
+    PeakSocketReportStatus status;
+
+    status = peak_socket_report_transport_begin(
+        NULL,
+        PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+        &session,
+        NULL);
+    if (status != PEAK_SOCKET_REPORT_FAILED || session != NULL) {
+        return 1;
+    }
+
+    status = peak_socket_report_transport_begin(
+        NULL,
+        PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+        NULL,
+        &aggregate);
+    return status != PEAK_SOCKET_REPORT_FAILED || aggregate != NULL;
+}
+
+static int
 check_slurm_host_parser(void)
 {
     char host[64];
@@ -357,6 +382,7 @@ main(void)
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     if (check_slurm_host_parser() != 0 ||
         check_single_process_clone() != 0 ||
+        check_invalid_output_pointers_are_cleared() != 0 ||
         run_two_rank_case(base_port, TEST_ROOT_COMMIT, false) != 0 ||
         run_two_rank_case(base_port + 2, TEST_ROOT_ABORT, false) != 0 ||
         run_two_rank_case(base_port + 4,
