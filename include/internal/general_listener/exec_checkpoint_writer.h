@@ -22,8 +22,9 @@ typedef struct {
  *
  * The writer borrows @p rows and every row name for the duration of the call.
  * It creates an exclusive file using @p checkpoint_index, trying later indices
- * when a checkpoint already exists. A failed write removes its incomplete
- * file. Listener state and snapshot ownership remain with the caller.
+ * when a checkpoint already exists. After a failed write, it attempts to
+ * remove the incomplete file. Listener state and snapshot ownership remain
+ * with the caller.
  *
  * @return true after the complete file is closed; otherwise false with errno
  *         describing the failure.
