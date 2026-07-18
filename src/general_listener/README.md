@@ -30,7 +30,8 @@ While unity fragments remain:
 
 The safe migration order is to establish an immutable report snapshot and
 clear ownership interfaces, then extract report formatting, socket transport,
-MPI transport, and exec-checkpoint support. Controller, heartbeat, attach,
-callback, and shutdown fragments stay in the unity translation unit until
-their shared state can be placed behind an explicit context without changing
-lifecycle ordering.
+and MPI transport. The exec-checkpoint writer is already independent; snapshot
+capture and its lifecycle-sensitive handoff remain in the listener translation
+unit. Controller, heartbeat, attach, callback, and shutdown fragments stay in
+that translation unit until their shared state can be placed behind an explicit
+context without changing lifecycle ordering.
