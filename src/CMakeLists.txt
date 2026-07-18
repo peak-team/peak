@@ -5,10 +5,14 @@ add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 set(sources_peak
     dlopen_interceptor.c
     general_listener.c
+    general_listener/attach_policy.c
     general_listener/exec_checkpoint_writer.c
+    general_listener/report_formatter.c
     general_listener/report_maxima.c
     general_listener/report_model.c
+    general_listener/report_snapshot.c
     general_listener/runtime_config.c
+    general_listener/socket_report_transport.c
     malloc_interceptor.c
     malloc_otf2.c
     peak.c
@@ -35,7 +39,9 @@ endif()
 
 # Preserve the original source order while expressing optional modules once.
 if(MPI_FOUND)
-    list(APPEND sources_peak mpi_interceptor.c)
+    list(APPEND sources_peak
+        general_listener/mpi_report_transport.c
+        mpi_interceptor.c)
 endif()
 if(CUDA_FOUND OR CUDAToolkit_FOUND)
     list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
