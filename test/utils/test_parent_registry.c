@@ -1,5 +1,5 @@
 #include "parent_registry.h"
-#include "parent_registry_internal.h"
+#include "internal/utils/parent_registry_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>

@@ -142,7 +142,6 @@ pthread_listener_on_enter(GumInvocationListener* listener,
 {
     PthreadState* thread_state = GUM_IC_GET_THREAD_DATA(ic, PthreadState);
     pthread_t* tid = (pthread_t*)(gum_invocation_context_get_nth_argument(ic, 0));
-    // g_print ("pthread_listener_on_enter %lu\n", *tid);
     if (tid == NULL) {
         pthread_t* replaced_tid = g_new0(pthread_t, 1);
         gum_invocation_context_replace_nth_argument(ic, 0, replaced_tid);
@@ -181,7 +180,6 @@ pthread_listener_on_leave(GumInvocationListener* listener,
         g_free(thread_state->start_context);
         thread_state->start_context = NULL;
     }
-    // g_print ("pthread_listener_on_leave %lu\n", tid);
     if (!thread_state->is_original)
         g_free(thread_state->child_tid);
 }
@@ -212,7 +210,6 @@ static int (*original_pthread_join)(pthread_t thread, void **retval);
 static int
 peak_pthread_join(pthread_t thread, void **retval)
 {
-    // g_printerr ("peak_pthread_join called on thread %ld\n",  thread);
     int ret = original_pthread_join(thread, retval);
     if (ret == 0) {
         pthread_listener_remove_thread(thread);
@@ -222,7 +219,6 @@ peak_pthread_join(pthread_t thread, void **retval)
 
 void pthread_listener_attach()
 {
-    // g_print ("peak_hook_address_count %lu num_cores %lu\n",  peak_hook_address_count, num_cores);
     peak_tid_mapping = g_hash_table_new_full(pthread_tid_hash,
                                              pthread_tid_equal,
                                              g_free,
@@ -241,7 +237,6 @@ void pthread_listener_attach()
     pthread_create_hook_address =
         peak_general_listener_find_function("pthread_create");
     if (pthread_create_hook_address) {
-        // g_print ("pthread_create found at %p\n",  hook_address);
         GumAttachReturn attach_status =
             gum_interceptor_attach(pthread_create_interceptor,
                                    pthread_create_hook_address,
@@ -261,11 +256,7 @@ void pthread_listener_attach()
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 }
-// gboolean print_key_value_pair(gpointer key, gpointer value, gpointer user_data)
-// {
-//     g_print("Key: %lu, Value: %lu\n", *((unsigned long *)(key)), value);
-//     return FALSE;
-// }
+
 static gboolean
 pthread_listener_flush_teardown(void)
 {
@@ -287,9 +278,6 @@ pthread_listener_flush_teardown(void)
 
 gboolean pthread_listener_dettach()
 {
-    // g_print("Hash table contents %p:\n", peak_tid_mapping);
-    // gum_metal_hash_table_foreach(peak_tid_mapping, (GHFunc)print_key_value_pair, NULL);
-
     if (pthread_create_interceptor == NULL) {
         return TRUE;
     }

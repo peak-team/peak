@@ -1,6 +1,11 @@
 #ifndef PEAK_SIGNAL_POLICY_H
 #define PEAK_SIGNAL_POLICY_H
 
+/**
+ * @file signal_policy.h
+ * @brief Expose PEAK reserved-signal diagnostics and test hooks.
+ */
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_SIGNAL_POLICY_API __attribute__((visibility("default")))
 #else

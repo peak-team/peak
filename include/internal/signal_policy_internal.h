@@ -1,6 +1,11 @@
 #ifndef PEAK_SIGNAL_POLICY_INTERNAL_H
 #define PEAK_SIGNAL_POLICY_INTERNAL_H
 
+/**
+ * @file signal_policy_internal.h
+ * @brief Coordinate reserved-signal selection, cookies, and delivery state.
+ */
+
 #include "signal_policy.h"
 
 #include <signal.h>

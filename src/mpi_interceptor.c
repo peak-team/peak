@@ -217,7 +217,6 @@ mpi_interceptor_call_original_finalize_once(void)
 static int
 peak_pmpi_finalize(void)
 {
-    // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     mpi_interceptor_mark_finalize_requested();
     if (mpi_interceptor_finalize_policy_defer()) {
         mpi_interceptor_set_real_finalize_allowed(1);
@@ -255,7 +254,6 @@ int mpi_interceptor_attach()
 
     gum_interceptor_begin_transaction(mpi_interceptor);
     hook_address = peak_general_listener_find_function("PMPI_Finalize");
-    // g_printerr ("PMPI_Finalize found at %p\n",  hook_address);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
                                                      hook_address, &peak_pmpi_finalize,

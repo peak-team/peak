@@ -1280,11 +1280,15 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     PeakReportRankTuple local_report_tuple;
     size_t record_bytes;
 
+    if (session_out != NULL) {
+        *session_out = NULL;
+    }
+    if (aggregate_out != NULL) {
+        *aggregate_out = NULL;
+    }
     if (session_out == NULL || aggregate_out == NULL) {
         return PEAK_SOCKET_REPORT_FAILED;
     }
-    *session_out = NULL;
-    *aggregate_out = NULL;
     if (!peak_socket_snapshot_is_complete(local) ||
         (rank_source != PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV &&
          rank_source != PEAK_SOCKET_REPORT_RANK_ENV_ONLY)) {

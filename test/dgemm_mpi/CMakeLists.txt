@@ -34,7 +34,10 @@ target_include_directories(test_mpi_report_transport PRIVATE
     ${FRIDA_GUM_INCLUDE_DIRS})
 target_compile_definitions(test_mpi_report_transport
     PRIVATE PEAK_ENABLE_TEST_HOOKS=1 HAVE_MPI=1)
-target_link_libraries(test_mpi_report_transport PRIVATE MPI::MPI_C m)
+target_link_libraries(test_mpi_report_transport PRIVATE
+    MPI::MPI_C
+    ${RT_LIBRARY}
+    m)
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_mpi_exit_before_finalize PRIVATE -Wl,--export-dynamic)
 endif()

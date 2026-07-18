@@ -1,6 +1,11 @@
 #ifndef PEAK_RUNTIME_CONFIG_H
 #define PEAK_RUNTIME_CONFIG_H
 
+/**
+ * @file runtime_config.h
+ * @brief Parse general-listener environment settings without lifecycle state.
+ */
+
 #include <stdbool.h>
 
 /**

@@ -8,6 +8,53 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int collective_observer_count;
+static int collective_observer_failures;
+static int collective_observer_target_seen;
+
+void
+peak_mpi_report_transport_test_observe_collective(
+    const char* label,
+    int kind,
+    int count,
+    MPI_Datatype datatype,
+    MPI_Op operation,
+    int root,
+    const void* original_send,
+    void* original_receive,
+    const void* staged_send,
+    void* staged_receive,
+    size_t buffer_size)
+{
+    const char* abandon_label =
+        getenv("PEAK_TEST_MPI_REDUCER_ABANDON_LABEL");
+
+    (void)count;
+    (void)datatype;
+    (void)operation;
+    (void)root;
+    collective_observer_count++;
+    if (label == NULL || staged_receive == NULL ||
+        staged_receive == original_receive) {
+        collective_observer_failures++;
+        return;
+    }
+    if (kind == 2) {
+        if (staged_send != NULL ||
+            (buffer_size != 0 &&
+             memcmp(staged_receive, original_receive, buffer_size) != 0)) {
+            collective_observer_failures++;
+        }
+    } else if (staged_send == NULL || staged_send == original_send ||
+               (buffer_size != 0 &&
+                memcmp(staged_send, original_send, buffer_size) != 0)) {
+        collective_observer_failures++;
+    }
+    if (abandon_label != NULL && strcmp(label, abandon_label) == 0) {
+        collective_observer_target_seen = 1;
+    }
+}
+
 static int
 close_enough(double actual, double expected)
 {
@@ -151,7 +198,7 @@ validate_root_aggregate(const PeakReportSnapshot* aggregate, int size)
 }
 
 static int
-run_fail_closed_case(int rank, const char* label)
+run_fail_closed_case(int rank, const char* label, bool abandon_active_request)
 {
     PeakReportSnapshot* local = fixture_snapshot(rank);
     PeakReportSnapshot* aggregate = NULL;
@@ -159,7 +206,13 @@ run_fail_closed_case(int rank, const char* label)
     int failures = local == NULL ? 1 : 0;
 
     peak_mpi_report_transport_reset_failed_closed();
-    if (setenv("PEAK_TEST_MPI_REDUCER_FAIL_LABEL", label, 1) != 0) {
+    if (unsetenv("PEAK_TEST_MPI_REDUCER_FAIL_LABEL") != 0 ||
+        unsetenv("PEAK_TEST_MPI_REDUCER_ABANDON_LABEL") != 0 ||
+        setenv(abandon_active_request
+                   ? "PEAK_TEST_MPI_REDUCER_ABANDON_LABEL"
+                   : "PEAK_TEST_MPI_REDUCER_FAIL_LABEL",
+               label,
+               1) != 0) {
         failures++;
     }
     if (local != NULL) {
@@ -168,6 +221,18 @@ run_fail_closed_case(int rank, const char* label)
             aggregate != NULL ||
             !peak_mpi_report_transport_failed_closed()) {
             failures++;
+        }
+        if (abandon_active_request &&
+            (peak_mpi_report_transport_quarantined_request_count() != 1 ||
+             !collective_observer_target_seen ||
+             collective_observer_failures != 0)) {
+            failures++;
+        }
+        if (abandon_active_request) {
+            peak_mpi_report_transport_reset_failed_closed();
+            if (!peak_mpi_report_transport_failed_closed()) {
+                failures++;
+            }
         }
         result = peak_mpi_report_transport_reduce(local, &aggregate);
         if (result != PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED ||
@@ -179,7 +244,9 @@ run_fail_closed_case(int rank, const char* label)
 
     /* The poisoned-path contract deliberately forbids MPI_Finalize here. */
     if (rank == 0 && failures == 0) {
-        puts("mpi_report_transport_fail_closed_ok");
+        puts(abandon_active_request
+                 ? "mpi_report_transport_active_request_fail_closed_ok"
+                 : "mpi_report_transport_fail_closed_ok");
     }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -209,7 +276,12 @@ main(int argc, char** argv)
     if (argc > 1 && strcmp(argv[1], "fail-closed") == 0) {
         const char* label = argc > 2 ? argv[2] : "accounting-valid";
 
-        return run_fail_closed_case(rank, label);
+        return run_fail_closed_case(rank, label, false);
+    }
+    if (argc > 1 && strcmp(argv[1], "active-request-fail-closed") == 0) {
+        const char* label = argc > 2 ? argv[2] : "accounting-valid";
+
+        return run_fail_closed_case(rank, label, true);
     }
 
     peak_mpi_report_transport_reset_failed_closed();
@@ -218,6 +290,10 @@ main(int argc, char** argv)
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
     result = peak_mpi_report_transport_reduce(local, &aggregate);
+    if (collective_observer_count != 54 ||
+        collective_observer_failures != 0) {
+        failures++;
+    }
     if (rank == 0) {
         if (result != PEAK_MPI_REPORT_TRANSPORT_ROOT_READY) {
             failures++;

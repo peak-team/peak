@@ -96,21 +96,8 @@ def require_order(body, *needles):
 
 
 def read_general_listener_source(repo_root):
-    source = (repo_root / "src" / "general_listener.c").read_text(
+    return (repo_root / "src" / "general_listener.c").read_text(
         encoding="utf-8")
-
-    def include_fragment(match):
-        fragment = match.group(1)
-        return (
-            repo_root / "src" / "general_listener" / fragment
-        ).read_text(encoding="utf-8")
-
-    return re.sub(
-        r'^#include "general_listener/([^"]+\.inc)"$',
-        include_fragment,
-        source,
-        flags=re.MULTILINE,
-    )
 
 
 def main():

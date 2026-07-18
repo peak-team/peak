@@ -1,6 +1,11 @@
 #ifndef PEAK_UNSAFE_GUM_PROLOGUE_H
 #define PEAK_UNSAFE_GUM_PROLOGUE_H
 
+/**
+ * @file unsafe_gum_prologue.h
+ * @brief Classify target prologues and construct safe Gum attach plans.
+ */
+
 #include "frida-gum.h"
 
 #define PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"
