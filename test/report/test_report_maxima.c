@@ -68,6 +68,21 @@ tuple_equal(const PeakReportRankTuple* actual,
            actual->ratio == expected->ratio;
 }
 
+static bool
+maxima_equal(const PeakReportMaxima* actual,
+             const PeakReportMaxima* expected)
+{
+    for (int metric = 0; metric < PEAK_REPORT_METRIC_COUNT; metric++) {
+        if (!tuple_equal(&actual->tuples[metric],
+                         &expected->tuples[metric]) ||
+            actual->owner_ranks[metric] != expected->owner_ranks[metric] ||
+            actual->present[metric] != expected->present[metric]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int
 check_distinct_owners_and_assignment(void)
 {
@@ -177,7 +192,7 @@ check_load_selected_tuples(void)
     PeakReportMaxima before = maxima;
     owners[PEAK_REPORT_METRIC_CONTROL] = -1;
     return peak_report_maxima_load(&maxima, tuples, owners) ||
-           memcmp(&maxima, &before, sizeof(maxima)) != 0;
+           !maxima_equal(&maxima, &before);
 }
 
 static int
