@@ -34,308 +34,12 @@ _Static_assert(sizeof(uint64_t) * CHAR_BIT == 64,
 #endif
 #endif
 
-static long
-peak_exec_checkpoint_raw_syscall6(long number,
-                                  long arg1,
-                                  long arg2,
-                                  long arg3,
-                                  long arg4,
-                                  long arg5,
-                                  long arg6)
-{
-#if defined(__linux__) && defined(__x86_64__)
-    long result;
-    register long r10 __asm__("r10") = arg4;
-    register long r8 __asm__("r8") = arg5;
-    register long r9 __asm__("r9") = arg6;
-
-    __asm__ volatile("syscall"
-                     : "=a"(result)
-                     : "a"(number),
-                       "D"(arg1),
-                       "S"(arg2),
-                       "d"(arg3),
-                       "r"(r10),
-                       "r"(r8),
-                       "r"(r9)
-                     : "rcx", "r11", "memory");
-    if (result < 0 && result >= -4095) {
-        errno = (int)-result;
-        return -1;
-    }
-    return result;
-#elif defined(__linux__) && defined(__aarch64__)
-    register long x0 __asm__("x0") = arg1;
-    register long x1 __asm__("x1") = arg2;
-    register long x2 __asm__("x2") = arg3;
-    register long x3 __asm__("x3") = arg4;
-    register long x4 __asm__("x4") = arg5;
-    register long x5 __asm__("x5") = arg6;
-    register long x8 __asm__("x8") = number;
-
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1),
-                       "r"(x2),
-                       "r"(x3),
-                       "r"(x4),
-                       "r"(x5),
-                       "r"(x8)
-                     : "cc", "memory");
-    if (x0 < 0 && x0 >= -4095) {
-        errno = (int)-x0;
-        return -1;
-    }
-    return x0;
-#else
-    (void)number;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    (void)arg5;
-    (void)arg6;
-    errno = ENOSYS;
-    return -1;
-#endif
-}
-
-static gboolean
-peak_exec_checkpoint_append_char(char* buffer,
-                                 size_t buffer_size,
-                                 size_t* out,
-                                 char value)
-{
-    if (*out + 1 >= buffer_size) {
-        errno = ENAMETOOLONG;
-        return FALSE;
-    }
-    buffer[(*out)++] = value;
-    buffer[*out] = '\0';
-    return TRUE;
-}
-
-static gboolean
-peak_exec_checkpoint_append_literal(char* buffer,
-                                    size_t buffer_size,
-                                    size_t* out,
-                                    const char* value)
-{
-    while (value != NULL && *value != '\0') {
-        if (!peak_exec_checkpoint_append_char(buffer,
-                                              buffer_size,
-                                              out,
-                                              *value++)) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-static gboolean
-peak_exec_checkpoint_append_u64(char* buffer,
-                                size_t buffer_size,
-                                size_t* out,
-                                unsigned long long value)
-{
-    char digits[32];
-    size_t count = 0;
-
-    do {
-        digits[count++] = (char)('0' + (value % 10ULL));
-        value /= 10ULL;
-    } while (value != 0ULL);
-
-    while (count != 0) {
-        if (!peak_exec_checkpoint_append_char(buffer,
-                                              buffer_size,
-                                              out,
-                                              digits[--count])) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-static gboolean
-peak_exec_checkpoint_append_padded_u64(char* buffer,
-                                       size_t buffer_size,
-                                       size_t* out,
-                                       unsigned long long value,
-                                       unsigned int width)
-{
-    char digits[32];
-    size_t count = 0;
-
-    do {
-        digits[count++] = (char)('0' + (value % 10ULL));
-        value /= 10ULL;
-    } while (value != 0ULL);
-    while (count < width && count < sizeof(digits)) {
-        digits[count++] = '0';
-    }
-    while (count != 0) {
-        if (!peak_exec_checkpoint_append_char(buffer,
-                                              buffer_size,
-                                              out,
-                                              digits[--count])) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-static int
-peak_stats_exec_checkpoint_path(char* buffer,
-                                size_t buffer_size,
-                                unsigned long long checkpoint_index)
-{
-    const char* base = getenv("PEAK_STATSLOG_PATH");
-    size_t out = 0;
-
-    if (buffer == NULL || buffer_size == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    buffer[0] = '\0';
-    if (base == NULL || base[0] == '\0') {
-        base = "./peak_statslog";
-    }
-
-    if (!peak_exec_checkpoint_append_literal(buffer, buffer_size, &out, base) ||
-        !peak_exec_checkpoint_append_literal(buffer, buffer_size, &out, "-p") ||
-        !peak_exec_checkpoint_append_u64(buffer,
-                                         buffer_size,
-                                         &out,
-                                         (unsigned long long)getpid()) ||
-        !peak_exec_checkpoint_append_literal(buffer,
-                                             buffer_size,
-                                             &out,
-                                             "-exec") ||
-        !peak_exec_checkpoint_append_u64(buffer,
-                                         buffer_size,
-                                         &out,
-                                         checkpoint_index) ||
-        !peak_exec_checkpoint_append_literal(buffer,
-                                             buffer_size,
-                                             &out,
-                                             ".csv")) {
-        return -1;
-    }
-    return 0;
-}
-
 static void
 peak_stats_csv_unlink(void)
 {
     char* out_csv = peak_stats_csv_path();
     (void)unlink(out_csv);
     g_free(out_csv);
-}
-
-static gboolean
-peak_exec_checkpoint_write_all(int fd, const char* data, size_t length)
-{
-    size_t written = 0;
-
-    while (written < length) {
-        ssize_t rc = (ssize_t)peak_exec_checkpoint_raw_syscall6(SYS_write,
-                                                                fd,
-                                                                (long)(data + written),
-                                                                (long)(length - written),
-                                                                0,
-                                                                0,
-                                                                0);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return FALSE;
-        }
-        if (rc == 0) {
-            errno = EIO;
-            return FALSE;
-        }
-        written += (size_t)rc;
-    }
-    return TRUE;
-}
-
-static int
-peak_exec_checkpoint_open_exclusive(const char* path)
-{
-    return (int)peak_exec_checkpoint_raw_syscall6(SYS_openat,
-                                                  AT_FDCWD,
-                                                  (long)path,
-                                                  O_WRONLY | O_CREAT |
-                                                      O_EXCL | O_CLOEXEC,
-                                                  0600,
-                                                  0,
-                                                  0);
-}
-
-static gboolean
-peak_exec_checkpoint_close_fd(int fd)
-{
-    return peak_exec_checkpoint_raw_syscall6(SYS_close,
-                                             fd,
-                                             0,
-                                             0,
-                                             0,
-                                             0,
-                                             0) == 0;
-}
-
-static void
-peak_exec_checkpoint_unlink_path(const char* path)
-{
-    (void)peak_exec_checkpoint_raw_syscall6(SYS_unlinkat,
-                                            AT_FDCWD,
-                                            (long)path,
-                                            0,
-                                            0,
-                                            0,
-                                            0);
-}
-
-static gboolean
-peak_exec_checkpoint_write_csv_name(int fd, const char* name)
-{
-    const char* start;
-    const char* cursor;
-
-    if (!peak_exec_checkpoint_write_all(fd, "\"", 1)) {
-        return FALSE;
-    }
-    if (name == NULL) {
-        return peak_exec_checkpoint_write_all(fd, "\"", 1);
-    }
-
-    start = name;
-    cursor = name;
-    while (*cursor != '\0') {
-        if (*cursor == '"') {
-            if (cursor > start &&
-                !peak_exec_checkpoint_write_all(
-                    fd,
-                    start,
-                    (size_t)(cursor - start))) {
-                return FALSE;
-            }
-            if (!peak_exec_checkpoint_write_all(fd, "\"\"", 2)) {
-                return FALSE;
-            }
-            start = cursor + 1;
-        }
-        cursor++;
-    }
-    if (cursor > start &&
-        !peak_exec_checkpoint_write_all(fd,
-                                        start,
-                                        (size_t)(cursor - start))) {
-        return FALSE;
-    }
-    return peak_exec_checkpoint_write_all(fd, "\"", 1);
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -357,18 +61,6 @@ peak_general_listener_checkpoint_snapshot_lock(void)
 {
     return pthread_mutex_trylock(&lock) == 0;
 }
-
-typedef struct {
-    char* name;
-    gulong num_calls;
-    gulong threads_seen;
-    gdouble total_time;
-    gdouble max_total_time;
-    gdouble min_total_time;
-    gdouble exclusive_time;
-    gfloat max_time;
-    gfloat min_time;
-} PeakExecCheckpointRecord;
 
 typedef struct {
     PeakGeneralListenerCheckpointShadow* shadows;
@@ -467,7 +159,7 @@ peak_exec_checkpoint_copy_listener(
             continue;
         }
 
-        long copied = peak_exec_checkpoint_raw_syscall6(
+        long copied = peak_exec_raw_syscall6(
             SYS_process_vm_readv,
             (long)getpid(),
             (long)&local,
@@ -506,7 +198,7 @@ peak_exec_checkpoint_copy_listener(
 }
 
 static void
-peak_exec_checkpoint_free_snapshot(PeakExecCheckpointRecord* records,
+peak_exec_checkpoint_free_snapshot(PeakExecCheckpointRow* records,
                                    size_t* name_lengths,
                                    char* names,
                                    void* thread_storage)
@@ -517,199 +209,18 @@ peak_exec_checkpoint_free_snapshot(PeakExecCheckpointRecord* records,
     free(records);
 }
 
-static gboolean
-peak_exec_checkpoint_append_double(char* buffer,
-                                   size_t buffer_size,
-                                   size_t* out,
-                                   double value)
-{
-    int exponent = 0;
-    unsigned long long scaled;
-    unsigned long long digit;
-    unsigned long long frac;
-
-    if (value != value) {
-        return peak_exec_checkpoint_append_literal(buffer,
-                                                   buffer_size,
-                                                   out,
-                                                   "nan");
-    }
-    if (value < 0.0) {
-        if (!peak_exec_checkpoint_append_char(buffer,
-                                              buffer_size,
-                                              out,
-                                              '-')) {
-            return FALSE;
-        }
-        value = -value;
-    }
-    if (value > DBL_MAX) {
-        return peak_exec_checkpoint_append_literal(buffer,
-                                                   buffer_size,
-                                                   out,
-                                                   "inf");
-    }
-    if (value == 0.0) {
-        return peak_exec_checkpoint_append_literal(buffer,
-                                                   buffer_size,
-                                                   out,
-                                                   "0.000000000e+00");
-    }
-    while (value >= 10.0 && exponent < 308) {
-        value /= 10.0;
-        exponent++;
-    }
-    while (value < 1.0 && exponent > -308) {
-        value *= 10.0;
-        exponent--;
-    }
-    scaled = (unsigned long long)(value * 1000000000.0 + 0.5);
-    if (scaled >= 10000000000ULL) {
-        scaled /= 10ULL;
-        exponent++;
-    }
-    digit = scaled / 1000000000ULL;
-    frac = scaled % 1000000000ULL;
-    if (!peak_exec_checkpoint_append_u64(buffer,
-                                         buffer_size,
-                                         out,
-                                         digit) ||
-        !peak_exec_checkpoint_append_char(buffer, buffer_size, out, '.') ||
-        !peak_exec_checkpoint_append_padded_u64(buffer,
-                                               buffer_size,
-                                               out,
-                                               frac,
-                                               9) ||
-        !peak_exec_checkpoint_append_char(buffer, buffer_size, out, 'e')) {
-        return FALSE;
-    }
-    if (exponent < 0) {
-        if (!peak_exec_checkpoint_append_char(buffer,
-                                              buffer_size,
-                                              out,
-                                              '-')) {
-            return FALSE;
-        }
-        exponent = -exponent;
-    } else if (!peak_exec_checkpoint_append_char(buffer,
-                                                  buffer_size,
-                                                  out,
-                                                  '+')) {
-        return FALSE;
-    }
-    return peak_exec_checkpoint_append_padded_u64(buffer,
-                                                 buffer_size,
-                                                 out,
-                                                 (unsigned long long)exponent,
-                                                 2);
-}
-
-static gboolean
-peak_exec_checkpoint_write_row(int fd,
-                               const char* name,
-                               gulong num_calls,
-                               gulong threads_seen,
-                               gdouble total_time,
-                               gdouble max_total_time,
-                               gdouble min_total_time,
-                               gdouble exclusive_time,
-                               gfloat max_time,
-                               gfloat min_time)
-{
-    char row[512];
-    size_t out = 0;
-    gulong safe_thread_count = threads_seen != 0 ? threads_seen : 1;
-    gulong per_thread =
-        num_calls / safe_thread_count +
-        ((num_calls % safe_thread_count != 0) ? 1 : 0);
-
-    if (exclusive_time < 0.0) {
-        exclusive_time = 0.0;
-    }
-    if (total_time >= 0.0 && exclusive_time > total_time) {
-        exclusive_time = total_time;
-    }
-
-    if (!peak_exec_checkpoint_write_csv_name(fd, name)) {
-        return FALSE;
-    }
-
-    if (!peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_u64(row,
-                                         sizeof(row),
-                                         &out,
-                                         (unsigned long long)num_calls) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_u64(row,
-                                         sizeof(row),
-                                         &out,
-                                         (unsigned long long)per_thread) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_u64(row,
-                                         sizeof(row),
-                                         &out,
-                                         (unsigned long long)num_calls) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)max_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)min_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)total_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)exclusive_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)max_total_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(row,
-                                            sizeof(row),
-                                            &out,
-                                            (double)min_total_time) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, ',') ||
-        !peak_exec_checkpoint_append_double(
-            row,
-            sizeof(row),
-            &out,
-            (double)num_calls * peak_general_overhead) ||
-        !peak_exec_checkpoint_append_char(row, sizeof(row), &out, '\n')) {
-        return FALSE;
-    }
-    return peak_exec_checkpoint_write_all(fd, row, out);
-}
-
 gboolean
 peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
 {
-    char path[PATH_MAX];
-    int fd = -1;
     size_t hook_count;
     size_t thread_count;
     size_t name_bytes = 0;
     size_t thread_storage_bytes;
-    PeakExecCheckpointRecord* records = NULL;
+    PeakExecCheckpointRow* records = NULL;
     size_t* name_lengths = NULL;
     char* names = NULL;
     void* thread_storage = NULL;
     PeakExecCheckpointThreadSnapshot threads = {0};
-    static const char header[] =
-        "function,"
-        "count,per_thread,per_rank,call_max_s,call_min_s,"
-        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s\n";
-
     if (!peak_general_listener_checkpoint_snapshot_lock()) {
         return FALSE;
     }
@@ -814,6 +325,7 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
     size_t name_offset = 0;
     for (size_t i = 0; i < hook_count; i++) {
         const char* name;
+        char* record_name;
         size_t current_length;
 
         if (i >= peak_hook_address_count || hook_address == NULL ||
@@ -841,8 +353,9 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
                                                thread_storage);
             return FALSE;
         }
-        records[i].name = names + name_offset;
-        memcpy(records[i].name, name, current_length);
+        record_name = names + name_offset;
+        memcpy(record_name, name, current_length);
+        records[i].name = record_name;
         name_offset += name_lengths[i];
 
         for (size_t j = 0; j < thread_count; j++) {
@@ -874,84 +387,16 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
     }
     pthread_mutex_unlock(&lock);
 
-    for (unsigned int attempt = 0; attempt < 1024; attempt++) {
-        if (peak_stats_exec_checkpoint_path(path,
-                                            sizeof(path),
-                                            checkpoint_index + attempt) != 0) {
-            peak_exec_checkpoint_free_snapshot(records,
-                                               name_lengths,
-                                               names,
-                                               thread_storage);
-            return FALSE;
-        }
-        fd = peak_exec_checkpoint_open_exclusive(path);
-        if (fd >= 0) {
-            break;
-        }
-        if (errno != EEXIST) {
-            peak_exec_checkpoint_free_snapshot(records,
-                                               name_lengths,
-                                               names,
-                                               thread_storage);
-            return FALSE;
-        }
-    }
-    if (fd < 0) {
-        errno = EEXIST;
-        peak_exec_checkpoint_free_snapshot(records,
-                                           name_lengths,
-                                           names,
-                                           thread_storage);
-        return FALSE;
-    }
-
-    if (!peak_exec_checkpoint_write_all(fd, header, sizeof(header) - 1)) {
-        peak_exec_checkpoint_close_fd(fd);
-        peak_exec_checkpoint_unlink_path(path);
-        peak_exec_checkpoint_free_snapshot(records,
-                                           name_lengths,
-                                           names,
-                                           thread_storage);
-        return FALSE;
-    }
-
-    for (size_t i = 0; i < hook_count; i++) {
-        if (records[i].num_calls == 0 || records[i].name == NULL) {
-            continue;
-        }
-        if (!peak_exec_checkpoint_write_row(fd,
-                                            records[i].name,
-                                            records[i].num_calls,
-                                            records[i].threads_seen,
-                                            records[i].total_time,
-                                            records[i].max_total_time,
-                                            records[i].min_total_time,
-                                            records[i].exclusive_time,
-                                            records[i].max_time,
-                                            records[i].min_time)) {
-            peak_exec_checkpoint_close_fd(fd);
-            peak_exec_checkpoint_unlink_path(path);
-            peak_exec_checkpoint_free_snapshot(records,
-                                               name_lengths,
-                                               names,
-                                               thread_storage);
-            return FALSE;
-        }
-    }
-
-    if (!peak_exec_checkpoint_close_fd(fd)) {
-        peak_exec_checkpoint_unlink_path(path);
-        peak_exec_checkpoint_free_snapshot(records,
-                                           name_lengths,
-                                           names,
-                                           thread_storage);
-        return FALSE;
-    }
+    gboolean written = peak_exec_checkpoint_write_rows(
+        checkpoint_index,
+        records,
+        hook_count,
+        peak_general_overhead);
     peak_exec_checkpoint_free_snapshot(records,
                                        name_lengths,
                                        names,
                                        thread_storage);
-    return TRUE;
+    return written;
 }
 
 static FILE* peak_stats_csv_open(void) {

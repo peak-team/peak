@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
+#include "internal/exec_raw_syscall.h"
 #include "internal/general_listener_internal.h"
+#include "internal/general_listener/exec_checkpoint_writer.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/runtime_config.h"
