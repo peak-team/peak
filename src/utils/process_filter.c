@@ -34,13 +34,20 @@ void get_argv0(char** argv0)
     }
 
     int n = fread(buffer, 1, 1024, fp);
+    int fread_errno = errno;
     if (n == 0) {
+        errno = fread_errno;
         perror("fread");
+        int return_errno = errno;
+        (void)fclose(fp);
         *argv0 = buffer;
+        errno = return_errno;
         return;
     }
     buffer[n - 1] = '\0';
+    (void)fclose(fp);
     *argv0 = buffer;
+    errno = fread_errno;
 }
 
 // Hardcoded list of command basenames, null-terminated.

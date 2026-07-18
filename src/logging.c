@@ -84,7 +84,7 @@ peak_log_parse_verbosity(const char* value, int* valid)
     return PEAK_VERBOSITY_WARN;
 }
 
-PeakVerbosity
+static PeakVerbosity
 peak_log_verbosity(void)
 {
     if (peak_log_cached_verbosity < 0) {
@@ -104,13 +104,13 @@ peak_log_verbosity(void)
     return (PeakVerbosity)peak_log_cached_verbosity;
 }
 
-int
+static int
 peak_log_enabled(PeakVerbosity level)
 {
     return level <= peak_log_verbosity();
 }
 
-void
+static void
 peak_log_vmessage(PeakVerbosity level, const char* format, va_list args)
 {
     if (!peak_log_enabled(level)) {

@@ -9,26 +9,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
- * @brief Checks if MPI is being used.
+ * @brief Checks for a nonempty MPI rank environment variable.
  *
- * This function checks for explicit MPI rank environment variables from PMI,
- * PMIx, MVAPICH, Open MPI, and Intel MPI. Size-only variables and Slurm task
- * variables are intentionally ignored because they can be present in launcher
- * or wrapper processes that are not MPI ranks.
+ * The recognized variables are @c PMI_RANK, @c PMIX_RANK,
+ * @c MV2_COMM_WORLD_RANK, @c OMPI_COMM_WORLD_RANK, and @c I_MPI_RANK. This is
+ * an environment heuristic; it does not query MPI initialization. Empty rank
+ * variables, size-only variables, and Slurm task variables are ignored.
  *
- * @return 1 if MPI is being used, otherwise 0.
+ * @retval 1 At least one recognized rank variable is nonempty.
+ * @retval 0 No recognized rank variable is nonempty.
  */
 int check_MPI();
 
 /**
- * @brief Gets the local rank when using MPI.
+ * @brief Gets a local rank from launcher environment variables.
  *
- * This function attempts to retrieve the local rank of the MPI process from the MPI_LOCALRANKID,
- * MV2_COMM_WORLD_LOCAL_RANK, or OMPI_COMM_WORLD_LOCAL_RANK environment variable, in that order.
+ * Variables are checked in this order: @c MPI_LOCALRANKID,
+ * @c MV2_COMM_WORLD_LOCAL_RANK, then @c OMPI_COMM_WORLD_LOCAL_RANK. The first
+ * variable that is set is converted with atoi(); an empty or nonnumeric value
+ * consequently produces 0. Out-of-range input has the undefined or
+ * implementation-specific behavior of atoi().
  *
- * @return The local rank of the MPI process, or -1 if MPI is not being used or the local rank cannot be determined.
+ * @return The converted value of the first set variable, or -1 when none is set.
  */
 int get_MPI_local_rank();
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __MPI_UTILS_H */
