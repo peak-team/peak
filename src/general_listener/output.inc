@@ -971,46 +971,6 @@ static FILE* peak_stats_csv_open(void) {
     return fp;
 }
 
-static gulong
-peak_general_listener_calls_per_active_thread(gulong calls,
-                                              gulong active_threads)
-{
-    if (calls == 0 || active_threads == 0) {
-        return 0;
-    }
-    return calls / active_threads +
-           (calls % active_threads != 0 ? 1 : 0);
-}
-
-typedef struct {
-    gboolean valid;
-    gboolean accounting_valid;
-    gboolean per_rank_max;
-    unsigned int local_ranks;
-    uint64_t stop_window_count;
-    uint64_t failed_stop_window_count;
-    double elapsed_seconds;
-    double elapsed_min_seconds;
-    double elapsed_max_seconds;
-    double profile_seconds;
-    double control_seconds;
-    double management_seconds;
-    double control_risk_seconds;
-    double profile_control_risk_seconds;
-    double profile_ratio;
-    double control_ratio;
-    double profile_control_risk_ratio;
-    double control_risk_ratio;
-    double management_ratio;
-    double ratio;
-    PeakReportMaxima per_rank_maxima;
-} PeakReportOverhead;
-
-#ifdef HAVE_MPI
-static PeakReportRankTuple
-peak_general_listener_report_rank_tuple(const PeakReportOverhead* report);
-#endif
-
 static void
 peak_general_listener_print_mpi_maximum_reports(
     const PeakReportRankTuple maximum[PEAK_REPORT_METRIC_COUNT],
@@ -1097,7 +1057,7 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
                 fprintf(csv, "\"%s\",%lu,%lu,%lu,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
                     peak_demangled_strings[i],
                     (unsigned long)sum_num_calls[i],
-                    (unsigned long)peak_general_listener_calls_per_active_thread(
+                    (unsigned long)peak_report_calls_per_active_thread(
                         sum_num_calls[i], thread_count[i]),
                     (unsigned long)sum_num_calls[i] / rank_count,
                     (double)sum_max_time[i],
@@ -1260,7 +1220,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     }
     if (have_output &&
         peak_general_listener_should_print_text(
-            rank_count <= 1 && peak_mpi_env_size() > 1)) {
+            rank_count <= 1 && peak_general_listener_mpi_env_size() > 1)) {
         const char* report_title = "PEAK Library Performance Report";
         int report_title_field =
             (int)(row_width + strlen(report_title)) / 2;
@@ -1421,7 +1381,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                 function_field_width, truncated_name, marker,
                                 max_col_width, sum_num_calls[i],
                                 max_col_width,
-                                peak_general_listener_calls_per_active_thread(
+                                peak_report_calls_per_active_thread(
                                     sum_num_calls[i], thread_count[i]),
                                 max_col_width, sum_num_calls[i] / rank_count,
                                 max_col_width, sum_max_time[i],
@@ -1454,7 +1414,7 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                 max_col_width, max_total_time[i],
                                 max_col_width, min_total_time[i],
                                 max_col_width,
-                                peak_general_listener_calls_per_active_thread(
+                                peak_report_calls_per_active_thread(
                                     sum_num_calls[i], thread_count[i]) *
                                     peak_general_overhead);
                 free(truncated_name);
@@ -1468,21 +1428,6 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     g_free(peak_demangled_strings);
     peak_demangled_strings = NULL;
     free(argv_o);
-}
-
-static void
-peak_general_listener_sanitize_output_times(gdouble* sum_total_time,
-                                            gdouble* sum_exclusive_time)
-{
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
-        if (sum_exclusive_time[i] < 0.0) {
-            sum_exclusive_time[i] = 0.0;
-        }
-        if (sum_total_time[i] >= 0.0 &&
-            sum_exclusive_time[i] > sum_total_time[i]) {
-            sum_exclusive_time[i] = sum_total_time[i];
-        }
-    }
 }
 
 static double
@@ -1635,8 +1580,9 @@ peak_general_listener_print_result(gulong* sum_num_calls,
                                    const int rank_count,
                                    const PeakReportOverhead* report_overhead)
 {
-    peak_general_listener_sanitize_output_times(sum_total_time,
-                                                sum_exclusive_time);
+    peak_report_sanitize_times(peak_hook_address_count,
+                               sum_total_time,
+                               sum_exclusive_time);
     peak_general_listener_export_csv_result(sum_num_calls,
                                             sum_total_time,
                                             max_total_time,
@@ -1862,31 +1808,6 @@ peak_socket_reduce_header_report_tuple(const PeakSocketReduceHeader* header)
     tuple.management_ratio = header->management_ratio;
     tuple.ratio = header->profile_control_ratio;
     return tuple;
-}
-
-static gboolean
-peak_general_listener_report_rank_tuple_is_valid(
-    const PeakReportRankTuple* tuple)
-{
-    return tuple != NULL &&
-           tuple->local_ranks > 0U &&
-           tuple->failed_stop_window_count != UINT64_MAX &&
-           peak_general_listener_positive_finite(tuple->elapsed_seconds) &&
-           peak_general_listener_nonnegative_finite(tuple->profile_seconds) &&
-           peak_general_listener_nonnegative_finite(tuple->control_seconds) &&
-           peak_general_listener_nonnegative_finite(tuple->management_seconds) &&
-           peak_general_listener_nonnegative_finite(
-               tuple->control_risk_seconds) &&
-           peak_general_listener_nonnegative_finite(
-               tuple->profile_control_risk_seconds) &&
-           peak_general_listener_nonnegative_finite(tuple->profile_ratio) &&
-           peak_general_listener_nonnegative_finite(tuple->control_ratio) &&
-           peak_general_listener_nonnegative_finite(
-               tuple->profile_control_risk_ratio) &&
-           peak_general_listener_nonnegative_finite(
-               tuple->control_risk_ratio) &&
-           peak_general_listener_nonnegative_finite(tuple->management_ratio) &&
-           peak_general_listener_nonnegative_finite(tuple->ratio);
 }
 
 typedef struct {
@@ -2484,7 +2405,7 @@ peak_socket_reduce_release_peers(int port,
     }
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (ack == PEAK_SOCKET_REDUCE_RELEASE_ACK &&
-        peak_env_value_truthy(
+        peak_general_listener_env_value_truthy(
             getenv(PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV))) {
         g_printerr("[peak] Socket aggregation release failure requested by test hook; peer ranks may fall back to local output\n");
         return FALSE;
@@ -2662,8 +2583,8 @@ peak_socket_reduce_rank_size(int* rank_out, int* size_out, gboolean allow_mpi)
     }
 #endif
 
-    long env_size = peak_mpi_env_size();
-    long env_rank = peak_mpi_env_rank();
+    long env_size = peak_general_listener_mpi_env_size();
+    long env_rank = peak_general_listener_mpi_env_rank();
     if (env_size > 1) {
         if (env_rank >= 0 && env_rank < env_size) {
             *rank_out = (int)env_rank;
@@ -2724,7 +2645,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
 
     local_report = peak_general_listener_local_report_overhead(sum_num_calls);
     local_report_tuple =
-        peak_general_listener_report_rank_tuple(&local_report);
+        peak_report_overhead_rank_tuple(&local_report);
     if (size <= 1) {
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
@@ -2894,7 +2815,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
             !seen[incoming_header.rank];
         PeakReportRankTuple incoming_report_tuple =
             peak_socket_reduce_header_report_tuple(&incoming_header);
-        ok = ok && peak_general_listener_report_rank_tuple_is_valid(
+        ok = ok && peak_report_rank_tuple_is_valid(
                        &incoming_report_tuple);
         if (ok) {
             release_targets[incoming_header.rank] = TRUE;
@@ -3277,34 +3198,6 @@ peak_mpi_bcast_checked(void* buffer,
     return peak_mpi_wait_collective_request(&request, label);
 }
 
-static PeakReportRankTuple
-peak_general_listener_report_rank_tuple(const PeakReportOverhead* report)
-{
-    PeakReportRankTuple tuple = {0};
-
-    if (report == NULL) {
-        return tuple;
-    }
-    tuple.accounting_valid = report->accounting_valid;
-    tuple.local_ranks = report->local_ranks;
-    tuple.stop_window_count = report->stop_window_count;
-    tuple.failed_stop_window_count = report->failed_stop_window_count;
-    tuple.elapsed_seconds = report->elapsed_seconds;
-    tuple.profile_seconds = report->profile_seconds;
-    tuple.control_seconds = report->control_seconds;
-    tuple.management_seconds = report->management_seconds;
-    tuple.control_risk_seconds = report->control_risk_seconds;
-    tuple.profile_control_risk_seconds =
-        report->profile_control_risk_seconds;
-    tuple.profile_ratio = report->profile_ratio;
-    tuple.control_ratio = report->control_ratio;
-    tuple.profile_control_risk_ratio = report->profile_control_risk_ratio;
-    tuple.control_risk_ratio = report->control_risk_ratio;
-    tuple.management_ratio = report->management_ratio;
-    tuple.ratio = report->ratio;
-    return tuple;
-}
-
 static gboolean
 peak_mpi_bcast_report_rank_tuple(PeakReportRankTuple* tuple, int owner_rank)
 {
@@ -3605,7 +3498,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     PeakReportOverhead local_report =
         peak_general_listener_local_report_overhead(sum_num_calls);
     PeakReportRankTuple local_report_tuple =
-        peak_general_listener_report_rank_tuple(&local_report);
+        peak_report_overhead_rank_tuple(&local_report);
     PeakReportRankTuple max_ratio_reports[PEAK_REPORT_METRIC_COUNT] = {{0}};
     int max_ratio_owner_ranks[PEAK_REPORT_METRIC_COUNT] = {0};
     double local_profile_seconds = local_report.profile_seconds;
@@ -3918,7 +3811,7 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
 
 rank_local:
     if (peak_general_listener_mpi_reducer_failed_closed() &&
-        peak_socket_reduce_fallback_enabled()) {
+        peak_general_listener_socket_reduce_fallback_enabled()) {
         g_printerr("[peak] MPI reducer failed; trying PEAK-owned socket aggregation fallback without further MPI calls\n");
         if (peak_general_listener_socket_reduce_result_with_rank_source(
                 sum_num_calls,

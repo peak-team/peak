@@ -2,8 +2,10 @@
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 #include "internal/general_listener_internal.h"
+#include "internal/general_listener/report_maxima.h"
+#include "internal/general_listener/report_model.h"
+#include "internal/general_listener/runtime_config.h"
 #include "internal/jit_provider.h"
-#include "general_listener/report_maxima.h"
 #include "detach_controller.h"
 #include "logging.h"
 #include "pthread_listener.h"
@@ -42,13 +44,10 @@ extern int peak_exec_checkpoint_enabled_at_startup(void) __attribute__((weak));
 
 #define PEAK_SIG_STOP (SIGRTMIN + 0)
 #define PEAK_SIG_CONT (SIGRTMIN + 1)
-#define PEAK_TEXT_OUTPUT_ENV "PEAK_TEXT_OUTPUT"
 #define PEAK_OUTPUT_AGGREGATION_HOST_ENV "PEAK_OUTPUT_AGGREGATION_HOST"
 #define PEAK_OUTPUT_AGGREGATION_PORT_ENV "PEAK_OUTPUT_AGGREGATION_PORT"
 #define PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"
 #define PEAK_OUTPUT_AGGREGATION_TOKEN_ENV "PEAK_OUTPUT_AGGREGATION_TOKEN"
-#define PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV \
-    "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_ENV \
     "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250

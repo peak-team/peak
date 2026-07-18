@@ -79,11 +79,32 @@ if(BUILD_TESTING)
         report/test_report_maxima.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
     target_include_directories(test_report_maxima PRIVATE
-        ${PROJECT_SOURCE_DIR}/src/general_listener)
+        ${PROJECT_SOURCE_DIR}/include)
     add_test(NAME test_report_maxima COMMAND test_report_maxima)
     set_tests_properties(test_report_maxima
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_maxima_test_ok")
+
+    add_executable(test_report_model
+        report/test_report_model.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c)
+    target_include_directories(test_report_model PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME test_report_model COMMAND test_report_model)
+    set_tests_properties(test_report_model
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_model_test_ok")
+
+    add_executable(test_runtime_config
+        report/test_runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_include_directories(test_runtime_config PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME test_runtime_config COMMAND test_runtime_config)
+    set_tests_properties(test_runtime_config
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "runtime_config_test_ok")
 
     add_test(NAME test_general_listener_unity_layout
         COMMAND ${Python3_EXECUTABLE}
