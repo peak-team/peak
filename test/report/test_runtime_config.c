@@ -2,6 +2,7 @@
 
 #include "internal/general_listener/runtime_config.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -51,6 +52,9 @@ check_truthy_values(void)
 static int
 check_unsigned_parser(void)
 {
+    char negative[64];
+    char spaced_negative[66];
+
     if (peak_general_listener_parse_uint_env_default(
             "PEAK_TEST_UINT", 7U) != 7U) {
         return 1;
@@ -71,13 +75,51 @@ check_unsigned_parser(void)
         return 1;
     }
     setenv("PEAK_TEST_UINT", "42junk", 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 7U ||
+        snprintf(negative, sizeof(negative), "-%lu", ULONG_MAX) >=
+            (int)sizeof(negative) ||
+        snprintf(spaced_negative,
+                 sizeof(spaced_negative),
+                 "  -%lu",
+                 ULONG_MAX) >= (int)sizeof(spaced_negative)) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", negative, 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 7U) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", spaced_negative, 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 7U) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", "-0", 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 7U) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", "-1", 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 7U) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", "+42", 1);
+    if (peak_general_listener_parse_uint_env_default(
+            "PEAK_TEST_UINT", 7U) != 42U) {
+        return 1;
+    }
+    setenv("PEAK_TEST_UINT", " 42", 1);
     return peak_general_listener_parse_uint_env_default(
-               "PEAK_TEST_UINT", 7U) != 7U;
+               "PEAK_TEST_UINT", 7U) != 42U;
 }
 
 static int
 check_detach_override(void)
 {
+    char negative[64];
+    char spaced_negative[66];
     unsigned long count = 99U;
 
     if (peak_general_listener_parse_detach_count_override(&count) ||
@@ -96,7 +138,44 @@ check_detach_override(void)
         return 1;
     }
     setenv("PEAK_DETACH_COUNT", "bad", 1);
-    return peak_general_listener_parse_detach_count_override(NULL);
+    if (peak_general_listener_parse_detach_count_override(NULL) ||
+        snprintf(negative, sizeof(negative), "-%lu", ULONG_MAX) >=
+            (int)sizeof(negative) ||
+        snprintf(spaced_negative,
+                 sizeof(spaced_negative),
+                 "  -%lu",
+                 ULONG_MAX) >= (int)sizeof(spaced_negative)) {
+        return 1;
+    }
+    count = 99U;
+    setenv("PEAK_DETACH_COUNT", negative, 1);
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", spaced_negative, 1);
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", "-0", 1);
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", "-1", 1);
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", "+1", 1);
+    if (!peak_general_listener_parse_detach_count_override(&count) ||
+        count != 1U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", " 2", 1);
+    return !peak_general_listener_parse_detach_count_override(&count) ||
+           count != 2U;
 }
 
 static int
@@ -117,16 +196,50 @@ check_local_rank_precedence(void)
 static int
 check_world_rank_precedence(void)
 {
+    char int_overflow[64];
+
     if (peak_general_listener_mpi_env_size() != -1 ||
         peak_general_listener_mpi_env_rank() != -1) {
         return 1;
     }
-    setenv("PMI_SIZE", "-1", 1);
+    setenv("PMI_SIZE", "2junk", 1);
     setenv("PMIX_SIZE", "8", 1);
-    setenv("PMI_RANK", "-1", 1);
+    setenv("PMI_RANK", "1junk", 1);
     setenv("PMIX_RANK", "2", 1);
-    return peak_general_listener_mpi_env_size() != 8 ||
-           peak_general_listener_mpi_env_rank() != 2;
+    if (peak_general_listener_mpi_env_size() != 8 ||
+        peak_general_listener_mpi_env_rank() != 2) {
+        return 1;
+    }
+
+    setenv("PMI_SIZE", "999999999999999999999999999999999", 1);
+    setenv("PMIX_SIZE", "9", 1);
+    setenv("PMI_RANK", "1 ", 1);
+    setenv("PMIX_RANK", "3", 1);
+    if (peak_general_listener_mpi_env_size() != 9 ||
+        peak_general_listener_mpi_env_rank() != 3) {
+        return 1;
+    }
+
+#if LONG_MAX > INT_MAX
+    if (snprintf(int_overflow,
+                 sizeof(int_overflow),
+                 "%ld",
+                 (long)INT_MAX + 1L) >= (int)sizeof(int_overflow)) {
+        return 1;
+    }
+    setenv("PMI_SIZE", int_overflow, 1);
+    setenv("PMIX_SIZE", "10", 1);
+    setenv("PMI_RANK", int_overflow, 1);
+    setenv("PMIX_RANK", "4", 1);
+    if (peak_general_listener_mpi_env_size() != 10 ||
+        peak_general_listener_mpi_env_rank() != 4) {
+        return 1;
+    }
+#else
+    (void)int_overflow;
+#endif
+
+    return 0;
 }
 
 static int

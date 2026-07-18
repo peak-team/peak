@@ -2,6 +2,7 @@
 
 #include "logging.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -11,12 +12,30 @@
 #define PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV \
     "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"
 
+static bool
+peak_general_listener_unsigned_text_is_negative(const char* value)
+{
+    const unsigned char* cursor = (const unsigned char*)value;
+
+    if (cursor == NULL) {
+        return false;
+    }
+    while (*cursor != '\0' && isspace(*cursor)) {
+        cursor++;
+    }
+    return *cursor == '-';
+}
+
 bool
 peak_general_listener_parse_detach_count_override(unsigned long* count_out)
 {
     const char* value = getenv("PEAK_DETACH_COUNT");
 
     if (value == NULL || value[0] == '\0') {
+        return false;
+    }
+    if (peak_general_listener_unsigned_text_is_negative(value)) {
+        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
         return false;
     }
 
@@ -41,6 +60,10 @@ peak_general_listener_parse_uint_env_default(const char* name,
 {
     const char* value = getenv(name);
     if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+    if (peak_general_listener_unsigned_text_is_negative(value)) {
+        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
         return default_value;
     }
 
@@ -185,8 +208,10 @@ peak_general_listener_parse_long_env(const char* name)
         return -1;
     }
 
+    errno = 0;
     parsed = strtol(value, &end, 10);
-    if (end == value || parsed < 0) {
+    if (errno != 0 || end == value || *end != '\0' || parsed < 0 ||
+        parsed > INT_MAX) {
         return -1;
     }
 
