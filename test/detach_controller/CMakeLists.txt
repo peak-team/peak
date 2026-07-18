@@ -14,6 +14,8 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
     ${PROJECT_SOURCE_DIR}/src/jit_provider.c
     ${PROJECT_SOURCE_DIR}/src/logging.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c

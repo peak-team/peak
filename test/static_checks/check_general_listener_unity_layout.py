@@ -43,6 +43,26 @@ def main() -> int:
     if not (fragment_dir / "README.md").is_file():
         errors.append("src/general_listener/README.md: missing layout contract")
 
+    module_headers = root / "include" / "internal" / "general_listener"
+    for module_name in ("report_maxima", "report_model", "runtime_config"):
+        source_module = fragment_dir / f"{module_name}.c"
+        header_module = module_headers / f"{module_name}.h"
+        if not source_module.is_file():
+            errors.append(
+                f"src/general_listener/{module_name}.c: missing module source"
+            )
+        if not header_module.is_file():
+            errors.append(
+                "include/internal/general_listener/"
+                f"{module_name}.h: missing private module interface"
+            )
+        misplaced_header = fragment_dir / f"{module_name}.h"
+        if misplaced_header.exists():
+            errors.append(
+                f"{misplaced_header.relative_to(root)}: private headers belong "
+                "under include/internal/general_listener"
+            )
+
     for fragment_name in EXPECTED_FRAGMENTS:
         fragment = fragment_dir / fragment_name
         if not fragment.is_file():
