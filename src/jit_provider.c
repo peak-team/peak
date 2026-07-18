@@ -871,9 +871,3 @@ peak_jit_provider_drain_pending_force_not_exec_timeout(void)
 {
     return peak_jit_provider_drain_pending_with_mode(TRUE);
 }
-
-gboolean
-peak_jit_provider_is_enabled(void)
-{
-    return peak_jit_provider_enabled;
-}

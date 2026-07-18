@@ -1,59 +1,21 @@
-#ifndef __ENV_PARSER_H
-#define __ENV_PARSER_H
+#ifndef PEAK_ENV_PARSER_H
+#define PEAK_ENV_PARSER_H
 
 /**
  * @file env_parser.h
- * @brief Header file for PEAK's environment variables related functions.
+ * @brief Scalar environment-value parsing for PEAK.
  */
 
-#include <stdio.h>
 #include <assert.h>
-#include <stdlib.h>
-#include <string.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/**
- * @brief Splits a string into an array of substrings based on a given delimiter.
- *
- * This function splits a given string into an array of substrings based on the specified delimiter character.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- * If the string does not contain the delimiter, the resulting array will have a single element containing the entire string.
- *
- * @param env_var The environment variable to parse.
- * @param a_delim A pointer to a char to be used as the delimiter.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @return 0 if the env is unset or empty, or the number of strings in the array.
- */
-size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
+#include "target_config.h"
 
-/**
- * @brief Read lines from a outside configuration file.
- *
- * This function reads lines from a outside configuration file by lines and add them to the resulting array.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- *
- * @param config_file The environment variable to parse.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @param existing_count The current size of the resulting array.
- * @return 0 if the env is unset or empty, or the number of lines read from the configuration file.
- */
-size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count);
-
-/**
- * @brief Read strings from a array.
- *
- * This function reads strings from a array and add them to the resulting array.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- *
- * @param source_array The array to read from.
- * @param source_array The count of the strings in the array.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @param existing_count The current size of the resulting array.
- * @return 0 if the env does not exist, or the number of strings read from the array.
- */
-size_t load_symbols_from_array(const char* env_var, char*** result, size_t existing_count);
 /**
  * @brief Parses a floating point number from an environment variable.
  *
@@ -129,10 +91,10 @@ unsigned int parse_env_to_time(const char* env_var);
  * This function retrieves the value of an environment variable as a string
  * and attempts to parse it as an unsigned integer using the standard library
  * function strtoul(). If the environment variable is not set, is empty, or 
- * contains invalid characters, a default value of 5 is returned.
+ * contains invalid characters, a default value of 50 is returned.
  *
  * @param env_var The name of the environment variable to parse.
- * @return The parsed unsigned integer value, or 5 if parsing fails.
+ * @return The parsed unsigned integer value, or 50 if parsing fails.
  */
 unsigned int parse_env_to_interval(const char* env_var);
 
@@ -170,7 +132,7 @@ double parse_env_to_double_default(const char* env_var, double default_value);
  * This function retrieves the value of an environment variable as a string
  * and attempts to parse it as a floating-point number using the standard 
  * library function strtod(). The parsed value, representing seconds, is then
- * converted to nanoseconds (ns) by multiplying by 1e6. 
+ * converted to nanoseconds (ns) by multiplying by 1e9.
  *
  * If the environment variable is not set, is empty, contains invalid characters, 
  * or results in an out-of-range value, a default value of 10000000 (0.01 seconds) 
@@ -194,17 +156,4 @@ unsigned long long parse_env_to_post_interval(const char* env_var);
  */
 bool parse_env_to_bool(const char* env_var);
 
-/**
- * @brief Frees the memory allocated by parse_env_w_delim function.
- *
- * This function frees the memory allocated by the parse_env_w_delim function
- * for the result variable. The function should be called when the result variable
- * is no longer needed to avoid memory leaks.
- *
- * @param result A pointer to the result variable.
- * @param count The number of elements in the result variable.
- * @return void
- */
-void free_parsed_result(char** result, size_t count);
-
-#endif /* __ENV_PARSER_H */
+#endif /* PEAK_ENV_PARSER_H */

@@ -25,52 +25,24 @@ set(sources_peak
 peak_exec_append_raw_syscall_trampoline(
     sources_peak exec_raw_syscall_trampoline.S)
 
-FILE(GLOB sources_peak_mpi
-    mpi_interceptor.c
-)
-FILE(GLOB sources_peak_cuda
-    cuda_interceptor.cpp
-)
-
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
-add_library(cuda_interceptor_obj OBJECT ${sources_peak_cuda})
-set_target_properties(cuda_interceptor_obj PROPERTIES LINKER_LANGUAGE CXX)
+    add_library(cuda_interceptor_obj OBJECT cuda_interceptor.cpp)
+    set_target_properties(cuda_interceptor_obj PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
-# Generate the shared library from the library sources
-if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
-    add_library(peak 
-        SHARED 
-            ${sources_peak}
-            ${sources_peak_mpi}
-	        $<TARGET_OBJECTS:cuda_interceptor_obj>
-            $<TARGET_OBJECTS:utils_c>
-            $<TARGET_OBJECTS:utils_cxx>  
-    )
-elseif (MPI_FOUND)
-    add_library(peak
-	SHARED
-	    ${sources_peak}
-	    ${sources_peak_mpi}
-	    $<TARGET_OBJECTS:utils_c>
-        $<TARGET_OBJECTS:utils_cxx>
-    )
-elseif (CUDA_FOUND OR CUDAToolkit_FOUND)
-    add_library(peak
-	SHARED
-	    ${sources_peak}
-	    $<TARGET_OBJECTS:cuda_interceptor_obj>
-	    $<TARGET_OBJECTS:utils_c>
-        $<TARGET_OBJECTS:utils_cxx>
-    )
-else()
-    add_library(peak 
-        SHARED 
-            ${sources_peak}
-            $<TARGET_OBJECTS:utils_c>  
-            $<TARGET_OBJECTS:utils_cxx>
-    )
+# Preserve the original source order while expressing optional modules once.
+if(MPI_FOUND)
+    list(APPEND sources_peak mpi_interceptor.c)
 endif()
+if(CUDA_FOUND OR CUDAToolkit_FOUND)
+    list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
+endif()
+list(APPEND sources_peak
+    $<TARGET_OBJECTS:utils_c>
+    $<TARGET_OBJECTS:utils_cxx>
+)
+
+add_library(peak SHARED ${sources_peak})
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
     add_executable(peak_detach_helper detach_helper.c)

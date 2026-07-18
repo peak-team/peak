@@ -1,5 +1,5 @@
 #include "utils.h"
-#include "utils_internal.h"
+#include "parent_registry_internal.h"
 
 #include <errno.h>
 #include <limits.h>
