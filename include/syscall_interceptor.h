@@ -1,5 +1,5 @@
-#ifndef __SYSCALL_INTERCEPTOR_H
-#define __SYSCALL_INTERCEPTOR_H
+#ifndef PEAK_SYSCALL_INTERCEPTOR_H
+#define PEAK_SYSCALL_INTERCEPTOR_H
 
 /**
  * @file syscall_interceptor.h
@@ -52,4 +52,4 @@ void syscall_interceptor_dettach(void);
 }
 #endif
 
-#endif /* __SYSCALL_INTERCEPTOR_H */
+#endif /* PEAK_SYSCALL_INTERCEPTOR_H */

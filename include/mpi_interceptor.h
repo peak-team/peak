@@ -1,5 +1,5 @@
-#ifndef __MPI_INTERCEPTOR_H
-#define __MPI_INTERCEPTOR_H
+#ifndef PEAK_MPI_INTERCEPTOR_H
+#define PEAK_MPI_INTERCEPTOR_H
 
 /**
  * @file mpi_interceptor.h
@@ -70,4 +70,4 @@ void mpi_interceptor_set_real_finalize_allowed(int allowed);
  */
 void mpi_interceptor_dettach(int allow_delayed_finalize);
 
-#endif /* __MPI_INTERCEPTOR_H */
+#endif /* PEAK_MPI_INTERCEPTOR_H */

@@ -1,5 +1,5 @@
-#ifndef PEAK_INTERNAL_EXEC_MEMORY_H
-#define PEAK_INTERNAL_EXEC_MEMORY_H
+#ifndef PEAK_EXEC_MEMORY_H
+#define PEAK_EXEC_MEMORY_H
 
 /**
  * @file exec_memory.h
@@ -95,4 +95,4 @@ PeakExecPreflightResult peak_exec_argv_envp_readable(char* const argv[],
 }
 #endif
 
-#endif /* PEAK_INTERNAL_EXEC_MEMORY_H */
+#endif /* PEAK_EXEC_MEMORY_H */

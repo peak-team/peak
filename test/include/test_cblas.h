@@ -1,5 +1,5 @@
-#ifndef __TEST_CBLAS_H
-#define __TEST_CBLAS_H
+#ifndef PEAK_TEST_CBLAS_H
+#define PEAK_TEST_CBLAS_H
 
 #include "FC.h"
 
@@ -33,4 +33,4 @@ void cblas_dgemm(const enum CBLAS_ORDER Order, const enum CBLAS_TRANSPOSE TransA
 }
 #endif
 
-#endif
+#endif /* PEAK_TEST_CBLAS_H */

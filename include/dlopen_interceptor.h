@@ -1,5 +1,5 @@
-#ifndef __DLOPEN_INTERCEPTOR_H
-#define __DLOPEN_INTERCEPTOR_H
+#ifndef PEAK_DLOPEN_INTERCEPTOR_H
+#define PEAK_DLOPEN_INTERCEPTOR_H
 
 /**
  * @file dlopen_interceptor.h
@@ -259,4 +259,4 @@ gboolean dlopen_interceptor_dettach(void);
 }
 #endif
 
-#endif /* __DLOPEN_INTERCEPTOR_H */
+#endif /* PEAK_DLOPEN_INTERCEPTOR_H */

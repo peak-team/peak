@@ -1,5 +1,5 @@
-#ifndef SOURCE_TARGET_H
-#define SOURCE_TARGET_H
+#ifndef PEAK_SOURCE_TARGET_H
+#define PEAK_SOURCE_TARGET_H
 
 /**
  * @file source_target.h
@@ -44,4 +44,4 @@ extern size_t source_count_FFTW;
 }
 #endif
 
-#endif // SOURCE_TARGET_H
+#endif /* PEAK_SOURCE_TARGET_H */

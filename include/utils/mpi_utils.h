@@ -1,5 +1,5 @@
-#ifndef __MPI_UTILS_H
-#define __MPI_UTILS_H
+#ifndef PEAK_MPI_UTILS_H
+#define PEAK_MPI_UTILS_H
 
 /**
  * @file mpi_utils.h
@@ -43,4 +43,4 @@ int get_MPI_local_rank();
 }
 #endif
 
-#endif /* __MPI_UTILS_H */
+#endif /* PEAK_MPI_UTILS_H */

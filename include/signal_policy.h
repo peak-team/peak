@@ -1,5 +1,5 @@
-#ifndef __PEAK_SIGNAL_POLICY_H
-#define __PEAK_SIGNAL_POLICY_H
+#ifndef PEAK_SIGNAL_POLICY_H
+#define PEAK_SIGNAL_POLICY_H
 
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_SIGNAL_POLICY_API __attribute__((visibility("default")))
@@ -20,4 +20,4 @@ PEAK_SIGNAL_POLICY_API int
 peak_signal_policy_test_send_bad_cookie_to_current_thread(void);
 #endif
 
-#endif /* __PEAK_SIGNAL_POLICY_H */
+#endif /* PEAK_SIGNAL_POLICY_H */

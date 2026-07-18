@@ -1,5 +1,5 @@
-#ifndef __PEAK_JIT_PROVIDER_H
-#define __PEAK_JIT_PROVIDER_H
+#ifndef PEAK_JIT_PROVIDER_H
+#define PEAK_JIT_PROVIDER_H
 
 /**
  * @file jit_provider.h
@@ -93,4 +93,4 @@ gboolean peak_jit_provider_drain_pending_force_not_exec_timeout(void);
 }
 #endif
 
-#endif /* __PEAK_JIT_PROVIDER_H */
+#endif /* PEAK_JIT_PROVIDER_H */

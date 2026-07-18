@@ -1108,6 +1108,22 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
     }
 }
 
+enum {
+    PEAK_TEXT_REPORT_FUNCTION_WIDTH = 32,
+    PEAK_TEXT_REPORT_COLUMN_WIDTH = 10,
+    PEAK_TEXT_REPORT_ROW_WIDTH =
+        PEAK_TEXT_REPORT_FUNCTION_WIDTH +
+        PEAK_TEXT_REPORT_COLUMN_WIDTH * 5 + 7,
+};
+
+static void
+peak_general_listener_print_text_section(const char* title,
+                                         const char* separator)
+{
+    peak_log_report("\n%s\n", title);
+    peak_log_report("%s\n", separator);
+}
+
 static void
 peak_general_listener_print_text_result(gulong* sum_num_calls,
                                         gdouble* sum_total_time,
@@ -1120,12 +1136,15 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                         const int rank_count,
                                         const PeakReportOverhead* report_overhead)
 {
-    guint max_function_width = 20;
-    guint max_col_width = 10;
-    guint row_width = max_function_width + max_col_width * 5 + 7;
-    char* row_separator = malloc(row_width + 1);
+    const guint max_function_width = PEAK_TEXT_REPORT_FUNCTION_WIDTH;
+    const guint max_col_width = PEAK_TEXT_REPORT_COLUMN_WIDTH;
+    const guint row_width = PEAK_TEXT_REPORT_ROW_WIDTH;
+    char row_separator[PEAK_TEXT_REPORT_ROW_WIDTH + 1];
+    char report_separator[PEAK_TEXT_REPORT_ROW_WIDTH + 1];
     memset(row_separator, '-', row_width);
     row_separator[row_width] = '\0';
+    memset(report_separator, '=', row_width);
+    report_separator[row_width] = '\0';
 
     char* argv_o;
     get_argv0(&argv_o);
@@ -1141,6 +1160,10 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     size_t detached_targets = 0;
     size_t reattached_targets = 0;
     size_t revisited_targets = 0;
+    size_t instrumented_targets = 0;
+    size_t profiled_targets = 0;
+    uint64_t total_calls = 0;
+    gboolean total_calls_saturated = FALSE;
     gboolean have_output = FALSE;
 
     if (report_overhead != NULL && report_overhead->valid) {
@@ -1191,7 +1214,18 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     }
 
     for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address[i]) {
+            instrumented_targets++;
+        }
         if (hook_address[i] && sum_num_calls[i] != 0) {
+            uint64_t calls = (uint64_t)sum_num_calls[i];
+            profiled_targets++;
+            if (calls > UINT64_MAX - total_calls) {
+                total_calls = UINT64_MAX;
+                total_calls_saturated = TRUE;
+            } else {
+                total_calls += calls;
+            }
             total_overhead +=
                 (double)sum_num_calls[i] * peak_general_overhead;
             have_output = TRUE;
@@ -1221,9 +1255,15 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     if (have_output &&
         peak_general_listener_should_print_text(
             rank_count <= 1 && peak_mpi_env_size() > 1)) {
-        peak_log_report("%.*s\n", row_width, row_separator);
-        peak_log_report("%*s PEAK Library\n", (row_width - 12) / 2, "");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        const char* report_title = "PEAK Library Performance Report";
+        int report_title_field =
+            (int)(row_width + strlen(report_title)) / 2;
+
+        peak_log_report("%s\n", report_separator);
+        peak_log_report("%*s\n", report_title_field, report_title);
+        peak_log_report("%s\n", report_separator);
+
+        peak_general_listener_print_text_section("Application", row_separator);
         peak_log_report("Time: %f\n", elapsed_seconds);
         if (report_overhead != NULL && report_overhead->valid) {
             peak_log_report("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f\n",
@@ -1231,7 +1271,70 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                             report_overhead->elapsed_max_seconds);
         }
         peak_log_report("PEAK done with: %s\n", argv_o);
+        if (rank_count > 1) {
+            peak_log_report("Report scope: aggregate (%d MPI ranks)\n", rank_count);
+        } else {
+            peak_log_report("Report scope: local (1 process)\n");
+        }
+        peak_log_report("Instrumented targets: %zu\n", instrumented_targets);
+        peak_log_report("Profiled targets: %zu\n", profiled_targets);
+        peak_log_report("Recorded calls: %s%llu\n",
+                        total_calls_saturated ? ">=" : "",
+                        (unsigned long long)total_calls);
+
+        peak_general_listener_print_text_section("Overhead summary",
+                                                 row_separator);
         peak_log_report("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
+        if (report_overhead != NULL && report_overhead->valid) {
+            if (report_overhead->per_rank_max) {
+                peak_log_report("Aggregated profile estimate: %.9f s\n",
+                                report_overhead->profile_seconds);
+            } else {
+                peak_log_report("Profile estimate: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->profile_seconds,
+                                report_overhead->profile_ratio * 100.0);
+                peak_log_report("Control stop windows: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->control_seconds,
+                                report_overhead->control_ratio * 100.0);
+                peak_log_report("Profile + control: %8.4f%% of runtime\n",
+                                report_overhead->ratio * 100.0);
+                peak_log_report("Local-rank risk estimate: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->profile_control_risk_seconds,
+                                report_overhead->profile_control_risk_ratio * 100.0);
+                peak_log_report("Heartbeat management CPU: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->management_seconds,
+                                report_overhead->management_ratio * 100.0);
+            }
+        }
+
+        peak_general_listener_print_text_section("Controller accounting",
+                                                 row_separator);
+        if (stop_window_owner_rank >= 0) {
+            peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), owner rank %d\n",
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio * 100.0,
+                            stop_window_owner_rank);
+        } else {
+            peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), %s\n",
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio * 100.0,
+                            rank_count > 1 ? "rank-0 local" : "local");
+        }
+        peak_log_report("Failed control windows: %llu (%s scope)\n",
+                        (unsigned long long)failed_stop_window_count,
+                        rank_count > 1 ? "aggregate" : "local");
+        peak_log_report("Accounting snapshot: %s\n",
+                        accounting_valid ? "valid" : "unavailable");
+        peak_log_report("Transition coverage (%s, ever observed): %zu detached, %zu reattached, %zu revisited\n",
+                        rank_count > 1 ? "aggregate" : "local",
+                        detached_targets,
+                        reattached_targets,
+                        revisited_targets);
+
+        peak_general_listener_print_text_section(
+            "Detailed metrics (stable key=value)", row_separator);
         if (report_overhead != NULL && report_overhead->valid) {
             if (report_overhead->per_rank_max) {
                 peak_general_listener_print_mpi_maximum_reports(
@@ -1287,98 +1390,67 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                         reattached_targets,
                         revisited_targets);
 
-        peak_log_report("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
-        peak_log_report(" individual call counts and time (in seconds)\n");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_general_listener_print_text_section("Function call statistics",
+                                                 row_separator);
+        peak_log_report("Detailed function statistics (call): counts and per-call timing in seconds\n");
         peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
-                   max_col_width, "count",
+                   max_col_width, "calls",
                    max_col_width, "per thread",
                    max_col_width, "per rank",
-                   max_col_width, "max",
-                   max_col_width, "min");
-        peak_log_report("%.*s\n", row_width, row_separator);
+                   max_col_width, "max (s)",
+                   max_col_width, "min (s)");
+        peak_log_report("%s\n", row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
-                if (!array_listener_detached[i])
-                    peak_log_report("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                               max_function_width, truncated_name,
-                               max_col_width, sum_num_calls[i],
-                               max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                               max_col_width, sum_num_calls[i] / rank_count,
-                               max_col_width, sum_max_time[i],
-                               max_col_width, sum_min_time[i]);
-                else {
-                    if (!array_listener_reattached[i])
-                        peak_log_report("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width, truncated_name,
-                                max_col_width, sum_num_calls[i],
-                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                                max_col_width, sum_num_calls[i] / rank_count,
-                                max_col_width, sum_max_time[i],
-                                max_col_width, sum_min_time[i]);
-                    else
-                        peak_log_report("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width, truncated_name,
-                                max_col_width, sum_num_calls[i],
-                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                                max_col_width, sum_num_calls[i] / rank_count,
-                                max_col_width, sum_max_time[i],
-                                max_col_width, sum_min_time[i]);
+                const char* marker = "";
+                if (array_listener_detached[i]) {
+                    marker = array_listener_reattached[i] ? "**" : "*";
                 }
+                int function_field_width =
+                    (int)max_function_width - (int)strlen(marker);
+                char* truncated_name = truncate_string(
+                    peak_demangled_strings[i], function_field_width);
+                peak_log_report("|%*s%s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                                function_field_width, truncated_name, marker,
+                                max_col_width, sum_num_calls[i],
+                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                                max_col_width, sum_num_calls[i] / rank_count,
+                                max_col_width, sum_max_time[i],
+                                max_col_width, sum_min_time[i]);
                 free(truncated_name);
             }
         }
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("Markers: * ever detached; ** ever reattached after detachment.\n");
+        peak_log_report("Revisited targets are summarized in Controller accounting.\n");
 
-        peak_log_report("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
-        peak_log_report(" thread aggregated time (in seconds)\n");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_general_listener_print_text_section("Function timing statistics",
+                                                 row_separator);
+        peak_log_report("Detailed function statistics (thread): aggregate timing in seconds\n");
         peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
-                   max_col_width, "total",
+                   max_col_width, "total (s)",
                    max_col_width, "exclusive",
-                   max_col_width, "max",
-                   max_col_width, "min",
-                   max_col_width, "overhead");
-        peak_log_report("%.*s\n", row_width, row_separator);
+                   max_col_width, "max (s)",
+                   max_col_width, "min (s)",
+                   max_col_width, "est. cost");
+        peak_log_report("%s\n", row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
-                if (!array_listener_detached[i]) {
-                    peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                               max_function_width, truncated_name,
-                               max_col_width, sum_total_time[i],
-                               max_col_width, sum_exclusive_time[i],
-                               max_col_width, max_total_time[i],
-                               max_col_width, min_total_time[i],
-                               max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                              * peak_general_overhead);
-                } else {
-                    if (!array_listener_reattached[i])
-                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                    max_function_width, truncated_name,
-                                    max_col_width, sum_total_time[i],
-                                    max_col_width, sum_exclusive_time[i],
-                                    max_col_width, max_total_time[i],
-                                    max_col_width, min_total_time[i],
-                                    max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                                    * peak_general_overhead);
-                    else
-                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
                                 max_col_width, max_total_time[i],
                                 max_col_width, min_total_time[i],
                                 max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                                * peak_general_overhead);
-                }
+                                    * peak_general_overhead);
                 free(truncated_name);
             }
         }
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("%s\n", row_separator);
     }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         g_free(peak_demangled_strings[i]);
@@ -1386,7 +1458,6 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     g_free(peak_demangled_strings);
     peak_demangled_strings = NULL;
     free(argv_o);
-    free(row_separator);
 }
 
 static void

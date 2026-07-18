@@ -1,5 +1,5 @@
-#ifndef MALLOC_OTF2_H
-#define MALLOC_OTF2_H
+#ifndef PEAK_MALLOC_OTF2_H
+#define PEAK_MALLOC_OTF2_H
 
 /**
  * @file malloc_otf2.h
@@ -49,4 +49,4 @@ void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t ev
 }
 #endif
 
-#endif /* MALLOC_OTF2_H */
+#endif /* PEAK_MALLOC_OTF2_H */

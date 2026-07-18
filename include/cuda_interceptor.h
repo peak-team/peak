@@ -1,5 +1,5 @@
-#ifndef __CUDA_INTERCEPTOR_H
-#define __CUDA_INTERCEPTOR_H
+#ifndef PEAK_CUDA_INTERCEPTOR_H
+#define PEAK_CUDA_INTERCEPTOR_H
 
 /**
  * @file cuda_interceptor.h
@@ -110,4 +110,4 @@ void cuda_interceptor_print(int is_MPI);
 }
 #endif
 
-#endif /* __CUDA_INTERCEPTOR_H */
+#endif /* PEAK_CUDA_INTERCEPTOR_H */
