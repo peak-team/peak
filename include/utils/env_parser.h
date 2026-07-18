@@ -1,210 +1,183 @@
-#ifndef __ENV_PARSER_H
-#define __ENV_PARSER_H
+#ifndef PEAK_ENV_PARSER_H
+#define PEAK_ENV_PARSER_H
 
 /**
  * @file env_parser.h
- * @brief Header file for PEAK's environment variables related functions.
+ * @brief Scalar environment-value parsing for PEAK.
  */
 
-#include <stdio.h>
 #include <assert.h>
-#include <stdlib.h>
-#include <string.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "target_config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /**
- * @brief Splits a string into an array of substrings based on a given delimiter.
+ * @brief Parses a single-precision value from an environment variable.
  *
- * This function splits a given string into an array of substrings based on the specified delimiter character.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- * If the string does not contain the delimiter, the resulting array will have a single element containing the entire string.
+ * Parsing uses strtof() and requires the complete string to be consumed. The
+ * implementation does not check @c errno or clamp the result. An empty string
+ * therefore produces 0.0; fully consumed NaN and infinity spellings, including
+ * overflow results, are returned unchanged.
  *
- * @param env_var The environment variable to parse.
- * @param a_delim A pointer to a char to be used as the delimiter.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @return 0 if the env is unset or empty, or the number of strings in the array.
- */
-size_t parse_env_w_delim(const char* env_var, const char a_delim, char*** result);
-
-/**
- * @brief Read lines from a outside configuration file.
- *
- * This function reads lines from a outside configuration file by lines and add them to the resulting array.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- *
- * @param config_file The environment variable to parse.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @param existing_count The current size of the resulting array.
- * @return 0 if the env is unset or empty, or the number of lines read from the configuration file.
- */
-size_t load_profiling_symbols(const char* config_file, char*** result, size_t existing_count);
-
-/**
- * @brief Read strings from a array.
- *
- * This function reads strings from a array and add them to the resulting array.
- * The resulting array is dynamically allocated and should be freed by the caller using `free()`.
- *
- * @param source_array The array to read from.
- * @param source_array The count of the strings in the array.
- * @param result A pointer to an array of strings to be allocated and filled by this function.
- * @param existing_count The current size of the resulting array.
- * @return 0 if the env does not exist, or the number of strings read from the array.
- */
-size_t load_symbols_from_array(const char* env_var, char*** result, size_t existing_count);
-/**
- * @brief Parses a floating point number from an environment variable.
- *
- * This function retrieves the value of an environment variable as a string
- * and parses it as a floating point number using the standard library
- * function strtof().
- *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed floating point value, or 0.0 if the environment
- *         variable is not set, is empty, or contains invalid characters.
+ * @param[in] env_var Name of the environment variable.
+ * @return The parsed value, or 0.0 if the variable is unset or has unconsumed
+ *         characters.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 float parse_env_to_float(const char* env_var);
 
 /**
- * @brief Parses a floating point number from an environment variable.
+ * @brief Parses a single-precision ratio from an environment variable.
  *
- * This function retrieves the value of an environment variable as a string
- * and parses it as a floating point number using the standard library
- * function strtof().
+ * Parsing uses strtof() and requires the complete string to be consumed. The
+ * result is not clamped and @c errno is not checked. Because the implementation
+ * does not require at least one digit, an empty value returns 0.0 rather than
+ * the fallback. Fully consumed NaN and infinity spellings, including overflow
+ * results, are returned unchanged.
  *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed floating point value, or 0.1 if the environment
- *         variable is not set, is empty, or contains invalid characters.
+ * @param[in] env_var Name of the environment variable.
+ * @return The parsed ratio, or 0.1 if the variable is unset or has unconsumed
+ *         characters.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 float parse_env_to_float_ratio(const char* env_var);
 
 /**
- * @brief Parses a floating point number from an environment variable.
+ * @brief Parses the single-precision detach factor from an environment variable.
  *
- * This function retrieves the value of an environment variable as a string
- * and parses it as a floating point number using the standard library
- * function strtof().
+ * Parsing uses strtof() and requires the complete string to be consumed. The
+ * result is not clamped and @c errno is not checked. An empty value returns
+ * 0.0 because the implementation does not require at least one digit. Fully
+ * consumed NaN and infinity spellings, including overflow results, are returned.
  *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed floating point value, or 1.2 if the environment
- *         variable is not set or contains invalid characters.
+ * @param[in] env_var Name of the environment variable.
+ * @return The parsed factor, or 1.2 if the variable is unset or has unconsumed
+ *         characters.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 float parse_env_to_float_detach_factor(const char* env_var);
 
 /**
- * @brief Parses a floating point number from an environment variable.
+ * @brief Parses the single-precision reattach factor from an environment variable.
  *
- * This function retrieves the value of an environment variable as a string
- * and parses it as a floating point number using the standard library
- * function strtof().
+ * Parsing uses strtof() and requires the complete string to be consumed. The
+ * result is not clamped and @c errno is not checked. An empty value returns
+ * 0.0 because the implementation does not require at least one digit. Fully
+ * consumed NaN and infinity spellings, including overflow results, are returned.
  *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed floating point value, or 0.85 if the environment
- *         variable is not set or contains invalid characters.
+ * @param[in] env_var Name of the environment variable.
+ * @return The parsed factor, or 0.85 if the variable is unset or has unconsumed
+ *         characters.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 float parse_env_to_float_reattach_factor(const char* env_var);
 
 /**
- * @brief Parses a time value in seconds from an environment variable and converts it to microseconds.
+ * @brief Parses seconds and converts them to microseconds.
  *
- * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as a floating-point number using the standard 
- * library function strtod(). The parsed value, representing seconds, is then
- * converted to microseconds (µs) by multiplying by 1e6. 
+ * A missing, empty, negative, partially parsed, or strtod() range-error value
+ * returns 100000 microseconds. Valid values above the representable range are
+ * clamped to UINT_MAX; this includes positive infinity. Negative infinity
+ * falls back. Other valid values are multiplied by 1e6 and truncated toward
+ * zero when converted to unsigned int.
  *
- * If the environment variable is not set, is empty, contains invalid characters, 
- * or results in an out-of-range value, a default value of 100000 (0.1 seconds) 
- * is returned.
- *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed time value in microseconds (µs), or 100000 (0.1 seconds) if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @return The interval in microseconds, or 100000 microseconds (0.1 seconds)
+ *         when parsing fails.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
+ * @pre The environment value does not parse as NaN; the current implementation
+ *      would otherwise perform an undefined floating-to-unsigned conversion.
  */
 unsigned int parse_env_to_time(const char* env_var);
 
 /**
- * @brief Parses an unsigned integer interval value from an environment variable.
+ * @brief Parses an unsigned integer interval from an environment variable.
  *
- * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as an unsigned integer using the standard library
- * function strtoul(). If the environment variable is not set, is empty, or 
- * contains invalid characters, a default value of 5 is returned.
+ * Parsing uses strtoul() with base 10. An unset value, a range error, or
+ * unconsumed characters returns 50. An empty value returns 0 because this
+ * function does not require at least one digit. Otherwise strtoul() semantics,
+ * including optional sign, apply; the converted result is not clamped before
+ * it is first narrowed to unsigned int. Values between UINT_MAX and ULONG_MAX,
+ * and accepted negative spellings, therefore follow unsigned narrowing rather
+ * than selecting the fallback.
  *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed unsigned integer value, or 5 if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @return The converted interval, or 50 for the fallback cases above.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 unsigned int parse_env_to_interval(const char* env_var);
 
 /**
- * @brief Parses an unsigned integer from an environment variable.
+ * @brief Parses an unsigned integer with a caller-supplied fallback.
  *
- * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as an unsigned integer using the standard library
- * function strtoul(). If the environment variable is not set, is empty, or
- * contains invalid characters, the provided default value is returned.
+ * Parsing uses strtoul() with base 10 and requires at least one character and
+ * complete consumption. Range errors and values above UINT_MAX return the
+ * fallback rather than being clamped.
  *
- * @param env_var The name of the environment variable to parse.
- * @param default_value The value to return when parsing fails.
- * @return The parsed unsigned integer value, or default_value if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @param[in] default_value Value returned for an unset or invalid value.
+ * @return The parsed unsigned integer, or @p default_value on failure.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 unsigned int parse_env_to_uint_default(const char* env_var, unsigned int default_value);
 
 /**
- * @brief Parses a double from an environment variable.
+ * @brief Parses a double with a caller-supplied fallback.
  *
- * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as a double using the standard library function
- * strtod(). If the environment variable is not set, is empty, or contains
- * invalid characters, the provided default value is returned.
+ * Parsing uses strtod(), requires at least one character and complete
+ * consumption, and rejects range errors. Accepted values are not clamped;
+ * literal NaN and positive or negative infinity are returned, while overflow
+ * or underflow that sets @c ERANGE selects the fallback.
  *
- * @param env_var The name of the environment variable to parse.
- * @param default_value The value to return when parsing fails.
- * @return The parsed double value, or default_value if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @param[in] default_value Value returned for an unset or invalid value.
+ * @return The parsed value, or @p default_value on failure.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 double parse_env_to_double_default(const char* env_var, double default_value);
 
- /**
- * @brief Parses a time value in seconds from an environment variable and converts it to nanoseconds.
+/**
+ * @brief Parses seconds and converts them to nanoseconds.
  *
- * This function retrieves the value of an environment variable as a string
- * and attempts to parse it as a floating-point number using the standard 
- * library function strtod(). The parsed value, representing seconds, is then
- * converted to nanoseconds (ns) by multiplying by 1e6. 
+ * A missing, empty, negative, partially parsed, or strtod() range-error value
+ * returns 10000000 nanoseconds. Valid values are multiplied by 1e9 and
+ * truncated toward zero. Unlike parse_env_to_time(), this function does not
+ * clamp large values. Negative infinity falls back. NaN, positive infinity,
+ * and finite products outside the unsigned long long range are unsupported.
  *
- * If the environment variable is not set, is empty, contains invalid characters, 
- * or results in an out-of-range value, a default value of 10000000 (0.01 seconds) 
- * is returned.
- *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed time value in nanoseconds (ns), or 10000000 (0.01 seconds) if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @return The interval in nanoseconds, or 10000000 nanoseconds (0.01 seconds)
+ *         when parsing fails.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
+ * @pre A successfully parsed value is nonnegative and finite, and its product
+ *      with 1e9 is representable as an unsigned long long; otherwise the
+ *      current implementation may perform an undefined conversion.
  */
 unsigned long long parse_env_to_post_interval(const char* env_var);
 
 /**
- * @brief Parses a boolean value from an environment variable.
+ * @brief Parses a boolean environment variable.
  *
- * This function retrieves the value of an environment variable as a string
- * and interprets it as a boolean. The function returns true if the value 
- * is "true" (case-insensitive) or "1", and false otherwise. If the environment 
- * variable is not set, false is returned by default.
+ * Only @c "true" (case-insensitive) and the exact string @c "1" produce true.
+ * Unset, empty, and all other values produce false.
  *
- * @param env_var The name of the environment variable to parse.
- * @return The parsed boolean value, or false if parsing fails.
+ * @param[in] env_var Name of the environment variable.
+ * @return true for the two accepted forms; false otherwise.
+ * @pre @p env_var is a non-NULL, null-terminated environment-variable name.
  */
 bool parse_env_to_bool(const char* env_var);
 
-/**
- * @brief Frees the memory allocated by parse_env_w_delim function.
- *
- * This function frees the memory allocated by the parse_env_w_delim function
- * for the result variable. The function should be called when the result variable
- * is no longer needed to avoid memory leaks.
- *
- * @param result A pointer to the result variable.
- * @param count The number of elements in the result variable.
- * @return void
- */
-void free_parsed_result(char** result, size_t count);
+#ifdef __cplusplus
+}
+#endif
 
-#endif /* __ENV_PARSER_H */
+#endif /* PEAK_ENV_PARSER_H */

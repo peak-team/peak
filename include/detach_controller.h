@@ -1,5 +1,5 @@
-#ifndef __PEAK_DETACH_CONTROLLER_H
-#define __PEAK_DETACH_CONTROLLER_H
+#ifndef PEAK_DETACH_CONTROLLER_H
+#define PEAK_DETACH_CONTROLLER_H
 
 #include "frida-gum.h"
 
@@ -141,4 +141,4 @@ void peak_detach_controller_abort_after_failed_finish(
 const char* peak_detach_controller_status_string(PeakDetachStatus status);
 const char* peak_detach_controller_operation_string(PeakDetachOperation operation);
 
-#endif /* __PEAK_DETACH_CONTROLLER_H */
+#endif /* PEAK_DETACH_CONTROLLER_H */

@@ -1,6 +1,3 @@
-#include <sys/syscall.h>
-#include <sys/uio.h>
-
 static char*
 peak_stats_csv_path(void)
 {
@@ -974,28 +971,16 @@ static FILE* peak_stats_csv_open(void) {
     return fp;
 }
 
-#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(HAVE_MPI)
-typedef PeakMpiReportTestTuple PeakReportRankTuple;
-#else
-typedef struct {
-    gboolean accounting_valid;
-    unsigned int local_ranks;
-    uint64_t stop_window_count;
-    uint64_t failed_stop_window_count;
-    double elapsed_seconds;
-    double profile_seconds;
-    double control_seconds;
-    double management_seconds;
-    double control_risk_seconds;
-    double profile_control_risk_seconds;
-    double profile_ratio;
-    double control_ratio;
-    double profile_control_risk_ratio;
-    double control_risk_ratio;
-    double management_ratio;
-    double ratio;
-} PeakReportRankTuple;
-#endif
+static gulong
+peak_general_listener_calls_per_active_thread(gulong calls,
+                                              gulong active_threads)
+{
+    if (calls == 0 || active_threads == 0) {
+        return 0;
+    }
+    return calls / active_threads +
+           (calls % active_threads != 0 ? 1 : 0);
+}
 
 typedef struct {
     gboolean valid;
@@ -1018,46 +1003,65 @@ typedef struct {
     double control_risk_ratio;
     double management_ratio;
     double ratio;
-    PeakReportRankTuple per_rank_max_reports[6];
-    int per_rank_max_owner_ranks[6];
+    PeakReportMaxima per_rank_maxima;
 } PeakReportOverhead;
+
+#ifdef HAVE_MPI
+static PeakReportRankTuple
+peak_general_listener_report_rank_tuple(const PeakReportOverhead* report);
+#endif
 
 static void
 peak_general_listener_print_mpi_maximum_reports(
-    const PeakReportRankTuple maximum[6],
-    const int owner_rank[6])
+    const PeakReportRankTuple maximum[PEAK_REPORT_METRIC_COUNT],
+    const int owner_rank[PEAK_REPORT_METRIC_COUNT])
 {
     peak_log_report("[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[0], maximum[0].profile_seconds,
-                    maximum[0].control_seconds,
-                    maximum[0].elapsed_seconds,
-                    maximum[0].ratio);
+                    owner_rank[PEAK_REPORT_METRIC_COMBINED],
+                    maximum[PEAK_REPORT_METRIC_COMBINED].profile_seconds,
+                    maximum[PEAK_REPORT_METRIC_COMBINED].control_seconds,
+                    maximum[PEAK_REPORT_METRIC_COMBINED].elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_COMBINED].ratio);
     peak_log_report("[peak] per-rank maximum profile overhead: owner_rank=%d profile_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[1], maximum[1].profile_seconds,
-                    maximum[1].elapsed_seconds,
-                    maximum[1].profile_ratio);
+                    owner_rank[PEAK_REPORT_METRIC_PROFILE],
+                    maximum[PEAK_REPORT_METRIC_PROFILE].profile_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE].elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE].profile_ratio);
     peak_log_report("[peak] per-rank maximum control overhead: owner_rank=%d control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[2], maximum[2].control_seconds,
-                    maximum[2].elapsed_seconds,
-                    maximum[2].control_ratio);
+                    owner_rank[PEAK_REPORT_METRIC_CONTROL],
+                    maximum[PEAK_REPORT_METRIC_CONTROL].control_seconds,
+                    maximum[PEAK_REPORT_METRIC_CONTROL].elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_CONTROL].control_ratio);
     peak_log_report("[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[4], maximum[4].profile_seconds,
-                    maximum[4].control_seconds,
-                    maximum[4].local_ranks,
-                    maximum[4].control_risk_seconds,
-                    maximum[4].profile_control_risk_seconds,
-                    maximum[4].elapsed_seconds,
-                    maximum[4].profile_control_risk_ratio);
+                    owner_rank[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK],
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .profile_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .control_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .local_ranks,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .control_risk_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .profile_control_risk_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+                        .profile_control_risk_ratio);
     peak_log_report("[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[5], maximum[5].control_seconds,
-                    maximum[5].local_ranks,
-                    maximum[5].control_risk_seconds,
-                    maximum[5].elapsed_seconds,
-                    maximum[5].control_risk_ratio);
+                    owner_rank[PEAK_REPORT_METRIC_CONTROL_RISK],
+                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].control_seconds,
+                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].local_ranks,
+                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
+                        .control_risk_seconds,
+                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK].elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_CONTROL_RISK]
+                        .control_risk_ratio);
     peak_log_report("[peak] per-rank maximum heartbeat management overhead: owner_rank=%d cpu_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f\n",
-                    owner_rank[3], maximum[3].management_seconds,
-                    maximum[3].elapsed_seconds,
-                    maximum[3].management_ratio);
+                    owner_rank[PEAK_REPORT_METRIC_MANAGEMENT],
+                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_seconds,
+                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].elapsed_seconds,
+                    maximum[PEAK_REPORT_METRIC_MANAGEMENT].management_ratio);
 }
 
 static void
@@ -1093,7 +1097,8 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
                 fprintf(csv, "\"%s\",%lu,%lu,%lu,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
                     peak_demangled_strings[i],
                     (unsigned long)sum_num_calls[i],
-                    (unsigned long)sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
+                    (unsigned long)peak_general_listener_calls_per_active_thread(
+                        sum_num_calls[i], thread_count[i]),
                     (unsigned long)sum_num_calls[i] / rank_count,
                     (double)sum_max_time[i],
                     (double)sum_min_time[i],
@@ -1108,6 +1113,22 @@ peak_general_listener_export_csv_result(gulong* sum_num_calls,
     }
 }
 
+enum {
+    PEAK_TEXT_REPORT_FUNCTION_WIDTH = 32,
+    PEAK_TEXT_REPORT_COLUMN_WIDTH = 10,
+    PEAK_TEXT_REPORT_ROW_WIDTH =
+        PEAK_TEXT_REPORT_FUNCTION_WIDTH +
+        PEAK_TEXT_REPORT_COLUMN_WIDTH * 5 + 7,
+};
+
+static void
+peak_general_listener_print_text_section(const char* title,
+                                         const char* separator)
+{
+    peak_log_report("\n%s\n", title);
+    peak_log_report("%s\n", separator);
+}
+
 static void
 peak_general_listener_print_text_result(gulong* sum_num_calls,
                                         gdouble* sum_total_time,
@@ -1120,12 +1141,15 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                                         const int rank_count,
                                         const PeakReportOverhead* report_overhead)
 {
-    guint max_function_width = 20;
-    guint max_col_width = 10;
-    guint row_width = max_function_width + max_col_width * 5 + 7;
-    char* row_separator = malloc(row_width + 1);
+    const guint max_function_width = PEAK_TEXT_REPORT_FUNCTION_WIDTH;
+    const guint max_col_width = PEAK_TEXT_REPORT_COLUMN_WIDTH;
+    const guint row_width = PEAK_TEXT_REPORT_ROW_WIDTH;
+    char row_separator[PEAK_TEXT_REPORT_ROW_WIDTH + 1];
+    char report_separator[PEAK_TEXT_REPORT_ROW_WIDTH + 1];
     memset(row_separator, '-', row_width);
     row_separator[row_width] = '\0';
+    memset(report_separator, '=', row_width);
+    report_separator[row_width] = '\0';
 
     char* argv_o;
     get_argv0(&argv_o);
@@ -1141,6 +1165,10 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     size_t detached_targets = 0;
     size_t reattached_targets = 0;
     size_t revisited_targets = 0;
+    size_t instrumented_targets = 0;
+    size_t profiled_targets = 0;
+    uint64_t total_calls = 0;
+    gboolean total_calls_saturated = FALSE;
     gboolean have_output = FALSE;
 
     if (report_overhead != NULL && report_overhead->valid) {
@@ -1151,7 +1179,8 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
         elapsed_seconds = report_overhead->elapsed_seconds;
         if (report_overhead->per_rank_max) {
             stop_window_owner_rank =
-                report_overhead->per_rank_max_owner_ranks[0];
+                report_overhead->per_rank_maxima.owner_ranks[
+                    PEAK_REPORT_METRIC_COMBINED];
         }
     } else {
         accounting_valid =
@@ -1191,7 +1220,18 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     }
 
     for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (hook_address[i]) {
+            instrumented_targets++;
+        }
         if (hook_address[i] && sum_num_calls[i] != 0) {
+            uint64_t calls = (uint64_t)sum_num_calls[i];
+            profiled_targets++;
+            if (calls > UINT64_MAX - total_calls) {
+                total_calls = UINT64_MAX;
+                total_calls_saturated = TRUE;
+            } else {
+                total_calls += calls;
+            }
             total_overhead +=
                 (double)sum_num_calls[i] * peak_general_overhead;
             have_output = TRUE;
@@ -1221,9 +1261,15 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     if (have_output &&
         peak_general_listener_should_print_text(
             rank_count <= 1 && peak_mpi_env_size() > 1)) {
-        peak_log_report("%.*s\n", row_width, row_separator);
-        peak_log_report("%*s PEAK Library\n", (row_width - 12) / 2, "");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        const char* report_title = "PEAK Library Performance Report";
+        int report_title_field =
+            (int)(row_width + strlen(report_title)) / 2;
+
+        peak_log_report("%s\n", report_separator);
+        peak_log_report("%*s\n", report_title_field, report_title);
+        peak_log_report("%s\n", report_separator);
+
+        peak_general_listener_print_text_section("Application", row_separator);
         peak_log_report("Time: %f\n", elapsed_seconds);
         if (report_overhead != NULL && report_overhead->valid) {
             peak_log_report("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f\n",
@@ -1231,12 +1277,75 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                             report_overhead->elapsed_max_seconds);
         }
         peak_log_report("PEAK done with: %s\n", argv_o);
+        if (rank_count > 1) {
+            peak_log_report("Report scope: aggregate (%d MPI ranks)\n", rank_count);
+        } else {
+            peak_log_report("Report scope: local (1 process)\n");
+        }
+        peak_log_report("Instrumented targets: %zu\n", instrumented_targets);
+        peak_log_report("Profiled targets: %zu\n", profiled_targets);
+        peak_log_report("Recorded calls: %s%llu\n",
+                        total_calls_saturated ? ">=" : "",
+                        (unsigned long long)total_calls);
+
+        peak_general_listener_print_text_section("Overhead summary",
+                                                 row_separator);
         peak_log_report("Estimated overhead: %.3es per call and %.3es total\n", peak_general_overhead, total_overhead);
         if (report_overhead != NULL && report_overhead->valid) {
             if (report_overhead->per_rank_max) {
+                peak_log_report("Aggregated profile estimate: %.9f s\n",
+                                report_overhead->profile_seconds);
+            } else {
+                peak_log_report("Profile estimate: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->profile_seconds,
+                                report_overhead->profile_ratio * 100.0);
+                peak_log_report("Control stop windows: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->control_seconds,
+                                report_overhead->control_ratio * 100.0);
+                peak_log_report("Profile + control: %8.4f%% of runtime\n",
+                                report_overhead->ratio * 100.0);
+                peak_log_report("Local-rank risk estimate: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->profile_control_risk_seconds,
+                                report_overhead->profile_control_risk_ratio * 100.0);
+                peak_log_report("Heartbeat management CPU: %.9f s (%8.4f%% of runtime)\n",
+                                report_overhead->management_seconds,
+                                report_overhead->management_ratio * 100.0);
+            }
+        }
+
+        peak_general_listener_print_text_section("Controller accounting",
+                                                 row_separator);
+        if (stop_window_owner_rank >= 0) {
+            peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), owner rank %d\n",
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio * 100.0,
+                            stop_window_owner_rank);
+        } else {
+            peak_log_report("Control windows: %llu, %.9f s (%8.4f%%), %s\n",
+                            (unsigned long long)stop_window_count,
+                            stop_window_seconds,
+                            stop_window_ratio * 100.0,
+                            rank_count > 1 ? "rank-0 local" : "local");
+        }
+        peak_log_report("Failed control windows: %llu (%s scope)\n",
+                        (unsigned long long)failed_stop_window_count,
+                        rank_count > 1 ? "aggregate" : "local");
+        peak_log_report("Accounting snapshot: %s\n",
+                        accounting_valid ? "valid" : "unavailable");
+        peak_log_report("Transition coverage (%s, ever observed): %zu detached, %zu reattached, %zu revisited\n",
+                        rank_count > 1 ? "aggregate" : "local",
+                        detached_targets,
+                        reattached_targets,
+                        revisited_targets);
+
+        peak_general_listener_print_text_section(
+            "Detailed metrics (stable key=value)", row_separator);
+        if (report_overhead != NULL && report_overhead->valid) {
+            if (report_overhead->per_rank_max) {
                 peak_general_listener_print_mpi_maximum_reports(
-                    report_overhead->per_rank_max_reports,
-                    report_overhead->per_rank_max_owner_ranks);
+                    report_overhead->per_rank_maxima.tuples,
+                    report_overhead->per_rank_maxima.owner_ranks);
             } else {
                 unsigned int report_local_ranks =
                     peak_general_listener_local_mpi_ranks();
@@ -1287,98 +1396,71 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
                         reattached_targets,
                         revisited_targets);
 
-        peak_log_report("\n%.*s function statistics (call)  %.*s\n", (row_width - 28) / 2, row_separator, (row_width - 28) / 2, row_separator);
-        peak_log_report(" individual call counts and time (in seconds)\n");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_general_listener_print_text_section("Function call statistics",
+                                                 row_separator);
+        peak_log_report("Detailed function statistics (call): counts and per-call timing in seconds\n");
         peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
-                   max_col_width, "count",
+                   max_col_width, "calls",
                    max_col_width, "per thread",
                    max_col_width, "per rank",
-                   max_col_width, "max",
-                   max_col_width, "min");
-        peak_log_report("%.*s\n", row_width, row_separator);
+                   max_col_width, "max (s)",
+                   max_col_width, "min (s)");
+        peak_log_report("%s\n", row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
-                char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
-                if (!array_listener_detached[i])
-                    peak_log_report("|%*s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                               max_function_width, truncated_name,
-                               max_col_width, sum_num_calls[i],
-                               max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                               max_col_width, sum_num_calls[i] / rank_count,
-                               max_col_width, sum_max_time[i],
-                               max_col_width, sum_min_time[i]);
-                else {
-                    if (!array_listener_reattached[i])
-                        peak_log_report("|%*s*|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width, truncated_name,
-                                max_col_width, sum_num_calls[i],
-                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                                max_col_width, sum_num_calls[i] / rank_count,
-                                max_col_width, sum_max_time[i],
-                                max_col_width, sum_min_time[i]);
-                    else
-                        peak_log_report("|%*s**|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
-                                max_function_width, truncated_name,
-                                max_col_width, sum_num_calls[i],
-                                max_col_width, sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0),
-                                max_col_width, sum_num_calls[i] / rank_count,
-                                max_col_width, sum_max_time[i],
-                                max_col_width, sum_min_time[i]);
+                const char* marker = "";
+                if (array_listener_detached[i]) {
+                    marker = array_listener_reattached[i] ? "**" : "*";
                 }
+                int function_field_width =
+                    (int)max_function_width - (int)strlen(marker);
+                char* truncated_name = truncate_string(
+                    peak_demangled_strings[i], function_field_width);
+                peak_log_report("|%*s%s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+                                function_field_width, truncated_name, marker,
+                                max_col_width, sum_num_calls[i],
+                                max_col_width,
+                                peak_general_listener_calls_per_active_thread(
+                                    sum_num_calls[i], thread_count[i]),
+                                max_col_width, sum_num_calls[i] / rank_count,
+                                max_col_width, sum_max_time[i],
+                                max_col_width, sum_min_time[i]);
                 free(truncated_name);
             }
         }
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("%s\n", row_separator);
+        peak_log_report("Markers: * ever detached; ** ever reattached after detachment.\n");
+        peak_log_report("Revisited targets are summarized in Controller accounting.\n");
 
-        peak_log_report("\n%.*s function statistics (thread)  %.*s\n", (row_width - 30) / 2, row_separator, (row_width - 30) / 2, row_separator);
-        peak_log_report(" thread aggregated time (in seconds)\n");
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_general_listener_print_text_section("Function timing statistics",
+                                                 row_separator);
+        peak_log_report("Detailed function statistics (thread): aggregate timing in seconds\n");
         peak_log_report("|%*s|%*s|%*s|%*s|%*s|%*s|\n",
                    max_function_width, "function",
-                   max_col_width, "total",
+                   max_col_width, "total (s)",
                    max_col_width, "exclusive",
-                   max_col_width, "max",
-                   max_col_width, "min",
-                   max_col_width, "overhead");
-        peak_log_report("%.*s\n", row_width, row_separator);
+                   max_col_width, "max (s)",
+                   max_col_width, "min (s)",
+                   max_col_width, "est. cost");
+        peak_log_report("%s\n", row_separator);
         for (size_t i = 0; i < peak_hook_address_count; i++) {
             if (hook_address[i] && sum_num_calls[i] != 0) {
                 char* truncated_name = truncate_string(peak_demangled_strings[i], max_function_width);
-                if (!array_listener_detached[i]) {
-                    peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                               max_function_width, truncated_name,
-                               max_col_width, sum_total_time[i],
-                               max_col_width, sum_exclusive_time[i],
-                               max_col_width, max_total_time[i],
-                               max_col_width, min_total_time[i],
-                               max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                              * peak_general_overhead);
-                } else {
-                    if (!array_listener_reattached[i])
-                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
-                                    max_function_width, truncated_name,
-                                    max_col_width, sum_total_time[i],
-                                    max_col_width, sum_exclusive_time[i],
-                                    max_col_width, max_total_time[i],
-                                    max_col_width, min_total_time[i],
-                                    max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                                    * peak_general_overhead);
-                    else
-                        peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
+                peak_log_report("|%*s|%*.3f|%*.3f|%*.3f|%*.3f|%*.3e|\n",
                                 max_function_width, truncated_name,
                                 max_col_width, sum_total_time[i],
                                 max_col_width, sum_exclusive_time[i],
                                 max_col_width, max_total_time[i],
                                 max_col_width, min_total_time[i],
-                                max_col_width, (sum_num_calls[i] / thread_count[i] + ((sum_num_calls[i] % thread_count[i] != 0) ? 1 : 0))
-                                                * peak_general_overhead);
-                }
+                                max_col_width,
+                                peak_general_listener_calls_per_active_thread(
+                                    sum_num_calls[i], thread_count[i]) *
+                                    peak_general_overhead);
                 free(truncated_name);
             }
         }
-        peak_log_report("%.*s\n", row_width, row_separator);
+        peak_log_report("%s\n", row_separator);
     }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         g_free(peak_demangled_strings[i]);
@@ -1386,7 +1468,6 @@ peak_general_listener_print_text_result(gulong* sum_num_calls,
     g_free(peak_demangled_strings);
     peak_demangled_strings = NULL;
     free(argv_o);
-    free(row_separator);
 }
 
 static void
@@ -1708,16 +1789,105 @@ typedef struct {
     uint64_t session_token;
     double elapsed_seconds;
     double profile_seconds;
+    double control_seconds;
+    double management_seconds;
+    double control_risk_seconds;
+    double profile_control_risk_seconds;
     double profile_ratio;
     double control_ratio;
     double profile_control_ratio;
     double profile_control_risk_ratio;
     double control_risk_ratio;
     double management_ratio;
+    uint64_t stop_window_count;
     uint64_t failed_stop_window_count;
+    uint32_t local_ranks;
     uint32_t accounting_valid;
-    uint32_t reserved;
 } PeakSocketReduceHeader;
+
+static void
+peak_socket_reduce_header_set_report_tuple(
+    PeakSocketReduceHeader* header,
+    const PeakReportRankTuple* tuple)
+{
+    if (header == NULL || tuple == NULL) {
+        return;
+    }
+
+    header->elapsed_seconds = tuple->elapsed_seconds;
+    header->profile_seconds = tuple->profile_seconds;
+    header->control_seconds = tuple->control_seconds;
+    header->management_seconds = tuple->management_seconds;
+    header->control_risk_seconds = tuple->control_risk_seconds;
+    header->profile_control_risk_seconds =
+        tuple->profile_control_risk_seconds;
+    header->profile_ratio = tuple->profile_ratio;
+    header->control_ratio = tuple->control_ratio;
+    header->profile_control_ratio = tuple->ratio;
+    header->profile_control_risk_ratio =
+        tuple->profile_control_risk_ratio;
+    header->control_risk_ratio = tuple->control_risk_ratio;
+    header->management_ratio = tuple->management_ratio;
+    header->stop_window_count = tuple->stop_window_count;
+    header->failed_stop_window_count = tuple->failed_stop_window_count;
+    header->local_ranks = tuple->local_ranks;
+    header->accounting_valid = tuple->accounting_valid ? 1U : 0U;
+}
+
+static PeakReportRankTuple
+peak_socket_reduce_header_report_tuple(const PeakSocketReduceHeader* header)
+{
+    PeakReportRankTuple tuple = {0};
+
+    if (header == NULL) {
+        return tuple;
+    }
+
+    tuple.accounting_valid = header->accounting_valid != 0U;
+    tuple.local_ranks = header->local_ranks;
+    tuple.stop_window_count = header->stop_window_count;
+    tuple.failed_stop_window_count = header->failed_stop_window_count;
+    tuple.elapsed_seconds = header->elapsed_seconds;
+    tuple.profile_seconds = header->profile_seconds;
+    tuple.control_seconds = header->control_seconds;
+    tuple.management_seconds = header->management_seconds;
+    tuple.control_risk_seconds = header->control_risk_seconds;
+    tuple.profile_control_risk_seconds =
+        header->profile_control_risk_seconds;
+    tuple.profile_ratio = header->profile_ratio;
+    tuple.control_ratio = header->control_ratio;
+    tuple.profile_control_risk_ratio =
+        header->profile_control_risk_ratio;
+    tuple.control_risk_ratio = header->control_risk_ratio;
+    tuple.management_ratio = header->management_ratio;
+    tuple.ratio = header->profile_control_ratio;
+    return tuple;
+}
+
+static gboolean
+peak_general_listener_report_rank_tuple_is_valid(
+    const PeakReportRankTuple* tuple)
+{
+    return tuple != NULL &&
+           tuple->local_ranks > 0U &&
+           tuple->failed_stop_window_count != UINT64_MAX &&
+           peak_general_listener_positive_finite(tuple->elapsed_seconds) &&
+           peak_general_listener_nonnegative_finite(tuple->profile_seconds) &&
+           peak_general_listener_nonnegative_finite(tuple->control_seconds) &&
+           peak_general_listener_nonnegative_finite(tuple->management_seconds) &&
+           peak_general_listener_nonnegative_finite(
+               tuple->control_risk_seconds) &&
+           peak_general_listener_nonnegative_finite(
+               tuple->profile_control_risk_seconds) &&
+           peak_general_listener_nonnegative_finite(tuple->profile_ratio) &&
+           peak_general_listener_nonnegative_finite(tuple->control_ratio) &&
+           peak_general_listener_nonnegative_finite(
+               tuple->profile_control_risk_ratio) &&
+           peak_general_listener_nonnegative_finite(
+               tuple->control_risk_ratio) &&
+           peak_general_listener_nonnegative_finite(tuple->management_ratio) &&
+           peak_general_listener_nonnegative_finite(tuple->ratio);
+}
 
 typedef struct {
     uint64_t magic;
@@ -1745,7 +1915,7 @@ typedef struct {
 } PeakSocketReduceRecord;
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 8U
+#define PEAK_SOCKET_REDUCE_VERSION 9U
 #define PEAK_SOCKET_REDUCE_RELEASE_ACK 0x51U
 #define PEAK_SOCKET_REDUCE_RELEASE_FALLBACK 0x52U
 #define PEAK_SOCKET_REDUCE_DEFAULT_TIMEOUT_MS 60000
@@ -2420,14 +2590,18 @@ peak_socket_reduce_merge_records(PeakSocketReduceRecord* aggregate,
         if (incoming[i].max_total_time > aggregate[i].max_total_time) {
             aggregate[i].max_total_time = incoming[i].max_total_time;
         }
-        if (incoming[i].min_total_time < aggregate[i].min_total_time) {
+        if (incoming[i].thread_count > 0 &&
+            (aggregate[i].thread_count == 0 ||
+             incoming[i].min_total_time < aggregate[i].min_total_time)) {
             aggregate[i].min_total_time = incoming[i].min_total_time;
         }
         aggregate[i].exclusive_time += incoming[i].exclusive_time;
         if (incoming[i].max_time > aggregate[i].max_time) {
             aggregate[i].max_time = incoming[i].max_time;
         }
-        if (incoming[i].min_time < aggregate[i].min_time) {
+        if (incoming[i].thread_count > 0 &&
+            (aggregate[i].thread_count == 0 ||
+             incoming[i].min_time < aggregate[i].min_time)) {
             aggregate[i].min_time = incoming[i].min_time;
         }
         aggregate[i].thread_count += incoming[i].thread_count;
@@ -2532,6 +2706,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     PeakSocketReduceRecord* local_records = NULL;
     PeakSocketReduceHeader header;
     PeakReportOverhead local_report = {0};
+    PeakReportRankTuple local_report_tuple = {0};
 
     if (!peak_socket_reduce_rank_size(&rank, &size, allow_mpi_rank_query)) {
         g_printerr("[peak] Socket aggregation could not determine rank/size from %s; skipping aggregate output\n",
@@ -2548,6 +2723,8 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     }
 
     local_report = peak_general_listener_local_report_overhead(sum_num_calls);
+    local_report_tuple =
+        peak_general_listener_report_rank_tuple(&local_report);
     if (size <= 1) {
         peak_general_listener_print_result(sum_num_calls,
                                            sum_total_time,
@@ -2581,17 +2758,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     header.rank = (uint32_t)rank;
     header.hook_count = (uint64_t)peak_hook_address_count;
     header.session_token = session_token;
-    header.elapsed_seconds = local_report.elapsed_seconds;
-    header.profile_seconds = local_report.profile_seconds;
-    header.profile_ratio = local_report.profile_ratio;
-    header.control_ratio = local_report.control_ratio;
-    header.profile_control_ratio = local_report.ratio;
-    header.profile_control_risk_ratio =
-        local_report.profile_control_risk_ratio;
-    header.control_risk_ratio = local_report.control_risk_ratio;
-    header.management_ratio = local_report.management_ratio;
-    header.failed_stop_window_count = local_report.failed_stop_window_count;
-    header.accounting_valid = local_report.accounting_valid ? 1U : 0U;
+    peak_socket_reduce_header_set_report_tuple(&header, &local_report_tuple);
 
     if (rank != 0) {
         char root_host[256];
@@ -2659,19 +2826,23 @@ peak_general_listener_socket_reduce_result_with_rank_source(
     double socket_profile_seconds = local_report.profile_seconds;
     double socket_min_elapsed_seconds = local_report.elapsed_seconds;
     double socket_max_elapsed_seconds = local_report.elapsed_seconds;
-    double socket_max_profile_ratio = local_report.profile_ratio;
-    double socket_max_control_ratio = local_report.control_ratio;
-    double socket_max_profile_control_ratio = local_report.ratio;
-    double socket_max_profile_control_risk_ratio =
-        local_report.profile_control_risk_ratio;
-    double socket_max_control_risk_ratio = local_report.control_risk_ratio;
-    double socket_max_management_ratio = local_report.management_ratio;
+    PeakReportMaxima socket_maxima;
     uint64_t socket_failed_stop_window_count =
         local_report.failed_stop_window_count;
     gboolean socket_accounting_valid = local_report.accounting_valid;
     unsigned int received = 0;
     gboolean failed = FALSE;
     seen[0] = TRUE;
+    if (!peak_report_maxima_initialize(&socket_maxima,
+                                       &local_report_tuple,
+                                       0)) {
+        close(listener);
+        g_free(local_records);
+        g_free(release_targets);
+        g_free(seen);
+        g_free(aggregate);
+        return FALSE;
+    }
 
     while (received < (unsigned int)(size - 1) &&
            peak_socket_reduce_remaining_ms(deadline_us) > 0) {
@@ -2705,7 +2876,7 @@ peak_general_listener_socket_reduce_result_with_rank_source(
             fd,
             peak_socket_reduce_remaining_ms(deadline_us));
 
-        PeakSocketReduceHeader incoming_header;
+        PeakSocketReduceHeader incoming_header = {0};
         PeakSocketReduceRecord* incoming =
             g_new0(PeakSocketReduceRecord, peak_hook_address_count);
         gboolean ok =
@@ -2720,10 +2891,11 @@ peak_general_listener_socket_reduce_result_with_rank_source(
             incoming_header.rank < (uint32_t)size &&
             incoming_header.rank > 0 &&
             incoming_header.accounting_valid <= 1U &&
-            incoming_header.failed_stop_window_count != UINT64_MAX &&
-            peak_general_listener_positive_finite(
-                incoming_header.elapsed_seconds) &&
             !seen[incoming_header.rank];
+        PeakReportRankTuple incoming_report_tuple =
+            peak_socket_reduce_header_report_tuple(&incoming_header);
+        ok = ok && peak_general_listener_report_rank_tuple_is_valid(
+                       &incoming_report_tuple);
         if (ok) {
             release_targets[incoming_header.rank] = TRUE;
         }
@@ -2733,61 +2905,34 @@ peak_general_listener_socket_reduce_result_with_rank_source(
                 incoming,
                 sizeof(PeakSocketReduceRecord) * peak_hook_address_count,
                 deadline_us) &&
-            peak_socket_reduce_merge_records(aggregate, incoming);
+            peak_socket_reduce_merge_records(aggregate, incoming) &&
+            peak_report_maxima_consider(&socket_maxima,
+                                        &incoming_report_tuple,
+                                        (int)incoming_header.rank);
         if (ok) {
-            if (incoming_header.elapsed_seconds <
+            if (incoming_report_tuple.elapsed_seconds <
                 socket_min_elapsed_seconds) {
                 socket_min_elapsed_seconds =
-                    incoming_header.elapsed_seconds;
+                    incoming_report_tuple.elapsed_seconds;
             }
-            if (incoming_header.elapsed_seconds >
+            if (incoming_report_tuple.elapsed_seconds >
                 socket_max_elapsed_seconds) {
                 socket_max_elapsed_seconds =
-                    incoming_header.elapsed_seconds;
+                    incoming_report_tuple.elapsed_seconds;
             }
             if (peak_general_listener_positive_finite(
-                    incoming_header.profile_seconds) &&
+                    incoming_report_tuple.profile_seconds) &&
                 socket_profile_seconds <=
-                    DBL_MAX - incoming_header.profile_seconds) {
-                socket_profile_seconds += incoming_header.profile_seconds;
-            }
-            if (incoming_header.profile_control_ratio >
-                socket_max_profile_control_ratio) {
-                socket_max_profile_control_ratio =
-                    incoming_header.profile_control_ratio;
-            }
-            if (incoming_header.profile_ratio >
-                socket_max_profile_ratio) {
-                socket_max_profile_ratio =
-                    incoming_header.profile_ratio;
-            }
-            if (incoming_header.control_ratio >
-                socket_max_control_ratio) {
-                socket_max_control_ratio =
-                    incoming_header.control_ratio;
-            }
-            if (incoming_header.profile_control_risk_ratio >
-                socket_max_profile_control_risk_ratio) {
-                socket_max_profile_control_risk_ratio =
-                    incoming_header.profile_control_risk_ratio;
-            }
-            if (incoming_header.control_risk_ratio >
-                socket_max_control_risk_ratio) {
-                socket_max_control_risk_ratio =
-                    incoming_header.control_risk_ratio;
-            }
-            if (incoming_header.management_ratio >
-                socket_max_management_ratio) {
-                socket_max_management_ratio =
-                    incoming_header.management_ratio;
+                    DBL_MAX - incoming_report_tuple.profile_seconds) {
+                socket_profile_seconds += incoming_report_tuple.profile_seconds;
             }
             socket_failed_stop_window_count =
                 peak_general_listener_add_uint64_saturated(
                     socket_failed_stop_window_count,
-                    incoming_header.failed_stop_window_count);
+                    incoming_report_tuple.failed_stop_window_count);
             socket_accounting_valid =
                 socket_accounting_valid &&
-                incoming_header.accounting_valid != 0U;
+                incoming_report_tuple.accounting_valid;
         }
         close(fd);
         g_free(incoming);
@@ -2890,26 +3035,43 @@ peak_general_listener_socket_reduce_result_with_rank_source(
         g_free(release_targets);
         return FALSE;
     }
+    const PeakReportRankTuple* combined_maximum =
+        &socket_maxima.tuples[PEAK_REPORT_METRIC_COMBINED];
     PeakReportOverhead socket_report = {0};
     socket_report.valid = TRUE;
     socket_report.accounting_valid = socket_accounting_valid;
-    socket_report.per_rank_max = TRUE;
-    socket_report.stop_window_count = local_report.stop_window_count;
+    socket_report.per_rank_max =
+        peak_report_maxima_complete(&socket_maxima);
+    socket_report.local_ranks = combined_maximum->local_ranks;
+    socket_report.stop_window_count = combined_maximum->stop_window_count;
     socket_report.failed_stop_window_count =
         socket_failed_stop_window_count;
-    socket_report.elapsed_seconds = local_report.elapsed_seconds;
+    socket_report.elapsed_seconds = combined_maximum->elapsed_seconds;
     socket_report.elapsed_min_seconds = socket_min_elapsed_seconds;
     socket_report.elapsed_max_seconds = socket_max_elapsed_seconds;
     socket_report.profile_seconds = socket_profile_seconds;
-    socket_report.control_seconds = local_report.control_seconds;
-    socket_report.management_seconds = local_report.management_seconds;
-    socket_report.profile_ratio = socket_max_profile_ratio;
-    socket_report.control_ratio = socket_max_control_ratio;
-    socket_report.ratio = socket_max_profile_control_ratio;
+    socket_report.control_seconds = combined_maximum->control_seconds;
+    socket_report.management_seconds = combined_maximum->management_seconds;
+    socket_report.control_risk_seconds =
+        combined_maximum->control_risk_seconds;
+    socket_report.profile_control_risk_seconds =
+        combined_maximum->profile_control_risk_seconds;
+    socket_report.profile_ratio =
+        socket_maxima.tuples[PEAK_REPORT_METRIC_PROFILE].profile_ratio;
+    socket_report.control_ratio =
+        socket_maxima.tuples[PEAK_REPORT_METRIC_CONTROL].control_ratio;
+    socket_report.ratio = combined_maximum->ratio;
     socket_report.profile_control_risk_ratio =
-        socket_max_profile_control_risk_ratio;
-    socket_report.control_risk_ratio = socket_max_control_risk_ratio;
-    socket_report.management_ratio = socket_max_management_ratio;
+        socket_maxima.tuples[
+            PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+            .profile_control_risk_ratio;
+    socket_report.control_risk_ratio =
+        socket_maxima.tuples[PEAK_REPORT_METRIC_CONTROL_RISK]
+            .control_risk_ratio;
+    socket_report.management_ratio =
+        socket_maxima.tuples[PEAK_REPORT_METRIC_MANAGEMENT]
+            .management_ratio;
+    socket_report.per_rank_maxima = socket_maxima;
     peak_general_listener_print_text_result(socket_sum_num_calls,
                                             socket_sum_total_time,
                                             socket_max_total_time,
@@ -3215,33 +3377,38 @@ peak_mpi_bcast_report_rank_tuple(PeakReportRankTuple* tuple, int owner_rank)
 
 static gboolean
 peak_mpi_reduce_report_rank_tuples(const PeakReportRankTuple* local_tuple,
-                                   PeakReportRankTuple maximum_tuples[6],
-                                   int owner_ranks[6],
+                                   PeakReportRankTuple maximum_tuples[
+                                       PEAK_REPORT_METRIC_COUNT],
+                                   int owner_ranks[
+                                       PEAK_REPORT_METRIC_COUNT],
                                    int rank)
 {
     struct {
         double value;
         int rank;
-    } local_locations[6], maximum_locations[6] = {{0}};
-    double ratios[6];
+    } local_locations[PEAK_REPORT_METRIC_COUNT],
+        maximum_locations[PEAK_REPORT_METRIC_COUNT] = {{0}};
+    double ratios[PEAK_REPORT_METRIC_COUNT];
 
     if (local_tuple == NULL || maximum_tuples == NULL ||
         owner_ranks == NULL) {
         return FALSE;
     }
-    ratios[0] = local_tuple->ratio;
-    ratios[1] = local_tuple->profile_ratio;
-    ratios[2] = local_tuple->control_ratio;
-    ratios[3] = local_tuple->management_ratio;
-    ratios[4] = local_tuple->profile_control_risk_ratio;
-    ratios[5] = local_tuple->control_risk_ratio;
+    ratios[PEAK_REPORT_METRIC_COMBINED] = local_tuple->ratio;
+    ratios[PEAK_REPORT_METRIC_PROFILE] = local_tuple->profile_ratio;
+    ratios[PEAK_REPORT_METRIC_CONTROL] = local_tuple->control_ratio;
+    ratios[PEAK_REPORT_METRIC_MANAGEMENT] = local_tuple->management_ratio;
+    ratios[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK] =
+        local_tuple->profile_control_risk_ratio;
+    ratios[PEAK_REPORT_METRIC_CONTROL_RISK] =
+        local_tuple->control_risk_ratio;
     for (size_t i = 0; i < G_N_ELEMENTS(local_locations); i++) {
         local_locations[i].value = ratios[i];
         local_locations[i].rank = rank;
     }
     if (!peak_mpi_reduce_checked(local_locations,
                                  maximum_locations,
-                                 6,
+                                 PEAK_REPORT_METRIC_COUNT,
                                  MPI_DOUBLE_INT,
                                  MPI_MAXLOC,
                                  0,
@@ -3271,6 +3438,62 @@ peak_mpi_reduce_report_rank_tuples(const PeakReportRankTuple* local_tuple,
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
+static PeakReportRankTuple
+peak_report_rank_tuple_from_test(const PeakMpiReportTestTuple* source)
+{
+    PeakReportRankTuple tuple = {0};
+
+    if (source == NULL) {
+        return tuple;
+    }
+    tuple.accounting_valid = source->accounting_valid != 0;
+    tuple.local_ranks = source->local_ranks;
+    tuple.stop_window_count = source->stop_window_count;
+    tuple.failed_stop_window_count = source->failed_stop_window_count;
+    tuple.elapsed_seconds = source->elapsed_seconds;
+    tuple.profile_seconds = source->profile_seconds;
+    tuple.control_seconds = source->control_seconds;
+    tuple.management_seconds = source->management_seconds;
+    tuple.control_risk_seconds = source->control_risk_seconds;
+    tuple.profile_control_risk_seconds =
+        source->profile_control_risk_seconds;
+    tuple.profile_ratio = source->profile_ratio;
+    tuple.control_ratio = source->control_ratio;
+    tuple.profile_control_risk_ratio =
+        source->profile_control_risk_ratio;
+    tuple.control_risk_ratio = source->control_risk_ratio;
+    tuple.management_ratio = source->management_ratio;
+    tuple.ratio = source->ratio;
+    return tuple;
+}
+
+static void
+peak_report_rank_tuple_to_test(const PeakReportRankTuple* source,
+                               PeakMpiReportTestTuple* destination)
+{
+    if (source == NULL || destination == NULL) {
+        return;
+    }
+    destination->accounting_valid = source->accounting_valid;
+    destination->local_ranks = source->local_ranks;
+    destination->stop_window_count = source->stop_window_count;
+    destination->failed_stop_window_count = source->failed_stop_window_count;
+    destination->elapsed_seconds = source->elapsed_seconds;
+    destination->profile_seconds = source->profile_seconds;
+    destination->control_seconds = source->control_seconds;
+    destination->management_seconds = source->management_seconds;
+    destination->control_risk_seconds = source->control_risk_seconds;
+    destination->profile_control_risk_seconds =
+        source->profile_control_risk_seconds;
+    destination->profile_ratio = source->profile_ratio;
+    destination->control_ratio = source->control_ratio;
+    destination->profile_control_risk_ratio =
+        source->profile_control_risk_ratio;
+    destination->control_risk_ratio = source->control_risk_ratio;
+    destination->management_ratio = source->management_ratio;
+    destination->ratio = source->ratio;
+}
+
 gboolean
 peak_general_listener_test_reduce_report_tuples(
     const PeakMpiReportTestTuple* local_tuple,
@@ -3278,12 +3501,27 @@ peak_general_listener_test_reduce_report_tuples(
     int owner_ranks[6])
 {
     int rank;
+    PeakReportRankTuple internal_local;
+    PeakReportRankTuple internal_maximum[PEAK_REPORT_METRIC_COUNT] = {{0}};
+
+    if (local_tuple == NULL || maximum_tuples == NULL ||
+        owner_ranks == NULL) {
+        return FALSE;
+    }
 
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    return peak_mpi_reduce_report_rank_tuples(local_tuple,
-                                              maximum_tuples,
-                                              owner_ranks,
-                                              rank);
+    internal_local = peak_report_rank_tuple_from_test(local_tuple);
+    if (!peak_mpi_reduce_report_rank_tuples(&internal_local,
+                                            internal_maximum,
+                                            owner_ranks,
+                                            rank)) {
+        return FALSE;
+    }
+    for (size_t i = 0; i < PEAK_REPORT_METRIC_COUNT; i++) {
+        peak_report_rank_tuple_to_test(&internal_maximum[i],
+                                       &maximum_tuples[i]);
+    }
+    return TRUE;
 }
 
 void
@@ -3291,7 +3529,16 @@ peak_general_listener_test_print_report_tuples(
     const PeakMpiReportTestTuple maximum_tuples[6],
     const int owner_ranks[6])
 {
-    peak_general_listener_print_mpi_maximum_reports(maximum_tuples,
+    PeakReportRankTuple internal_maximum[PEAK_REPORT_METRIC_COUNT] = {{0}};
+
+    if (maximum_tuples == NULL || owner_ranks == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < PEAK_REPORT_METRIC_COUNT; i++) {
+        internal_maximum[i] =
+            peak_report_rank_tuple_from_test(&maximum_tuples[i]);
+    }
+    peak_general_listener_print_mpi_maximum_reports(internal_maximum,
                                                     owner_ranks);
 }
 
@@ -3359,8 +3606,8 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
         peak_general_listener_local_report_overhead(sum_num_calls);
     PeakReportRankTuple local_report_tuple =
         peak_general_listener_report_rank_tuple(&local_report);
-    PeakReportRankTuple max_ratio_reports[6] = {{0}};
-    int max_ratio_owner_ranks[6] = {0};
+    PeakReportRankTuple max_ratio_reports[PEAK_REPORT_METRIC_COUNT] = {{0}};
+    int max_ratio_owner_ranks[PEAK_REPORT_METRIC_COUNT] = {0};
     double local_profile_seconds = local_report.profile_seconds;
     double mpi_profile_seconds = 0.0;
     double local_elapsed_seconds = local_report.elapsed_seconds;
@@ -3569,29 +3816,43 @@ peak_general_listener_reduce_result(gulong* sum_num_calls,
     PeakReportOverhead mpi_report = {0};
     mpi_report.valid = TRUE;
     mpi_report.accounting_valid = all_accounting_valid != 0;
-    mpi_report.per_rank_max = TRUE;
-    mpi_report.stop_window_count = max_ratio_reports[0].stop_window_count;
+    mpi_report.per_rank_max = peak_report_maxima_load(
+        &mpi_report.per_rank_maxima,
+        max_ratio_reports,
+        max_ratio_owner_ranks);
+    mpi_report.local_ranks =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].local_ranks;
+    mpi_report.stop_window_count =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].stop_window_count;
     mpi_report.failed_stop_window_count = mpi_failed_stop_window_count;
-    mpi_report.elapsed_seconds = max_ratio_reports[0].elapsed_seconds;
+    mpi_report.elapsed_seconds =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].elapsed_seconds;
     mpi_report.elapsed_min_seconds = mpi_min_elapsed_seconds;
     mpi_report.elapsed_max_seconds = mpi_max_elapsed_seconds;
     mpi_report.profile_seconds = mpi_profile_seconds;
-    mpi_report.control_seconds = max_ratio_reports[0].control_seconds;
-    mpi_report.management_seconds = max_ratio_reports[0].management_seconds;
-    mpi_report.ratio = max_ratio_reports[0].ratio;
-    mpi_report.profile_ratio = max_ratio_reports[1].profile_ratio;
-    mpi_report.control_ratio = max_ratio_reports[2].control_ratio;
-    mpi_report.management_ratio = max_ratio_reports[3].management_ratio;
+    mpi_report.control_seconds =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].control_seconds;
+    mpi_report.management_seconds =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].management_seconds;
+    mpi_report.control_risk_seconds =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].control_risk_seconds;
+    mpi_report.profile_control_risk_seconds =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED]
+            .profile_control_risk_seconds;
+    mpi_report.ratio =
+        max_ratio_reports[PEAK_REPORT_METRIC_COMBINED].ratio;
+    mpi_report.profile_ratio =
+        max_ratio_reports[PEAK_REPORT_METRIC_PROFILE].profile_ratio;
+    mpi_report.control_ratio =
+        max_ratio_reports[PEAK_REPORT_METRIC_CONTROL].control_ratio;
+    mpi_report.management_ratio =
+        max_ratio_reports[PEAK_REPORT_METRIC_MANAGEMENT].management_ratio;
     mpi_report.profile_control_risk_ratio =
-        max_ratio_reports[4].profile_control_risk_ratio;
-    mpi_report.control_risk_ratio = max_ratio_reports[5].control_risk_ratio;
-    memcpy(mpi_report.per_rank_max_reports,
-           max_ratio_reports,
-           sizeof(max_ratio_reports));
-    for (size_t i = 0; i < G_N_ELEMENTS(mpi_report.per_rank_max_owner_ranks);
-         i++) {
-        mpi_report.per_rank_max_owner_ranks[i] = max_ratio_owner_ranks[i];
-    }
+        max_ratio_reports[PEAK_REPORT_METRIC_PROFILE_CONTROL_RISK]
+            .profile_control_risk_ratio;
+    mpi_report.control_risk_ratio =
+        max_ratio_reports[PEAK_REPORT_METRIC_CONTROL_RISK]
+            .control_risk_ratio;
     gulong* mpi_sum_num_calls = g_new0(gulong, peak_hook_address_count);
     gdouble* mpi_sum_total_time = g_new0(gdouble, peak_hook_address_count);
     gdouble* mpi_max_total_time = g_new0(gdouble, peak_hook_address_count);

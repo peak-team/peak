@@ -1,5 +1,5 @@
-#ifndef PEAK_UTILS_INTERNAL_H
-#define PEAK_UTILS_INTERNAL_H
+#ifndef PEAK_PARENT_REGISTRY_INTERNAL_H
+#define PEAK_PARENT_REGISTRY_INTERNAL_H
 
 #ifdef PEAK_UTILS_TESTING
 typedef enum {
@@ -23,4 +23,4 @@ typedef struct {
 int peak_check_parent_process_for_test(const PeakParentRegistryTestConfig* config);
 #endif
 
-#endif
+#endif /* PEAK_PARENT_REGISTRY_INTERNAL_H */

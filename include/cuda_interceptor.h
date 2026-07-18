@@ -1,9 +1,15 @@
-#ifndef __CUDA_INTERCEPTOR_H
-#define __CUDA_INTERCEPTOR_H
+#ifndef PEAK_CUDA_INTERCEPTOR_H
+#define PEAK_CUDA_INTERCEPTOR_H
 
 /**
  * @file cuda_interceptor.h
- * @brief Header file for CUDA function interception using Gum library
+ * @brief CUDA Runtime and Driver launch interception and reporting.
+ *
+ * PEAK replaces the CUDA Runtime and Driver kernel- and graph-launch entry
+ * points that are present in the process.  The wrappers record launch
+ * metadata and CUDA events while preserving the original CUDA return value.
+ * All interceptor state, CUDA events, and result maps are owned by this
+ * module; callers do not acquire ownership through this interface.
  */
 #include "frida-gum.h"
 #include "utils/utils.h"
@@ -43,36 +49,65 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** @name Interceptor lifecycle
+ * @{ */
+
 /**
- * @brief Attach CUDA function interception
+ * @brief Installs the available CUDA launch replacements.
  *
- * This function attaches interception to the CUDA library functions using the Gum library.
- * Specifically, it intercepts the `cudaLaunchKernel` function and replaces it with a custom implementation,
- * `peak_cuda_launch_kernel`, which can be used to perform additional actions before calling the original function.
+ * The implementation initializes the module-owned result maps and per-target
+ * CUDA events, then attempts each supported Runtime and Driver replacement in
+ * one Gum transaction.  Missing entry points are skipped.  If one replacement
+ * fails, already successful replacements remain installed; the function does
+ * not roll them back.
  *
- * @return 0 if the interception was successful, a negative number in the GumReplaceReturn otherwise.
+ * @return `GUM_REPLACE_OK` when every replacement that was attempted
+ *         succeeded; otherwise, the first non-OK `GumReplaceReturn`.  A return
+ *         of `GUM_REPLACE_OK` does not imply that every optional CUDA entry
+ *         point was present.
  */
 int cuda_interceptor_attach();
 
 /**
- * @brief Detach CUDA function interception
+ * @brief Reverts installed CUDA replacements and releases collected state.
  *
- * This function detaches the previously attached CUDA function interception and releases any resources used by the Gum library.
+ * New event admission is stopped before the Gum replacements are reverted.
+ * If Gum cannot flush, the function logs the failure and deliberately retains
+ * the interceptor, CUDA events, and result maps so live trampoline users do
+ * not observe freed state.  After a successful flush it drains pending CUDA
+ * events and releases the module-owned maps and event arrays.  The Gum
+ * interceptor reference itself remains pinned to cover wrappers that may
+ * already have entered before in-flight accounting began.
  *
- * @return void
+ * The function is a no-op when no interceptor has been obtained.
  */
 void cuda_interceptor_dettach();
 
+/** @} */
+
+/** @name Reporting
+ * @{ */
+
 /**
- * @brief Prints stored CUDA kernel launch configurations
+ * @brief Synchronizes pending CUDA work and reports collected launch data.
  *
- * This function prints the results of the CUDA Interceptor for each kernel launch hook.
+ * Calling this function permanently stops admission of new events for the
+ * current attachment, synchronizes the CUDA device, and drains kernel and
+ * graph event records.  When PEAK is built with MPI and @p is_MPI is nonzero,
+ * results are reduced through the MPI reporting path; otherwise they are
+ * printed locally.  The function is a no-op if the result maps were not
+ * initialized.
  *
+ * @param[in] is_MPI Nonzero to request MPI reduction in an MPI-enabled build;
+ *                   zero to emit the local report.
  */
 void cuda_interceptor_print(int is_MPI);
+
+/** @} */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __CUDA_INTERCEPTOR_H */
+#endif /* PEAK_CUDA_INTERCEPTOR_H */

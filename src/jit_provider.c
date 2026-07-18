@@ -44,7 +44,6 @@ typedef enum {
 } PeakJitPendingKind;
 
 typedef struct {
-    PeakJitPendingKind kind;
     uintptr_t address;
     size_t size;
     char* name;
@@ -410,7 +409,6 @@ peak_jit_pending_record_add(PeakJitPendingKind kind,
 
     record = peak_jit_pending_record_find(address, size, name);
     if (record != NULL) {
-        record->kind = kind;
         if (kind == PEAK_JIT_PENDING_NOT_EXECUTABLE &&
             record->not_exec_started_at <= 0.0) {
             record->not_exec_started_at = peak_second();
@@ -419,7 +417,6 @@ peak_jit_pending_record_add(PeakJitPendingKind kind,
     }
 
     record = g_new0(PeakJitPendingRecord, 1);
-    record->kind = kind;
     record->address = address;
     record->size = size;
     record->name = g_strdup(name);
@@ -601,7 +598,6 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
                 continue;
             }
 
-            record->kind = PEAK_JIT_PENDING_NOT_EXECUTABLE;
             pending = TRUE;
             i++;
             continue;
@@ -617,7 +613,6 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
                        record->size,
                        peak_jit_attach_result_string(attach_result));
         if (attach_result == PEAK_DYNAMIC_ATTACH_RETRY) {
-            record->kind = PEAK_JIT_PENDING_ATTACH_RETRY;
             pending = TRUE;
             i++;
             continue;
@@ -870,10 +865,4 @@ gboolean
 peak_jit_provider_drain_pending_force_not_exec_timeout(void)
 {
     return peak_jit_provider_drain_pending_with_mode(TRUE);
-}
-
-gboolean
-peak_jit_provider_is_enabled(void)
-{
-    return peak_jit_provider_enabled;
 }

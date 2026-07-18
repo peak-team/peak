@@ -1,54 +1,85 @@
-#ifndef CXX_UTILS_H
-#define CXX_UTILS_H
+#ifndef PEAK_CXX_UTILS_H
+#define PEAK_CXX_UTILS_H
+
+/**
+ * @file cxx_utils.h
+ * @brief C-callable helpers for C++ symbol names.
+ */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * Remove trailing offset for a mangled symbol with address.
+ * @brief Removes a @c +0x-prefixed suffix from a symbol in place.
  *
- * @param mangled_name_with_offset The mangled symbol (e.g., "_Z3fooi+0x01").
- * @return void. Directly applied the changed to the string.
+ * The first @c '+' terminates the string only when it is immediately followed
+ * by @c "0x". An empty string or a string without that form is unchanged.
+ *
+ * @param[in,out] mangled_name_with_offset Writable, null-terminated symbol
+ *                 string, for example @c "_Z3fooi+0x01".
+ * @pre @p mangled_name_with_offset is not NULL and points to writable storage.
  */
 void removeTrailingOffset(char* mangled_name_with_offset);
 
 /**
- * Demangles a C++ mangled symbol name (cxa).
+ * @brief Demangles a C++ ABI symbol name.
  *
- * @param mangled_name The mangled symbol (e.g., "_Z3fooi").
- * @return A newly allocated string with the demangled name.
- *         Caller must free the returned string using free().
+ * If ABI demangling fails, the returned allocation contains an unchanged copy
+ * of @p name. This includes an empty input string.
+ *
+ * @param[in] name Null-terminated symbol name, for example @c "_Z3fooi".
+ * @return A newly allocated demangled name or input copy, or NULL if allocation
+ *         fails. The caller owns the result and must release it with free().
+ * @pre @p name is not NULL.
  */
 char* cxa_demangle(const char* name);
 
 /**
- * Return demangle status for input string (cxa).
+ * @brief Returns the C++ ABI demangler status for a symbol name.
  *
- * @param name
- * @return Status code for demangle operation on input string
+ * Any temporary demangled string is freed before this function returns.
+ *
+ * @param[in] mangled_name Null-terminated symbol name to test.
+ * @retval 0 Demangling succeeded.
+ * @return A nonzero status reported by @c abi::__cxa_demangle otherwise.
  */
  int cxa_demangle_status(const char* mangled_name);
 
 /**
- * Extracts the function name only (without return type, namespace, templates, or parameters).
+ * @brief Extracts a bare function name from a demangled signature.
  *
- * @param demangled A demangled C++ function signature.
- * @return The bare function name (e.g., "MyKernel").
+ * The implementation heuristically removes the final parameter list, trailing
+ * template arguments, text through the final space, and namespace qualification.
+ * An empty input produces an allocated empty string.
+ *
+ * @param[in] demangled Null-terminated demangled C++ signature.
+ * @return A newly allocated bare name, for example @c "MyKernel", or NULL if
+ *         the final result allocation fails. The caller owns a non-NULL result
+ *         and must free it.
+ * @pre @p demangled is not NULL.
+ * @warning The current implementation assumes every intermediate allocation
+ *          succeeds.
  */
 char* extract_function_name(const char* demangled);
 
 /**
- * @brief Truncate a string and append ellipsis if it exceeds the specified length.
+ * @brief Copies a string, optionally truncating it with an ellipsis.
  *
- * This function creates a new dynamically allocated string. If the input string
- * `s` is longer than `max_len`, the returned string will contain the first
- * (max_len - 3) characters followed by "...". Otherwise, it returns a copy of the
- * original string.
+ * When PEAK name truncation is disabled, this always returns a complete copy.
+ * When truncation is enabled and @p s is longer than @p max_len, the result
+ * contains the first @c max_len-3 bytes followed by @c "...". The limit counts
+ * bytes including the ellipsis but excludes the null terminator.
+ * Empty and already-short strings are copied unchanged.
  *
- * @param s The input null-terminated string to truncate.
- * @param max_len The maximum allowed length of the output string (including ellipsis).
- * @return A newly allocated null-terminated string. The caller is responsible for freeing it.
+ * @param[in] s Null-terminated string to copy.
+ * @param[in] max_len Maximum result length when truncation is enabled.
+ * @return A newly allocated null-terminated string, or NULL if a complete-copy
+ *         allocation fails. The caller owns a non-NULL result and must release
+ *         it with free().
+ * @pre @p s is not NULL.
+ * @pre When truncation is enabled, @p max_len is at least 3.
+ * @warning The truncating allocation path assumes allocation succeeds.
  */
 char* truncate_string(const char* s, int max_len);
 
@@ -56,4 +87,4 @@ char* truncate_string(const char* s, int max_len);
 }
 #endif
 
-#endif // CXX_UTILS_H
+#endif /* PEAK_CXX_UTILS_H */

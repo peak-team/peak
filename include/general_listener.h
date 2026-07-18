@@ -1,5 +1,5 @@
-#ifndef __GENERAL_LISTENER_H
-#define __GENERAL_LISTENER_H
+#ifndef PEAK_GENERAL_LISTENER_H
+#define PEAK_GENERAL_LISTENER_H
 
 /**
  * @file general_listener.h
@@ -360,4 +360,4 @@ void* peak_heartbeat_monitor(void* arg);
 extern _Atomic gboolean heartbeat_running;
 extern pthread_mutex_t heartbeat_mutex;
 extern pthread_cond_t heartbeat_cond;
-#endif /* __GENERAL_LISTENER_H */
+#endif /* PEAK_GENERAL_LISTENER_H */

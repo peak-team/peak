@@ -1,5 +1,5 @@
-#ifndef __PEAK_SIGNAL_POLICY_INTERNAL_H
-#define __PEAK_SIGNAL_POLICY_INTERNAL_H
+#ifndef PEAK_SIGNAL_POLICY_INTERNAL_H
+#define PEAK_SIGNAL_POLICY_INTERNAL_H
 
 #include "signal_policy.h"
 
@@ -34,4 +34,4 @@ PEAK_SIGNAL_POLICY_INTERNAL int peak_signal_policy_unblock_reserved_for_current_
 PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_push_migration_disabled(void);
 PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_pop_migration_disabled(void);
 
-#endif /* __PEAK_SIGNAL_POLICY_INTERNAL_H */
+#endif /* PEAK_SIGNAL_POLICY_INTERNAL_H */

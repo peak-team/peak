@@ -67,6 +67,32 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "gum_mutation_allowlist_ok")
 
+    add_test(NAME test_header_guard_style
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_header_guard_style.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_header_guard_style
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "header_guard_style_ok")
+
+    add_executable(test_report_maxima
+        report/test_report_maxima.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
+    target_include_directories(test_report_maxima PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/general_listener)
+    add_test(NAME test_report_maxima COMMAND test_report_maxima)
+    set_tests_properties(test_report_maxima
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_maxima_test_ok")
+
+    add_test(NAME test_general_listener_unity_layout
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_general_listener_unity_layout.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_general_listener_unity_layout
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "general_listener_unity_layout_ok")
+
     add_test(NAME test_cuda_interceptor_consistency
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_cuda_interceptor_consistency.py
@@ -1250,6 +1276,23 @@ if(BUILD_TESTING)
         PROPERTIES 
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
     )
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        set(_PEAK_REPORT_PRELOAD_ENV LD_PRELOAD)
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+        set(_PEAK_REPORT_PRELOAD_ENV DYLD_INSERT_LIBRARIES)
+    endif()
+    if(_PEAK_REPORT_PRELOAD_ENV)
+        add_test(NAME test_report_format
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/report/run_report_format_check.py
+                    --exe $<TARGET_FILE:test_sleep>
+                    --libpeak $<TARGET_FILE:peak>
+                    --preload-env ${_PEAK_REPORT_PRELOAD_ENV})
+        set_tests_properties(test_report_format
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "report_format_check_ok"
+                TIMEOUT 35)
+    endif()
     add_test(NAME test_rank_local_mpi_env_suppresses_text COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
     set_tests_properties(test_rank_local_mpi_env_suppresses_text
         PROPERTIES
@@ -2190,15 +2233,6 @@ if(BUILD_TESTING)
     # Add Cuda Test cases
     if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))
         add_subdirectory(cuda)
-
-        # add_test(NAME test_ompmpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/parallel_tests/test_omp_mpi)
-        # set_tests_properties(test_omp_mpi PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=4;PEAK_TARGET=main;${PRELOAD_VAR}")
-
-        # add_test(NAME test_mpi COMMAND ${MPIEXEC} ${MPIEXEC_NUMPROC_FLAG} 2 ${PROJECT_BINARY_DIR}/test/parallel_tests/test_mpi)
-        # set_tests_properties(test_mpi PROPERTIES ENVIRONMENT "PEAK_TARGET=main;${PRELOAD_VAR}")
-
-        # add_test(NAME test_pthread COMMAND ${PROJECT_BINARY_DIR}/test/parallel_tests/test_pthread)
-        # set_tests_properties(test_pthread PROPERTIES ENVIRONMENT "PEAK_TARGET=main;${PRELOAD_VAR}")
     endif()
     
     # Add test of dynamic library intercepting

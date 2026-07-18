@@ -3,6 +3,7 @@
 #include "dlopen_interceptor.h"
 #include "internal/general_listener_internal.h"
 #include "internal/jit_provider.h"
+#include "general_listener/report_maxima.h"
 #include "detach_controller.h"
 #include "logging.h"
 #include "pthread_listener.h"
@@ -22,8 +23,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -202,6 +205,13 @@ static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
 static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 
+/*
+ * These files are unity implementation fragments, not independently compiled
+ * modules. Their order is part of the private implementation contract while
+ * the state-machine code is migrated behind explicit interfaces. New
+ * transport-independent logic belongs in a normal .c/.h module instead.
+ * See general_listener/README.md.
+ */
 #include "general_listener/config.inc"
 
 #include "general_listener/accounting.inc"
