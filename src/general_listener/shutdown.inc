@@ -90,7 +90,7 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                                                        sum_max_time,
                                                        sum_min_time,
                                                        thread_count) &&
-            peak_socket_reduce_fallback_enabled()) {
+            peak_general_listener_socket_reduce_fallback_enabled()) {
             g_printerr("[peak] Socket aggregation failed; falling back to rank-local output\n");
             PeakReportOverhead local_report =
                 peak_general_listener_local_report_overhead(sum_num_calls);

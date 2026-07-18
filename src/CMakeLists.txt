@@ -6,6 +6,8 @@ set(sources_peak
     dlopen_interceptor.c
     general_listener.c
     general_listener/report_maxima.c
+    general_listener/report_model.c
+    general_listener/runtime_config.c
     malloc_interceptor.c
     malloc_otf2.c
     peak.c

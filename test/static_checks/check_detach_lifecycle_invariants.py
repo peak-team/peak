@@ -539,6 +539,9 @@ def check_mpi_finalize_trampoline_default(repo_root):
 def check_final_report_snapshot_order(repo_root):
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     general = read_source(repo_root, "src/general_listener.c")
+    runtime_config = read_source(
+        repo_root, "src/general_listener/runtime_config.c"
+    )
     fini = extract_function(peak_source, "peak_fini_impl")
     local_report = extract_function(
         general, "peak_general_listener_local_report_overhead"
@@ -557,10 +560,10 @@ def check_final_report_snapshot_order(repo_root):
     )
     print_entry = extract_function(general, "peak_general_listener_print")
     local_ranks = extract_function(
-        general, "peak_general_listener_local_mpi_ranks"
+        runtime_config, "peak_general_listener_local_mpi_ranks"
     )
     parse_positive_uint = extract_function(
-        general, "peak_general_listener_parse_positive_uint_text"
+        runtime_config, "peak_general_listener_parse_positive_uint_text"
     )
     control_risk = extract_function(
         general, "peak_general_listener_control_risk_seconds"
@@ -625,7 +628,7 @@ def check_final_report_snapshot_order(repo_root):
             "final local report must consume separate frozen raw and risk fields")
 
     require("parsed == 0" in parse_positive_uint and
-            "parsed > G_MAXUINT" in parse_positive_uint and
+            "parsed > UINT_MAX" in parse_positive_uint and
             "MPI_LOCALNRANKS" in local_ranks and
             "OMPI_COMM_WORLD_LOCAL_SIZE" in local_ranks and
             "MV2_COMM_WORLD_LOCAL_SIZE" in local_ranks and
@@ -678,7 +681,7 @@ def check_final_report_snapshot_order(repo_root):
         tuple_reduce = extract_function(
             general, "peak_mpi_reduce_report_rank_tuples"
         )
-        require("peak_general_listener_report_rank_tuple(&local_report)" in reduce_result and
+        require("peak_report_overhead_rank_tuple(&local_report)" in reduce_result and
                 "peak_mpi_reduce_report_rank_tuples" in reduce_result and
                 "peak_report_maxima_load" in reduce_result and
                 "&mpi_report.per_rank_maxima" in reduce_result and
@@ -731,7 +734,7 @@ def check_final_report_snapshot_order(repo_root):
         require("#define PEAK_SOCKET_REDUCE_VERSION 9U" in general and
                 "peak_socket_reduce_header_set_report_tuple" in socket_result and
                 "peak_socket_reduce_header_report_tuple" in socket_result and
-                "peak_general_listener_report_rank_tuple_is_valid" in socket_result and
+                "peak_report_rank_tuple_is_valid" in socket_result and
                 "peak_report_maxima_initialize" in socket_result and
                 "peak_report_maxima_consider" in socket_result and
                 "socket_report.per_rank_maxima = socket_maxima" in socket_result and
@@ -742,7 +745,7 @@ def check_final_report_snapshot_order(repo_root):
                 "socket reducer must carry complete owner tuples and accounting health")
         require("min_total_time[i] = DBL_MAX" in general and
                 "sum_min_time[i] = FLT_MAX" in general and
-                "peak_general_listener_calls_per_active_thread" in general and
+                "peak_report_calls_per_active_thread" in general and
                 "thread_count[i] = 1" not in general,
                 "inactive ranks must be neutral for thread counts and minima")
 
@@ -1577,6 +1580,9 @@ def check_general_controller_dlopen_drain_order(repo_root):
 
 def check_exclusive_time_nonnegative(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
+    report_model = read_source(
+        repo_root, "src/general_listener/report_model.c"
+    )
     helper = extract_function(
         source, "peak_general_listener_exclusive_duration"
     )
@@ -1585,7 +1591,7 @@ def check_exclusive_time_nonnegative(repo_root):
     leave = extract_function(source, "peak_general_listener_on_leave")
     output = extract_function(source, "peak_general_listener_print_result")
     sanitize = extract_function(
-        source, "peak_general_listener_sanitize_output_times"
+        report_model, "peak_report_sanitize_times"
     )
 
     require("gulong stack_level" in source,
@@ -1606,13 +1612,13 @@ def check_exclusive_time_nonnegative(repo_root):
             "strict/detach paths")
     require("end_time - thread_data.child_time[thread_data.level]" not in leave,
             "on_leave must not accumulate open-coded negative exclusive time")
-    require("sum_exclusive_time[i] < 0.0" in sanitize and
-            "sum_exclusive_time[i] = 0.0" in sanitize,
+    require("exclusive_time[i] < 0.0" in sanitize and
+            "exclusive_time[i] = 0.0" in sanitize,
             "output must clamp negative exclusive times after aggregation")
-    require("sum_exclusive_time[i] > sum_total_time[i]" in sanitize,
+    require("exclusive_time[i] > total_time[i]" in sanitize,
             "output must clamp exclusive time to total time after aggregation")
-    require("peak_general_listener_sanitize_output_times" in output and
-            output.find("peak_general_listener_sanitize_output_times") <
+    require("peak_report_sanitize_times" in output and
+            output.find("peak_report_sanitize_times") <
             output.find("peak_general_listener_export_csv_result"),
             "output time sanitization must run before CSV/text printing")
 

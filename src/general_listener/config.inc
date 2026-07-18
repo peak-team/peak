@@ -1,98 +1,3 @@
-static gboolean
-peak_general_listener_parse_detach_count_override(gulong* count_out)
-{
-    const char* value = getenv("PEAK_DETACH_COUNT");
-
-    if (value == NULL || value[0] == '\0') {
-        return FALSE;
-    }
-
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0) {
-        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
-        return FALSE;
-    }
-
-    if (count_out != NULL) {
-        *count_out = (gulong)parsed;
-    }
-    return TRUE;
-}
-
-static unsigned int
-peak_general_listener_parse_uint_env_default(const char* name,
-                                             unsigned int default_value)
-{
-    const char* value = getenv(name);
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > G_MAXUINT) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
-}
-
-static gboolean
-peak_general_listener_parse_positive_uint_text(const char* value,
-                                               unsigned int* parsed_out)
-{
-    const char* cursor;
-    char* end = NULL;
-    unsigned long parsed;
-
-    if (value == NULL || value[0] == '\0') {
-        return FALSE;
-    }
-    for (cursor = value; *cursor != '\0'; cursor++) {
-        if (*cursor < '0' || *cursor > '9') {
-            return FALSE;
-        }
-    }
-
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
-        parsed > G_MAXUINT) {
-        return FALSE;
-    }
-    if (parsed_out != NULL) {
-        *parsed_out = (unsigned int)parsed;
-    }
-    return TRUE;
-}
-
-static unsigned int
-peak_general_listener_local_mpi_ranks(void)
-{
-    static const char* local_size_envs[] = {
-        "MPI_LOCALNRANKS",
-        "OMPI_COMM_WORLD_LOCAL_SIZE",
-        "MV2_COMM_WORLD_LOCAL_SIZE",
-        "PMI_LOCAL_SIZE",
-    };
-
-    for (size_t i = 0; i < G_N_ELEMENTS(local_size_envs); i++) {
-        unsigned int parsed = 0;
-        if (peak_general_listener_parse_positive_uint_text(
-                getenv(local_size_envs[i]),
-                &parsed)) {
-            return parsed;
-        }
-    }
-    return 1U;
-}
-
 static void
 peak_general_listener_init_reattach_policy_once(void)
 {
@@ -112,33 +17,14 @@ peak_general_listener_init_reattach_policy(void)
     }
 }
 
-static gboolean
-peak_env_value_truthy(const char* value)
-{
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "1") == 0 ||
-            g_ascii_strcasecmp(value, "true") == 0 ||
-            g_ascii_strcasecmp(value, "yes") == 0 ||
-            g_ascii_strcasecmp(value, "on") == 0);
-}
-
-static gboolean
-peak_env_value_falsey(const char* value)
-{
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "0") == 0 ||
-            g_ascii_strcasecmp(value, "false") == 0 ||
-            g_ascii_strcasecmp(value, "off") == 0 ||
-            g_ascii_strcasecmp(value, "no") == 0);
-}
-
 static void
 peak_general_listener_init_attach_policy_once(void)
 {
     gboolean policy_valid = FALSE;
 
     peak_allow_unsafe_gum_prologue =
-        peak_env_value_truthy(g_getenv(PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV));
+        peak_general_listener_env_value_truthy(
+            g_getenv(PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV));
 
     peak_unsafe_gum_prologue_policy =
         peak_unsafe_gum_prologue_policy_from_env(
@@ -243,28 +129,6 @@ peak_general_listener_needs_dynamic_attach(void)
     return peak_dynamic_attach_needed;
 }
 
-static gboolean
-peak_socket_reduce_fallback_enabled(void)
-{
-    const char* value =
-        getenv(PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV);
-
-    if (value == NULL || value[0] == '\0') {
-        return TRUE;
-    }
-    if (peak_env_value_falsey(value)) {
-        return FALSE;
-    }
-    if (peak_env_value_truthy(value)) {
-        return TRUE;
-    }
-
-    peak_log_info("[peak] Ignoring invalid %s=%s; using fallback-to-local behavior\n",
-               PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV,
-               value);
-    return TRUE;
-}
-
 static void
 peak_general_listener_mark_mpi_reducer_failed_closed(void)
 {
@@ -278,80 +142,6 @@ peak_general_listener_mpi_reducer_failed_closed(void)
 {
     return atomic_load_explicit(&peak_general_mpi_reducer_failed_closed,
                                 memory_order_acquire);
-}
-
-static long
-peak_parse_long_env(const char* name)
-{
-    const char* value = getenv(name);
-    char* end = NULL;
-    long parsed;
-
-    if (value == NULL || value[0] == '\0') {
-        return -1;
-    }
-
-    parsed = strtol(value, &end, 10);
-    if (end == value || parsed < 0) {
-        return -1;
-    }
-
-    return parsed;
-}
-
-static long
-peak_mpi_env_size(void)
-{
-    static const char* names[] = {
-        "PMI_SIZE",
-        "PMIX_SIZE",
-        "OMPI_COMM_WORLD_SIZE",
-        "SLURM_NTASKS",
-        NULL
-    };
-
-    for (const char** name = names; *name != NULL; name++) {
-        long value = peak_parse_long_env(*name);
-        if (value > 0) {
-            return value;
-        }
-    }
-
-    return -1;
-}
-
-static long
-peak_mpi_env_rank(void)
-{
-    static const char* names[] = {
-        "PMI_RANK",
-        "PMIX_RANK",
-        "OMPI_COMM_WORLD_RANK",
-        "MV2_COMM_WORLD_RANK",
-        "SLURM_PROCID",
-        NULL
-    };
-
-    for (const char** name = names; *name != NULL; name++) {
-        long value = peak_parse_long_env(*name);
-        if (value >= 0) {
-            return value;
-        }
-    }
-
-    return -1;
-}
-
-static gboolean
-peak_general_listener_should_print_text(gboolean rank_local_mpi_output)
-{
-    const char* value = getenv(PEAK_TEXT_OUTPUT_ENV);
-
-    if (value != NULL && value[0] != '\0') {
-        return peak_env_value_truthy(value);
-    }
-
-    return !rank_local_mpi_output;
 }
 
 typedef struct {
