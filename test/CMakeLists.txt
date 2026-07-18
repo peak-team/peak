@@ -95,6 +95,55 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_model_test_ok")
 
+    add_executable(test_report_snapshot
+        report/test_report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c)
+    target_include_directories(test_report_snapshot PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_report_snapshot PRIVATE -UNDEBUG)
+    add_test(NAME test_report_snapshot COMMAND test_report_snapshot)
+    set_tests_properties(test_report_snapshot
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_snapshot_test_ok")
+
+    add_executable(test_report_formatter
+        report/test_report_formatter.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_include_directories(test_report_formatter PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
+    add_test(NAME test_report_formatter COMMAND test_report_formatter)
+    set_tests_properties(test_report_formatter
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_formatter_test_ok")
+
+    add_executable(test_socket_report_transport
+        report/test_socket_report_transport.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/socket_report_transport.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_compile_definitions(test_socket_report_transport PRIVATE
+        PEAK_ENABLE_TEST_HOOKS=1)
+    target_include_directories(test_socket_report_transport PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${FRIDA_GUM_INCLUDE_DIRS})
+    target_link_libraries(test_socket_report_transport PRIVATE
+        Threads::Threads
+        ${M_LIBRARY})
+    add_test(NAME test_socket_report_transport
+        COMMAND test_socket_report_transport)
+    set_tests_properties(test_socket_report_transport
+        PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "socket_report_transport_test_ok")
+
     add_executable(test_runtime_config
         report/test_runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
@@ -105,6 +154,27 @@ if(BUILD_TESTING)
     set_tests_properties(test_runtime_config
         PROPERTIES
             PASS_REGULAR_EXPRESSION "runtime_config_test_ok")
+
+    add_executable(test_attach_policy
+        report/test_attach_policy.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/attach_policy.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_include_directories(test_attach_policy PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${FRIDA_GUM_INCLUDE_DIRS})
+    target_compile_options(test_attach_policy PRIVATE -UNDEBUG)
+    target_link_libraries(test_attach_policy PRIVATE
+        ${FRIDA_GUM_LIBRARIES}
+        Threads::Threads
+        ${DL_LIBRARY}
+        ${RT_LIBRARY}
+        ${M_LIBRARY})
+    add_test(NAME test_attach_policy COMMAND test_attach_policy)
+    set_tests_properties(test_attach_policy
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "attach_policy_test_ok")
 
     add_executable(test_exec_checkpoint_writer
         report/test_exec_checkpoint_writer.c
@@ -1578,8 +1648,40 @@ if(BUILD_TESTING)
         if(MPIEXEC_MAX_NUMPROCS AND MPIEXEC_MAX_NUMPROCS LESS _PEAK_MPI_TEST_NPROCS)
             set(_PEAK_MPI_TEST_NPROCS ${MPIEXEC_MAX_NUMPROCS})
         endif()
+        set(_PEAK_MPI_REPORT_TRANSPORT_NPROCS 3)
+        set(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE TRUE)
+        if(MPIEXEC_MAX_NUMPROCS AND
+           MPIEXEC_MAX_NUMPROCS LESS _PEAK_MPI_REPORT_TRANSPORT_NPROCS)
+            set(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE FALSE)
+        endif()
         string(JOIN " " _PEAK_MPIEXEC_PREFLAGS_STRING ${MPIEXEC_PREFLAGS})
         string(JOIN " " _PEAK_MPIEXEC_POSTFLAGS_STRING ${MPIEXEC_POSTFLAGS})
+        if(_PEAK_MPI_REPORT_TRANSPORT_AVAILABLE)
+            add_test(NAME test_mpi_report_transport
+                COMMAND ${MPIEXEC_EXECUTABLE}
+                        ${MPIEXEC_NUMPROC_FLAG}
+                        ${_PEAK_MPI_REPORT_TRANSPORT_NPROCS}
+                        ${MPIEXEC_PREFLAGS}
+                        ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_report_transport
+                        ${MPIEXEC_POSTFLAGS})
+            add_test(NAME test_mpi_report_transport_fail_closed
+                COMMAND ${MPIEXEC_EXECUTABLE}
+                        ${MPIEXEC_NUMPROC_FLAG}
+                        ${_PEAK_MPI_REPORT_TRANSPORT_NPROCS}
+                        ${MPIEXEC_PREFLAGS}
+                        ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_report_transport
+                        fail-closed
+                        accounting-valid
+                        ${MPIEXEC_POSTFLAGS})
+            set_tests_properties(test_mpi_report_transport
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "mpi_report_transport_ok"
+                    TIMEOUT 30)
+            set_tests_properties(test_mpi_report_transport_fail_closed
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "mpi_report_transport_fail_closed_ok"
+                    TIMEOUT 30)
+        endif()
         add_test(NAME test_dgemm_mpi
             COMMAND ${MPIEXEC_EXECUTABLE}
                     ${MPIEXEC_NUMPROC_FLAG} ${_PEAK_MPI_TEST_NPROCS}

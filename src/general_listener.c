@@ -3,17 +3,23 @@
 #include "dlopen_interceptor.h"
 #include "internal/exec_raw_syscall.h"
 #include "internal/general_listener_internal.h"
+#include "internal/general_listener/attach_policy.h"
 #include "internal/general_listener/exec_checkpoint_writer.h"
+#include "internal/general_listener/report_formatter.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
+#include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
+#include "internal/general_listener/socket_report_transport.h"
+#ifdef HAVE_MPI
+#include "internal/general_listener/mpi_report_transport.h"
+#endif
 #include "internal/jit_provider.h"
 #include "detach_controller.h"
 #include "logging.h"
 #include "pthread_listener.h"
 #include "internal/unsafe_gum_prologue.h"
 #include <errno.h>
-#include <dirent.h>
 #include <float.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -99,8 +105,6 @@ static PeakDetachStatus* peak_hook_last_retry_status;
 static const char*
 peak_hook_request_source_string(PeakHookRequestSource source);
 static gboolean
-peak_general_listener_startup_attach_can_skip_stop(void);
-static gboolean
 peak_general_listener_refresh_hook_sample_cache_unlocked(
     size_t hook_id,
     gulong* calls_out,
@@ -151,6 +155,7 @@ static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 char** peak_demangled_strings;
+extern gboolean peak_truncate_function_name;
 extern gulong peak_max_num_threads;
 extern double peak_main_time;
 extern float peak_detach_cost;
@@ -187,7 +192,6 @@ static const double peak_controller_default_max_pending_age_s = 30.0;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
 static _Atomic gboolean peak_general_mpi_finalize_requested = FALSE;
-static _Atomic gboolean peak_general_mpi_reducer_failed_closed = FALSE;
 static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
@@ -199,10 +203,6 @@ static double peak_reattach_cooldown_s = 60.0;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
 static gboolean peak_controller_trace_enabled = FALSE;
-static gsize peak_attach_policy_initialized = 0;
-static gboolean peak_allow_unsafe_gum_prologue = FALSE;
-static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
-    PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT;
 static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
 

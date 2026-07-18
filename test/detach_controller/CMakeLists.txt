@@ -13,10 +13,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   add_executable(test_detach_listener_shutdown
     test_detach_listener_shutdown.c
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/attach_policy.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/socket_report_transport.c
     ${PROJECT_SOURCE_DIR}/src/jit_provider.c
     ${PROJECT_SOURCE_DIR}/src/logging.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
@@ -27,6 +31,10 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     $<TARGET_OBJECTS:utils_c>
     $<TARGET_OBJECTS:utils_cxx>
   )
+  if(MPI_FOUND)
+    target_sources(test_detach_listener_shutdown PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c)
+  endif()
 endif()
 
 if(PEAK_EXEC_RAW_SYSCALL_SUPPORTED)
