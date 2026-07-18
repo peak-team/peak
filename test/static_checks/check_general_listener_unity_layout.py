@@ -44,13 +44,29 @@ def main() -> int:
         errors.append("src/general_listener/README.md: missing layout contract")
 
     module_headers = root / "include" / "internal" / "general_listener"
-    for module_name in ("report_maxima", "report_model", "runtime_config"):
+    for module_name in (
+        "exec_checkpoint_writer",
+        "report_maxima",
+        "report_model",
+        "runtime_config",
+    ):
         source_module = fragment_dir / f"{module_name}.c"
         header_module = module_headers / f"{module_name}.h"
         if not source_module.is_file():
             errors.append(
                 f"src/general_listener/{module_name}.c: missing module source"
             )
+        else:
+            module_source = source_module.read_text(encoding="utf-8")
+            expected_header = (
+                '#include "internal/general_listener/'
+                f'{module_name}.h"'
+            )
+            if expected_header not in module_source:
+                errors.append(
+                    f"src/general_listener/{module_name}.c: must include its "
+                    "private interface"
+                )
         if not header_module.is_file():
             errors.append(
                 "include/internal/general_listener/"
@@ -62,6 +78,29 @@ def main() -> int:
                 f"{misplaced_header.relative_to(root)}: private headers belong "
                 "under include/internal/general_listener"
             )
+
+    writer = fragment_dir / "exec_checkpoint_writer.c"
+    if writer.is_file():
+        writer_text = writer.read_text(encoding="utf-8")
+        for forbidden in (
+            "PeakGeneralListener",
+            "array_listener",
+            "peak_general_overhead",
+            "pthread_mutex",
+        ):
+            if forbidden in writer_text:
+                errors.append(
+                    "src/general_listener/exec_checkpoint_writer.c: writer "
+                    f"must not own listener state ({forbidden})"
+                )
+    output_fragment = fragment_dir / "output.inc"
+    if output_fragment.is_file() and "peak_exec_checkpoint_write_rows(" not in (
+        output_fragment.read_text(encoding="utf-8")
+    ):
+        errors.append(
+            "src/general_listener/output.inc: checkpoint capture must hand "
+            "immutable rows to the writer module"
+        )
 
     for fragment_name in EXPECTED_FRAGMENTS:
         fragment = fragment_dir / fragment_name

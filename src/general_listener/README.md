@@ -14,9 +14,9 @@ module:
 - private interfaces live in `include/internal/general_listener/*.h`;
 - only stable consumer APIs belong directly under `include/`.
 
-The current independent modules are `runtime_config`, `report_model`, and
-`report_maxima`. Their headers are private because no symbol in them is part of
-PEAK's supported external API.
+The current independent modules are `runtime_config`, `report_model`,
+`report_maxima`, and the `exec_checkpoint_writer`. Their headers are private
+because no symbol in them is part of PEAK's supported external API.
 
 While unity fragments remain:
 
