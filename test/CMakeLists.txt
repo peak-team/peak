@@ -106,6 +106,17 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "runtime_config_test_ok")
 
+    add_executable(test_exec_checkpoint_writer
+        report/test_exec_checkpoint_writer.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
+    target_include_directories(test_exec_checkpoint_writer PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME test_exec_checkpoint_writer
+        COMMAND test_exec_checkpoint_writer)
+    set_tests_properties(test_exec_checkpoint_writer
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "exec_checkpoint_writer_test_ok")
+
     add_test(NAME test_general_listener_unity_layout
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_general_listener_unity_layout.py
