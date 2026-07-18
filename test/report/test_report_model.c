@@ -3,7 +3,19 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+
+static int
+double_array_equal(const double* actual,
+                   const double* expected,
+                   size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (actual[i] != expected[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static int
 check_calls_per_active_thread(void)
@@ -23,13 +35,13 @@ check_time_sanitization(void)
     const double expected[] = {0.0, 2.0, 5.0, 2.0};
 
     peak_report_sanitize_times(4, total, exclusive);
-    if (memcmp(exclusive, expected, sizeof(expected)) != 0) {
+    if (!double_array_equal(exclusive, expected, 4)) {
         return 1;
     }
 
     peak_report_sanitize_times(4, NULL, exclusive);
     peak_report_sanitize_times(4, total, NULL);
-    return memcmp(exclusive, expected, sizeof(expected)) != 0;
+    return !double_array_equal(exclusive, expected, 4);
 }
 
 static PeakReportOverhead
@@ -57,11 +69,37 @@ fixture_overhead(void)
 }
 
 static int
+tuple_equal(const PeakReportRankTuple* actual,
+            const PeakReportRankTuple* expected)
+{
+    return actual->accounting_valid == expected->accounting_valid &&
+           actual->local_ranks == expected->local_ranks &&
+           actual->stop_window_count == expected->stop_window_count &&
+           actual->failed_stop_window_count ==
+               expected->failed_stop_window_count &&
+           actual->elapsed_seconds == expected->elapsed_seconds &&
+           actual->profile_seconds == expected->profile_seconds &&
+           actual->control_seconds == expected->control_seconds &&
+           actual->management_seconds == expected->management_seconds &&
+           actual->control_risk_seconds == expected->control_risk_seconds &&
+           actual->profile_control_risk_seconds ==
+               expected->profile_control_risk_seconds &&
+           actual->profile_ratio == expected->profile_ratio &&
+           actual->control_ratio == expected->control_ratio &&
+           actual->profile_control_risk_ratio ==
+               expected->profile_control_risk_ratio &&
+           actual->control_risk_ratio == expected->control_risk_ratio &&
+           actual->management_ratio == expected->management_ratio &&
+           actual->ratio == expected->ratio;
+}
+
+static int
 check_tuple_conversion(void)
 {
     PeakReportOverhead report = fixture_overhead();
     PeakReportRankTuple tuple = peak_report_overhead_rank_tuple(&report);
     PeakReportRankTuple zero = peak_report_overhead_rank_tuple(NULL);
+    PeakReportRankTuple expected_zero = {0};
 
     return !tuple.accounting_valid || tuple.local_ranks != 3U ||
            tuple.stop_window_count != 4U ||
@@ -77,7 +115,7 @@ check_tuple_conversion(void)
            tuple.profile_control_risk_ratio != 14.0 ||
            tuple.control_risk_ratio != 15.0 ||
            tuple.management_ratio != 16.0 || tuple.ratio != 17.0 ||
-           memcmp(&zero, &(PeakReportRankTuple){0}, sizeof(zero)) != 0;
+           !tuple_equal(&zero, &expected_zero);
 }
 
 static PeakReportRankTuple
