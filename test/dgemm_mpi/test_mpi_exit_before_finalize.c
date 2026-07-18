@@ -14,6 +14,7 @@
 #endif
 
 static volatile int peak_mpi_exit_sink;
+static int peak_mpi_exit_target_delay_us;
 
 static int
 peak_mpi_exit_parse_loop_count(const char* env_name, int default_value)
@@ -79,6 +80,9 @@ peak_mpi_exit_post_finalize_loop_count(void)
 void PEAK_EXPORT PEAK_NOINLINE
 peak_mpi_exit_target(int rank)
 {
+    if (peak_mpi_exit_target_delay_us > 0) {
+        usleep((useconds_t)peak_mpi_exit_target_delay_us);
+    }
     peak_mpi_exit_sink += rank + 1;
 }
 
@@ -90,9 +94,15 @@ main(int argc, char** argv)
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
+    int uneven_rank_calls =
+        argc > 1 && strstr(argv[1], "uneven") != NULL;
+    peak_mpi_exit_target_delay_us = peak_mpi_exit_parse_loop_count(
+        "PEAK_MPI_EXIT_TARGET_DELAY_US", 0);
     int loops = peak_mpi_exit_loop_count();
-    for (int i = 0; i < loops; i++) {
-        peak_mpi_exit_target(rank);
+    if (!uneven_rank_calls || rank == 0) {
+        for (int i = 0; i < loops; i++) {
+            peak_mpi_exit_target(rank);
+        }
     }
 
     if (rank == 0) {
@@ -136,7 +146,9 @@ main(int argc, char** argv)
         exit(0);
     }
 
-    if (argc > 1 && strcmp(argv[1], "finalize-then-exit0") == 0) {
+    if (argc > 1 &&
+        (strcmp(argv[1], "finalize-then-exit0") == 0 ||
+         strcmp(argv[1], "finalize-uneven-then-exit0") == 0)) {
         MPI_Finalize();
         exit(0);
     }
@@ -151,11 +163,15 @@ main(int argc, char** argv)
         exit(0);
     }
 
-    if (argc > 1 && strcmp(argv[1], "finalize-post-work-then-exit0") == 0) {
+    if (argc > 1 &&
+        (strcmp(argv[1], "finalize-post-work-then-exit0") == 0 ||
+         strcmp(argv[1], "finalize-post-work-uneven-then-exit0") == 0)) {
         MPI_Finalize();
         int post_loops = peak_mpi_exit_post_finalize_loop_count();
-        for (int i = 0; i < post_loops; i++) {
-            peak_mpi_exit_target(rank);
+        if (!uneven_rank_calls || rank == 0) {
+            for (int i = 0; i < post_loops; i++) {
+                peak_mpi_exit_target(rank);
+            }
         }
         exit(0);
     }

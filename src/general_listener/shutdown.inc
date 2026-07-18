@@ -63,8 +63,10 @@ gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode)
                         sum_min_time[i] = pg_listener->min_time[index];
                 }
             }
-            if (thread_count[i] == 0)
-                thread_count[i] = 1;
+            if (thread_count[i] == 0) {
+                min_total_time[i] = DBL_MAX;
+                sum_min_time[i] = FLT_MAX;
+            }
         }
     }
     peak_general_listener_refresh_revisited_markers(sum_num_calls);

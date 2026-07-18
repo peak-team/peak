@@ -26,6 +26,7 @@ OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
     r"-{10,}\n",
     re.DOTALL,
 )
+NUMBER_RE = r"[0-9.eE+-]+"
 EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "no-finalize",
     "no-finalize-nonzero",
@@ -102,6 +103,36 @@ def run_mpi_command(command, env, timeout):
             terminate_process_group(proc, signal.SIGKILL)
             output, _ = proc.communicate()
         return proc.returncode, output or "", True
+
+
+def require_socket_maximum_tuples(output, nprocs):
+    lines = [
+        line for line in output.splitlines()
+        if "[peak] per-rank maximum " in line
+    ]
+    if len(lines) != 6:
+        raise AssertionError(
+            f"expected 6 socket maximum tuples, got {len(lines)}"
+        )
+    for line in lines:
+        owner_match = re.search(r"owner_rank=(\d+)", line)
+        elapsed_match = re.search(
+            rf"elapsed_seconds=({NUMBER_RE})", line
+        )
+        if owner_match is None or elapsed_match is None:
+            raise AssertionError(f"incomplete socket maximum tuple: {line}")
+        owner = int(owner_match.group(1))
+        elapsed = float(elapsed_match.group(1))
+        if owner < 0 or owner >= nprocs:
+            raise AssertionError(f"socket maximum owner out of range: {line}")
+        if elapsed <= 0.0:
+            raise AssertionError(f"socket maximum lost owner elapsed data: {line}")
+        if "risk overhead" in line:
+            local_ranks = re.search(r"local_ranks=(\d+)", line)
+            if local_ranks is None or int(local_ranks.group(1)) <= 0:
+                raise AssertionError(
+                    f"socket maximum lost owner local-rank data: {line}"
+                )
 
 
 def parse_args():
@@ -193,6 +224,10 @@ def main():
     expected_stats_files = None
     expected_min_stats_files = None
     expected_min_target_count = None
+    expected_target_count = None
+    expected_per_thread = None
+    expected_positive_minima = False
+    verify_socket_maxima = False
     expected_extra = []
     forbidden_output = []
     done_file = None
@@ -213,7 +248,14 @@ def main():
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        app_args.append("finalize-then-exit0")
+        if args.require_detach_trace:
+            app_args.append("finalize-then-exit0")
+        else:
+            env["PEAK_MPI_EXIT_TARGET_DELAY_US"] = "100"
+            app_args.append("finalize-uneven-then-exit0")
+            expected_target_count = int(env.get("PEAK_MPI_EXIT_LOOPS", "16"))
+            expected_per_thread = expected_target_count
+            expected_positive_minima = True
         expected = "PMPI_Finalize was observed on every rank"
         expected_extra.append(
             "per-rank maximum profile+control overhead: owner_rank="
@@ -241,6 +283,7 @@ def main():
         forbidden_output.append("PEAK output is complete; returning to real PMPI_Finalize")
         expected_peak_tables = 1
         expected_stats_files = 1
+        verify_socket_maxima = True
     elif args.mode == "finalize-clean-output-mpi-intel-default":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
@@ -310,11 +353,15 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
         env["PEAK_MPI_EXIT_LOOPS"] = "16"
         env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
-        app_args.append("finalize-post-work-then-exit0")
+        env["PEAK_MPI_EXIT_TARGET_DELAY_US"] = "100"
+        app_args.append("finalize-post-work-uneven-then-exit0")
         expected = "Writing PEAK-owned socket-reduced output"
         expected_peak_tables = 1
         expected_stats_files = 1
-        expected_min_target_count = nprocs * (16 + 32)
+        expected_target_count = 16 + 32
+        expected_per_thread = expected_target_count
+        expected_positive_minima = True
+        verify_socket_maxima = True
     elif args.mode == "finalize-defer-post-work":
         env["PEAK_MPI_FINALIZE_POLICY"] = "defer"
         env["PEAK_MPI_EXIT_LOOPS"] = "16"
@@ -426,6 +473,8 @@ def main():
     for forbidden in forbidden_output:
         if forbidden in output:
             raise AssertionError(f"unexpected PEAK diagnostic: {forbidden}")
+    if verify_socket_maxima:
+        require_socket_maximum_tuples(output, nprocs)
     if args.require_pinned_finalize and "Leaving PEAK target hooks pinned" not in output:
         raise AssertionError("missing pinned-finalize diagnostic")
     for function_name in args.forbid_stats_function:
@@ -487,6 +536,41 @@ def main():
                 f"expected at least {expected_min_target_count} "
                 f"post-finalize target calls, got {observed_count}"
             )
+    target_rows = [
+        row for row in stats_rows
+        if row.get("function") == "peak_mpi_exit_target"
+    ]
+    if expected_target_count is not None:
+        observed_count = sum(
+            int(float(row.get("count", "0") or 0))
+            for row in target_rows
+        )
+        if observed_count != expected_target_count:
+            raise AssertionError(
+                f"expected exactly {expected_target_count} target calls, "
+                f"got {observed_count}"
+            )
+    if expected_per_thread is not None:
+        if len(target_rows) != 1:
+            raise AssertionError(
+                f"expected one aggregate target row, got {len(target_rows)}"
+            )
+        observed_per_thread = int(
+            float(target_rows[0].get("per_thread", "0") or 0)
+        )
+        if observed_per_thread != expected_per_thread:
+            raise AssertionError(
+                f"expected per_thread={expected_per_thread}, "
+                f"got {observed_per_thread}"
+            )
+    if expected_positive_minima:
+        row = target_rows[0]
+        for field in ("call_min_s", "thread_min_s"):
+            value = float(row.get(field, "0") or 0)
+            if value <= 0.0:
+                raise AssertionError(
+                    f"expected positive {field} from active ranks, got {value}"
+                )
     if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
             returncode != 0):
