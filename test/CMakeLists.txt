@@ -75,6 +75,24 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "header_guard_style_ok")
 
+    add_executable(test_report_maxima
+        report/test_report_maxima.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
+    target_include_directories(test_report_maxima PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/general_listener)
+    add_test(NAME test_report_maxima COMMAND test_report_maxima)
+    set_tests_properties(test_report_maxima
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_maxima_test_ok")
+
+    add_test(NAME test_general_listener_unity_layout
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_general_listener_unity_layout.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_general_listener_unity_layout
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "general_listener_unity_layout_ok")
+
     add_test(NAME test_cuda_interceptor_consistency
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_cuda_interceptor_consistency.py

@@ -5,6 +5,7 @@ add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 set(sources_peak
     dlopen_interceptor.c
     general_listener.c
+    general_listener/report_maxima.c
     malloc_interceptor.c
     malloc_otf2.c
     peak.c

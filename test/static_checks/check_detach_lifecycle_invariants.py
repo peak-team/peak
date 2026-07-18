@@ -680,7 +680,8 @@ def check_final_report_snapshot_order(repo_root):
         )
         require("peak_general_listener_report_rank_tuple(&local_report)" in reduce_result and
                 "peak_mpi_reduce_report_rank_tuples" in reduce_result and
-                "mpi_report.per_rank_max_owner_ranks[i] = max_ratio_owner_ranks[i]" in reduce_result and
+                "peak_report_maxima_load" in reduce_result and
+                "&mpi_report.per_rank_maxima" in reduce_result and
                 "local_tuple->profile_ratio" in tuple_reduce and
                 "local_tuple->control_ratio" in tuple_reduce and
                 "local_tuple->profile_control_risk_ratio" in tuple_reduce and
@@ -727,20 +728,23 @@ def check_final_report_snapshot_order(repo_root):
         socket_result = extract_function(
             general, "peak_general_listener_socket_reduce_result_with_rank_source"
         )
-        require("#define PEAK_SOCKET_REDUCE_VERSION 8U" in general and
-                "header.profile_ratio = local_report.profile_ratio" in socket_result and
-                "header.control_ratio = local_report.control_ratio" in socket_result and
-                "header.profile_control_risk_ratio =\n        local_report.profile_control_risk_ratio" in socket_result and
-                "header.control_risk_ratio = local_report.control_risk_ratio" in socket_result and
-                "header.failed_stop_window_count = local_report.failed_stop_window_count" in socket_result and
-                "header.accounting_valid = local_report.accounting_valid ? 1U : 0U" in socket_result and
-                "socket_report.profile_ratio = socket_max_profile_ratio" in socket_result and
-                "socket_report.control_ratio = socket_max_control_ratio" in socket_result and
-                "socket_report.profile_control_risk_ratio =\n        socket_max_profile_control_risk_ratio" in socket_result and
-                "socket_report.control_risk_ratio = socket_max_control_risk_ratio" in socket_result and
+        require("#define PEAK_SOCKET_REDUCE_VERSION 9U" in general and
+                "peak_socket_reduce_header_set_report_tuple" in socket_result and
+                "peak_socket_reduce_header_report_tuple" in socket_result and
+                "peak_general_listener_report_rank_tuple_is_valid" in socket_result and
+                "peak_report_maxima_initialize" in socket_result and
+                "peak_report_maxima_consider" in socket_result and
+                "socket_report.per_rank_maxima = socket_maxima" in socket_result and
+                "combined_maximum->stop_window_count" in socket_result and
+                "combined_maximum->elapsed_seconds" in socket_result and
                 "socket_report.accounting_valid = socket_accounting_valid" in socket_result and
                 "peak_general_listener_add_uint64_saturated" in socket_result,
-                "socket reducer version and aggregation must carry raw, risk, and accounting health")
+                "socket reducer must carry complete owner tuples and accounting health")
+        require("min_total_time[i] = DBL_MAX" in general and
+                "sum_min_time[i] = FLT_MAX" in general and
+                "peak_general_listener_calls_per_active_thread" in general and
+                "thread_count[i] = 1" not in general,
+                "inactive ranks must be neutral for thread counts and minima")
 
 
 def check_stop_window_accounting_sidecar(repo_root):
