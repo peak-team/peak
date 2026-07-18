@@ -3,10 +3,11 @@
 
 /**
  * @file general_listener.h
- * @brief Peak General Listener header file
+ * @brief Define listener accounting, lifecycle requests, and final reporting.
  *
- * This header file defines the Peak General Listener and State structs and their associated functions.
- * It also contains the main entrance of the library for interception.
+ * The implementation owns PEAK's per-target accounting and coordinates
+ * controller-owned attach/detach transitions. Report transports consume an
+ * immutable snapshot captured from this state.
  */
 
 #include "frida-gum.h"
@@ -36,6 +37,7 @@
 
 typedef struct _PeakGeneralListener PeakGeneralListener;
 
+/** Lock-free report row published for exec-checkpoint snapshot capture. */
 #if defined(__GNUC__) || defined(__clang__)
 typedef struct __attribute__((aligned(64))) {
 #else
@@ -60,6 +62,7 @@ _Static_assert(__alignof__(PeakGeneralListenerCheckpointShadow) == 64,
 #define PEAKGENERAL_TYPE_LISTENER (peak_general_listener_get_type())
 G_DECLARE_FINAL_TYPE(PeakGeneralListener, peak_general_listener, PEAKGENERAL, LISTENER, GObject)
 
+/** Controller-owned lifecycle state for one configured profiling target. */
 typedef enum {
     PEAK_HOOK_UNRESOLVED = 0,
     PEAK_HOOK_ATTACHED,
@@ -71,6 +74,7 @@ typedef enum {
     PEAK_HOOK_SHUTDOWN
 } PeakHookState;
 
+/** Available coordination transports for final report output. */
 typedef enum {
     PEAK_OUTPUT_AGGREGATION_LOCAL = 0,
     PEAK_OUTPUT_AGGREGATION_MPI = 1,
@@ -81,8 +85,8 @@ typedef enum {
  * @struct _PeakGeneralListener
  * @brief Struct representing the Peak General Listener
  *
- * This struct represents the Peak General Listener, which extends GObject and implements the GumInvocationListener interface.
- * It keeps track of the total time and number of calls for each hooked function.
+ * The listener extends GObject and implements GumInvocationListener. One
+ * instance owns the per-thread counts and timing arrays for a hooked target.
  */
 struct _PeakGeneralListener {
     GObject parent;
@@ -97,6 +101,7 @@ struct _PeakGeneralListener {
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
 };
 
+/** Adaptive heartbeat timing and control parameters. */
 typedef struct {
     unsigned int heartbeat_time;
     unsigned int check_interval;
@@ -110,15 +115,14 @@ typedef struct {
 /**
  * @brief Attaches the Peak General Listener.
  *
- * This function attaches the Peak General Listener to the function hooks specified
- * in `peak_hook_strings`. It will record the number of times each function is called as
- * well as its total execution time in seconds. The time spent in multiple threads 
- * will be summed up.
+ * The function attempts to attach every resolved target that passes PEAK's Gum
+ * safety policy. Unresolved targets remain eligible for later dynamic attach.
+ * Attached targets record call counts and timing across tracked threads.
  *
- * @return void
  */
 void peak_general_listener_attach();
 
+/** Records the monotonic application start used by final overhead reporting. */
 void peak_general_listener_note_runtime_start(double start_time);
 
 /**
@@ -258,7 +262,9 @@ gboolean peak_general_listener_needs_dynamic_attach(void);
 /**
  * @brief Detaches the Peak General Listener.
  *
- * This function detaches the Peak General Listener and frees the memory allocated for it.
+ * The function attempts to detach Gum listeners and release listener-owned
+ * state. If teardown cannot be proven safe, it deliberately retains callback
+ * state until process exit.
  *
  * @return TRUE when Gum teardown flushed and listener-owned state was freed.
  *         FALSE means PEAK intentionally left callback state alive to avoid
@@ -347,8 +353,10 @@ PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
  * This function periodically checks the profiling overhead and dynamically 
  * adjusts the attachment or detachment of hooks based on the profiling ratio. 
  * If the profiling overhead exceeds a target threshold, the corresponding 
- * listener is detached to reduce resource consumption. If reattachment is 
- * enabled and the overhead falls below the threshold, the listener is reattached.
+ * physical Gum hook is detached to reduce callback overhead. Its listener,
+ * statistics, and lifecycle state remain available for reattachment and final
+ * reporting. If reattachment is enabled and overhead falls below the
+ * threshold, the listener is reattached.
  *
  * The function runs in a separate thread and continuously monitors the profiling 
  * activity, adjusting accordingly until the monitoring process is stopped.

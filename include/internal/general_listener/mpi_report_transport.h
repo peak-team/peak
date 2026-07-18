@@ -1,9 +1,15 @@
 #ifndef PEAK_MPI_REPORT_TRANSPORT_H
 #define PEAK_MPI_REPORT_TRANSPORT_H
 
+/**
+ * @file mpi_report_transport.h
+ * @brief Aggregate immutable final-report snapshots through MPI.
+ */
+
 #include "internal/general_listener/report_snapshot.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /** Outcome of one MPI final-report aggregation attempt. */
 typedef enum {
@@ -43,7 +49,13 @@ bool peak_mpi_report_transport_failed_closed(void);
  * Clears the fail-closed marker before a new, proven-safe report lifecycle.
  *
  * This must never be used to retry MPI after a failed aggregation request.
+ * If an active request has been quarantined, the marker remains set.
  */
 void peak_mpi_report_transport_reset_failed_closed(void);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/** Returns the number of active requests retained for process lifetime. */
+size_t peak_mpi_report_transport_quarantined_request_count(void);
+#endif
 
 #endif /* PEAK_MPI_REPORT_TRANSPORT_H */

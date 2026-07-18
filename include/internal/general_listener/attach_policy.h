@@ -1,6 +1,11 @@
 #ifndef PEAK_ATTACH_POLICY_H
 #define PEAK_ATTACH_POLICY_H
 
+/**
+ * @file attach_policy.h
+ * @brief Decide whether PEAK may attach Gum hooks to resolved targets.
+ */
+
 #include "frida-gum.h"
 
 /** Initializes the process-wide attach policy from the environment once. */

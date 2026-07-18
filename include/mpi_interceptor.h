@@ -3,7 +3,7 @@
 
 /**
  * @file mpi_interceptor.h
- * @brief Header file for MPI function interception using Gum library 
+ * @brief Intercept PMPI_Finalize while PEAK emits its final report.
  */
 
 #include "frida-gum.h"
@@ -30,7 +30,7 @@
  * so can re-enter MPI from an application state that has already logically
  * finalized.
  *
- * @return 0 if the interception was successful, a negative number in the GumReplaceReturn otherwise.
+ * @return GUM_REPLACE_OK on success; otherwise a Gum replacement failure code.
  */
 int mpi_interceptor_attach();
 
@@ -60,13 +60,15 @@ int mpi_interceptor_finalize_path_active();
 void mpi_interceptor_set_real_finalize_allowed(int allowed);
 
 /**
- * @brief Detach MPI function interception
+ * @brief Attempts to revert PMPI_Finalize interception before finalization.
  *
- * This function detaches the previously attached MPI function interception and
- * releases any resources used by the Gum library. The argument is retained for
- * ABI compatibility and is ignored.
+ * Once finalization has been requested, the replacement remains pinned until
+ * process exit. Before that point the function reverts and flushes the hook;
+ * a failed flush also leaves it pinned. The interceptor object is retained for
+ * process lifetime. The argument is retained for ABI compatibility and is
+ * ignored.
  *
- * @return void
+ * @param allow_delayed_finalize Ignored ABI-compatibility argument.
  */
 void mpi_interceptor_dettach(int allow_delayed_finalize);
 

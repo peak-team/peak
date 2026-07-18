@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char* peak_report_snapshot_duplicate_string(const char* source)
+static char*
+peak_report_snapshot_duplicate_string(const char* source)
 {
     const char* value = source != NULL ? source : "";
     size_t length = strlen(value) + 1;
@@ -15,7 +16,8 @@ static char* peak_report_snapshot_duplicate_string(const char* source)
     return copy;
 }
 
-static bool peak_report_snapshot_allocate_arrays(PeakReportSnapshot* snapshot)
+static bool
+peak_report_snapshot_allocate_arrays(PeakReportSnapshot* snapshot)
 {
     size_t count;
 
@@ -53,7 +55,8 @@ static bool peak_report_snapshot_allocate_arrays(PeakReportSnapshot* snapshot)
     return true;
 }
 
-PeakReportSnapshot* peak_report_snapshot_create(size_t hook_count)
+PeakReportSnapshot*
+peak_report_snapshot_create(size_t hook_count)
 {
     PeakReportSnapshot* snapshot = calloc(1, sizeof(*snapshot));
 
@@ -69,8 +72,9 @@ PeakReportSnapshot* peak_report_snapshot_create(size_t hook_count)
     return snapshot;
 }
 
-bool peak_report_snapshot_set_program(PeakReportSnapshot* snapshot,
-                                      const char* program)
+bool
+peak_report_snapshot_set_program(PeakReportSnapshot* snapshot,
+                                 const char* program)
 {
     char* copy;
 
@@ -86,9 +90,10 @@ bool peak_report_snapshot_set_program(PeakReportSnapshot* snapshot,
     return true;
 }
 
-bool peak_report_snapshot_set_name(PeakReportSnapshot* snapshot,
-                                   size_t hook_id,
-                                   const char* name)
+bool
+peak_report_snapshot_set_name(PeakReportSnapshot* snapshot,
+                              size_t hook_id,
+                              const char* name)
 {
     char* copy;
 
@@ -104,7 +109,8 @@ bool peak_report_snapshot_set_name(PeakReportSnapshot* snapshot,
     return true;
 }
 
-PeakReportSnapshot* peak_report_snapshot_clone(
+PeakReportSnapshot*
+peak_report_snapshot_clone(
     const PeakReportSnapshot* source)
 {
     PeakReportSnapshot* copy;
@@ -157,7 +163,8 @@ PeakReportSnapshot* peak_report_snapshot_clone(
     return copy;
 }
 
-void peak_report_snapshot_prepare_for_render(PeakReportSnapshot* snapshot)
+void
+peak_report_snapshot_prepare_for_render(PeakReportSnapshot* snapshot)
 {
     if (snapshot == NULL) {
         return;
@@ -167,7 +174,8 @@ void peak_report_snapshot_prepare_for_render(PeakReportSnapshot* snapshot)
                                snapshot->exclusive_time);
 }
 
-uint64_t peak_report_snapshot_slot_identity_hash(
+uint64_t
+peak_report_snapshot_slot_identity_hash(
     const PeakReportSnapshot* snapshot,
     size_t hook_id)
 {
@@ -186,7 +194,8 @@ uint64_t peak_report_snapshot_slot_identity_hash(
     return hash;
 }
 
-bool peak_report_snapshot_has_duplicate_names(
+bool
+peak_report_snapshot_has_duplicate_names(
     const PeakReportSnapshot* snapshot)
 {
     if (snapshot == NULL) {
@@ -209,7 +218,8 @@ bool peak_report_snapshot_has_duplicate_names(
     return false;
 }
 
-void peak_report_snapshot_destroy(PeakReportSnapshot* snapshot)
+void
+peak_report_snapshot_destroy(PeakReportSnapshot* snapshot)
 {
     if (snapshot == NULL) {
         return;

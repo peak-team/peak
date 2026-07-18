@@ -150,22 +150,8 @@ FUNCTION_ANCHORS = {
 
 
 def read_source(repo_root, rel, path):
-    source = path.read_text(encoding="utf-8")
-    if rel != "src/general_listener.c":
-        return source
-
-    def include_fragment(match):
-        fragment = match.group(1)
-        return (
-            repo_root / "src/general_listener" / fragment
-        ).read_text(encoding="utf-8")
-
-    return re.sub(
-        r'^#include "general_listener/([^"]+\.inc)"$',
-        include_fragment,
-        source,
-        flags=re.MULTILINE,
-    )
+    del repo_root, rel
+    return path.read_text(encoding="utf-8")
 
 
 def classify_function(rel, line_no, function_starts):

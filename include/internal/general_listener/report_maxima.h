@@ -1,6 +1,11 @@
 #ifndef PEAK_REPORT_MAXIMA_H
 #define PEAK_REPORT_MAXIMA_H
 
+/**
+ * @file report_maxima.h
+ * @brief Retain complete owner tuples for per-rank report maxima.
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 

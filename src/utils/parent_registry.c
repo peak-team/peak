@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #ifdef PEAK_UTILS_TESTING
-#include "parent_registry_internal.h"
+#include "internal/utils/parent_registry_internal.h"
 #else
 enum {
     PEAK_PARENT_FAULT_NONE = 0,

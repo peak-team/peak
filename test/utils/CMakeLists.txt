@@ -17,8 +17,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_compile_definitions(test_parent_registry PRIVATE PEAK_UTILS_TESTING=1)
     target_include_directories(test_parent_registry PRIVATE
         ${PROJECT_SOURCE_DIR}/include
-        ${PROJECT_SOURCE_DIR}/include/utils
-        ${PROJECT_SOURCE_DIR}/src/utils)
+        ${PROJECT_SOURCE_DIR}/include/utils)
 
     add_test(NAME test_parent_registry
         COMMAND test_parent_registry)

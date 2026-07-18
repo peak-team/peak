@@ -136,13 +136,47 @@ if(BUILD_TESTING)
         ${FRIDA_GUM_INCLUDE_DIRS})
     target_link_libraries(test_socket_report_transport PRIVATE
         Threads::Threads
+        ${RT_LIBRARY}
         ${M_LIBRARY})
+    if(MPI_FOUND)
+        target_link_libraries(test_socket_report_transport PRIVATE MPI::MPI_C)
+    endif()
     add_test(NAME test_socket_report_transport
         COMMAND test_socket_report_transport)
     set_tests_properties(test_socket_report_transport
         PROPERTIES
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION "socket_report_transport_test_ok")
+
+    add_executable(test_mpi_report_request_lifetime
+        report/test_mpi_report_request_lifetime.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/timing.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_compile_definitions(test_mpi_report_request_lifetime PRIVATE
+        HAVE_MPI=1
+        PEAK_ENABLE_TEST_HOOKS=1
+        PEAK_HAVE_MPI_UINT64_T=1)
+    target_include_directories(test_mpi_report_request_lifetime BEFORE PRIVATE
+        ${PROJECT_SOURCE_DIR}/test/report/fake_mpi
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils
+        ${FRIDA_GUM_INCLUDE_DIRS})
+    target_link_libraries(test_mpi_report_request_lifetime PRIVATE
+        ${RT_LIBRARY}
+        ${M_LIBRARY})
+    add_test(NAME test_mpi_report_request_lifetime
+        COMMAND test_mpi_report_request_lifetime)
+    set_tests_properties(test_mpi_report_request_lifetime
+        PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION
+                "mpi_report_request_lifetime_ok operations=54 labels=29 failures=108")
 
     add_executable(test_runtime_config
         report/test_runtime_config.c
@@ -187,13 +221,13 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "exec_checkpoint_writer_test_ok")
 
-    add_test(NAME test_general_listener_unity_layout
+    add_test(NAME test_general_listener_layout
         COMMAND ${Python3_EXECUTABLE}
-                ${PROJECT_SOURCE_DIR}/test/static_checks/check_general_listener_unity_layout.py
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_general_listener_layout.py
                 ${PROJECT_SOURCE_DIR})
-    set_tests_properties(test_general_listener_unity_layout
+    set_tests_properties(test_general_listener_layout
         PROPERTIES
-            PASS_REGULAR_EXPRESSION "general_listener_unity_layout_ok")
+            PASS_REGULAR_EXPRESSION "general_listener_layout_ok")
 
     add_test(NAME test_cuda_interceptor_consistency
         COMMAND ${Python3_EXECUTABLE}
@@ -1670,9 +1704,36 @@ if(BUILD_TESTING)
                         ${_PEAK_MPI_REPORT_TRANSPORT_NPROCS}
                         ${MPIEXEC_PREFLAGS}
                         ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_report_transport
+                        ${MPIEXEC_POSTFLAGS}
                         fail-closed
-                        accounting-valid
-                        ${MPIEXEC_POSTFLAGS})
+                        accounting-valid)
+            set(_PEAK_MPI_ACTIVE_REQUEST_SUFFIXES
+                allreduce reduce bcast)
+            set(_PEAK_MPI_ACTIVE_REQUEST_LABELS
+                hook-slot-min-hash
+                sum-num-calls
+                profile-control-ratio-owner)
+            foreach(_peak_active_index RANGE 0 2)
+                list(GET _PEAK_MPI_ACTIVE_REQUEST_SUFFIXES
+                     ${_peak_active_index} _peak_active_suffix)
+                list(GET _PEAK_MPI_ACTIVE_REQUEST_LABELS
+                     ${_peak_active_index} _peak_active_label)
+                add_test(
+                    NAME test_mpi_report_transport_active_request_${_peak_active_suffix}
+                    COMMAND ${MPIEXEC_EXECUTABLE}
+                            ${MPIEXEC_NUMPROC_FLAG}
+                            ${_PEAK_MPI_REPORT_TRANSPORT_NPROCS}
+                            ${MPIEXEC_PREFLAGS}
+                            ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_report_transport
+                            ${MPIEXEC_POSTFLAGS}
+                            active-request-fail-closed
+                            ${_peak_active_label})
+                set_tests_properties(
+                    test_mpi_report_transport_active_request_${_peak_active_suffix}
+                    PROPERTIES
+                        PASS_REGULAR_EXPRESSION "mpi_report_transport_active_request_fail_closed_ok"
+                        TIMEOUT 30)
+            endforeach()
             set_tests_properties(test_mpi_report_transport
                 PROPERTIES
                     PASS_REGULAR_EXPRESSION "mpi_report_transport_ok"

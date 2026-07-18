@@ -73,12 +73,10 @@ peak_close_overlaps_nocancel_entry(gpointer close_address)
  */
 static int
 peak_close(int fd) {
-    //g_printerr ("close called on %d\n", fd);
     if (fd == STDERR_FILENO) {
         return 0;
     }
     return original_close(fd);
-    //return 0;
 }
 
 

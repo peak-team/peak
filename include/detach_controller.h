@@ -1,6 +1,11 @@
 #ifndef PEAK_DETACH_CONTROLLER_H
 #define PEAK_DETACH_CONTROLLER_H
 
+/**
+ * @file detach_controller.h
+ * @brief Coordinate safe Gum mutation windows and detach-helper requests.
+ */
+
 #include "frida-gum.h"
 
 #include <stddef.h>
