@@ -27,7 +27,6 @@ peak_exec_append_raw_syscall_trampoline(
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
     add_library(cuda_interceptor_obj OBJECT cuda_interceptor.cpp)
-    set_target_properties(cuda_interceptor_obj PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 # Preserve the original source order while expressing optional modules once.
@@ -62,7 +61,6 @@ target_include_directories(peak
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
-        ${LIBIBERTY_INCLUDE_DIR}
         ${OTF2_INCLUDE_DIRS}
 )
 
@@ -78,7 +76,6 @@ target_include_directories(cuda_interceptor_obj
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
-        ${LIBIBERTY_INCLUDE_DIR}
 )
 endif()
 
@@ -90,7 +87,6 @@ target_link_libraries(peak
         ${RT_LIBRARY}
         ${RESOLV_LIBRARY}
         ${M_LIBRARY}
-        ${LIBIBERTY_LIB}
         ${OTF2_LIBRARIES}
 )
 
@@ -103,7 +99,6 @@ target_link_libraries(cuda_interceptor_obj
         ${RT_LIBRARY}
         ${RESOLV_LIBRARY}
         ${M_LIBRARY}
-        ${LIBIBERTY_LIB}
 )
 endif()
 
