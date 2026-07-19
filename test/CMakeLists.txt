@@ -75,6 +75,18 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "header_guard_style_ok")
 
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
+        add_test(NAME test_peak_shared_unwinder
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/static_checks/check_peak_shared_unwinder.py
+                    --readelf ${CMAKE_READELF}
+                    --library $<TARGET_FILE:peak>
+                    --compiler-id ${CMAKE_CXX_COMPILER_ID})
+        set_tests_properties(test_peak_shared_unwinder
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "peak_shared_unwinder_ok")
+    endif()
+
     add_executable(test_report_maxima
         report/test_report_maxima.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
@@ -177,6 +189,28 @@ if(BUILD_TESTING)
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION
                 "mpi_report_request_lifetime_ok operations=54 labels=29 failures=108")
+
+    add_executable(test_mpi_teardown_guard
+        report/test_mpi_teardown_guard.c
+        ${PROJECT_SOURCE_DIR}/src/mpi_teardown_guard.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
+        ${PROJECT_SOURCE_DIR}/src/utils/timing.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_compile_definitions(test_mpi_teardown_guard PRIVATE
+        HAVE_MPI=1
+        PEAK_ENABLE_TEST_HOOKS=1)
+    target_include_directories(test_mpi_teardown_guard BEFORE PRIVATE
+        ${PROJECT_SOURCE_DIR}/test/report/fake_mpi
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils)
+    target_link_libraries(test_mpi_teardown_guard PRIVATE
+        ${RT_LIBRARY})
+    add_test(NAME test_mpi_teardown_guard COMMAND test_mpi_teardown_guard)
+    set_tests_properties(test_mpi_teardown_guard
+        PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION
+                "mpi_teardown_guard_test_ok success=2 failure_paths=4")
 
     add_executable(test_runtime_config
         report/test_runtime_config.c

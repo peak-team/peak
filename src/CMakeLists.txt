@@ -41,6 +41,7 @@ endif()
 if(MPI_FOUND)
     list(APPEND sources_peak
         general_listener/mpi_report_transport.c
+        mpi_teardown_guard.c
         mpi_interceptor.c)
 endif()
 if(CUDA_FOUND OR CUDAToolkit_FOUND)
