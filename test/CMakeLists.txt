@@ -45,7 +45,7 @@ if(BUILD_TESTING)
 
     include (FortranCInterface)
     list (APPEND FORTRAN_FUNCTIONS sdot dgemm)
-    FortranCInterface_HEADER (include/FC.h 
+    FortranCInterface_HEADER (include/FC.h
         MACRO_NAMESPACE "FC_"
         SYMBOLS ${FORTRAN_FUNCTIONS}
     )
@@ -1371,34 +1371,34 @@ if(BUILD_TESTING)
     # Add test of dgemm
     add_subdirectory(dgemm)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
-    set_tests_properties(test_dgemm 
-        PROPERTIES 
+    set_tests_properties(test_dgemm
+        PROPERTIES
             ENVIRONMENT "PEAK_TARGET=dgemm_,main,dummy;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
-    set_tests_properties(test_dgemm 
-        PROPERTIES 
+    set_tests_properties(test_dgemm
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
 
     # Add test of TARGET_CONFIG
     add_test(NAME test_target_config COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
-    set_tests_properties(test_target_config 
-        PROPERTIES 
+    set_tests_properties(test_target_config
+        PROPERTIES
             ENVIRONMENT "PEAK_TARGET_GROUP=BLAS;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
-    set_tests_properties(test_target_config 
-        PROPERTIES 
+    set_tests_properties(test_target_config
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
 
     # Add test of config_file
     add_test(NAME test_config_file COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
-    set_tests_properties(test_config_file 
-        PROPERTIES 
+    set_tests_properties(test_config_file
+        PROPERTIES
             ENVIRONMENT "PEAK_TARGET_FILE=${PEAK_TARGET_CONFIG_PATH};${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
-    set_tests_properties(test_config_file 
-        PROPERTIES 
+    set_tests_properties(test_config_file
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
 
@@ -1407,17 +1407,17 @@ if(BUILD_TESTING)
     add_test(NAME test_sdot COMMAND ${PROJECT_BINARY_DIR}/test/sdot/test_sdot)
     if(OpenMP_FOUND)
         set_tests_properties(test_sdot
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=cblas_sdot,main;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sdot
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=cblas_sdot,main;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sdot
-        PROPERTIES 
+        PROPERTIES
         PASS_REGULAR_EXPRESSION "cblas_sdot\\|[ \t]+1000000\\|"
     )
 
@@ -1426,17 +1426,17 @@ if(BUILD_TESTING)
     add_test(NAME test_sleep COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
     if(OpenMP_FOUND)
         set_tests_properties(test_sleep
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_sleep
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_sleep
-        PROPERTIES 
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|[ \t]+1000\\|.*my_sleep_func\\|[ \t]+10\\."
     )
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -1492,7 +1492,7 @@ if(BUILD_TESTING)
     add_subdirectory(recursive)
     add_test(NAME test_recursive COMMAND ${PROJECT_BINARY_DIR}/test/recursive/test_recursive)
     set_tests_properties(test_recursive
-        PROPERTIES 
+        PROPERTIES
             ENVIRONMENT "PEAK_TARGET=functionA,functionB;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
 
@@ -1702,7 +1702,7 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "fftw_dlopen_cancellation_cleanup_ok"
                 TIMEOUT 15)
     endif()
-    
+
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
         set(_PEAK_MPI_TEST_NPROCS 2)
@@ -2086,7 +2086,7 @@ if(BUILD_TESTING)
         math(EXPR N_CPU_DIV2 "${N_CPU}/2")
         if(OpenMP_FOUND)
             set_tests_properties(test_dgemm_mpi
-                PROPERTIES 
+                PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=${N_CPU_DIV2};PEAK_TARGET=cblas_dgemm,main;PEAK_MPI_COLLECTIVE_OUTPUT=1;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
             )
             set_tests_properties(test_mpi_exit_before_finalize
@@ -2190,7 +2190,7 @@ if(BUILD_TESTING)
             endif()
         else()
             set_tests_properties(test_dgemm_mpi
-                PROPERTIES 
+                PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=cblas_dgemm,main;PEAK_MPI_COLLECTIVE_OUTPUT=1;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
             )
             set_tests_properties(test_mpi_exit_before_finalize
@@ -2294,7 +2294,7 @@ if(BUILD_TESTING)
             endif()
         endif()
         set_tests_properties(test_dgemm_mpi
-            PROPERTIES 
+            PROPERTIES
                 PASS_REGULAR_EXPRESSION "cblas_dgemm[*]*\\|[ \t]+200\\|"
         )
         set(_PEAK_MPI_LIFECYCLE_FATAL_REGEX "Caught signal|Segmentation fault|SIGSEGV|signal 11|Fatal error|MPII_finalize|ofi_cq_read|hwloc")
@@ -2438,17 +2438,17 @@ if(BUILD_TESTING)
     add_test(NAME test_heartbeat COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
     if(OpenMP_FOUND)
         set_tests_properties(test_heartbeat
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "OMP_NUM_THREADS=${N_CPU};PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_ON_ENV};${PRELOAD_VAR}"
         )
     else()
         set_tests_properties(test_heartbeat
-            PROPERTIES 
+            PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;${HEARTBEAT_ON_ENV};${PRELOAD_VAR}"
         )
     endif()
     set_tests_properties(test_heartbeat
-        PROPERTIES 
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|"
     )
 
@@ -2456,7 +2456,7 @@ if(BUILD_TESTING)
     if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))
         add_subdirectory(cuda)
     endif()
-    
+
     # Add test of dynamic library intercepting
     if(PEAK_BUILD_DYNAMIC_LIB_TESTS)
         add_subdirectory(dynamic_lib)
@@ -2465,12 +2465,12 @@ if(BUILD_TESTING)
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
     add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
-    set_tests_properties(test_memory 
-        PROPERTIES 
+    set_tests_properties(test_memory
+        PROPERTIES
             ENVIRONMENT "PEAK_TARGET=performAllocation,performFree;PEAK_MEMORY_PROFILE=TRUE;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
     )
     set_tests_properties(test_memory
-        PROPERTIES 
+        PROPERTIES
             PASS_REGULAR_EXPRESSION "performAllocation*\\|[ \t]+[0-9]+\\|.*performAllocation*\\|[ \t]+[0-9]+(\\.[0-9]+)?"
             PASS_REGULAR_EXPRESSION "performFree*\\|[ \t]+[0-9]+\\|.*performFree*\\|[ \t]+[0-9]+(\\.[0-9]+)?"
             PASS_REGULAR_EXPRESSION "Max usage \\(bytes\\):[ \t]*[0-9]+"

@@ -30,7 +30,7 @@ PEAK_TEST_NOINLINE double rfftwnd_threads_one_complex_to_real() {
 int main() {
     double sum_result = rfftwnd_print_plan();
     double product_result = rfftwnd_threads_one_complex_to_real();
-    
+
     printf("rfftwnd_print_plan result: %f\n", sum_result);
     printf("rfftwnd_threads_one_complex_to_real result: %f\n", product_result);
 

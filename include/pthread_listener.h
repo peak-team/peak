@@ -13,29 +13,24 @@
 
 /**
  * @struct _PthreadListener
- * @brief Structure for PthreadListener
- *
- * This structure represents a PthreadListener.
+ * @brief Gum invocation listener used to wrap pthread_create calls.
  */
 typedef struct _PthreadListener PthreadListener;
 
-/**
- * @brief PthreadListener class
- */
+/** Gum listener object that supplies pthread_create enter/leave callbacks. */
 struct _PthreadListener {
     GObject parent;
 };
 
 /**
  * @struct _PthreadState
- * @brief Structure for PthreadState
- *
- * This structure represents a PthreadState.
+ * @brief Per-invocation state retained around one pthread_create call.
  */
 typedef struct _PthreadState PthreadState;
 
 /**
- * @brief PthreadState class
+ * Tracks the child ID argument and wrapper context until pthread_create
+ * returns.
  */
 struct _PthreadState {
     pthread_t* child_tid;

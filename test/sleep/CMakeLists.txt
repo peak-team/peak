@@ -2,7 +2,7 @@
 add_executable(test_sleep test_sleep.c)
 
 target_include_directories(test_sleep
-    PUBLIC 
+    PUBLIC
         ${PROJECT_BINARY_DIR}/test/include
         ${PROJECT_SOURCE_DIR}/test/include
 )
