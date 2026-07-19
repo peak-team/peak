@@ -42,7 +42,10 @@ typedef struct PeakSocketReportSession PeakSocketReportSession;
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
  * snapshot. ROOT_PREPARED also returns an owned session through @p session_out.
  * Both output pointers are required. Other outcomes, including a missing
- * output pointer, clear every provided output to NULL.
+ * output pointer, clear every provided output to NULL. Wire-v9 does not carry
+ * instrumented markers; the aggregate retains root's marker or promotes it
+ * when a positive aggregate call count proves that some rank instrumented the
+ * slot. Peer-only instrumented slots with zero calls are not represented.
  */
 PeakSocketReportStatus peak_socket_report_transport_begin(
     const PeakReportSnapshot* local,
