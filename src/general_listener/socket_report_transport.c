@@ -1047,6 +1047,8 @@ peak_socket_reduce_records_to_snapshot(
 {
     for (size_t i = 0; i < snapshot->hook_count; i++) {
         snapshot->num_calls[i] = (unsigned long)records[i].num_calls;
+        snapshot->instrumented[i] =
+            snapshot->instrumented[i] || records[i].num_calls != 0;
         snapshot->total_time[i] = records[i].total_time;
         snapshot->max_total_time[i] = records[i].max_total_time;
         snapshot->min_total_time[i] = records[i].min_total_time;
