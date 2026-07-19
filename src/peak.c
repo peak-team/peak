@@ -982,7 +982,7 @@ __attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_ini
 __attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
 #elif defined(__ELF__)
 typedef int (*main_fn)(int, char**, char**);
-typedef int (*libc_start_main_fn)(main_fn, int, char**, 
+typedef int (*libc_start_main_fn)(main_fn, int, char**,
                                   int (*)(int, char**, char**),
                                   void (*)(void), void (*)(void), void*);
 
@@ -1045,7 +1045,7 @@ peak_exit(int status) {
 /**
  * @brief Attaches the interceptor to the `exit` function.
  *
- * This function uses the Gum API to intercept calls to the `exit` function, 
+ * This function uses the Gum API to intercept calls to the `exit` function,
  * replacing it with a custom implementation (`peak_exit`).
  *
  * @return 0 on success, -1 on failure.
@@ -1070,7 +1070,7 @@ int exit_interceptor_attach() {
 /**
  * @brief Detaches the interceptor from the `exit` function.
  *
- * This function reverts the interception of the `exit` function, restoring its 
+ * This function reverts the interception of the `exit` function, restoring its
  * original behavior.
  */
 void exit_interceptor_detach() {

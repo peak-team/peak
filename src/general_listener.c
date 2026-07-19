@@ -4988,7 +4988,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
          * Auxiliary listeners, including the overhead-calibration listener,
          * share this callback implementation.  Only the listener currently
          * published for a target may drive that target's lifecycle.
-        */
+         */
         gboolean listener_owns_hook =
             peak_general_hook_is_published_unlocked(hook_id) &&
             array_listener[hook_id] == listener;

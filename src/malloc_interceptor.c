@@ -117,7 +117,7 @@ static int peak_log_backtrace_malloc() {
     for (guint i = 0; i != retaddrs.len; i++) {
         const gchar *sym = gum_symbol_name_from_address(retaddrs.items[i]);
         if (!sym || !*sym) continue;
-        
+
         gchar *symbol_name = strdup(sym);
         removeTrailingOffset(symbol_name);
         char *demangledName = cxa_demangle(symbol_name);
@@ -133,13 +133,6 @@ static int peak_log_backtrace_malloc() {
             }
         }
         pthread_mutex_unlock(&caller_mutex);
-        
-        // for (guint idx = 0; idx < peak_hook_address_count; idx++) {
-        //     if (strcmp(func, peak_hook_strings[idx]) == 0) {
-        //         flag = 1;
-        //         break;
-        //     }
-        // }
 
         free(func);
         free(symbol_name);
@@ -341,7 +334,7 @@ static void peak_memlog_finalize(void) {
     size_t events = atomic_load_explicit(&g_memlog.index, memory_order_relaxed);
     size_t used_bytes = g_memlog.header_bytes + events * sizeof(PeakMemEvent);
     if (used_bytes > g_memlog.map_bytes) used_bytes = g_memlog.map_bytes;
-    
+
     msync(g_memlog.map, used_bytes, MS_SYNC);
 
     /* base pointer of the events region (after header) */
@@ -442,7 +435,7 @@ static void init_table(void) {
         peak_log_warn("[peak] Failed to initialize memory caller target table\n");
         exit(1);
     }
-    
+
     pthread_mutex_lock(&caller_mutex);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         gum_metal_hash_table_insert(memory_caller_target_table, peak_hook_strings[i], peak_hook_strings[i]);
@@ -538,7 +531,7 @@ static void* custom_calloc(size_t nmemb, size_t size) {
     if (ptr) {
         int flag = peak_log_backtrace_malloc();
         add_tracking_entry(ptr, total_size, flag);
-    } 
+    }
     in_peak_alloc_hook = hook_val;
     malloc_hook_leave();
 

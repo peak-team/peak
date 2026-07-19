@@ -8,7 +8,7 @@ ExternalProject_Add(
   openblas
   SOURCE_DIR "@OPENBLAS_DOWNLOAD_ROOT@/openblas-src"
   GIT_REPOSITORY
-    https://github.com/xianyi/OpenBLAS.git 
+    https://github.com/xianyi/OpenBLAS.git
   GIT_TAG
     v0.3.23
   UPDATE_COMMAND ""

@@ -67,7 +67,7 @@ void print_line() {
 void* run_kernel(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     pthread_t thread_id = pthread_self();
-    
+
     if (args->enable_logging) {
         print_line();
         std::cout << "Thread " << thread_id << " running on GPU " << 0 << "\n";
@@ -78,13 +78,13 @@ void* run_kernel(void* arg) {
         }
         print_line();
     }
-    
+
     for (size_t i = 0; i < args->kernel_numbers.size(); ++i) {
         int blocks = args->num_blocks[i];
         int threads = args->num_threads[i];
         int calls = args->num_calls[i];
         int kernel = args->kernel_numbers[i];
-        
+
         for (int j = 0; j < calls; ++j) {
             switch (kernel) {
                 case 1:
@@ -122,14 +122,14 @@ int main(int argc, char** argv) {
     int kernel_number = 5;
     bool enable_logging = false;
     bool randomize = false;
-    
+
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dist_blocks(1, 16);
     std::uniform_int_distribution<int> dist_threads(32, 512);
     std::uniform_int_distribution<int> dist_calls(1, 10);
     std::uniform_int_distribution<int> dist_kernel(1, 5);
-    
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--num_pthreads" && i + 1 < argc) num_cpu_threads = std::atoi(argv[++i]);
@@ -140,10 +140,10 @@ int main(int argc, char** argv) {
         else if (arg == "--verbose") enable_logging = true;
         else if (arg == "--random") randomize = true;
     }
-    
+
     pthread_t threads[num_cpu_threads];
     ThreadArgs thread_args[num_cpu_threads];
-    
+
     for (int t = 0; t < num_cpu_threads; ++t) {
         for (int i = 0; i < kernel_number; ++i) {
             thread_args[t].num_blocks.push_back(randomize ? dist_blocks(gen) : num_blocks);
@@ -155,11 +155,11 @@ int main(int argc, char** argv) {
         thread_args[t].enable_logging = enable_logging;
         pthread_create(&threads[t], nullptr, run_kernel, (void*)&thread_args[t]);
     }
-    
+
     for (int t = 0; t < num_cpu_threads; ++t) {
         pthread_join(threads[t], nullptr);
     }
-    
+
     if (enable_logging) {
         print_line();
         std::cout << "Execution completed!\n";
@@ -172,6 +172,6 @@ int main(int argc, char** argv) {
     std::cout << "Total Kernel Calls: " << total_calls.load() << "\n";
     std::cout << "Average Block Size: " << avg_blocks << "\n";
     std::cout << "Average Grid Size: " << avg_threads << "\n";
-    
+
     return 0;
 }

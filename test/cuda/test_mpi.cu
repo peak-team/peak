@@ -62,13 +62,13 @@ void run_kernel(int rank, const std::vector<KernelConfig>& configs, bool enable_
         std::cout << "MPI Rank " << rank << " running on GPU " << 0 << "\n";
         print_line();
     }
-    
+
     for (const auto& config : configs) {
         if (enable_logging) {
             std::cout << "Kernel " << config.kernel_number << " | Blocks: " << config.num_blocks
                       << " | Threads: " << config.num_threads << " | Calls: " << config.num_calls << "\n";
         }
-        
+
         for (int j = 0; j < config.num_calls; ++j) {
             switch (config.kernel_number) {
                 case 1:
@@ -91,7 +91,7 @@ void run_kernel(int rank, const std::vector<KernelConfig>& configs, bool enable_
             }
             cudaDeviceSynchronize();
             if (enable_logging) {
-                std::cout << "Rank " << rank << " executed Kernel " << config.kernel_number 
+                std::cout << "Rank " << rank << " executed Kernel " << config.kernel_number
                           << " | Blocks: " << config.num_blocks << " | Threads: " << config.num_threads
                           << " | Call ID: " << j << "\n";
             }
@@ -101,7 +101,7 @@ void run_kernel(int rank, const std::vector<KernelConfig>& configs, bool enable_
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    
+
     int rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -109,14 +109,14 @@ int main(int argc, char** argv) {
     bool enable_logging = false;
     bool randomize = false;
     int num_blocks = 1, num_threads = 32, num_calls = 1, kernel_number = 5;
-    
+
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dist_blocks(1, 16);
     std::uniform_int_distribution<int> dist_threads(32, 512);
     std::uniform_int_distribution<int> dist_calls(1, 10);
     std::uniform_int_distribution<int> dist_kernel(1, 5);
-    
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--num_blocks" && i + 1 < argc) num_blocks = std::atoi(argv[++i]);
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
         else if (arg == "--verbose") enable_logging = true;
         else if (arg == "--random") randomize = true;
     }
-    
+
     std::vector<KernelConfig> configs;
     for (int i = 0; i < kernel_number; ++i) {
         configs.push_back({
@@ -136,9 +136,9 @@ int main(int argc, char** argv) {
             randomize ? dist_kernel(gen) : i+1
         });
     }
-    
+
     run_kernel(rank, configs, enable_logging);
-    
+
     MPI_Finalize();
     return 0;
 }

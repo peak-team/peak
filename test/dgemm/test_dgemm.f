@@ -20,7 +20,7 @@
       PRINT 10, " matrix A(",M," x",K, ") and matrix B(", K," x", N, ")"
 10    FORMAT(a,I5,a,I5,a,I5,a,I5,a)
       PRINT *, ""
-      ALPHA = 1.0 
+      ALPHA = 1.0
       BETA = 0.0
 
 !     PRINT *, "Intializing matrix data"
@@ -47,8 +47,8 @@
 !     PRINT *, "subroutine"
       DO  I1=1, 1   !10 million times
       DO  I2=1, 10  !0.1 million
-      DO  I3=1, 100  
-      DO  I4=1, 100  
+      DO  I3=1, 100
+      DO  I4=1, 100
         CALL DGEMM('N','N',M,N,K,ALPHA,A,M,B,K,BETA,C(1,1),M)
       END DO
       END DO
@@ -75,6 +75,6 @@
  30   FORMAT(6(ES12.4,1x))
 
       PRINT *, "Example completed."
-      STOP 
+      STOP
 
       END

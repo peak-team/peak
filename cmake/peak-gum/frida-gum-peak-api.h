@@ -1,5 +1,7 @@
+#ifndef PEAK_FRIDA_GUM_PEAK_API_H
+#define PEAK_FRIDA_GUM_PEAK_API_H
+
 /* PEAK extension ABI for Frida Gum PC classification. */
-#ifndef GUM_PEAK_PC_API_VERSION
 #define GUM_PEAK_PC_API_VERSION 1
 #define GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64 0x01171503u
 #define GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64 0x02171503u
@@ -80,4 +82,4 @@ GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
 }
 #endif
 
-#endif
+#endif /* PEAK_FRIDA_GUM_PEAK_API_H */

@@ -21,7 +21,7 @@ struct AllocationStats {
     size_t freeCount;
     std::chrono::microseconds totalTime;
 
-    AllocationStats() : totalAllocated(0), totalFreed(0), peakMemory(0), 
+    AllocationStats() : totalAllocated(0), totalFreed(0), peakMemory(0),
                        allocCount(0), freeCount(0), totalTime(0) {}
 };
 
@@ -82,11 +82,11 @@ void verbosePrint(const Config& config, int threadId, const std::string& message
 }
 
 // Function to perform a single allocation based on the allocation type
-void* performAllocation(AllocType type, size_t& size, size_t alignment, AllocationStats& stats, 
+void* performAllocation(AllocType type, size_t& size, size_t alignment, AllocationStats& stats,
                         const Config& config, int threadId) {
     void* ptr = nullptr;
     auto start = std::chrono::high_resolution_clock::now();
-    
+
     std::string allocType = allocTypeToString(type);
 
     switch (type) {
@@ -99,7 +99,7 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
             ptr = calloc(1, size);
             break;
         case REALLOC:
-            verbosePrint(config, threadId, "Allocating " + std::to_string(size/2) + " bytes then reallocating to " + 
+            verbosePrint(config, threadId, "Allocating " + std::to_string(size/2) + " bytes then reallocating to " +
                          std::to_string(size) + " bytes using realloc");
             ptr = malloc(size/2);
             if (ptr) {
@@ -107,7 +107,7 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
             }
             break;
         case POSIX_MEMALIGN:
-            verbosePrint(config, threadId, "Allocating " + std::to_string(size) + " bytes with alignment " + 
+            verbosePrint(config, threadId, "Allocating " + std::to_string(size) + " bytes with alignment " +
                          std::to_string(alignment) + " using posix_memalign");
             if (posix_memalign(&ptr, alignment, size) != 0) {
                 ptr = nullptr;
@@ -115,7 +115,7 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
             }
             break;
         case ALIGNED_ALLOC:
-            verbosePrint(config, threadId, "Requested " + std::to_string(size) + " bytes with alignment " + 
+            verbosePrint(config, threadId, "Requested " + std::to_string(size) + " bytes with alignment " +
                          std::to_string(alignment) + " using aligned_alloc");
             // Ensure size is a multiple of alignment
             size = (size + alignment - 1) & ~(alignment - 1);
@@ -149,12 +149,12 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
     if (ptr) {
         // Write to memory to ensure it's actually allocated
         memset(ptr, 0xAB, size);
-        
+
         stats.totalAllocated += size;
         stats.allocCount++;
         stats.peakMemory = std::max(stats.peakMemory, stats.totalAllocated - stats.totalFreed);
-        
-        verbosePrint(config, threadId, "Successfully allocated " + std::to_string(size) + " bytes at address " + 
+
+        verbosePrint(config, threadId, "Successfully allocated " + std::to_string(size) + " bytes at address " +
                      std::to_string(reinterpret_cast<uintptr_t>(ptr)) + " in " + std::to_string(duration.count()) + " μs");
     } else {
         verbosePrint(config, threadId, "Failed to allocate " + std::to_string(size) + " bytes");
@@ -164,14 +164,14 @@ void* performAllocation(AllocType type, size_t& size, size_t alignment, Allocati
 }
 
 // Function to free memory based on the allocation type
-void performFree(void* ptr, AllocType type, size_t size, AllocationStats& stats, 
+void performFree(void* ptr, AllocType type, size_t size, AllocationStats& stats,
                  const Config& config, int threadId) {
     if (!ptr) return;
 
     auto start = std::chrono::high_resolution_clock::now();
     std::string allocType = allocTypeToString(type);
-    
-    verbosePrint(config, threadId, "Freeing " + std::to_string(size) + " bytes at address " + 
+
+    verbosePrint(config, threadId, "Freeing " + std::to_string(size) + " bytes at address " +
                  std::to_string(reinterpret_cast<uintptr_t>(ptr)) + " using " + allocType);
 
     switch (type) {
@@ -196,7 +196,7 @@ void performFree(void* ptr, AllocType type, size_t size, AllocationStats& stats,
 
     stats.totalFreed += size;
     stats.freeCount++;
-    
+
     verbosePrint(config, threadId, "Successfully freed memory in " + std::to_string(duration.count()) + " μs");
 }
 
@@ -207,15 +207,15 @@ void* threadFunction(void* arg) {
     const Config& config = args->config;
     int threadId = args->threadId;
 
-    verbosePrint(config, threadId, "Thread started with target allocation of " + 
+    verbosePrint(config, threadId, "Thread started with target allocation of " +
                  std::to_string(config.totalSize / config.threadCount) + " bytes");
 
     // Seed for this thread
     unsigned int seed = threadId * 1000 + time(nullptr);
-    
+
     std::vector<std::pair<void*, std::pair<AllocType, size_t>>> allocations;
     size_t allocatedSoFar = 0;
-    
+
     // Thread-local allocation statistics
     size_t localAllocCount = 0;
     size_t localFreeCount = 0;
@@ -226,25 +226,25 @@ void* threadFunction(void* arg) {
     while (allocatedSoFar < config.totalSize / config.threadCount) {
         // Randomly choose allocation type
         AllocType type = config.allocTypes[rand_r(&seed) % config.allocTypes.size()];
-        
+
         // Randomize chunk size between 50% and 150% of the configured chunk size
         size_t actualSize = config.chunkSize * (50 + rand_r(&seed) % 101) / 100;
         actualSize = std::min(actualSize, config.totalSize / config.threadCount - allocatedSoFar);
         if (actualSize == 0) break;
 
         localTotalRequested += actualSize;
-        
+
         // Store original size
         size_t allocationSize = actualSize;
-        
+
         // Perform allocation - note that allocationSize may be modified for aligned allocations
         void* ptr = performAllocation(type, allocationSize, config.alignment, stats, config, threadId);
-        
+
         if (ptr) {
             allocations.push_back({ptr, {type, allocationSize}});
             allocatedSoFar += allocationSize;
             localAllocCount++;
-            
+
             // Randomly free some allocations
             if (rand_r(&seed) % 4 == 0 && !allocations.empty()) {
                 int index = rand_r(&seed) % allocations.size();
@@ -255,18 +255,18 @@ void* threadFunction(void* arg) {
                 localFreeCount++;
             }
         }
-        
+
         // Periodically print thread progress
         if (config.verbose && localAllocCount % 100 == 0) {
             std::lock_guard<std::mutex> lock(outputMutex);
-            std::cout << "[Thread " << threadId << "] Progress: " 
+            std::cout << "[Thread " << threadId << "] Progress: "
                       << std::fixed << std::setprecision(2)
                       << (allocatedSoFar * 100.0 / (config.totalSize / config.threadCount)) << "% - "
                       << "Allocated: " << allocatedSoFar << " bytes, "
                       << "Allocs: " << localAllocCount << ", "
                       << "Frees: " << localFreeCount << std::endl;
         }
-        
+
         // Introduce some randomness in thread timing
         if (rand_r(&seed) % 100 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(rand_r(&seed) % 1000));
@@ -334,75 +334,75 @@ void runStressTest(const Config& config) {
 
     for (int iteration = 0; iteration < config.iterations; ++iteration) {
         globalStats = AllocationStats();
-        
+
         std::cout << "Iteration " << (iteration + 1) << "/" << config.iterations << " starting...\n";
-        
+
         auto startTime = std::chrono::high_resolution_clock::now();
-        
+
         // Create threads
         std::vector<pthread_t> threads(config.threadCount);
         std::vector<ThreadArgs> threadArgs(config.threadCount);
-        
+
         for (int i = 0; i < config.threadCount; ++i) {
             threadArgs[i].threadId = i;
             threadArgs[i].config = config;
             threadArgs[i].stats = AllocationStats();
-            
+
             pthread_create(&threads[i], nullptr, threadFunction, &threadArgs[i]);
         }
-        
+
         // Wait for all threads to complete
         for (int i = 0; i < config.threadCount; ++i) {
             pthread_join(threads[i], nullptr);
         }
-        
+
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        
+
         double durationSeconds = duration.count() / 1000.0;
         double allocationRate = globalStats.allocCount / durationSeconds;
         double freeRate = globalStats.freeCount / durationSeconds;
-        
+
         allocationRates.push_back(allocationRate);
         freeRates.push_back(freeRate);
         peakMemoryValues.push_back(globalStats.peakMemory);
         executionTimes.push_back(duration.count());
-        
+
         // Print results
         std::cout << "  Total allocated: " << globalStats.totalAllocated << " bytes";
         if (config.verbose) {
             std::cout << " (" << (globalStats.totalAllocated / (1024.0 * 1024.0)) << " MB)";
         }
         std::cout << "\n";
-        
+
         std::cout << "  Total freed: " << globalStats.totalFreed << " bytes";
         if (config.verbose) {
             std::cout << " (" << (globalStats.totalFreed / (1024.0 * 1024.0)) << " MB)";
         }
         std::cout << "\n";
-        
+
         std::cout << "  Peak memory: " << globalStats.peakMemory << " bytes";
         if (config.verbose) {
             std::cout << " (" << (globalStats.peakMemory / (1024.0 * 1024.0)) << " MB)";
         }
         std::cout << "\n";
-        
+
         std::cout << "  Allocation count: " << globalStats.allocCount << "\n";
         std::cout << "  Free count: " << globalStats.freeCount << "\n";
         std::cout << "  Total allocation/free time: " << globalStats.totalTime.count() << " μs\n";
         std::cout << "  Total execution time: " << duration.count() << " ms\n";
         std::cout << "  Allocation rate: " << std::fixed << std::setprecision(2) << allocationRate << " allocs/sec\n";
         std::cout << "  Free rate: " << std::fixed << std::setprecision(2) << freeRate << " frees/sec\n";
-        
+
         if (globalStats.totalAllocated != globalStats.totalFreed) {
-            std::cout << "  WARNING: Memory leak detected! " 
-                      << (globalStats.totalAllocated - globalStats.totalFreed) 
+            std::cout << "  WARNING: Memory leak detected! "
+                      << (globalStats.totalAllocated - globalStats.totalFreed)
                       << " bytes not freed.\n";
         }
-        
+
         std::cout << "\n";
     }
-    
+
     // Only print summary statistics if we have multiple iterations
     if (config.iterations > 1) {
         // Calculate average and standard deviation
@@ -410,57 +410,57 @@ void runStressTest(const Config& config) {
         double avgFreeRate = 0.0;
         double avgPeakMemory = 0.0;
         double avgExecutionTime = 0.0;
-        
+
         for (int i = 0; i < config.iterations; ++i) {
             avgAllocationRate += allocationRates[i];
             avgFreeRate += freeRates[i];
             avgPeakMemory += peakMemoryValues[i];
             avgExecutionTime += executionTimes[i];
         }
-        
+
         avgAllocationRate /= config.iterations;
         avgFreeRate /= config.iterations;
         avgPeakMemory /= config.iterations;
         avgExecutionTime /= config.iterations;
-        
+
         // Calculate standard deviation
         double stdDevAllocationRate = 0.0;
         double stdDevFreeRate = 0.0;
         double stdDevPeakMemory = 0.0;
         double stdDevExecutionTime = 0.0;
-        
+
         for (int i = 0; i < config.iterations; ++i) {
             stdDevAllocationRate += pow(allocationRates[i] - avgAllocationRate, 2);
             stdDevFreeRate += pow(freeRates[i] - avgFreeRate, 2);
             stdDevPeakMemory += pow(peakMemoryValues[i] - avgPeakMemory, 2);
             stdDevExecutionTime += pow(executionTimes[i] - avgExecutionTime, 2);
         }
-        
+
         stdDevAllocationRate = sqrt(stdDevAllocationRate / config.iterations);
         stdDevFreeRate = sqrt(stdDevFreeRate / config.iterations);
         stdDevPeakMemory = sqrt(stdDevPeakMemory / config.iterations);
         stdDevExecutionTime = sqrt(stdDevExecutionTime / config.iterations);
-        
+
         std::cout << "Summary statistics over " << config.iterations << " iterations:\n";
-        std::cout << "  Average allocation rate: " << std::fixed << std::setprecision(2) 
+        std::cout << "  Average allocation rate: " << std::fixed << std::setprecision(2)
                   << avgAllocationRate << " ± " << stdDevAllocationRate << " allocs/sec\n";
-        std::cout << "  Average free rate: " << std::fixed << std::setprecision(2) 
+        std::cout << "  Average free rate: " << std::fixed << std::setprecision(2)
                   << avgFreeRate << " ± " << stdDevFreeRate << " frees/sec\n";
-        std::cout << "  Average peak memory: " << std::fixed << std::setprecision(2) 
+        std::cout << "  Average peak memory: " << std::fixed << std::setprecision(2)
                   << avgPeakMemory << " ± " << stdDevPeakMemory << " bytes";
         if (config.verbose) {
             std::cout << " (" << (avgPeakMemory / (1024.0 * 1024.0)) << " MB)";
         }
         std::cout << "\n";
-        std::cout << "  Average execution time: " << std::fixed << std::setprecision(2) 
+        std::cout << "  Average execution time: " << std::fixed << std::setprecision(2)
                   << avgExecutionTime << " ± " << stdDevExecutionTime << " ms\n\n";
-                  
+
         if (config.verbose) {
             std::cout << "Detailed performance data:\n";
             std::cout << "  Iteration | Alloc Rate (allocs/sec) | Free Rate (frees/sec) | Peak Memory (bytes) | Execution Time (ms)\n";
             std::cout << "  ----------|------------------------|---------------------|-------------------|------------------\n";
             for (int i = 0; i < config.iterations; ++i) {
-                std::cout << "  " << std::setw(9) << (i + 1) << " | " 
+                std::cout << "  " << std::setw(9) << (i + 1) << " | "
                           << std::setw(22) << std::fixed << std::setprecision(2) << allocationRates[i] << " | "
                           << std::setw(19) << std::fixed << std::setprecision(2) << freeRates[i] << " | "
                           << std::setw(17) << std::fixed << std::setprecision(0) << peakMemoryValues[i] << " | "
@@ -499,10 +499,10 @@ int main(int argc, char* argv[]) {
     config.threadCount = 2;                 // 2 threads default
     config.iterations = 1;                  // 1 iterations default
     config.verbose = false;
-    
+
     // Default to using all allocation types
     config.allocTypes = {MALLOC, CALLOC, REALLOC, POSIX_MEMALIGN, ALIGNED_ALLOC, NEW, NEW_ARRAY};
-    
+
     static struct option long_options[] = {
         {"total-size",     required_argument, 0, 't'},
         {"chunk-size",     required_argument, 0, 'c'},
@@ -521,11 +521,11 @@ int main(int argc, char* argv[]) {
         {"all",            no_argument,       0, 'x'},
         {0,                0,                 0,  0 }
     };
-    
+
     int opt;
     int option_index = 0;
     bool specificAllocTypeSpecified = false;
-    
+
     while ((opt = getopt_long(argc, argv, "t:c:a:n:i:vh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't':
@@ -607,39 +607,39 @@ int main(int argc, char* argv[]) {
                 return 1;
         }
     }
-    
+
     // Validate configuration
     if (config.chunkSize > config.totalSize) {
         std::cerr << "Error: Chunk size cannot be larger than total size\n";
         return 1;
     }
-    
+
     if (config.threadCount <= 0) {
         std::cerr << "Error: Thread count must be positive\n";
         return 1;
     }
-    
+
     if (config.iterations <= 0) {
         std::cerr << "Error: Iteration count must be positive\n";
         return 1;
     }
-    
+
     if (config.alignment <= 0 || (config.alignment & (config.alignment - 1)) != 0) {
         std::cerr << "Error: Alignment must be a positive power of 2\n";
         return 1;
     }
-    
+
     if (config.allocTypes.empty()) {
         std::cerr << "Error: No allocation types specified\n";
         return 1;
     }
-    
+
     if (config.verbose) {
         std::cout << "Verbose mode enabled. This will generate detailed output.\n\n";
     }
-    
+
     // Run the stress test
     runStressTest(config);
-    
+
     return 0;
 }
