@@ -1,5 +1,6 @@
 #include "internal/general_listener/socket_report_transport.h"
 
+#include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,7 +50,7 @@ set_test_rank(int rank)
 static PeakReportSnapshot*
 fixture_snapshot(int rank, bool mismatch_name)
 {
-    PeakReportSnapshot* snapshot = peak_report_snapshot_create(2);
+    PeakReportSnapshot* snapshot = peak_report_snapshot_create(3);
     double scale = rank == 0 ? 1.0 : 2.0;
 
     if (snapshot == NULL ||
@@ -60,32 +61,34 @@ fixture_snapshot(int rank, bool mismatch_name)
         !peak_report_snapshot_set_name(
             snapshot,
             1,
-            mismatch_name ? "mismatched-beta" : "beta")) {
+            mismatch_name ? "mismatched-beta" : "beta") ||
+        !peak_report_snapshot_set_name(snapshot, 2, "gamma")) {
         peak_report_snapshot_destroy(snapshot);
         return NULL;
     }
 
-    snapshot->instrumented[0] = rank == 0;
+    snapshot->instrumented[0] = 1;
     snapshot->instrumented[1] = rank != 0;
+    snapshot->instrumented[2] = rank != 0;
     snapshot->detached[0] = rank != 0;
     snapshot->reattached[1] = rank == 0;
     snapshot->revisited[1] = rank != 0;
 
     snapshot->num_calls[0] = rank == 0 ? 10UL : 7UL;
-    snapshot->num_calls[1] = rank == 0 ? 4UL : 6UL;
+    snapshot->num_calls[1] = rank == 0 ? 0UL : 6UL;
     snapshot->total_time[0] = rank == 0 ? 8.0 : 3.0;
-    snapshot->total_time[1] = rank == 0 ? 5.0 : 9.0;
+    snapshot->total_time[1] = rank == 0 ? 0.0 : 9.0;
     snapshot->max_total_time[0] = rank == 0 ? 6.0 : 4.0;
-    snapshot->max_total_time[1] = rank == 0 ? 3.0 : 8.0;
-    snapshot->min_total_time[0] = rank == 0 ? 2.0 : -999.0;
-    snapshot->min_total_time[1] = rank == 0 ? 888.0 : 1.0;
+    snapshot->max_total_time[1] = rank == 0 ? 0.0 : 8.0;
+    snapshot->min_total_time[0] = rank == 0 ? 2.0 : 1.5;
+    snapshot->min_total_time[1] = rank == 0 ? DBL_MAX : 1.0;
     snapshot->exclusive_time[0] = rank == 0 ? 7.0 : 2.0;
-    snapshot->exclusive_time[1] = rank == 0 ? 4.0 : 8.0;
+    snapshot->exclusive_time[1] = rank == 0 ? 0.0 : 8.0;
     snapshot->max_time[0] = rank == 0 ? 0.6f : 0.4f;
-    snapshot->max_time[1] = rank == 0 ? 0.3f : 0.8f;
-    snapshot->min_time[0] = rank == 0 ? 0.2f : -99.0f;
-    snapshot->min_time[1] = rank == 0 ? 88.0f : 0.1f;
-    snapshot->thread_count[0] = rank == 0 ? 2UL : 0UL;
+    snapshot->max_time[1] = rank == 0 ? 0.0f : 0.8f;
+    snapshot->min_time[0] = rank == 0 ? 0.2f : 0.15f;
+    snapshot->min_time[1] = rank == 0 ? FLT_MAX : 0.1f;
+    snapshot->thread_count[0] = rank == 0 ? 2UL : 1UL;
     snapshot->thread_count[1] = rank == 0 ? 0UL : 3UL;
 
     snapshot->overhead_per_call = rank == 0 ? 1e-7 : 9e-7;
@@ -115,35 +118,38 @@ fixture_snapshot(int rank, bool mismatch_name)
 static bool
 aggregate_matches(const PeakReportSnapshot* aggregate)
 {
-    if (aggregate == NULL || aggregate->hook_count != 2 ||
+    if (aggregate == NULL || aggregate->hook_count != 3 ||
         aggregate->rank_count != 2 ||
         strcmp(aggregate->program, "root-program") != 0 ||
         strcmp(aggregate->names[0], "alpha") != 0 ||
         strcmp(aggregate->names[1], "beta") != 0 ||
+        strcmp(aggregate->names[2], "gamma") != 0 ||
         aggregate->overhead_per_call != 1e-7) {
         return false;
     }
 
     if (aggregate->instrumented[0] != 1 ||
-        aggregate->instrumented[1] != 0 ||
+        aggregate->instrumented[1] != 1 ||
+        aggregate->instrumented[2] != 0 ||
         aggregate->detached[0] != 1 ||
         aggregate->reattached[1] != 1 ||
         aggregate->revisited[1] != 1 ||
         aggregate->num_calls[0] != 17UL ||
-        aggregate->num_calls[1] != 10UL ||
+        aggregate->num_calls[1] != 6UL ||
+        aggregate->num_calls[2] != 0UL ||
         aggregate->total_time[0] != 11.0 ||
-        aggregate->total_time[1] != 14.0 ||
+        aggregate->total_time[1] != 9.0 ||
         aggregate->max_total_time[0] != 6.0 ||
         aggregate->max_total_time[1] != 8.0 ||
-        aggregate->min_total_time[0] != 2.0 ||
+        aggregate->min_total_time[0] != 1.5 ||
         aggregate->min_total_time[1] != 1.0 ||
         aggregate->exclusive_time[0] != 9.0 ||
-        aggregate->exclusive_time[1] != 12.0 ||
+        aggregate->exclusive_time[1] != 8.0 ||
         aggregate->max_time[0] != 0.6f ||
         aggregate->max_time[1] != 0.8f ||
-        aggregate->min_time[0] != 0.2f ||
+        aggregate->min_time[0] != 0.15f ||
         aggregate->min_time[1] != 0.1f ||
-        aggregate->thread_count[0] != 2UL ||
+        aggregate->thread_count[0] != 3UL ||
         aggregate->thread_count[1] != 3UL) {
         return false;
     }

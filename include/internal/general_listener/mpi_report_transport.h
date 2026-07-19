@@ -34,9 +34,11 @@ typedef enum {
  *
  * On PEAK_MPI_REPORT_TRANSPORT_ROOT_READY, rank zero owns the snapshot stored
  * in @p root_aggregate. All other outcomes leave it NULL. The aggregate keeps
- * rank zero's owned names, program text, and instrumented markers while
- * replacing reducible metrics, transition markers, overhead, and rank count
- * with their MPI aggregate.
+ * rank zero's owned names and program text while replacing reducible metrics,
+ * transition markers, overhead, and rank count with their MPI aggregate. An
+ * instrumented marker is retained from rank zero or promoted when a positive
+ * aggregate call count proves that at least one rank instrumented that slot.
+ * Peer-only instrumented slots with zero calls are not represented.
  */
 PeakMpiReportTransportResult peak_mpi_report_transport_reduce(
     const PeakReportSnapshot* local,

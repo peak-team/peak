@@ -1119,6 +1119,10 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
         peak_report_snapshot_destroy(aggregate);
         return PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE;
     }
+    for (size_t i = 0; i < aggregate->hook_count; i++) {
+        aggregate->instrumented[i] =
+            aggregate->instrumented[i] || aggregate->num_calls[i] != 0;
+    }
     aggregate->rank_count = size;
     peak_mpi_report_transport_set_overhead(
         aggregate,
