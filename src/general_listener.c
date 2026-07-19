@@ -4984,7 +4984,15 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         gboolean detach_requested = FALSE;
 
         pthread_mutex_lock(&lock);
-        if (current_num_calls >= peak_detach_count) {
+        /*
+         * Auxiliary listeners, including the overhead-calibration listener,
+         * share this callback implementation.  Only the listener currently
+         * published for a target may drive that target's lifecycle.
+        */
+        gboolean listener_owns_hook =
+            peak_general_hook_is_published_unlocked(hook_id) &&
+            array_listener[hook_id] == listener;
+        if (listener_owns_hook && current_num_calls >= peak_detach_count) {
             gulong total_num_calls = 0;
             for (size_t j = 0; j < peak_max_num_threads; j++) {
                 total_num_calls += peak_general_listener_num_calls_load(
