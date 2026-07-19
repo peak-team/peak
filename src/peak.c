@@ -7,6 +7,7 @@
 
 #ifdef HAVE_MPI
 #include <mpi.h>
+#include "internal/mpi_teardown_guard.h"
 #include "mpi_interceptor.h"
 #endif
 
@@ -61,8 +62,6 @@
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
 #define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
-#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS   "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
-#define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 250
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -87,9 +86,6 @@ float peak_global_detach_factor;
 bool enable_per_target_heartbeat;
 bool enable_global_heartbeat;
 bool enable_reattach;
-#ifdef HAVE_MPI
-static atomic_int peak_mpi_collectives_fail_closed;
-#endif
 unsigned int hb_min_us;
 unsigned int hb_max_us;
 double hb_k_err;
@@ -575,78 +571,6 @@ peak_mpi_runtime_allows_collectives(void)
     return initialized && !finalized;
 }
 
-static void
-peak_mpi_mark_collectives_fail_closed(void)
-{
-    atomic_store_explicit(&peak_mpi_collectives_fail_closed,
-                          1,
-                          memory_order_release);
-}
-
-static int
-peak_mpi_collectives_failed_closed(void)
-{
-    return atomic_load_explicit(&peak_mpi_collectives_fail_closed,
-                                memory_order_acquire) != 0;
-}
-
-static int
-peak_mpi_all_ranks_requested_finalize(int local_requested)
-{
-    int all_requested = 0;
-    MPI_Request request = MPI_REQUEST_NULL;
-    MPI_Status status;
-    int done = 0;
-    int mpi_result = MPI_Iallreduce(&local_requested,
-                                    &all_requested,
-                                    1,
-                                    MPI_INT,
-                                    MPI_MIN,
-                                    MPI_COMM_WORLD,
-                                    &request);
-    if (mpi_result != MPI_SUCCESS) {
-        g_printerr("[peak] MPI_Iallreduce for finalize participation proof failed; skipping MPI finalizer return path\n");
-        peak_mpi_mark_collectives_fail_closed();
-        return 0;
-    }
-
-    unsigned int timeout_ms =
-        parse_env_to_uint_default(PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS,
-                                  PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT);
-    if (timeout_ms == 0) {
-        timeout_ms = PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT;
-    }
-
-    double deadline = peak_second() + (double)timeout_ms / 1000.0;
-    while (1) {
-        mpi_result = MPI_Test(&request, &done, &status);
-        if (mpi_result != MPI_SUCCESS) {
-            g_printerr("[peak] MPI_Test for finalize participation proof failed; skipping MPI finalizer return path\n");
-            peak_mpi_mark_collectives_fail_closed();
-            return 0;
-        }
-        if (done) {
-            return all_requested != 0;
-        }
-        if (peak_second() >= deadline) {
-            g_printerr("[peak] MPI finalize participation proof timed out after %u ms; "
-                       "assuming not all ranks reached finalizer\n",
-                       timeout_ms);
-            /*
-             * The MPI standard does not provide a portable cancellation path
-             * for an active nonblocking collective. Freeing the request would
-             * also leave PEAK unable to observe completion while the MPI
-             * library may still own progress state. Treat MPI as poisoned for
-             * the rest of PEAK teardown instead: do not call any further MPI
-             * collectives, do not call the real finalizer from this wrapper,
-             * and let process exit reclaim the outstanding request.
-             */
-            peak_mpi_mark_collectives_fail_closed();
-            return 0;
-        }
-        sched_yield();
-    }
-}
 #endif
 
 static void
@@ -742,10 +666,11 @@ peak_fini_impl(void)
         mpi_runtime_can_collect &&
         !abnormal_exit) {
         all_ranks_requested_mpi_finalize =
-            peak_mpi_all_ranks_requested_finalize(
+            peak_mpi_teardown_all_ranks_requested_finalize(
                 local_requested_mpi_finalize ? 1 : 0);
     }
-    int mpi_collectives_failed_closed = peak_mpi_collectives_failed_closed();
+    int mpi_collectives_failed_closed =
+        peak_mpi_teardown_collectives_failed_closed();
     int use_mpi_collective_output =
         aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
         mpi_runtime_can_collect &&
@@ -803,7 +728,7 @@ peak_fini_impl(void)
     int mpi_reducer_failed_closed =
         found_MPI && peak_general_listener_mpi_reducer_failed_closed();
     if (mpi_reducer_failed_closed) {
-        peak_mpi_mark_collectives_fail_closed();
+        peak_mpi_teardown_collectives_mark_failed_closed();
         use_mpi_collective_output = 0;
         allow_real_mpi_finalize = 0;
         if (mpi_log_rank) {
