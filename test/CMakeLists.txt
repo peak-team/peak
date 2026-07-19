@@ -477,6 +477,31 @@ if(BUILD_TESTING)
                 ENVIRONMENT "PEAK_TARGET=peak_detach_hot_target;PEAK_ENABLE_PER_TARGET_HEARTBEAT=1;PEAK_COST=0.000000000001;PEAK_DETACH_COUNT=1;PEAK_OVERHEAD_RATIO=0.000001;PEAK_HEARTBEAT_INTERVAL=0.005;PEAK_HIBERNATION_CYCLE=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/hotloop-strict-trace.csv;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "trace_detach_success=1"
                 TIMEOUT 20)
+        add_test(NAME test_detach_count_calibration_listener_isolation
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
+                    --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --threads 4
+                    --seconds 1
+                    --startup-delay-seconds 1
+                    --samples 1
+                    --timeout 45
+                    --heartbeat-interval 0
+                    --peak-cost 0
+                    --detach-count 1
+                    --disable-reattach
+                    --disable-per-target-heartbeat
+                    --detach-backend signal
+                    --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/detach-count-listener-isolation-trace
+                    --require-detach-source detach-count
+                    --min-detach-request-calls 1
+                    --require-detach-count-report-invariant
+                    --require-trace-diagnostics)
+        set_tests_properties(test_detach_count_calibration_listener_isolation
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
+                TIMEOUT 60)
         add_test(NAME test_detach_hotloop_signal_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 32 --seconds 3)
         set_tests_properties(test_detach_hotloop_signal_strict
