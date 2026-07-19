@@ -1350,6 +1350,7 @@ peak_general_listener_add_nonnegative_finite(double lhs,
     return TRUE;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
 static uint64_t
 peak_general_listener_add_uint64_saturated(uint64_t lhs, uint64_t rhs)
 {
@@ -1361,7 +1362,6 @@ peak_general_listener_add_uint64_saturated(uint64_t lhs, uint64_t rhs)
     return lhs + rhs;
 }
 
-#ifdef PEAK_ENABLE_TEST_HOOKS
 uint64_t
 peak_general_listener_test_add_uint64_saturated(uint64_t lhs, uint64_t rhs)
 {

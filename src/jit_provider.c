@@ -504,9 +504,9 @@ peak_jit_test_forced_attach_result(PeakDynamicAttachResult* result_out)
 static PeakDynamicAttachResult
 peak_jit_attach_perfmap_symbol(const char* name, uintptr_t address, size_t size)
 {
+#ifdef PEAK_ENABLE_TEST_HOOKS
     PeakDynamicAttachResult result;
 
-#ifdef PEAK_ENABLE_TEST_HOOKS
     if (peak_jit_test_forced_attach_result(&result)) {
         return result;
     }
