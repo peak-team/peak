@@ -122,7 +122,7 @@ unsigned int parse_env_to_interval(const char* env_var) {
     }
 
     char* endptr;
-    errno = 0; 
+    errno = 0;
     unsigned int result = strtoul(varvalue, &endptr, 10);
     if (errno == ERANGE || result > UINT_MAX || *endptr != '\0') {
         return 50;
@@ -182,7 +182,7 @@ bool parse_env_to_bool(const char* env_var) {
     if (varvalue == NULL) {
         return false;
     }
-    
+
     if (strcasecmp(varvalue, "true") == 0 || strcmp(varvalue, "1") == 0) {
         return true;
     }

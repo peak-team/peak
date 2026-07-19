@@ -18,7 +18,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <signal.h>
-#include <dlfcn.h> 
+#include <dlfcn.h>
 #include <execinfo.h>   // backtrace()
 #include <inttypes.h>   // PRIu64, etc.
 

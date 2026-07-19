@@ -14,7 +14,7 @@ add_executable(test_mpi_report_transport
     ${PROJECT_SOURCE_DIR}/src/logging.c)
 
 target_include_directories(test_dgemm_mpi
-    PUBLIC 
+    PUBLIC
         ${PROJECT_BINARY_DIR}/test/include
         ${PROJECT_SOURCE_DIR}/test/include
 )

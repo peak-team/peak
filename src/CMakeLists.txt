@@ -68,7 +68,7 @@ if(PEAK_DETACH_HELPER_SUPPORTED)
 endif()
 
 target_include_directories(peak
-    PUBLIC 
+    PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
         ${OTF2_INCLUDE_DIRS}
@@ -83,7 +83,7 @@ endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
 target_include_directories(cuda_interceptor_obj
-    PUBLIC 
+    PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
 )
@@ -113,15 +113,15 @@ target_link_libraries(cuda_interceptor_obj
 endif()
 
 if(MPI_FOUND)
-    target_link_libraries(peak 
-        PRIVATE 
+    target_link_libraries(peak
+        PRIVATE
             MPI::MPI_C
     )
 endif()
 
 if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
-    target_link_libraries(cuda_interceptor_obj 
-        PRIVATE 
+    target_link_libraries(cuda_interceptor_obj
+        PRIVATE
             MPI::MPI_C
     )
 endif()

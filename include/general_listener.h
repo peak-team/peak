@@ -130,8 +130,8 @@ void peak_general_listener_note_runtime_start(double start_time);
  *
  * Called after heartbeat shutdown and after the controller has stopped and
  * joined under its existing drain/finalize policy. `peak_main_time` must
- * already be converted to elapsed application runtime. Later per-hook cleanup in
- * `peak_general_listener_dettach()` is intentionally outside this report
+ * already be converted to elapsed application runtime. Later per-hook cleanup
+ * in `peak_general_listener_dettach()` is intentionally outside this report
  * boundary.
  */
 void peak_general_listener_freeze_final_report_snapshot(void);
@@ -139,18 +139,22 @@ void peak_general_listener_freeze_final_report_snapshot(void);
 /**
  * @brief Prints the results of the Peak General Listener.
  *
- * This function prints the results of the Peak General Listener for each function hook.
+ * Text and CSV rows are emitted for targets that were instrumented and
+ * recorded at least one call. Call counts are cumulative; lifecycle markers
+ * annotate whether a reported target was ever detached or reattached.
  *
- * @return TRUE when MPI aggregation completed; FALSE for socket/local output or fallback.
+ * @return TRUE when MPI aggregation completed; FALSE for socket/local output
+ *         or fallback.
  */
 gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
 
 /**
- * @brief Returns whether the last print attempt poisoned PEAK's MPI reducer path.
+ * @brief Reports whether the previous print poisoned the MPI reducer path.
  *
- * A TRUE result means an MPI output reducer collective failed or timed out after
- * PEAK had started MPI payload aggregation. The caller must not issue later MPI
- * calls from teardown, including returning to the real PMPI_Finalize path.
+ * A TRUE result means an MPI output reducer collective failed or timed out
+ * after PEAK had started MPI payload aggregation. The caller must not issue
+ * later MPI calls from teardown, including returning to the real PMPI_Finalize
+ * path.
  */
 gboolean peak_general_listener_mpi_reducer_failed_closed(void);
 
@@ -350,15 +354,15 @@ PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 /**
  * @brief Monitors the heartbeat of the Peak profiling system.
  *
- * This function periodically checks the profiling overhead and dynamically 
- * adjusts the attachment or detachment of hooks based on the profiling ratio. 
- * If the profiling overhead exceeds a target threshold, the corresponding 
+ * This function periodically checks the profiling overhead and dynamically
+ * adjusts the attachment or detachment of hooks based on the profiling ratio.
+ * If the profiling overhead exceeds a target threshold, the corresponding
  * physical Gum hook is detached to reduce callback overhead. Its listener,
  * statistics, and lifecycle state remain available for reattachment and final
  * reporting. If reattachment is enabled and overhead falls below the
  * threshold, the listener is reattached.
  *
- * The function runs in a separate thread and continuously monitors the profiling 
+ * The function runs in a separate thread and continuously monitors the profiling
  * activity, adjusting accordingly until the monitoring process is stopped.
  *
  * @param arg A pointer to the arguments structure containing heartbeat settings.

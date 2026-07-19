@@ -2,7 +2,7 @@
 add_executable(test_heartbeat test_heartbeat.c)
 
 target_include_directories(test_heartbeat
-    PUBLIC 
+    PUBLIC
         ${PROJECT_BINARY_DIR}/test/include
         ${PROJECT_SOURCE_DIR}/test/include
 )

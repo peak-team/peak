@@ -61,14 +61,14 @@ peak_close_overlaps_nocancel_entry(gpointer close_address)
 /**
  * @brief Custom implementation of the `close` function.
  *
- * This function overrides the default `close` behavior to perform specific actions 
- * when the file descriptor being closed matches certain conditions. In particular, 
+ * This function overrides the default `close` behavior to perform specific actions
+ * when the file descriptor being closed matches certain conditions. In particular,
  * it ensures that closing `STDERR_FILENO` does not proceed further by returning 0.
- * For all other file descriptors, it delegates the operation to the original 
+ * For all other file descriptors, it delegates the operation to the original
  * `close` function, `original_close`.
  *
  * @param fd The file descriptor to be closed.
- * 
+ *
  * @return 0 if the file descriptor is `STDERR_FILENO`, otherwise the return value of the `original_close` function.
  */
 static int

@@ -57,7 +57,7 @@ void print_line() {
     std::cout << "\n";
 }
 
-void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& configs, bool enable_logging) {    
+void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& configs, bool enable_logging) {
     if (enable_logging) {
         #pragma omp critical
         {
@@ -66,7 +66,7 @@ void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& config
             print_line();
         }
     }
-    
+
     for (const auto& config : configs) {
         if (enable_logging) {
             #pragma omp critical
@@ -75,7 +75,7 @@ void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& config
                           << " | Threads: " << config.num_threads << " | Calls: " << config.num_calls << "\n";
             }
         }
-        
+
         for (int j = 0; j < config.num_calls; ++j) {
             switch (config.kernel_number) {
                 case 1:
@@ -103,7 +103,7 @@ void run_kernel(int rank, int thread_id, const std::vector<KernelConfig>& config
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    
+
     int rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
@@ -112,14 +112,14 @@ int main(int argc, char** argv) {
     bool randomize = false;
     int num_threads_omp = 4;
     int num_blocks = 1, num_threads = 32, num_calls = 1, kernel_number = 5;
-    
+
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<int> dist_blocks(1, 16);
     std::uniform_int_distribution<int> dist_threads(32, 512);
     std::uniform_int_distribution<int> dist_calls(1, 10);
     std::uniform_int_distribution<int> dist_kernel(1, 5);
-    
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--num_threads_omp" && i + 1 < argc) num_threads_omp = std::atoi(argv[++i]);
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
         else if (arg == "--verbose") enable_logging = true;
         else if (arg == "--random") randomize = true;
     }
-    
+
     std::vector<KernelConfig> configs;
     for (int i = 0; i < kernel_number; ++i) {
         configs.push_back({
@@ -144,15 +144,15 @@ int main(int argc, char** argv) {
     if (enable_logging && rank == 0) {
         std::cout << "OMP threads: " << num_threads_omp << "\n";
     }
-    
+
     #pragma omp parallel num_threads(num_threads_omp)
     {
         int thread_id = omp_get_thread_num();
         run_kernel(rank, thread_id, configs, enable_logging);
     }
-    
+
     // MPI_Barrier(); // Ensure all processes reach this point before finalizing
     MPI_Finalize();
-    
+
     return 0;
 }
