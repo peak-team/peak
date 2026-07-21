@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <dlfcn.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,7 +63,6 @@
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
-#define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -296,79 +297,14 @@ peak_output_aggregation_mode_from_value(const char* name,
 }
 
 static gboolean
-peak_env_is_nonempty(const char* name)
-{
-    const char* value = getenv(name);
-
-    return value != NULL && value[0] != '\0';
-}
-
-static gboolean
-peak_env_looks_like_intel_mpi(void)
-{
-    static const char* names[] = {
-        "I_MPI_ROOT",
-        "I_MPI_FABRICS",
-        "I_MPI_HYDRA_BOOTSTRAP",
-        "I_MPI_PMI_LIBRARY",
-        NULL
-    };
-
-    for (const char** name = names; *name != NULL; name++) {
-        if (peak_env_is_nonempty(*name)) {
-            return TRUE;
-        }
-    }
-
-    return FALSE;
-}
-
-static gboolean
-peak_mpi_runtime_matches_intel_mpi(void)
-{
-    const char* test_version = getenv(PEAK_TEST_MPI_LIBRARY_VERSION_ENV);
-    char version[MPI_MAX_LIBRARY_VERSION_STRING] = { 0 };
-    int version_len = 0;
-    const char* text = test_version;
-
-    if (peak_env_looks_like_intel_mpi()) {
-        return TRUE;
-    }
-
-    if (text == NULL || text[0] == '\0') {
-        if (MPI_Get_library_version(version, &version_len) != MPI_SUCCESS) {
-            return FALSE;
-        }
-        if (version_len < 0) {
-            version_len = 0;
-        }
-        if (version_len >= (int)sizeof(version)) {
-            version_len = (int)sizeof(version) - 1;
-        }
-        version[version_len] = '\0';
-        text = version;
-    }
-
-    return strstr(text, "Intel(R) MPI") != NULL ||
-           strstr(text, "Intel MPI") != NULL;
-}
-
-static gboolean
-peak_mpi_real_finalize_default_allowed(void)
+peak_mpi_real_finalize_config_allowed(void)
 {
     const char* value = getenv(PEAK_MPI_REAL_FINALIZE_ENV);
 
-    if (value != NULL && value[0] != '\0') {
-        return peak_env_value_truthy(value);
+    if (value == NULL || value[0] == '\0') {
+        return TRUE;
     }
-
-    /*
-     * Frontera's Intel MPI 2019 finalizer has repeatedly crashed in hwloc
-     * teardown after PEAK has already produced its all-rank report. Keep the
-     * normal real-finalize default for OpenMPI/MPICH, but fail closed for
-     * Intel MPI unless the user explicitly opts back in.
-     */
-    return !peak_mpi_runtime_matches_intel_mpi();
+    return peak_env_value_truthy(value);
 }
 
 static PeakOutputAggregationMode
@@ -691,12 +627,12 @@ peak_fini_impl(void)
         !abnormal_exit &&
         !mpi_collectives_failed_closed &&
         all_ranks_requested_mpi_finalize;
-    int real_mpi_finalize_default_allowed =
+    int real_mpi_finalize_config_allowed =
         base_real_mpi_finalize_allowed ?
-            peak_mpi_real_finalize_default_allowed() : 0;
+            peak_mpi_real_finalize_config_allowed() : 0;
     int allow_real_mpi_finalize =
         base_real_mpi_finalize_allowed &&
-        real_mpi_finalize_default_allowed;
+        real_mpi_finalize_config_allowed;
     if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
         g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
@@ -718,7 +654,9 @@ peak_fini_impl(void)
     } else if (found_MPI && output_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
         g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
     }
-    gboolean used_mpi_aggregation = peak_general_listener_print(output_mode);
+    gboolean report_write_succeeded = FALSE;
+    gboolean used_mpi_aggregation = peak_general_listener_print(
+        output_mode, &report_write_succeeded);
     /*
      * Keep this check adjacent to PEAK output. If the payload reducer started
      * a nonblocking collective and then failed or timed out, the request has no
@@ -735,32 +673,42 @@ peak_fini_impl(void)
             g_printerr("[peak] MPI output reducer failed or timed out; skipping real PMPI_Finalize and avoiding further MPI teardown calls\n");
         }
     }
-    if (found_MPI && mpi_finalize_path) {
-        mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
-        if (mpi_log_rank) {
-            if (allow_real_mpi_finalize) {
-                peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
-            } else if (mpi_reducer_failed_closed) {
-                g_printerr("[peak] PEAK output reducer did not complete cleanly; skipping real PMPI_Finalize\n");
-            } else if (!base_real_mpi_finalize_allowed) {
-                g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
-            } else if (!real_mpi_finalize_default_allowed) {
-                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize for this MPI runtime unless PEAK_MPI_REAL_FINALIZE=1 is set\n");
-            } else {
-                g_printerr("[peak] Real PMPI_Finalize is disabled by policy; skipping real MPI finalizer\n");
-            }
-        }
-    }
     #ifdef HAVE_CUDA
         cuda_interceptor_print(use_mpi_collective_output &&
                                used_mpi_aggregation &&
                                !mpi_reducer_failed_closed);
+        errno = 0;
+        if (fflush(stderr) != 0 || ferror(stderr)) {
+            report_write_succeeded = FALSE;
+            peak_log_warn("[peak] failed to flush the complete CUDA report: %s\n",
+                          strerror(errno != 0 ? errno : EIO));
+        }
         if (!mpi_finalize_path) {
             cuda_interceptor_dettach();
         }
     #else
         (void)used_mpi_aggregation;
     #endif
+    if (found_MPI && mpi_finalize_path) {
+        mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
+        if (mpi_log_rank) {
+            if (allow_real_mpi_finalize) {
+                if (report_write_succeeded) {
+                    peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
+                } else {
+                    g_printerr("[peak] PEAK report publication failed on rank 0; returning to real PMPI_Finalize for clean MPI teardown\n");
+                }
+            } else if (mpi_reducer_failed_closed) {
+                g_printerr("[peak] PEAK output reducer did not complete cleanly; skipping real PMPI_Finalize\n");
+            } else if (!base_real_mpi_finalize_allowed) {
+                g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
+            } else if (!real_mpi_finalize_config_allowed) {
+                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
+            } else {
+                g_printerr("[peak] Real PMPI_Finalize is disabled by policy; skipping real MPI finalizer\n");
+            }
+        }
+    }
     if (found_MPI && !mpi_finalize_path && !local_requested_mpi_finalize) {
         mpi_interceptor_dettach(0);
     }
@@ -779,7 +727,7 @@ peak_fini_impl(void)
         return;
     }
 #else
-    (void)peak_general_listener_print(0);
+    (void)peak_general_listener_print(0, NULL);
     #ifdef HAVE_CUDA
     cuda_interceptor_print(0);
     cuda_interceptor_dettach();

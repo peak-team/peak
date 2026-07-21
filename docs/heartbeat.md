@@ -557,14 +557,20 @@ MPI enters the picture during teardown/reporting:
   fails after the proof, PEAK first attempts its socket fallback without further
   MPI calls when that fallback is enabled, then writes rank-local output if the
   socket path is unavailable or fails.
-- Explicit socket aggregation can avoid MPI reducer progress, including on a
-  deferred process-exit output path that does not require an MPI-finalize proof.
-- Intel MPI defaults to skipping the real finalizer after PEAK output unless
-  `PEAK_MPI_REAL_FINALIZE=1` opts back in.
+- Explicit socket aggregation can avoid MPI reducer progress. It reports on the
+  pre-finalize path by default; with explicit `PEAK_MPI_FINALIZE_POLICY=defer`,
+  it instead uses a process-exit path that does not require an MPI-finalize
+  proof.
+- Healthy all-rank jobs return to the real `PMPI_Finalize()` after report
+  publication on the writer rank. `MPI_Finalize()` is not a barrier and need
+  not return on every process, but it hands each rank to the MPI runtime's
+  launcher-aware completion protocol instead of letting Hydra observe an
+  improper exit. `PEAK_MPI_REAL_FINALIZE=0` is diagnostic only and cannot
+  guarantee report publication or clean launcher termination.
 - An abnormal exit uses rank-local output. Missing all-rank participation
   rejects MPI aggregation, but explicit socket mode may still aggregate when
   the participation check itself completed safely. A failed or timed-out proof
-  is fail-closed to rank-local output.
+  is locally fail-closed to rank-local output.
 
 ## Testing and Diagnostics
 

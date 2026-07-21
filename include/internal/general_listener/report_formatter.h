@@ -21,22 +21,34 @@ typedef struct {
 } PeakReportFormatOptions;
 
 /**
- * Write the report CSV selected by `PEAK_STATSLOG_PATH` and the process ID.
+ * Write an aggregate report CSV selected by `PEAK_STATSLOG_PATH` and the
+ * process ID.
  *
  * No file is created when the snapshot has no instrumented calls. Values are
  * rendered exactly as captured; the coordinator decides whether to sanitize
- * the final snapshot before calling this function.
+ * the final snapshot before calling this function. The complete CSV is first
+ * written to a unique same-directory temporary file and atomically published,
+ * so the final pathname never exposes a partial write. A failed update leaves
+ * any existing completed CSV unchanged. Newly created files use mode `0666`
+ * filtered by the process umask.
  *
  * @return true when no CSV is needed or the complete CSV was written.
  */
 bool peak_report_formatter_write_csv(const PeakReportSnapshot* snapshot);
 
 /**
- * Remove the report CSV selected by `PEAK_STATSLOG_PATH` and the process ID.
+ * Write a rank-local report CSV without cross-node PID collisions.
  *
- * A missing file is treated as a successful removal.
+ * A multi-rank launcher job retains the aggregate-compatible `-pPID` portion
+ * and appends a validated `-rRANK` suffix. When the launcher reports a
+ * multi-rank job but no valid rank, a sanitized hostname suffix is used. A
+ * single-process job keeps the aggregate-compatible filename. Publication is
+ * atomic with the same guarantees as peak_report_formatter_write_csv().
+ *
+ * @return true when no CSV is needed or the complete CSV was written.
  */
-bool peak_report_formatter_remove_csv(void);
+bool peak_report_formatter_write_rank_local_csv(
+    const PeakReportSnapshot* snapshot);
 
 /** Write the stable key/value lines for per-rank maximum overhead owners. */
 void peak_report_formatter_write_rank_maxima(
@@ -44,13 +56,18 @@ void peak_report_formatter_write_rank_maxima(
     const int owner_rank[PEAK_REPORT_METRIC_COUNT]);
 
 /**
- * Write the human-readable report through the runtime logging interface.
+ * Write and flush the human-readable report through the runtime logging
+ * interface.
  *
  * The report is suppressed when the snapshot contains no reportable data or
  * when @p options disables text output. Values are rendered exactly as
- * captured; the coordinator decides whether to sanitize first.
+ * captured; the coordinator decides whether to sanitize first. A suppressed
+ * report is treated as successfully complete.
+ *
+ * @return true when no text is needed or the complete report was flushed;
+ *         false when the output stream reports an error.
  */
-void peak_report_formatter_write_text(
+bool peak_report_formatter_write_text(
     const PeakReportSnapshot* snapshot,
     const PeakReportFormatOptions* options);
 

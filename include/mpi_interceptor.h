@@ -18,17 +18,17 @@
  * a custom implementation, `peak_pmpi_finalize`, which records the
  * application's finalization request. By default it lets PEAK write final
  * output while MPI is still alive on the application's own finalize path, and
- * then returns to the real `PMPI_Finalize()` after all-rank proof. Intel MPI
- * is a fail-closed exception: PEAK skips the real finalizer by default after
- * output because Intel MPI 2019 has crashed in hwloc teardown after large
- * Frontera PEAK reports; `PEAK_MPI_REAL_FINALIZE=1` opts back in.
- * `PEAK_MPI_FINALIZE_POLICY=defer`, or explicit socket output without an
- * explicit finalize policy, instead calls the real finalizer immediately and
- * leaves PEAK profiling/output until process exit.
- * `PEAK_MPI_REAL_FINALIZE=0` may skip the real finalizer for diagnostics. PEAK
- * does not replay the real `PMPI_Finalize()` later from process teardown; doing
- * so can re-enter MPI from an application state that has already logically
- * finalized.
+ * then returns to the real `PMPI_Finalize()` after all-rank proof. The real
+ * finalizer supplies the MPI-runtime/launcher-aware clean-exit protocol; a
+ * PEAK-owned collective cannot replace that protocol.
+ * Output aggregation selects only the report transport; socket output uses
+ * the same pre-finalize report ordering by default.
+ * `PEAK_MPI_FINALIZE_POLICY=defer` instead calls the real finalizer immediately
+ * and leaves PEAK profiling/output until process exit.
+ * `PEAK_MPI_REAL_FINALIZE=0` may skip the real finalizer for diagnostics, but
+ * clean launcher termination is then not guaranteed. PEAK does not replay the
+ * real `PMPI_Finalize()` later from process teardown; doing so can re-enter MPI
+ * from an application state that has already logically finalized.
  *
  * @return GUM_REPLACE_OK on success; otherwise a Gum replacement failure code.
  */
@@ -47,12 +47,11 @@ int mpi_interceptor_finalize_path_active();
 /**
  * @brief Controls whether the intercepted finalizer may call real PMPI_Finalize.
  *
- * The real MPI finalizer is enabled by default for most MPI runtimes, but only
- * after PEAK has proven that every rank reached the application finalizer.
- * Intel MPI defaults to skipping it unless `PEAK_MPI_REAL_FINALIZE=1` is set.
- * PEAK uses a short proof timeout and fails closed if proof cannot be
- * confirmed, so a subset-rank finalizer does not block on collectives or
- * re-enter MPI unexpectedly. A timed-out nonblocking collective proof is
+ * The real MPI finalizer is enabled by default, but only after PEAK has proven
+ * that every rank reached the application finalizer. PEAK uses a short proof
+ * timeout and fails closed if proof cannot be confirmed, so a subset-rank
+ * finalizer does not block on collectives or re-enter MPI unexpectedly. A
+ * timed-out nonblocking collective proof is
  * intentionally abandoned rather than cancelled or freed because active
  * nonblocking collective cancellation is not portable; after that point PEAK
  * must not use MPI again during teardown.
