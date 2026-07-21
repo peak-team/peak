@@ -27,7 +27,7 @@ typedef enum {
     PEAK_SOCKET_REPORT_SINGLE_READY,
     /** A peer submitted its snapshot and received the root's final ACK. */
     PEAK_SOCKET_REPORT_PEER_RELEASED,
-    /** Root gathered every peer; CSV output must precede commit. */
+    /** Root gathered every peer; complete report output must precede commit. */
     PEAK_SOCKET_REPORT_ROOT_PREPARED,
 } PeakSocketReportStatus;
 
@@ -56,7 +56,8 @@ PeakSocketReportStatus peak_socket_report_transport_begin(
 /**
  * Sends the final ACK to every registered peer and consumes @p session.
  *
- * The caller must write the aggregate CSV before this call. A false result
+ * The caller must atomically publish the aggregate CSV and finish the text
+ * report before this call. A false result
  * preserves the wire-v9 behavior: no extra fallback release is attempted, so
  * peers that did not receive an ACK fail when their release wait expires.
  */
@@ -65,9 +66,8 @@ bool peak_socket_report_transport_commit(PeakSocketReportSession* session);
 /**
  * Sends RELEASE_FALLBACK to every registered peer and consumes @p session.
  *
- * This is only for a root-side preparation failure before the established CSV
- * write and ACK sequence begins. A CSV I/O failure alone does not select this
- * path because wire-v9 still releases peers and prints aggregate text.
+ * This is for any root-side preparation or report-publication failure before
+ * the final ACK sequence begins, including aggregate CSV I/O failure.
  */
 void peak_socket_report_transport_abort(PeakSocketReportSession* session);
 

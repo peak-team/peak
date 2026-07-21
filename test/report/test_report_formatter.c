@@ -3,12 +3,95 @@
 #include "internal/general_listener/report_formatter.h"
 
 #include <assert.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+enum { TEST_HOSTNAME_CAPACITY = 256 };
+
+static const char* const launcher_environment[] = {
+    "PMI_SIZE",
+    "PMIX_SIZE",
+    "OMPI_COMM_WORLD_SIZE",
+    "SLURM_NTASKS",
+    "PMI_RANK",
+    "PMIX_RANK",
+    "OMPI_COMM_WORLD_RANK",
+    "MV2_COMM_WORLD_RANK",
+    "SLURM_PROCID",
+    NULL,
+};
+
+static void
+clear_launcher_environment(void)
+{
+    for (const char* const* name = launcher_environment;
+         *name != NULL;
+         name++) {
+        assert(unsetenv(*name) == 0);
+    }
+}
+
+static void
+sanitized_hostname(char sanitized[TEST_HOSTNAME_CAPACITY])
+{
+    char hostname[TEST_HOSTNAME_CAPACITY] = {0};
+    size_t output_length = 0;
+
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0 ||
+        hostname[0] == '\0') {
+        assert(snprintf(hostname, sizeof(hostname), "unknown") > 0);
+    }
+    hostname[sizeof(hostname) - 1] = '\0';
+    for (size_t i = 0;
+         hostname[i] != '\0' &&
+         output_length + 1 < TEST_HOSTNAME_CAPACITY;
+         i++) {
+        const unsigned char byte = (unsigned char)hostname[i];
+
+        if ((byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
+            (byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
+            (byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
+            byte == (unsigned char)'-' || byte == (unsigned char)'_' ||
+            byte == (unsigned char)'.') {
+            sanitized[output_length++] = (char)byte;
+        } else {
+            sanitized[output_length++] = '_';
+        }
+    }
+    if (output_length == 0) {
+        assert(snprintf(sanitized,
+                        TEST_HOSTNAME_CAPACITY,
+                        "unknown") > 0);
+        return;
+    }
+    sanitized[output_length] = '\0';
+}
+
+static bool
+directory_has_prefix(const char* directory, const char* prefix)
+{
+    DIR* stream = opendir(directory);
+    struct dirent* entry;
+    bool found = false;
+
+    assert(stream != NULL);
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
+            found = true;
+            break;
+        }
+    }
+    assert(closedir(stream) == 0);
+    return found;
+}
 
 static char*
 read_stream(FILE* stream)
@@ -53,7 +136,7 @@ capture_text_report(const PeakReportSnapshot* snapshot,
     saved_stderr = dup(STDERR_FILENO);
     assert(saved_stderr >= 0);
     assert(dup2(fileno(capture), STDERR_FILENO) >= 0);
-    peak_report_formatter_write_text(snapshot, options);
+    assert(peak_report_formatter_write_text(snapshot, options));
     assert(fflush(stderr) == 0);
     assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
     assert(close(saved_stderr) == 0);
@@ -131,10 +214,11 @@ check_csv_golden(const char* csv_path)
     assert(strcmp(actual, expected) == 0);
     free(actual);
 
-    assert(peak_report_formatter_remove_csv());
+    assert(unlink(csv_path) == 0);
     errno = 0;
     assert(access(csv_path, F_OK) != 0 && errno == ENOENT);
-    assert(peak_report_formatter_remove_csv());
+    errno = 0;
+    assert(unlink(csv_path) != 0 && errno == ENOENT);
     peak_report_snapshot_destroy(prepared);
     peak_report_snapshot_destroy(snapshot);
 }
@@ -151,7 +235,71 @@ check_csv_quoted_name(const char* csv_path)
     actual = read_file(csv_path);
     assert(strstr(actual, expected_name) != NULL);
     free(actual);
-    assert(peak_report_formatter_remove_csv());
+    assert(unlink(csv_path) == 0);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_rank_local_csv_names(const char* stats_base,
+                           const char* aggregate_path)
+{
+    char rank_path[768];
+    char hostname[TEST_HOSTNAME_CAPACITY] = {0};
+    char hostname_path[1024];
+    PeakReportSnapshot* snapshot = create_fixture("rank-local");
+
+    clear_launcher_environment();
+    assert(setenv("PMI_SIZE", "4", 1) == 0);
+    assert(setenv("PMI_RANK", "3", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    peak_report_snapshot_prepare_for_render(snapshot);
+
+    /* Aggregate naming remains unchanged even inside a multi-rank job. */
+    assert(peak_report_formatter_write_csv(snapshot));
+    assert(access(aggregate_path, F_OK) == 0);
+    assert(unlink(aggregate_path) == 0);
+
+    assert(snprintf(rank_path,
+                    sizeof(rank_path),
+                    "%s-p%d-r3.csv",
+                    stats_base,
+                    (int)getpid()) > 0);
+    assert(peak_report_formatter_write_rank_local_csv(snapshot));
+    assert(access(rank_path, F_OK) == 0);
+    assert(access(aggregate_path, F_OK) != 0);
+    assert(unlink(rank_path) == 0);
+
+    /* An out-of-range launcher rank must not become part of a pathname. */
+    assert(setenv("PMI_RANK", "4", 1) == 0);
+    sanitized_hostname(hostname);
+    assert(snprintf(hostname_path,
+                    sizeof(hostname_path),
+                    "%s-p%d-h%s.csv",
+                    stats_base,
+                    (int)getpid(),
+                    hostname) > 0);
+    assert(peak_report_formatter_write_rank_local_csv(snapshot));
+    assert(access(hostname_path, F_OK) == 0);
+    assert(unlink(hostname_path) == 0);
+
+    clear_launcher_environment();
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_csv_permissions(const char* csv_path)
+{
+    PeakReportSnapshot* snapshot = create_fixture("permissions");
+    struct stat attributes;
+    mode_t previous_umask;
+
+    peak_report_snapshot_prepare_for_render(snapshot);
+    previous_umask = umask(0027);
+    assert(peak_report_formatter_write_csv(snapshot));
+    (void)umask(previous_umask);
+    assert(stat(csv_path, &attributes) == 0);
+    assert((attributes.st_mode & 0777) == 0640);
+    assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);
 }
 
@@ -210,6 +358,30 @@ check_text_name_policy(void)
 }
 
 static void
+check_text_flush_failure(void)
+{
+    PeakReportSnapshot* snapshot = create_fixture("flush-failure");
+    const PeakReportFormatOptions options = {.print_text = true};
+    int full_fd;
+    int saved_stderr;
+
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(fflush(stderr) == 0);
+    saved_stderr = dup(STDERR_FILENO);
+    assert(saved_stderr >= 0);
+    full_fd = open("/dev/full", O_WRONLY);
+    assert(full_fd >= 0);
+    assert(dup2(full_fd, STDERR_FILENO) >= 0);
+    assert(close(full_fd) == 0);
+    clearerr(stderr);
+    assert(!peak_report_formatter_write_text(snapshot, &options));
+    clearerr(stderr);
+    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    assert(close(saved_stderr) == 0);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
 check_long_stats_path(const char* temp_directory)
 {
     char segment_a[91];
@@ -246,7 +418,7 @@ check_long_stats_path(const char* temp_directory)
     peak_report_snapshot_prepare_for_render(snapshot);
     assert(peak_report_formatter_write_csv(snapshot));
     assert(access(csv_path, F_OK) == 0);
-    assert(peak_report_formatter_remove_csv());
+    assert(unlink(csv_path) == 0);
 
     peak_report_snapshot_destroy(snapshot);
     assert(rmdir(directory_c) == 0);
@@ -255,20 +427,63 @@ check_long_stats_path(const char* temp_directory)
 }
 
 static void
-check_partial_csv_removed(const char* temp_directory)
+check_failed_csv_never_replaces_final(const char* temp_directory)
 {
+    static const char preserved[] = "previous-complete-report\n";
     char stats_base[512];
     char csv_path[768];
+    char temp_prefix[256];
+    char* actual;
+    const char* csv_name;
     PeakReportSnapshot* snapshot = create_fixture("write-failure");
+    FILE* existing;
+    struct rlimit previous_limit;
+    struct rlimit limited;
+    struct sigaction ignore_signal = {0};
+    struct sigaction previous_signal;
 
-    assert(snprintf(stats_base, sizeof(stats_base), "%s/full",
+    assert(snprintf(stats_base, sizeof(stats_base), "%s/close-failure",
                     temp_directory) > 0);
     assert(snprintf(csv_path, sizeof(csv_path), "%s-p%d.csv",
                     stats_base, (int)getpid()) > 0);
-    assert(symlink("/dev/full", csv_path) == 0);
     assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    existing = fopen(csv_path, "w");
+    assert(existing != NULL);
+    assert(fputs(preserved, existing) >= 0);
+    assert(fclose(existing) == 0);
+
+    assert(getrlimit(RLIMIT_FSIZE, &previous_limit) == 0);
+    assert(previous_limit.rlim_cur == RLIM_INFINITY ||
+           previous_limit.rlim_cur > 1);
+    limited = previous_limit;
+    limited.rlim_cur = 1;
+    ignore_signal.sa_handler = SIG_IGN;
+    assert(sigemptyset(&ignore_signal.sa_mask) == 0);
+    assert(sigaction(SIGXFSZ, &ignore_signal, &previous_signal) == 0);
+    assert(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+
     peak_report_snapshot_prepare_for_render(snapshot);
     assert(!peak_report_formatter_write_csv(snapshot));
+    actual = read_file(csv_path);
+    assert(strcmp(actual, preserved) == 0);
+    free(actual);
+
+    assert(unlink(csv_path) == 0);
+    assert(!peak_report_formatter_write_csv(snapshot));
+    errno = 0;
+    assert(access(csv_path, F_OK) != 0 && errno == ENOENT);
+
+    assert(setrlimit(RLIMIT_FSIZE, &previous_limit) == 0);
+    assert(sigaction(SIGXFSZ, &previous_signal, NULL) == 0);
+
+    csv_name = strrchr(csv_path, '/');
+    assert(csv_name != NULL);
+    csv_name++;
+    assert(snprintf(temp_prefix,
+                    sizeof(temp_prefix),
+                    "%s.tmp.",
+                    csv_name) > 0);
+    assert(!directory_has_prefix(temp_directory, temp_prefix));
     errno = 0;
     assert(access(csv_path, F_OK) != 0 && errno == ENOENT);
     peak_report_snapshot_destroy(snapshot);
@@ -282,6 +497,7 @@ main(void)
     char csv_path[768];
 
     assert(mkdtemp(temp_directory) != NULL);
+    clear_launcher_environment();
     assert(snprintf(stats_base,
                     sizeof(stats_base),
                     "%s/stats",
@@ -295,10 +511,13 @@ main(void)
 
     check_csv_golden(csv_path);
     check_csv_quoted_name(csv_path);
+    check_rank_local_csv_names(stats_base, csv_path);
+    check_csv_permissions(csv_path);
     check_no_output(csv_path);
     check_text_name_policy();
+    check_text_flush_failure();
     check_long_stats_path(temp_directory);
-    check_partial_csv_removed(temp_directory);
+    check_failed_csv_never_replaces_final(temp_directory);
 
     assert(unsetenv("PEAK_STATSLOG_PATH") == 0);
     assert(rmdir(temp_directory) == 0);

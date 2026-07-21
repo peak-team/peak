@@ -81,7 +81,7 @@ validate_root_formatting(PeakReportSnapshot* aggregate)
     if (csv != NULL && fclose(csv) != 0) {
         failures++;
     }
-    if (!peak_report_formatter_remove_csv()) {
+    if (unlink(stats_path) != 0) {
         failures++;
     }
 
@@ -91,8 +91,8 @@ validate_root_formatting(PeakReportSnapshot* aggregate)
         dup2(fileno(capture), STDERR_FILENO) < 0) {
         failures++;
     } else {
-        peak_report_formatter_write_text(aggregate, &options);
-        if (fflush(stderr) != 0) {
+        if (!peak_report_formatter_write_text(aggregate, &options) ||
+            fflush(stderr) != 0) {
             failures++;
         }
     }

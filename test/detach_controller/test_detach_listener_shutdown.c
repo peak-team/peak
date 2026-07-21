@@ -223,7 +223,7 @@ print_with_stderr_capture(char** output_out)
     close(capture_fd);
 
     fflush(stderr);
-    (void)peak_general_listener_print(PEAK_OUTPUT_AGGREGATION_LOCAL);
+    (void)peak_general_listener_print(PEAK_OUTPUT_AGGREGATION_LOCAL, NULL);
     fflush(stderr);
 
     if (dup2(saved_stderr, STDERR_FILENO) < 0) {

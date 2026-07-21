@@ -124,6 +124,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_report_formatter PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
@@ -1865,6 +1866,17 @@ if(BUILD_TESTING)
                     --mode finalize-clean-output-mpi
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_finalize_publishes_output_before_root_return
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode finalize-clean-output-mpi-publish-before-root-return
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_report_owner_tuples
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_report_reduction_check.py
@@ -1909,7 +1921,7 @@ if(BUILD_TESTING)
                         --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
                         --timeout 15)
         endforeach()
-        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_intel_default
+        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
                     --mpiexec ${MPIEXEC_EXECUTABLE}
@@ -1917,10 +1929,10 @@ if(BUILD_TESTING)
                     --nprocs ${_PEAK_MPI_TEST_NPROCS}
                     --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
-                    --mode finalize-clean-output-mpi-intel-default
+                    --mode finalize-clean-output-mpi-real-finalize-default
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
-        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
                     --mpiexec ${MPIEXEC_EXECUTABLE}
@@ -1928,7 +1940,7 @@ if(BUILD_TESTING)
                     --nprocs ${_PEAK_MPI_TEST_NPROCS}
                     --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
-                    --mode finalize-clean-output-mpi-intel-real-finalize
+                    --mode finalize-clean-output-mpi-real-finalize-explicit
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_finalize_clean_exit_output_mpi_strict_detach
@@ -2041,6 +2053,18 @@ if(BUILD_TESTING)
                     --mode finalize-defer-post-work
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_finalize_defer_socket_post_work
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode finalize-defer-socket-post-work
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
+                    --timeout 30)
         add_test(NAME test_mpi_finalize_then_nonzero_exit
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -2143,15 +2167,19 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_finalize_publishes_output_before_root_return
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_reducer_fail
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
-            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
-            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
@@ -2188,6 +2216,10 @@ if(BUILD_TESTING)
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
             set_tests_properties(test_mpi_finalize_defer_post_work
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_defer_socket_post_work
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
@@ -2247,15 +2279,19 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_finalize_publishes_output_before_root_return
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_reducer_fail
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
-            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
-            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
@@ -2292,6 +2328,10 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
             set_tests_properties(test_mpi_finalize_defer_post_work
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_defer_socket_post_work
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
@@ -2357,6 +2397,11 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
+        set_tests_properties(test_mpi_finalize_publishes_output_before_root_return
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-publish-before-root-return"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 30)
         set_tests_properties(test_mpi_report_owner_tuples
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_report_lines_ok"
@@ -2374,14 +2419,14 @@ if(BUILD_TESTING)
                     FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                     TIMEOUT 30)
         endforeach()
-        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_default
+        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
             PROPERTIES
-                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-intel-default"
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-real-finalize-default"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
-        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_intel_real_finalize
+        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
             PROPERTIES
-                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-intel-real-finalize"
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-real-finalize-explicit"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_strict_detach
@@ -2429,6 +2474,11 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-defer-post-work"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
+        set_tests_properties(test_mpi_finalize_defer_socket_post_work
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-defer-socket-post-work"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 45)
         set_tests_properties(test_mpi_finalize_then_nonzero_exit
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-nonzero"
