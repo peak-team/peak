@@ -502,23 +502,16 @@ def check_mpi_finalize_trampoline_default(repo_root):
             "PMPI_Finalize must not restore the replacement by default")
 
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
-    guard = extract_function(peak_source, "peak_mpi_real_finalize_default_allowed")
+    guard = extract_function(peak_source, "peak_mpi_real_finalize_config_allowed")
     require("PEAK_MPI_REAL_FINALIZE_ENV" in guard and
             "peak_env_value_truthy(value)" in guard,
             "real MPI finalizer policy must preserve explicit env override")
-    require("peak_mpi_runtime_matches_intel_mpi" in guard and
-            "return !peak_mpi_runtime_matches_intel_mpi();" in guard,
-            "Intel MPI must fail closed by default after PEAK output")
-    vendor = extract_function(peak_source, "peak_mpi_runtime_matches_intel_mpi")
-    require("MPI_Get_library_version" in vendor and
-            "Intel(R) MPI" in vendor and
-            "Intel MPI" in vendor,
-            "Intel MPI finalize guard must inspect MPI library version")
-    env_guard = extract_function(peak_source, "peak_env_looks_like_intel_mpi")
-    require("I_MPI_ROOT" in env_guard and
-            "I_MPI_FABRICS" in env_guard and
-            "I_MPI_HYDRA_BOOTSTRAP" in env_guard,
-            "Intel MPI finalize guard must inspect Intel MPI environment markers")
+    require("value == NULL || value[0] == '\\0'" in guard and
+            "return TRUE;" in guard,
+            "healthy all-rank finalization must use the real MPI finalizer by default")
+    require("peak_mpi_runtime_matches_intel_mpi" not in peak_source and
+            "peak_env_looks_like_intel_mpi" not in peak_source,
+            "MPI vendor detection must not bypass launcher-aware finalization")
 
 
 def check_final_report_snapshot_order(repo_root):
@@ -636,10 +629,12 @@ def check_final_report_snapshot_order(repo_root):
             "control risk must be local ranks times raw control and fail closed")
 
     require("PeakReportSnapshot* snapshot" in write_report and
+            "peak_report_formatter_write_rank_local_csv(snapshot)" in
+                write_report and
             "peak_report_formatter_write_csv(snapshot)" in write_report and
             "peak_report_formatter_write_text(snapshot, &options)" in
                 write_report,
-            "final reporting wrapper must forward the immutable report snapshot")
+            "final reporting wrapper must forward the immutable report snapshot with explicit rank-local naming")
     require("const PeakReportOverhead* overhead" in print_text and
             "overhead = &snapshot->overhead" in print_text and
             "overhead->valid" in print_text and
@@ -670,9 +665,22 @@ def check_final_report_snapshot_order(repo_root):
             "peak_general_listener_local_report_overhead(sum_num_calls)" in print_entry and
             "peak_general_listener_build_report_snapshot(" in print_entry and
             "&local_report" in print_entry and
-            "peak_general_listener_write_report(local_snapshot, TRUE)" in
-                print_entry,
+            "local_snapshot, TRUE, TRUE)" in print_entry,
             "local final output must consume the frozen report snapshot")
+
+    report_position = fini.find("peak_general_listener_print(")
+    cuda_position = fini.find("cuda_interceptor_print(", report_position)
+    finalize_permission_position = fini.find(
+        "mpi_interceptor_set_real_finalize_allowed(", report_position
+    )
+    require(report_position != -1 and cuda_position != -1 and
+            finalize_permission_position != -1 and
+            report_position < cuda_position < finalize_permission_position,
+            "CPU/CUDA report output must precede the real-finalize decision")
+    require("fflush(stderr)" in fini and
+            fini.find("fflush(stderr)", cuda_position) <
+                finalize_permission_position,
+            "CUDA text output must be flushed before real PMPI_Finalize")
 
     reduce_result = extract_function(
         mpi_transport, "peak_mpi_report_transport_reduce"

@@ -143,10 +143,15 @@ void peak_general_listener_freeze_final_report_snapshot(void);
  * recorded at least one call. Call counts are cumulative; lifecycle markers
  * annotate whether a reported target was ever detached or reattached.
  *
+ * @param report_write_succeeded Optional output set to TRUE when this rank's
+ *        selected report path completed. For aggregate output, rank 0 receives
+ *        the formatter result while peer ranks receive transport completion.
  * @return TRUE when MPI aggregation completed; FALSE for socket/local output
  *         or fallback.
  */
-gboolean peak_general_listener_print(PeakOutputAggregationMode aggregation_mode);
+gboolean peak_general_listener_print(
+    PeakOutputAggregationMode aggregation_mode,
+    gboolean* report_write_succeeded);
 
 /**
  * @brief Reports whether the previous print poisoned the MPI reducer path.

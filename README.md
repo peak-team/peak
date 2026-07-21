@@ -137,10 +137,10 @@ in detail.
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_OUTPUT_AGGREGATION` | Final output mode: `mpi` (default), `socket`, or `local`, with documented aliases. |
+| `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases; it does not change finalize ordering. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | Legacy aggregate-output switch; `PEAK_OUTPUT_AGGREGATION` takes precedence. |
-| `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`) or defer PEAK output until process exit (`defer`). |
-| `PEAK_MPI_REAL_FINALIZE` | Force or skip the real MPI finalizer where supported; see the caveat below. |
+| `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). |
+| `PEAK_MPI_REAL_FINALIZE` | Diagnostic override for the real MPI finalizer; default is enabled after healthy all-rank reporting. Setting `0` does not guarantee clean launcher termination. |
 | `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | Timeout for the all-rank finalization participation check. Default: `250`. |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each MPI payload reduction. Default: `5000`. |
 | `PEAK_OUTPUT_AGGREGATION_HOST` | Override the socket reducer host. |
@@ -149,7 +149,16 @@ in detail.
 | `PEAK_OUTPUT_AGGREGATION_TOKEN` | Override the socket reducer session token. |
 | `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK` | Enable MPI-reducer-to-socket and socket-to-rank-local fallback paths. Default: enabled. |
 
-MPI finalization and aggregation are deliberately bounded and fail closed.
+MPI finalization and aggregation are deliberately bounded and locally
+fail-closed. A rank that observes a collective error or timeout stops issuing
+later MPI teardown calls.
+Healthy ranks hand off to the real `PMPI_Finalize()` after completing their
+local report or transport role; the aggregate writer publishes before its own
+handoff, and the MPI runtime and launcher complete their normal clean-exit
+protocol.
+Aggregate CSVs retain `base-pPID.csv`; multi-rank local fallback files use
+`base-pPID-rRANK.csv` (or a sanitized hostname suffix when rank metadata is
+unavailable) to avoid cross-node PID collisions.
 See [Physical detach controller](docs/physical-detach-controller.md) for the
 full output and teardown behavior.
 
@@ -310,9 +319,9 @@ toolchains and host capabilities detected during configuration.
   overhead proof; measured A/B overhead remains authoritative. The current
   60-second cooldown is provisional under the linked validation standard.
 - MPI output and finalization behavior is runtime-sensitive. MPI aggregation is
-  the default; Intel MPI may skip the real finalizer after reporting unless
-  `PEAK_MPI_REAL_FINALIZE=1` is set. Consult the detach-controller document
-  before overriding finalization behavior.
+  the default. Healthy all-rank jobs return to the real MPI finalizer after
+  reporting; consult the detach-controller document before using the
+  diagnostic `PEAK_MPI_REAL_FINALIZE=0` override.
 
 ## Citation
 

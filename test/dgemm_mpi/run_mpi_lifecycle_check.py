@@ -43,37 +43,10 @@ EXPECTED_NONZERO_RETURN_MODES = {
     "finalize-nonzero",
     "finalize-return-nonzero",
 }
-INTEL_MPI_ONLY_MODES = {
-    "finalize-clean-output-mpi-intel-default",
-    "finalize-clean-output-mpi-intel-real-finalize",
-}
+
 
 def split_flags(value):
     return [flag for flag in shlex.split(value) if flag]
-
-
-def launcher_version_text(mpiexec):
-    try:
-        proc = subprocess.run(
-            [mpiexec, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return proc.stdout or ""
-
-
-def launcher_looks_like_intel_mpi(mpiexec):
-    text = f"{mpiexec}\n{launcher_version_text(mpiexec)}"
-    return (
-        "Intel(R) MPI" in text or
-        "Intel MPI" in text or
-        "I_MPI" in text
-    )
 
 
 def terminate_process_group(proc, sig):
@@ -150,9 +123,10 @@ def parse_args():
             "no-finalize-collective-disabled",
             "finalize-clean",
             "finalize-clean-output-mpi",
+            "finalize-clean-output-mpi-publish-before-root-return",
             "finalize-clean-output-mpi-reducer-fail",
-            "finalize-clean-output-mpi-intel-default",
-            "finalize-clean-output-mpi-intel-real-finalize",
+            "finalize-clean-output-mpi-real-finalize-default",
+            "finalize-clean-output-mpi-real-finalize-explicit",
             "finalize-clean-output-local",
             "finalize-clean-output-socket-bad-host",
             "finalize-clean-output-socket-bad-host-no-fallback",
@@ -161,6 +135,7 @@ def parse_args():
             "finalize-clean-output-socket-token-mismatch-no-fallback",
             "finalize-socket-post-work",
             "finalize-defer-post-work",
+            "finalize-defer-socket-post-work",
             "finalize-nonzero",
             "subset-finalize-nonzero",
             "subset-finalize-clean",
@@ -184,11 +159,11 @@ def parse_args():
 def main():
     args = parse_args()
     nprocs = int(args.nprocs)
-    if (args.mode in INTEL_MPI_ONLY_MODES and
-            not launcher_looks_like_intel_mpi(args.mpiexec)):
-        print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-intel-mpi")
-        return 0
     if args.mode.startswith("subset-") and nprocs < 2:
+        print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
+        return 0
+    if (args.mode == "finalize-clean-output-mpi-publish-before-root-return" and
+            nprocs < 2):
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
     if (args.mode in {
@@ -197,6 +172,7 @@ def main():
             "finalize-clean-output-socket-release-fail",
             "finalize-clean-output-socket-token-mismatch",
             "finalize-clean-output-socket-token-mismatch-no-fallback",
+            "finalize-defer-socket-post-work",
         } and nprocs < 2):
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
@@ -231,6 +207,7 @@ def main():
     expected_extra = []
     forbidden_output = []
     done_file = None
+    verify_finalize_return_publication = False
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -265,6 +242,24 @@ def main():
         )
         expected_peak_tables = 1
         expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-publish-before-root-return":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        env["PEAK_TEST_REPORT_ROOT_WRITE_DELAY_MS"] = "750"
+        app_args.append("finalize-publish-before-root-return")
+        expected = "PMPI_Finalize was observed on every rank"
+        expected_extra.append(
+            "PEAK output is complete; returning to real PMPI_Finalize"
+        )
+        expected_extra.append(
+            "Test hook delaying aggregate CSV publication by 750 ms"
+        )
+        expected_peak_tables = 1
+        expected_stats_files = 1
+        expected_per_thread = int(env.get("PEAK_MPI_EXIT_LOOPS", "16"))
+        expected_target_count = nprocs * expected_per_thread
+        verify_finalize_return_publication = True
     elif args.mode == "finalize-clean-output-mpi-reducer-fail":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env.setdefault("PEAK_TARGET", "peak_mpi_exit_target")
@@ -284,18 +279,19 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 1
         verify_socket_maxima = True
-    elif args.mode == "finalize-clean-output-mpi-intel-default":
+    elif args.mode == "finalize-clean-output-mpi-real-finalize-default":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
-        expected = "skipping real PMPI_Finalize for this MPI runtime"
+        expected = "PEAK output is complete; returning to real PMPI_Finalize"
         expected_extra.append("PMPI_Finalize was observed on every rank")
         expected_peak_tables = 0
         expected_stats_files = 1
-    elif args.mode == "finalize-clean-output-mpi-intel-real-finalize":
+    elif args.mode == "finalize-clean-output-mpi-real-finalize-explicit":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
         env["PEAK_MPI_REAL_FINALIZE"] = "1"
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
         expected = "PEAK output is complete; returning to real PMPI_Finalize"
         expected_extra.append("PMPI_Finalize was observed on every rank")
@@ -330,9 +326,12 @@ def main():
         env["PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"] = "1"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation release failure requested by test hook"
-        expected_peak_tables = 0
-        expected_max_peak_tables = 0
-        expected_stats_files = nprocs
+        # Root has already atomically published and printed the complete
+        # aggregate before the injected release failure. Preserve that report;
+        # every rank then emits a uniquely named local fallback.
+        expected_peak_tables = 1
+        expected_max_peak_tables = 1
+        expected_stats_files = nprocs + 1
     elif args.mode == "finalize-clean-output-socket-token-mismatch":
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
@@ -350,6 +349,10 @@ def main():
         expected_stats_files = 0
     elif args.mode == "finalize-socket-post-work":
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        # Socket selects only the report transport. With no explicit defer
+        # policy, output must be committed from the MPI finalizer path, before
+        # the application performs its post-finalize target calls.
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
         env["PEAK_MPI_EXIT_LOOPS"] = "16"
         env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
@@ -358,19 +361,37 @@ def main():
         expected = "Writing PEAK-owned socket-reduced output"
         expected_peak_tables = 1
         expected_stats_files = 1
-        expected_target_count = 16 + 32
-        expected_per_thread = expected_target_count
+        expected_target_count = 16
+        expected_per_thread = 16
         expected_positive_minima = True
         verify_socket_maxima = True
     elif args.mode == "finalize-defer-post-work":
         env["PEAK_MPI_FINALIZE_POLICY"] = "defer"
+        env["PEAK_OUTPUT_AGGREGATION"] = "rank-local"
         env["PEAK_MPI_EXIT_LOOPS"] = "16"
         env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
         app_args.append("finalize-post-work-then-exit0")
-        expected = "MPI runtime is not in an output-safe state"
+        expected = "Aggregate output is disabled for strict teardown"
+        expected_extra.append(
+            "Leaving PEAK target hooks pinned after application PMPI_Finalize"
+        )
         expected_peak_tables = 0
         expected_stats_files = nprocs
         expected_min_target_count = nprocs * (16 + 32)
+    elif args.mode == "finalize-defer-socket-post-work":
+        env["PEAK_MPI_FINALIZE_POLICY"] = "defer"
+        env["PEAK_OUTPUT_AGGREGATION"] = "socket"
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
+        env["PEAK_MPI_EXIT_LOOPS"] = "16"
+        env["PEAK_MPI_EXIT_POST_LOOPS"] = "32"
+        app_args.append("finalize-post-work-uneven-then-exit0")
+        expected = "Writing PEAK-owned socket-reduced output"
+        expected_peak_tables = 1
+        expected_stats_files = 1
+        expected_target_count = 16 + 32
+        expected_per_thread = expected_target_count
+        expected_positive_minima = True
+        verify_socket_maxima = True
     elif args.mode == "finalize-nonzero":
         app_args.append("finalize-then-exit1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -442,12 +463,36 @@ def main():
     ) as stats_dir:
         stats_prefix = str(Path(stats_dir) / "peak-stats")
         env["PEAK_STATSLOG_PATH"] = stats_prefix
+        if verify_finalize_return_publication:
+            env["PEAK_MPI_FINALIZE_ENTER_MARKER_PREFIX"] = str(
+                Path(stats_dir) / "finalize-enter"
+            )
+            env["PEAK_MPI_FINALIZE_RETURN_MARKER_PREFIX"] = str(
+                Path(stats_dir) / "finalize-return"
+            )
         returncode, output, timed_out = run_mpi_command(
             command,
             env=env,
             timeout=args.timeout,
         )
         stats_files = sorted(Path(stats_dir).glob("peak-stats-p*.csv"))
+        temporary_stats_files = sorted(
+            Path(stats_dir).glob("peak-stats-p*.csv.tmp.*")
+        )
+        finalize_enter_markers = sorted(
+            Path(stats_dir).glob("finalize-enter-r*.txt")
+        )
+        finalize_enter_marker_text = {
+            path.name: path.read_text(encoding="utf-8", errors="replace")
+            for path in finalize_enter_markers
+        }
+        finalize_return_markers = sorted(
+            Path(stats_dir).glob("finalize-return-r*.txt")
+        )
+        finalize_return_marker_text = {
+            path.name: path.read_text(encoding="utf-8", errors="replace")
+            for path in finalize_return_markers
+        }
         stats_text = "\n".join(
             path.read_text(encoding="utf-8", errors="replace")
             for path in stats_files
@@ -519,6 +564,62 @@ def main():
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
+    if verify_finalize_return_publication:
+        if returncode != 0 or timed_out:
+            raise AssertionError(
+                "MPI launcher did not complete cleanly after report "
+                f"publication: rc={returncode} timed_out={int(timed_out)}"
+            )
+        if temporary_stats_files:
+            raise AssertionError(
+                "aggregate CSV temporary file remained after MPI_Finalize: "
+                + ", ".join(path.name for path in temporary_stats_files)
+            )
+        if len(finalize_enter_markers) != nprocs:
+            present_markers = ", ".join(
+                path.name for path in finalize_enter_markers
+            ) or "none"
+            raise AssertionError(
+                f"expected {nprocs} MPI_Finalize entry markers, "
+                f"got {len(finalize_enter_markers)}; "
+                f"present={present_markers}; launcher_rc={returncode}; "
+                f"timed_out={int(timed_out)}"
+            )
+        for rank in range(nprocs):
+            entry_name = f"finalize-enter-r{rank}.txt"
+            entry_text = finalize_enter_marker_text.get(entry_name, "")
+            if f"rank={rank} entered=1" not in entry_text:
+                raise AssertionError(
+                    "rank did not enter intercepted MPI_Finalize: "
+                    f"{entry_name}={entry_text!r}"
+                )
+
+        root_marker_name = "finalize-return-r0.txt"
+        if root_marker_name not in finalize_return_marker_text:
+            raise AssertionError(
+                "aggregate root did not return cleanly from intercepted "
+                f"MPI_Finalize; present={sorted(finalize_return_marker_text)}"
+            )
+        for rank in range(nprocs):
+            marker_name = f"finalize-return-r{rank}.txt"
+            if marker_name not in finalize_return_marker_text:
+                continue
+            marker_text = finalize_return_marker_text.get(marker_name, "")
+            marker_prefix = f"rank={rank} finalize_rc=0 final_csv_published="
+            if not any(
+                marker_prefix + value in marker_text
+                for value in ("0", "1")
+            ):
+                raise AssertionError(
+                    "rank did not return cleanly from intercepted "
+                    f"MPI_Finalize: {marker_name}={marker_text!r}"
+                )
+            if rank == 0 and marker_prefix + "1" not in marker_text:
+                raise AssertionError(
+                    "aggregate root returned from intercepted MPI_Finalize "
+                    "before publishing the complete CSV: "
+                    f"{marker_name}={marker_text!r}"
+                )
     if (expected_min_stats_files is not None and
             len(stats_files) < expected_min_stats_files):
         raise AssertionError(
