@@ -531,9 +531,10 @@ The defaults below describe the current implementation.
 | `PEAK_TEXT_OUTPUT` | auto | Truthy values force text output. Without it, rank-local MPI-shaped output may suppress duplicate text. |
 | `PEAK_OUTPUT_AGGREGATION` | `mpi` under MPI | Selects `mpi`, `socket`, or local/rank-local aggregation. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | unset | Legacy alias used when `PEAK_OUTPUT_AGGREGATION` is unset. |
-| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | `250` | Timeout for all-rank finalize participation proof. |
+| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | `10000` | Timeout for all-rank finalize participation proof. |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | `5000` | Timeout for MPI output reducer collectives. |
 | `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | `60000` | Timeout for socket aggregation. |
+| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | `180000` | Timeout for the common post-publication release gate; keep it above twice any configured socket timeout plus local-fallback margin. |
 | `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`, `MV2_COMM_WORLD_LOCAL_SIZE`, `PMI_LOCAL_SIZE` | `1` fallback | Local rank count for reattach admission and diagnostic risk reporting. |
 
 Several backend safety variables, such as `PEAK_SAFE_DETACH_MODE`,
@@ -561,12 +562,18 @@ MPI enters the picture during teardown/reporting:
   pre-finalize path by default; with explicit `PEAK_MPI_FINALIZE_POLICY=defer`,
   it instead uses a process-exit path that does not require an MPI-finalize
   proof.
-- Healthy all-rank jobs return to the real `PMPI_Finalize()` after report
-  publication on the writer rank. `MPI_Finalize()` is not a barrier and need
-  not return on every process, but it hands each rank to the MPI runtime's
-  launcher-aware completion protocol instead of letting Hydra observe an
-  improper exit. `PEAK_MPI_REAL_FINALIZE=0` is diagnostic only and cannot
-  guarantee report publication or clean launcher termination.
+- On the default pre-finalize path, MPI, socket, and rank-local writers all
+  enter a bounded post-publication gate. Its reduction distinguishes output
+  failure from protocol failure. Ranks that complete the same gate observe one
+  reduced real-finalizer policy, but a local collective error or timeout cannot
+  prove that every peer observed the same failure; that path is locally
+  fail-closed rather than distributed failure consensus.
+- Healthy runtimes other than Intel MPI 2019 normally return to the real
+  `PMPI_Finalize()` after the release gate. Intel MPI 2019 skips its observed
+  crash-prone finalizer by default; `PEAK_MPI_REAL_FINALIZE=1` explicitly opts
+  back in. Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer
+  before this compatibility policy and therefore bypasses it. Skipping the
+  finalizer is non-conforming and still requires launcher-scale validation.
 - An abnormal exit uses rank-local output. Missing all-rank participation
   rejects MPI aggregation, but explicit socket mode may still aggregate when
   the participation check itself completed safely. A failed or timed-out proof

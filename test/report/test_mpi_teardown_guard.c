@@ -12,6 +12,7 @@
 typedef enum {
     TEST_REQUEST_COMPLETE_ALL = 0,
     TEST_REQUEST_COMPLETE_NOT_ALL,
+    TEST_REQUEST_COMPLETE_POLICY_DISABLED,
     TEST_REQUEST_INIT_ERROR,
     TEST_REQUEST_TEST_ERROR,
     TEST_REQUEST_TIMEOUT,
@@ -24,6 +25,7 @@ static bool fake_request_completed;
 static const int* fake_send_buffer;
 static int* fake_receive_buffer;
 static MPI_Request* fake_request;
+static int fake_value_count;
 
 static void
 fake_reset(TestRequestMode mode)
@@ -35,16 +37,19 @@ fake_reset(TestRequestMode mode)
     fake_send_buffer = NULL;
     fake_receive_buffer = NULL;
     fake_request = NULL;
+    fake_value_count = 0;
 }
 
 void
 peak_mpi_teardown_guard_test_observe_request(const int* local_requested,
                                              int* all_requested,
-                                             MPI_Request* request)
+                                             MPI_Request* request,
+                                             int value_count)
 {
     fake_send_buffer = local_requested;
     fake_receive_buffer = all_requested;
     fake_request = request;
+    fake_value_count = value_count;
 }
 
 int
@@ -59,7 +64,8 @@ MPI_Iallreduce(const void* send_buffer,
     fake_iallreduce_calls++;
     if (send_buffer != fake_send_buffer ||
         receive_buffer != fake_receive_buffer ||
-        request != fake_request || count != 1 || datatype != MPI_INT ||
+        request != fake_request || count != fake_value_count ||
+        count <= 0 || count > 2 || datatype != MPI_INT ||
         operation != MPI_MIN || communicator != MPI_COMM_WORLD) {
         return MPI_ERR_OTHER;
     }
@@ -68,8 +74,15 @@ MPI_Iallreduce(const void* send_buffer,
     if (fake_mode == TEST_REQUEST_INIT_ERROR) {
         return MPI_ERR_OTHER;
     }
-    *(int*)receive_buffer =
-        fake_mode == TEST_REQUEST_COMPLETE_NOT_ALL ? 0 : 1;
+    for (int i = 0; i < count; i++) {
+        ((int*)receive_buffer)[i] = 1;
+    }
+    if (fake_mode == TEST_REQUEST_COMPLETE_NOT_ALL) {
+        ((int*)receive_buffer)[0] = 0;
+    } else if (fake_mode == TEST_REQUEST_COMPLETE_POLICY_DISABLED &&
+               count > 1) {
+        ((int*)receive_buffer)[1] = 0;
+    }
     return MPI_SUCCESS;
 }
 
@@ -106,14 +119,41 @@ run_success_case(TestRequestMode mode, bool expected)
         peak_mpi_teardown_quarantined_request_count() != 0 ||
         fake_iallreduce_calls != 1 || fake_test_calls != 1 ||
         fake_send_buffer == NULL || fake_receive_buffer == NULL ||
-        fake_request == NULL || !fake_request_completed) {
+        fake_request == NULL || fake_value_count != 1 ||
+        !fake_request_completed) {
         return 1;
     }
     return 0;
 }
 
 static int
-run_failure_case(TestRequestMode mode)
+run_report_release_success_case(TestRequestMode mode,
+                                bool expected_all_complete,
+                                bool expected_all_finalize_allowed)
+{
+    bool all_complete = !expected_all_complete;
+    bool all_finalize_allowed = !expected_all_finalize_allowed;
+    bool protocol_completed;
+
+    fake_reset(mode);
+    protocol_completed =
+        peak_mpi_teardown_complete_report_release(
+            1, 1, &all_complete, &all_finalize_allowed);
+    if (!protocol_completed || all_complete != expected_all_complete ||
+        all_finalize_allowed != expected_all_finalize_allowed ||
+        peak_mpi_teardown_collectives_failed_closed() ||
+        peak_mpi_teardown_quarantined_request_count() != 0 ||
+        fake_iallreduce_calls != 1 || fake_test_calls != 1 ||
+        fake_send_buffer == NULL || fake_receive_buffer == NULL ||
+        fake_request == NULL || fake_value_count != 2 ||
+        !fake_request_completed) {
+        return 1;
+    }
+    return 0;
+}
+
+static int
+run_failure_case(TestRequestMode mode, bool report_release)
 {
     const int delayed_local_requested = 17;
     const int delayed_all_requested = 23;
@@ -122,8 +162,21 @@ run_failure_case(TestRequestMode mode)
     int operations_after_failure;
     int tests_after_failure;
 
+    bool all_complete = true;
+    bool all_finalize_allowed = true;
+    bool operation_completed;
+
     fake_reset(mode);
-    if (peak_mpi_teardown_all_ranks_requested_finalize(1) ||
+    operation_completed = report_release
+                              ? peak_mpi_teardown_complete_report_release(
+                                    1,
+                                    1,
+                                    &all_complete,
+                                    &all_finalize_allowed)
+                              : peak_mpi_teardown_all_ranks_requested_finalize(
+                                    1);
+    if (operation_completed ||
+        (report_release && (all_complete || all_finalize_allowed)) ||
         !peak_mpi_teardown_collectives_failed_closed() ||
         peak_mpi_teardown_quarantined_request_count() != 1 ||
         fake_iallreduce_calls != 1 || fake_send_buffer == NULL ||
@@ -158,7 +211,12 @@ run_failure_case(TestRequestMode mode)
 
     operations_after_failure = fake_iallreduce_calls;
     tests_after_failure = fake_test_calls;
+    all_complete = true;
+    all_finalize_allowed = true;
     if (peak_mpi_teardown_all_ranks_requested_finalize(1) ||
+        peak_mpi_teardown_complete_report_release(
+            1, 1, &all_complete, &all_finalize_allowed) ||
+        all_complete || all_finalize_allowed ||
         fake_iallreduce_calls != operations_after_failure ||
         fake_test_calls != tests_after_failure ||
         peak_mpi_teardown_quarantined_request_count() != 1 ||
@@ -172,7 +230,7 @@ run_failure_case(TestRequestMode mode)
 }
 
 static int
-run_failure_child(TestRequestMode mode)
+run_failure_child(TestRequestMode mode, bool report_release)
 {
     pid_t child = fork();
     int status;
@@ -181,7 +239,9 @@ run_failure_child(TestRequestMode mode)
         return 1;
     }
     if (child == 0) {
-        _exit(run_failure_case(mode) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+        _exit(run_failure_case(mode, report_release) == 0
+                  ? EXIT_SUCCESS
+                  : EXIT_FAILURE);
     }
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
         WEXITSTATUS(status) != EXIT_SUCCESS) {
@@ -200,9 +260,18 @@ run_prepoison_child(void)
         return 1;
     }
     if (child == 0) {
+        bool all_complete = true;
+        bool all_finalize_allowed = true;
+
         fake_reset(TEST_REQUEST_COMPLETE_ALL);
         peak_mpi_teardown_collectives_mark_failed_closed();
         _exit(!peak_mpi_teardown_all_ranks_requested_finalize(1) &&
+                      !peak_mpi_teardown_complete_report_release(
+                          1,
+                          1,
+                          &all_complete,
+                          &all_finalize_allowed) &&
+                      !all_complete && !all_finalize_allowed &&
                       peak_mpi_teardown_collectives_failed_closed() &&
                       fake_iallreduce_calls == 0
                   ? EXIT_SUCCESS
@@ -222,16 +291,26 @@ main(void)
 
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     (void)setenv("PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS", "1", 1);
+    (void)setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "1", 1);
     failures += run_success_case(TEST_REQUEST_COMPLETE_ALL, true);
     failures += run_success_case(TEST_REQUEST_COMPLETE_NOT_ALL, false);
-    failures += run_failure_child(TEST_REQUEST_INIT_ERROR);
-    failures += run_failure_child(TEST_REQUEST_TEST_ERROR);
-    failures += run_failure_child(TEST_REQUEST_TIMEOUT);
+    failures += run_report_release_success_case(
+        TEST_REQUEST_COMPLETE_ALL, true, true);
+    failures += run_report_release_success_case(
+        TEST_REQUEST_COMPLETE_NOT_ALL, false, true);
+    failures += run_report_release_success_case(
+        TEST_REQUEST_COMPLETE_POLICY_DISABLED, true, false);
+    failures += run_failure_child(TEST_REQUEST_INIT_ERROR, false);
+    failures += run_failure_child(TEST_REQUEST_TEST_ERROR, false);
+    failures += run_failure_child(TEST_REQUEST_TIMEOUT, false);
+    failures += run_failure_child(TEST_REQUEST_INIT_ERROR, true);
+    failures += run_failure_child(TEST_REQUEST_TEST_ERROR, true);
+    failures += run_failure_child(TEST_REQUEST_TIMEOUT, true);
     failures += run_prepoison_child();
     if (failures != 0) {
         fprintf(stderr, "mpi_teardown_guard failures=%d\n", failures);
         return EXIT_FAILURE;
     }
-    puts("mpi_teardown_guard_test_ok success=2 failure_paths=4");
+    puts("mpi_teardown_guard_test_ok success=5 failure_paths=7");
     return EXIT_SUCCESS;
 }
