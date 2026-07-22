@@ -16,10 +16,6 @@ FAIL_RE = re.compile(
     r"Caught signal|Segmentation fault|SIGSEGV|signal 11|"
     r"Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
 )
-UNINTENDED_REPORT_SIGNAL_FATAL_RE = re.compile(
-    r"Segmentation fault|SIGSEGV|signal 11|"
-    r"MPII_finalize|ofi_cq_read|hwloc"
-)
 LAUNCHER_ABNORMAL_RE = re.compile(
     r"BAD TERMINATION|KILLED BY SIGNAL|exiting improperly|"
     r"mpiexec has exited due to process rank"
@@ -75,6 +71,36 @@ STATS_FIELDS = [
     "thread_min_s",
     "overhead_s",
 ]
+REPORT_RELEASE_REAL_DIAGNOSTIC = (
+    "All-rank report publication release completed: "
+    "all_reports_succeeded=1 all_real_finalize_allowed=1"
+)
+REPORT_RELEASE_SKIP_DIAGNOSTIC = (
+    "All-rank report publication release completed: "
+    "all_reports_succeeded=1 all_real_finalize_allowed=0"
+)
+REPORT_REAL_FINALIZE_DIAGNOSTIC = (
+    "PEAK output is complete; returning to real PMPI_Finalize"
+)
+REPORT_INTEL_SKIP_DIAGNOSTIC = (
+    "PEAK output release is complete; skipping real PMPI_Finalize "
+    "for Intel MPI 2019 compatibility"
+)
+REPORT_COMPLETION_DIAGNOSTICS = (
+    "All-rank report publication release completed:",
+    REPORT_REAL_FINALIZE_DIAGNOSTIC,
+    "PEAK output release is complete; skipping real PMPI_Finalize",
+)
+REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS = (
+    "MPI_Iallreduce for report publication release failed; "
+    "disabling later MPI teardown calls",
+    "MPI_Test for report publication release failed; "
+    "disabling later MPI teardown calls",
+    "MPI report publication release timed out after 2500 ms; "
+    "disabling later MPI teardown calls",
+    "All-rank report publication release failed; "
+    "skipping real PMPI_Finalize and avoiding later MPI teardown calls",
+)
 
 
 def split_flags(value):
@@ -146,6 +172,24 @@ def require_complete_stats_evidence(name, evidence):
         )
     if int(float(target_rows[0].get("count", "0") or 0)) <= 0:
         raise AssertionError(f"PEAK final CSV target count was not positive: {name}")
+
+
+def report_clean_completion_policy(output):
+    continued_real = (
+        REPORT_RELEASE_REAL_DIAGNOSTIC in output and
+        REPORT_REAL_FINALIZE_DIAGNOSTIC in output and
+        REPORT_RELEASE_SKIP_DIAGNOSTIC not in output and
+        REPORT_INTEL_SKIP_DIAGNOSTIC not in output
+    )
+    continued_intel_skip = (
+        REPORT_RELEASE_SKIP_DIAGNOSTIC in output and
+        REPORT_INTEL_SKIP_DIAGNOSTIC in output and
+        REPORT_RELEASE_REAL_DIAGNOSTIC not in output and
+        REPORT_REAL_FINALIZE_DIAGNOSTIC not in output
+    )
+    if continued_real == continued_intel_skip:
+        return None
+    return "real-finalize" if continued_real else "intel-2019-skip"
 
 
 def terminate_process_group(proc, sig):
@@ -790,11 +834,31 @@ def main():
         output,
         timed_out,
     )
+    report_completion_policy = report_clean_completion_policy(output)
+    report_release_interrupted = any(
+        diagnostic in output
+        for diagnostic in REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS
+    )
+    launcher_abnormal = LAUNCHER_ABNORMAL_RE.search(output) is not None
+    report_interruption_evidence = (
+        returncode != 0 or
+        launcher_abnormal or
+        report_release_interrupted
+    )
     report_signal_continued = (
         report_signal_requested and
         args.report_signal == "TERM" and
         returncode == 0 and
-        not timed_out
+        not timed_out and
+        report_completion_policy is not None and
+        not report_interruption_evidence
+    )
+    report_signal_interrupted = (
+        report_signal_requested and
+        args.report_signal == "TERM" and
+        not timed_out and
+        report_completion_policy is None and
+        report_interruption_evidence
     )
 
     if expected is not None and expected not in output:
@@ -818,16 +882,9 @@ def main():
             "",
             fatal_scan_output,
         )
-    if (report_signal_requested and
-            UNINTENDED_REPORT_SIGNAL_FATAL_RE.search(fatal_scan_output)):
+    if report_signal_requested and FAIL_RE.search(fatal_scan_output):
         raise AssertionError(
             "report signal run produced an unintended crash/fatal MPI diagnostic"
-        )
-    if (report_signal_continued and
-            (FAIL_RE.search(fatal_scan_output) or
-             LAUNCHER_ABNORMAL_RE.search(output))):
-        raise AssertionError(
-            "continued SIGTERM run produced a crash or launcher-abnormal diagnostic"
         )
     if not report_signal_requested and FAIL_RE.search(fatal_scan_output):
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
@@ -893,51 +950,16 @@ def main():
                     "continued SIGTERM left a temporary CSV: "
                     + ", ".join(path.name for path in temporary_stats_files)
                 )
-            release_real = (
-                "All-rank report publication release completed: "
-                "all_reports_succeeded=1 all_real_finalize_allowed=1"
-            )
-            release_skip = (
-                "All-rank report publication release completed: "
-                "all_reports_succeeded=1 all_real_finalize_allowed=0"
-            )
-            real_finalize = (
-                "PEAK output is complete; returning to real PMPI_Finalize"
-            )
-            intel_skip = (
-                "PEAK output release is complete; skipping real PMPI_Finalize "
-                "for Intel MPI 2019 compatibility"
-            )
-            continued_real = (
-                release_real in output and
-                real_finalize in output and
-                release_skip not in output and
-                intel_skip not in output
-            )
-            continued_intel_skip = (
-                release_skip in output and
-                intel_skip in output and
-                release_real not in output and
-                real_finalize not in output
-            )
-            if continued_real == continued_intel_skip:
-                raise AssertionError(
-                    "continued SIGTERM did not complete exactly one valid "
-                    "release/finalizer policy pair"
-                )
         else:
-            if returncode == 0:
+            if args.report_signal == "TERM" and not report_signal_interrupted:
                 raise AssertionError(
-                    "SIGTERM returned zero without completing cleanly"
+                    "SIGTERM neither completed cleanly nor produced explicit "
+                    "bounded-interruption evidence"
                 )
-            for diagnostic in (
-                "All-rank report publication release completed:",
-                "PEAK output is complete; returning to real PMPI_Finalize",
-                "PEAK output release is complete; skipping real PMPI_Finalize",
-            ):
+            for diagnostic in REPORT_COMPLETION_DIAGNOSTICS:
                 if diagnostic in output:
                     raise AssertionError(
-                        "terminated report-signal run contained clean-completion "
+                        "interrupted report-signal run contained clean-completion "
                         "evidence: " + diagnostic
                     )
             if args.report_signal_phase == "before-publish":
@@ -1091,7 +1113,12 @@ def main():
         raise AssertionError(f"{args.mode} run returned {returncode}")
 
     if report_signal_requested:
-        outcome = "continued" if report_signal_continued else "terminated"
+        if report_signal_continued:
+            outcome = "continued"
+        elif report_signal_interrupted:
+            outcome = "interrupted"
+        else:
+            outcome = "terminated"
         print(
             "mpi_report_signal_atomicity_ok "
             f"phase={args.report_signal_phase} "
