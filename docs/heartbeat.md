@@ -558,10 +558,13 @@ MPI enters the picture during teardown/reporting:
   fails after the proof, PEAK first attempts its socket fallback without further
   MPI calls when that fallback is enabled, then writes rank-local output if the
   socket path is unavailable or fails.
-- Explicit socket aggregation can avoid MPI reducer progress. It reports on the
-  pre-finalize path by default; with explicit `PEAK_MPI_FINALIZE_POLICY=defer`,
-  it instead uses a process-exit path that does not require an MPI-finalize
-  proof.
+- Explicit socket aggregation and rank-local output publish their frozen CPU
+  report before the finalize-participation proof. The strict socket path uses
+  consistent launcher rank/size pairs and makes no MPI call until publication
+  and socket release are finished. The later proof only decides whether PEAK
+  may enter the common release gate and real finalizer. With explicit
+  `PEAK_MPI_FINALIZE_POLICY=defer`, socket output instead uses a process-exit
+  path that does not require an MPI-finalize proof.
 - On the default pre-finalize path, MPI, socket, and rank-local writers all
   enter a bounded post-publication gate. Its reduction distinguishes output
   failure from protocol failure. Ranks that complete the same gate observe one
@@ -574,10 +577,19 @@ MPI enters the picture during teardown/reporting:
   back in. Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer
   before this compatibility policy and therefore bypasses it. Skipping the
   finalizer is non-conforming and still requires launcher-scale validation.
-- An abnormal exit uses rank-local output. Missing all-rank participation
-  rejects MPI aggregation, but explicit socket mode may still aggregate when
-  the participation check itself completed safely. A failed or timed-out proof
-  is locally fail-closed to rank-local output.
+- An abnormal exit uses rank-local output without making teardown MPI calls.
+  Missing all-rank participation rejects MPI aggregation. A local/socket report
+  already published before a failed or timed-out proof is retained; PEAK then
+  fails the MPI finalizer path closed without issuing later MPI calls.
+
+PEAK does not call full teardown from a termination-signal handler. `SIGKILL`
+cannot be caught, and `peak_fini()` uses locks, threads, allocators, I/O, and
+optional MPI operations that are not async-signal-safe. CSV publication instead
+uses a same-directory temporary file plus atomic rename: after abrupt process
+termination the final pathname is absent or complete, while an interrupted
+pre-rename writer may leave a temporary file. This is a process-level atomicity
+guarantee, not a guarantee of an exact final snapshot under arbitrary kill,
+launcher abort, node loss, or power loss.
 
 ## Testing and Diagnostics
 

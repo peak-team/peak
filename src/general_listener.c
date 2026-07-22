@@ -6282,7 +6282,8 @@ peak_general_listener_report_format_options(int rank_count)
 static gboolean
 peak_general_listener_write_report(PeakReportSnapshot* snapshot,
                                    gboolean sanitize,
-                                   gboolean rank_local)
+                                   gboolean rank_local,
+                                   gboolean host_disambiguate_rank_local)
 {
     PeakReportFormatOptions options;
     gboolean csv_succeeded;
@@ -6297,7 +6298,9 @@ peak_general_listener_write_report(PeakReportSnapshot* snapshot,
     options = peak_general_listener_report_format_options(
         snapshot->rank_count);
     if (rank_local) {
-        csv_succeeded =
+        csv_succeeded = host_disambiguate_rank_local ?
+            peak_report_formatter_write_rank_local_csv_host_disambiguated(
+                snapshot) :
             peak_report_formatter_write_rank_local_csv(snapshot);
     } else {
         csv_succeeded = peak_report_formatter_write_csv(snapshot);
@@ -6380,7 +6383,8 @@ peak_general_listener_run_socket_report(
 
     if (status == PEAK_SOCKET_REPORT_SINGLE_READY) {
         gboolean write_succeeded =
-            peak_general_listener_write_report(aggregate, TRUE, FALSE);
+            peak_general_listener_write_report(
+                aggregate, TRUE, FALSE, FALSE);
 
         peak_report_snapshot_destroy(aggregate);
         return write_succeeded;
@@ -6440,8 +6444,9 @@ peak_general_listener_mpi_reducer_failed_closed(void)
 #endif
 }
 
-gboolean peak_general_listener_print(
+gboolean peak_general_listener_print_with_mpi_job_policy(
     PeakOutputAggregationMode aggregation_mode,
+    gboolean active_mpi_job,
     gboolean* report_write_succeeded)
 {
     gboolean used_mpi_aggregation = FALSE;
@@ -6532,7 +6537,7 @@ gboolean peak_general_listener_print(
                 peak_general_listener_commit_report_marker_swap(&marker_swap);
                 write_succeeded =
                     peak_general_listener_write_report(
-                        aggregate, TRUE, FALSE);
+                        aggregate, TRUE, FALSE, FALSE);
                 peak_report_snapshot_destroy(aggregate);
                 used_mpi_aggregation = TRUE;
             } else if (result == PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
@@ -6547,34 +6552,38 @@ gboolean peak_general_listener_print(
                 g_printerr("[peak] MPI reducer failed; trying PEAK-owned socket aggregation fallback without further MPI calls\n");
                 write_succeeded = peak_general_listener_run_socket_report(
                     local_snapshot,
-                    PEAK_SOCKET_REPORT_RANK_ENV_ONLY);
+                    active_mpi_job ?
+                        PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED :
+                        PEAK_SOCKET_REPORT_RANK_ENV_ONLY);
                 if (!write_succeeded) {
                     g_printerr("[peak] MPI reducer socket fallback failed; writing rank-local output\n");
                     write_succeeded = peak_general_listener_write_report(
-                        local_snapshot, TRUE, TRUE);
+                        local_snapshot, TRUE, TRUE, active_mpi_job);
                 }
             } else {
                 write_succeeded = peak_general_listener_write_report(
-                    local_snapshot, TRUE, TRUE);
+                    local_snapshot, TRUE, TRUE, active_mpi_job);
             }
         } else if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
             write_succeeded = peak_general_listener_run_socket_report(
                 local_snapshot,
-                PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV);
+                active_mpi_job ?
+                    PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED :
+                    PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV);
             if (!write_succeeded &&
                 peak_general_listener_socket_reduce_fallback_enabled()) {
                 g_printerr("[peak] Socket aggregation failed; falling back to rank-local output\n");
                 write_succeeded = peak_general_listener_write_report(
-                    local_snapshot, TRUE, TRUE);
+                    local_snapshot, TRUE, TRUE, active_mpi_job);
             }
         } else {
             write_succeeded = peak_general_listener_write_report(
-                local_snapshot, TRUE, TRUE);
+                local_snapshot, TRUE, TRUE, active_mpi_job);
         }
 #else
         (void)aggregation_mode;
         write_succeeded = peak_general_listener_write_report(
-            local_snapshot, TRUE, TRUE);
+            local_snapshot, TRUE, TRUE, FALSE);
 #endif
     }
 
@@ -6595,6 +6604,16 @@ gboolean peak_general_listener_print(
         *report_write_succeeded = write_succeeded;
     }
     return used_mpi_aggregation;
+}
+
+gboolean
+peak_general_listener_print(PeakOutputAggregationMode aggregation_mode,
+                            gboolean* report_write_succeeded)
+{
+    return peak_general_listener_print_with_mpi_job_policy(
+        aggregation_mode,
+        FALSE,
+        report_write_succeeded);
 }
 
 gboolean peak_general_listener_dettach()
