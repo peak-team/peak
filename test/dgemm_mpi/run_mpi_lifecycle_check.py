@@ -24,6 +24,13 @@ LAUNCHER_ABNORMAL_RE = re.compile(
     r"BAD TERMINATION|KILLED BY SIGNAL|exiting improperly|"
     r"mpiexec has exited due to process rank"
 )
+INTEL_MPI_SKIP_HYDRA_SIGKILL_RE = re.compile(
+    r"={10,}\r?\n"
+    r"=\s+BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES\r?\n"
+    r"=\s+RANK \d+ PID \d+ RUNNING AT [^\r\n]+\r?\n"
+    r"=\s+KILLED BY SIGNAL:\s*9 \(Killed\)\r?\n"
+    r"={10,}\r?\n"
+)
 OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
     r"-{10,}\n"
     r"(?:mpiexec|prterun) has exited due to process rank.*?"
@@ -55,6 +62,19 @@ NON_INTEL_MPI_ONLY_MODES = {
     "finalize-clean-output-mpi-real-finalize-default",
     "finalize-clean-output-mpi-writer-fail",
 }
+STATS_FIELDS = [
+    "function",
+    "count",
+    "per_thread",
+    "per_rank",
+    "call_max_s",
+    "call_min_s",
+    "total_s",
+    "exclusive_s",
+    "thread_max_s",
+    "thread_min_s",
+    "overhead_s",
+]
 
 
 def split_flags(value):
@@ -88,6 +108,44 @@ def launcher_looks_like_intel_mpi(mpiexec):
         "Intel MPI" in text or
         "I_MPI" in text
     )
+
+
+def intel_default_launcher_outcome_allowed(mode, returncode, output, timed_out):
+    if mode != "finalize-clean-output-mpi-intel-default" or timed_out:
+        return False
+
+    blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
+    if returncode == 0:
+        return not blocks and LAUNCHER_ABNORMAL_RE.search(output) is None
+    if len(blocks) != 1:
+        return False
+
+    block = blocks[0]
+    remaining_output = output[:block.start()] + output[block.end():]
+    return LAUNCHER_ABNORMAL_RE.search(remaining_output) is None
+
+
+def require_complete_stats_evidence(name, evidence):
+    if evidence["size"] <= 0:
+        raise AssertionError(f"PEAK final CSV was empty: {name}")
+    if evidence["fields"] != STATS_FIELDS:
+        raise AssertionError(
+            f"PEAK final CSV had an incomplete or unexpected header: "
+            f"{name}: {evidence['fields']!r}"
+        )
+    for row in evidence["rows"]:
+        if None in row or any(value is None for value in row.values()):
+            raise AssertionError(f"PEAK final CSV contained a partial row: {name}")
+    target_rows = [
+        row for row in evidence["rows"]
+        if row.get("function") == "peak_mpi_exit_target"
+    ]
+    if len(target_rows) != 1:
+        raise AssertionError(
+            "PEAK final CSV did not contain exactly one target row: " + name
+        )
+    if int(float(target_rows[0].get("count", "0") or 0)) <= 0:
+        raise AssertionError(f"PEAK final CSV target count was not positive: {name}")
 
 
 def terminate_process_group(proc, sig):
@@ -596,16 +654,24 @@ def main():
 
     if report_signal_requested:
         signal_number = 15 if args.report_signal == "TERM" else 9
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
         env["PEAK_TEST_REPORT_SIGNAL_PHASE"] = args.report_signal_phase
         env["PEAK_TEST_REPORT_SIGNAL"] = args.report_signal
         env["PEAK_TEST_REPORT_SIGNAL_RANK"] = "0"
+        # If the selected rank terminates, give surviving ranks time to fail
+        # closed at the report-release gate before the outer watchdog fires.
+        # A runtime that consumes SIGTERM can still complete this small test
+        # well within the same bound.
+        env["PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS"] = "2500"
         expected_extra.append(
             f"Test hook delivering signal {signal_number} on rank 0 at "
             f"report phase {args.report_signal_phase}"
         )
-        # The selected rank is intentionally terminated in its CSV writer.
-        # Other ranks may or may not publish before the MPI launcher tears
-        # down the job, so only rank 0 has a deterministic file expectation.
+        # SIGKILL always terminates the writer. MPI runtimes may either
+        # terminate on SIGTERM or consume it and let the writer continue, so
+        # the validation below distinguishes those outcomes explicitly.
         expected_peak_tables = 0
         expected_stats_files = None
 
@@ -676,9 +742,17 @@ def main():
             for path in stats_files
         )
         stats_rows = []
+        stats_file_evidence = {}
         for path in stats_files:
-            with path.open(newline="", encoding="utf-8", errors="replace") as handle:
-                stats_rows.extend(csv.DictReader(handle))
+            with path.open(newline="", encoding="utf-8", errors="strict") as handle:
+                reader = csv.DictReader(handle, strict=True)
+                rows = list(reader)
+                stats_file_evidence[path.name] = {
+                    "size": path.stat().st_size,
+                    "fields": reader.fieldnames,
+                    "rows": rows,
+                }
+                stats_rows.extend(rows)
         selected_stats_pattern = (
             "peak-stats-p*-r0.csv" if nprocs > 1 else "peak-stats-p*.csv"
         )
@@ -695,13 +769,12 @@ def main():
         selected_stats_rows = []
         selected_stats_fields = None
         if len(selected_stats_files) == 1:
-            selected_stats_size = selected_stats_files[0].stat().st_size
-            with selected_stats_files[0].open(
-                newline="", encoding="utf-8", errors="strict"
-            ) as handle:
-                reader = csv.DictReader(handle, strict=True)
-                selected_stats_fields = reader.fieldnames
-                selected_stats_rows = list(reader)
+            selected_stats_evidence = stats_file_evidence[
+                selected_stats_files[0].name
+            ]
+            selected_stats_size = selected_stats_evidence["size"]
+            selected_stats_fields = selected_stats_evidence["fields"]
+            selected_stats_rows = selected_stats_evidence["rows"]
     sys.stdout.write(output)
     if done_file is not None:
         try:
@@ -710,6 +783,19 @@ def main():
             pass
         except OSError:
             pass
+
+    intel_default_launcher_allowed = intel_default_launcher_outcome_allowed(
+        args.mode,
+        returncode,
+        output,
+        timed_out,
+    )
+    report_signal_continued = (
+        report_signal_requested and
+        args.report_signal == "TERM" and
+        returncode == 0 and
+        not timed_out
+    )
 
     if expected is not None and expected not in output:
         raise AssertionError(f"missing expected PEAK diagnostic: {expected}")
@@ -737,10 +823,17 @@ def main():
         raise AssertionError(
             "report signal run produced an unintended crash/fatal MPI diagnostic"
         )
+    if (report_signal_continued and
+            (FAIL_RE.search(fatal_scan_output) or
+             LAUNCHER_ABNORMAL_RE.search(output))):
+        raise AssertionError(
+            "continued SIGTERM run produced a crash or launcher-abnormal diagnostic"
+        )
     if not report_signal_requested and FAIL_RE.search(fatal_scan_output):
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
     if (not report_signal_requested and
             args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
+            not intel_default_launcher_allowed and
             LAUNCHER_ABNORMAL_RE.search(output)):
         raise AssertionError(
             "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
@@ -782,41 +875,97 @@ def main():
             + ", ".join(path.name for path in temporary_stats_files)
         )
     if report_signal_requested:
-        if returncode == 0:
+        if args.report_signal == "KILL" and returncode == 0:
             raise AssertionError(
-                "report signal hook did not terminate the MPI launcher"
+                "SIGKILL report hook did not terminate the MPI launcher"
             )
-        if args.report_signal_phase == "before-publish":
-            if selected_stats_files:
+        for name, evidence in stats_file_evidence.items():
+            require_complete_stats_evidence(name, evidence)
+
+        if report_signal_continued:
+            if len(stats_files) != nprocs:
                 raise AssertionError(
-                    "rank 0 final CSV existed after the before-publish signal"
+                    "continued SIGTERM did not publish one complete CSV per rank: "
+                    f"expected {nprocs}, got {len(stats_files)}"
+                )
+            if temporary_stats_files:
+                raise AssertionError(
+                    "continued SIGTERM left a temporary CSV: "
+                    + ", ".join(path.name for path in temporary_stats_files)
+                )
+            release_real = (
+                "All-rank report publication release completed: "
+                "all_reports_succeeded=1 all_real_finalize_allowed=1"
+            )
+            release_skip = (
+                "All-rank report publication release completed: "
+                "all_reports_succeeded=1 all_real_finalize_allowed=0"
+            )
+            real_finalize = (
+                "PEAK output is complete; returning to real PMPI_Finalize"
+            )
+            intel_skip = (
+                "PEAK output release is complete; skipping real PMPI_Finalize "
+                "for Intel MPI 2019 compatibility"
+            )
+            continued_real = (
+                release_real in output and
+                real_finalize in output and
+                release_skip not in output and
+                intel_skip not in output
+            )
+            continued_intel_skip = (
+                release_skip in output and
+                intel_skip in output and
+                release_real not in output and
+                real_finalize not in output
+            )
+            if continued_real == continued_intel_skip:
+                raise AssertionError(
+                    "continued SIGTERM did not complete exactly one valid "
+                    "release/finalizer policy pair"
                 )
         else:
-            expected_fields = [
-                "function",
-                "count",
-                "per_thread",
-                "per_rank",
-                "call_max_s",
-                "call_min_s",
-                "total_s",
-                "exclusive_s",
-                "thread_max_s",
-                "thread_min_s",
-                "overhead_s",
-            ]
+            if returncode == 0:
+                raise AssertionError(
+                    "SIGTERM returned zero without completing cleanly"
+                )
+            for diagnostic in (
+                "All-rank report publication release completed:",
+                "PEAK output is complete; returning to real PMPI_Finalize",
+                "PEAK output release is complete; skipping real PMPI_Finalize",
+            ):
+                if diagnostic in output:
+                    raise AssertionError(
+                        "terminated report-signal run contained clean-completion "
+                        "evidence: " + diagnostic
+                    )
+            if args.report_signal_phase == "before-publish":
+                if selected_stats_files:
+                    raise AssertionError(
+                        "rank 0 final CSV existed after the before-publish signal"
+                    )
+            else:
+                if len(selected_stats_files) != 1:
+                    raise AssertionError(
+                        "expected exactly one rank 0 final CSV after publication, "
+                        f"got {len(selected_stats_files)}"
+                    )
+                if selected_temporary_stats_files:
+                    raise AssertionError(
+                        "rank 0 temporary CSV remained after atomic publication"
+                    )
+
+        if (report_signal_continued or
+                args.report_signal_phase == "after-publish"):
             if len(selected_stats_files) != 1:
                 raise AssertionError(
-                    "expected exactly one rank 0 final CSV after publication, "
+                    "expected exactly one complete rank 0 final CSV, "
                     f"got {len(selected_stats_files)}"
-                )
-            if selected_temporary_stats_files:
-                raise AssertionError(
-                    "rank 0 temporary CSV remained after atomic publication"
                 )
             if selected_stats_size <= 0:
                 raise AssertionError("rank 0 final CSV was empty")
-            if selected_stats_fields != expected_fields:
+            if selected_stats_fields != STATS_FIELDS:
                 raise AssertionError(
                     "rank 0 final CSV had an incomplete or unexpected header: "
                     f"{selected_stats_fields!r}"
@@ -937,14 +1086,16 @@ def main():
     if (not report_signal_requested and
             args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
+            not intel_default_launcher_allowed and
             returncode != 0):
         raise AssertionError(f"{args.mode} run returned {returncode}")
 
     if report_signal_requested:
+        outcome = "continued" if report_signal_continued else "terminated"
         print(
             "mpi_report_signal_atomicity_ok "
             f"phase={args.report_signal_phase} "
-            f"signal={args.report_signal} rc={returncode}"
+            f"signal={args.report_signal} outcome={outcome} rc={returncode}"
         )
         return 0
 
