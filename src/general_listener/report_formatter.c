@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <float.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -55,6 +56,56 @@ peak_report_formatter_test_delay_aggregate_write(void)
                   delay_ms);
     while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
     }
+}
+
+static void
+peak_report_formatter_test_signal_publication_phase(const char* phase)
+{
+    const char* configured_phase =
+        getenv("PEAK_TEST_REPORT_SIGNAL_PHASE");
+    const char* signal_text = getenv("PEAK_TEST_REPORT_SIGNAL");
+    const char* rank_text = getenv("PEAK_TEST_REPORT_SIGNAL_RANK");
+    char* end = NULL;
+    long configured_rank = 0;
+    long current_rank = peak_general_listener_mpi_env_rank();
+    int signal_number;
+
+    if (configured_phase == NULL || signal_text == NULL ||
+        strcmp(configured_phase, phase) != 0) {
+        return;
+    }
+    if (rank_text != NULL && rank_text[0] != '\0') {
+        errno = 0;
+        configured_rank = strtol(rank_text, &end, 10);
+        if (errno != 0 || end == rank_text || *end != '\0' ||
+            configured_rank < 0) {
+            return;
+        }
+    }
+    if (current_rank < 0) {
+        current_rank = 0;
+    }
+    if (current_rank != configured_rank) {
+        return;
+    }
+    if (strcmp(signal_text, "TERM") == 0 ||
+        strcmp(signal_text, "SIGTERM") == 0 ||
+        strcmp(signal_text, "15") == 0) {
+        signal_number = SIGTERM;
+    } else if (strcmp(signal_text, "KILL") == 0 ||
+               strcmp(signal_text, "SIGKILL") == 0 ||
+               strcmp(signal_text, "9") == 0) {
+        signal_number = SIGKILL;
+    } else {
+        return;
+    }
+
+    peak_log_info("[peak] Test hook delivering signal %d on rank %ld at report phase %s\n",
+                  signal_number,
+                  current_rank,
+                  phase);
+    (void)fflush(stderr);
+    (void)kill(getpid(), signal_number);
 }
 #endif
 
@@ -568,12 +619,24 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         success = false;
         failure_errno = errno;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (success) {
+        peak_report_formatter_test_signal_publication_phase(
+            "before-publish");
+    }
+#endif
     if (success) {
         if (rename(temp_csv, out_csv) != 0) {
             success = false;
             failure_errno = errno;
         }
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (success) {
+        peak_report_formatter_test_signal_publication_phase(
+            "after-publish");
+    }
+#endif
     if (!success) {
         (void)unlink(temp_csv);
         peak_log_warn("[peak] failed to publish complete stats csv '%s': %s; "

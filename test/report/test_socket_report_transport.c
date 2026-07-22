@@ -371,6 +371,14 @@ check_slurm_host_parser(void)
                "c[001-004]", host, sizeof(host)) ||
                    strcmp(host, "c001") != 0 ||
            !peak_general_listener_test_first_slurm_host(
+               "c101-063,c102-[161-162],c103-[001-004]",
+               host,
+               sizeof(host)) ||
+                   strcmp(host, "c101-063") != 0 ||
+           !peak_general_listener_test_first_slurm_host(
+               "c001,c[002-004]", host, sizeof(host)) ||
+                   strcmp(host, "c001") != 0 ||
+           !peak_general_listener_test_first_slurm_host(
                "node[007,009]", host, sizeof(host)) ||
                    strcmp(host, "node007") != 0 ||
            !peak_general_listener_test_first_slurm_host(
