@@ -23,8 +23,10 @@
  * the MPI-runtime/launcher-aware clean-exit protocol; a PEAK-owned collective
  * cannot replace that protocol. Intel MPI 2019 is a compatibility exception:
  * PEAK skips its crash-prone hwloc finalizer by default after the release gate.
- * Output aggregation selects only the report transport; socket output uses
- * the same pre-finalize report ordering by default.
+ * On the default report path, rank-local and socket CPU output is published
+ * before the MPI finalize-participation proof; MPI aggregate output remains
+ * proof-first. Every healthy path still completes the common post-publication
+ * release gate before deciding whether to enter the real finalizer.
  * `PEAK_MPI_FINALIZE_POLICY=defer` instead attempts the real finalizer
  * immediately and leaves PEAK profiling/output until process exit. Unless
  * `PEAK_MPI_REAL_FINALIZE=0`, it therefore bypasses the Intel MPI 2019

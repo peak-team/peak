@@ -23,6 +23,7 @@
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
+#include "internal/general_listener/runtime_config.h"
 #include "internal/jit_provider.h"
 #include "logging.h"
 #include "pthread_listener.h"
@@ -622,23 +623,84 @@ peak_fini_impl(void)
     int exit_status =
         atomic_load_explicit(&peak_exit_status_value, memory_order_acquire);
     int abnormal_exit = exit_status_known == 2 && exit_status != 0;
-    /*
-     * Error exits often happen while only a subset of ranks is unwinding. Do
-     * not let PEAK introduce MPI collectives there.
-     */
     PeakOutputAggregationMode aggregation_mode =
         found_MPI ? peak_output_aggregation_mode()
                   : PEAK_OUTPUT_AGGREGATION_LOCAL;
-    int mpi_runtime_can_collect =
-        found_MPI && peak_mpi_runtime_allows_collectives();
+    int local_requested_mpi_finalize =
+        mpi_interceptor_finalize_was_requested();
+    int mpi_collectives_failed_closed =
+        peak_mpi_teardown_collectives_failed_closed();
+    gboolean report_write_succeeded = FALSE;
+    gboolean used_mpi_aggregation = FALSE;
+    int report_published = 0;
+    PeakOutputAggregationMode output_mode = PEAK_OUTPUT_AGGREGATION_LOCAL;
     int mpi_log_rank = 1;
+
+    /*
+     * Rank-local and strict socket output do not need MPI. Publish their
+     * immutable snapshots before the all-rank finalize-participation proof so
+     * a missing rank cannot consume the entire report window. Error exits and
+     * a previously poisoned collective path also publish local evidence
+     * without touching MPI. The MPI backend keeps its existing proof-first
+     * ordering.
+     */
+    int publish_before_finalize_proof =
+        mpi_finalize_path &&
+        (aggregation_mode != PEAK_OUTPUT_AGGREGATION_MPI ||
+         abnormal_exit ||
+         mpi_collectives_failed_closed);
+    if (publish_before_finalize_proof) {
+        long env_rank = -1;
+        long env_size = -1;
+        if (peak_general_listener_mpi_env_rank_size(&env_rank, &env_size)) {
+            (void)env_size;
+            mpi_log_rank = env_rank == 0;
+        }
+
+        output_mode =
+            aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
+            !abnormal_exit &&
+            !mpi_collectives_failed_closed ?
+                PEAK_OUTPUT_AGGREGATION_SOCKET :
+                PEAK_OUTPUT_AGGREGATION_LOCAL;
+        if (found_MPI && abnormal_exit &&
+            local_requested_mpi_finalize && mpi_log_rank) {
+            g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
+                       exit_status);
+        } else if (found_MPI &&
+                   output_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
+                   mpi_log_rank) {
+            peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI teardown proof, MPI finalization, or process exit\n");
+        } else if (found_MPI &&
+                   aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL &&
+                   mpi_log_rank) {
+            peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI teardown proof, MPI finalization, or process exit\n");
+        } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
+            g_printerr("[peak] PEAK MPI collective path was already failed closed; writing rank-local output without touching MPI again\n");
+        }
+        used_mpi_aggregation =
+            peak_general_listener_print_with_mpi_job_policy(
+                output_mode,
+                TRUE,
+                &report_write_succeeded);
+        report_published = 1;
+    }
+
+    /*
+     * Error exits often happen while only a subset of ranks is unwinding, and
+     * a failed-closed request may still own MPI buffers. Do not make any MPI
+     * call in either case.
+     */
+    int mpi_runtime_can_collect =
+        found_MPI &&
+        !abnormal_exit &&
+        !mpi_collectives_failed_closed &&
+        peak_mpi_runtime_allows_collectives();
     if (mpi_runtime_can_collect) {
         int mpi_rank = 0;
         MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
         mpi_log_rank = mpi_rank == 0;
     }
-    int local_requested_mpi_finalize =
-        mpi_interceptor_finalize_was_requested();
     int all_ranks_requested_mpi_finalize = 0;
     int need_mpi_finalize_proof =
         mpi_finalize_path ||
@@ -651,22 +713,26 @@ peak_fini_impl(void)
             peak_mpi_teardown_all_ranks_requested_finalize(
                 local_requested_mpi_finalize ? 1 : 0);
     }
-    int mpi_collectives_failed_closed =
+    mpi_collectives_failed_closed =
         peak_mpi_teardown_collectives_failed_closed();
     int use_mpi_collective_output =
+        !report_published &&
         aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
         mpi_runtime_can_collect &&
         !abnormal_exit &&
         !mpi_collectives_failed_closed &&
         all_ranks_requested_mpi_finalize;
     int use_socket_output =
+        !report_published &&
         aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
         !abnormal_exit &&
         !mpi_collectives_failed_closed;
-    PeakOutputAggregationMode output_mode =
-        use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
-        use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
-        PEAK_OUTPUT_AGGREGATION_LOCAL;
+    if (!report_published) {
+        output_mode =
+            use_mpi_collective_output ? PEAK_OUTPUT_AGGREGATION_MPI :
+            use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
+            PEAK_OUTPUT_AGGREGATION_LOCAL;
+    }
     int base_real_mpi_finalize_allowed =
         mpi_finalize_path &&
         mpi_runtime_can_collect &&
@@ -679,30 +745,45 @@ peak_fini_impl(void)
             peak_mpi_real_finalize_config_allowed(
                 &intel_2019_finalize_workaround) : 0;
     int allow_real_mpi_finalize = 0;
-    if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
-        g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
-                   exit_status);
-    } else if (found_MPI && use_mpi_collective_output && mpi_log_rank) {
-        peak_log_info("[peak] PMPI_Finalize was observed on every rank; writing MPI-reduced output before MPI finalization or process exit\n");
-    } else if (found_MPI && use_socket_output && mpi_log_rank) {
-        peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI finalization or process exit\n");
-    } else if (found_MPI && aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
-        peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI finalization or process exit\n");
-    } else if (found_MPI && !mpi_runtime_can_collect && mpi_log_rank) {
-        g_printerr("[peak] MPI runtime is not in an output-safe state; writing rank-local output before process exit\n");
-    } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
-        g_printerr("[peak] PEAK MPI collective proof failed or timed out; writing rank-local output without touching MPI again\n");
-    } else if (found_MPI &&
-               aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
-               !all_ranks_requested_mpi_finalize &&
-               mpi_log_rank) {
-        g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output before process exit\n");
-    } else if (found_MPI && output_mode == PEAK_OUTPUT_AGGREGATION_LOCAL && mpi_log_rank) {
-        g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
+    if (!report_published) {
+        if (found_MPI && abnormal_exit &&
+            local_requested_mpi_finalize && mpi_log_rank) {
+            g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
+                       exit_status);
+        } else if (found_MPI && use_mpi_collective_output && mpi_log_rank) {
+            peak_log_info("[peak] PMPI_Finalize was observed on every rank; writing MPI-reduced output before MPI finalization or process exit\n");
+        } else if (found_MPI && use_socket_output && mpi_log_rank) {
+            peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI finalization or process exit\n");
+        } else if (found_MPI &&
+                   aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL &&
+                   mpi_log_rank) {
+            peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI finalization or process exit\n");
+        } else if (found_MPI &&
+                   aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+                   !local_requested_mpi_finalize &&
+                   mpi_log_rank) {
+            g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output before process exit\n");
+        } else if (found_MPI && !mpi_runtime_can_collect && mpi_log_rank) {
+            g_printerr("[peak] MPI runtime is not in an output-safe state; writing rank-local output before process exit\n");
+        } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
+            g_printerr("[peak] PEAK MPI collective proof failed or timed out; writing rank-local output without touching MPI again\n");
+        } else if (found_MPI &&
+                   aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+                   !all_ranks_requested_mpi_finalize &&
+                   mpi_log_rank) {
+            g_printerr("[peak] PMPI_Finalize was not observed on every rank; writing rank-local output before process exit\n");
+        } else if (found_MPI &&
+                   output_mode == PEAK_OUTPUT_AGGREGATION_LOCAL &&
+                   mpi_log_rank) {
+            g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
+        }
+        used_mpi_aggregation =
+            peak_general_listener_print_with_mpi_job_policy(
+                output_mode,
+                found_MPI ? TRUE : FALSE,
+                &report_write_succeeded);
+        report_published = 1;
     }
-    gboolean report_write_succeeded = FALSE;
-    gboolean used_mpi_aggregation = peak_general_listener_print(
-        output_mode, &report_write_succeeded);
     /*
      * Keep this check adjacent to PEAK output. If the payload reducer started
      * a nonblocking collective and then failed or timed out, the request has no

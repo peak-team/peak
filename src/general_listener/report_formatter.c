@@ -67,8 +67,14 @@ peak_report_formatter_test_signal_publication_phase(const char* phase)
     const char* rank_text = getenv("PEAK_TEST_REPORT_SIGNAL_RANK");
     char* end = NULL;
     long configured_rank = 0;
-    long current_rank = peak_general_listener_mpi_env_rank();
+    long current_rank = -1;
+    long current_size = -1;
     int signal_number;
+
+    (void)peak_general_listener_mpi_env_rank_size(
+        &current_rank,
+        &current_size);
+    (void)current_size;
 
     if (configured_phase == NULL || signal_text == NULL ||
         strcmp(configured_phase, phase) != 0) {
@@ -195,7 +201,8 @@ peak_report_formatter_sanitized_hostname(
 }
 
 static char*
-peak_report_formatter_csv_path(bool rank_local)
+peak_report_formatter_csv_path(bool rank_local,
+                               bool require_host_suffix)
 {
     const char* env_path = getenv("PEAK_STATSLOG_PATH");
     const char* base = env_path != NULL && env_path[0] != '\0' ?
@@ -212,15 +219,16 @@ peak_report_formatter_csv_path(bool rank_local)
     char* path;
 
     if (rank_local) {
-        world_size = peak_general_listener_mpi_env_size();
-        if (world_size > 1) {
-            world_rank = peak_general_listener_mpi_env_rank();
-            if (world_rank >= 0 && world_rank < world_size) {
-                suffix = PEAK_REPORT_SUFFIX_RANK;
-            } else {
-                peak_report_formatter_sanitized_hostname(hostname);
-                suffix = PEAK_REPORT_SUFFIX_HOSTNAME;
-            }
+        bool have_pair = peak_general_listener_mpi_env_rank_size(
+            &world_rank,
+            &world_size);
+        if (have_pair && world_size > 1) {
+            suffix = PEAK_REPORT_SUFFIX_RANK;
+        } else if (!have_pair &&
+                   (require_host_suffix ||
+                    peak_general_listener_mpi_env_world_metadata_present())) {
+            peak_report_formatter_sanitized_hostname(hostname);
+            suffix = PEAK_REPORT_SUFFIX_HOSTNAME;
         }
     }
 
@@ -524,7 +532,8 @@ peak_report_formatter_summarize(const PeakReportSnapshot* snapshot)
 
 static bool
 peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
-                                       bool rank_local)
+                                       bool rank_local,
+                                       bool require_host_suffix)
 {
     static const char header[] =
         "function,"
@@ -557,7 +566,9 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     }
 #endif
 
-    out_csv = peak_report_formatter_csv_path(rank_local);
+    out_csv = peak_report_formatter_csv_path(
+        rank_local,
+        require_host_suffix);
     if (out_csv == NULL) {
         peak_log_warn("[peak] failed to allocate stats csv path\n");
         return false;
@@ -652,14 +663,21 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
 bool
 peak_report_formatter_write_csv(const PeakReportSnapshot* snapshot)
 {
-    return peak_report_formatter_write_csv_scoped(snapshot, false);
+    return peak_report_formatter_write_csv_scoped(snapshot, false, false);
 }
 
 bool
 peak_report_formatter_write_rank_local_csv(
     const PeakReportSnapshot* snapshot)
 {
-    return peak_report_formatter_write_csv_scoped(snapshot, true);
+    return peak_report_formatter_write_csv_scoped(snapshot, true, false);
+}
+
+bool
+peak_report_formatter_write_rank_local_csv_host_disambiguated(
+    const PeakReportSnapshot* snapshot)
+{
+    return peak_report_formatter_write_csv_scoped(snapshot, true, true);
 }
 
 bool

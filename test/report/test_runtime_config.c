@@ -16,11 +16,14 @@ static const char* const peak_test_environment_names[] = {
     "PMI_SIZE",
     "PMIX_SIZE",
     "OMPI_COMM_WORLD_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+    "I_MPI_SIZE",
     "SLURM_NTASKS",
     "PMI_RANK",
     "PMIX_RANK",
     "OMPI_COMM_WORLD_RANK",
     "MV2_COMM_WORLD_RANK",
+    "I_MPI_RANK",
     "SLURM_PROCID",
     "PEAK_TEXT_OUTPUT",
     "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK",
@@ -243,6 +246,51 @@ check_world_rank_precedence(void)
 }
 
 static int
+check_world_rank_size_pairs(void)
+{
+    long rank = 99;
+    long size = 99;
+
+    if (peak_general_listener_mpi_env_rank_size(&rank, &size) ||
+        rank != 99 || size != 99) {
+        return 1;
+    }
+
+    setenv("PMI_RANK", "2", 1);
+    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+        return 1;
+    }
+    setenv("PMI_SIZE", "8", 1);
+    if (!peak_general_listener_mpi_env_rank_size(&rank, &size) ||
+        rank != 2 || size != 8) {
+        return 1;
+    }
+
+    setenv("OMPI_COMM_WORLD_RANK", "2", 1);
+    setenv("OMPI_COMM_WORLD_SIZE", "8", 1);
+    if (!peak_general_listener_mpi_env_rank_size(&rank, &size) ||
+        rank != 2 || size != 8) {
+        return 1;
+    }
+    setenv("OMPI_COMM_WORLD_RANK", "3", 1);
+    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+        return 1;
+    }
+
+    setenv("OMPI_COMM_WORLD_RANK", "2", 1);
+    setenv("MV2_COMM_WORLD_RANK", "8", 1);
+    setenv("MV2_COMM_WORLD_SIZE", "8", 1);
+    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+        return 1;
+    }
+
+    unsetenv("MV2_COMM_WORLD_RANK");
+    unsetenv("MV2_COMM_WORLD_SIZE");
+    setenv("PMI_SIZE", "bad", 1);
+    return peak_general_listener_mpi_env_rank_size(&rank, &size);
+}
+
+static int
 check_output_policies(void)
 {
     if (!peak_general_listener_should_print_text(false) ||
@@ -288,6 +336,12 @@ main(void)
 
     clear_test_environment();
     if (check_world_rank_precedence()) {
+        fputs("runtime_config_test_failed\n", stderr);
+        return 1;
+    }
+
+    clear_test_environment();
+    if (check_world_rank_size_pairs()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;
     }

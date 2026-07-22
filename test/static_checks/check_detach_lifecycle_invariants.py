@@ -307,7 +307,19 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     shutdown_failure = fini.find(
         "if (!dlopen_shutdown_flushed)", pinned_shutdown
     )
-    report = fini.find("peak_general_listener_print(", pinned_shutdown)
+    early_report = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy(",
+        pinned_shutdown,
+    )
+    regular_report = fini.find(
+        "peak_general_listener_print(",
+        pinned_shutdown,
+    )
+    report_positions = [
+        position for position in (early_report, regular_report)
+        if position != -1
+    ]
+    report = min(report_positions) if report_positions else -1
     require(pinned_shutdown != -1 and shutdown_failure != -1 and report != -1 and
             pinned_shutdown < shutdown_failure < report,
             "MPI pinned-listener path must drain dlopen callbacks before report metadata is freed")
@@ -548,7 +560,10 @@ def check_final_report_snapshot_order(repo_root):
     print_mpi_maxima = extract_function(
         formatter, "peak_report_formatter_write_rank_maxima"
     )
-    print_entry = extract_function(general, "peak_general_listener_print")
+    print_entry = extract_function(
+        general,
+        "peak_general_listener_print_with_mpi_job_policy",
+    )
     local_ranks = extract_function(
         runtime_config, "peak_general_listener_local_mpi_ranks"
     )
@@ -634,6 +649,8 @@ def check_final_report_snapshot_order(repo_root):
     require("PeakReportSnapshot* snapshot" in write_report and
             "peak_report_formatter_write_rank_local_csv(snapshot)" in
                 write_report and
+            "peak_report_formatter_write_rank_local_csv_host_disambiguated(" in
+                write_report and
             "peak_report_formatter_write_csv(snapshot)" in write_report and
             "peak_report_formatter_write_text(snapshot, &options)" in
                 write_report,
@@ -668,10 +685,20 @@ def check_final_report_snapshot_order(repo_root):
             "peak_general_listener_local_report_overhead(sum_num_calls)" in print_entry and
             "peak_general_listener_build_report_snapshot(" in print_entry and
             "&local_report" in print_entry and
-            "local_snapshot, TRUE, TRUE)" in print_entry,
+            "local_snapshot, TRUE, TRUE, active_mpi_job)" in print_entry,
             "local final output must consume the frozen report snapshot")
 
-    report_position = fini.find("peak_general_listener_print(")
+    early_report_position = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy("
+    )
+    proof_position = fini.find(
+        "peak_mpi_teardown_all_ranks_requested_finalize("
+    )
+    regular_report_position = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy(",
+        early_report_position + 1,
+    )
+    report_position = early_report_position
     cuda_position = fini.find("cuda_interceptor_print(", report_position)
     finalize_permission_position = fini.find(
         "mpi_interceptor_set_real_finalize_allowed(", report_position
@@ -679,12 +706,14 @@ def check_final_report_snapshot_order(repo_root):
     report_release_position = fini.find(
         "peak_mpi_teardown_complete_report_release(", report_position
     )
-    require(report_position != -1 and cuda_position != -1 and
+    require(early_report_position != -1 and proof_position != -1 and
+            regular_report_position != -1 and cuda_position != -1 and
             report_release_position != -1 and
             finalize_permission_position != -1 and
-            report_position < cuda_position < report_release_position <
-                finalize_permission_position,
-            "CPU/CUDA output and all-rank report release must precede the real-finalize decision")
+            early_report_position < proof_position <
+                regular_report_position < cuda_position <
+                report_release_position < finalize_permission_position,
+            "local/socket output must precede the finalize proof while MPI output, CUDA output, and release remain ordered before the real-finalize decision")
     require("fflush(stderr)" in fini and
             fini.find("fflush(stderr)", cuda_position) <
                 report_release_position,
@@ -924,7 +953,10 @@ def check_stop_window_accounting_sidecar(repo_root):
         general,
         "peak_general_listener_begin_report_marker_swap",
     )
-    print_entry = extract_function(general, "peak_general_listener_print")
+    print_entry = extract_function(
+        general,
+        "peak_general_listener_print_with_mpi_job_policy",
+    )
     scalar_reattach = extract_function(
         general,
         "peak_general_controller_reattach_if_requested_unlocked",

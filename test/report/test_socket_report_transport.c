@@ -23,11 +23,14 @@ clear_rank_environment(void)
         "PMI_SIZE",
         "PMIX_SIZE",
         "OMPI_COMM_WORLD_SIZE",
+        "MV2_COMM_WORLD_SIZE",
+        "I_MPI_SIZE",
         "SLURM_NTASKS",
         "PMI_RANK",
         "PMIX_RANK",
         "OMPI_COMM_WORLD_RANK",
         "MV2_COMM_WORLD_RANK",
+        "I_MPI_RANK",
         "SLURM_PROCID",
         NULL,
     };
@@ -363,6 +366,46 @@ check_invalid_output_pointers_are_cleared(void)
 }
 
 static int
+check_required_rank_metadata(void)
+{
+    PeakReportSnapshot* local = fixture_snapshot(0, false);
+    PeakReportSnapshot* aggregate = NULL;
+    PeakSocketReportSession* session = NULL;
+    PeakSocketReportStatus status;
+    int result = 0;
+
+    clear_rank_environment();
+    if (local == NULL) {
+        return 1;
+    }
+    status = peak_socket_report_transport_begin(
+        local,
+        PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED,
+        &session,
+        &aggregate);
+    if (status != PEAK_SOCKET_REPORT_FAILED || session != NULL ||
+        aggregate != NULL) {
+        result = 1;
+    }
+
+    (void)setenv("PMI_RANK", "0", 1);
+    (void)setenv("PMI_SIZE", "1", 1);
+    status = peak_socket_report_transport_begin(
+        local,
+        PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED,
+        &session,
+        &aggregate);
+    if (status != PEAK_SOCKET_REPORT_SINGLE_READY || session != NULL ||
+        aggregate == NULL || aggregate->rank_count != 1) {
+        result = 1;
+    }
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    clear_rank_environment();
+    return result;
+}
+
+static int
 check_slurm_host_parser(void)
 {
     char host[64];
@@ -396,6 +439,7 @@ main(void)
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     if (check_slurm_host_parser() != 0 ||
         check_single_process_clone() != 0 ||
+        check_required_rank_metadata() != 0 ||
         check_invalid_output_pointers_are_cleared() != 0 ||
         run_two_rank_case(base_port, TEST_ROOT_COMMIT, false) != 0 ||
         run_two_rank_case(base_port + 2, TEST_ROOT_ABORT, false) != 0 ||

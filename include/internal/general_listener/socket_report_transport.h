@@ -17,6 +17,8 @@ typedef enum {
     PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV = 0,
     /** Use launcher metadata only; this mode never calls MPI. */
     PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+    /** Require launcher metadata and never assume an unlabelled singleton. */
+    PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED,
 } PeakSocketReportRankSource;
 
 /** Outcome of the blocking first phase of socket report aggregation. */

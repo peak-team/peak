@@ -1085,24 +1085,20 @@ peak_socket_reduce_rank_size(int* rank_out,
     (void)rank_source;
 #endif
 
-    long env_size = peak_general_listener_mpi_env_size();
-    long env_rank = peak_general_listener_mpi_env_rank();
+    long env_size = -1;
+    long env_rank = -1;
 
-    if (env_size > 1) {
-        if (env_rank >= 0 && env_rank < env_size) {
-            *rank_out = (int)env_rank;
-            *size_out = (int)env_size;
-            return true;
+    if (!peak_general_listener_mpi_env_rank_size(&env_rank, &env_size)) {
+        if (rank_source == PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED ||
+            peak_general_listener_mpi_env_world_metadata_present()) {
+            return false;
         }
-        return false;
+        *rank_out = 0;
+        *size_out = 1;
+        return true;
     }
-
-    if (env_rank > 0) {
-        return false;
-    }
-
-    *rank_out = 0;
-    *size_out = 1;
+    *rank_out = (int)env_rank;
+    *size_out = (int)env_size;
     return true;
 }
 
@@ -1293,7 +1289,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     }
     if (!peak_socket_snapshot_is_complete(local) ||
         (rank_source != PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV &&
-         rank_source != PEAK_SOCKET_REPORT_RANK_ENV_ONLY)) {
+         rank_source != PEAK_SOCKET_REPORT_RANK_ENV_ONLY &&
+         rank_source != PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED)) {
         return PEAK_SOCKET_REPORT_FAILED;
     }
 
