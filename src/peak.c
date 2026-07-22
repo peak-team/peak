@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +64,9 @@
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
+#ifdef PEAK_ENABLE_TEST_HOOKS
+#define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
+#endif
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -297,14 +301,56 @@ peak_output_aggregation_mode_from_value(const char* name,
 }
 
 static gboolean
-peak_mpi_real_finalize_config_allowed(void)
+peak_mpi_runtime_is_intel_2019(void)
+{
+    char version[MPI_MAX_LIBRARY_VERSION_STRING] = { 0 };
+    int version_len = 0;
+    const char* text = NULL;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    text = getenv(PEAK_TEST_MPI_LIBRARY_VERSION_ENV);
+    if (text != NULL && text[0] == '\0') {
+        text = NULL;
+    }
+#endif
+    if (text == NULL) {
+        if (MPI_Get_library_version(version, &version_len) != MPI_SUCCESS) {
+            return FALSE;
+        }
+        if (version_len < 0) {
+            version_len = 0;
+        }
+        if (version_len >= (int)sizeof(version)) {
+            version_len = (int)sizeof(version) - 1;
+        }
+        version[version_len] = '\0';
+        text = version;
+    }
+
+    return (strstr(text, "Intel(R) MPI") != NULL ||
+            strstr(text, "Intel MPI") != NULL) &&
+           strstr(text, "2019") != NULL;
+}
+
+static gboolean
+peak_mpi_real_finalize_config_allowed(
+    gboolean* intel_2019_workaround)
 {
     const char* value = getenv(PEAK_MPI_REAL_FINALIZE_ENV);
 
-    if (value == NULL || value[0] == '\0') {
-        return TRUE;
+    if (intel_2019_workaround != NULL) {
+        *intel_2019_workaround = FALSE;
     }
-    return peak_env_value_truthy(value);
+    if (value != NULL && value[0] != '\0') {
+        return peak_env_value_truthy(value);
+    }
+    if (peak_mpi_runtime_is_intel_2019()) {
+        if (intel_2019_workaround != NULL) {
+            *intel_2019_workaround = TRUE;
+        }
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static PeakOutputAggregationMode
@@ -627,12 +673,12 @@ peak_fini_impl(void)
         !abnormal_exit &&
         !mpi_collectives_failed_closed &&
         all_ranks_requested_mpi_finalize;
+    gboolean intel_2019_finalize_workaround = FALSE;
     int real_mpi_finalize_config_allowed =
         base_real_mpi_finalize_allowed ?
-            peak_mpi_real_finalize_config_allowed() : 0;
-    int allow_real_mpi_finalize =
-        base_real_mpi_finalize_allowed &&
-        real_mpi_finalize_config_allowed;
+            peak_mpi_real_finalize_config_allowed(
+                &intel_2019_finalize_workaround) : 0;
+    int allow_real_mpi_finalize = 0;
     if (found_MPI && abnormal_exit && local_requested_mpi_finalize && mpi_log_rank) {
         g_printerr("[peak] PMPI_Finalize was requested before nonzero exit status %d; skipping aggregate output\n",
                    exit_status);
@@ -689,21 +735,51 @@ peak_fini_impl(void)
     #else
         (void)used_mpi_aggregation;
     #endif
+    bool all_reports_succeeded = false;
+    bool all_real_mpi_finalize_config_allowed = false;
+    int report_release_protocol_completed = 0;
+    if (base_real_mpi_finalize_allowed && !mpi_reducer_failed_closed) {
+        report_release_protocol_completed =
+            peak_mpi_teardown_complete_report_release(
+                report_write_succeeded ? 1 : 0,
+                real_mpi_finalize_config_allowed ? 1 : 0,
+                &all_reports_succeeded,
+                &all_real_mpi_finalize_config_allowed);
+        if (mpi_log_rank) {
+            if (report_release_protocol_completed) {
+                peak_log_info("[peak] All-rank report publication release completed: all_reports_succeeded=%d all_real_finalize_allowed=%d\n",
+                              all_reports_succeeded ? 1 : 0,
+                              all_real_mpi_finalize_config_allowed ? 1 : 0);
+            } else {
+                g_printerr("[peak] All-rank report publication release failed; skipping real PMPI_Finalize and avoiding later MPI teardown calls\n");
+            }
+        }
+    }
+    allow_real_mpi_finalize =
+        base_real_mpi_finalize_allowed &&
+        report_release_protocol_completed &&
+        all_real_mpi_finalize_config_allowed;
     if (found_MPI && mpi_finalize_path) {
         mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
         if (mpi_log_rank) {
             if (allow_real_mpi_finalize) {
-                if (report_write_succeeded) {
+                if (all_reports_succeeded) {
                     peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
                 } else {
-                    g_printerr("[peak] PEAK report publication failed on rank 0; returning to real PMPI_Finalize for clean MPI teardown\n");
+                    g_printerr("[peak] PEAK report publication failed on at least one rank; returning to real PMPI_Finalize for clean MPI teardown\n");
                 }
             } else if (mpi_reducer_failed_closed) {
                 g_printerr("[peak] PEAK output reducer did not complete cleanly; skipping real PMPI_Finalize\n");
             } else if (!base_real_mpi_finalize_allowed) {
                 g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
+            } else if (!report_release_protocol_completed) {
+                g_printerr("[peak] Real PMPI_Finalize is not safe after report-release protocol failure; skipping real MPI finalizer\n");
+            } else if (intel_2019_finalize_workaround) {
+                peak_log_info("[peak] PEAK output release is complete; skipping real PMPI_Finalize for Intel MPI 2019 compatibility; set PEAK_MPI_REAL_FINALIZE=1 to override\n");
             } else if (!real_mpi_finalize_config_allowed) {
                 g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
+            } else if (!all_real_mpi_finalize_config_allowed) {
+                g_printerr("[peak] At least one rank disabled real PMPI_Finalize by runtime or environment policy; all ranks are skipping it\n");
             } else {
                 g_printerr("[peak] Real PMPI_Finalize is disabled by policy; skipping real MPI finalizer\n");
             }

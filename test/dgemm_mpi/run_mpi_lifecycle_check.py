@@ -16,6 +16,10 @@ FAIL_RE = re.compile(
     r"Caught signal|Segmentation fault|SIGSEGV|signal 11|"
     r"Fatal error|MPI_ABORT|MPI_Abort|MPII_finalize|ofi_cq_read|hwloc"
 )
+UNINTENDED_REPORT_SIGNAL_FATAL_RE = re.compile(
+    r"Segmentation fault|SIGSEGV|signal 11|"
+    r"MPII_finalize|ofi_cq_read|hwloc"
+)
 LAUNCHER_ABNORMAL_RE = re.compile(
     r"BAD TERMINATION|KILLED BY SIGNAL|exiting improperly|"
     r"mpiexec has exited due to process rank"
@@ -43,10 +47,47 @@ EXPECTED_NONZERO_RETURN_MODES = {
     "finalize-nonzero",
     "finalize-return-nonzero",
 }
+INTEL_MPI_ONLY_MODES = {
+    "finalize-clean-output-mpi-intel-default",
+    "finalize-clean-output-mpi-intel-real-finalize",
+}
+NON_INTEL_MPI_ONLY_MODES = {
+    "finalize-clean-output-mpi-real-finalize-default",
+    "finalize-clean-output-mpi-writer-fail",
+}
 
 
 def split_flags(value):
     return [flag for flag in shlex.split(value) if flag]
+
+
+def launcher_version_text(mpiexec):
+    try:
+        proc = subprocess.run(
+            [mpiexec, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout or ""
+
+
+def launcher_looks_like_intel_mpi(mpiexec):
+    if any(
+        os.environ.get(name)
+        for name in ("I_MPI_ROOT", "I_MPI_FABRICS", "I_MPI_HYDRA_BOOTSTRAP")
+    ):
+        return True
+    text = f"{mpiexec}\n{launcher_version_text(mpiexec)}"
+    return (
+        "Intel(R) MPI" in text or
+        "Intel MPI" in text or
+        "I_MPI" in text
+    )
 
 
 def terminate_process_group(proc, sig):
@@ -125,6 +166,9 @@ def parse_args():
             "finalize-clean-output-mpi",
             "finalize-clean-output-mpi-publish-before-root-return",
             "finalize-clean-output-mpi-reducer-fail",
+            "finalize-clean-output-mpi-writer-fail",
+            "finalize-clean-output-mpi-intel-default",
+            "finalize-clean-output-mpi-intel-real-finalize",
             "finalize-clean-output-mpi-real-finalize-default",
             "finalize-clean-output-mpi-real-finalize-explicit",
             "finalize-clean-output-local",
@@ -153,12 +197,47 @@ def parse_args():
     parser.add_argument("--include-finalize-target", action="store_true")
     parser.add_argument("--forbid-stats-function", action="append", default=[])
     parser.add_argument("--reducer-fail-label")
+    parser.add_argument(
+        "--report-signal-phase",
+        choices=["before-publish", "after-publish"],
+    )
+    parser.add_argument(
+        "--report-signal",
+        choices=["TERM", "KILL"],
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     nprocs = int(args.nprocs)
+    report_signal_requested = (
+        args.report_signal_phase is not None or
+        args.report_signal is not None
+    )
+    if ((args.report_signal_phase is None) !=
+            (args.report_signal is None)):
+        raise AssertionError(
+            "--report-signal-phase and --report-signal must be used together"
+        )
+    if report_signal_requested and args.mode != "finalize-clean-output-local":
+        raise AssertionError(
+            "report publication signals require finalize-clean-output-local"
+        )
+    if args.mode in INTEL_MPI_ONLY_MODES:
+        if not launcher_looks_like_intel_mpi(args.mpiexec):
+            print(
+                f"mpi_lifecycle_check_ok mode={args.mode} "
+                "skipped=needs-intel-mpi"
+            )
+            return 0
+    elif args.mode in NON_INTEL_MPI_ONLY_MODES:
+        if launcher_looks_like_intel_mpi(args.mpiexec):
+            print(
+                f"mpi_lifecycle_check_ok mode={args.mode} "
+                "skipped=needs-non-intel-mpi"
+            )
+            return 0
     if args.mode.startswith("subset-") and nprocs < 2:
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
@@ -208,6 +287,7 @@ def main():
     forbidden_output = []
     done_file = None
     verify_finalize_return_publication = False
+    force_stats_path_failure = False
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -250,7 +330,8 @@ def main():
         app_args.append("finalize-publish-before-root-return")
         expected = "PMPI_Finalize was observed on every rank"
         expected_extra.append(
-            "PEAK output is complete; returning to real PMPI_Finalize"
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
         )
         expected_extra.append(
             "Test hook delaying aggregate CSV publication by 750 ms"
@@ -279,6 +360,63 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 1
         verify_socket_maxima = True
+    elif args.mode == "finalize-clean-output-mpi-writer-fail":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
+        app_args.append("finalize-then-exit0")
+        expected = "failed to create temporary stats csv"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=0"
+        )
+        expected_extra.append(
+            "PEAK report publication failed on at least one rank; "
+            "returning to real PMPI_Finalize for clean MPI teardown"
+        )
+        forbidden_output.append(
+            "All-rank report publication release failed"
+        )
+        forbidden_output.append(
+            "skipping real PMPI_Finalize for Intel MPI 2019 compatibility"
+        )
+        expected_peak_tables = 1
+        expected_stats_files = 0
+        force_stats_path_failure = True
+    elif args.mode == "finalize-clean-output-mpi-intel-default":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        app_args.append("finalize-then-exit0")
+        expected = (
+            "skipping real PMPI_Finalize for Intel MPI 2019 compatibility"
+        )
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
+        expected_extra.append("PMPI_Finalize was observed on every rank")
+        forbidden_output.append(
+            "PEAK output is complete; returning to real PMPI_Finalize"
+        )
+        expected_peak_tables = 0
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-intel-real-finalize":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
+        env["PEAK_MPI_REAL_FINALIZE"] = "1"
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        app_args.append("finalize-then-exit0")
+        expected = "PEAK output is complete; returning to real PMPI_Finalize"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
+        expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_peak_tables = 0
+        expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-real-finalize-default":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
@@ -309,6 +447,10 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
         expected_peak_tables = 0
         expected_stats_files = nprocs
     elif args.mode == "finalize-clean-output-socket-bad-host-no-fallback":
@@ -318,6 +460,10 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"] = "0"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=0"
+        )
         expected_peak_tables = 0
         expected_stats_files = 0
     elif args.mode == "finalize-clean-output-socket-release-fail":
@@ -326,6 +472,10 @@ def main():
         env["PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"] = "1"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation release failure requested by test hook"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
         # Root has already atomically published and printed the complete
         # aggregate before the injected release failure. Preserve that report;
         # every rank then emits a uniquely named local fallback.
@@ -337,6 +487,10 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
         app_args.append("finalize-token-mismatch-then-exit0")
         expected = "Socket aggregation received"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
         expected_peak_tables = 0
         expected_stats_files = nprocs
     elif args.mode == "finalize-clean-output-socket-token-mismatch-no-fallback":
@@ -345,6 +499,10 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"] = "0"
         app_args.append("finalize-token-mismatch-then-exit0")
         expected = "Socket aggregation received"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=0"
+        )
         expected_peak_tables = 0
         expected_stats_files = 0
     elif args.mode == "finalize-socket-post-work":
@@ -436,6 +594,21 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 1
 
+    if report_signal_requested:
+        signal_number = 15 if args.report_signal == "TERM" else 9
+        env["PEAK_TEST_REPORT_SIGNAL_PHASE"] = args.report_signal_phase
+        env["PEAK_TEST_REPORT_SIGNAL"] = args.report_signal
+        env["PEAK_TEST_REPORT_SIGNAL_RANK"] = "0"
+        expected_extra.append(
+            f"Test hook delivering signal {signal_number} on rank 0 at "
+            f"report phase {args.report_signal_phase}"
+        )
+        # The selected rank is intentionally terminated in its CSV writer.
+        # Other ranks may or may not publish before the MPI launcher tears
+        # down the job, so only rank 0 has a deterministic file expectation.
+        expected_peak_tables = 0
+        expected_stats_files = None
+
     if args.require_detach_trace:
         # The strict-detach lifecycle variant intentionally uses an extremely
         # low detach threshold. A correct run may physically detach before any
@@ -461,7 +634,12 @@ def main():
         prefix=f"peak-mpi-lifecycle-{args.mode}-",
         dir=os.getcwd(),
     ) as stats_dir:
-        stats_prefix = str(Path(stats_dir) / "peak-stats")
+        stats_prefix_path = Path(stats_dir) / "peak-stats"
+        if force_stats_path_failure:
+            blocked_component = Path(stats_dir) / "not-a-directory"
+            blocked_component.write_text("regular file\n", encoding="utf-8")
+            stats_prefix_path = blocked_component / "peak-stats"
+        stats_prefix = str(stats_prefix_path)
         env["PEAK_STATSLOG_PATH"] = stats_prefix
         if verify_finalize_return_publication:
             env["PEAK_MPI_FINALIZE_ENTER_MARKER_PREFIX"] = str(
@@ -501,6 +679,29 @@ def main():
         for path in stats_files:
             with path.open(newline="", encoding="utf-8", errors="replace") as handle:
                 stats_rows.extend(csv.DictReader(handle))
+        selected_stats_pattern = (
+            "peak-stats-p*-r0.csv" if nprocs > 1 else "peak-stats-p*.csv"
+        )
+        selected_temporary_stats_pattern = (
+            "peak-stats-p*-r0.csv.tmp.*" if nprocs > 1 else
+            "peak-stats-p*.csv.tmp.*"
+        )
+        selected_stats_files = sorted(
+            Path(stats_dir).glob(selected_stats_pattern)
+        )
+        selected_temporary_stats_files = sorted(
+            Path(stats_dir).glob(selected_temporary_stats_pattern)
+        )
+        selected_stats_rows = []
+        selected_stats_fields = None
+        if len(selected_stats_files) == 1:
+            selected_stats_size = selected_stats_files[0].stat().st_size
+            with selected_stats_files[0].open(
+                newline="", encoding="utf-8", errors="strict"
+            ) as handle:
+                reader = csv.DictReader(handle, strict=True)
+                selected_stats_fields = reader.fieldnames
+                selected_stats_rows = list(reader)
     sys.stdout.write(output)
     if done_file is not None:
         try:
@@ -531,14 +732,25 @@ def main():
             "",
             fatal_scan_output,
         )
-    if FAIL_RE.search(fatal_scan_output):
+    if (report_signal_requested and
+            UNINTENDED_REPORT_SIGNAL_FATAL_RE.search(fatal_scan_output)):
+        raise AssertionError(
+            "report signal run produced an unintended crash/fatal MPI diagnostic"
+        )
+    if not report_signal_requested and FAIL_RE.search(fatal_scan_output):
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
-    if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
+    if (not report_signal_requested and
+            args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             LAUNCHER_ABNORMAL_RE.search(output)):
         raise AssertionError(
             "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
         )
-    if timed_out and args.mode not in EXPECTED_TIMEOUT_MODES:
+    if (report_signal_requested and timed_out):
+        raise AssertionError(
+            f"report signal run did not terminate within {args.timeout:g}s"
+        )
+    if (not report_signal_requested and timed_out and
+            args.mode not in EXPECTED_TIMEOUT_MODES):
         raise AssertionError(f"{args.mode} run timed out after {args.timeout:g}s")
     if args.require_detach_trace:
         if not trace_path:
@@ -564,16 +776,71 @@ def main():
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
+    if temporary_stats_files and not report_signal_requested:
+        raise AssertionError(
+            "PEAK CSV temporary file remained after launcher return: "
+            + ", ".join(path.name for path in temporary_stats_files)
+        )
+    if report_signal_requested:
+        if returncode == 0:
+            raise AssertionError(
+                "report signal hook did not terminate the MPI launcher"
+            )
+        if args.report_signal_phase == "before-publish":
+            if selected_stats_files:
+                raise AssertionError(
+                    "rank 0 final CSV existed after the before-publish signal"
+                )
+        else:
+            expected_fields = [
+                "function",
+                "count",
+                "per_thread",
+                "per_rank",
+                "call_max_s",
+                "call_min_s",
+                "total_s",
+                "exclusive_s",
+                "thread_max_s",
+                "thread_min_s",
+                "overhead_s",
+            ]
+            if len(selected_stats_files) != 1:
+                raise AssertionError(
+                    "expected exactly one rank 0 final CSV after publication, "
+                    f"got {len(selected_stats_files)}"
+                )
+            if selected_temporary_stats_files:
+                raise AssertionError(
+                    "rank 0 temporary CSV remained after atomic publication"
+                )
+            if selected_stats_size <= 0:
+                raise AssertionError("rank 0 final CSV was empty")
+            if selected_stats_fields != expected_fields:
+                raise AssertionError(
+                    "rank 0 final CSV had an incomplete or unexpected header: "
+                    f"{selected_stats_fields!r}"
+                )
+            target_rows_after_signal = [
+                row for row in selected_stats_rows
+                if row.get("function") == "peak_mpi_exit_target"
+            ]
+            if len(target_rows_after_signal) != 1:
+                raise AssertionError(
+                    "rank 0 final CSV did not contain exactly one target row"
+                )
+            row = target_rows_after_signal[0]
+            if None in row or any(value is None for value in row.values()):
+                raise AssertionError("rank 0 final CSV contained a partial row")
+            if int(float(row.get("count", "0") or 0)) <= 0:
+                raise AssertionError(
+                    "rank 0 final CSV target count was not positive"
+                )
     if verify_finalize_return_publication:
         if returncode != 0 or timed_out:
             raise AssertionError(
                 "MPI launcher did not complete cleanly after report "
                 f"publication: rc={returncode} timed_out={int(timed_out)}"
-            )
-        if temporary_stats_files:
-            raise AssertionError(
-                "aggregate CSV temporary file remained after MPI_Finalize: "
-                + ", ".join(path.name for path in temporary_stats_files)
             )
         if len(finalize_enter_markers) != nprocs:
             present_markers = ", ".join(
@@ -594,29 +861,24 @@ def main():
                     f"{entry_name}={entry_text!r}"
                 )
 
-        root_marker_name = "finalize-return-r0.txt"
-        if root_marker_name not in finalize_return_marker_text:
+        if len(finalize_return_markers) != nprocs:
             raise AssertionError(
-                "aggregate root did not return cleanly from intercepted "
-                f"MPI_Finalize; present={sorted(finalize_return_marker_text)}"
+                f"expected {nprocs} MPI_Finalize return markers, "
+                f"got {len(finalize_return_markers)}; "
+                f"present={sorted(finalize_return_marker_text)}"
             )
         for rank in range(nprocs):
             marker_name = f"finalize-return-r{rank}.txt"
             if marker_name not in finalize_return_marker_text:
-                continue
+                raise AssertionError(
+                    "rank did not return from intercepted MPI_Finalize: "
+                    f"missing {marker_name}"
+                )
             marker_text = finalize_return_marker_text.get(marker_name, "")
             marker_prefix = f"rank={rank} finalize_rc=0 final_csv_published="
-            if not any(
-                marker_prefix + value in marker_text
-                for value in ("0", "1")
-            ):
+            if marker_prefix + "1" not in marker_text:
                 raise AssertionError(
-                    "rank did not return cleanly from intercepted "
-                    f"MPI_Finalize: {marker_name}={marker_text!r}"
-                )
-            if rank == 0 and marker_prefix + "1" not in marker_text:
-                raise AssertionError(
-                    "aggregate root returned from intercepted MPI_Finalize "
+                    "rank returned from intercepted MPI_Finalize "
                     "before publishing the complete CSV: "
                     f"{marker_name}={marker_text!r}"
                 )
@@ -672,10 +934,19 @@ def main():
                 raise AssertionError(
                     f"expected positive {field} from active ranks, got {value}"
                 )
-    if (args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
+    if (not report_signal_requested and
+            args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
             returncode != 0):
         raise AssertionError(f"{args.mode} run returned {returncode}")
+
+    if report_signal_requested:
+        print(
+            "mpi_report_signal_atomicity_ok "
+            f"phase={args.report_signal_phase} "
+            f"signal={args.report_signal} rc={returncode}"
+        )
+        return 0
 
     timeout_text = " timeout=1" if timed_out else ""
     print(f"mpi_lifecycle_check_ok mode={args.mode} rc={returncode}{timeout_text}")

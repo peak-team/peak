@@ -506,12 +506,15 @@ def check_mpi_finalize_trampoline_default(repo_root):
     require("PEAK_MPI_REAL_FINALIZE_ENV" in guard and
             "peak_env_value_truthy(value)" in guard,
             "real MPI finalizer policy must preserve explicit env override")
-    require("value == NULL || value[0] == '\\0'" in guard and
-            "return TRUE;" in guard,
-            "healthy all-rank finalization must use the real MPI finalizer by default")
-    require("peak_mpi_runtime_matches_intel_mpi" not in peak_source and
-            "peak_env_looks_like_intel_mpi" not in peak_source,
-            "MPI vendor detection must not bypass launcher-aware finalization")
+    require("peak_mpi_runtime_is_intel_2019()" in guard and
+            "return FALSE;" in guard,
+            "Intel MPI 2019 must skip its unsafe real finalizer by default")
+    vendor = extract_function(peak_source, "peak_mpi_runtime_is_intel_2019")
+    require("MPI_Get_library_version" in vendor and
+            "Intel(R) MPI" in vendor and
+            "Intel MPI" in vendor and
+            'strstr(text, "2019")' in vendor,
+            "Intel MPI 2019 containment must inspect the MPI library version")
 
 
 def check_final_report_snapshot_order(repo_root):
@@ -673,14 +676,25 @@ def check_final_report_snapshot_order(repo_root):
     finalize_permission_position = fini.find(
         "mpi_interceptor_set_real_finalize_allowed(", report_position
     )
+    report_release_position = fini.find(
+        "peak_mpi_teardown_complete_report_release(", report_position
+    )
     require(report_position != -1 and cuda_position != -1 and
+            report_release_position != -1 and
             finalize_permission_position != -1 and
-            report_position < cuda_position < finalize_permission_position,
-            "CPU/CUDA report output must precede the real-finalize decision")
+            report_position < cuda_position < report_release_position <
+                finalize_permission_position,
+            "CPU/CUDA output and all-rank report release must precede the real-finalize decision")
     require("fflush(stderr)" in fini and
             fini.find("fflush(stderr)", cuda_position) <
+                report_release_position,
+            "CUDA text output must be flushed before the all-rank report release")
+    require("report_release_protocol_completed &&" in fini and
+            "all_real_mpi_finalize_config_allowed" in fini and
+            "real_mpi_finalize_config_allowed" in fini and
+            fini.find("report_release_protocol_completed &&", report_position) <
                 finalize_permission_position,
-            "CUDA text output must be flushed before real PMPI_Finalize")
+            "real PMPI_Finalize must require a completed release protocol and an all-rank policy decision")
 
     reduce_result = extract_function(
         mpi_transport, "peak_mpi_report_transport_reduce"

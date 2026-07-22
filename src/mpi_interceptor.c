@@ -193,11 +193,13 @@ mpi_interceptor_call_original_finalize_once(void)
  * This function is a custom implementation of the `PMPI_Finalize` function. It
  * records the application's finalization request. The default policy lets PEAK
  * emit final output while MPI is still alive on the application's own finalize
- * path, then returns to the real MPI finalizer after all-rank proof. Output
- * aggregation selects the report transport and does not change that ordering.
- * Only an explicit PEAK_MPI_FINALIZE_POLICY=defer calls the real finalizer
- * immediately and leaves PEAK output for normal process teardown. PEAK does
- * not replay `PMPI_Finalize()` later from process teardown.
+ * path, then decides collectively after finalize-participation and
+ * report-release gates whether returning to the real MPI finalizer is safe and
+ * compatible. Output aggregation selects the report transport and does not
+ * change that ordering. Only an explicit PEAK_MPI_FINALIZE_POLICY=defer
+ * attempts the real finalizer immediately and leaves PEAK output for normal
+ * process teardown; PEAK_MPI_REAL_FINALIZE=0 still disables that call. PEAK
+ * does not replay `PMPI_Finalize()` later from process teardown.
  *
  * @return The original `PMPI_Finalize()` result.
  */

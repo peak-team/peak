@@ -531,8 +531,8 @@ peak_socket_reduce_first_host_from_slurm_nodelist(const char* nodelist,
     }
 
     bracket = strchr(nodelist, '[');
-    if (bracket == NULL) {
-        comma = strchr(nodelist, ',');
+    comma = strchr(nodelist, ',');
+    if (bracket == NULL || (comma != NULL && comma < bracket)) {
         token_len =
             comma != NULL ? (size_t)(comma - nodelist) : strlen(nodelist);
         if (token_len == 0 || token_len >= out_size) {
