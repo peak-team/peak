@@ -390,6 +390,7 @@ def main():
     done_file = None
     verify_finalize_return_publication = False
     force_stats_path_failure = False
+    allow_interrupted_peer_temporary_stats = False
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
         expected = "PMPI_Finalize was not observed on every rank"
@@ -690,6 +691,13 @@ def main():
         expected_peak_tables = 0
         expected_stats_files = None
         expected_min_stats_files = 1
+        # Rank 0 returns from PEAK's bounded finalize-participation proof and
+        # hands off to a peer that deliberately never calls MPI_Finalize.
+        # MPICH may tear that peer down while its exit-time rank-local CSV is
+        # still being written.  The atomic writer is allowed to leave only
+        # that non-root temporary file; rank 0 must already have published a
+        # complete final CSV before creating the handoff marker.
+        allow_interrupted_peer_temporary_stats = True
     elif args.mode == "finalize-return-nonzero":
         app_args.append("finalize-then-return1")
         expected = "PMPI_Finalize was observed on every rank"
@@ -926,11 +934,28 @@ def main():
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
-    if temporary_stats_files and not report_signal_requested:
+    if (temporary_stats_files and
+            not report_signal_requested and
+            not allow_interrupted_peer_temporary_stats):
         raise AssertionError(
             "PEAK CSV temporary file remained after launcher return: "
             + ", ".join(path.name for path in temporary_stats_files)
         )
+    if allow_interrupted_peer_temporary_stats:
+        if len(selected_stats_files) != 1:
+            raise AssertionError(
+                "subset-finalize handoff did not publish exactly one rank 0 "
+                f"final CSV: got {len(selected_stats_files)}"
+            )
+        for name, evidence in stats_file_evidence.items():
+            require_complete_stats_evidence(name, evidence)
+        for path in temporary_stats_files:
+            rank_match = re.search(r"-r(\d+)\.csv\.tmp\.", path.name)
+            if rank_match is None or int(rank_match.group(1)) == 0:
+                raise AssertionError(
+                    "subset-finalize handoff left an unexpected temporary CSV: "
+                    + path.name
+                )
     if report_signal_requested:
         if args.report_signal == "KILL" and returncode == 0:
             raise AssertionError(
