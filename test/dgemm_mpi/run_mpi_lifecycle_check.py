@@ -92,6 +92,7 @@ REPORT_COMPLETION_DIAGNOSTICS = (
     "PEAK output release is complete; skipping real PMPI_Finalize",
 )
 REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS = (
+    "MPI finalize participation proof timed out after ",
     "MPI_Iallreduce for report publication release failed; "
     "disabling later MPI teardown calls",
     "MPI_Test for report publication release failed; "
