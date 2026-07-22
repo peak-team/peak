@@ -262,6 +262,81 @@ peak_general_listener_mpi_env_rank(void)
 }
 
 bool
+peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
+{
+    static const struct {
+        const char* rank_name;
+        const char* size_name;
+    } pairs[] = {
+        { "PMI_RANK", "PMI_SIZE" },
+        { "PMIX_RANK", "PMIX_SIZE" },
+        { "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE" },
+        { "MV2_COMM_WORLD_RANK", "MV2_COMM_WORLD_SIZE" },
+        { "I_MPI_RANK", "I_MPI_SIZE" },
+        { "SLURM_PROCID", "SLURM_NTASKS" },
+    };
+    long resolved_rank = -1;
+    long resolved_size = -1;
+
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        const char* rank_text = getenv(pairs[i].rank_name);
+        const char* size_text = getenv(pairs[i].size_name);
+        bool rank_present = rank_text != NULL && rank_text[0] != '\0';
+        bool size_present = size_text != NULL && size_text[0] != '\0';
+
+        if (!rank_present || !size_present) {
+            continue;
+        }
+
+        long rank = peak_general_listener_parse_long_env(
+            pairs[i].rank_name);
+        long size = peak_general_listener_parse_long_env(
+            pairs[i].size_name);
+        if (rank < 0 || size <= 0 || rank >= size) {
+            return false;
+        }
+        if (resolved_rank >= 0 &&
+            (resolved_rank != rank || resolved_size != size)) {
+            return false;
+        }
+        resolved_rank = rank;
+        resolved_size = size;
+    }
+
+    if (resolved_rank < 0 || resolved_size <= 0) {
+        return false;
+    }
+    if (rank_out != NULL) {
+        *rank_out = resolved_rank;
+    }
+    if (size_out != NULL) {
+        *size_out = resolved_size;
+    }
+    return true;
+}
+
+bool
+peak_general_listener_mpi_env_world_metadata_present(void)
+{
+    static const char* names[] = {
+        "PMI_RANK", "PMI_SIZE",
+        "PMIX_RANK", "PMIX_SIZE",
+        "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE",
+        "MV2_COMM_WORLD_RANK", "MV2_COMM_WORLD_SIZE",
+        "I_MPI_RANK", "I_MPI_SIZE",
+        "SLURM_PROCID", "SLURM_NTASKS",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char* value = getenv(names[i]);
+        if (value != NULL && value[0] != '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
 peak_general_listener_should_print_text(bool rank_local_mpi_output)
 {
     const char* value = getenv(PEAK_TEXT_OUTPUT_ENV);

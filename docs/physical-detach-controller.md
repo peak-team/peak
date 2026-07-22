@@ -646,13 +646,17 @@ job.
 
 The MPI finalizer interposer therefore records whether the application attempted
 `PMPI_Finalize()`. With the default `PEAK_MPI_FINALIZE_POLICY=report`, it
-immediately makes target callbacks pass-through, runs PEAK output while MPI is
-still alive on that application-owned finalizer path, and then runs a bounded
-post-publication release gate after PEAK has proven every rank reached finalize.
-The finalize proof is timeout-bounded; if only a subset of ranks entered
-`PMPI_Finalize()` or the proof cannot complete, PEAK falls back to rank-local
-output and skips the real finalizer on that unsafe subset path instead of
-blocking indefinitely. The proof is implemented with a nonblocking MPI
+immediately makes target callbacks pass-through and freezes the CPU report on
+that application-owned finalizer path. MPI aggregation remains proof-first.
+Explicit socket and rank-local output instead publish the frozen report before
+the finalize-participation proof, so a missing rank cannot consume their entire
+publication window. The later proof and post-publication release gate still
+control whether PEAK may return to the real finalizer. The finalize proof is
+timeout-bounded; if only a subset of ranks entered `PMPI_Finalize()` or the
+proof cannot complete, an already published local/socket report is retained,
+MPI aggregation falls back to rank-local output, and PEAK skips the real
+finalizer on that unsafe subset path instead of blocking indefinitely. The
+proof is implemented with a nonblocking MPI
 collective plus bounded `MPI_Test()` polling. This is much safer than a blocking
 `MPI_Allreduce`, but it is still an MPI progress call and therefore a
 best-effort proof, not a hard guarantee against every broken MPI runtime state.
@@ -733,11 +737,14 @@ PEAK is producing final output.
 after first proving that every rank observed the application's `PMPI_Finalize()`
 request. `mpi`, `collective`, or truthy values select this default reducer.
 `socket`, `tcp`, or `interconnect` explicitly select the PEAK-owned TCP reducer
-over the job interconnect. Aggregation mode selects only the transport: socket
-output follows the default pre-finalize report ordering unless
-`PEAK_MPI_FINALIZE_POLICY=defer` is also set, and it uses launcher rank metadata
-rather than MPI for its payload. The default pre-finalize participation and
-post-publication gates still use MPI collectives. `local`,
+over the job interconnect. On the intercepted-finalize path, socket and local
+CPU output publish before the MPI participation proof. Strict socket rank/size
+discovery accepts only complete, mutually consistent PMI, PMIx, OpenMPI,
+MVAPICH2, Intel MPI, or Slurm environment pairs and does not query MPI. The
+later participation and post-publication gates still use MPI collectives to
+decide whether the real finalizer is safe. With
+`PEAK_MPI_FINALIZE_POLICY=defer`, socket output runs from process teardown after
+the real finalizer. `local`,
 `rank-local`, `none`, or falsey values write rank-local output. The older
 boolean `PEAK_MPI_COLLECTIVE_OUTPUT=1` remains a compatibility alias for
 aggregate output and maps to the MPI reducer when `PEAK_OUTPUT_AGGREGATION` is
@@ -773,9 +780,9 @@ tries the PEAK-owned socket reducer using launcher rank metadata before falling
 back to rank-local output. Those wrappers still rely on `MPI_Test()` for
 progress, so this reducer is appropriate for ordinary all-rank clean shutdown,
 but not for environments where PEAK must avoid MPI progress entirely.
-Use socket output when the report payload must avoid MPI reducer collectives.
-Combine it with `PEAK_MPI_FINALIZE_POLICY=defer` when PEAK must also avoid the
-pre-finalize MPI participation proof.
+Use socket output when the report payload must avoid MPI reducer collectives
+and should be published before the MPI participation proof. Combine it with
+`PEAK_MPI_FINALIZE_POLICY=defer` when PEAK must avoid that proof entirely.
 `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` controls only the initial finalize
 participation proof and defaults to 10000 ms. `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS`
 controls each MPI payload reducer collective and defaults to 5000 ms, because
@@ -790,7 +797,8 @@ bounded set of framed per-rank payloads, validates a Slurm/PMI-derived reducer
 token plus the job's hook-slot identity, and writes one aggregate result only
 after every rank has arrived. With explicit socket output and no explicit
 `PEAK_MPI_FINALIZE_POLICY`, PEAK runs the socket reducer from the application
-finalizer path and uses the bounded all-rank proof before returning to the real
+finalizer path before the bounded all-rank participation proof. The proof then
+determines whether PEAK may enter the common release gate and return to the real
 MPI finalizer. If `PEAK_MPI_FINALIZE_POLICY=defer` is explicitly combined with
 socket output, PEAK calls the real MPI finalizer immediately and runs the socket
 reducer from normal process teardown without MPI collectives or an MPI finalize

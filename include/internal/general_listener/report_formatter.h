@@ -50,6 +50,18 @@ bool peak_report_formatter_write_csv(const PeakReportSnapshot* snapshot);
 bool peak_report_formatter_write_rank_local_csv(
     const PeakReportSnapshot* snapshot);
 
+/**
+ * Write a rank-local CSV with a rank or sanitized-host suffix.
+ *
+ * A consistent launcher pair uses `-rRANK`; missing or inconsistent metadata
+ * uses a sanitized hostname. The host suffix reduces cross-node PID collision
+ * risk but cannot guarantee uniqueness when host identity is unavailable or
+ * duplicated. This is the fail-closed fallback for an active MPI job whose
+ * strict socket path cannot identify the world without MPI.
+ */
+bool peak_report_formatter_write_rank_local_csv_host_disambiguated(
+    const PeakReportSnapshot* snapshot);
+
 /** Write the stable key/value lines for per-rank maximum overhead owners. */
 void peak_report_formatter_write_rank_maxima(
     const PeakReportRankTuple maximum[PEAK_REPORT_METRIC_COUNT],

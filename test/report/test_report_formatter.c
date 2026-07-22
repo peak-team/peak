@@ -20,11 +20,14 @@ static const char* const launcher_environment[] = {
     "PMI_SIZE",
     "PMIX_SIZE",
     "OMPI_COMM_WORLD_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+    "I_MPI_SIZE",
     "SLURM_NTASKS",
     "PMI_RANK",
     "PMIX_RANK",
     "OMPI_COMM_WORLD_RANK",
     "MV2_COMM_WORLD_RANK",
+    "I_MPI_RANK",
     "SLURM_PROCID",
     NULL,
 };
@@ -279,6 +282,21 @@ check_rank_local_csv_names(const char* stats_base,
                     (int)getpid(),
                     hostname) > 0);
     assert(peak_report_formatter_write_rank_local_csv(snapshot));
+    assert(access(hostname_path, F_OK) == 0);
+    assert(unlink(hostname_path) == 0);
+
+    /* Complete launcher namespaces must agree; conflicts use host naming. */
+    assert(setenv("PMI_RANK", "3", 1) == 0);
+    assert(setenv("OMPI_COMM_WORLD_RANK", "1", 1) == 0);
+    assert(setenv("OMPI_COMM_WORLD_SIZE", "4", 1) == 0);
+    assert(peak_report_formatter_write_rank_local_csv(snapshot));
+    assert(access(hostname_path, F_OK) == 0);
+    assert(unlink(hostname_path) == 0);
+
+    /* Strict MPI fallback naming reduces cross-node PID collision risk. */
+    clear_launcher_environment();
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
     assert(access(hostname_path, F_OK) == 0);
     assert(unlink(hostname_path) == 0);
 

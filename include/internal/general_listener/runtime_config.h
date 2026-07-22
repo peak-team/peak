@@ -37,6 +37,20 @@ long peak_general_listener_mpi_env_size(void);
 /** Returns the first valid launcher-provided MPI rank, or -1. */
 long peak_general_listener_mpi_env_rank(void);
 
+/**
+ * Resolves a consistent launcher-provided world rank/size pair.
+ *
+ * Unlike the legacy independent accessors above, this function never combines
+ * values from different launcher namespaces. Multiple complete namespaces
+ * must agree. Incomplete namespaces are ignored; malformed or contradictory
+ * complete pairs fail closed.
+ */
+bool peak_general_listener_mpi_env_rank_size(long* rank_out,
+                                             long* size_out);
+
+/** Returns true when any recognized world rank/size variable is present. */
+bool peak_general_listener_mpi_env_world_metadata_present(void);
+
 /** Applies the text-output override and rank-local output default. */
 bool peak_general_listener_should_print_text(bool rank_local_mpi_output);
 

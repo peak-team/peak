@@ -28,6 +28,19 @@ gboolean peak_general_listener_dynamic_symbol_matches_any_target(
 gboolean peak_general_listener_checkpoint_for_exec(
     unsigned long long checkpoint_index);
 
+/**
+ * Emits one frozen report under an explicit active-MPI-job output policy.
+ *
+ * An active MPI job requires launcher metadata for any no-more-MPI socket
+ * path and host-disambiguates rank-local fallback when that metadata is
+ * unavailable. Non-MPI callers use the public wrapper and preserve legacy
+ * single-process naming.
+ */
+gboolean peak_general_listener_print_with_mpi_job_policy(
+    PeakOutputAggregationMode aggregation_mode,
+    gboolean active_mpi_job,
+    gboolean* report_write_succeeded);
+
 /* Starts target lifecycle processing after startup-only Gum hooks are ready. */
 void peak_general_listener_controller_start(void);
 

@@ -137,7 +137,7 @@ in detail.
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases; it does not change finalize ordering. |
+| `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases. On the intercepted-finalize path, socket/local publish before the MPI participation proof; MPI aggregation remains proof-first. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | Legacy aggregate-output switch; `PEAK_OUTPUT_AGGREGATION` takes precedence. |
 | `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer immediately and therefore bypasses the Intel MPI 2019 compatibility skip. |
 | `PEAK_MPI_REAL_FINALIZE` | Override for the real MPI finalizer. Healthy non-Intel-MPI-2019 jobs enable it by default; Intel MPI 2019 skips its crash-prone finalizer unless set to `1`. Setting it to `0` also disables the immediate real-finalizer call in `defer` mode. Setting it to `1` cannot override a failed collective safety gate on the default `report` path. |
