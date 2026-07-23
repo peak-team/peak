@@ -267,20 +267,21 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
     static const struct {
         const char* rank_name;
         const char* size_name;
-    } pairs[] = {
+    } mpi_pairs[] = {
         { "PMI_RANK", "PMI_SIZE" },
         { "PMIX_RANK", "PMIX_SIZE" },
         { "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE" },
         { "MV2_COMM_WORLD_RANK", "MV2_COMM_WORLD_SIZE" },
         { "I_MPI_RANK", "I_MPI_SIZE" },
-        { "SLURM_PROCID", "SLURM_NTASKS" },
     };
     long resolved_rank = -1;
     long resolved_size = -1;
 
-    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
-        const char* rank_text = getenv(pairs[i].rank_name);
-        const char* size_text = getenv(pairs[i].size_name);
+    for (size_t i = 0;
+         i < sizeof(mpi_pairs) / sizeof(mpi_pairs[0]);
+         i++) {
+        const char* rank_text = getenv(mpi_pairs[i].rank_name);
+        const char* size_text = getenv(mpi_pairs[i].size_name);
         bool rank_present = rank_text != NULL && rank_text[0] != '\0';
         bool size_present = size_text != NULL && size_text[0] != '\0';
 
@@ -289,9 +290,9 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         }
 
         long rank = peak_general_listener_parse_long_env(
-            pairs[i].rank_name);
+            mpi_pairs[i].rank_name);
         long size = peak_general_listener_parse_long_env(
-            pairs[i].size_name);
+            mpi_pairs[i].size_name);
         if (rank < 0 || size <= 0 || rank >= size) {
             return false;
         }
@@ -303,8 +304,23 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         resolved_size = size;
     }
 
-    if (resolved_rank < 0 || resolved_size <= 0) {
-        return false;
+    if (resolved_rank < 0) {
+        const char* rank_text = getenv("SLURM_PROCID");
+        const char* size_text = getenv("SLURM_NTASKS");
+        bool rank_present = rank_text != NULL && rank_text[0] != '\0';
+        bool size_present = size_text != NULL && size_text[0] != '\0';
+
+        if (!rank_present || !size_present) {
+            return false;
+        }
+        resolved_rank = peak_general_listener_parse_long_env(
+            "SLURM_PROCID");
+        resolved_size = peak_general_listener_parse_long_env(
+            "SLURM_NTASKS");
+        if (resolved_rank < 0 || resolved_size <= 0 ||
+            resolved_rank >= resolved_size) {
+            return false;
+        }
     }
     if (rank_out != NULL) {
         *rank_out = resolved_rank;
