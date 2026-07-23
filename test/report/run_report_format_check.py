@@ -102,7 +102,7 @@ def main() -> int:
     rules = [line for line in output_lines
              if re.fullmatch(r"[=-]{80,}", line)]
     require(rules, "missing ASCII report rules")
-    require({len(line) for line in rules} == {89},
+    require({len(line) for line in rules} == {99},
             "report rules must use one consistent width")
 
     print("report_format_check_ok")

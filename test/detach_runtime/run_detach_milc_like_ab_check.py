@@ -895,7 +895,9 @@ def progress_aligned_summary(args, baseline_before, peak, baseline_after):
     }
 
 
-def validated_profiled_stats_rows(handle, allowed_targets):
+def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
+    if rank_count <= 0:
+        raise AssertionError(f"invalid stats report rank count: {rank_count}")
     reader = csv.DictReader(handle)
     if tuple(reader.fieldnames or ()) != STATS_CSV_FIELDS:
         raise AssertionError(
@@ -915,10 +917,27 @@ def validated_profiled_stats_rows(handle, allowed_targets):
             raise AssertionError(f"duplicate stats CSV function: {function!r}")
         if not re.fullmatch(r"[1-9][0-9]*", row["count"]):
             raise AssertionError(f"invalid positive stats count: {row}")
+        count = int(row["count"])
         if not re.fullmatch(r"[1-9][0-9]*", row["per_thread"]):
             raise AssertionError(f"invalid positive per-thread count: {row}")
-        if not re.fullmatch(r"[0-9]+", row["per_rank"]):
-            raise AssertionError(f"invalid nonnegative per-rank count: {row}")
+        try:
+            per_rank = float(row["per_rank"])
+        except ValueError as exc:
+            raise AssertionError(
+                f"invalid numeric per-rank average: {row}"
+            ) from exc
+        expected_per_rank = count / rank_count
+        if (not math.isfinite(per_rank) or per_rank <= 0.0 or
+                not math.isclose(
+                    per_rank,
+                    expected_per_rank,
+                    rel_tol=1e-10,
+                    abs_tol=1e-15,
+                )):
+            raise AssertionError(
+                "invalid per-rank average "
+                f"(expected {expected_per_rank:.12g}): {row}"
+            )
         for field in STATS_CSV_FIELDS[4:]:
             try:
                 value = float(row[field])
@@ -2435,6 +2454,39 @@ def run_synthetic_policy_diagnostics():
         "malformed stats integer",
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(STATS_CSV_FIELDS, malformed_integer_values),
+            {"target"},
+        ),
+    )
+    sparse_rank_values = list(valid_stats_values)
+    sparse_rank_values[3] = "0.000244140625"
+    sparse_rank_rows = validated_profiled_stats_rows(
+        synthetic_stats_csv(STATS_CSV_FIELDS, sparse_rank_values),
+        {"target"},
+        rank_count=4096,
+    )
+    if len(sparse_rank_rows) != 1:
+        raise AssertionError("fractional per-rank average was not accepted")
+    invalid_per_rank_values = list(valid_stats_values)
+    invalid_per_rank_values[3] = "0"
+    expect_assertion(
+        "zero per-rank average",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                invalid_per_rank_values,
+            ),
+            {"target"},
+        ),
+    )
+    inconsistent_per_rank_values = list(valid_stats_values)
+    inconsistent_per_rank_values[3] = "0.5"
+    expect_assertion(
+        "inconsistent per-rank average",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                inconsistent_per_rank_values,
+            ),
             {"target"},
         ),
     )

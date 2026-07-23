@@ -24,9 +24,10 @@
  * cannot replace that protocol. Intel MPI 2019 is a compatibility exception:
  * PEAK skips its crash-prone hwloc finalizer by default after the release gate.
  * On the default report path, rank-local and socket CPU output is published
- * before the MPI finalize-participation proof; MPI aggregate output remains
- * proof-first. Every healthy path still completes the common post-publication
- * release gate before deciding whether to enter the real finalizer.
+ * before MPI teardown coordination, and finalize participation joins their
+ * long post-publication release gate. MPI aggregate output remains
+ * proof-first. Every healthy path completes a post-publication release gate
+ * before deciding whether to enter the real finalizer.
  * `PEAK_MPI_FINALIZE_POLICY=defer` instead attempts the real finalizer
  * immediately and leaves PEAK profiling/output until process exit. Unless
  * `PEAK_MPI_REAL_FINALIZE=0`, it therefore bypasses the Intel MPI 2019
@@ -57,13 +58,15 @@ int mpi_interceptor_finalize_path_active();
  *
  * The real MPI finalizer is enabled by default for healthy runtimes other than
  * Intel MPI 2019, but only after PEAK has proven that every rank reached the
- * application finalizer and completed its report responsibility. PEAK uses
- * separate bounded participation and post-publication gates and fails closed
- * if either cannot be confirmed, so a subset-rank finalizer does not block on
- * collectives or re-enter MPI unexpectedly. A timed-out nonblocking request is
- * intentionally abandoned rather than cancelled or freed because active
- * nonblocking collective cancellation is not portable; after that point PEAK
- * must not use MPI again during teardown.
+ * application finalizer and completed its report responsibility. MPI
+ * aggregation uses separate bounded participation and post-publication gates;
+ * rank-local and socket output use one combined participation/publication
+ * gate after publishing. PEAK fails closed if the required gate cannot be
+ * confirmed, so a subset-rank finalizer does not block on collectives or
+ * re-enter MPI unexpectedly. A timed-out nonblocking request is intentionally
+ * abandoned rather than cancelled or freed because active nonblocking
+ * collective cancellation is not portable; after that point PEAK must not use
+ * MPI again during teardown.
  */
 void mpi_interceptor_set_real_finalize_allowed(int allowed);
 

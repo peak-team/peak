@@ -21,7 +21,7 @@
 
 enum {
     PEAK_TEXT_REPORT_FUNCTION_WIDTH = 32,
-    PEAK_TEXT_REPORT_COLUMN_WIDTH = 10,
+    PEAK_TEXT_REPORT_COLUMN_WIDTH = 12,
     PEAK_TEXT_REPORT_ROW_WIDTH =
         PEAK_TEXT_REPORT_FUNCTION_WIDTH +
         PEAK_TEXT_REPORT_COLUMN_WIDTH * 5 + 7,
@@ -98,6 +98,10 @@ peak_report_formatter_test_signal_publication_phase(const char* phase)
         strcmp(signal_text, "SIGTERM") == 0 ||
         strcmp(signal_text, "15") == 0) {
         signal_number = SIGTERM;
+    } else if (strcmp(signal_text, "INT") == 0 ||
+               strcmp(signal_text, "SIGINT") == 0 ||
+               strcmp(signal_text, "2") == 0) {
+        signal_number = SIGINT;
     } else if (strcmp(signal_text, "KILL") == 0 ||
                strcmp(signal_text, "SIGKILL") == 0 ||
                strcmp(signal_text, "9") == 0) {
@@ -160,6 +164,14 @@ static int
 peak_report_formatter_rank_count(const PeakReportSnapshot* snapshot)
 {
     return snapshot->rank_count > 0 ? snapshot->rank_count : 1;
+}
+
+static long double
+peak_report_formatter_calls_per_rank(unsigned long calls, int rank_count)
+{
+    int effective_rank_count = rank_count > 0 ? rank_count : 1;
+
+    return (long double)calls / (long double)effective_rank_count;
 }
 
 static void
@@ -609,11 +621,12 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, peak_report_formatter_name(snapshot, i)) &&
                   fprintf(
                       csv,
-                      ",%lu,%lu,%lu,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
+                      ",%lu,%lu,%.12Lg,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
                       snapshot->num_calls[i],
                       peak_report_calls_per_active_thread(
                           snapshot->num_calls[i], snapshot->thread_count[i]),
-                      snapshot->num_calls[i] / (unsigned long)rank_count,
+                      peak_report_formatter_calls_per_rank(
+                          snapshot->num_calls[i], rank_count),
                       (double)snapshot->max_time[i],
                       (double)snapshot->min_time[i],
                       snapshot->total_time[i],
@@ -856,7 +869,7 @@ peak_report_formatter_write_text(
                     max_col_width,
                     "per thread",
                     max_col_width,
-                    "per rank",
+                    "avg/rank",
                     max_col_width,
                     "max (s)",
                     max_col_width,
@@ -884,7 +897,7 @@ peak_report_formatter_write_text(
             peak_report_formatter_name(snapshot, i),
             function_field_width,
             options->truncate_names);
-        peak_log_report("|%*s%s|%*lu|%*lu|%*lu|%*.3e|%*.3e|\n",
+        peak_log_report("|%*s%s|%*lu|%*lu|%*.6Lg|%*.3e|%*.3e|\n",
                         function_field_width,
                         truncated_name != NULL ? truncated_name :
                                                  peak_report_formatter_name(
@@ -897,7 +910,8 @@ peak_report_formatter_write_text(
                             snapshot->num_calls[i],
                             snapshot->thread_count[i]),
                         max_col_width,
-                        snapshot->num_calls[i] / (unsigned long)rank_count,
+                        peak_report_formatter_calls_per_rank(
+                            snapshot->num_calls[i], rank_count),
                         max_col_width,
                         snapshot->max_time[i],
                         max_col_width,
@@ -905,6 +919,9 @@ peak_report_formatter_write_text(
         free(truncated_name);
     }
     peak_log_report("%s\n", row_separator);
+    peak_log_report("Count semantics: calls is exact; per thread is the ceiling over active threads; avg/rank is the arithmetic mean over all %d report rank%s.\n",
+                    rank_count,
+                    rank_count == 1 ? "" : "s");
     peak_log_report("Markers: * ever detached; ** ever reattached after detachment.\n");
     peak_log_report("Revisited targets are summarized in Controller accounting.\n");
 

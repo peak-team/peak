@@ -694,6 +694,9 @@ def check_final_report_snapshot_order(repo_root):
     proof_position = fini.find(
         "peak_mpi_teardown_all_ranks_requested_finalize("
     )
+    proof_guard_position = fini.rfind(
+        "if (need_mpi_finalize_proof", early_report_position, proof_position
+    )
     regular_report_position = fini.find(
         "peak_general_listener_print_with_mpi_job_policy(",
         early_report_position + 1,
@@ -706,17 +709,41 @@ def check_final_report_snapshot_order(repo_root):
     report_release_position = fini.find(
         "peak_mpi_teardown_complete_report_release(", report_position
     )
+    combined_release_position = fini.find(
+        "peak_mpi_teardown_complete_post_publication_release(",
+        report_position,
+    )
     require(early_report_position != -1 and proof_position != -1 and
+            proof_guard_position != -1 and
             regular_report_position != -1 and cuda_position != -1 and
+            combined_release_position != -1 and
             report_release_position != -1 and
             finalize_permission_position != -1 and
             early_report_position < proof_position <
                 regular_report_position < cuda_position <
-                report_release_position < finalize_permission_position,
-            "local/socket output must precede the finalize proof while MPI output, CUDA output, and release remain ordered before the real-finalize decision")
+                combined_release_position < report_release_position <
+                finalize_permission_position,
+            "local/socket output must precede MPI's proof-first output while CUDA output and both release gates remain ordered before the real-finalize decision")
+    require(
+        "!publish_before_finalize_proof" in
+            fini[proof_guard_position:proof_position] and
+        "if (publish_before_finalize_proof)" in
+            fini[cuda_position:combined_release_position] and
+        "(publish_before_finalize_proof ||" in fini and
+        "all_ranks_requested_mpi_finalize" in
+            fini[combined_release_position:finalize_permission_position],
+        "post-publication local/socket output must combine finalize participation with its long release gate while MPI aggregation retains the separate proof-first gate")
+    require(
+        "output_mode == PEAK_OUTPUT_AGGREGATION_SOCKET" in
+            fini[cuda_position:combined_release_position] and
+        "socket_combined_release_minimum_ms" in
+            fini[cuda_position:combined_release_position] and
+        "publication_timeout_minimum_ms," in
+            fini[combined_release_position:report_release_position],
+        "the combined gate must use the stable attempted socket mode, including socket-to-local fallback, to select the R+2T timeout floor")
     require("fflush(stderr)" in fini and
             fini.find("fflush(stderr)", cuda_position) <
-                report_release_position,
+                combined_release_position,
             "CUDA text output must be flushed before the all-rank report release")
     require("report_release_protocol_completed &&" in fini and
             "all_real_mpi_finalize_config_allowed" in fini and
@@ -799,7 +826,7 @@ def check_final_report_snapshot_order(repo_root):
     set_socket_overhead = extract_function(
         socket_transport, "peak_socket_report_set_aggregate_overhead"
     )
-    require("#define PEAK_SOCKET_REDUCE_VERSION 9U" in socket_transport and
+    require("#define PEAK_SOCKET_REDUCE_VERSION 10U" in socket_transport and
             "peak_socket_reduce_header_set_report_tuple" in socket_result and
             "peak_socket_reduce_header_report_tuple" in socket_result and
             "peak_report_rank_tuple_is_valid" in socket_result and

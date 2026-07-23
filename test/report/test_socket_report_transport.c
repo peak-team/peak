@@ -1,20 +1,70 @@
 #include "internal/general_listener/socket_report_transport.h"
 
 #include <float.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#define TEST_PORT_SLOT_COUNT 800
+#define TEST_PORT_SLOT_WIDTH 64
+#define TEST_PORT_BASE 10000
 
 typedef enum {
     TEST_ROOT_COMMIT = 0,
     TEST_ROOT_ABORT,
     TEST_ROOT_COMMIT_FAILURE,
+    TEST_ROOT_COMMIT_DELAYED_DEFAULT,
+    TEST_ROOT_COMMIT_DELAYED_CLAMP,
+    TEST_ROOT_COMMIT_DROP_ONCE,
+    TEST_ROOT_COMMIT_RESOLVE_AGAIN,
+    TEST_ROOT_COMMIT_CONFIRM_RETRY,
 } TestRootAction;
+
+static int
+reserve_test_port_slot(int* lock_fd_out)
+{
+    int first_slot;
+
+    if (lock_fd_out == NULL) {
+        return -1;
+    }
+    *lock_fd_out = -1;
+    first_slot = (int)(getpid() % TEST_PORT_SLOT_COUNT);
+    for (int offset = 0; offset < TEST_PORT_SLOT_COUNT; offset++) {
+        int slot = (first_slot + offset) % TEST_PORT_SLOT_COUNT;
+        int port = TEST_PORT_BASE + slot * TEST_PORT_SLOT_WIDTH;
+        int lock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in address = {
+            .sin_family = AF_INET,
+            .sin_port = htons((uint16_t)port),
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        };
+
+        /*
+         * UDP and TCP have separate port namespaces. Holding the UDP endpoint
+         * gives this process a kernel-enforced, cross-UID slot lock while the
+         * transport tests use the corresponding TCP range.
+         */
+        if (lock_fd >= 0 &&
+            bind(lock_fd,
+                 (const struct sockaddr*)&address,
+                 sizeof(address)) == 0) {
+            *lock_fd_out = lock_fd;
+            return port;
+        }
+        if (lock_fd >= 0) {
+            close(lock_fd);
+        }
+    }
+    return -1;
+}
 
 static void
 clear_rank_environment(void)
@@ -41,12 +91,14 @@ clear_rank_environment(void)
 }
 
 static void
-set_test_rank(int rank)
+set_test_rank(int rank, int size)
 {
     char rank_text[16];
+    char size_text[16];
 
     snprintf(rank_text, sizeof(rank_text), "%d", rank);
-    (void)setenv("PMI_SIZE", "2", 1);
+    snprintf(size_text, sizeof(size_text), "%d", size);
+    (void)setenv("PMI_SIZE", size_text, 1);
     (void)setenv("PMI_RANK", rank_text, 1);
 }
 
@@ -216,7 +268,13 @@ run_two_rank_case(int port,
     PeakSocketReportSession* session = NULL;
     PeakSocketReportStatus root_status;
     PeakSocketReportStatus expected_peer =
-        action == TEST_ROOT_COMMIT && !mismatched_peer_name
+        (action == TEST_ROOT_COMMIT ||
+         action == TEST_ROOT_COMMIT_DELAYED_DEFAULT ||
+         action == TEST_ROOT_COMMIT_DELAYED_CLAMP ||
+         action == TEST_ROOT_COMMIT_DROP_ONCE ||
+         action == TEST_ROOT_COMMIT_RESOLVE_AGAIN ||
+         action == TEST_ROOT_COMMIT_CONFIRM_RETRY) &&
+                !mismatched_peer_name
             ? PEAK_SOCKET_REPORT_PEER_RELEASED
             : PEAK_SOCKET_REPORT_FAILED;
     char port_text[16];
@@ -235,12 +293,46 @@ run_two_rank_case(int port,
              port);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
-    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1500", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "500", 1);
+    if (action == TEST_ROOT_COMMIT_DELAYED_DEFAULT) {
+        (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    } else if (action == TEST_ROOT_COMMIT_DELAYED_CLAMP) {
+        (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
+                     "100",
+                     1);
+    } else {
+        (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
+                     "1500",
+                     1);
+    }
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
     if (action == TEST_ROOT_COMMIT_FAILURE) {
         (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL", "1", 1);
     } else {
         (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL");
+    }
+    if (action == TEST_ROOT_COMMIT_DROP_ONCE) {
+        (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_DROP_ONCE",
+                     "1",
+                     1);
+    } else {
+        (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_DROP_ONCE");
+    }
+    if (action == TEST_ROOT_COMMIT_RESOLVE_AGAIN) {
+        (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_RESOLVE_AGAIN_ONCE",
+                     "1",
+                     1);
+    } else {
+        (void)unsetenv(
+            "PEAK_TEST_OUTPUT_AGGREGATION_RESOLVE_AGAIN_ONCE");
+    }
+    if (action == TEST_ROOT_COMMIT_CONFIRM_RETRY) {
+        (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_FAIL_ONCE",
+                     "1",
+                     1);
+    } else {
+        (void)unsetenv(
+            "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_FAIL_ONCE");
     }
 
     child = fork();
@@ -254,7 +346,7 @@ run_two_rank_case(int port,
         PeakSocketReportSession* peer_session = NULL;
         PeakSocketReportStatus peer_status;
 
-        set_test_rank(1);
+        set_test_rank(1, 2);
         if (peer == NULL) {
             _exit(99);
         }
@@ -269,7 +361,7 @@ run_two_rank_case(int port,
         _exit((int)peer_status);
     }
 
-    set_test_rank(0);
+    set_test_rank(0, 2);
     root_status = peak_socket_report_transport_begin(
         root,
         PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -290,10 +382,19 @@ run_two_rank_case(int port,
         peak_socket_report_transport_abort(session);
         session = NULL;
     } else {
+        if (action == TEST_ROOT_COMMIT_DELAYED_DEFAULT ||
+            action == TEST_ROOT_COMMIT_DELAYED_CLAMP) {
+            /*
+             * Exceed two gather-phase budgets after root preparation. Both
+             * the default and a too-small override must retain the complete
+             * three-phase gather/publication/release budget.
+             */
+            usleep(1250000);
+        }
         bool committed = peak_socket_report_transport_commit(session);
 
         session = NULL;
-        if (committed != (action == TEST_ROOT_COMMIT)) {
+        if (committed != (action != TEST_ROOT_COMMIT_FAILURE)) {
             result = 1;
         }
     }
@@ -304,6 +405,119 @@ run_two_rank_case(int port,
     peak_report_snapshot_destroy(aggregate);
     peak_report_snapshot_destroy(root);
     (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_DROP_ONCE");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RESOLVE_AGAIN_ONCE");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_FAIL_ONCE");
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    return result;
+}
+
+static int
+run_many_rank_case(int port, int size)
+{
+    PeakReportSnapshot* root = fixture_snapshot(0, false);
+    PeakReportSnapshot* aggregate = NULL;
+    PeakSocketReportSession* session = NULL;
+    pid_t* children = NULL;
+    char port_text[16];
+    char token_text[64];
+    int started = 0;
+    int result = 0;
+
+    if (root == NULL || size <= 2) {
+        peak_report_snapshot_destroy(root);
+        return 1;
+    }
+    children = calloc((size_t)(size - 1), sizeof(*children));
+    if (children == NULL) {
+        peak_report_snapshot_destroy(root);
+        return 1;
+    }
+    snprintf(port_text, sizeof(port_text), "%d", port);
+    snprintf(token_text,
+             sizeof(token_text),
+             "socket-report-many-test-%ld-%d",
+             (long)getpid(),
+             port);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "3000", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
+                 "6000",
+                 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_DROP_ONCE");
+
+    for (int rank = 1; rank < size; rank++) {
+        pid_t child = fork();
+
+        if (child < 0) {
+            result = 1;
+            break;
+        }
+        if (child == 0) {
+            PeakReportSnapshot* peer = fixture_snapshot(rank, false);
+            PeakReportSnapshot* peer_aggregate = NULL;
+            PeakSocketReportSession* peer_session = NULL;
+            PeakSocketReportStatus peer_status;
+
+            set_test_rank(rank, size);
+            if (peer == NULL) {
+                _exit(99);
+            }
+            peer_status = peak_socket_report_transport_begin(
+                peer,
+                PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+                &peer_session,
+                &peer_aggregate);
+            peak_socket_report_transport_abort(peer_session);
+            peak_report_snapshot_destroy(peer_aggregate);
+            peak_report_snapshot_destroy(peer);
+            _exit((int)peer_status);
+        }
+        children[started++] = child;
+    }
+
+    if (!result) {
+        PeakSocketReportStatus root_status;
+
+        set_test_rank(0, size);
+        root_status = peak_socket_report_transport_begin(
+            root,
+            PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+            &session,
+            &aggregate);
+        if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
+            session == NULL || aggregate == NULL ||
+            aggregate->rank_count != size ||
+            aggregate->num_calls[0] !=
+                10UL + 7UL * (unsigned long)(size - 1) ||
+            aggregate->num_calls[1] !=
+                6UL * (unsigned long)(size - 1)) {
+            result = 1;
+            peak_socket_report_transport_abort(session);
+            session = NULL;
+        } else if (!peak_socket_report_transport_commit(session)) {
+            result = 1;
+            session = NULL;
+        } else {
+            session = NULL;
+        }
+    } else {
+        peak_socket_report_transport_abort(session);
+        session = NULL;
+    }
+
+    for (int i = 0; i < started; i++) {
+        if (wait_for_expected_child(
+                children[i], PEAK_SOCKET_REPORT_PEER_RELEASED) != 0) {
+            result = 1;
+        }
+    }
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(root);
+    free(children);
     return result;
 }
 
@@ -434,10 +648,21 @@ check_slurm_host_parser(void)
 int
 main(void)
 {
-    int base_port = 22000 + (int)(getpid() % 8000) * 4;
+    /*
+     * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
+     * consumes base..base+19, and the kernel lock prevents parallel CTest
+     * processes, including different UIDs, from choosing the same range.
+     */
+    int port_lock_fd = -1;
+    int base_port = reserve_test_port_slot(&port_lock_fd);
+    int failed;
 
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
-    if (check_slurm_host_parser() != 0 ||
+    if (base_port < 0) {
+        return 1;
+    }
+    failed =
+        check_slurm_host_parser() != 0 ||
         check_single_process_clone() != 0 ||
         check_required_rank_metadata() != 0 ||
         check_invalid_output_pointers_are_cleared() != 0 ||
@@ -446,7 +671,25 @@ main(void)
         run_two_rank_case(base_port + 4,
                           TEST_ROOT_COMMIT_FAILURE,
                           false) != 0 ||
-        run_two_rank_case(base_port + 6, TEST_ROOT_COMMIT, true) != 0) {
+        run_two_rank_case(base_port + 6, TEST_ROOT_COMMIT, true) != 0 ||
+        run_two_rank_case(base_port + 8,
+                          TEST_ROOT_COMMIT_DELAYED_DEFAULT,
+                          false) != 0 ||
+        run_two_rank_case(base_port + 10,
+                          TEST_ROOT_COMMIT_DELAYED_CLAMP,
+                          false) != 0 ||
+        run_two_rank_case(base_port + 12,
+                          TEST_ROOT_COMMIT_DROP_ONCE,
+                          false) != 0 ||
+        run_two_rank_case(base_port + 14,
+                          TEST_ROOT_COMMIT_RESOLVE_AGAIN,
+                          false) != 0 ||
+        run_two_rank_case(base_port + 16,
+                          TEST_ROOT_COMMIT_CONFIRM_RETRY,
+                          false) != 0 ||
+        run_many_rank_case(base_port + 18, 32) != 0;
+    close(port_lock_fd);
+    if (failed) {
         return 1;
     }
 
