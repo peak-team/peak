@@ -75,6 +75,13 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "header_guard_style_ok")
 
+    add_test(NAME test_mpi_lifecycle_checker_policy
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/test_mpi_lifecycle_checker_policy.py)
+    set_tests_properties(test_mpi_lifecycle_checker_policy
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "mpi_lifecycle_checker_policy_ok")
+
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
         add_test(NAME test_peak_shared_unwinder
             COMMAND ${Python3_EXECUTABLE}
