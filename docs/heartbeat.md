@@ -531,10 +531,11 @@ The defaults below describe the current implementation.
 | `PEAK_TEXT_OUTPUT` | auto | Truthy values force text output. Without it, rank-local MPI-shaped output may suppress duplicate text. |
 | `PEAK_OUTPUT_AGGREGATION` | `mpi` under MPI | Selects `mpi`, `socket`, or local/rank-local aggregation. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | unset | Legacy alias used when `PEAK_OUTPUT_AGGREGATION` is unset. |
-| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | `10000` | Timeout for all-rank finalize participation proof. |
+| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | `10000` | Timeout for MPI aggregation's proof-first all-rank finalize participation check. |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | `5000` | Timeout for MPI output reducer collectives. |
-| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | `60000` | Timeout for socket aggregation. |
-| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | `180000` | Timeout for the common post-publication release gate; keep it above twice any configured socket timeout plus local-fallback margin. |
+| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | `60000` | Timeout for each socket gather or root-release phase. |
+| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | `3 × socket phase timeout` | Peer-side end-to-end budget spanning gather, report publication, and confirmed release; values below three phase timeouts are raised. |
+| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | `180000` | Baseline post-publication gate timeout. A path that attempted socket publication automatically raises the effective timeout to at least the peer release budget plus two socket-phase margins; MPI and rank-local paths retain this baseline. |
 | `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`, `MV2_COMM_WORLD_LOCAL_SIZE`, `PMI_LOCAL_SIZE` | `1` fallback | Local rank count for reattach admission and diagnostic risk reporting. |
 
 Several backend safety variables, such as `PEAK_SAFE_DETACH_MODE`,
@@ -553,16 +554,16 @@ application-observed overhead.
 MPI enters the picture during teardown/reporting:
 
 - `peak.c` requires an all-rank finalize-participation proof before using MPI
-  collectives for output on the finalize path.
+  collectives for MPI-aggregated output on the finalize path.
 - MPI reducer calls use bounded nonblocking collectives. If a payload reduction
   fails after the proof, PEAK first attempts its socket fallback without further
   MPI calls when that fallback is enabled, then writes rank-local output if the
   socket path is unavailable or fails.
 - Explicit socket aggregation and rank-local output publish their frozen CPU
-  report before the finalize-participation proof. The strict socket path uses
+  report before MPI teardown coordination. The strict socket path uses
   consistent launcher rank/size pairs and makes no MPI call until publication
-  and socket release are finished. The later proof only decides whether PEAK
-  may enter the common release gate and real finalizer. With explicit
+  and socket release are finished. Finalize participation then joins report
+  completion and finalizer policy in one long release gate. With explicit
   `PEAK_MPI_FINALIZE_POLICY=defer`, socket output instead uses a process-exit
   path that does not require an MPI-finalize proof.
 - On the default pre-finalize path, MPI, socket, and rank-local writers all
@@ -579,8 +580,9 @@ MPI enters the picture during teardown/reporting:
   finalizer is non-conforming and still requires launcher-scale validation.
 - An abnormal exit uses rank-local output without making teardown MPI calls.
   Missing all-rank participation rejects MPI aggregation. A local/socket report
-  already published before a failed or timed-out proof is retained; PEAK then
-  fails the MPI finalizer path closed without issuing later MPI calls.
+  already published before a failed or timed-out combined gate is retained;
+  PEAK then fails the MPI finalizer path closed without issuing later MPI
+  calls or starting another output fallback.
 
 PEAK does not call full teardown from a termination-signal handler. `SIGKILL`
 cannot be caught, and `peak_fini()` uses locks, threads, allocators, I/O, and

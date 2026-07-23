@@ -11,6 +11,16 @@
 #define PEAK_TEXT_OUTPUT_ENV "PEAK_TEXT_OUTPUT"
 #define PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK_ENV \
     "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK"
+#define PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV \
+    "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"
+#define PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV \
+    "PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS"
+#define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_ENV \
+    "PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS"
+#define PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT 60000U
+#define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT 180000U
+#define PEAK_SOCKET_RELEASE_PHASE_COUNT 3U
+#define PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT 2U
 
 static bool
 peak_general_listener_unsigned_text_is_negative(const char* value)
@@ -24,6 +34,108 @@ peak_general_listener_unsigned_text_is_negative(const char* value)
         cursor++;
     }
     return *cursor == '-';
+}
+
+static bool
+peak_general_listener_parse_positive_uint_bounded(const char* name,
+                                                  unsigned int maximum,
+                                                  unsigned int* value_out)
+{
+    const char* value = getenv(name);
+    char* end = NULL;
+    unsigned long parsed;
+
+    if (value == NULL || value[0] == '\0' ||
+        peak_general_listener_unsigned_text_is_negative(value)) {
+        return false;
+    }
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
+        parsed > maximum) {
+        return false;
+    }
+    if (value_out != NULL) {
+        *value_out = (unsigned int)parsed;
+    }
+    return true;
+}
+
+static unsigned int
+peak_general_listener_multiply_saturated(unsigned int value,
+                                         unsigned int multiplier,
+                                         unsigned int maximum)
+{
+    if (value > maximum / multiplier) {
+        return maximum;
+    }
+    return value * multiplier;
+}
+
+static unsigned int
+peak_general_listener_add_saturated(unsigned int left,
+                                    unsigned int right)
+{
+    if (left > UINT_MAX - right) {
+        return UINT_MAX;
+    }
+    return left + right;
+}
+
+PeakReportTimeoutBudget
+peak_general_listener_report_timeout_budget(void)
+{
+    PeakReportTimeoutBudget budget = {
+        .socket_phase_timeout_ms =
+            PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT,
+        .socket_release_timeout_ms = 0,
+        .mpi_report_release_timeout_ms =
+            PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT,
+        .socket_combined_release_minimum_ms = 0,
+        .socket_release_was_raised = false,
+    };
+    unsigned int configured;
+    unsigned int minimum_socket_release;
+    unsigned int mpi_margin;
+    unsigned int minimum_mpi_release;
+
+    if (peak_general_listener_parse_positive_uint_bounded(
+            PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
+            (unsigned int)INT_MAX,
+            &configured)) {
+        budget.socket_phase_timeout_ms = configured;
+    }
+    minimum_socket_release =
+        peak_general_listener_multiply_saturated(
+            budget.socket_phase_timeout_ms,
+            PEAK_SOCKET_RELEASE_PHASE_COUNT,
+            (unsigned int)INT_MAX);
+    budget.socket_release_timeout_ms = minimum_socket_release;
+    if (peak_general_listener_parse_positive_uint_bounded(
+            PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
+            (unsigned int)INT_MAX,
+            &configured)) {
+        budget.socket_release_timeout_ms = configured;
+        if (configured < minimum_socket_release) {
+            budget.socket_release_timeout_ms = minimum_socket_release;
+            budget.socket_release_was_raised = true;
+        }
+    }
+
+    if (peak_general_listener_parse_positive_uint_bounded(
+            PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_ENV,
+            UINT_MAX,
+            &configured)) {
+        budget.mpi_report_release_timeout_ms = configured;
+    }
+    mpi_margin = peak_general_listener_multiply_saturated(
+        budget.socket_phase_timeout_ms,
+        PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT,
+        UINT_MAX);
+    minimum_mpi_release = peak_general_listener_add_saturated(
+        budget.socket_release_timeout_ms, mpi_margin);
+    budget.socket_combined_release_minimum_ms = minimum_mpi_release;
+    return budget;
 }
 
 bool

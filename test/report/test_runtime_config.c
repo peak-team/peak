@@ -27,6 +27,9 @@ static const char* const peak_test_environment_names[] = {
     "SLURM_PROCID",
     "PEAK_TEXT_OUTPUT",
     "PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK",
+    "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS",
+    "PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
+    "PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS",
 };
 
 static void
@@ -116,6 +119,66 @@ check_unsigned_parser(void)
     setenv("PEAK_TEST_UINT", " 42", 1);
     return peak_general_listener_parse_uint_env_default(
                "PEAK_TEST_UINT", 7U) != 42U;
+}
+
+static int
+check_report_timeout_budget(void)
+{
+    PeakReportTimeoutBudget budget =
+        peak_general_listener_report_timeout_budget();
+    char int_max_text[32];
+
+    if (budget.socket_phase_timeout_ms != 60000U ||
+        budget.socket_release_timeout_ms != 180000U ||
+        budget.mpi_report_release_timeout_ms != 180000U ||
+        budget.socket_combined_release_minimum_ms != 300000U ||
+        budget.socket_release_was_raised) {
+        return 1;
+    }
+
+    setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1000", 1);
+    setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "1", 1);
+    setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "2", 1);
+    budget = peak_general_listener_report_timeout_budget();
+    if (budget.socket_phase_timeout_ms != 1000U ||
+        budget.socket_release_timeout_ms != 3000U ||
+        budget.mpi_report_release_timeout_ms != 2U ||
+        budget.socket_combined_release_minimum_ms != 5000U ||
+        !budget.socket_release_was_raised) {
+        return 1;
+    }
+
+    setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "8000", 1);
+    setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "12000", 1);
+    budget = peak_general_listener_report_timeout_budget();
+    if (budget.socket_release_timeout_ms != 8000U ||
+        budget.mpi_report_release_timeout_ms != 12000U ||
+        budget.socket_combined_release_minimum_ms != 10000U ||
+        budget.socket_release_was_raised) {
+        return 1;
+    }
+    setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "9000", 1);
+    budget = peak_general_listener_report_timeout_budget();
+    if (budget.mpi_report_release_timeout_ms != 9000U ||
+        budget.socket_combined_release_minimum_ms != 10000U) {
+        return 1;
+    }
+
+    if (snprintf(int_max_text,
+                 sizeof(int_max_text),
+                 "%d",
+                 INT_MAX) >= (int)sizeof(int_max_text)) {
+        return 1;
+    }
+    setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", int_max_text, 1);
+    setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "1", 1);
+    setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "1", 1);
+    budget = peak_general_listener_report_timeout_budget();
+    return budget.socket_phase_timeout_ms != (unsigned int)INT_MAX ||
+           budget.socket_release_timeout_ms != (unsigned int)INT_MAX ||
+           budget.mpi_report_release_timeout_ms != 1U ||
+           budget.socket_combined_release_minimum_ms != UINT_MAX ||
+           !budget.socket_release_was_raised;
 }
 
 static int
@@ -424,6 +487,12 @@ main(void)
     clear_test_environment();
     if (check_truthy_values() || check_unsigned_parser() ||
         check_detach_override()) {
+        fputs("runtime_config_test_failed\n", stderr);
+        return 1;
+    }
+
+    clear_test_environment();
+    if (check_report_timeout_budget()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;
     }

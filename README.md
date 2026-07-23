@@ -137,16 +137,17 @@ in detail.
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases. On the intercepted-finalize path, socket/local publish before the MPI participation proof; MPI aggregation remains proof-first. |
+| `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases. On the intercepted-finalize path, socket/local publish before MPI teardown coordination and fold participation into the long release gate; MPI aggregation remains proof-first. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | Legacy aggregate-output switch; `PEAK_OUTPUT_AGGREGATION` takes precedence. |
 | `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer immediately and therefore bypasses the Intel MPI 2019 compatibility skip. |
 | `PEAK_MPI_REAL_FINALIZE` | Override for the real MPI finalizer. Healthy non-Intel-MPI-2019 jobs enable it by default; Intel MPI 2019 skips its crash-prone finalizer unless set to `1`. Setting it to `0` also disables the immediate real-finalizer call in `defer` mode. Setting it to `1` cannot override a failed collective safety gate on the default `report` path. |
-| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | Timeout for the all-rank finalization participation check. Default: `10000`. |
-| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | Timeout for the post-publication all-rank release gate. Default: `180000`, covering two default socket timeout periods plus local fallback publication. |
+| `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | Timeout for the proof-first MPI aggregation finalization-participation check. Default: `10000`. |
+| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | Baseline timeout for the post-publication all-rank release gate. For socket/local output this same gate also proves finalize participation. Default: `180000`; only a path that attempted socket publication raises the effective timeout to at least the peer release budget plus two socket-phase margins (normally `300000`). |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each MPI payload reduction. Default: `5000`. |
 | `PEAK_OUTPUT_AGGREGATION_HOST` | Override the socket reducer host. |
 | `PEAK_OUTPUT_AGGREGATION_PORT` | Override the socket reducer port. |
-| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | Override the socket reducer timeout. |
+| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each socket gather or root-release phase. Default: `60000`. |
+| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | Peer-side end-to-end socket release budget spanning gather, report publication, and confirmed release. Default and minimum: three socket phase timeouts. |
 | `PEAK_OUTPUT_AGGREGATION_TOKEN` | Override the socket reducer session token. |
 | `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK` | Enable MPI-reducer-to-socket and socket-to-rank-local fallback paths. Default: enabled. |
 
@@ -163,6 +164,9 @@ calls, even when `PEAK_MPI_REAL_FINALIZE=1` was requested.
 Aggregate CSVs retain `base-pPID.csv`; multi-rank local fallback files use
 `base-pPID-rRANK.csv` (or a sanitized hostname suffix when rank metadata is
 unavailable) to avoid cross-node PID collisions.
+In both CSV and text reports, `count` is the exact total call count,
+`per_thread` is the ceiling over active threads, and `per_rank`/`avg/rank` is
+the non-truncated arithmetic mean over all ranks represented by the report.
 See [Physical detach controller](docs/physical-detach-controller.md) for the
 full output and teardown behavior.
 
