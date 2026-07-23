@@ -823,23 +823,66 @@ def check_final_report_snapshot_order(repo_root):
     socket_result = extract_function(
         socket_transport, "peak_socket_report_transport_begin"
     )
+    socket_validate_header = extract_function(
+        socket_transport, "peak_socket_gather_validate_header"
+    )
+    socket_prepare_receipt = extract_function(
+        socket_transport, "peak_socket_gather_prepare_receipt"
+    )
+    socket_root_gather = extract_function(
+        socket_transport, "peak_socket_reduce_root_gather"
+    )
+    socket_read_ready = extract_function(
+        socket_transport, "peak_socket_gather_read_ready"
+    )
+    socket_write_ready = extract_function(
+        socket_transport, "peak_socket_gather_write_ready"
+    )
+    socket_peer_begin = extract_function(
+        socket_transport, "peak_socket_report_peer_begin"
+    )
     set_socket_overhead = extract_function(
         socket_transport, "peak_socket_report_set_aggregate_overhead"
     )
-    require("#define PEAK_SOCKET_REDUCE_VERSION 10U" in socket_transport and
+    require("#define PEAK_SOCKET_REDUCE_VERSION 11U" in socket_transport and
             "peak_socket_reduce_header_set_report_tuple" in socket_result and
-            "peak_socket_reduce_header_report_tuple" in socket_result and
-            "peak_report_rank_tuple_is_valid" in socket_result and
+            "peak_socket_reduce_header_report_tuple" in
+                socket_validate_header and
+            "peak_report_rank_tuple_is_valid" in socket_validate_header and
             "peak_report_maxima_initialize" in socket_result and
-            "peak_report_maxima_consider" in socket_result and
+            "peak_report_maxima_consider" in socket_prepare_receipt and
             "peak_socket_report_set_aggregate_overhead" in socket_result and
             "report.per_rank_maxima = *maxima" in set_socket_overhead and
             "combined_maximum->stop_window_count" in set_socket_overhead and
             "combined_maximum->elapsed_seconds" in set_socket_overhead and
             "report.accounting_valid = accounting_valid" in
                 set_socket_overhead and
-            "peak_socket_add_uint64_saturated" in socket_result,
+            "peak_socket_add_uint64_saturated" in socket_prepare_receipt,
             "socket reducer must carry complete owner tuples and accounting health")
+    require("PEAK_SOCKET_REDUCE_GATHER_ACTIVE_MAX" in socket_transport and
+            "peak_socket_reduce_gather_active_limit" in
+                socket_root_gather and
+            "active < active_limit" in socket_root_gather and
+            "poll(descriptors" in socket_root_gather and
+            "peak_socket_reduce_remaining_ms(deadline_us)" in
+                socket_root_gather and
+            "PEAK_SOCKET_GATHER_READING_HEADER" in socket_read_ready and
+            "PEAK_SOCKET_GATHER_READING_PAYLOAD" in socket_read_ready,
+            "socket gather must use a bounded nonblocking poll window under one deadline")
+    require("PEAK_SOCKET_REDUCE_GATHER_RECEIPT" in
+                socket_prepare_receipt and
+            "PEAK_SOCKET_REDUCE_GATHER_REGISTERED" in
+                socket_prepare_receipt and
+            "sizeof(connection->receipt)" in socket_write_ready and
+            "PEAK_SOCKET_GATHER_READING_CONFIRM" in socket_root_gather and
+            "PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM" in
+                socket_read_ready and
+            "peak_socket_reduce_recv_all" in socket_peer_begin and
+            "peak_socket_reduce_send_gather_confirmation" in
+                socket_peer_begin and
+            "receipt_received" in socket_peer_begin and
+            "release_targets[rank] = true" in socket_root_gather,
+            "wire-v11 gather must receipt and confirm each peer before completion")
     require("min_total_time[i] = DBL_MAX" in print_entry and
             "sum_min_time[i] = FLT_MAX" in print_entry and
             "peak_report_calls_per_active_thread" in formatter and
