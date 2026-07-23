@@ -246,48 +246,148 @@ check_world_rank_precedence(void)
 }
 
 static int
-check_world_rank_size_pairs(void)
+expect_world_rank_size(long expected_rank, long expected_size)
 {
     long rank = 99;
     long size = 99;
 
-    if (peak_general_listener_mpi_env_rank_size(&rank, &size) ||
-        rank != 99 || size != 99) {
+    return !peak_general_listener_mpi_env_rank_size(&rank, &size) ||
+           rank != expected_rank || size != expected_size;
+}
+
+static int
+expect_world_rank_size_failure(void)
+{
+    long rank = 99;
+    long size = 99;
+
+    return peak_general_listener_mpi_env_rank_size(&rank, &size) ||
+           rank != 99 || size != 99;
+}
+
+static int
+check_world_rank_size_pairs(void)
+{
+    static const struct {
+        const char* rank_name;
+        const char* size_name;
+    } mpi_pairs[] = {
+        { "PMI_RANK", "PMI_SIZE" },
+        { "PMIX_RANK", "PMIX_SIZE" },
+        { "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE" },
+        { "MV2_COMM_WORLD_RANK", "MV2_COMM_WORLD_SIZE" },
+        { "I_MPI_RANK", "I_MPI_SIZE" },
+    };
+
+    if (expect_world_rank_size_failure()) {
         return 1;
     }
 
+    for (size_t i = 0;
+         i < sizeof(mpi_pairs) / sizeof(mpi_pairs[0]);
+         i++) {
+        clear_test_environment();
+        setenv(mpi_pairs[i].rank_name, "2", 1);
+        setenv(mpi_pairs[i].size_name, "8", 1);
+        setenv("SLURM_PROCID", "0", 1);
+        setenv("SLURM_NTASKS", "8", 1);
+        if (expect_world_rank_size(2, 8)) {
+            return 1;
+        }
+
+        setenv("SLURM_PROCID", "bad", 1);
+        setenv("SLURM_NTASKS", "0", 1);
+        if (expect_world_rank_size(2, 8)) {
+            return 1;
+        }
+    }
+
+    clear_test_environment();
     setenv("PMI_RANK", "2", 1);
-    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+    if (expect_world_rank_size_failure()) {
         return 1;
     }
     setenv("PMI_SIZE", "8", 1);
-    if (!peak_general_listener_mpi_env_rank_size(&rank, &size) ||
-        rank != 2 || size != 8) {
+    if (expect_world_rank_size(2, 8)) {
         return 1;
     }
 
     setenv("OMPI_COMM_WORLD_RANK", "2", 1);
     setenv("OMPI_COMM_WORLD_SIZE", "8", 1);
-    if (!peak_general_listener_mpi_env_rank_size(&rank, &size) ||
-        rank != 2 || size != 8) {
+    if (expect_world_rank_size(2, 8)) {
         return 1;
     }
     setenv("OMPI_COMM_WORLD_RANK", "3", 1);
-    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+    if (expect_world_rank_size_failure()) {
         return 1;
     }
 
+    clear_test_environment();
+    setenv("PMI_RANK", "bad", 1);
+    setenv("PMI_SIZE", "8", 1);
+    setenv("SLURM_PROCID", "2", 1);
+    setenv("SLURM_NTASKS", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("PMI_RANK", "8", 1);
+    setenv("PMI_SIZE", "8", 1);
+    setenv("SLURM_PROCID", "2", 1);
+    setenv("SLURM_NTASKS", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("PMI_RANK", "2", 1);
+    setenv("PMI_SIZE", "8", 1);
+    setenv("OMPI_COMM_WORLD_RANK", "bad", 1);
+    setenv("OMPI_COMM_WORLD_SIZE", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("PMI_RANK", "2", 1);
+    setenv("SLURM_PROCID", "3", 1);
+    setenv("SLURM_NTASKS", "8", 1);
+    if (expect_world_rank_size(3, 8)) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("SLURM_PROCID", "3", 1);
+    setenv("SLURM_NTASKS", "8", 1);
+    if (expect_world_rank_size(3, 8)) {
+        return 1;
+    }
+    unsetenv("SLURM_NTASKS");
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+    setenv("SLURM_NTASKS", "8", 1);
+    setenv("SLURM_PROCID", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+    setenv("SLURM_PROCID", "3", 1);
+    setenv("SLURM_NTASKS", "0", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("PMI_RANK", "2", 1);
+    setenv("PMI_SIZE", "8", 1);
     setenv("OMPI_COMM_WORLD_RANK", "2", 1);
-    setenv("MV2_COMM_WORLD_RANK", "8", 1);
-    setenv("MV2_COMM_WORLD_SIZE", "8", 1);
-    if (peak_general_listener_mpi_env_rank_size(&rank, &size)) {
+    setenv("OMPI_COMM_WORLD_SIZE", "8", 1);
+    if (expect_world_rank_size(2, 8)) {
         return 1;
     }
-
-    unsetenv("MV2_COMM_WORLD_RANK");
-    unsetenv("MV2_COMM_WORLD_SIZE");
-    setenv("PMI_SIZE", "bad", 1);
-    return peak_general_listener_mpi_env_rank_size(&rank, &size);
+    setenv("OMPI_COMM_WORLD_RANK", "3", 1);
+    return expect_world_rank_size_failure();
 }
 
 static int
