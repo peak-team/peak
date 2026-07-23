@@ -3,13 +3,14 @@
 
 /**
  * @file socket_report_transport.h
- * @brief Aggregate immutable final-report snapshots through PEAK wire-v10.
+ * @brief Aggregate immutable final-report snapshots through PEAK wire-v11.
  */
 
 #include "internal/general_listener/report_snapshot.h"
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /** Sources from which socket aggregation may obtain the process rank. */
 typedef enum {
@@ -27,7 +28,7 @@ typedef enum {
     PEAK_SOCKET_REPORT_FAILED = 0,
     /** This is a single-process report; an owned snapshot is ready. */
     PEAK_SOCKET_REPORT_SINGLE_READY,
-    /** A peer submitted its snapshot and confirmed the root's final ACK. */
+    /** A peer submitted its snapshot and accepted the root's final ACK. */
     PEAK_SOCKET_REPORT_PEER_RELEASED,
     /** Root gathered every peer; complete report output must precede commit. */
     PEAK_SOCKET_REPORT_ROOT_PREPARED,
@@ -37,18 +38,26 @@ typedef enum {
 typedef struct PeakSocketReportSession PeakSocketReportSession;
 
 /**
- * Gathers immutable report snapshots through the established wire-v10 socket
+ * Gathers immutable report snapshots through the established wire-v11 socket
  * protocol.
+ *
+ * Root advances a bounded set of nonblocking peer connections under one hard
+ * gather deadline. A peer enters the final-release wait only after receiving a
+ * complete registration receipt. Root completes that peer's gather only after
+ * receiving the matching receipt confirmation; if the confirmation fails, the
+ * registered peer waits for root's authoritative fallback decision. A partial,
+ * invalid, duplicate, or unconfirmed peer fails the whole aggregate without
+ * publishing it.
  *
  * The function blocks peers until root commits or aborts the prepared report.
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
  * snapshot. ROOT_PREPARED also returns an owned session through @p session_out.
  * Both output pointers are required. Other outcomes, including a missing
- * output pointer, clear every provided output to NULL. Wire-v10 does not carry
+ * output pointer, clear every provided output to NULL. Wire-v11 does not carry
  * instrumented markers; the aggregate retains root's marker or promotes it
  * when a positive aggregate call count proves that some rank instrumented the
  * slot. Peer-only instrumented slots with zero calls are not represented.
- * Wire-v10 is supported only among ranks with the same byte order,
+ * Wire-v11 is supported only among ranks with the same byte order,
  * floating-point representation, and 64-bit Linux C ABI. The peer release-wait
  * budget defaults to three gather-phase budgets so it covers gather, report
  * publication, and confirmed release. A positive
@@ -83,6 +92,31 @@ bool peak_socket_report_transport_commit(PeakSocketReportSession* session);
 void peak_socket_report_transport_abort(PeakSocketReportSession* session);
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
+/** Test-only observations from the current process's latest socket gather. */
+typedef struct {
+    uint32_t wire_version;
+    uint32_t root_payload_count;
+    uint32_t root_receipt_count;
+    uint32_t root_confirmation_count;
+    uint32_t root_max_active;
+    uint32_t root_release_target_count;
+    uint32_t root_release_confirmed_count;
+    uint8_t root_release_decision;
+    bool peer_receipt_received;
+    bool peer_confirmation_sent;
+    bool peer_release_started;
+    bool peer_release_decision_received;
+    bool peer_release_confirmation_sent;
+    uint8_t peer_release_decision;
+} PeakSocketReportTestTelemetry;
+
+/** Clears test-only socket gather observations. */
+void peak_socket_report_test_telemetry_reset(void);
+
+/** Copies test-only socket gather observations to @p telemetry_out. */
+void peak_socket_report_test_telemetry_get(
+    PeakSocketReportTestTelemetry* telemetry_out);
+
 /** Parses the first host represented by a Slurm node-list expression. */
 int peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                 char* out,
