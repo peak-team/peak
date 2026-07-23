@@ -33,6 +33,16 @@ OPENMPI_IMPROPER_EXIT_BLOCK_RE = re.compile(
     r"-{10,}\n",
     re.DOTALL,
 )
+MPI_REDUCER_COMPLETE_REPORT_TAIL_RE = re.compile(
+    r"Function timing statistics\r?\n"
+    r"-{20,}\r?\n"
+    r"Detailed function statistics \(thread\): "
+    r"aggregate timing in seconds\r?\n"
+    r"\|[^\r\n]*function[^\r\n]*\|\r?\n"
+    r"-{20,}\r?\n"
+    r"\|[^\r\n]*peak_mpi_exit_target[^\r\n]*\|\r?\n"
+    r"-{20,}\r?\n"
+)
 NUMBER_RE = r"[0-9.eE+-]+"
 EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "no-finalize",
@@ -93,6 +103,7 @@ REPORT_COMPLETION_DIAGNOSTICS = (
 )
 REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS = (
     "MPI finalize participation proof timed out after ",
+    "MPI combined finalize/report publication release timed out after ",
     "MPI_Iallreduce for report publication release failed; "
     "disabling later MPI teardown calls",
     "MPI_Test for report publication release failed; "
@@ -101,6 +112,16 @@ REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS = (
     "disabling later MPI teardown calls",
     "All-rank report publication release failed; "
     "skipping real PMPI_Finalize and avoiding later MPI teardown calls",
+)
+MPI_REDUCER_FAIL_LATE_DIAGNOSTICS = (
+    "MPI output reducer failed or timed out",
+    "PEAK output reducer did not complete cleanly",
+)
+MPI_REDUCER_FAIL_FORCED_DIAGNOSTIC = (
+    "MPI reducer test hook forced failure for "
+)
+MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC = (
+    "MPI reducer failed; trying PEAK-owned socket aggregation fallback"
 )
 
 
@@ -152,6 +173,46 @@ def intel_default_launcher_outcome_allowed(mode, returncode, output, timed_out):
     return LAUNCHER_ABNORMAL_RE.search(remaining_output) is None
 
 
+def intel_reducer_fallback_launcher_outcome_allowed(
+    mode,
+    returncode,
+    output,
+    timed_out,
+    nprocs,
+    is_intel_mpi,
+):
+    """Accept Intel Hydra cleanup only after a complete fail-closed fallback."""
+    if (
+        mode != "finalize-clean-output-mpi-reducer-fail" or
+        returncode == 0 or
+        timed_out or
+        nprocs <= 0 or
+        not is_intel_mpi
+    ):
+        return False
+
+    blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
+    if not blocks:
+        return False
+    remaining_output = INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.sub("", output)
+    if LAUNCHER_ABNORMAL_RE.search(remaining_output):
+        return False
+    if output.count(MPI_REDUCER_FAIL_FORCED_DIAGNOSTIC) != nprocs:
+        return False
+    if output.count(MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC) != nprocs:
+        return False
+    report_scope = f"Report scope: aggregate ({nprocs} MPI ranks)"
+    complete_report_tails = list(
+        MPI_REDUCER_COMPLETE_REPORT_TAIL_RE.finditer(output)
+    )
+    return (
+        output.count("PEAK done with:") == 1 and
+        output.count(report_scope) == 1 and
+        len(complete_report_tails) == 1 and
+        complete_report_tails[0].end() <= blocks[0].start()
+    )
+
+
 def require_complete_stats_evidence(name, evidence):
     if evidence["size"] <= 0:
         raise AssertionError(f"PEAK final CSV was empty: {name}")
@@ -191,6 +252,13 @@ def report_clean_completion_policy(output):
     if continued_real == continued_intel_skip:
         return None
     return "real-finalize" if continued_real else "intel-2019-skip"
+
+
+def report_release_was_interrupted(output):
+    return any(
+        diagnostic in output
+        for diagnostic in REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS
+    )
 
 
 def terminate_process_group(proc, sig):
@@ -386,6 +454,8 @@ def main():
     expected_per_thread = None
     expected_positive_minima = False
     verify_socket_maxima = False
+    require_complete_stats_files = False
+    expected_exact_messages = {}
     expected_extra = []
     forbidden_output = []
     done_file = None
@@ -456,14 +526,27 @@ def main():
         )
         env["PEAK_TEST_MPI_REDUCER_FAIL_LABEL"] = reducer_fail_label
         app_args.append("finalize-then-exit0")
-        expected = f"MPI reducer test hook forced failure for {reducer_fail_label}"
-        expected_extra.append("MPI reducer failed; trying PEAK-owned socket aggregation fallback")
-        expected_extra.append("MPI output reducer failed or timed out")
-        expected_extra.append("PEAK output reducer did not complete cleanly")
-        forbidden_output.append("PEAK output is complete; returning to real PMPI_Finalize")
+        expected = (
+            f"{MPI_REDUCER_FAIL_FORCED_DIAGNOSTIC}{reducer_fail_label}"
+        )
+        expected_extra.append(MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC)
+        expected_extra.extend(MPI_REDUCER_FAIL_LATE_DIAGNOSTICS)
+        expected_exact_messages[expected] = nprocs
+        expected_exact_messages[
+            MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC
+        ] = nprocs
+        forbidden_output.append(
+            "PEAK output is complete; returning to real PMPI_Finalize"
+        )
+        forbidden_output.append(
+            "All-rank report publication release completed:"
+        )
         expected_peak_tables = 1
         expected_stats_files = 1
+        expected_per_thread = int(env.get("PEAK_MPI_EXIT_LOOPS", "16"))
+        expected_target_count = nprocs * expected_per_thread
         verify_socket_maxima = True
+        require_complete_stats_files = True
     elif args.mode == "finalize-clean-output-mpi-writer-fail":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
@@ -847,11 +930,19 @@ def main():
         output,
         timed_out,
     )
-    report_completion_policy = report_clean_completion_policy(output)
-    report_release_interrupted = any(
-        diagnostic in output
-        for diagnostic in REPORT_RELEASE_INTERRUPTION_DIAGNOSTICS
+    intel_reducer_fallback_launcher_allowed = (
+        intel_reducer_fallback_launcher_outcome_allowed(
+            args.mode,
+            returncode,
+            output,
+            timed_out,
+            nprocs,
+            args.mode == "finalize-clean-output-mpi-reducer-fail" and
+            launcher_looks_like_intel_mpi(args.mpiexec),
+        )
     )
+    report_completion_policy = report_clean_completion_policy(output)
+    report_release_interrupted = report_release_was_interrupted(output)
     launcher_abnormal = LAUNCHER_ABNORMAL_RE.search(output) is not None
     report_interruption_evidence = (
         returncode != 0 or
@@ -878,7 +969,18 @@ def main():
         raise AssertionError(f"missing expected PEAK diagnostic: {expected}")
     for extra in expected_extra:
         if extra not in output:
+            if (
+                intel_reducer_fallback_launcher_allowed and
+                extra in MPI_REDUCER_FAIL_LATE_DIAGNOSTICS
+            ):
+                continue
             raise AssertionError(f"missing expected PEAK diagnostic: {extra}")
+    for message, count in expected_exact_messages.items():
+        observed = output.count(message)
+        if observed != count:
+            raise AssertionError(
+                f"expected {count} occurrences of {message!r}, got {observed}"
+            )
     for forbidden in forbidden_output:
         if forbidden in output:
             raise AssertionError(f"unexpected PEAK diagnostic: {forbidden}")
@@ -939,6 +1041,9 @@ def main():
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
         )
+    if require_complete_stats_files:
+        for name, evidence in stats_file_evidence.items():
+            require_complete_stats_evidence(name, evidence)
     if (temporary_stats_files and
             not report_signal_requested and
             not allow_interrupted_peer_temporary_stats):
