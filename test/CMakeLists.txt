@@ -194,6 +194,7 @@ if(BUILD_TESTING)
     add_executable(test_mpi_teardown_guard
         report/test_mpi_teardown_guard.c
         ${PROJECT_SOURCE_DIR}/src/mpi_teardown_guard.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/utils/timing.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
@@ -211,7 +212,7 @@ if(BUILD_TESTING)
         PROPERTIES
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION
-                "mpi_teardown_guard_test_ok success=5 failure_paths=7")
+                "mpi_teardown_guard_test_ok success=11 failure_paths=10")
 
     add_executable(test_runtime_config
         report/test_runtime_config.c
@@ -1857,7 +1858,7 @@ if(BUILD_TESTING)
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         set(_PEAK_MPI_REPORT_SIGNAL_TESTS)
         foreach(_peak_report_phase IN ITEMS before after)
-            foreach(_peak_report_signal IN ITEMS term kill)
+            foreach(_peak_report_signal IN ITEMS term int kill)
                 string(TOUPPER "${_peak_report_signal}"
                        _peak_report_signal_upper)
                 set(_peak_report_signal_test

@@ -1,5 +1,6 @@
 #include "internal/mpi_teardown_guard.h"
 
+#include "internal/general_listener/runtime_config.h"
 #include "logging.h"
 #include "utils/env_parser.h"
 #include "utils/timing.h"
@@ -13,10 +14,7 @@
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS \
     "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT 10000U
-#define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS \
-    "PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS"
-#define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT 180000U
-#define PEAK_MPI_TEARDOWN_MAX_VALUES 2
+#define PEAK_MPI_TEARDOWN_MAX_VALUES 3
 
 typedef struct PeakMpiTeardownRequest PeakMpiTeardownRequest;
 struct PeakMpiTeardownRequest {
@@ -39,6 +37,8 @@ extern void peak_mpi_teardown_guard_test_observe_request(
     int* all_requested,
     MPI_Request* request,
     int value_count) __attribute__((weak));
+extern void peak_mpi_teardown_guard_test_observe_timeout(
+    unsigned int timeout_ms) __attribute__((weak));
 #endif
 
 void
@@ -155,19 +155,49 @@ peak_mpi_teardown_observe_request(PeakMpiTeardownRequest* pending)
 #endif
 }
 
+static unsigned int
+peak_mpi_teardown_finalize_timeout_ms(void)
+{
+    unsigned int timeout_ms = parse_env_to_uint_default(
+        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS,
+        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT);
+
+    return timeout_ms == 0
+               ? PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT
+               : timeout_ms;
+}
+
+static unsigned int
+peak_mpi_teardown_report_release_timeout_ms(
+    unsigned int minimum_timeout_ms)
+{
+    PeakReportTimeoutBudget budget =
+        peak_general_listener_report_timeout_budget();
+    unsigned int timeout_ms = budget.mpi_report_release_timeout_ms;
+
+    if (timeout_ms < minimum_timeout_ms) {
+        timeout_ms = minimum_timeout_ms;
+    }
+    if (timeout_ms != budget.mpi_report_release_timeout_ms &&
+        peak_general_listener_mpi_env_rank() == 0) {
+        peak_log_info("[peak] Raised MPI report-release timeout from %u to %u ms to satisfy the caller's publication-path minimum\n",
+                      budget.mpi_report_release_timeout_ms,
+                      timeout_ms);
+    }
+    return timeout_ms;
+}
+
 static bool
 peak_mpi_teardown_all_ranks_min(const int* local_values,
                                 int value_count,
                                 const char* operation,
-                                const char* timeout_env,
-                                unsigned int timeout_default_ms,
+                                unsigned int timeout_ms,
                                 int* all_values)
 {
     PeakMpiTeardownRequest* pending;
     MPI_Status status;
     int done = 0;
     int mpi_result;
-    unsigned int timeout_ms;
     double deadline;
     const struct timespec poll_pause = { .tv_sec = 0, .tv_nsec = 1000000L };
 
@@ -199,11 +229,12 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
         return false;
     }
 
-    timeout_ms =
-        parse_env_to_uint_default(timeout_env, timeout_default_ms);
-    if (timeout_ms == 0) {
-        timeout_ms = timeout_default_ms;
+#if defined(PEAK_ENABLE_TEST_HOOKS) && \
+    (defined(__GNUC__) || defined(__clang__))
+    if (peak_mpi_teardown_guard_test_observe_timeout != NULL) {
+        peak_mpi_teardown_guard_test_observe_timeout(timeout_ms);
     }
+#endif
     deadline = peak_second() + (double)timeout_ms / 1000.0;
     while (1) {
         mpi_result = MPI_Test(&pending->request, &done, &status);
@@ -250,8 +281,7 @@ peak_mpi_teardown_all_ranks_requested_finalize(int local_requested)
                local_values,
                1,
                "finalize participation proof",
-               PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS,
-               PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT,
+               peak_mpi_teardown_finalize_timeout_ms(),
                &all_requested) &&
            all_requested != 0;
 }
@@ -280,14 +310,59 @@ peak_mpi_teardown_complete_report_release(
         local_values,
         2,
         "report publication release",
-        PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS,
-        PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT,
+        peak_mpi_teardown_report_release_timeout_ms(0),
         reduced_values);
     if (protocol_completed && all_complete != NULL) {
         *all_complete = reduced_values[0] != 0;
     }
     if (protocol_completed && all_real_finalize_allowed != NULL) {
         *all_real_finalize_allowed = reduced_values[1] != 0;
+    }
+    return protocol_completed;
+}
+
+bool
+peak_mpi_teardown_complete_post_publication_release(
+    int local_requested_finalize,
+    int local_complete,
+    int local_real_finalize_allowed,
+    unsigned int minimum_timeout_ms,
+    bool* all_requested_finalize,
+    bool* all_complete,
+    bool* all_real_finalize_allowed)
+{
+    const int local_values[] = {
+        local_requested_finalize,
+        local_complete,
+        local_real_finalize_allowed,
+    };
+    int reduced_values[3] = { 0, 0, 0 };
+    bool protocol_completed;
+
+    if (all_requested_finalize != NULL) {
+        *all_requested_finalize = false;
+    }
+    if (all_complete != NULL) {
+        *all_complete = false;
+    }
+    if (all_real_finalize_allowed != NULL) {
+        *all_real_finalize_allowed = false;
+    }
+    protocol_completed = peak_mpi_teardown_all_ranks_min(
+        local_values,
+        3,
+        "combined finalize/report publication release",
+        peak_mpi_teardown_report_release_timeout_ms(
+            minimum_timeout_ms),
+        reduced_values);
+    if (protocol_completed && all_requested_finalize != NULL) {
+        *all_requested_finalize = reduced_values[0] != 0;
+    }
+    if (protocol_completed && all_complete != NULL) {
+        *all_complete = reduced_values[1] != 0;
+    }
+    if (protocol_completed && all_real_finalize_allowed != NULL) {
+        *all_real_finalize_allowed = reduced_values[2] != 0;
     }
     return protocol_completed;
 }

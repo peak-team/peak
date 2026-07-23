@@ -3,7 +3,7 @@
 
 /**
  * @file socket_report_transport.h
- * @brief Aggregate immutable final-report snapshots through PEAK wire-v9.
+ * @brief Aggregate immutable final-report snapshots through PEAK wire-v10.
  */
 
 #include "internal/general_listener/report_snapshot.h"
@@ -27,7 +27,7 @@ typedef enum {
     PEAK_SOCKET_REPORT_FAILED = 0,
     /** This is a single-process report; an owned snapshot is ready. */
     PEAK_SOCKET_REPORT_SINGLE_READY,
-    /** A peer submitted its snapshot and received the root's final ACK. */
+    /** A peer submitted its snapshot and confirmed the root's final ACK. */
     PEAK_SOCKET_REPORT_PEER_RELEASED,
     /** Root gathered every peer; complete report output must precede commit. */
     PEAK_SOCKET_REPORT_ROOT_PREPARED,
@@ -37,17 +37,23 @@ typedef enum {
 typedef struct PeakSocketReportSession PeakSocketReportSession;
 
 /**
- * Gathers immutable report snapshots through the established wire-v9 socket
+ * Gathers immutable report snapshots through the established wire-v10 socket
  * protocol.
  *
  * The function blocks peers until root commits or aborts the prepared report.
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
  * snapshot. ROOT_PREPARED also returns an owned session through @p session_out.
  * Both output pointers are required. Other outcomes, including a missing
- * output pointer, clear every provided output to NULL. Wire-v9 does not carry
+ * output pointer, clear every provided output to NULL. Wire-v10 does not carry
  * instrumented markers; the aggregate retains root's marker or promotes it
  * when a positive aggregate call count proves that some rank instrumented the
  * slot. Peer-only instrumented slots with zero calls are not represented.
+ * Wire-v10 is supported only among ranks with the same byte order,
+ * floating-point representation, and 64-bit Linux C ABI. The peer release-wait
+ * budget defaults to three gather-phase budgets so it covers gather, report
+ * publication, and confirmed release. A positive
+ * `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` may raise that budget, but it is
+ * clamped to at least three gather-phase budgets.
  */
 PeakSocketReportStatus peak_socket_report_transport_begin(
     const PeakReportSnapshot* local,
@@ -56,12 +62,15 @@ PeakSocketReportStatus peak_socket_report_transport_begin(
     PeakReportSnapshot** aggregate_out);
 
 /**
- * Sends the final ACK to every registered peer and consumes @p session.
+ * Sends the final ACK decision to every registered peer, waits for each peer's
+ * confirmation, and consumes @p session.
  *
  * The caller must atomically publish the aggregate CSV and finish the text
- * report before this call. A false result
- * preserves the wire-v9 behavior: no extra fallback release is attempted, so
- * peers that did not receive an ACK fail when their release wait expires.
+ * report before this call. A validated decision is authoritative: a peer that
+ * received ACK never downgrades to rank-local output merely because its
+ * confirmation path later fails. A false result means at least one registered
+ * peer did not confirm before the root deadline; no contradictory fallback
+ * decision is sent after ACK release begins.
  */
 bool peak_socket_report_transport_commit(PeakSocketReportSession* session);
 

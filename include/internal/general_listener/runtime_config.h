@@ -3,10 +3,41 @@
 
 /**
  * @file runtime_config.h
- * @brief Parse general-listener environment settings without lifecycle state.
+ * @brief Parse report/listener environment settings without lifecycle state.
  */
 
 #include <stdbool.h>
+
+/**
+ * End-to-end timeout contract shared by socket publication and MPI teardown.
+ *
+ * The socket peer budget covers three socket phases: gather, report
+ * publication, and confirmed release. The MPI post-publication gate then
+ * retains two additional socket phases for rank-local fallback publication
+ * and collective-arrival/progress margin.
+ */
+typedef struct {
+    unsigned int socket_phase_timeout_ms;
+    unsigned int socket_release_timeout_ms;
+    unsigned int mpi_report_release_timeout_ms;
+    bool socket_release_was_raised;
+    unsigned int socket_combined_release_minimum_ms;
+} PeakReportTimeoutBudget;
+
+/**
+ * Resolves the shared report timeout budget with saturating arithmetic.
+ *
+ * Defaults are 60000 ms per socket phase, 180000 ms peer release, 180000 ms
+ * ordinary MPI/local report release, and a 300000 ms minimum for a
+ * socket-combined release. The resolved socket invariants are
+ * `socket_release >= 3 * socket_phase` (capped at INT_MAX) and
+ * `socket_combined_release_minimum = socket_release + 2 * socket_phase`
+ * (capped at UINT_MAX). The ordinary MPI/local timeout is not itself raised by
+ * socket settings; callers select the socket minimum only for a path that
+ * attempted socket publication. Invalid or zero values select the
+ * corresponding default.
+ */
+PeakReportTimeoutBudget peak_general_listener_report_timeout_budget(void);
 
 /**
  * Reads the optional detach-count override.

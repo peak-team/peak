@@ -5,9 +5,10 @@
  * @file mpi_teardown_guard.h
  * @brief Fail-closed coordination for MPI teardown collectives.
  *
- * The teardown path uses a bounded nonblocking collective to prove that every
- * rank requested finalization. Active requests that cannot be completed are
- * retained for process lifetime so MPI never observes expired request buffers.
+ * The teardown path uses bounded nonblocking collectives to coordinate final
+ * report publication and prove that every rank requested finalization. Active
+ * requests that cannot be completed are retained for process lifetime so MPI
+ * never observes expired request buffers.
  */
 
 #include <stdbool.h>
@@ -62,11 +63,10 @@ bool peak_mpi_teardown_all_ranks_requested_finalize(int local_requested);
  * of those local responsibilities succeeded.
  *
  * The timeout is configured by @c PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS and
- * defaults to 180000 ms so it covers the default socket gather/release budget
- * plus rank-local fallback publication. An initiation error, completion error,
- * or timeout permanently disables subsequent teardown MPI calls. As with the
- * finalize proof, a request that may still be active and both of its buffers
- * are kept alive until process exit rather than cancelled or freed.
+ * defaults to 180000 ms. An initiation error, completion error, or timeout
+ * permanently disables subsequent teardown MPI calls. As with the finalize
+ * proof, a request that may still be active and both of its buffers are kept
+ * alive until process exit rather than cancelled or freed.
  *
  * @param local_complete Nonzero when this rank completed its output role.
  * @param local_real_finalize_allowed Nonzero when this rank's cached runtime
@@ -87,6 +87,52 @@ bool peak_mpi_teardown_all_ranks_requested_finalize(int local_requested);
 bool peak_mpi_teardown_complete_report_release(
     int local_complete,
     int local_real_finalize_allowed,
+    bool* all_complete,
+    bool* all_real_finalize_allowed);
+
+/**
+ * @brief Combine finalize participation with the post-publication release gate.
+ *
+ * Rank-local and socket output publish before any MPI teardown proof. Their
+ * finalize-participation value therefore joins the report-completion and
+ * real-finalizer-policy values in one @c MPI_Iallreduce with @c MPI_MIN. This
+ * avoids imposing the short proof-first timeout on ranks that legitimately
+ * arrive late while another rank is still completing PEAK-owned output.
+ *
+ * The operation uses the same @c PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS baseline
+ * and fail-closed request ownership as
+ * peak_mpi_teardown_complete_report_release(). The caller may supply a larger
+ * @p minimum_timeout_ms for a publication path whose pre-collective work has a
+ * longer end-to-end budget. Explicit socket output uses its peer release
+ * budget plus two socket-phase margins; rank-local output passes zero and
+ * retains the ordinary 180000 ms default.
+ *
+ * @param local_requested_finalize Nonzero when this rank requested MPI
+ *             finalization.
+ * @param local_complete Nonzero when this rank completed its output role.
+ * @param local_real_finalize_allowed Nonzero when this rank's cached runtime
+ *             and environment policy allows return to real PMPI_Finalize.
+ * @param minimum_timeout_ms Publication-path-specific lower bound for the
+ *             collective timeout, or zero to use only the configured/default
+ *             MPI report-release timeout.
+ * @param[out] all_requested_finalize Set to `true` only when every rank
+ *             supplied a nonzero finalization-participation value.
+ * @param[out] all_complete Set to `true` only when every rank supplied a
+ *             nonzero report-completion value.
+ * @param[out] all_real_finalize_allowed Set to `true` only when every rank
+ *             supplied a nonzero finalizer-policy value.
+ * @return `true` when the combined release collective completed, even when a
+ *         reduced value is zero; `false` on collective error or timeout.
+ * @pre Local report publication or socket transport responsibility has
+ *      completed, no separate finalize-participation proof has run, and no
+ *      teardown collective has failed closed.
+ */
+bool peak_mpi_teardown_complete_post_publication_release(
+    int local_requested_finalize,
+    int local_complete,
+    int local_real_finalize_allowed,
+    unsigned int minimum_timeout_ms,
+    bool* all_requested_finalize,
     bool* all_complete,
     bool* all_real_finalize_allowed);
 

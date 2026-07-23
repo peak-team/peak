@@ -638,9 +638,9 @@ peak_fini_impl(void)
 
     /*
      * Rank-local and strict socket output do not need MPI. Publish their
-     * immutable snapshots before the all-rank finalize-participation proof so
-     * a missing rank cannot consume the entire report window. Error exits and
-     * a previously poisoned collective path also publish local evidence
+     * immutable snapshots before any MPI teardown proof, then combine finalize
+     * participation with the long post-publication release gate. Error exits
+     * and a previously poisoned collective path also publish local evidence
      * without touching MPI. The MPI backend keeps its existing proof-first
      * ordering.
      */
@@ -670,11 +670,11 @@ peak_fini_impl(void)
         } else if (found_MPI &&
                    output_mode == PEAK_OUTPUT_AGGREGATION_SOCKET &&
                    mpi_log_rank) {
-            peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI teardown proof, MPI finalization, or process exit\n");
+            peak_log_info("[peak] Writing PEAK-owned socket-reduced output before MPI teardown coordination, MPI finalization, or process exit\n");
         } else if (found_MPI &&
                    aggregation_mode == PEAK_OUTPUT_AGGREGATION_LOCAL &&
                    mpi_log_rank) {
-            peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI teardown proof, MPI finalization, or process exit\n");
+            peak_log_info("[peak] Aggregate output is disabled for strict teardown; writing rank-local output before MPI teardown coordination, MPI finalization, or process exit\n");
         } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
             g_printerr("[peak] PEAK MPI collective path was already failed closed; writing rank-local output without touching MPI again\n");
         }
@@ -708,7 +708,8 @@ peak_fini_impl(void)
          local_requested_mpi_finalize);
     if (need_mpi_finalize_proof &&
         mpi_runtime_can_collect &&
-        !abnormal_exit) {
+        !abnormal_exit &&
+        !publish_before_finalize_proof) {
         all_ranks_requested_mpi_finalize =
             peak_mpi_teardown_all_ranks_requested_finalize(
                 local_requested_mpi_finalize ? 1 : 0);
@@ -733,15 +734,16 @@ peak_fini_impl(void)
             use_socket_output ? PEAK_OUTPUT_AGGREGATION_SOCKET :
             PEAK_OUTPUT_AGGREGATION_LOCAL;
     }
-    int base_real_mpi_finalize_allowed =
+    int report_release_gate_allowed =
         mpi_finalize_path &&
         mpi_runtime_can_collect &&
         !abnormal_exit &&
         !mpi_collectives_failed_closed &&
-        all_ranks_requested_mpi_finalize;
+        (publish_before_finalize_proof ||
+         all_ranks_requested_mpi_finalize);
     gboolean intel_2019_finalize_workaround = FALSE;
     int real_mpi_finalize_config_allowed =
-        base_real_mpi_finalize_allowed ?
+        report_release_gate_allowed ?
             peak_mpi_real_finalize_config_allowed(
                 &intel_2019_finalize_workaround) : 0;
     int allow_real_mpi_finalize = 0;
@@ -819,23 +821,63 @@ peak_fini_impl(void)
     bool all_reports_succeeded = false;
     bool all_real_mpi_finalize_config_allowed = false;
     int report_release_protocol_completed = 0;
-    if (base_real_mpi_finalize_allowed && !mpi_reducer_failed_closed) {
-        report_release_protocol_completed =
-            peak_mpi_teardown_complete_report_release(
-                report_write_succeeded ? 1 : 0,
-                real_mpi_finalize_config_allowed ? 1 : 0,
-                &all_reports_succeeded,
-                &all_real_mpi_finalize_config_allowed);
+    if (report_release_gate_allowed && !mpi_reducer_failed_closed) {
+        if (publish_before_finalize_proof) {
+            bool all_requested_finalize = false;
+            /*
+             * output_mode records the attempted publication transport and
+             * remains SOCKET if that backend waited and then fell back local.
+             * Do not use the later use_socket_output eligibility boolean: it
+             * is false after early publication and would lose the socket
+             * R+2T arrival budget on exactly that fallback path.
+             */
+            PeakReportTimeoutBudget timeout_budget =
+                peak_general_listener_report_timeout_budget();
+            unsigned int publication_timeout_minimum_ms =
+                output_mode == PEAK_OUTPUT_AGGREGATION_SOCKET
+                    ? timeout_budget
+                          .socket_combined_release_minimum_ms
+                    : 0U;
+
+            report_release_protocol_completed =
+                peak_mpi_teardown_complete_post_publication_release(
+                    local_requested_mpi_finalize ? 1 : 0,
+                    report_write_succeeded ? 1 : 0,
+                    real_mpi_finalize_config_allowed ? 1 : 0,
+                    publication_timeout_minimum_ms,
+                    &all_requested_finalize,
+                    &all_reports_succeeded,
+                    &all_real_mpi_finalize_config_allowed);
+            all_ranks_requested_mpi_finalize =
+                all_requested_finalize ? 1 : 0;
+        } else {
+            report_release_protocol_completed =
+                peak_mpi_teardown_complete_report_release(
+                    report_write_succeeded ? 1 : 0,
+                    real_mpi_finalize_config_allowed ? 1 : 0,
+                    &all_reports_succeeded,
+                    &all_real_mpi_finalize_config_allowed);
+        }
         if (mpi_log_rank) {
             if (report_release_protocol_completed) {
-                peak_log_info("[peak] All-rank report publication release completed: all_reports_succeeded=%d all_real_finalize_allowed=%d\n",
-                              all_reports_succeeded ? 1 : 0,
-                              all_real_mpi_finalize_config_allowed ? 1 : 0);
+                if (publish_before_finalize_proof) {
+                    peak_log_info("[peak] All-rank report publication release completed: all_reports_succeeded=%d all_real_finalize_allowed=%d all_requested_finalize=%d (combined finalize/report gate)\n",
+                                  all_reports_succeeded ? 1 : 0,
+                                  all_real_mpi_finalize_config_allowed ? 1 : 0,
+                                  all_ranks_requested_mpi_finalize);
+                } else {
+                    peak_log_info("[peak] All-rank report publication release completed: all_reports_succeeded=%d all_real_finalize_allowed=%d\n",
+                                  all_reports_succeeded ? 1 : 0,
+                                  all_real_mpi_finalize_config_allowed ? 1 : 0);
+                }
             } else {
                 g_printerr("[peak] All-rank report publication release failed; skipping real PMPI_Finalize and avoiding later MPI teardown calls\n");
             }
         }
     }
+    int base_real_mpi_finalize_allowed =
+        report_release_gate_allowed &&
+        all_ranks_requested_mpi_finalize;
     allow_real_mpi_finalize =
         base_real_mpi_finalize_allowed &&
         report_release_protocol_completed &&

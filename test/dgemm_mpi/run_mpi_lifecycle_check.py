@@ -306,7 +306,7 @@ def parse_args():
     )
     parser.add_argument(
         "--report-signal",
-        choices=["TERM", "KILL"],
+        choices=["TERM", "INT", "KILL"],
     )
     return parser.parse_args()
 
@@ -706,7 +706,11 @@ def main():
         expected_stats_files = 1
 
     if report_signal_requested:
-        signal_number = 15 if args.report_signal == "TERM" else 9
+        signal_number = {
+            "TERM": signal.SIGTERM,
+            "INT": signal.SIGINT,
+            "KILL": signal.SIGKILL,
+        }[args.report_signal]
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
@@ -715,16 +719,16 @@ def main():
         env["PEAK_TEST_REPORT_SIGNAL_RANK"] = "0"
         # If the selected rank terminates, give surviving ranks time to fail
         # closed at the report-release gate before the outer watchdog fires.
-        # A runtime that consumes SIGTERM can still complete this small test
-        # well within the same bound.
+        # A runtime that consumes a catchable TERM/INT signal can still
+        # complete this small test well within the same bound.
         env["PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS"] = "2500"
         expected_extra.append(
             f"Test hook delivering signal {signal_number} on rank 0 at "
             f"report phase {args.report_signal_phase}"
         )
         # SIGKILL always terminates the writer. MPI runtimes may either
-        # terminate on SIGTERM or consume it and let the writer continue, so
-        # the validation below distinguishes those outcomes explicitly.
+        # terminate on a catchable TERM/INT signal or consume it and let the
+        # writer continue, so validation distinguishes those outcomes.
         expected_peak_tables = 0
         expected_stats_files = None
 
@@ -856,7 +860,7 @@ def main():
     )
     report_signal_continued = (
         report_signal_requested and
-        args.report_signal == "TERM" and
+        args.report_signal in ("TERM", "INT") and
         returncode == 0 and
         not timed_out and
         report_completion_policy is not None and
@@ -864,7 +868,7 @@ def main():
     )
     report_signal_interrupted = (
         report_signal_requested and
-        args.report_signal == "TERM" and
+        args.report_signal in ("TERM", "INT") and
         not timed_out and
         report_completion_policy is None and
         report_interruption_evidence
@@ -968,19 +972,21 @@ def main():
         if report_signal_continued:
             if len(stats_files) != nprocs:
                 raise AssertionError(
-                    "continued SIGTERM did not publish one complete CSV per rank: "
+                    f"continued SIG{args.report_signal} did not publish one "
+                    "complete CSV per rank: "
                     f"expected {nprocs}, got {len(stats_files)}"
                 )
             if temporary_stats_files:
                 raise AssertionError(
-                    "continued SIGTERM left a temporary CSV: "
+                    f"continued SIG{args.report_signal} left a temporary CSV: "
                     + ", ".join(path.name for path in temporary_stats_files)
                 )
         else:
-            if args.report_signal == "TERM" and not report_signal_interrupted:
+            if (args.report_signal in ("TERM", "INT") and
+                    not report_signal_interrupted):
                 raise AssertionError(
-                    "SIGTERM neither completed cleanly nor produced explicit "
-                    "bounded-interruption evidence"
+                    f"SIG{args.report_signal} neither completed cleanly nor "
+                    "produced explicit bounded-interruption evidence"
                 )
             for diagnostic in REPORT_COMPLETION_DIAGNOSTICS:
                 if diagnostic in output:

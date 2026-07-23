@@ -201,7 +201,7 @@ check_csv_golden(const char* csv_path)
     static const char expected[] =
         "function,count,per_thread,per_rank,call_max_s,call_min_s,"
         "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s\n"
-        "\"alpha\",5,3,2,5.000000000e-01,1.250000000e-01,"
+        "\"alpha\",5,3,2.5,5.000000000e-01,1.250000000e-01,"
         "1.250000000e+00,1.250000000e+00,7.500000000e-01,"
         "2.500000000e-01,5.000000000e-02\n";
     PeakReportSnapshot* snapshot = create_fixture("alpha");
@@ -229,7 +229,7 @@ check_csv_golden(const char* csv_path)
 static void
 check_csv_quoted_name(const char* csv_path)
 {
-    static const char expected_name[] = "\"operator\"\"\"\"_x\",5,3,2,";
+    static const char expected_name[] = "\"operator\"\"\"\"_x\",5,3,2.5,";
     PeakReportSnapshot* snapshot = create_fixture("operator\"\"_x");
     char* actual;
 
@@ -237,6 +237,53 @@ check_csv_quoted_name(const char* csv_path)
     assert(peak_report_formatter_write_csv(snapshot));
     actual = read_file(csv_path);
     assert(strstr(actual, expected_name) != NULL);
+    free(actual);
+    assert(unlink(csv_path) == 0);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_per_rank_average_precision(const char* csv_path)
+{
+    const PeakReportFormatOptions options = {.print_text = true};
+    PeakReportSnapshot* snapshot = create_fixture("sparse-rank-calls");
+    char* actual;
+    char* text;
+
+    snapshot->num_calls[0] = 1;
+    snapshot->thread_count[0] = 1;
+    snapshot->rank_count = 4096;
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(peak_report_formatter_write_csv(snapshot));
+    actual = read_file(csv_path);
+    assert(strstr(actual,
+                  "\"sparse-rank-calls\",1,1,0.000244140625,") != NULL);
+    free(actual);
+    assert(unlink(csv_path) == 0);
+
+    text = capture_text_report(snapshot, &options);
+    assert(strstr(text, "avg/rank") != NULL);
+    assert(strstr(text, "0.000244141") != NULL);
+    assert(strstr(text,
+                  "calls is exact; per thread is the ceiling over active "
+                  "threads; avg/rank is the arithmetic mean over all 4096 "
+                  "report ranks.") != NULL);
+    free(text);
+
+    snapshot->num_calls[0] = 8192;
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(peak_report_formatter_write_csv(snapshot));
+    actual = read_file(csv_path);
+    assert(strstr(actual, "\"sparse-rank-calls\",8192,8192,2,") != NULL);
+    free(actual);
+    assert(unlink(csv_path) == 0);
+
+    snapshot->num_calls[0] = 1;
+    snapshot->rank_count = 0;
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(peak_report_formatter_write_csv(snapshot));
+    actual = read_file(csv_path);
+    assert(strstr(actual, "\"sparse-rank-calls\",1,1,1,") != NULL);
     free(actual);
     assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);
@@ -529,6 +576,7 @@ main(void)
 
     check_csv_golden(csv_path);
     check_csv_quoted_name(csv_path);
+    check_per_rank_average_precision(csv_path);
     check_rank_local_csv_names(stats_base, csv_path);
     check_csv_permissions(csv_path);
     check_no_output(csv_path);
