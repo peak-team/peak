@@ -815,11 +815,14 @@ gate determines whether PEAK may return to the real MPI finalizer. If
 `PEAK_MPI_FINALIZE_POLICY=defer` is explicitly combined with
 socket output, PEAK calls the real MPI finalizer immediately and runs the socket
 reducer from normal process teardown without MPI collectives or an MPI finalize
-proof. After rank 0 writes the aggregate, it opens a PEAK-owned
-release port, sends each peer an authoritative ACK-or-fallback decision, and
-waits for peer confirmation; non-root ranks wait for that decision before
-leaving process teardown. Once a peer validates ACK it never downgrades to
-rank-local output merely because the confirmation path later fails. On the default
+proof. Rank 0 reserves the PEAK-owned release port before gathering any peer,
+then activates that same socket after it writes the aggregate, sends each peer
+an authoritative ACK-or-fallback decision, and waits for peer confirmation;
+non-root ranks wait for that decision before leaving process teardown. The
+gather uses a 60000 ms no-progress deadline plus a rank-count-scaled absolute
+cap that adds 5000 ms per 128-peer wave, capped at 300000 ms adaptive margin.
+Once a peer validates ACK it never downgrades to rank-local output merely
+because the confirmation path later fails. On the default
 pre-finalize path, the common post-publication MPI gate then covers both socket
 success and every rank-local fallback writer before finalizer handoff. If the
 socket reducer cannot prove complete participation, it

@@ -142,12 +142,12 @@ in detail.
 | `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer immediately and therefore bypasses the Intel MPI 2019 compatibility skip. |
 | `PEAK_MPI_REAL_FINALIZE` | Override for the real MPI finalizer. Healthy non-Intel-MPI-2019 jobs enable it by default; Intel MPI 2019 skips its crash-prone finalizer unless set to `1`. Setting it to `0` also disables the immediate real-finalizer call in `defer` mode. Setting it to `1` cannot override a failed collective safety gate on the default `report` path. |
 | `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | Timeout for the proof-first MPI aggregation finalization-participation check. Default: `10000`. |
-| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | Baseline timeout for the post-publication all-rank release gate. For socket/local output this same gate also proves finalize participation. Default: `180000`; only a path that attempted socket publication raises the effective timeout to at least the peer release budget plus two socket-phase margins (normally `300000`). |
+| `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | Baseline timeout for the post-publication all-rank release gate. For socket/local output this same gate also proves finalize participation. Default: `180000`; only a path that attempted socket publication raises the effective timeout to at least the peer release budget plus two socket-phase margins (`300000` for a singleton-size default and scale-adjusted for larger jobs). |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each MPI payload reduction. Default: `5000`. |
 | `PEAK_OUTPUT_AGGREGATION_HOST` | Override the socket reducer host. |
 | `PEAK_OUTPUT_AGGREGATION_PORT` | Override the socket reducer port. |
-| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each socket gather or root-release phase. Default: `60000`. |
-| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | Peer-side end-to-end socket release budget spanning gather, report publication, and confirmed release. Default and minimum: three socket phase timeouts. |
+| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | Socket no-progress timeout and root-release phase timeout. Default: `60000`. The absolute gather cap adds `5000` ms per 128-peer wave, with at most `300000` ms adaptive margin; explicit values are never shortened. |
+| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | Peer-side end-to-end socket release budget spanning the absolute gather cap, report publication, and confirmed release. Default and minimum: gather hard cap plus two socket phase timeouts. |
 | `PEAK_OUTPUT_AGGREGATION_TOKEN` | Override the socket reducer session token. |
 | `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK` | Enable MPI-reducer-to-socket and socket-to-rank-local fallback paths. Default: enabled. |
 

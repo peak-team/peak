@@ -15,11 +15,13 @@
     "PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"
 #define PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV \
     "PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS"
+#define PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS_ENV \
+    "PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS"
 #define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_ENV \
     "PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS"
 #define PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT 60000U
 #define PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT 180000U
-#define PEAK_SOCKET_RELEASE_PHASE_COUNT 3U
+#define PEAK_SOCKET_POST_GATHER_PHASE_COUNT 2U
 #define PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT 2U
 
 static bool
@@ -83,33 +85,73 @@ peak_general_listener_add_saturated(unsigned int left,
 }
 
 PeakReportTimeoutBudget
-peak_general_listener_report_timeout_budget(void)
+peak_general_listener_report_timeout_budget_for_rank_count(
+    unsigned int rank_count)
 {
     PeakReportTimeoutBudget budget = {
         .socket_phase_timeout_ms =
             PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT,
+        .socket_gather_hard_timeout_ms = 0,
         .socket_release_timeout_ms = 0,
         .mpi_report_release_timeout_ms =
             PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT,
+        .socket_gather_timeout_was_scaled = false,
         .socket_combined_release_minimum_ms = 0,
         .socket_release_was_raised = false,
     };
     unsigned int configured;
+    unsigned int peer_count = rank_count > 0 ? rank_count - 1U : 0U;
+    unsigned int waves =
+        peer_count / PEAK_SOCKET_GATHER_ACTIVE_MAX +
+        (peer_count % PEAK_SOCKET_GATHER_ACTIVE_MAX != 0U);
+    unsigned int wave_budget_ms =
+        PEAK_SOCKET_GATHER_WAVE_BUDGET_MS;
+    unsigned int adaptive_margin;
+    unsigned int adaptive_hard;
+    bool phase_was_configured;
     unsigned int minimum_socket_release;
     unsigned int mpi_margin;
     unsigned int minimum_mpi_release;
 
-    if (peak_general_listener_parse_positive_uint_bounded(
+    phase_was_configured =
+        peak_general_listener_parse_positive_uint_bounded(
             PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
             (unsigned int)INT_MAX,
-            &configured)) {
+            &configured);
+    if (phase_was_configured) {
         budget.socket_phase_timeout_ms = configured;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_general_listener_parse_positive_uint_bounded(
+            PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS_ENV,
+            PEAK_SOCKET_GATHER_ADAPTIVE_MARGIN_MAX_MS,
+            &configured)) {
+        wave_budget_ms = configured;
+    }
+#endif
+    adaptive_margin = peak_general_listener_multiply_saturated(
+        waves,
+        wave_budget_ms,
+        PEAK_SOCKET_GATHER_ADAPTIVE_MARGIN_MAX_MS);
+    adaptive_hard =
+        budget.socket_phase_timeout_ms >
+                (unsigned int)INT_MAX - adaptive_margin
+            ? (unsigned int)INT_MAX
+            : budget.socket_phase_timeout_ms + adaptive_margin;
+    budget.socket_gather_hard_timeout_ms = adaptive_hard;
+    budget.socket_gather_timeout_was_scaled =
+        adaptive_hard > budget.socket_phase_timeout_ms;
+
     minimum_socket_release =
-        peak_general_listener_multiply_saturated(
+        peak_general_listener_add_saturated(
+            budget.socket_gather_hard_timeout_ms,
+            peak_general_listener_multiply_saturated(
             budget.socket_phase_timeout_ms,
-            PEAK_SOCKET_RELEASE_PHASE_COUNT,
-            (unsigned int)INT_MAX);
+            PEAK_SOCKET_POST_GATHER_PHASE_COUNT,
+            (unsigned int)INT_MAX));
+    if (minimum_socket_release > (unsigned int)INT_MAX) {
+        minimum_socket_release = (unsigned int)INT_MAX;
+    }
     budget.socket_release_timeout_ms = minimum_socket_release;
     if (peak_general_listener_parse_positive_uint_bounded(
             PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
@@ -136,6 +178,19 @@ peak_general_listener_report_timeout_budget(void)
         budget.socket_release_timeout_ms, mpi_margin);
     budget.socket_combined_release_minimum_ms = minimum_mpi_release;
     return budget;
+}
+
+PeakReportTimeoutBudget
+peak_general_listener_report_timeout_budget(void)
+{
+    long rank_count = -1;
+
+    (void)peak_general_listener_mpi_env_rank_size(NULL, &rank_count);
+
+    return peak_general_listener_report_timeout_budget_for_rank_count(
+        rank_count > 0 && (unsigned long)rank_count <= UINT_MAX
+            ? (unsigned int)rank_count
+            : 1U);
 }
 
 bool
