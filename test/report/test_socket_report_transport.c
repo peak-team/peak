@@ -1,6 +1,7 @@
 #include "internal/general_listener/socket_report_transport.h"
 
 #include <float.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -800,6 +801,40 @@ check_progress_deadline_hard_cap(void)
 }
 
 static int
+check_gather_admission_waves(void)
+{
+    return peak_socket_report_test_admission_delay_ms(
+               0, 4096U, 128U, 5000U, 60000U, 220000U) != 0U ||
+           peak_socket_report_test_admission_delay_ms(
+               1, 4096U, 128U, 5000U, 60000U, 220000U) != 0U ||
+           peak_socket_report_test_admission_delay_ms(
+               128, 4096U, 128U, 5000U, 60000U, 220000U) != 0U ||
+           peak_socket_report_test_admission_delay_ms(
+               129, 4096U, 128U, 5000U, 60000U, 220000U) != 5000U ||
+           peak_socket_report_test_admission_delay_ms(
+               256, 4096U, 128U, 5000U, 60000U, 220000U) != 5000U ||
+           peak_socket_report_test_admission_delay_ms(
+               257, 4096U, 128U, 5000U, 60000U, 220000U) != 10000U ||
+           peak_socket_report_test_admission_delay_ms(
+               4095, 4096U, 128U, 5000U, 60000U, 220000U) != 155000U ||
+           peak_socket_report_test_admission_delay_ms(
+               4095, 4096U, 64U, 5000U, 60000U, 220000U) != 157500U ||
+           peak_socket_report_test_admission_delay_ms(
+               4095, 4096U, 128U, 5000U, 1000U, 161000U) != 10323U ||
+           peak_socket_report_test_admission_delay_ms(
+               INT_MAX,
+               UINT_MAX,
+               1U,
+               UINT_MAX,
+               60000U,
+               360000U) > 300000U ||
+           peak_socket_report_test_latest_admission_ms(
+               4095, 4096U, 16U, 5000U, 60000U, 220000U) != 160000U ||
+           peak_socket_report_test_latest_admission_ms(
+               4095, 4096U, 1U, 5000U, 60000U, 220000U) != 159705U;
+}
+
+static int
 run_many_rank_case(int port, int size, bool exercise_concurrency)
 {
     PeakReportSnapshot* root = fixture_snapshot(0, false);
@@ -1237,6 +1272,8 @@ main(void)
     CHECK_SOCKET_CASE("slurm-host-parser", check_slurm_host_parser());
     CHECK_SOCKET_CASE("progress-hard-cap",
                       check_progress_deadline_hard_cap());
+    CHECK_SOCKET_CASE("gather-admission-waves",
+                      check_gather_admission_waves());
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
     CHECK_SOCKET_CASE("required-rank", check_required_rank_metadata());
     CHECK_SOCKET_CASE("invalid-output-pointers",

@@ -27,6 +27,7 @@
  */
 typedef struct {
     unsigned int socket_phase_timeout_ms;
+    unsigned int socket_gather_wave_budget_ms;
     unsigned int socket_gather_hard_timeout_ms;
     unsigned int socket_release_timeout_ms;
     unsigned int mpi_report_release_timeout_ms;
@@ -46,10 +47,14 @@ PeakReportTimeoutBudget peak_general_listener_report_timeout_budget(void);
 /**
  * Resolves the shared report timeout budget for @p rank_count ranks.
  *
- * The socket inactivity/phase default is 60000 ms. Its absolute gather budget
- * adds 5000 ms per 128-peer connection wave and caps the adaptive margin at
- * 300000 ms; that margin is then added with saturation, so an explicit phase
- * timeout is never shortened. The peer end-to-end release minimum is
+ * The socket inactivity/phase default is 60000 ms. Socket admission uses a
+ * nominal maximum of 128 ranks per wave and a nominal 5000 ms wave budget.
+ * The effective width may be reduced by the root's file-descriptor limit, and
+ * admission spacing is clamped to preserve both the no-progress phase and the
+ * absolute gather deadline. The nominal wave budget also scales the absolute
+ * deadline; its adaptive margin is capped at 300000 ms and added with
+ * saturation, so an explicit phase timeout is never shortened. The peer
+ * end-to-end release minimum is
  * `gather_hard + 2 * socket_phase` (capped at INT_MAX), and the
  * socket-combined MPI gate adds two further phase margins (capped at
  * UINT_MAX). The ordinary MPI/local release default remains 180000 ms.

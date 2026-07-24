@@ -43,14 +43,21 @@ typedef struct PeakSocketReportSession PeakSocketReportSession;
  *
  * Root advances a bounded set of nonblocking peer connections under both a
  * no-progress deadline and a rank-count-scaled absolute gather deadline.
- * Valid protocol milestones refresh only the former. Root reserves the release
- * port before accepting gather peers so outbound ephemeral ports cannot claim
- * it between phases. A peer enters the final-release wait only after receiving
- * a complete registration receipt. Root completes that peer's gather only
- * after receiving the matching receipt confirmation; if the confirmation
- * fails, the registered peer waits for root's authoritative fallback decision.
- * A partial, invalid, duplicate, or unconfirmed peer fails the whole aggregate
- * without publishing it.
+ * Peers enter the gather in deterministic rank waves. The nominal maximum
+ * width is 128 peers, but root may reduce it to fit its file-descriptor limit;
+ * ranks are expected to inherit the same limit. Admission spacing starts from
+ * the nominal per-wave budget used to scale the absolute deadline and is
+ * clamped to preserve both the no-progress phase and the hard deadline. This
+ * reduces the risk that a large job overwhelms a kernel-capped listen backlog
+ * with a synchronized connection incast. Valid protocol milestones refresh
+ * only the no-progress deadline. Root reserves the release port before
+ * accepting gather peers so outbound ephemeral ports cannot claim it between
+ * phases. A peer enters the final-release wait only after receiving a complete
+ * registration receipt. Root completes that peer's gather only after receiving
+ * the matching receipt confirmation; if the confirmation fails, the
+ * registered peer waits for root's authoritative fallback decision. A partial,
+ * invalid, duplicate, or unconfirmed peer fails the whole aggregate without
+ * publishing it.
  *
  * The function blocks peers until root commits or aborts the prepared report.
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
@@ -125,6 +132,26 @@ int64_t peak_socket_report_test_progress_deadline_us(
     int64_t now_us,
     int64_t hard_deadline_us,
     int progress_timeout_ms);
+
+/**
+ * Computes the bounded deterministic gather admission delay for a peer rank.
+ */
+unsigned int peak_socket_report_test_admission_delay_ms(
+    int rank,
+    unsigned int rank_count,
+    size_t active_limit,
+    unsigned int wave_budget_ms,
+    unsigned int phase_timeout_ms,
+    unsigned int hard_timeout_ms);
+
+/** Computes the latest bounded gather-admission time for a peer rank. */
+unsigned int peak_socket_report_test_latest_admission_ms(
+    int rank,
+    unsigned int rank_count,
+    size_t active_limit,
+    unsigned int wave_budget_ms,
+    unsigned int phase_timeout_ms,
+    unsigned int hard_timeout_ms);
 
 /** Parses the first host represented by a Slurm node-list expression. */
 int peak_general_listener_test_first_slurm_host(const char* nodelist,
