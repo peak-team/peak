@@ -543,6 +543,131 @@ peak_socket_report_test_progress_deadline_us(
 }
 #endif
 
+static size_t
+peak_socket_reduce_gather_active_limit(size_t peer_count);
+
+static unsigned int
+peak_socket_reduce_admission_spacing_ms(
+    unsigned int rank_count,
+    size_t active_limit,
+    unsigned int wave_budget_ms,
+    unsigned int phase_timeout_ms,
+    unsigned int hard_timeout_ms)
+{
+    uint64_t peer_count =
+        rank_count > 0U ? (uint64_t)rank_count - 1U : 0U;
+    uint64_t waves;
+    uint64_t hard_margin_ms;
+    uint64_t spacing_ms = wave_budget_ms;
+
+    if (peer_count == 0U || active_limit == 0U ||
+        wave_budget_ms == 0U || phase_timeout_ms <= 1U ||
+        hard_timeout_ms <= phase_timeout_ms) {
+        return 0U;
+    }
+    waves = peer_count / active_limit +
+            (peer_count % active_limit != 0U);
+    hard_margin_ms =
+        (uint64_t)hard_timeout_ms - phase_timeout_ms;
+    if (spacing_ms > (phase_timeout_ms - 1U) / 3U) {
+        spacing_ms = (phase_timeout_ms - 1U) / 3U;
+    }
+    if (spacing_ms > hard_margin_ms / waves) {
+        spacing_ms = hard_margin_ms / waves;
+    }
+    return (unsigned int)spacing_ms;
+}
+
+static unsigned int
+peak_socket_reduce_admission_delay_ms(
+    int rank,
+    size_t active_limit,
+    unsigned int spacing_ms)
+{
+    uint64_t wave_index;
+    uint64_t delay_ms;
+
+    if (rank <= 0 || active_limit == 0U || spacing_ms == 0U) {
+        return 0U;
+    }
+    wave_index =
+        ((uint64_t)(unsigned int)rank - 1U) /
+        (uint64_t)active_limit;
+    delay_ms = wave_index * (uint64_t)spacing_ms;
+    return delay_ms > (uint64_t)INT_MAX
+               ? (unsigned int)INT_MAX
+               : (unsigned int)delay_ms;
+}
+
+static unsigned int
+peak_socket_reduce_admission_jitter_window_ms(
+    unsigned int spacing_ms,
+    unsigned int phase_timeout_ms)
+{
+    unsigned int jitter_ms;
+
+    if (spacing_ms == 0U || phase_timeout_ms <= 1U ||
+        spacing_ms >= phase_timeout_ms - 1U) {
+        return 0U;
+    }
+    jitter_ms = phase_timeout_ms - spacing_ms - 1U;
+    if (jitter_ms > spacing_ms) {
+        jitter_ms = spacing_ms;
+    }
+    return jitter_ms > 1000U ? 1000U : jitter_ms;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+unsigned int
+peak_socket_report_test_admission_delay_ms(
+    int rank,
+    unsigned int rank_count,
+    size_t active_limit,
+    unsigned int wave_budget_ms,
+    unsigned int phase_timeout_ms,
+    unsigned int hard_timeout_ms)
+{
+    unsigned int spacing_ms =
+        peak_socket_reduce_admission_spacing_ms(
+            rank_count,
+            active_limit,
+            wave_budget_ms,
+            phase_timeout_ms,
+            hard_timeout_ms);
+
+    return peak_socket_reduce_admission_delay_ms(
+        rank, active_limit, spacing_ms);
+}
+
+unsigned int
+peak_socket_report_test_latest_admission_ms(
+    int rank,
+    unsigned int rank_count,
+    size_t active_limit,
+    unsigned int wave_budget_ms,
+    unsigned int phase_timeout_ms,
+    unsigned int hard_timeout_ms)
+{
+    unsigned int spacing_ms =
+        peak_socket_reduce_admission_spacing_ms(
+            rank_count,
+            active_limit,
+            wave_budget_ms,
+            phase_timeout_ms,
+            hard_timeout_ms);
+    unsigned int delay_ms =
+        peak_socket_reduce_admission_delay_ms(
+            rank, active_limit, spacing_ms);
+    unsigned int jitter_ms =
+        peak_socket_reduce_admission_jitter_window_ms(
+            spacing_ms, phase_timeout_ms);
+
+    return delay_ms > UINT_MAX - jitter_ms
+               ? UINT_MAX
+               : delay_ms + jitter_ms;
+}
+#endif
+
 static uint64_t
 peak_socket_reduce_jitter_value(uint32_t rank,
                                 uint64_t session_token,
@@ -2519,6 +2644,23 @@ peak_socket_reduce_root_gather(
         }
     }
 
+    if (completed < peer_count) {
+        const char* reason =
+            !ok
+                ? "protocol-or-poll-error"
+                : peak_socket_reduce_remaining_ms(
+                      hard_deadline_us) <= 0
+                      ? "hard-timeout"
+                      : "no-progress-timeout";
+
+        peak_log_warn("[peak] Socket aggregation root gather stopped: reason=%s accepted=%zu active=%zu completed=%u expected=%zu active_limit=%zu\n",
+                      reason,
+                      accepted,
+                      active,
+                      completed,
+                      peer_count,
+                      active_limit);
+    }
     for (size_t i = 0; i < active_limit; i++) {
         peak_socket_gather_connection_close(&connections[i]);
     }
@@ -2533,6 +2675,9 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
                               int rank,
                               int port,
                               int release_port,
+                              size_t gather_wave_width,
+                              unsigned int gather_wave_spacing_ms,
+                              int gather_progress_timeout_ms,
                               int gather_hard_timeout_ms,
                               int release_wait_timeout_ms,
                               int64_t deadline_us,
@@ -2557,9 +2702,21 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
     }
 
     if (rank > 0) {
+        unsigned int admission_delay_ms =
+            peak_socket_reduce_admission_delay_ms(
+                rank,
+                gather_wave_width,
+                gather_wave_spacing_ms);
         int initial_window_ms =
             peak_socket_reduce_remaining_ms(deadline_us) / 8;
+        int maximum_jitter_ms =
+            (int)peak_socket_reduce_admission_jitter_window_ms(
+                gather_wave_spacing_ms,
+                (unsigned int)gather_progress_timeout_ms);
         uint64_t jitter;
+
+        peak_socket_reduce_sleep_before_deadline(
+            (int)admission_delay_ms, deadline_us);
 #ifdef PEAK_ENABLE_TEST_HOOKS
         int preconnect_delay_ms =
             peak_socket_reduce_parse_positive_int_env(
@@ -2577,6 +2734,9 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
 
         if (initial_window_ms > 1000) {
             initial_window_ms = 1000;
+        }
+        if (initial_window_ms > maximum_jitter_ms) {
+            initial_window_ms = maximum_jitter_ms;
         }
         if (initial_window_ms > 0) {
             jitter = peak_socket_reduce_jitter_value(
@@ -2731,6 +2891,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     PeakSocketReduceHeader header;
     PeakReportRankTuple local_report_tuple;
     PeakReportTimeoutBudget timeout_budget;
+    size_t gather_wave_width;
+    unsigned int gather_wave_spacing_ms;
     size_t record_bytes;
 
     if (session_out != NULL) {
@@ -2777,6 +2939,16 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         (int)timeout_budget.socket_gather_hard_timeout_ms;
     release_wait_timeout_ms =
         (int)timeout_budget.socket_release_timeout_ms;
+    gather_wave_width =
+        peak_socket_reduce_gather_active_limit(
+            size > 1 ? (size_t)(size - 1) : 0U);
+    gather_wave_spacing_ms =
+        peak_socket_reduce_admission_spacing_ms(
+            (unsigned int)size,
+            gather_wave_width,
+            timeout_budget.socket_gather_wave_budget_ms,
+            timeout_budget.socket_phase_timeout_ms,
+            timeout_budget.socket_gather_hard_timeout_ms);
     deadline_us =
         peak_socket_reduce_deadline_us(gather_hard_timeout_ms);
     if (rank == 0 && timeout_budget.socket_release_was_raised) {
@@ -2785,9 +2957,11 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     }
     if (rank == 0 &&
         timeout_budget.socket_gather_timeout_was_scaled) {
-        peak_log_info("[peak] Scaled socket gather hard timeout to %u ms for %d MPI ranks; the no-progress timeout remains %u ms\n",
+        peak_log_info("[peak] Scaled socket gather hard timeout to %u ms for %d MPI ranks; admitting peers in %zu-rank waves spaced by %u ms; the no-progress timeout remains %u ms\n",
                       timeout_budget.socket_gather_hard_timeout_ms,
                       size,
+                      gather_wave_width,
+                      gather_wave_spacing_ms,
                       timeout_budget.socket_phase_timeout_ms);
     }
 
@@ -2831,6 +3005,9 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                                              rank,
                                              port,
                                              release_port,
+                                             gather_wave_width,
+                                             gather_wave_spacing_ms,
+                                             timeout_ms,
                                              gather_hard_timeout_ms,
                                              release_wait_timeout_ms,
                                              deadline_us,

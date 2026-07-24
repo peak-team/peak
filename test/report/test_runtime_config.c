@@ -130,6 +130,7 @@ check_report_timeout_budget(void)
     char int_max_text[32];
 
     if (budget.socket_phase_timeout_ms != 60000U ||
+        budget.socket_gather_wave_budget_ms != 5000U ||
         budget.socket_gather_hard_timeout_ms != 60000U ||
         budget.socket_release_timeout_ms != 180000U ||
         budget.mpi_report_release_timeout_ms != 180000U ||
@@ -142,6 +143,7 @@ check_report_timeout_budget(void)
     budget =
         peak_general_listener_report_timeout_budget_for_rank_count(4096U);
     if (budget.socket_phase_timeout_ms != 60000U ||
+        budget.socket_gather_wave_budget_ms != 5000U ||
         budget.socket_gather_hard_timeout_ms != 220000U ||
         budget.socket_release_timeout_ms != 340000U ||
         budget.socket_combined_release_minimum_ms != 460000U ||

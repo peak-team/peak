@@ -91,6 +91,8 @@ peak_general_listener_report_timeout_budget_for_rank_count(
     PeakReportTimeoutBudget budget = {
         .socket_phase_timeout_ms =
             PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT,
+        .socket_gather_wave_budget_ms =
+            PEAK_SOCKET_GATHER_WAVE_BUDGET_MS,
         .socket_gather_hard_timeout_ms = 0,
         .socket_release_timeout_ms = 0,
         .mpi_report_release_timeout_ms =
@@ -129,6 +131,7 @@ peak_general_listener_report_timeout_budget_for_rank_count(
         wave_budget_ms = configured;
     }
 #endif
+    budget.socket_gather_wave_budget_ms = wave_budget_ms;
     adaptive_margin = peak_general_listener_multiply_saturated(
         waves,
         wave_budget_ms,
