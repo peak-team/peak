@@ -13,7 +13,7 @@
  */
 
 #include "frida-gum.h"
-#include <dlfcn.h> 
+#include <dlfcn.h>
 #include <unistd.h>
 
 #if defined(__GNUC__) || defined(__clang__)

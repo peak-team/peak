@@ -5,7 +5,14 @@ add_compile_options(-fno-omit-frame-pointer) # add for tracing caller stack
 set(sources_peak
     dlopen_interceptor.c
     general_listener.c
+    general_listener/attach_policy.c
+    general_listener/exec_checkpoint_writer.c
+    general_listener/report_formatter.c
     general_listener/report_maxima.c
+    general_listener/report_model.c
+    general_listener/report_snapshot.c
+    general_listener/runtime_config.c
+    general_listener/socket_report_transport.c
     malloc_interceptor.c
     malloc_otf2.c
     peak.c
@@ -32,7 +39,10 @@ endif()
 
 # Preserve the original source order while expressing optional modules once.
 if(MPI_FOUND)
-    list(APPEND sources_peak mpi_interceptor.c)
+    list(APPEND sources_peak
+        general_listener/mpi_report_transport.c
+        mpi_teardown_guard.c
+        mpi_interceptor.c)
 endif()
 if(CUDA_FOUND OR CUDAToolkit_FOUND)
     list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
@@ -59,7 +69,7 @@ if(PEAK_DETACH_HELPER_SUPPORTED)
 endif()
 
 target_include_directories(peak
-    PUBLIC 
+    PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
         ${OTF2_INCLUDE_DIRS}
@@ -74,7 +84,7 @@ endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
 target_include_directories(cuda_interceptor_obj
-    PUBLIC 
+    PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
 )
@@ -104,15 +114,15 @@ target_link_libraries(cuda_interceptor_obj
 endif()
 
 if(MPI_FOUND)
-    target_link_libraries(peak 
-        PRIVATE 
+    target_link_libraries(peak
+        PRIVATE
             MPI::MPI_C
     )
 endif()
 
 if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
-    target_link_libraries(cuda_interceptor_obj 
-        PRIVATE 
+    target_link_libraries(cuda_interceptor_obj
+        PRIVATE
             MPI::MPI_C
     )
 endif()

@@ -118,6 +118,7 @@ static const char *check_list[] = {
     "rm",
     "cp",
     "mv",
+    "ln",
     "chmod",
     "chown",
     "find",

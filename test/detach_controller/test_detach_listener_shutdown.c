@@ -1,5 +1,6 @@
 #include "general_listener.h"
 #include "detach_controller.h"
+#include "internal/general_listener_internal.h"
 #include "pthread_listener.h"
 
 #include <stdbool.h>
@@ -35,6 +36,29 @@ extern gpointer* hook_address;
 extern GumInvocationListener** array_listener;
 
 static int failures;
+
+static void
+clear_mpi_launcher_environment(void)
+{
+    static const char* const names[] = {
+        "PMI_RANK",
+        "PMI_SIZE",
+        "PMIX_RANK",
+        "PMIX_SIZE",
+        "OMPI_COMM_WORLD_RANK",
+        "OMPI_COMM_WORLD_SIZE",
+        "MV2_COMM_WORLD_RANK",
+        "MV2_COMM_WORLD_SIZE",
+        "I_MPI_RANK",
+        "I_MPI_SIZE",
+        "SLURM_PROCID",
+        "SLURM_NTASKS",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        (void)unsetenv(names[i]);
+    }
+}
 
 void
 dlopen_interceptor_drain_dynamic_attach_queue(void)
@@ -107,6 +131,21 @@ check_contains(const char* label, const char* haystack, const char* needle)
                 label,
                 needle,
                 haystack != NULL ? haystack : "<null>");
+        failures++;
+    }
+}
+
+static void
+check_not_contains(const char* label,
+                   const char* haystack,
+                   const char* needle)
+{
+    if (haystack != NULL && strstr(haystack, needle) != NULL) {
+        fprintf(stderr,
+                "FAIL: %s: unexpected '%s' in '%s'\n",
+                label,
+                needle,
+                haystack);
         failures++;
     }
 }
@@ -193,12 +232,15 @@ detach_with_stderr_capture(char** output_out)
 }
 
 static gboolean
-print_with_stderr_capture(char** output_out)
+print_with_stderr_capture_for_mpi_policy(
+    gboolean active_mpi_job,
+    char** output_out)
 {
     char capture_template[] = "/tmp/peak_public_listener_report_XXXXXX";
     int capture_fd = mkstemp(capture_template);
     int saved_stderr = -1;
     gchar* contents = NULL;
+    gboolean report_write_succeeded = FALSE;
 
     if (output_out != NULL) {
         *output_out = NULL;
@@ -223,7 +265,10 @@ print_with_stderr_capture(char** output_out)
     close(capture_fd);
 
     fflush(stderr);
-    (void)peak_general_listener_print(PEAK_OUTPUT_AGGREGATION_LOCAL);
+    (void)peak_general_listener_print_with_mpi_job_policy(
+        PEAK_OUTPUT_AGGREGATION_LOCAL,
+        active_mpi_job,
+        &report_write_succeeded);
     fflush(stderr);
 
     if (dup2(saved_stderr, STDERR_FILENO) < 0) {
@@ -241,7 +286,13 @@ print_with_stderr_capture(char** output_out)
     } else {
         g_free(contents);
     }
-    return TRUE;
+    return report_write_succeeded;
+}
+
+static gboolean
+print_with_stderr_capture(char** output_out)
+{
+    return print_with_stderr_capture_for_mpi_policy(FALSE, output_out);
 }
 
 static void
@@ -595,6 +646,120 @@ run_invalid_accounting_baseline_report(void)
 }
 
 static int
+run_rank_local_mpi_text_default(void)
+{
+    char log_template[128];
+    char* report_log = NULL;
+
+    if (setup_public_listener_fixture(log_template,
+                                      sizeof(log_template),
+                                      "success-zero") != 0) {
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+    unsetenv("PEAK_TEXT_OUTPUT");
+    clear_mpi_launcher_environment();
+    if (setenv("I_MPI_RANK", "17", 1) != 0 ||
+        setenv("I_MPI_SIZE", "4096", 1) != 0 ||
+        setenv("SLURM_PROCID", "0", 1) != 0 ||
+        setenv("SLURM_NTASKS", "1", 1) != 0) {
+        perror("setenv");
+        finish_public_listener_fixture(log_template);
+        return EXIT_FAILURE;
+    }
+
+    peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    peak_general_listener_controller_stop();
+    peak_main_time = peak_second() - peak_main_time;
+    peak_general_listener_freeze_final_report_snapshot();
+
+    check_true("rank-local MPI report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   TRUE, &report_log) == TRUE);
+    check_not_contains("rank-local MPI default suppresses text",
+                       report_log,
+                       "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    clear_mpi_launcher_environment();
+    (void)setenv("I_MPI_RANK", "0", 1);
+    (void)setenv("I_MPI_SIZE", "1", 1);
+    check_true("singleton MPI report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   TRUE, &report_log) == TRUE);
+    check_contains("singleton MPI default keeps text",
+                   report_log,
+                   "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    clear_mpi_launcher_environment();
+    check_true("missing metadata report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   TRUE, &report_log) == TRUE);
+    check_contains("missing metadata fails open for text",
+                   report_log,
+                   "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    clear_mpi_launcher_environment();
+    (void)setenv("I_MPI_RANK", "17", 1);
+    (void)setenv("I_MPI_SIZE", "4096", 1);
+    check_true("inactive MPI policy report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   FALSE, &report_log) == TRUE);
+    check_contains("inactive policy ignores launcher metadata",
+                   report_log,
+                   "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    (void)setenv("PEAK_TEXT_OUTPUT", "1", 1);
+    check_true("rank-local MPI text override report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   TRUE, &report_log) == TRUE);
+    check_contains("rank-local MPI text override keeps text",
+                   report_log,
+                   "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    (void)setenv("PEAK_TEXT_OUTPUT", "0", 1);
+    check_true("explicit text disable report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   FALSE, &report_log) == TRUE);
+    check_not_contains("explicit text disable suppresses text",
+                       report_log,
+                       "PEAK Library Performance Report");
+    g_free(report_log);
+    report_log = NULL;
+
+    unsetenv("PEAK_TEXT_OUTPUT");
+    clear_mpi_launcher_environment();
+    (void)setenv("PMI_RANK", "0", 1);
+    (void)setenv("PMI_SIZE", "4", 1);
+    (void)setenv("I_MPI_RANK", "1", 1);
+    (void)setenv("I_MPI_SIZE", "4", 1);
+    check_true("contradictory metadata report write succeeded",
+               print_with_stderr_capture_for_mpi_policy(
+                   TRUE, &report_log) == TRUE);
+    check_contains("contradictory metadata fails open for text",
+                   report_log,
+                   "PEAK Library Performance Report");
+    g_free(report_log);
+
+    clear_mpi_launcher_environment();
+    if (finish_public_listener_fixture(log_template) != 0) {
+        return EXIT_FAILURE;
+    }
+    fprintf(stderr, "general-listener-rank-local-mpi-text-default-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
 run_slurm_host_parser(void)
 {
 #ifndef HAVE_MPI
@@ -656,7 +821,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-slurm-host-parser|general-listener-uint64-saturation\n",
+                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-rank-local-mpi-text-default|general-listener-slurm-host-parser|general-listener-uint64-saturation\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -672,6 +837,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "general-listener-invalid-accounting-baseline-report") == 0) {
         return run_invalid_accounting_baseline_report();
+    }
+    if (strcmp(argv[1], "general-listener-rank-local-mpi-text-default") == 0) {
+        return run_rank_local_mpi_text_default();
     }
     if (strcmp(argv[1], "general-listener-slurm-host-parser") == 0) {
         return run_slurm_host_parser();

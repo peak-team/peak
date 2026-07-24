@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import math
 import os
 import re
 import subprocess
@@ -11,6 +12,12 @@ import sys
 
 CALLS_PER_SEC_RE = re.compile(r"calls_per_sec=([0-9.]+)")
 SPAWNED_THREADS_RE = re.compile(r"\bspawned_threads=([0-9]+)\b")
+APPLICATION_TIME_RE = re.compile(r"(?m)^Time:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
+PROFILED_TARGETS_RE = re.compile(r"(?m)^Profiled targets:\s*([0-9]+)\s*$")
+RECORDED_CALLS_RE = re.compile(r"(?m)^Recorded calls:\s*([0-9]+)\s*$")
+TARGET_ROW_CALLS_RE = re.compile(
+    r"(?m)^\|\s*peak_detach_hot_target\*+\s*\|\s*([1-9][0-9]*)\s*\|"
+)
 DETACHED_MARKER_RE = re.compile(
     r"(?m)^\|\s*peak_detach_hot_target\*+\s*\|\s*[1-9][0-9]*\s*\|"
 )
@@ -36,6 +43,7 @@ PAIRED_TARGET_SYMBOL = "peak_detach_hot_target_two"
 COLD_TARGET_SYMBOL = "peak_detach_cold_target"
 TRACE_REQUEST_SOURCE_INDEX = 17
 TRACE_REQUEST_CALLS_INDEX = 18
+TRACE_REQUEST_TOTAL_TIME_INDEX = 21
 COLD_MARKED_RE = re.compile(
     r"(?m)^\|\s*peak_detach_cold_target\*+\s*\|\s*1\s*\|"
 )
@@ -590,6 +598,71 @@ def trace_has_required_request_source(args, sample):
     return False
 
 
+def detach_count_report_invariant(args, sample, output):
+    if not args.require_detach_count_report_invariant:
+        return True, ""
+
+    application_time_match = APPLICATION_TIME_RE.search(output)
+    profiled_targets_match = PROFILED_TARGETS_RE.search(output)
+    recorded_calls_match = RECORDED_CALLS_RE.search(output)
+    target_calls_match = TARGET_ROW_CALLS_RE.search(output)
+    if (application_time_match is None or profiled_targets_match is None or
+            recorded_calls_match is None or target_calls_match is None):
+        return False, "missing detach-count report accounting fields"
+
+    application_time = float(application_time_match.group(1))
+    profiled_targets = int(profiled_targets_match.group(1))
+    recorded_calls = int(recorded_calls_match.group(1))
+    target_calls = int(target_calls_match.group(1))
+    if profiled_targets != 1:
+        return False, f"expected one profiled target, observed {profiled_targets}"
+    if not math.isfinite(application_time) or application_time < 0.0:
+        return False, f"invalid application time: {application_time}"
+    if recorded_calls < 1 or target_calls < 1 or recorded_calls != target_calls:
+        return False, (
+            "invalid positive call accounting: "
+            f"recorded_calls={recorded_calls} target_calls={target_calls}"
+        )
+
+    rows = read_trace_rows(args, sample)
+    if rows is None:
+        return False, "missing detach-count trace rows"
+
+    request_calls = []
+    for fields in rows:
+        if (len(fields) <= TRACE_REQUEST_TOTAL_TIME_INDEX or
+                fields[2] != TARGET_SYMBOL or fields[3] != "detach" or
+                fields[4] != "success" or fields[5] != "1" or
+                fields[6] != "safe" or
+                fields[TRACE_REQUEST_SOURCE_INDEX] != "detach-count"):
+            continue
+        try:
+            calls = int(fields[TRACE_REQUEST_CALLS_INDEX])
+            request_total_time = float(fields[TRACE_REQUEST_TOTAL_TIME_INDEX])
+        except ValueError:
+            return False, "malformed detach-count request accounting"
+        if calls < 1:
+            return False, "detach-count request recorded zero calls"
+        if (not math.isfinite(request_total_time) or
+                request_total_time < 0.0 or
+                request_total_time > application_time + 0.001):
+            return False, (
+                "detach-count request occurred outside the application boundary: "
+                f"request_total_time={request_total_time} "
+                f"application_time={application_time}"
+            )
+        request_calls.append(calls)
+
+    if not request_calls:
+        return False, "missing successful detach-count request"
+    if target_calls < max(request_calls):
+        return False, (
+            "final target calls regressed below the detach request snapshot: "
+            f"target_calls={target_calls} request_calls={max(request_calls)}"
+        )
+    return True, ""
+
+
 def trace_transition_counts(args, sample):
     rows = read_trace_rows(args, sample)
     counts = {
@@ -737,6 +810,11 @@ def run_sample(args, sample):
         "--seconds",
         str(args.seconds),
     ]
+    if args.startup_delay_seconds:
+        cmd.extend([
+            "--startup-delay-seconds",
+            str(args.startup_delay_seconds),
+        ])
     if args.paired_targets:
         cmd.append("--paired-targets")
     if args.cold_one_shot_target:
@@ -775,6 +853,9 @@ def run_sample(args, sample):
         trace_has_paired_target_lifecycle(args, sample)
     )
     trace_source_ok = trace_has_required_request_source(args, sample)
+    report_invariant_ok, report_invariant_reason = (
+        detach_count_report_invariant(args, sample, output)
+    )
     trace_transition_ok = trace_transition_limits_ok(args, sample)
     observed_guard_ok = (
         not args.require_observed_guard_suppression or
@@ -808,6 +889,7 @@ def run_sample(args, sample):
         not trace_reattach_batched or
         not paired_target_lifecycle_ok or
         not trace_source_ok or
+        not report_invariant_ok or
         not trace_transition_ok or
         not observed_guard_ok or
         not helper_retry_ok or
@@ -845,6 +927,8 @@ def run_sample(args, sample):
                   file=sys.stderr)
         if not trace_source_ok:
             print("missing required detach request source evidence", file=sys.stderr)
+        if not report_invariant_ok:
+            print(report_invariant_reason, file=sys.stderr)
         if not trace_transition_ok:
             print("trace transition limits failed", file=sys.stderr)
         if not observed_guard_ok:
@@ -894,6 +978,7 @@ def main():
     parser.add_argument("--trace-path", default="")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--seconds", type=int, default=1)
+    parser.add_argument("--startup-delay-seconds", type=int, default=0)
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=45)
     parser.add_argument("--stats-prefix", default="/tmp/peak-hotloop-trace-check")
@@ -935,6 +1020,8 @@ def main():
     parser.add_argument("--require-trace-diagnostics", action="store_true")
     parser.add_argument("--require-detach-source", default="")
     parser.add_argument("--min-detach-request-calls", type=int, default=1)
+    parser.add_argument("--require-detach-count-report-invariant",
+                        action="store_true")
     parser.add_argument("--detach-backend", choices=("helper", "signal"),
                         default="")
     parser.add_argument("--detach-helper", default="")
@@ -953,9 +1040,19 @@ def main():
         return run_controller_two_target_lifecycle_check(args)
 
     if (args.threads <= 0 or args.seconds <= 0 or args.samples <= 0 or
-            args.spawner_threads <= 0):
+            args.spawner_threads <= 0 or args.startup_delay_seconds < 0):
         print(
-            "threads, seconds, samples, and spawner-threads must be positive",
+            "threads, seconds, samples, and spawner-threads must be positive; "
+            "startup-delay-seconds must be nonnegative",
+            file=sys.stderr,
+        )
+        return 2
+    if (args.require_detach_count_report_invariant and
+            (not args.detach_count or args.paired_targets or
+             args.cold_one_shot_target)):
+        print(
+            "--require-detach-count-report-invariant requires --detach-count "
+            "and a single hot target",
             file=sys.stderr,
         )
         return 2

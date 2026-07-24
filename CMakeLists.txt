@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.9)
+cmake_minimum_required(VERSION 3.13)
 
 project(peak C CXX Fortran)
 
@@ -21,15 +21,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(CMAKE_BUILD_TYPE MATCHES "Release")
     add_compile_options("SHELL: -Wall -O3 -ffunction-sections -fdata-sections")
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
-        message (STATUS "Linux detected")
-	    if(NOT CMAKE_C_COMPILER_ID MATCHES "NVHPC")
-            add_link_options("SHELL: -static-libgcc -Wl,-z,noexecstack,--gc-sections")
+        message(STATUS "Linux detected")
+        if(NOT CMAKE_C_COMPILER_ID MATCHES "NVHPC")
+            add_link_options("SHELL: -Wl,-z,noexecstack,--gc-sections")
+            # A private static unwinder in a preloaded DSO cannot safely
+            # participate in pthread cancellation across DSO boundaries.
+            # Keep the existing static-libgcc policy for final executables,
+            # while shared and module libraries use the toolchain unwinder.
+            add_link_options(
+                "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-static-libgcc>")
         else()
             add_link_options("SHELL: -Wl,-z,noexecstack,--gc-sections")
             message(STATUS "Skipping -static-libgcc for NVHPC compiler")
         endif()
     elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-        message (STATUS "MacOS detected")
+        message(STATUS "MacOS detected")
         add_link_options("SHELL: -Wl,-dead_strip")
     endif()
 elseif(CMAKE_BUILD_TYPE MATCHES "Debug")

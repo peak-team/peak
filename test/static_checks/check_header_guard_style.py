@@ -19,7 +19,7 @@ def main() -> int:
     source_root = Path(sys.argv[1]).resolve()
     headers = sorted(
         path
-        for directory in ("include", "src", "test")
+        for directory in ("include", "src", "test", "cmake/peak-gum")
         for path in (source_root / directory).rglob("*.h")
         if path.is_file()
     )

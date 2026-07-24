@@ -1,3 +1,4 @@
+#include <glob.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,143 @@ peak_mpi_exit_post_finalize_loop_count(void)
     return peak_mpi_exit_parse_loop_count("PEAK_MPI_EXIT_POST_LOOPS", 32);
 }
 
+static int
+peak_mpi_exit_aggregate_csv_is_published(void)
+{
+    static const char expected_header[] = "function,count,";
+    const char* stats_prefix = getenv("PEAK_STATSLOG_PATH");
+    char* pattern;
+    glob_t matches = {0};
+    int length;
+    int published = 0;
+
+    if (stats_prefix == NULL || stats_prefix[0] == '\0') {
+        return 0;
+    }
+    length = snprintf(NULL, 0, "%s-p*.csv", stats_prefix);
+    if (length < 0) {
+        return 0;
+    }
+    pattern = malloc((size_t)length + 1);
+    if (pattern == NULL) {
+        return 0;
+    }
+    (void)snprintf(pattern, (size_t)length + 1,
+                   "%s-p*.csv", stats_prefix);
+
+    if (glob(pattern, 0, NULL, &matches) == 0) {
+        for (size_t i = 0; i < matches.gl_pathc; i++) {
+            char header[sizeof(expected_header)] = {0};
+            FILE* csv;
+
+            /* A temporary writer is never evidence of atomic publication. */
+            if (strstr(matches.gl_pathv[i], ".tmp.") != NULL) {
+                continue;
+            }
+            csv = fopen(matches.gl_pathv[i], "r");
+            if (csv == NULL) {
+                continue;
+            }
+            if (fread(header, 1, sizeof(expected_header) - 1, csv) ==
+                    sizeof(expected_header) - 1 &&
+                memcmp(header,
+                       expected_header,
+                       sizeof(expected_header) - 1) == 0) {
+                published = 1;
+            }
+            (void)fclose(csv);
+            if (published) {
+                break;
+            }
+        }
+    }
+    globfree(&matches);
+    free(pattern);
+    return published;
+}
+
+static int
+peak_mpi_exit_record_finalize_entry(int rank)
+{
+    const char* marker_prefix =
+        getenv("PEAK_MPI_FINALIZE_ENTER_MARKER_PREFIX");
+    char* marker_path;
+    FILE* marker;
+    int length;
+    int marker_written;
+
+    if (marker_prefix == NULL || marker_prefix[0] == '\0') {
+        return 0;
+    }
+    length = snprintf(NULL, 0, "%s-r%d.txt", marker_prefix, rank);
+    if (length < 0) {
+        return 0;
+    }
+    marker_path = malloc((size_t)length + 1);
+    if (marker_path == NULL) {
+        return 0;
+    }
+    (void)snprintf(marker_path,
+                   (size_t)length + 1,
+                   "%s-r%d.txt",
+                   marker_prefix,
+                   rank);
+    marker = fopen(marker_path, "w");
+    free(marker_path);
+    if (marker == NULL) {
+        return 0;
+    }
+    marker_written = fprintf(marker, "rank=%d entered=1\n", rank) > 0;
+    if (fclose(marker) != 0) {
+        marker_written = 0;
+    }
+    return marker_written;
+}
+
+static int
+peak_mpi_exit_record_finalize_return(int rank, int finalize_result)
+{
+    const char* marker_prefix =
+        getenv("PEAK_MPI_FINALIZE_RETURN_MARKER_PREFIX");
+    int published = peak_mpi_exit_aggregate_csv_is_published();
+    char* marker_path;
+    FILE* marker;
+    int length;
+    int marker_written;
+
+    if (marker_prefix == NULL || marker_prefix[0] == '\0') {
+        return 0;
+    }
+    length = snprintf(NULL, 0, "%s-r%d.txt", marker_prefix, rank);
+    if (length < 0) {
+        return 0;
+    }
+    marker_path = malloc((size_t)length + 1);
+    if (marker_path == NULL) {
+        return 0;
+    }
+    (void)snprintf(marker_path,
+                   (size_t)length + 1,
+                   "%s-r%d.txt",
+                   marker_prefix,
+                   rank);
+    marker = fopen(marker_path, "w");
+    free(marker_path);
+    if (marker == NULL) {
+        return 0;
+    }
+    marker_written = fprintf(marker,
+                             "rank=%d finalize_rc=%d final_csv_published=%d\n",
+                             rank,
+                             finalize_result,
+                             published) > 0;
+    if (fclose(marker) != 0) {
+        marker_written = 0;
+    }
+    return marker_written && finalize_result == MPI_SUCCESS &&
+           (rank != 0 || published);
+}
+
 void PEAK_EXPORT PEAK_NOINLINE
 peak_mpi_exit_target(int rank)
 {
@@ -151,6 +289,17 @@ main(int argc, char** argv)
          strcmp(argv[1], "finalize-uneven-then-exit0") == 0)) {
         MPI_Finalize();
         exit(0);
+    }
+
+    if (argc > 1 &&
+        strcmp(argv[1], "finalize-publish-before-root-return") == 0) {
+        int finalize_entry_was_recorded =
+            peak_mpi_exit_record_finalize_entry(rank);
+        int finalize_result = MPI_Finalize();
+        int finalize_return_was_valid = peak_mpi_exit_record_finalize_return(
+            rank, finalize_result);
+
+        exit(finalize_entry_was_recorded && finalize_return_was_valid ? 0 : 2);
     }
 
     if (argc > 1 && strcmp(argv[1], "finalize-token-mismatch-then-exit0") == 0) {

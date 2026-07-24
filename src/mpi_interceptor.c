@@ -7,7 +7,6 @@
 #include <string.h>
 
 #define PEAK_MPI_FINALIZE_POLICY_ENV "PEAK_MPI_FINALIZE_POLICY"
-#define PEAK_OUTPUT_AGGREGATION_ENV  "PEAK_OUTPUT_AGGREGATION"
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -63,30 +62,18 @@ mpi_interceptor_direct_finalize_enabled(void)
 }
 
 static int
-mpi_interceptor_socket_aggregation_selected(void)
-{
-    const char* value = getenv(PEAK_OUTPUT_AGGREGATION_ENV);
-
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "socket") == 0 ||
-            g_ascii_strcasecmp(value, "tcp") == 0 ||
-            g_ascii_strcasecmp(value, "interconnect") == 0);
-}
-
-static int
 mpi_interceptor_finalize_policy_defer(void)
 {
     const char* value = getenv(PEAK_MPI_FINALIZE_POLICY_ENV);
 
     if (value == NULL || value[0] == '\0') {
-        return mpi_interceptor_socket_aggregation_selected();
+        return 0;
     }
 
-    return value != NULL &&
-           (g_ascii_strcasecmp(value, "defer") == 0 ||
-            g_ascii_strcasecmp(value, "deferred") == 0 ||
-            g_ascii_strcasecmp(value, "continue") == 0 ||
-            g_ascii_strcasecmp(value, "exit") == 0);
+    return g_ascii_strcasecmp(value, "defer") == 0 ||
+           g_ascii_strcasecmp(value, "deferred") == 0 ||
+           g_ascii_strcasecmp(value, "continue") == 0 ||
+           g_ascii_strcasecmp(value, "exit") == 0;
 }
 
 static int
@@ -206,18 +193,19 @@ mpi_interceptor_call_original_finalize_once(void)
  * This function is a custom implementation of the `PMPI_Finalize` function. It
  * records the application's finalization request. The default policy lets PEAK
  * emit final output while MPI is still alive on the application's own finalize
- * path, then returns to the real MPI finalizer after all-rank proof.
- * PEAK_MPI_FINALIZE_POLICY=defer, or explicitly selecting socket output
- * without an explicit finalize policy, calls the real finalizer immediately
- * and leaves PEAK output for normal process teardown. PEAK does not replay
- * `PMPI_Finalize()` later from process teardown.
+ * path, then decides collectively after finalize-participation and
+ * report-release gates whether returning to the real MPI finalizer is safe and
+ * compatible. Output aggregation selects the report transport and does not
+ * change that ordering. Only an explicit PEAK_MPI_FINALIZE_POLICY=defer
+ * attempts the real finalizer immediately and leaves PEAK output for normal
+ * process teardown; PEAK_MPI_REAL_FINALIZE=0 still disables that call. PEAK
+ * does not replay `PMPI_Finalize()` later from process teardown.
  *
  * @return The original `PMPI_Finalize()` result.
  */
 static int
 peak_pmpi_finalize(void)
 {
-    // g_printerr ("peak_pmpi_finalize called %p\n",  &peak_is_done);
     mpi_interceptor_mark_finalize_requested();
     if (mpi_interceptor_finalize_policy_defer()) {
         mpi_interceptor_set_real_finalize_allowed(1);
@@ -255,7 +243,6 @@ int mpi_interceptor_attach()
 
     gum_interceptor_begin_transaction(mpi_interceptor);
     hook_address = peak_general_listener_find_function("PMPI_Finalize");
-    // g_printerr ("PMPI_Finalize found at %p\n",  hook_address);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
                                                      hook_address, &peak_pmpi_finalize,

@@ -12,22 +12,7 @@ def require(condition, message):
 
 
 def read_source(repo_root, rel):
-    source = (repo_root / rel).read_text(encoding="utf-8")
-    if rel != "src/general_listener.c":
-        return source
-
-    def include_fragment(match):
-        fragment = match.group(1)
-        return (
-            repo_root / "src/general_listener" / fragment
-        ).read_text(encoding="utf-8")
-
-    return re.sub(
-        r'^#include "general_listener/([^"]+\.inc)"$',
-        include_fragment,
-        source,
-        flags=re.MULTILINE,
-    )
+    return (repo_root / rel).read_text(encoding="utf-8")
 
 
 def extract_function(source, name):
@@ -322,7 +307,19 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     shutdown_failure = fini.find(
         "if (!dlopen_shutdown_flushed)", pinned_shutdown
     )
-    report = fini.find("peak_general_listener_print(", pinned_shutdown)
+    early_report = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy(",
+        pinned_shutdown,
+    )
+    regular_report = fini.find(
+        "peak_general_listener_print(",
+        pinned_shutdown,
+    )
+    report_positions = [
+        position for position in (early_report, regular_report)
+        if position != -1
+    ]
+    report = min(report_positions) if report_positions else -1
     require(pinned_shutdown != -1 and shutdown_failure != -1 and report != -1 and
             pinned_shutdown < shutdown_failure < report,
             "MPI pinned-listener path must drain dlopen callbacks before report metadata is freed")
@@ -517,28 +514,36 @@ def check_mpi_finalize_trampoline_default(repo_root):
             "PMPI_Finalize must not restore the replacement by default")
 
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
-    guard = extract_function(peak_source, "peak_mpi_real_finalize_default_allowed")
+    guard = extract_function(peak_source, "peak_mpi_real_finalize_config_allowed")
     require("PEAK_MPI_REAL_FINALIZE_ENV" in guard and
             "peak_env_value_truthy(value)" in guard,
             "real MPI finalizer policy must preserve explicit env override")
-    require("peak_mpi_runtime_matches_intel_mpi" in guard and
-            "return !peak_mpi_runtime_matches_intel_mpi();" in guard,
-            "Intel MPI must fail closed by default after PEAK output")
-    vendor = extract_function(peak_source, "peak_mpi_runtime_matches_intel_mpi")
+    require("peak_mpi_runtime_is_intel_2019()" in guard and
+            "return FALSE;" in guard,
+            "Intel MPI 2019 must skip its unsafe real finalizer by default")
+    vendor = extract_function(peak_source, "peak_mpi_runtime_is_intel_2019")
     require("MPI_Get_library_version" in vendor and
             "Intel(R) MPI" in vendor and
-            "Intel MPI" in vendor,
-            "Intel MPI finalize guard must inspect MPI library version")
-    env_guard = extract_function(peak_source, "peak_env_looks_like_intel_mpi")
-    require("I_MPI_ROOT" in env_guard and
-            "I_MPI_FABRICS" in env_guard and
-            "I_MPI_HYDRA_BOOTSTRAP" in env_guard,
-            "Intel MPI finalize guard must inspect Intel MPI environment markers")
+            "Intel MPI" in vendor and
+            'strstr(text, "2019")' in vendor,
+            "Intel MPI 2019 containment must inspect the MPI library version")
 
 
 def check_final_report_snapshot_order(repo_root):
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     general = read_source(repo_root, "src/general_listener.c")
+    formatter = read_source(
+        repo_root, "src/general_listener/report_formatter.c"
+    )
+    mpi_transport = read_source(
+        repo_root, "src/general_listener/mpi_report_transport.c"
+    )
+    socket_transport = read_source(
+        repo_root, "src/general_listener/socket_report_transport.c"
+    )
+    runtime_config = read_source(
+        repo_root, "src/general_listener/runtime_config.c"
+    )
     fini = extract_function(peak_source, "peak_fini_impl")
     local_report = extract_function(
         general, "peak_general_listener_local_report_overhead"
@@ -546,21 +551,24 @@ def check_final_report_snapshot_order(repo_root):
     freeze_report = extract_function(
         general, "peak_general_listener_freeze_final_report_snapshot"
     )
-    print_result = extract_function(
-        general, "peak_general_listener_print_result"
+    write_report = extract_function(
+        general, "peak_general_listener_write_report"
     )
     print_text = extract_function(
-        general, "peak_general_listener_print_text_result"
+        formatter, "peak_report_formatter_write_text"
     )
     print_mpi_maxima = extract_function(
-        general, "peak_general_listener_print_mpi_maximum_reports"
+        formatter, "peak_report_formatter_write_rank_maxima"
     )
-    print_entry = extract_function(general, "peak_general_listener_print")
+    print_entry = extract_function(
+        general,
+        "peak_general_listener_print_with_mpi_job_policy",
+    )
     local_ranks = extract_function(
-        general, "peak_general_listener_local_mpi_ranks"
+        runtime_config, "peak_general_listener_local_mpi_ranks"
     )
     parse_positive_uint = extract_function(
-        general, "peak_general_listener_parse_positive_uint_text"
+        runtime_config, "peak_general_listener_parse_positive_uint_text"
     )
     control_risk = extract_function(
         general, "peak_general_listener_control_risk_seconds"
@@ -625,7 +633,7 @@ def check_final_report_snapshot_order(repo_root):
             "final local report must consume separate frozen raw and risk fields")
 
     require("parsed == 0" in parse_positive_uint and
-            "parsed > G_MAXUINT" in parse_positive_uint and
+            "parsed > UINT_MAX" in parse_positive_uint and
             "MPI_LOCALNRANKS" in local_ranks and
             "OMPI_COMM_WORLD_LOCAL_SIZE" in local_ranks and
             "MV2_COMM_WORLD_LOCAL_SIZE" in local_ranks and
@@ -638,18 +646,25 @@ def check_final_report_snapshot_order(repo_root):
             "return DBL_MAX;" in control_risk,
             "control risk must be local ranks times raw control and fail closed")
 
-    require("const PeakReportOverhead* report_overhead" in print_result and
-            "report_overhead);" in print_result,
-            "final reporting wrapper must forward the report snapshot")
-    require("const PeakReportOverhead* report_overhead" in print_text and
-            "report_overhead != NULL && report_overhead->valid" in print_text and
-            "report_overhead->profile_seconds" in print_text and
-            "report_overhead->control_seconds" in print_text and
-            "report_overhead->profile_ratio" in print_text and
-            "report_overhead->control_ratio" in print_text and
-            "report_overhead->profile_control_risk_ratio" in print_text and
-            "report_overhead->control_risk_ratio" in print_text and
-            "report_overhead->management_ratio" in print_text,
+    require("PeakReportSnapshot* snapshot" in write_report and
+            "peak_report_formatter_write_rank_local_csv(snapshot)" in
+                write_report and
+            "peak_report_formatter_write_rank_local_csv_host_disambiguated(" in
+                write_report and
+            "peak_report_formatter_write_csv(snapshot)" in write_report and
+            "peak_report_formatter_write_text(snapshot, &options)" in
+                write_report,
+            "final reporting wrapper must forward the immutable report snapshot with explicit rank-local naming")
+    require("const PeakReportOverhead* overhead" in print_text and
+            "overhead = &snapshot->overhead" in print_text and
+            "overhead->valid" in print_text and
+            "overhead->profile_seconds" in print_text and
+            "overhead->control_seconds" in print_text and
+            "overhead->profile_ratio" in print_text and
+            "overhead->control_ratio" in print_text and
+            "overhead->profile_control_risk_ratio" in print_text and
+            "overhead->control_risk_ratio" in print_text and
+            "overhead->management_ratio" in print_text,
             "text output must consume explicit raw and risk report fields")
     require("profile_ratio=%.9f control_ratio=%.9f ratio=%.9f" in print_text,
             "local text output must include explicit profile/control ratio fields")
@@ -657,94 +672,240 @@ def check_final_report_snapshot_order(repo_root):
             "[peak] per-rank maximum profile+control risk overhead: owner_rank=%d profile_seconds=%.9f raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
             "[peak] per-rank maximum control risk overhead: owner_rank=%d raw_control_seconds=%.9f local_ranks=%u control_risk_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
             "[peak] per-rank maximum profile+control overhead: owner_rank=%d profile_seconds=%.9f control_seconds=%.9f elapsed_seconds=%.9f ratio=%.9f" in print_mpi_maxima and
-            "peak_general_listener_print_mpi_maximum_reports" in print_text,
+            "peak_report_formatter_write_rank_maxima" in print_text,
             "text output must keep strict, separate, and owner-consistent raw/risk ratio contracts")
     require("[peak] %s final transition coverage: detached_targets=%zu reattached_targets=%zu revisited_targets=%zu" in print_text and
             "rank_count > 1 ? \"aggregate\" : \"local\"" in print_text,
             "final output must expose exact aggregate ever-revisited coverage")
     require("[peak] per-rank elapsed range: min_seconds=%.9f max_seconds=%.9f" in print_text and
-            "report_overhead->elapsed_min_seconds" in print_text and
-            "report_overhead->elapsed_max_seconds" in print_text,
+            "overhead->elapsed_min_seconds" in print_text and
+            "overhead->elapsed_max_seconds" in print_text,
             "final output must expose the exact per-rank elapsed range contract")
     require("PeakReportOverhead local_report =" in print_entry and
             "peak_general_listener_local_report_overhead(sum_num_calls)" in print_entry and
-            "&local_report" in print_entry,
+            "peak_general_listener_build_report_snapshot(" in print_entry and
+            "&local_report" in print_entry and
+            "local_snapshot, TRUE, TRUE, active_mpi_job)" in print_entry,
             "local final output must consume the frozen report snapshot")
 
-    if "peak_general_listener_reduce_result" in general:
-        reduce_result = extract_function(
-            general, "peak_general_listener_reduce_result"
-        )
-        tuple_reduce = extract_function(
-            general, "peak_mpi_reduce_report_rank_tuples"
-        )
-        require("peak_general_listener_report_rank_tuple(&local_report)" in reduce_result and
-                "peak_mpi_reduce_report_rank_tuples" in reduce_result and
-                "peak_report_maxima_load" in reduce_result and
-                "&mpi_report.per_rank_maxima" in reduce_result and
-                "local_tuple->profile_ratio" in tuple_reduce and
-                "local_tuple->control_ratio" in tuple_reduce and
-                "local_tuple->profile_control_risk_ratio" in tuple_reduce and
-                "local_tuple->control_risk_ratio" in tuple_reduce and
-                "MPI_DOUBLE_INT" in tuple_reduce and
-                "MPI_MAXLOC" in tuple_reduce and
-                "profile-control-ratio-maxloc" in tuple_reduce and
-                "profile-control-ratio-owner" in tuple_reduce and
-                "peak_mpi_bcast_report_rank_tuple" in tuple_reduce,
-                "MPI final reporting must retain the owner and local tuple for each maximum ratio")
-        tuple_bcast = extract_function(
-            general, "peak_mpi_bcast_report_rank_tuple"
-        )
-        require("MPI_BYTE" not in tuple_bcast and
-                "MPI_INT" in tuple_bcast and
-                "MPI_UNSIGNED" in tuple_bcast and
-                "PEAK_MPI_UINT64_DATATYPE" in tuple_bcast and
-                "MPI_DOUBLE" in tuple_bcast,
-                "MPI report tuples must use field-wise typed broadcasts")
-        require("_Static_assert(sizeof(uint64_t) * CHAR_BIT == 64" in general and
-                "MPI_UINT64_T" in general and
-                "UINT64_MAX == ULONG_MAX" in general and
-                "UINT64_MAX == ULLONG_MAX" in general,
-                "MPI reporting must select an exact uint64 datatype with a compile-time fallback")
-        require("local_elapsed_valid" in reduce_result and
-                "\"elapsed-valid\"" in reduce_result and
-                "MPI_MIN" in reduce_result and
-                "\"elapsed-min\"" in reduce_result and
-                "MPI_MAX" in reduce_result and
-                "\"elapsed-max\"" in reduce_result and
-                "mpi_report.elapsed_min_seconds = mpi_min_elapsed_seconds" in reduce_result and
-                "mpi_report.elapsed_max_seconds = mpi_max_elapsed_seconds" in reduce_result,
-                "MPI final reporting must validate and reduce exact elapsed endpoints")
-        require("\"accounting-valid\"" in reduce_result and
-                "MPI_MIN" in reduce_result and
-                "\"failed-stop-window-max\"" in reduce_result and
-                "(UINT64_MAX - 1) / (uint64_t)size" in reduce_result and
-                "\"failed-stop-window-count\"" in reduce_result and
-                "MPI_SUM" in reduce_result and
-                "mpi_report.accounting_valid = all_accounting_valid != 0" in reduce_result and
-                "mpi_report.failed_stop_window_count = mpi_failed_stop_window_count" in reduce_result,
-                "MPI final reporting must carry all-rank accounting validity and failed-window evidence")
-    if "peak_general_listener_socket_reduce_result_with_rank_source" in general:
-        socket_result = extract_function(
-            general, "peak_general_listener_socket_reduce_result_with_rank_source"
-        )
-        require("#define PEAK_SOCKET_REDUCE_VERSION 9U" in general and
-                "peak_socket_reduce_header_set_report_tuple" in socket_result and
-                "peak_socket_reduce_header_report_tuple" in socket_result and
-                "peak_general_listener_report_rank_tuple_is_valid" in socket_result and
-                "peak_report_maxima_initialize" in socket_result and
-                "peak_report_maxima_consider" in socket_result and
-                "socket_report.per_rank_maxima = socket_maxima" in socket_result and
-                "combined_maximum->stop_window_count" in socket_result and
-                "combined_maximum->elapsed_seconds" in socket_result and
-                "socket_report.accounting_valid = socket_accounting_valid" in socket_result and
-                "peak_general_listener_add_uint64_saturated" in socket_result,
-                "socket reducer must carry complete owner tuples and accounting health")
-        require("min_total_time[i] = DBL_MAX" in general and
-                "sum_min_time[i] = FLT_MAX" in general and
-                "peak_general_listener_calls_per_active_thread" in general and
-                "thread_count[i] = 1" not in general,
-                "inactive ranks must be neutral for thread counts and minima")
+    early_report_position = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy("
+    )
+    proof_position = fini.find(
+        "peak_mpi_teardown_all_ranks_requested_finalize("
+    )
+    proof_guard_position = fini.rfind(
+        "if (need_mpi_finalize_proof", early_report_position, proof_position
+    )
+    regular_report_position = fini.find(
+        "peak_general_listener_print_with_mpi_job_policy(",
+        early_report_position + 1,
+    )
+    report_position = early_report_position
+    cuda_position = fini.find("cuda_interceptor_print(", report_position)
+    finalize_permission_position = fini.find(
+        "mpi_interceptor_set_real_finalize_allowed(", report_position
+    )
+    report_release_position = fini.find(
+        "peak_mpi_teardown_complete_report_release(", report_position
+    )
+    combined_release_position = fini.find(
+        "peak_mpi_teardown_complete_post_publication_release(",
+        report_position,
+    )
+    require(early_report_position != -1 and proof_position != -1 and
+            proof_guard_position != -1 and
+            regular_report_position != -1 and cuda_position != -1 and
+            combined_release_position != -1 and
+            report_release_position != -1 and
+            finalize_permission_position != -1 and
+            early_report_position < proof_position <
+                regular_report_position < cuda_position <
+                combined_release_position < report_release_position <
+                finalize_permission_position,
+            "local/socket output must precede MPI's proof-first output while CUDA output and both release gates remain ordered before the real-finalize decision")
+    require(
+        "!publish_before_finalize_proof" in
+            fini[proof_guard_position:proof_position] and
+        "if (publish_before_finalize_proof)" in
+            fini[cuda_position:combined_release_position] and
+        "(publish_before_finalize_proof ||" in fini and
+        "all_ranks_requested_mpi_finalize" in
+            fini[combined_release_position:finalize_permission_position],
+        "post-publication local/socket output must combine finalize participation with its long release gate while MPI aggregation retains the separate proof-first gate")
+    require(
+        "output_mode == PEAK_OUTPUT_AGGREGATION_SOCKET" in
+            fini[cuda_position:combined_release_position] and
+        "socket_combined_release_minimum_ms" in
+            fini[cuda_position:combined_release_position] and
+        "publication_timeout_minimum_ms," in
+            fini[combined_release_position:report_release_position],
+        "the combined gate must use the stable attempted socket mode, including socket-to-local fallback, to select the R+2T timeout floor")
+    require("fflush(stderr)" in fini and
+            fini.find("fflush(stderr)", cuda_position) <
+                combined_release_position,
+            "CUDA text output must be flushed before the all-rank report release")
+    require("report_release_protocol_completed &&" in fini and
+            "all_real_mpi_finalize_config_allowed" in fini and
+            "real_mpi_finalize_config_allowed" in fini and
+            fini.find("report_release_protocol_completed &&", report_position) <
+                finalize_permission_position,
+            "real PMPI_Finalize must require a completed release protocol and an all-rank policy decision")
+
+    reduce_result = extract_function(
+        mpi_transport, "peak_mpi_report_transport_reduce"
+    )
+    tuple_reduce = extract_function(
+        mpi_transport, "peak_mpi_reduce_report_rank_tuples"
+    )
+    tuple_bcast = extract_function(
+        mpi_transport, "peak_mpi_bcast_report_rank_tuple"
+    )
+    set_mpi_overhead = extract_function(
+        mpi_transport, "peak_mpi_report_transport_set_overhead"
+    )
+    require("peak_report_overhead_rank_tuple(&local->overhead)" in reduce_result and
+            "peak_mpi_reduce_report_rank_tuples" in reduce_result and
+            "peak_mpi_report_transport_set_overhead" in reduce_result and
+            "maximum_reports" in reduce_result and
+            "maximum_owner_ranks" in reduce_result and
+            "peak_report_maxima_load" in set_mpi_overhead and
+            "&overhead->per_rank_maxima" in set_mpi_overhead and
+            "local_tuple->profile_ratio" in tuple_reduce and
+            "local_tuple->control_ratio" in tuple_reduce and
+            "local_tuple->profile_control_risk_ratio" in tuple_reduce and
+            "local_tuple->control_risk_ratio" in tuple_reduce and
+            "MPI_DOUBLE_INT" in tuple_reduce and
+            "MPI_MAXLOC" in tuple_reduce and
+            "profile-control-ratio-maxloc" in tuple_reduce and
+            "profile-control-ratio-owner" in tuple_reduce and
+            "peak_mpi_bcast_report_rank_tuple" in tuple_reduce,
+            "MPI final reporting must retain the owner and local tuple for each maximum ratio")
+    require("MPI_BYTE" not in tuple_bcast and
+            "MPI_INT" in tuple_bcast and
+            "MPI_UNSIGNED" in tuple_bcast and
+            "PEAK_MPI_UINT64_DATATYPE" in tuple_bcast and
+            "MPI_DOUBLE" in tuple_bcast,
+            "MPI report tuples must use field-wise typed broadcasts")
+    require("_Static_assert(sizeof(uint64_t) * CHAR_BIT == 64" in
+                mpi_transport and
+            "MPI_UINT64_T" in mpi_transport and
+            "UINT64_MAX == ULONG_MAX" in mpi_transport and
+            "UINT64_MAX == ULLONG_MAX" in mpi_transport,
+            "MPI reporting must select an exact uint64 datatype with a compile-time fallback")
+    require("local_elapsed_valid" in reduce_result and
+            "\"elapsed-valid\"" in reduce_result and
+            "MPI_MIN" in reduce_result and
+            "\"elapsed-min\"" in reduce_result and
+            "MPI_MAX" in reduce_result and
+            "\"elapsed-max\"" in reduce_result and
+            "overhead->elapsed_min_seconds = min_elapsed_seconds" in
+                set_mpi_overhead and
+            "overhead->elapsed_max_seconds = max_elapsed_seconds" in
+                set_mpi_overhead and
+            "mpi_min_elapsed_seconds" in reduce_result and
+            "mpi_max_elapsed_seconds" in reduce_result,
+            "MPI final reporting must validate and reduce exact elapsed endpoints")
+    require("\"accounting-valid\"" in reduce_result and
+            "MPI_MIN" in reduce_result and
+            "\"failed-stop-window-max\"" in reduce_result and
+            "(UINT64_MAX - 1) / (uint64_t)size" in reduce_result and
+            "\"failed-stop-window-count\"" in reduce_result and
+            "MPI_SUM" in reduce_result and
+            "all_accounting_valid != 0" in reduce_result and
+            "mpi_failed_stop_window_count" in reduce_result and
+            "overhead->accounting_valid = all_accounting_valid" in
+                set_mpi_overhead and
+            "overhead->failed_stop_window_count = failed_stop_window_count" in
+                set_mpi_overhead,
+            "MPI final reporting must carry all-rank accounting validity and failed-window evidence")
+
+    socket_result = extract_function(
+        socket_transport, "peak_socket_report_transport_begin"
+    )
+    socket_validate_header = extract_function(
+        socket_transport, "peak_socket_gather_validate_header"
+    )
+    socket_prepare_receipt = extract_function(
+        socket_transport, "peak_socket_gather_prepare_receipt"
+    )
+    socket_root_gather = extract_function(
+        socket_transport, "peak_socket_reduce_root_gather"
+    )
+    socket_read_ready = extract_function(
+        socket_transport, "peak_socket_gather_read_ready"
+    )
+    socket_write_ready = extract_function(
+        socket_transport, "peak_socket_gather_write_ready"
+    )
+    socket_peer_begin = extract_function(
+        socket_transport, "peak_socket_report_peer_begin"
+    )
+    set_socket_overhead = extract_function(
+        socket_transport, "peak_socket_report_set_aggregate_overhead"
+    )
+    require("#define PEAK_SOCKET_REDUCE_VERSION 11U" in socket_transport and
+            "peak_socket_reduce_header_set_report_tuple" in socket_result and
+            "peak_socket_reduce_header_report_tuple" in
+                socket_validate_header and
+            "peak_report_rank_tuple_is_valid" in socket_validate_header and
+            "peak_report_maxima_initialize" in socket_result and
+            "peak_report_maxima_consider" in socket_prepare_receipt and
+            "peak_socket_report_set_aggregate_overhead" in socket_result and
+            "report.per_rank_maxima = *maxima" in set_socket_overhead and
+            "combined_maximum->stop_window_count" in set_socket_overhead and
+            "combined_maximum->elapsed_seconds" in set_socket_overhead and
+            "report.accounting_valid = accounting_valid" in
+                set_socket_overhead and
+            "peak_socket_add_uint64_saturated" in socket_prepare_receipt,
+            "socket reducer must carry complete owner tuples and accounting health")
+    require("PEAK_SOCKET_GATHER_ACTIVE_MAX" in socket_transport and
+            "peak_socket_reduce_gather_active_limit" in
+                socket_root_gather and
+            "active < active_limit" in socket_root_gather and
+            "poll(descriptors" in socket_root_gather and
+            "progress_timeout_ms" in socket_root_gather and
+            "hard_deadline_us" in socket_root_gather and
+            "peak_socket_reduce_refresh_progress_deadline_us" in
+                socket_root_gather and
+            "peak_socket_reduce_remaining_ms(progress_deadline_us)" in
+                socket_root_gather and
+            "connection->record_index > record_index_before" in
+                socket_root_gather and
+            "completed > completed_before" in socket_root_gather and
+            "PEAK_SOCKET_GATHER_READING_HEADER" in socket_read_ready and
+            "PEAK_SOCKET_GATHER_READING_PAYLOAD" in socket_read_ready,
+            "socket gather must combine bounded no-progress and absolute deadlines")
+    release_bind = socket_result.find(
+        "peak_socket_reduce_bind_listener(release_port)"
+    )
+    gather_listen = socket_result.find(
+        "peak_socket_reduce_create_listener(port, size - 1)"
+    )
+    require(release_bind != -1 and gather_listen != -1 and
+            release_bind < gather_listen and
+            "int release_listener;" in socket_transport and
+            "session->release_listener = -1" in socket_transport,
+            "socket root must reserve one release fd before gather and consume it exactly once")
+    require("PEAK_SOCKET_REDUCE_GATHER_RECEIPT" in
+                socket_prepare_receipt and
+            "PEAK_SOCKET_REDUCE_GATHER_REGISTERED" in
+                socket_prepare_receipt and
+            "sizeof(connection->receipt)" in socket_write_ready and
+            "PEAK_SOCKET_GATHER_READING_CONFIRM" in socket_root_gather and
+            "PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM" in
+                socket_read_ready and
+            "peak_socket_reduce_recv_all" in socket_peer_begin and
+            "peak_socket_reduce_send_gather_confirmation" in
+                socket_peer_begin and
+            "receipt_received" in socket_peer_begin and
+            "release_targets[rank] = true" in socket_root_gather,
+            "wire-v11 gather must receipt and confirm each peer before completion")
+    require("min_total_time[i] = DBL_MAX" in print_entry and
+            "sum_min_time[i] = FLT_MAX" in print_entry and
+            "peak_report_calls_per_active_thread" in formatter and
+            "thread_count[i] = 1" not in print_entry,
+            "inactive ranks must be neutral for thread counts and minima")
 
 
 def check_stop_window_accounting_sidecar(repo_root):
@@ -752,6 +913,15 @@ def check_stop_window_accounting_sidecar(repo_root):
         encoding="utf-8"
     )
     general = read_source(repo_root, "src/general_listener.c")
+    attach_policy = read_source(
+        repo_root, "src/general_listener/attach_policy.c"
+    )
+    formatter = read_source(
+        repo_root, "src/general_listener/report_formatter.c"
+    )
+    mpi_transport = read_source(
+        repo_root, "src/general_listener/mpi_report_transport.c"
+    )
     started = extract_function(
         source, "peak_detach_controller_note_stop_window_started"
     )
@@ -795,23 +965,29 @@ def check_stop_window_accounting_sidecar(repo_root):
         general, "peak_general_controller_init_trace_config_once"
     )
     general_attach_supported = extract_function(
-        general, "peak_general_listener_attach_target_is_supported"
+        attach_policy, "peak_general_listener_attach_target_is_supported"
     )
     general_listener_attach = extract_function(
         general, "peak_general_listener_attach"
     )
     startup_skip = extract_function(
-        general, "peak_general_listener_startup_attach_can_skip_stop"
+        attach_policy, "peak_general_listener_startup_attach_can_skip_stop"
     )
     general_attach_policy_init = extract_function(
-        general, "peak_general_listener_init_attach_policy_once"
+        attach_policy, "peak_general_listener_init_attach_policy_once"
     )
     heartbeat = extract_function(general, "peak_heartbeat_monitor")
     note_runtime_start = extract_function(
         general, "peak_general_listener_note_runtime_start"
     )
     print_text = extract_function(
-        general, "peak_general_listener_print_text_result"
+        formatter, "peak_report_formatter_write_text"
+    )
+    summarize_report = extract_function(
+        formatter, "peak_report_formatter_summarize"
+    )
+    local_report = extract_function(
+        general, "peak_general_listener_local_report_overhead"
     )
     clear_pending_context = extract_function(
         general,
@@ -858,8 +1034,16 @@ def check_stop_window_accounting_sidecar(repo_root):
         "peak_general_listener_refresh_revisited_markers",
     )
     reduce_result = extract_function(
+        mpi_transport,
+        "peak_mpi_report_transport_reduce",
+    )
+    begin_marker_swap = extract_function(
         general,
-        "peak_general_listener_reduce_result",
+        "peak_general_listener_begin_report_marker_swap",
+    )
+    print_entry = extract_function(
+        general,
+        "peak_general_listener_print_with_mpi_job_policy",
     )
     scalar_reattach = extract_function(
         general,
@@ -957,9 +1141,19 @@ def check_stop_window_accounting_sidecar(repo_root):
             "stop_window_us = peak_detach_controller_last_stop_window_us();" in
                 batch_mutation[batch_mutation.find("if (prepared_count > 0)"):],
             "prepare-failed traces must use zero unless they share a completed partial-batch window")
-    require("PeakDetachAccountingSnapshot detach_accounting" in print_text and
-            "control stop-window overhead:" in print_text and
-            "stop_window_seconds / peak_main_time" in print_text,
+    require("PeakDetachAccountingSnapshot accounting" in local_report and
+            "peak_general_listener_runtime_accounting_snapshot(&accounting)" in
+                local_report and
+            "peak_general_listener_control_wall_ns_since_heartbeat(" in
+                local_report and
+            "overhead.control_seconds" in local_report and
+            "summary.stop_window_seconds = overhead->control_seconds" in
+                summarize_report and
+            "summary.elapsed_seconds = overhead->elapsed_seconds" in
+                summarize_report and
+            "summary.stop_window_seconds / summary.elapsed_seconds" in
+                summarize_report and
+            "control stop-window overhead:" in print_text,
             "text output must report measured stop-window overhead")
     require("double profile_spent_seconds = 0.0" in heartbeat and
             "double control_spent_seconds = 0.0" in heartbeat and
@@ -1022,14 +1216,15 @@ def check_stop_window_accounting_sidecar(repo_root):
             "peak_general_listener_heartbeat_control_baseline_valid" in general,
             "heartbeat accounting baseline must be shared with trace through atomics")
     per_target_detach = heartbeat[
-        heartbeat.find("// 1) Per-target DETACH"):
-        heartbeat.find("// 2) Global DETACH")
+        heartbeat.find("/* 1) Per-target detach. */"):
+        heartbeat.find("/* 2) Global detach. */")
     ]
     global_detach_for_budget = heartbeat[
-        heartbeat.find("// 2) Global DETACH"):
-        heartbeat.find("// 3) Reattach")
+        heartbeat.find("/* 2) Global detach. */"):
+        heartbeat.find("/* 3) Reattach. */")
     ]
-    adaptive_sleep_start = heartbeat.find("// Adaptive heartbeat sleep")
+    adaptive_sleep_start = heartbeat.find(
+        "/* Adapt the next heartbeat sleep interval. */")
     adaptive_sleep = heartbeat[
         adaptive_sleep_start:heartbeat.find("cleanup:", adaptive_sleep_start)
     ]
@@ -1112,7 +1307,8 @@ def check_stop_window_accounting_sidecar(repo_root):
             "risk" not in adaptive_sleep and
             "local_mpi_ranks" not in adaptive_sleep,
             "adaptive heartbeat sleep must use only the immutable hybrid global overhead")
-    reattach_section = heartbeat[heartbeat.find("// 3) Reattach"):]
+    reattach_section = heartbeat[
+        heartbeat.find("/* 3) Reattach. */"):]
     require("value >= 0.0" in nonnegative_finite and
             "value == value" in nonnegative_finite and
             "value <= DBL_MAX" in nonnegative_finite and
@@ -1262,9 +1458,32 @@ def check_stop_window_accounting_sidecar(repo_root):
             "array_listener_revisited[i] = TRUE" in refresh_revisited and
             "array_listener_revisited[i] = FALSE" not in refresh_revisited,
             "final revisit refresh must only OR in growth from a valid baseline")
-    require("array_listener_revisited, mpi_array_listener_revisited" in reduce_result and
-            "MPI_INT, MPI_MAX, 0, \"revisited-marker\"" in reduce_result and
-            "array_listener_revisited = mpi_array_listener_revisited" in reduce_result,
+    revisit_reduce = re.search(
+        r"peak_mpi_reduce_checked\(\s*local->revisited,\s*"
+        r"aggregate->revisited,\s*hook_count,\s*MPI_INT,\s*MPI_MAX,\s*0,\s*"
+        r"rank\s*==\s*0,\s*"
+        r"\"revisited-marker\"\s*\)",
+        reduce_result,
+    )
+    mpi_root_branch = print_entry.find(
+        "result == PEAK_MPI_REPORT_TRANSPORT_ROOT_READY"
+    )
+    marker_swap_call = print_entry.find(
+        "peak_general_listener_begin_report_marker_swap(aggregate)",
+        mpi_root_branch,
+    )
+    marker_swap_commit = print_entry.find(
+        "peak_general_listener_commit_report_marker_swap(&marker_swap)",
+        marker_swap_call,
+    )
+    require(revisit_reduce is not None and
+            "swap.installed_revisited[i] = source->revisited[i] != 0" in
+                begin_marker_swap and
+            "array_listener_revisited = swap.installed_revisited" in
+                begin_marker_swap and
+            mpi_root_branch != -1 and marker_swap_call != -1 and
+            marker_swap_commit != -1 and
+            mpi_root_branch < marker_swap_call < marker_swap_commit,
             "MPI revisit aggregation must use logical OR via integer maximum")
     scalar_mark = scalar_reattach.find(
         "array_listener_reattached[hook_id] = TRUE"
@@ -1338,7 +1557,8 @@ def check_stop_window_accounting_sidecar(repo_root):
             "initial attach must skip the stop backend only after a single-thread proof")
 
     support_attach_supported = extract_function(
-        general, "peak_general_listener_support_attach_target_is_supported"
+        attach_policy,
+        "peak_general_listener_support_attach_target_is_supported",
     )
     syscall = (repo_root / "src/syscall_interceptor.c").read_text(
         encoding="utf-8"
@@ -1438,8 +1658,8 @@ def check_global_detach_overhead_selection(repo_root):
     comparator = extract_function(source, "compare_ratio_de")
     wait_helper = extract_function(source, "peak_heartbeat_wait_us")
 
-    global_detach_marker = "// 2) Global DETACH"
-    reattach_marker = "// 3) Reattach"
+    global_detach_marker = "/* 2) Global detach. */"
+    reattach_marker = "/* 3) Reattach. */"
     start = heartbeat.find(global_detach_marker)
     end = heartbeat.find(reattach_marker, start)
     require(start != -1 and end != -1,
@@ -1577,15 +1797,24 @@ def check_general_controller_dlopen_drain_order(repo_root):
 
 def check_exclusive_time_nonnegative(repo_root):
     source = read_source(repo_root, "src/general_listener.c")
+    report_model = read_source(
+        repo_root, "src/general_listener/report_model.c"
+    )
+    report_snapshot = read_source(
+        repo_root, "src/general_listener/report_snapshot.c"
+    )
     helper = extract_function(
         source, "peak_general_listener_exclusive_duration"
     )
     pop = extract_function(source, "peak_general_listener_pop_invocation")
     enter = extract_function(source, "peak_general_listener_on_enter")
     leave = extract_function(source, "peak_general_listener_on_leave")
-    output = extract_function(source, "peak_general_listener_print_result")
+    output = extract_function(source, "peak_general_listener_write_report")
     sanitize = extract_function(
-        source, "peak_general_listener_sanitize_output_times"
+        report_model, "peak_report_sanitize_times"
+    )
+    prepare_for_render = extract_function(
+        report_snapshot, "peak_report_snapshot_prepare_for_render"
     )
 
     require("gulong stack_level" in source,
@@ -1606,14 +1835,19 @@ def check_exclusive_time_nonnegative(repo_root):
             "strict/detach paths")
     require("end_time - thread_data.child_time[thread_data.level]" not in leave,
             "on_leave must not accumulate open-coded negative exclusive time")
-    require("sum_exclusive_time[i] < 0.0" in sanitize and
-            "sum_exclusive_time[i] = 0.0" in sanitize,
+    require("exclusive_time[i] < 0.0" in sanitize and
+            "exclusive_time[i] = 0.0" in sanitize,
             "output must clamp negative exclusive times after aggregation")
-    require("sum_exclusive_time[i] > sum_total_time[i]" in sanitize,
+    require("exclusive_time[i] > total_time[i]" in sanitize,
             "output must clamp exclusive time to total time after aggregation")
-    require("peak_general_listener_sanitize_output_times" in output and
-            output.find("peak_general_listener_sanitize_output_times") <
-            output.find("peak_general_listener_export_csv_result"),
+    require("peak_report_sanitize_times" in prepare_for_render and
+            "snapshot->total_time" in prepare_for_render and
+            "snapshot->exclusive_time" in prepare_for_render and
+            "peak_report_snapshot_prepare_for_render(snapshot)" in output and
+            output.find("peak_report_snapshot_prepare_for_render(snapshot)") <
+            output.find("peak_report_formatter_write_csv(snapshot)") and
+            output.find("peak_report_snapshot_prepare_for_render(snapshot)") <
+            output.find("peak_report_formatter_write_text(snapshot, &options)"),
             "output time sanitization must run before CSV/text printing")
 
 

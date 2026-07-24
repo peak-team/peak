@@ -1,29 +1,27 @@
 # General listener implementation layout
 
-The `*.inc` files in this directory are unity implementation fragments. They
-are included, in a fixed order, by `general_listener.c` and form one C
-translation unit. They are not independent modules and must not be compiled or
-included elsewhere.
+The detach/reattach lifecycle remains in `general_listener.c` as one C
+translation unit. Its private declarations, static state, macro scope, and
+section order are an implementation contract. Keeping that code together
+preserves the established state-machine ordering without exporting mutable
+listener state between modules.
 
-This layout temporarily preserves private state and the established
-detach/reattach ordering while explicit interfaces are introduced. New logic
-that does not require that shared state belongs in a normal, independently
-compiled `.c` file with a private header. `report_maxima.c` is the first such
-reporting component.
+Code that does not require direct access to lifecycle state is independently
+compiled:
 
-While unity fragments remain:
+- implementations live in `src/general_listener/*.c`;
+- private interfaces live in `include/internal/general_listener/*.h`;
+- only stable consumer APIs belong directly under `include/`.
 
-- only `general_listener.c` may include them;
-- their include order is part of the implementation contract;
-- system and project headers belong at the top of `general_listener.c`;
-- fragments must not be described as modules or gain new externally linked
-  private functions;
-- state-machine fragments must not be mechanically separated by turning
-  private state into `extern` globals.
+The independent modules are `attach_policy`, `exec_checkpoint_writer`,
+`mpi_report_transport`, `report_formatter`, `report_maxima`, `report_model`,
+`report_snapshot`, `runtime_config`, and `socket_report_transport`. Their
+headers are private because none of these interfaces is part of PEAK's
+supported external API.
 
-The safe migration order is to establish an immutable report model and clear
-ownership interfaces, then extract report formatting, socket transport, MPI
-transport, and exec-checkpoint support. Controller, heartbeat, attach, callback,
-and shutdown fragments stay in the unity translation unit until their shared
-state can be placed behind an explicit context without changing lifecycle
-ordering.
+`general_listener.c` captures the immutable report snapshot and coordinates
+transport completion with lifecycle-owned marker arrays. Formatter and
+transport modules consume only snapshot data; they do not read listener
+globals. Future lifecycle extraction requires an explicit state context and a
+separate equivalence review. It must not be implemented by exposing the
+current static state as `extern` globals.

@@ -3486,6 +3486,8 @@ main(int argc, char** argv)
     long threads = parse_long_arg(argc, argv, "--threads", 4);
     long seconds = parse_long_arg(argc, argv, "--seconds", 3);
     long spawner_threads = parse_long_arg(argc, argv, "--spawner-threads", 2);
+    long startup_delay_seconds =
+        parse_long_arg(argc, argv, "--startup-delay-seconds", 0);
     int paired_targets = has_flag_arg(argc, argv, "--paired-targets");
     int cold_one_shot_target = has_flag_arg(argc, argv, "--cold-one-shot-target");
     int spawn_transient_threads = has_flag_arg(argc, argv, "--spawn-transient-threads");
@@ -3498,6 +3500,13 @@ main(int argc, char** argv)
         fprintf(stderr,
                 "--require-detach-during-churn requires transient spawners and no pre-gate cold target\n");
         return 2;
+    }
+    if (startup_delay_seconds < 0) {
+        fprintf(stderr, "--startup-delay-seconds must be nonnegative\n");
+        return 2;
+    }
+    if (startup_delay_seconds > 0) {
+        sleep_for_seconds(startup_delay_seconds);
     }
     pthread_t* tids = calloc((size_t)threads, sizeof(*tids));
     WorkerState* states = calloc((size_t)threads, sizeof(*states));
