@@ -41,13 +41,16 @@ typedef struct PeakSocketReportSession PeakSocketReportSession;
  * Gathers immutable report snapshots through the established wire-v11 socket
  * protocol.
  *
- * Root advances a bounded set of nonblocking peer connections under one hard
- * gather deadline. A peer enters the final-release wait only after receiving a
- * complete registration receipt. Root completes that peer's gather only after
- * receiving the matching receipt confirmation; if the confirmation fails, the
- * registered peer waits for root's authoritative fallback decision. A partial,
- * invalid, duplicate, or unconfirmed peer fails the whole aggregate without
- * publishing it.
+ * Root advances a bounded set of nonblocking peer connections under both a
+ * no-progress deadline and a rank-count-scaled absolute gather deadline.
+ * Valid protocol milestones refresh only the former. Root reserves the release
+ * port before accepting gather peers so outbound ephemeral ports cannot claim
+ * it between phases. A peer enters the final-release wait only after receiving
+ * a complete registration receipt. Root completes that peer's gather only
+ * after receiving the matching receipt confirmation; if the confirmation
+ * fails, the registered peer waits for root's authoritative fallback decision.
+ * A partial, invalid, duplicate, or unconfirmed peer fails the whole aggregate
+ * without publishing it.
  *
  * The function blocks peers until root commits or aborts the prepared report.
  * On SINGLE_READY and ROOT_PREPARED, @p aggregate_out receives an owned
@@ -59,10 +62,10 @@ typedef struct PeakSocketReportSession PeakSocketReportSession;
  * slot. Peer-only instrumented slots with zero calls are not represented.
  * Wire-v11 is supported only among ranks with the same byte order,
  * floating-point representation, and 64-bit Linux C ABI. The peer release-wait
- * budget defaults to three gather-phase budgets so it covers gather, report
- * publication, and confirmed release. A positive
+ * budget covers the absolute gather budget plus two phase budgets for report
+ * publication and confirmed release. A positive
  * `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` may raise that budget, but it is
- * clamped to at least three gather-phase budgets.
+ * clamped to that computed minimum.
  */
 PeakSocketReportStatus peak_socket_report_transport_begin(
     const PeakReportSnapshot* local,
@@ -116,6 +119,12 @@ void peak_socket_report_test_telemetry_reset(void);
 /** Copies test-only socket gather observations to @p telemetry_out. */
 void peak_socket_report_test_telemetry_get(
     PeakSocketReportTestTelemetry* telemetry_out);
+
+/** Computes a test-only rolling deadline from an injected clock value. */
+int64_t peak_socket_report_test_progress_deadline_us(
+    int64_t now_us,
+    int64_t hard_deadline_us,
+    int progress_timeout_ms);
 
 /** Parses the first host represented by a Slurm node-list expression. */
 int peak_general_listener_test_first_slurm_host(const char* nodelist,

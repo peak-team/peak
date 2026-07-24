@@ -8,18 +8,29 @@
 
 #include <stdbool.h>
 
+/** Compiled root concurrency used by the shared gather-budget calculation. */
+#define PEAK_SOCKET_GATHER_ACTIVE_MAX 128U
+
+/** Per-connection-wave margin added to the absolute gather deadline. */
+#define PEAK_SOCKET_GATHER_WAVE_BUDGET_MS 5000U
+
+/** Maximum adaptive margin; the configured base timeout is added afterward. */
+#define PEAK_SOCKET_GATHER_ADAPTIVE_MARGIN_MAX_MS 300000U
+
 /**
  * End-to-end timeout contract shared by socket publication and MPI teardown.
  *
- * The socket peer budget covers three socket phases: gather, report
+ * The socket peer budget covers the scaled absolute gather cap, report
  * publication, and confirmed release. The MPI post-publication gate then
- * retains two additional socket phases for rank-local fallback publication
- * and collective-arrival/progress margin.
+ * retains two additional base phases for rank-local fallback publication and
+ * collective-arrival/progress margin.
  */
 typedef struct {
     unsigned int socket_phase_timeout_ms;
+    unsigned int socket_gather_hard_timeout_ms;
     unsigned int socket_release_timeout_ms;
     unsigned int mpi_report_release_timeout_ms;
+    bool socket_gather_timeout_was_scaled;
     bool socket_release_was_raised;
     unsigned int socket_combined_release_minimum_ms;
 } PeakReportTimeoutBudget;
@@ -27,17 +38,26 @@ typedef struct {
 /**
  * Resolves the shared report timeout budget with saturating arithmetic.
  *
- * Defaults are 60000 ms per socket phase, 180000 ms peer release, 180000 ms
- * ordinary MPI/local report release, and a 300000 ms minimum for a
- * socket-combined release. The resolved socket invariants are
- * `socket_release >= 3 * socket_phase` (capped at INT_MAX) and
- * `socket_combined_release_minimum = socket_release + 2 * socket_phase`
- * (capped at UINT_MAX). The ordinary MPI/local timeout is not itself raised by
- * socket settings; callers select the socket minimum only for a path that
- * attempted socket publication. Invalid or zero values select the
- * corresponding default.
+ * The zero-argument form derives the world size from launcher metadata when
+ * available. See the rank-count form for the scaling and saturation contract.
  */
 PeakReportTimeoutBudget peak_general_listener_report_timeout_budget(void);
+
+/**
+ * Resolves the shared report timeout budget for @p rank_count ranks.
+ *
+ * The socket inactivity/phase default is 60000 ms. Its absolute gather budget
+ * adds 5000 ms per 128-peer connection wave and caps the adaptive margin at
+ * 300000 ms; that margin is then added with saturation, so an explicit phase
+ * timeout is never shortened. The peer end-to-end release minimum is
+ * `gather_hard + 2 * socket_phase` (capped at INT_MAX), and the
+ * socket-combined MPI gate adds two further phase margins (capped at
+ * UINT_MAX). The ordinary MPI/local release default remains 180000 ms.
+ * Invalid or zero environment values select the corresponding default.
+ */
+PeakReportTimeoutBudget
+peak_general_listener_report_timeout_budget_for_rank_count(
+    unsigned int rank_count);
 
 /**
  * Reads the optional detach-count override.
