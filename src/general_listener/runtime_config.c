@@ -385,49 +385,6 @@ peak_general_listener_parse_long_env(const char* name)
     return parsed;
 }
 
-long
-peak_general_listener_mpi_env_size(void)
-{
-    static const char* names[] = {
-        "PMI_SIZE",
-        "PMIX_SIZE",
-        "OMPI_COMM_WORLD_SIZE",
-        "SLURM_NTASKS",
-        NULL
-    };
-
-    for (const char** name = names; *name != NULL; name++) {
-        long value = peak_general_listener_parse_long_env(*name);
-        if (value > 0) {
-            return value;
-        }
-    }
-
-    return -1;
-}
-
-long
-peak_general_listener_mpi_env_rank(void)
-{
-    static const char* names[] = {
-        "PMI_RANK",
-        "PMIX_RANK",
-        "OMPI_COMM_WORLD_RANK",
-        "MV2_COMM_WORLD_RANK",
-        "SLURM_PROCID",
-        NULL
-    };
-
-    for (const char** name = names; *name != NULL; name++) {
-        long value = peak_general_listener_parse_long_env(*name);
-        if (value >= 0) {
-            return value;
-        }
-    }
-
-    return -1;
-}
-
 bool
 peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
 {
@@ -460,7 +417,7 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
             mpi_pairs[i].rank_name);
         long size = peak_general_listener_parse_long_env(
             mpi_pairs[i].size_name);
-        if (rank < 0 || size <= 0 || rank >= size) {
+        if (rank < 0 || size <= 0 || size > INT_MAX || rank >= size) {
             return false;
         }
         if (resolved_rank >= 0 &&
@@ -485,6 +442,7 @@ peak_general_listener_mpi_env_rank_size(long* rank_out, long* size_out)
         resolved_size = peak_general_listener_parse_long_env(
             "SLURM_NTASKS");
         if (resolved_rank < 0 || resolved_size <= 0 ||
+            resolved_size > INT_MAX ||
             resolved_rank >= resolved_size) {
             return false;
         }

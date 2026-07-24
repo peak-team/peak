@@ -505,6 +505,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       PASS_REGULAR_EXPRESSION "general-listener-invalid-accounting-baseline-report-ok"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_general_listener_rank_local_mpi_text_default
+    COMMAND test_detach_listener_shutdown general-listener-rank-local-mpi-text-default)
+  set_tests_properties(test_detach_controller_general_listener_rank_local_mpi_text_default
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>"
+      PASS_REGULAR_EXPRESSION "general-listener-rank-local-mpi-text-default-ok"
+      SKIP_RETURN_CODE 77)
+
   add_test(NAME test_detach_controller_general_listener_uint64_saturation
     COMMAND test_detach_listener_shutdown general-listener-uint64-saturation)
   set_tests_properties(test_detach_controller_general_listener_uint64_saturation

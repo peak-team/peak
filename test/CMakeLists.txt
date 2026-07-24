@@ -1499,18 +1499,6 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "report_format_check_ok"
                 TIMEOUT 35)
     endif()
-    add_test(NAME test_rank_local_mpi_env_suppresses_text COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
-    set_tests_properties(test_rank_local_mpi_env_suppresses_text
-        PROPERTIES
-            ENVIRONMENT "PMI_SIZE=4;PEAK_TARGET=my_sleep_func;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_rank_local_mpi_env_statslog;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-            FAIL_REGULAR_EXPRESSION "PEAK Library|function statistics"
-    )
-    add_test(NAME test_rank_local_mpi_env_text_override COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
-    set_tests_properties(test_rank_local_mpi_env_text_override
-        PROPERTIES
-            ENVIRONMENT "PMI_SIZE=4;PEAK_TARGET=my_sleep_func;PEAK_TEXT_OUTPUT=1;PEAK_STATSLOG_PATH=${CMAKE_CURRENT_BINARY_DIR}/peak_rank_local_mpi_env_override_statslog;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-            PASS_REGULAR_EXPRESSION "PEAK Library"
-    )
     add_test(NAME test_verbosity_quiet_keeps_report COMMAND ${PROJECT_BINARY_DIR}/test/sleep/test_sleep)
     set_tests_properties(test_verbosity_quiet_keeps_report
         PROPERTIES
