@@ -655,7 +655,10 @@ def main():
         expected_stats_files = 0
     elif args.mode == "finalize-clean-output-socket-release-fail":
         env["PEAK_OUTPUT_AGGREGATION"] = "socket"
-        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "500"
+        # This mode targets the post-publication release fault. Give MPI
+        # launchers enough time to bring both ranks into the gather so startup
+        # skew cannot turn it into a gather-timeout test instead.
+        env["PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS"] = "5000"
         env["PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"] = "1"
         app_args.append("finalize-then-exit0")
         expected = "Socket aggregation release failure requested by test hook"
