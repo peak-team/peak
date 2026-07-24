@@ -213,6 +213,8 @@ main(void)
     ok &= expect_filtered("timeout");
     ok &= expect_filtered("/usr/bin/time");
     ok &= expect_filtered("tee");
+    ok &= expect_filtered("ln");
+    ok &= expect_filtered("/usr/bin/ln");
     ok &= expect_filtered("/bin/stty");
     ok &= expect_filtered("tty");
     ok &= expect_filtered("tput");
