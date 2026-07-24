@@ -6268,11 +6268,17 @@ typedef struct {
 #endif
 
 static PeakReportFormatOptions
-peak_general_listener_report_format_options(int rank_count)
+peak_general_listener_report_format_options(
+    gboolean active_rank_local_mpi_output)
 {
+    long world_size = -1;
+    gboolean multi_rank_mpi_output =
+        active_rank_local_mpi_output &&
+        peak_general_listener_mpi_env_rank_size(NULL, &world_size) &&
+        world_size > 1;
     const PeakReportFormatOptions options = {
         .print_text = peak_general_listener_should_print_text(
-            rank_count <= 1 && peak_general_listener_mpi_env_size() > 1),
+            multi_rank_mpi_output),
         .truncate_names = peak_truncate_function_name,
     };
 
@@ -6296,7 +6302,7 @@ peak_general_listener_write_report(PeakReportSnapshot* snapshot,
         peak_report_snapshot_prepare_for_render(snapshot);
     }
     options = peak_general_listener_report_format_options(
-        snapshot->rank_count);
+        rank_local && host_disambiguate_rank_local);
     if (rank_local) {
         csv_succeeded = host_disambiguate_rank_local ?
             peak_report_formatter_write_rank_local_csv_host_disambiguated(
@@ -6402,7 +6408,7 @@ peak_general_listener_run_socket_report(
     PeakReportMarkerSwap marker_swap =
         peak_general_listener_begin_report_marker_swap(aggregate);
     PeakReportFormatOptions options =
-        peak_general_listener_report_format_options(aggregate->rank_count);
+        peak_general_listener_report_format_options(FALSE);
 
     if (!peak_report_formatter_write_csv(aggregate)) {
         peak_socket_report_transport_abort(session);
@@ -6583,7 +6589,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
 #else
         (void)aggregation_mode;
         write_succeeded = peak_general_listener_write_report(
-            local_snapshot, TRUE, TRUE, FALSE);
+            local_snapshot, TRUE, TRUE, active_mpi_job);
 #endif
     }
 

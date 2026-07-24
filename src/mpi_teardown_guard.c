@@ -167,6 +167,23 @@ peak_mpi_teardown_finalize_timeout_ms(void)
                : timeout_ms;
 }
 
+static bool
+peak_mpi_teardown_launcher_rank_is_root(void)
+{
+    long rank = -1;
+
+    return peak_general_listener_mpi_env_rank_size(&rank, NULL) &&
+           rank == 0;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+bool
+peak_mpi_teardown_test_launcher_rank_is_root(void)
+{
+    return peak_mpi_teardown_launcher_rank_is_root();
+}
+#endif
+
 static unsigned int
 peak_mpi_teardown_report_release_timeout_ms(
     unsigned int minimum_timeout_ms)
@@ -179,7 +196,7 @@ peak_mpi_teardown_report_release_timeout_ms(
         timeout_ms = minimum_timeout_ms;
     }
     if (timeout_ms != budget.mpi_report_release_timeout_ms &&
-        peak_general_listener_mpi_env_rank() == 0) {
+        peak_mpi_teardown_launcher_rank_is_root()) {
         peak_log_info("[peak] Raised MPI report-release timeout from %u to %u ms to satisfy the caller's publication-path minimum\n",
                       budget.mpi_report_release_timeout_ms,
                       timeout_ms);

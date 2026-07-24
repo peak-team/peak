@@ -31,6 +31,78 @@ static int fake_observed_send_values[3];
 static unsigned int fake_observed_timeout_ms;
 
 static void
+clear_launcher_environment(void)
+{
+    static const char* const names[] = {
+        "PMI_RANK",
+        "PMI_SIZE",
+        "PMIX_RANK",
+        "PMIX_SIZE",
+        "OMPI_COMM_WORLD_RANK",
+        "OMPI_COMM_WORLD_SIZE",
+        "MV2_COMM_WORLD_RANK",
+        "MV2_COMM_WORLD_SIZE",
+        "I_MPI_RANK",
+        "I_MPI_SIZE",
+        "SLURM_PROCID",
+        "SLURM_NTASKS",
+    };
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        (void)unsetenv(names[i]);
+    }
+}
+
+static int
+run_launcher_root_selector_cases(void)
+{
+    clear_launcher_environment();
+    if (peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+
+    (void)setenv("I_MPI_RANK", "0", 1);
+    (void)setenv("I_MPI_SIZE", "4096", 1);
+    if (!peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+    (void)setenv("I_MPI_RANK", "17", 1);
+    (void)setenv("SLURM_PROCID", "0", 1);
+    (void)setenv("SLURM_NTASKS", "1", 1);
+    if (peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+
+    clear_launcher_environment();
+    (void)setenv("MV2_COMM_WORLD_RANK", "0", 1);
+    (void)setenv("MV2_COMM_WORLD_SIZE", "224", 1);
+    if (!peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+
+    clear_launcher_environment();
+    (void)setenv("SLURM_PROCID", "0", 1);
+    if (peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+    (void)setenv("SLURM_NTASKS", "4", 1);
+    if (!peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+
+    (void)setenv("PMI_RANK", "0", 1);
+    (void)setenv("PMI_SIZE", "4", 1);
+    (void)setenv("I_MPI_RANK", "1", 1);
+    (void)setenv("I_MPI_SIZE", "4", 1);
+    if (peak_mpi_teardown_test_launcher_rank_is_root()) {
+        return 1;
+    }
+
+    clear_launcher_environment();
+    return 0;
+}
+
+static void
 fake_reset(TestRequestMode mode)
 {
     fake_mode = mode;
@@ -438,6 +510,7 @@ main(void)
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "3", 1);
     (void)setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "5", 1);
+    failures += run_launcher_root_selector_cases();
     failures += run_success_case(TEST_REQUEST_COMPLETE_ALL, true);
     failures += run_success_case(TEST_REQUEST_COMPLETE_NOT_ALL, false);
     failures += run_report_release_success_case(

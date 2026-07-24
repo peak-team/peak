@@ -151,6 +151,9 @@ size_t peak_mpi_teardown_quarantined_request_count(void);
 bool peak_mpi_teardown_test_quarantine_owns(const void* local_requested,
                                             const void* all_requested,
                                             const void* request);
+
+/** Test-only strict launcher-metadata root selector used for info logging. */
+bool peak_mpi_teardown_test_launcher_rank_is_root(void);
 #endif
 
 #ifdef __cplusplus

@@ -388,55 +388,6 @@ check_local_rank_precedence(void)
 }
 
 static int
-check_world_rank_precedence(void)
-{
-    char int_overflow[64];
-
-    if (peak_general_listener_mpi_env_size() != -1 ||
-        peak_general_listener_mpi_env_rank() != -1) {
-        return 1;
-    }
-    setenv("PMI_SIZE", "2junk", 1);
-    setenv("PMIX_SIZE", "8", 1);
-    setenv("PMI_RANK", "1junk", 1);
-    setenv("PMIX_RANK", "2", 1);
-    if (peak_general_listener_mpi_env_size() != 8 ||
-        peak_general_listener_mpi_env_rank() != 2) {
-        return 1;
-    }
-
-    setenv("PMI_SIZE", "999999999999999999999999999999999", 1);
-    setenv("PMIX_SIZE", "9", 1);
-    setenv("PMI_RANK", "1 ", 1);
-    setenv("PMIX_RANK", "3", 1);
-    if (peak_general_listener_mpi_env_size() != 9 ||
-        peak_general_listener_mpi_env_rank() != 3) {
-        return 1;
-    }
-
-#if LONG_MAX > INT_MAX
-    if (snprintf(int_overflow,
-                 sizeof(int_overflow),
-                 "%ld",
-                 (long)INT_MAX + 1L) >= (int)sizeof(int_overflow)) {
-        return 1;
-    }
-    setenv("PMI_SIZE", int_overflow, 1);
-    setenv("PMIX_SIZE", "10", 1);
-    setenv("PMI_RANK", int_overflow, 1);
-    setenv("PMIX_RANK", "4", 1);
-    if (peak_general_listener_mpi_env_size() != 10 ||
-        peak_general_listener_mpi_env_rank() != 4) {
-        return 1;
-    }
-#else
-    (void)int_overflow;
-#endif
-
-    return 0;
-}
-
-static int
 expect_world_rank_size(long expected_rank, long expected_size)
 {
     long rank = 99;
@@ -459,6 +410,7 @@ expect_world_rank_size_failure(void)
 static int
 check_world_rank_size_pairs(void)
 {
+    char int_overflow[64];
     static const struct {
         const char* rank_name;
         const char* size_name;
@@ -570,6 +522,43 @@ check_world_rank_size_pairs(void)
     }
 
     clear_test_environment();
+    setenv("PMI_RANK", "1 ", 1);
+    setenv("PMI_SIZE", "8", 1);
+    setenv("PMIX_RANK", "2", 1);
+    setenv("PMIX_SIZE", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+    clear_test_environment();
+    setenv("PMI_RANK", "999999999999999999999999999999999", 1);
+    setenv("PMI_SIZE", "8", 1);
+    setenv("PMIX_RANK", "2", 1);
+    setenv("PMIX_SIZE", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+
+#if LONG_MAX > INT_MAX
+    if (snprintf(int_overflow,
+                 sizeof(int_overflow),
+                 "%ld",
+                 (long)INT_MAX + 1L) >= (int)sizeof(int_overflow)) {
+        return 1;
+    }
+    clear_test_environment();
+    setenv("PMI_RANK", "0", 1);
+    setenv("PMI_SIZE", int_overflow, 1);
+    setenv("PMIX_RANK", "2", 1);
+    setenv("PMIX_SIZE", "8", 1);
+    if (expect_world_rank_size_failure()) {
+        return 1;
+    }
+#else
+    (void)int_overflow;
+#endif
+
+    clear_test_environment();
     setenv("PMI_RANK", "2", 1);
     setenv("PMI_SIZE", "8", 1);
     setenv("OMPI_COMM_WORLD_RANK", "2", 1);
@@ -628,12 +617,6 @@ main(void)
 
     clear_test_environment();
     if (check_local_rank_precedence()) {
-        fputs("runtime_config_test_failed\n", stderr);
-        return 1;
-    }
-
-    clear_test_environment();
-    if (check_world_rank_precedence()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;
     }

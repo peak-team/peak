@@ -82,22 +82,15 @@ bool peak_general_listener_env_value_truthy(const char* value);
 /** Returns whether failed socket aggregation may fall back to local output. */
 bool peak_general_listener_socket_reduce_fallback_enabled(void);
 
-/** Returns the first valid launcher-provided MPI world size, or -1. */
-long peak_general_listener_mpi_env_size(void);
-
-/** Returns the first valid launcher-provided MPI rank, or -1. */
-long peak_general_listener_mpi_env_rank(void);
-
 /**
  * Resolves a consistent launcher-provided world rank/size pair.
  *
- * Unlike the legacy independent accessors above, this function never combines
- * values from different launcher namespaces. Complete MPI-specific namespaces
- * must agree. A Slurm pair is used only when no complete MPI-specific pair is
- * available because launchers such as ibrun may propagate batch-step Slurm
- * metadata unchanged to every MPI process. Incomplete namespaces are ignored;
- * malformed complete pairs in the selected tier fail closed, as do
- * contradictory complete MPI-specific pairs.
+ * This function never combines values from different launcher namespaces.
+ * Complete MPI-specific namespaces must agree. A Slurm pair is used only when
+ * no complete MPI-specific pair is available because launchers such as ibrun
+ * may propagate batch-step Slurm metadata unchanged to every MPI process.
+ * Incomplete namespaces are ignored; malformed complete pairs in the selected
+ * tier fail closed, as do contradictory complete MPI-specific pairs.
  */
 bool peak_general_listener_mpi_env_rank_size(long* rank_out,
                                              long* size_out);
