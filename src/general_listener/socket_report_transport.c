@@ -41,6 +41,8 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_FAIL_ONCE"
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_CHUNK_BYTES_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_CHUNK_BYTES"
+#define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_CHUNK_DELAY_MS_ENV \
+    "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_CHUNK_DELAY_MS"
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_MS_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_MS"
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK_ENV \
@@ -59,6 +61,8 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_DROP_RANK"
 #define PEAK_TEST_OUTPUT_AGGREGATION_RECEIPT_FAIL_ONCE_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_RECEIPT_FAIL_ONCE"
+#define PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL_ENV \
+    "PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL"
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
 #define PEAK_SOCKET_REDUCE_VERSION 11U
@@ -76,7 +80,6 @@
 #define PEAK_SOCKET_REDUCE_CONNECT_BACKOFF_MIN_MS 10
 #define PEAK_SOCKET_REDUCE_CONNECT_BACKOFF_MAX_MS 250
 #define PEAK_SOCKET_REDUCE_PEER_IO_TIMEOUT_MS 5000
-#define PEAK_SOCKET_REDUCE_GATHER_ACTIVE_MAX 128U
 #define PEAK_SOCKET_REDUCE_FD_RESERVE 32U
 #define PEAK_SOCKET_REDUCE_GATHER_SALT 0x676174686572ULL
 #define PEAK_SOCKET_REDUCE_RELEASE_SALT 0x72656c65617365ULL
@@ -154,7 +157,7 @@ _Static_assert(sizeof(unsigned long) == sizeof(uint64_t),
 struct PeakSocketReportSession {
     bool* release_targets;
     int size;
-    int release_port;
+    int release_listener;
     int phase_timeout_ms;
     uint64_t hook_count;
     uint64_t session_token;
@@ -503,6 +506,43 @@ peak_socket_reduce_capped_deadline_us(int64_t outer_deadline_us,
                : outer_deadline_us;
 }
 
+static int64_t
+peak_socket_reduce_refresh_progress_deadline_at_us(
+    int64_t now_us,
+    int64_t hard_deadline_us,
+    int progress_timeout_ms)
+{
+    int64_t progress_deadline_us =
+        now_us + (int64_t)progress_timeout_ms * 1000;
+
+    return progress_deadline_us < hard_deadline_us
+               ? progress_deadline_us
+               : hard_deadline_us;
+}
+
+static int64_t
+peak_socket_reduce_refresh_progress_deadline_us(
+    int64_t hard_deadline_us,
+    int progress_timeout_ms)
+{
+    return peak_socket_reduce_refresh_progress_deadline_at_us(
+        peak_socket_reduce_monotonic_us(),
+        hard_deadline_us,
+        progress_timeout_ms);
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+int64_t
+peak_socket_report_test_progress_deadline_us(
+    int64_t now_us,
+    int64_t hard_deadline_us,
+    int progress_timeout_ms)
+{
+    return peak_socket_reduce_refresh_progress_deadline_at_us(
+        now_us, hard_deadline_us, progress_timeout_ms);
+}
+#endif
+
 static uint64_t
 peak_socket_reduce_jitter_value(uint32_t rank,
                                 uint64_t session_token,
@@ -633,6 +673,10 @@ peak_socket_reduce_send_gather_all(int fd,
     size_t chunk_limit =
         peak_socket_reduce_test_gather_chunk_bytes();
 #ifdef PEAK_ENABLE_TEST_HOOKS
+    int chunk_delay_ms =
+        peak_socket_reduce_parse_positive_int_env(
+            PEAK_TEST_OUTPUT_AGGREGATION_GATHER_CHUNK_DELAY_MS_ENV,
+            0);
     size_t drop_after = 0;
     size_t drop_rank = SIZE_MAX;
     bool drop_enabled = peak_socket_reduce_parse_test_size_env(
@@ -682,6 +726,12 @@ peak_socket_reduce_send_gather_all(int fd,
         cursor += written;
         size -= (size_t)written;
         *total_written += (size_t)written;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (size > 0 && chunk_delay_ms > 0) {
+            peak_socket_reduce_sleep_before_deadline(
+                chunk_delay_ms, deadline_us);
+        }
+#endif
     }
 
     return size == 0;
@@ -994,12 +1044,10 @@ peak_socket_reduce_build_records(const PeakReportSnapshot* snapshot,
 }
 
 static int
-peak_socket_reduce_create_listener(int port, int expected_connections)
+peak_socket_reduce_bind_listener(int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
-    int backlog = expected_connections > 0 ? expected_connections : 1;
-    int flags;
     struct sockaddr_in address;
 
     if (fd < 0) {
@@ -1012,17 +1060,47 @@ peak_socket_reduce_create_listener(int port, int expected_connections)
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons((uint16_t)port);
 
-    if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0 ||
-        listen(fd, backlog) != 0 ||
-        (flags = fcntl(fd, F_GETFL, 0)) < 0 ||
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+    if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
         int saved_errno = errno;
 
         close(fd);
         errno = saved_errno;
         return -1;
     }
+    return fd;
+}
 
+static bool
+peak_socket_reduce_activate_listener(int fd, int expected_connections)
+{
+    int backlog = expected_connections > 0 ? expected_connections : 1;
+    int flags;
+
+    if (fd < 0 ||
+        listen(fd, backlog) != 0 ||
+        (flags = fcntl(fd, F_GETFL, 0)) < 0 ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static int
+peak_socket_reduce_create_listener(int port, int expected_connections)
+{
+    int fd = peak_socket_reduce_bind_listener(port);
+
+    if (fd < 0) {
+        return -1;
+    }
+    if (!peak_socket_reduce_activate_listener(fd,
+                                              expected_connections)) {
+        int saved_errno = errno;
+
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
     return fd;
 }
 
@@ -1391,7 +1469,7 @@ peak_socket_reduce_wait_for_release(const struct addrinfo* addresses,
 }
 
 static bool
-peak_socket_reduce_release_peers(int port,
+peak_socket_reduce_release_peers(int listener,
                                  bool* release_targets,
                                  int size,
                                  uint64_t hook_count,
@@ -1399,7 +1477,6 @@ peak_socket_reduce_release_peers(int port,
                                  int timeout_ms,
                                  uint8_t ack)
 {
-    int listener;
     int64_t deadline_us;
     unsigned int peer_count = 0;
     unsigned int released = 0;
@@ -1411,7 +1488,10 @@ peak_socket_reduce_release_peers(int port,
     bool dropped_release_response = false;
 #endif
 
-    if (release_targets == NULL || size <= 1) {
+    if (listener < 0 || release_targets == NULL || size <= 1) {
+        if (listener >= 0) {
+            close(listener);
+        }
         return true;
     }
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -1420,6 +1500,7 @@ peak_socket_reduce_release_peers(int port,
         peak_general_listener_env_value_truthy(
             getenv(PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV))) {
         peak_log_warn("[peak] Socket aggregation release failure requested by test hook; peer ranks may fall back to local output\n");
+        close(listener);
         return false;
     }
 #endif
@@ -1430,15 +1511,16 @@ peak_socket_reduce_release_peers(int port,
         }
     }
     if (peer_count == 0) {
+        close(listener);
         return true;
     }
 
-    listener = peak_socket_reduce_create_listener(port, (int)peer_count);
-    if (listener < 0) {
-        peak_log_warn("[peak] Socket aggregation could not listen on release port %d for %u peers: %s; peer ranks may exit after timeout\n",
-                      port,
+    if (!peak_socket_reduce_activate_listener(listener,
+                                              (int)peer_count)) {
+        peak_log_warn("[peak] Socket aggregation could not activate the reserved release listener for %u peers: %s; peer ranks may exit after timeout\n",
                       peer_count,
                       strerror(errno));
+        close(listener);
         return false;
     }
 
@@ -1706,11 +1788,18 @@ peak_socket_snapshot_is_complete(const PeakReportSnapshot* snapshot)
 static PeakSocketReportSession*
 peak_socket_report_session_create(bool* release_targets,
                                   int size,
-                                  int release_port,
+                                  int release_listener,
                                   int phase_timeout_ms,
                                   uint64_t hook_count,
                                   uint64_t session_token)
 {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_general_listener_env_value_truthy(
+            getenv(
+                PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL_ENV))) {
+        return NULL;
+    }
+#endif
     PeakSocketReportSession* session = malloc(sizeof(*session));
 
     if (session == NULL) {
@@ -1718,7 +1807,7 @@ peak_socket_report_session_create(bool* release_targets,
     }
     session->release_targets = release_targets;
     session->size = size;
-    session->release_port = release_port;
+    session->release_listener = release_listener;
     session->phase_timeout_ms = phase_timeout_ms;
     session->hook_count = hook_count;
     session->session_token = session_token;
@@ -1730,6 +1819,9 @@ peak_socket_report_session_destroy(PeakSocketReportSession* session)
 {
     if (session == NULL) {
         return;
+    }
+    if (session->release_listener >= 0) {
+        close(session->release_listener);
     }
     free(session->release_targets);
     free(session);
@@ -2163,9 +2255,9 @@ peak_socket_reduce_gather_active_limit(size_t peer_count)
 {
     struct rlimit descriptor_limit;
     size_t active_limit =
-        peer_count < PEAK_SOCKET_REDUCE_GATHER_ACTIVE_MAX
+        peer_count < PEAK_SOCKET_GATHER_ACTIVE_MAX
             ? peer_count
-            : PEAK_SOCKET_REDUCE_GATHER_ACTIVE_MAX;
+            : PEAK_SOCKET_GATHER_ACTIVE_MAX;
 
     if (getrlimit(RLIMIT_NOFILE, &descriptor_limit) == 0 &&
         descriptor_limit.rlim_cur != RLIM_INFINITY) {
@@ -2190,7 +2282,8 @@ static bool
 peak_socket_reduce_root_gather(
     int listener,
     int size,
-    int64_t deadline_us,
+    int progress_timeout_ms,
+    int64_t hard_deadline_us,
     PeakSocketGatherAggregate* aggregate,
     unsigned int* received_out)
 {
@@ -2202,6 +2295,7 @@ peak_socket_reduce_root_gather(
     size_t accepted = 0;
     size_t active = 0;
     unsigned int completed = 0;
+    int64_t progress_deadline_us;
     bool ok = true;
 
     if (received_out != NULL) {
@@ -2231,9 +2325,12 @@ peak_socket_reduce_root_gather(
     for (size_t i = 0; i < active_limit; i++) {
         connections[i].fd = -1;
     }
+    progress_deadline_us =
+        peak_socket_reduce_refresh_progress_deadline_us(
+            hard_deadline_us, progress_timeout_ms);
 
     while (completed < peer_count &&
-           peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+           peak_socket_reduce_remaining_ms(progress_deadline_us) > 0) {
         int poll_result;
 
         descriptors[0].fd =
@@ -2254,7 +2351,8 @@ peak_socket_reduce_root_gather(
 
         poll_result = poll(descriptors,
                            (nfds_t)poll_count,
-                           peak_socket_reduce_remaining_ms(deadline_us));
+                           peak_socket_reduce_remaining_ms(
+                               progress_deadline_us));
         if (poll_result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -2273,7 +2371,8 @@ peak_socket_reduce_root_gather(
         if ((descriptors[0].revents & POLLIN) != 0) {
             while (accepted < peer_count &&
                    active < active_limit &&
-                   peak_socket_reduce_remaining_ms(deadline_us) > 0) {
+                   peak_socket_reduce_remaining_ms(
+                       progress_deadline_us) > 0) {
                 size_t slot = active_limit;
                 int fd = accept(listener, NULL, NULL);
 
@@ -2326,6 +2425,11 @@ peak_socket_reduce_root_gather(
         for (size_t i = 0; i < active_limit && ok; i++) {
             PeakSocketGatherConnection* connection =
                 &connections[i];
+            PeakSocketGatherPhase phase_before =
+                connection->phase;
+            size_t record_index_before =
+                connection->record_index;
+            unsigned int completed_before = completed;
             short revents = descriptors[i + 1].revents;
             short expected =
                 connection->phase ==
@@ -2342,7 +2446,9 @@ peak_socket_reduce_root_gather(
                     bool complete = false;
 
                     ok = peak_socket_gather_write_ready(
-                        connection, deadline_us, &complete);
+                        connection,
+                        progress_deadline_us,
+                        &complete);
                     if (ok && complete) {
                         uint32_t rank = connection->header.rank;
 
@@ -2380,7 +2486,7 @@ peak_socket_reduce_root_gather(
                     ok = peak_socket_gather_read_ready(
                         connection,
                         aggregate,
-                        deadline_us,
+                        progress_deadline_us,
                         &confirmed);
                     if (ok && confirmed) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -2397,6 +2503,14 @@ peak_socket_reduce_root_gather(
                             connection);
                     }
                 }
+            }
+            if (ok &&
+                (connection->phase != phase_before ||
+                 connection->record_index > record_index_before ||
+                 completed > completed_before)) {
+                progress_deadline_us =
+                    peak_socket_reduce_refresh_progress_deadline_us(
+                        hard_deadline_us, progress_timeout_ms);
             }
             if (ok && connection->fd >= 0 &&
                 (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
@@ -2419,6 +2533,7 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
                               int rank,
                               int port,
                               int release_port,
+                              int gather_hard_timeout_ms,
                               int release_wait_timeout_ms,
                               int64_t deadline_us,
                               const PeakSocketReduceHeader* header,
@@ -2504,6 +2619,13 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
         return PEAK_SOCKET_REPORT_FAILED;
     }
 
+    /*
+     * Resolution, jitter, and connection retries remain bounded by the
+     * attempt deadline. Once connected to the root listener, give the wire
+     * protocol the same complete hard budget used by the root gather.
+     */
+    deadline_us =
+        peak_socket_reduce_deadline_us(gather_hard_timeout_ms);
     sent = peak_socket_reduce_send_gather_all(fd,
                                               header,
                                               sizeof(*header),
@@ -2601,6 +2723,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     int port;
     int release_port;
     int timeout_ms;
+    int gather_hard_timeout_ms;
     int release_wait_timeout_ms;
     int64_t deadline_us;
     uint64_t session_token;
@@ -2631,11 +2754,6 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
 
     port = peak_socket_reduce_port();
     release_port = peak_socket_reduce_release_port(port);
-    timeout_budget = peak_general_listener_report_timeout_budget();
-    timeout_ms = (int)timeout_budget.socket_phase_timeout_ms;
-    release_wait_timeout_ms =
-        (int)timeout_budget.socket_release_timeout_ms;
-    deadline_us = peak_socket_reduce_deadline_us(timeout_ms);
     session_token = peak_socket_reduce_session_token();
 
     if (!peak_socket_reduce_rank_size(&rank, &size, rank_source)) {
@@ -2651,9 +2769,26 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                       size);
         return PEAK_SOCKET_REPORT_FAILED;
     }
+    timeout_budget =
+        peak_general_listener_report_timeout_budget_for_rank_count(
+            (unsigned int)size);
+    timeout_ms = (int)timeout_budget.socket_phase_timeout_ms;
+    gather_hard_timeout_ms =
+        (int)timeout_budget.socket_gather_hard_timeout_ms;
+    release_wait_timeout_ms =
+        (int)timeout_budget.socket_release_timeout_ms;
+    deadline_us =
+        peak_socket_reduce_deadline_us(gather_hard_timeout_ms);
     if (rank == 0 && timeout_budget.socket_release_was_raised) {
-        peak_log_info("[peak] Raised socket peer release timeout to %u ms to preserve the three-phase gather/publication/release budget\n",
+        peak_log_info("[peak] Raised socket peer release timeout to %u ms to preserve the scaled gather/publication/release budget\n",
                       timeout_budget.socket_release_timeout_ms);
+    }
+    if (rank == 0 &&
+        timeout_budget.socket_gather_timeout_was_scaled) {
+        peak_log_info("[peak] Scaled socket gather hard timeout to %u ms for %d MPI ranks; the no-progress timeout remains %u ms\n",
+                      timeout_budget.socket_gather_hard_timeout_ms,
+                      size,
+                      timeout_budget.socket_phase_timeout_ms);
     }
 
     if (peak_report_snapshot_has_duplicate_names(local)) {
@@ -2696,6 +2831,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                                              rank,
                                              port,
                                              release_port,
+                                             gather_hard_timeout_ms,
                                              release_wait_timeout_ms,
                                              deadline_us,
                                              &header,
@@ -2703,6 +2839,16 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                                              record_bytes);
     }
 
+    int release_listener =
+        peak_socket_reduce_bind_listener(release_port);
+    if (release_listener < 0) {
+        peak_log_warn("[peak] Socket aggregation could not reserve release port %d before gathering %d peers: %s; skipping aggregate output\n",
+                      release_port,
+                      size - 1,
+                      strerror(errno));
+        free(local_records);
+        return PEAK_SOCKET_REPORT_FAILED;
+    }
     int listener =
         peak_socket_reduce_create_listener(port, size - 1);
     if (listener < 0) {
@@ -2710,6 +2856,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                       port,
                       size - 1,
                       strerror(errno));
+        close(release_listener);
         free(local_records);
         return PEAK_SOCKET_REPORT_FAILED;
     }
@@ -2741,6 +2888,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                                        &local_report_tuple,
                                        0)) {
         close(listener);
+        close(release_listener);
         free(local_records);
         free(release_targets);
         free(claimed_ranks);
@@ -2767,6 +2915,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     gather_aggregate.accounting_valid = &socket_accounting_valid;
     failed = !peak_socket_reduce_root_gather(listener,
                                              size,
+                                             timeout_ms,
                                              deadline_us,
                                              &gather_aggregate,
                                              &received);
@@ -2780,7 +2929,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                       received,
                       size - 1);
         (void)peak_socket_reduce_release_peers(
-            release_port,
+            release_listener,
             release_targets,
             size,
             (uint64_t)local->hook_count,
@@ -2797,7 +2946,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
 
     if (aggregate == NULL) {
         (void)peak_socket_reduce_release_peers(
-            release_port,
+            release_listener,
             release_targets,
             size,
             (uint64_t)local->hook_count,
@@ -2823,14 +2972,14 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     session = peak_socket_report_session_create(
         release_targets,
         size,
-        release_port,
+        release_listener,
         timeout_ms,
         (uint64_t)local->hook_count,
         session_token);
     if (session == NULL) {
         peak_report_snapshot_destroy(aggregate);
         (void)peak_socket_reduce_release_peers(
-            release_port,
+            release_listener,
             release_targets,
             size,
             (uint64_t)local->hook_count,
@@ -2854,8 +3003,11 @@ peak_socket_report_transport_commit(PeakSocketReportSession* session)
     if (session == NULL) {
         return false;
     }
+    int release_listener = session->release_listener;
+
+    session->release_listener = -1;
     committed = peak_socket_reduce_release_peers(
-        session->release_port,
+        release_listener,
         session->release_targets,
         session->size,
         session->hook_count,
@@ -2872,8 +3024,11 @@ peak_socket_report_transport_abort(PeakSocketReportSession* session)
     if (session == NULL) {
         return;
     }
+    int release_listener = session->release_listener;
+
+    session->release_listener = -1;
     (void)peak_socket_reduce_release_peers(
-        session->release_port,
+        release_listener,
         session->release_targets,
         session->size,
         session->hook_count,

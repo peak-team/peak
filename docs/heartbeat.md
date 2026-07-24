@@ -533,8 +533,8 @@ The defaults below describe the current implementation.
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | unset | Legacy alias used when `PEAK_OUTPUT_AGGREGATION` is unset. |
 | `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | `10000` | Timeout for MPI aggregation's proof-first all-rank finalize participation check. |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | `5000` | Timeout for MPI output reducer collectives. |
-| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | `60000` | Timeout for each socket gather or root-release phase. |
-| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | `3 × socket phase timeout` | Peer-side end-to-end budget spanning gather, report publication, and confirmed release; values below three phase timeouts are raised. |
+| `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | `60000` | Socket no-progress timeout and root-release phase timeout. The absolute gather cap adds `5000` ms per 128-peer wave, up to `300000` ms adaptive margin; explicit values are never shortened. |
+| `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | `gather hard cap + 2 × socket phase timeout` | Peer-side end-to-end budget spanning gather, report publication, and confirmed release; smaller values are raised. |
 | `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | `180000` | Baseline post-publication gate timeout. A path that attempted socket publication automatically raises the effective timeout to at least the peer release budget plus two socket-phase margins; MPI and rank-local paths retain this baseline. |
 | `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`, `MV2_COMM_WORLD_LOCAL_SIZE`, `PMI_LOCAL_SIZE` | `1` fallback | Local rank count for reattach admission and diagnostic risk reporting. |
 

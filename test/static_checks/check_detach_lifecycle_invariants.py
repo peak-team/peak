@@ -859,16 +859,34 @@ def check_final_report_snapshot_order(repo_root):
                 set_socket_overhead and
             "peak_socket_add_uint64_saturated" in socket_prepare_receipt,
             "socket reducer must carry complete owner tuples and accounting health")
-    require("PEAK_SOCKET_REDUCE_GATHER_ACTIVE_MAX" in socket_transport and
+    require("PEAK_SOCKET_GATHER_ACTIVE_MAX" in socket_transport and
             "peak_socket_reduce_gather_active_limit" in
                 socket_root_gather and
             "active < active_limit" in socket_root_gather and
             "poll(descriptors" in socket_root_gather and
-            "peak_socket_reduce_remaining_ms(deadline_us)" in
+            "progress_timeout_ms" in socket_root_gather and
+            "hard_deadline_us" in socket_root_gather and
+            "peak_socket_reduce_refresh_progress_deadline_us" in
                 socket_root_gather and
+            "peak_socket_reduce_remaining_ms(progress_deadline_us)" in
+                socket_root_gather and
+            "connection->record_index > record_index_before" in
+                socket_root_gather and
+            "completed > completed_before" in socket_root_gather and
             "PEAK_SOCKET_GATHER_READING_HEADER" in socket_read_ready and
             "PEAK_SOCKET_GATHER_READING_PAYLOAD" in socket_read_ready,
-            "socket gather must use a bounded nonblocking poll window under one deadline")
+            "socket gather must combine bounded no-progress and absolute deadlines")
+    release_bind = socket_result.find(
+        "peak_socket_reduce_bind_listener(release_port)"
+    )
+    gather_listen = socket_result.find(
+        "peak_socket_reduce_create_listener(port, size - 1)"
+    )
+    require(release_bind != -1 and gather_listen != -1 and
+            release_bind < gather_listen and
+            "int release_listener;" in socket_transport and
+            "session->release_listener = -1" in socket_transport,
+            "socket root must reserve one release fd before gather and consume it exactly once")
     require("PEAK_SOCKET_REDUCE_GATHER_RECEIPT" in
                 socket_prepare_receipt and
             "PEAK_SOCKET_REDUCE_GATHER_REGISTERED" in
