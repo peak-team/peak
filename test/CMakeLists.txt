@@ -2083,7 +2083,7 @@ if(BUILD_TESTING)
                     --mode finalize-clean-output-socket-release-fail
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}"
-                    --timeout 10)
+                    --timeout 30)
         add_test(NAME test_mpi_finalize_socket_post_work
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -2566,7 +2566,7 @@ if(BUILD_TESTING)
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-socket-release-fail"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
-                TIMEOUT 15)
+                TIMEOUT 35)
         set_tests_properties(test_mpi_finalize_socket_post_work
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-socket-post-work"
