@@ -1,35 +1,57 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="title desc">
   <title id="title">PEAK — Performance Evaluation and Analysis Kit</title>
-  <desc id="desc">PEAK horizontal logo for light backgrounds, combining a mountain-shaped performance trace with the PEAK wordmark.</desc>
+  <desc id="desc">PEAK horizontal logo for light backgrounds, combining a mountain and performance trace with a custom geometric wordmark.</desc>
   <defs>
-    <linearGradient id="markGradient" x1="20" y1="238" x2="354" y2="14" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#006BD6"/>
-      <stop offset="0.52" stop-color="#009BEF"/>
-      <stop offset="1" stop-color="#00D1F2"/>
+    <linearGradient id="markGradient" x1="42" y1="232" x2="398" y2="34" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0759D6"/>
+      <stop offset="0.5" stop-color="#078DE5"/>
+      <stop offset="1" stop-color="#10CDE9"/>
+    </linearGradient>
+    <linearGradient id="trailGradient" x1="36" y1="0" x2="236" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4B8DE5" stop-opacity="0"/>
+      <stop offset="0.3" stop-color="#4B8DE5" stop-opacity="0.4"/>
+      <stop offset="0.62" stop-color="#167EE1" stop-opacity="0.82"/>
+      <stop offset="1" stop-color="#0872DC"/>
+    </linearGradient>
+    <linearGradient id="wordGradient" x1="0" y1="55" x2="0" y2="215" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#283645"/>
+      <stop offset="0.52" stop-color="#152230"/>
+      <stop offset="1" stop-color="#243241"/>
+    </linearGradient>
+    <linearGradient id="accentGradient" x1="930" y1="160" x2="930" y2="214" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#079BE8"/>
+      <stop offset="1" stop-color="#0759D6"/>
     </linearGradient>
   </defs>
 
-  <g transform="translate(24 47) scale(0.84)" fill="none" stroke="url(#markGradient)" stroke-width="15" stroke-linejoin="miter">
-    <path d="M43 164 L139 63 L166 104 L225 14 L314 136 L331 106 L383 164"/>
-    <path d="M34 180 H208 L226 113 L257 232 L276 180 H411" stroke-linejoin="round"/>
-    <path d="M25 207 H211" stroke-linecap="round"/>
-    <path d="M14 232 H198" stroke-linecap="round"/>
-    <path d="M5 257 H184" stroke-linecap="round"/>
+  <g transform="translate(18 28) scale(0.87)">
+    <path d="M58 169 L151 56 L181 104 L251 8 L340 126 L356 100 L411 169"
+          fill="none" stroke="url(#markGradient)" stroke-width="18" stroke-linejoin="miter"/>
+    <rect x="19" y="186" width="27" height="18" rx="9" fill="#0863D9"/>
+    <rect x="9" y="216" width="27" height="18" rx="9" fill="#0697E1"/>
+    <rect x="0" y="246" width="27" height="18" rx="9" fill="#07A5E5"/>
+    <path d="M55 195 H226" fill="none" stroke="url(#trailGradient)" stroke-width="16"/>
+    <path d="M45 225 H218 L207 241 H45 Z" fill="url(#trailGradient)"/>
+    <path d="M36 255 H197 L186 271 H36 Z" fill="url(#trailGradient)"/>
+    <path d="M217 195 H226 L247 107 L278 263 L301 195 H433"
+          fill="none" stroke="url(#markGradient)" stroke-width="16"
+          stroke-linecap="round" stroke-linejoin="miter"/>
   </g>
 
-  <g fill="none" stroke="#172033" stroke-width="18" stroke-linejoin="round">
-    <path d="M456 207 V76 H558 C593 76 611 93 611 119 C611 145 592 159 558 159 H488"/>
-    <path d="M815 207 L878 76 L941 207"/>
-    <path d="M978 76 V207 M1001 145 L1077 76 M1001 145 L1084 207"/>
+  <g fill="url(#wordGradient)">
+    <path d="M480 55 H590 C637 55 664 80 664 119 C664 158 637 183 590 183 H532 L519 161 H588 C620 161 638 146 638 119 C638 92 620 78 588 78 H507 V215 H480 Z"/>
+    <path d="M695 55 H842 V80 H695 Z"/>
+    <path d="M706 122 H830 L844 137 L830 153 H706 L692 137 Z"/>
+    <path d="M695 190 H842 V215 H695 Z"/>
+    <path fill-rule="evenodd" d="M930 55 L1012 215 H979 L930 113 L881 215 H848 Z M930 101 L886 215 H974 Z"/>
+    <path d="M1048 55 H1075 V215 H1048 Z"/>
+    <path d="M1083 137 L1160 55 H1201 L1113 137 Z"/>
+    <path d="M1083 137 H1113 L1203 215 H1161 Z"/>
   </g>
-  <g fill="#172033">
-    <path d="M640 76 H780 V97 H652 Z"/>
-    <path d="M652 132 H766 L781 145 L766 159 H652 L637 145 Z"/>
-    <path d="M652 194 H780 V215 H640 Z"/>
-  </g>
-  <path d="M878 157 L900 199 H856 Z" fill="#00BDEB"/>
+  <path d="M930 162 L956 215 H904 Z" fill="url(#accentGradient)"/>
 
-  <text x="456" y="263" fill="#566173"
+  <text x="480" y="270" textLength="723" lengthAdjust="spacing"
+        fill="#768396"
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="27" font-weight="600" letter-spacing="0.8">Performance Evaluation and Analysis Kit</text>
+        font-size="20" font-weight="500">Performance Evaluation and Analysis Kit</text>
 </svg>

@@ -1,18 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="420" height="280" viewBox="0 0 420 280" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="460" height="280" viewBox="0 0 460 280" role="img" aria-labelledby="title desc">
   <title id="title">PEAK logo mark for dark backgrounds</title>
-  <desc id="desc">A mountain-shaped performance trace above three parallel measurement paths.</desc>
+  <desc id="desc">A mountain and heartbeat trace above three parallel paths that fade in after distinct leading points.</desc>
   <defs>
-    <linearGradient id="markGradient" x1="20" y1="258" x2="354" y2="14" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#2D8CFF"/>
-      <stop offset="0.52" stop-color="#00BCEB"/>
+    <linearGradient id="markGradient" x1="42" y1="232" x2="398" y2="34" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2C79FF"/>
+      <stop offset="0.5" stop-color="#00A9EE"/>
       <stop offset="1" stop-color="#4DE2F5"/>
     </linearGradient>
+    <linearGradient id="trailGradient" x1="36" y1="0" x2="236" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#69A0FF" stop-opacity="0"/>
+      <stop offset="0.3" stop-color="#69A0FF" stop-opacity="0.42"/>
+      <stop offset="0.62" stop-color="#318BFA" stop-opacity="0.86"/>
+      <stop offset="1" stop-color="#2C79FF"/>
+    </linearGradient>
   </defs>
-  <g transform="translate(2 4)" fill="none" stroke="url(#markGradient)" stroke-width="15" stroke-linejoin="miter">
-    <path d="M43 164 L139 63 L166 104 L225 14 L314 136 L331 106 L383 164"/>
-    <path d="M34 180 H208 L226 113 L257 232 L276 180 H411" stroke-linejoin="round"/>
-    <path d="M25 207 H211" stroke-linecap="round"/>
-    <path d="M14 232 H198" stroke-linecap="round"/>
-    <path d="M5 257 H184" stroke-linecap="round"/>
-  </g>
+  <path d="M58 169 L151 56 L181 104 L251 8 L340 126 L356 100 L411 169"
+        fill="none" stroke="url(#markGradient)" stroke-width="18" stroke-linejoin="miter"/>
+  <rect x="19" y="186" width="27" height="18" rx="9" fill="#2C79FF"/>
+  <rect x="9" y="216" width="27" height="18" rx="9" fill="#159EED"/>
+  <rect x="0" y="246" width="27" height="18" rx="9" fill="#23BFEF"/>
+  <path d="M55 195 H226" fill="none" stroke="url(#trailGradient)" stroke-width="16"/>
+  <path d="M45 225 H218 L207 241 H45 Z" fill="url(#trailGradient)"/>
+  <path d="M36 255 H197 L186 271 H36 Z" fill="url(#trailGradient)"/>
+  <path d="M217 195 H226 L247 107 L278 263 L301 195 H433"
+        fill="none" stroke="url(#markGradient)" stroke-width="16"
+        stroke-linecap="round" stroke-linejoin="miter"/>
 </svg>
