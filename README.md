@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/peak-logo-horizontal-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/assets/peak-logo-horizontal.svg">
-    <img src="docs/assets/peak-logo-horizontal.svg"
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/peak-logo-horizontal-light.svg">
+    <img src="docs/assets/peak-logo-horizontal-light.svg"
          alt="PEAK — Performance Evaluation and Analysis Kit"
          width="720">
   </picture>
