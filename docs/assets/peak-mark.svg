@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 236" role="img" aria-labelledby="title desc">
+<title id="title">PEAK logo mark</title>
+<desc id="desc">A stepped performance profile formed by distributed blocks converging toward a peak.</desc>
+
+<defs>
+  <linearGradient id="peakGradient" x1="32" y1="208" x2="160" y2="28" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#5B5CE2"/>
+    <stop offset="0.55" stop-color="#3478F6"/>
+    <stop offset="1" stop-color="#00C2FF"/>
+  </linearGradient>
+</defs>
+
+<rect x="104" y="28" width="48" height="36" rx="12" fill="url(#peakGradient)"/>
+<rect x="80" y="76" width="42" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="134" y="76" width="42" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="56" y="124" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="106" y="124" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="156" y="124" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="32" y="172" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="82" y="172" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="132" y="172" width="44" height="36" rx="11" fill="url(#peakGradient)"/>
+<rect x="182" y="172" width="42" height="36" rx="11" fill="url(#peakGradient)"/>
+</svg>
