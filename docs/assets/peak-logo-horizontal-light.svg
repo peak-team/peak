@@ -2,12 +2,20 @@
 <title id="title">PEAK — Performance Evaluation and Analysis Kit</title>
 <desc id="desc">PEAK horizontal logo with clean vector contours and a continuous performance trace.</desc>
 <defs><linearGradient id="markGradient" x1="70" y1="310" x2="520" y2="35" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0759D6"/><stop offset="0.52" stop-color="#078DE5"/><stop offset="1" stop-color="#10CDE9"/></linearGradient><linearGradient id="trailGradient" x1="50" y1="0" x2="286" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4B8DE5" stop-opacity="0"/><stop offset="0.22" stop-color="#4B8DE5" stop-opacity="0"/><stop offset="0.52" stop-color="#4B8DE5" stop-opacity="0.52"/><stop offset="0.72" stop-color="#167EE1" stop-opacity="0.88"/><stop offset="1" stop-color="#078DE5"/></linearGradient><linearGradient id="wordGradient" x1="0" y1="90" x2="0" y2="265" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#283645"/><stop offset="0.52" stop-color="#152230"/><stop offset="1" stop-color="#243241"/></linearGradient><linearGradient id="accentGradient" x1="0" y1="180" x2="0" y2="260" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#079BE8"/><stop offset="1" stop-color="#0759D6"/></linearGradient></defs>
-<path d="M441 212 L383 132 L366 153 L278 24 L203 133 L200 131 L177 98 L175 98 L93 211 L93 213 L117 213 L176 133 L202 170 L204 170 L277 62 L365 189 L383 167 L383 170 L387 172 L417 213Z" fill="url(#markGradient)" fill-rule="evenodd"/>
-<path d="M72 233 L73 243 L269 244 L285 191 L319 316 L346 244 L500 244 L505 240 L505 233 L500 229 L337 229 L335 230 L321 268 L286 139 L263 215 L257 229 L74 230Z" fill="url(#trailGradient)" fill-rule="evenodd"/>
-<path d="M40 234 L41 241 L46 245 L59 245 L64 240 L64 233 L60 229 L45 229Z M29 266 L30 272 L37 277 L49 276 L54 270 L54 266 L49 260 L35 260Z M19 297 L20 304 L25 308 L38 308 L42 305 L44 300 L43 296 L38 292 L24 292Z" fill="url(#markGradient)" fill-rule="evenodd"/>
-<path d="M60 264 L62 267 L62 274 L68 275 L245 275 L255 261 L75 261 L61 262Z M51 303 L53 306 L78 307 L224 307 L233 293 L55 293 L52 294Z" fill="url(#trailGradient)" fill-rule="evenodd"/>
-<path d="M558 252 L584 252 L585 136 L667 136 L677 140 L682 145 L685 152 L685 163 L678 174 L665 179 L600 179 L587 201 L670 202 L685 198 L695 192 L707 176 L710 166 L710 148 L702 130 L689 119 L672 113 L558 113Z M740 113 L741 136 L883 136 L883 113Z M1092 251 L1001 113 L909 253 L939 252 L1001 157 L1063 252 L1092 253Z M1122 113 L1122 253 L1147 253 L1147 113Z M1230 113 L1153 183 L1232 253 L1268 253 L1189 183 L1267 114Z M744 181 L744 185 L750 194 L872 194 L879 185 L879 180 L872 171 L751 171Z M740 230 L741 253 L883 253 L882 229Z" fill="url(#wordGradient)" fill-rule="evenodd"/>
-<path d="M974 252 L1028 253 L1002 212 L995 220Z" fill="url(#accentGradient)" fill-rule="evenodd"/>
+<path d="M105 205 176 108 203 145 278 35 366 164 383 143 430 205" fill="none" stroke="url(#markGradient)" stroke-width="17" stroke-linecap="butt" stroke-linejoin="miter"/>
+<path d="M74 237H263L286 154 320 303 341 237H500" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="round" stroke-linejoin="miter"/>
+<path d="M63 269H249M53 301H228" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="round"/>
+<g fill="url(#markGradient)"><circle cx="52" cy="237" r="8"/><circle cx="42" cy="269" r="8"/><circle cx="32" cy="301" r="8"/></g>
+<g fill="url(#wordGradient)">
+<path d="M558 113H661C692 113 711 129 711 153S692 194 662 194H604L618 171H661C678 171 686 164 686 153S678 137 661 137H584V254H558Z"/>
+<rect x="740" y="113" width="144" height="24"/>
+<rect x="744" y="171" width="136" height="24" rx="12"/>
+<rect x="740" y="230" width="144" height="24"/>
+<path d="M909 254 1001 113 1093 254H1063L1001 158 939 254Z"/>
+<rect x="1121" y="113" width="27" height="141"/>
+<path d="M1153 183 1230 113H1269L1189 183 1269 254H1230Z"/>
+</g>
+<path d="M974 254 1002 212 1029 254Z" fill="url(#accentGradient)"/>
 <g aria-label="Performance Evaluation and Analysis Kit"><path d="M283 575V0H184V1434H530Q751 1434 868.0 1331.5Q985 1229 985 1032Q985 832 854.5 703.5Q724 575 489 575ZM283 1343V666H487Q681 666 782.0 758.5Q883 851 883 1020Q883 1343 512 1343Z" fill="#7C8796" transform="translate(555.8438 313) scale(0.01171875 -0.01171875)"/>
 <path d="M186 508Q186 297 283.5 178.0Q381 59 551 59Q723 59 887 186V88Q728 -25 532 -25Q334 -25 212.0 117.0Q90 259 90 518Q90 742 217.5 895.5Q345 1049 549 1049Q740 1049 842.0 915.0Q944 781 944 549V508ZM848 592Q842 769 763.0 867.0Q684 965 545 965Q401 965 306.5 868.5Q212 772 190 592Z" fill="#7C8796" transform="translate(577.1700 313) scale(0.01171875 -0.01171875)"/>
 <path d="M647 928Q601 961 539 961Q418 961 336.0 836.0Q254 711 254 481V0H164V1024H254V797H258Q293 914 369.0 979.0Q445 1044 545 1044Q602 1044 647 1026Z" fill="#7C8796" transform="translate(597.5588 313) scale(0.01171875 -0.01171875)"/>
