@@ -2,14 +2,14 @@
 <title id="title">PEAK — Performance Evaluation and Analysis Kit</title>
 <desc id="desc">PEAK horizontal logo with clean vector contours and a continuous performance trace.</desc>
 <defs><linearGradient id="markGradient" x1="70" y1="310" x2="520" y2="35" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2C79FF"/><stop offset="0.52" stop-color="#00A9EE"/><stop offset="1" stop-color="#4DE2F5"/></linearGradient><linearGradient id="trailGradient" x1="50" y1="0" x2="286" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#69A0FF" stop-opacity="0"/><stop offset="0.22" stop-color="#69A0FF" stop-opacity="0"/><stop offset="0.52" stop-color="#69A0FF" stop-opacity="0.55"/><stop offset="0.72" stop-color="#318BFA" stop-opacity="0.9"/><stop offset="1" stop-color="#00A9EE"/></linearGradient><linearGradient id="wordGradient" x1="0" y1="90" x2="0" y2="265" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#F8FAFC"/><stop offset="0.52" stop-color="#E3E9F0"/><stop offset="1" stop-color="#B9C5D2"/></linearGradient><linearGradient id="accentGradient" x1="0" y1="180" x2="0" y2="260" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4DE2F5"/><stop offset="1" stop-color="#2C79FF"/></linearGradient></defs>
-<path d="M105 205 176 108 203 145 278 35 366 164 383 143 430 205" fill="none" stroke="url(#markGradient)" stroke-width="17" stroke-linecap="butt" stroke-linejoin="miter"/>
-<path d="M74 237H263L286 154 320 303 341 237H500" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="round" stroke-linejoin="miter"/>
-<path d="M63 269H249M53 301H228" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="round"/>
-<g fill="url(#markGradient)"><circle cx="52" cy="237" r="8"/><circle cx="42" cy="269" r="8"/><circle cx="32" cy="301" r="8"/></g>
+<path d="M93 212 176 97 203 134 278 24 366 153 383 132 441 212 383 167 366 189 277 62 203 170 176 133Z" fill="url(#markGradient)"/>
+<path d="M74 237H263L286 154 320 303 341 237H500" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="round" stroke-linejoin="miter" stroke-miterlimit="20"/>
+<path d="M63 261H255L245 276H63ZM53 293H233L224 308H53Z" fill="url(#trailGradient)"/>
+<g fill="url(#markGradient)"><rect x="40" y="229" width="25" height="16" rx="8"/><rect x="29" y="260" width="26" height="17" rx="8.5"/><rect x="19" y="292" width="26" height="17" rx="8.5"/></g>
 <g fill="url(#wordGradient)">
-<path d="M558 113H661C692 113 711 129 711 153S692 194 662 194H604L618 171H661C678 171 686 164 686 153S678 137 661 137H584V254H558Z"/>
+<path d="M558 113H661C692 113 711 129 711 153S692 194 662 194H587L603 171H661C678 171 686 164 686 153S678 137 661 137H584V254H558Z"/>
 <rect x="740" y="113" width="144" height="24"/>
-<rect x="744" y="171" width="136" height="24" rx="12"/>
+<path d="M752 171H872L880 183 872 195H752L744 183Z"/>
 <rect x="740" y="230" width="144" height="24"/>
 <path d="M909 254 1001 113 1093 254H1063L1001 158 939 254Z"/>
 <rect x="1121" y="113" width="27" height="141"/>
