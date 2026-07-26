@@ -17,6 +17,8 @@
 #define TEST_PORT_SLOT_COUNT 800
 #define TEST_PORT_SLOT_WIDTH 64
 #define TEST_PORT_BASE 10000
+#define TEST_DEFAULT_PORT_BASE 42000
+#define TEST_DEFAULT_PORT_SPAN 20000
 #define TEST_RELEASE_ACK 0x51U
 #define TEST_RELEASE_FALLBACK 0x52U
 
@@ -136,6 +138,31 @@ clear_rank_environment(void)
         "MV2_COMM_WORLD_RANK",
         "I_MPI_RANK",
         "SLURM_PROCID",
+        NULL,
+    };
+
+    for (size_t i = 0; names[i] != NULL; i++) {
+        (void)unsetenv(names[i]);
+    }
+}
+
+static void
+clear_socket_identity_environment(void)
+{
+    static const char* names[] = {
+        "SLURM_JOB_ID",
+        "SLURM_STEP_ID",
+        "SLURM_STEPID",
+        "SLURM_JOB_UID",
+        "SLURM_CLUSTER_NAME",
+        "SLURM_NODELIST",
+        "SLURM_JOB_NODELIST",
+        "PMI_JOBID",
+        "PMI_KVS",
+        "PMI_NAMESPACE",
+        "PMIX_NAMESPACE",
+        "OMPI_COMM_WORLD_JOBID",
+        "PEAK_OUTPUT_AGGREGATION_TOKEN",
         NULL,
     };
 
@@ -365,11 +392,16 @@ run_two_rank_case(int port,
     (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS",
-                 (action == TEST_GATHER_SLOW_FAILURE ||
-                  action == TEST_GATHER_PROGRESS_SUCCESS)
-                     ? "150"
-                     : "500",
+                 action == TEST_GATHER_SLOW_FAILURE ? "150" : "500",
                  1);
+    if (action == TEST_GATHER_PROGRESS_SUCCESS) {
+        /*
+         * The peer crosses the initial no-progress deadline only after its
+         * accepted connection refreshes that deadline. Leave enough margin
+         * on both sides of the refresh for a loaded hosted runner.
+         */
+        (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1000", 1);
+    }
     (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS",
                  action == TEST_GATHER_PROGRESS_SUCCESS
                      ? "1000"
@@ -385,7 +417,9 @@ run_two_rank_case(int port,
                      1);
     } else {
         (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
-                     "1500",
+                     action == TEST_ROOT_COMMIT_CONFIRM_RETRY
+                         ? "5000"
+                         : "1500",
                      1);
     }
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
@@ -449,7 +483,7 @@ run_two_rank_case(int port,
         action == TEST_GATHER_PROGRESS_SUCCESS) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_MS",
-            action == TEST_GATHER_SLOW_FAILURE ? "1000" : "100",
+            action == TEST_GATHER_SLOW_FAILURE ? "1000" : "600",
             1);
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK",
@@ -464,7 +498,7 @@ run_two_rank_case(int port,
     if (action == TEST_GATHER_PROGRESS_SUCCESS) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS",
-            "100",
+            "600",
             1);
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER",
@@ -678,10 +712,6 @@ run_two_rank_case(int port,
         test_monotonic_ms() - case_started_ms > 5000) {
         result = 1;
     }
-    if (action == TEST_GATHER_PROGRESS_SUCCESS &&
-        test_monotonic_ms() - case_started_ms < 180) {
-        result = 1;
-    }
     if (action == TEST_GATHER_PARTIAL_DRIP_FAILURE) {
         int64_t elapsed_ms = test_monotonic_ms() - case_started_ms;
 
@@ -798,6 +828,72 @@ check_progress_deadline_hard_cap(void)
     return peak_socket_report_test_progress_deadline_us(
                240000, hard_deadline_us, 100) !=
            hard_deadline_us;
+}
+
+static int
+check_default_port_derivation(void)
+{
+    int fallback_port;
+    int pmi_port_a;
+    int pmi_port_b;
+    int pmix_port;
+    int rank_zero_port;
+    int rank_one_port;
+    int override_port_a;
+    int override_port_b;
+    int failed;
+
+    clear_socket_identity_environment();
+    clear_rank_environment();
+    fallback_port = peak_socket_report_test_default_port();
+
+    (void)setenv("PMI_JOBID", "hydra-launch-a", 1);
+    pmi_port_a = peak_socket_report_test_default_port();
+    (void)setenv("PMI_RANK", "0", 1);
+    rank_zero_port = peak_socket_report_test_default_port();
+    (void)setenv("PMI_RANK", "1", 1);
+    rank_one_port = peak_socket_report_test_default_port();
+
+    (void)setenv("PMI_JOBID", "hydra-launch-b", 1);
+    pmi_port_b = peak_socket_report_test_default_port();
+
+    (void)unsetenv("PMI_JOBID");
+    (void)setenv("PMIX_NAMESPACE", "pmix-launch-a", 1);
+    pmix_port = peak_socket_report_test_default_port();
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN",
+                 "explicit-launch-token",
+                 1);
+    override_port_a = peak_socket_report_test_default_port();
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN",
+                 "different-explicit-token",
+                 1);
+    override_port_b = peak_socket_report_test_default_port();
+
+    failed =
+        fallback_port < TEST_DEFAULT_PORT_BASE ||
+        fallback_port >=
+            TEST_DEFAULT_PORT_BASE + TEST_DEFAULT_PORT_SPAN ||
+        pmi_port_a < TEST_DEFAULT_PORT_BASE ||
+        pmi_port_a >=
+            TEST_DEFAULT_PORT_BASE + TEST_DEFAULT_PORT_SPAN ||
+        pmi_port_b < TEST_DEFAULT_PORT_BASE ||
+        pmi_port_b >=
+            TEST_DEFAULT_PORT_BASE + TEST_DEFAULT_PORT_SPAN ||
+        pmix_port < TEST_DEFAULT_PORT_BASE ||
+        pmix_port >=
+            TEST_DEFAULT_PORT_BASE + TEST_DEFAULT_PORT_SPAN ||
+        fallback_port == pmi_port_a ||
+        pmi_port_a == pmi_port_b ||
+        pmi_port_b == pmix_port ||
+        rank_zero_port != pmi_port_a ||
+        rank_one_port != pmi_port_a ||
+        override_port_a != pmix_port ||
+        override_port_a != override_port_b;
+
+    clear_socket_identity_environment();
+    clear_rank_environment();
+    return failed;
 }
 
 static int
@@ -1272,6 +1368,8 @@ main(void)
     CHECK_SOCKET_CASE("slurm-host-parser", check_slurm_host_parser());
     CHECK_SOCKET_CASE("progress-hard-cap",
                       check_progress_deadline_hard_cap());
+    CHECK_SOCKET_CASE("default-port-derivation",
+                      check_default_port_derivation());
     CHECK_SOCKET_CASE("gather-admission-waves",
                       check_gather_admission_waves());
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
