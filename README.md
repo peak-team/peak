@@ -1,3 +1,13 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/peak-logo-horizontal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/peak-logo-horizontal-light.svg">
+    <img src="docs/assets/peak-logo-horizontal-light.svg"
+         alt="PEAK — Performance Evaluation and Analysis Kit"
+         width="720">
+  </picture>
+</p>
+
 [![CMake](https://img.shields.io/github/actions/workflow/status/peak-team/peak/cmake.yml?branch=main&logo=GitHub&label=cmake)](https://github.com/peak-team/peak/actions/workflows/cmake.yml)
 [![MPI](https://img.shields.io/github/actions/workflow/status/peak-team/peak/mpi.yml?branch=main&logo=GitHub&label=mpi)](https://github.com/peak-team/peak/actions/workflows/mpi.yml)
 [![License](https://img.shields.io/github/license/peak-team/peak)](LICENSE)
