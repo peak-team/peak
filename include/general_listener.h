@@ -92,6 +92,8 @@ struct _PeakGeneralListener {
     GObject parent;
 
     size_t hook_id;
+    _Atomic int callback_hook_state;
+    _Atomic gboolean detach_count_request_pending;
     gulong* num_calls;
     gdouble* total_time;
     gdouble* exclusive_time;

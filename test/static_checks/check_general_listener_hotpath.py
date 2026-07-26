@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Guard the target callback against steady-state blocking operations."""
+
+from pathlib import Path
+import sys
+
+
+def function_body(source, name):
+    marker = f"\n{name}("
+    start = source.find(marker)
+    if start < 0:
+        raise AssertionError(f"missing function {name}")
+    brace = source.find("{", start)
+    if brace < 0:
+        raise AssertionError(f"missing body for {name}")
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace : index + 1]
+    raise AssertionError(f"unterminated body for {name}")
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: check_general_listener_hotpath.py <source-root>")
+
+    root = Path(sys.argv[1])
+    source = (root / "src/general_listener.c").read_text()
+    header = (root / "include/general_listener.h").read_text()
+    enter = function_body(source, "peak_general_listener_on_enter")
+    leave = function_body(source, "peak_general_listener_on_leave")
+    initialize = function_body(
+        source, "peak_general_listener_thread_state_initialize"
+    )
+    push = function_body(source, "peak_general_listener_push_invocation")
+    publish = function_body(
+        source, "peak_general_controller_publish_detach_count_requests_unlocked"
+    )
+
+    forbidden = (
+        "pthread_listener_lookup_thread",
+        "pthread_mutex_lock",
+        "pthread_pause_enable",
+        "pthread_pause_disable",
+        "pthread_sigmask",
+        "gum_interceptor_ignore_current_thread",
+        "gum_interceptor_unignore_current_thread",
+        "g_object_is_floating",
+        "g_mutex_lock",
+        "g_new",
+        "g_renew",
+        "g_free",
+    )
+    for name, body in (("enter", enter), ("leave", leave)):
+        for token in forbidden:
+            require(
+                token not in body,
+                f"{name} callback contains forbidden steady-state operation {token}",
+            )
+
+    require(
+        "pthread_listener_lookup_thread" in initialize
+        and "thread_data.initialized" in initialize
+        and 'tls_model("initial-exec")' in source,
+        "thread slot lookup must be cached by one-time TLS initialization",
+    )
+    require(
+        "child_time_inline[16]" in source
+        and "thread_data.child_time_inline" in push
+        and "g_renew" in push,
+        "child-time stack must use inline depth 16 and grow only on overflow",
+    )
+    require(
+        "PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64" in source
+        and source.count("g_aligned_alloc0(") >= 6
+        and "peak_general_listener_num_calls_slot(self, index)" in enter,
+        "per-thread accounting slots must remain cache-line isolated",
+    )
+    require(
+        "_Atomic gboolean detach_count_request_pending" in header
+        and "atomic_compare_exchange_strong_explicit" in enter,
+        "callback must publish the detach-count request through a CAS latch",
+    )
+    require(
+        "atomic_exchange_explicit" in publish
+        and "peak_general_listener_request_detach_with_context_unlocked" in publish,
+        "controller must consume the CAS latch under its existing request path",
+    )
+    require(
+        "thread_data.self_mapped_id" in enter
+        and "thread_data.self_mapped_id" in leave,
+        "both callbacks must use the cached TLS slot",
+    )
+
+    print("general_listener_hotpath_ok")
+
+
+if __name__ == "__main__":
+    main()
