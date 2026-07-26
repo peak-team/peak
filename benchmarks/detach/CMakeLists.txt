@@ -30,6 +30,22 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
   target_link_options(benchmark_detach_stale_threads PRIVATE -Wl,--export-dynamic)
 endif()
 
+add_executable(benchmark_callback_hotpath
+  benchmark_callback_hotpath.c
+)
+target_link_libraries(benchmark_callback_hotpath PRIVATE Threads::Threads)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+  target_link_options(benchmark_callback_hotpath PRIVATE -Wl,--export-dynamic)
+endif()
+
+set(PEAK_HOTPATH_PERF_MAX_SLOWDOWN "10:40,100:8,1000:2" CACHE STRING
+  "Maximum profiled/unprofiled slowdown as target-ns:limit pairs")
+set(PEAK_HOTPATH_PERF_MAX_NS_PER_CALL "10:500,100:650,1000:1800"
+  CACHE STRING
+  "Maximum aggregate callback ns/call as target-ns:limit pairs")
+set(PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY "0.02" CACHE STRING
+  "Minimum per-thread steady-state throughput scaling efficiency")
+
 set(PEAK_STRICT_DETACH_BENCHMARK_MIN_RATIO "0.80" CACHE STRING
   "Minimum current strict physical-detach throughput as a fraction of no-preload throughput")
 set(PEAK_STRICT_DETACH_STRESS_THREADS "32" CACHE STRING
@@ -42,6 +58,28 @@ set(PEAK_STRICT_DETACH_STRESS_SECONDS "1" CACHE STRING
 if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
    PEAK_GUM_PEAK_PC_API_AVAILABLE AND
    TARGET peak_detach_helper)
+  add_test(NAME benchmark_callback_hotpath_matrix
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/run_callback_hotpath_matrix.py
+            --exe $<TARGET_FILE:benchmark_callback_hotpath>
+            --current-libpeak $<TARGET_FILE:peak>
+            --threads 1,2,8,32,64
+            --target-ns 10,100,1000
+            --seconds 0.5
+            --samples 3
+            --max-slowdown ${PEAK_HOTPATH_PERF_MAX_SLOWDOWN}
+            --max-ns-per-call
+              ${PEAK_HOTPATH_PERF_MAX_NS_PER_CALL}
+            --min-scaling-efficiency
+              ${PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY})
+  set_tests_properties(benchmark_callback_hotpath_matrix
+    PROPERTIES
+      LABELS benchmark
+      RESOURCE_LOCK peak_detach_benchmark
+      TIMEOUT 180
+      PASS_REGULAR_EXPRESSION
+        "HOTPATH_SUMMARY .*max_ns_per_call=.*min_scaling_efficiency=")
+
   add_test(NAME benchmark_detach_hotloop_strict
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/run_detach_hotloop_benchmark.py

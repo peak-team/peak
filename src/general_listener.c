@@ -886,12 +886,10 @@ typedef struct _PeakGeneralThreadState {
     gulong level;
     gulong capacity;
     gdouble* child_time;
-    pthread_t* tid_keys;
-    size_t* mapped_ids;
-    int* pause_session_ids;
-    int* pause_status;
+    gdouble child_time_inline[16];
     size_t self_mapped_id;
-    gboolean self_mapped_known;
+    gboolean initialized;
+    gboolean in_callback;
 } PeakGeneralThreadState;
 
 typedef struct _PeakInvocationData {
@@ -900,7 +898,16 @@ typedef struct _PeakInvocationData {
     gboolean initialized;
 } PeakInvocationData;
 
-static __thread PeakGeneralThreadState thread_data;
+/*
+ * PEAK is loaded during process startup (normally through LD_PRELOAD), so its
+ * callback TLS can use the initial-exec model. This keeps every steady-state
+ * access relative to the thread pointer instead of calling __tls_get_addr.
+ */
+static __thread PeakGeneralThreadState thread_data
+    __attribute__((tls_model("initial-exec")));
+static pthread_key_t peak_general_thread_state_key;
+static pthread_once_t peak_general_thread_state_key_once = PTHREAD_ONCE_INIT;
+static gboolean peak_general_thread_state_key_created = FALSE;
 
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -912,6 +919,124 @@ static int pthread_pause_ack_pipe[2] = { -1, -1 };
 static gboolean peak_general_controller_flush_teardown(void);
 static gboolean peak_general_listener_pop_invocation(PeakInvocationData* priv,
                                                      gdouble* child_duration_out);
+static inline gulong
+peak_general_listener_num_calls_load(const gulong* slot);
+
+#define PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64
+
+static inline gulong*
+peak_general_listener_num_calls_slot(PeakGeneralListener* listener,
+                                     size_t thread_id)
+{
+    return (gulong*)((guint8*)listener->num_calls +
+                     thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static inline gdouble*
+peak_general_listener_total_time_slot(PeakGeneralListener* listener,
+                                      size_t thread_id)
+{
+    return (gdouble*)((guint8*)listener->total_time +
+                      thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static inline gdouble*
+peak_general_listener_exclusive_time_slot(PeakGeneralListener* listener,
+                                          size_t thread_id)
+{
+    return (gdouble*)((guint8*)listener->exclusive_time +
+                      thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static inline gfloat*
+peak_general_listener_max_time_slot(PeakGeneralListener* listener,
+                                    size_t thread_id)
+{
+    return (gfloat*)((guint8*)listener->max_time +
+                     thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static inline gfloat*
+peak_general_listener_min_time_slot(PeakGeneralListener* listener,
+                                    size_t thread_id)
+{
+    return (gfloat*)((guint8*)listener->min_time +
+                     thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static void
+peak_general_listener_thread_state_destroy(void* data)
+{
+    PeakGeneralThreadState* state = data;
+
+    if (state != NULL &&
+        state->child_time != NULL &&
+        state->child_time != state->child_time_inline) {
+        g_free(state->child_time);
+        state->child_time = state->child_time_inline;
+    }
+}
+
+static void
+peak_general_listener_thread_state_key_create(void)
+{
+    peak_general_thread_state_key_created =
+        pthread_key_create(&peak_general_thread_state_key,
+                           peak_general_listener_thread_state_destroy) == 0;
+}
+
+static void
+peak_general_listener_thread_state_initialize(void)
+{
+    gboolean mapped_found = FALSE;
+    size_t mapped_tid;
+
+    if (G_LIKELY(thread_data.initialized)) {
+        return;
+    }
+
+    mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
+    if (!mapped_found || mapped_tid >= peak_max_num_threads) {
+        mapped_tid = 0;
+    }
+
+    thread_data.level = 0;
+    thread_data.capacity = G_N_ELEMENTS(thread_data.child_time_inline);
+    thread_data.child_time = thread_data.child_time_inline;
+    thread_data.self_mapped_id = mapped_tid;
+    thread_data.initialized = TRUE;
+
+    pthread_once(&peak_general_thread_state_key_once,
+                 peak_general_listener_thread_state_key_create);
+    if (peak_general_thread_state_key_created) {
+        (void)pthread_setspecific(peak_general_thread_state_key, &thread_data);
+    }
+}
+
+static void
+peak_general_listener_push_invocation(PeakInvocationData* priv)
+{
+    if (G_UNLIKELY(thread_data.level == thread_data.capacity)) {
+        gulong old_capacity = thread_data.capacity;
+        gulong new_capacity = old_capacity * 2;
+
+        if (thread_data.child_time == thread_data.child_time_inline) {
+            gdouble* expanded = g_new(gdouble, new_capacity);
+            memcpy(expanded,
+                   thread_data.child_time_inline,
+                   sizeof(gdouble) * old_capacity);
+            thread_data.child_time = expanded;
+        } else {
+            thread_data.child_time =
+                g_renew(gdouble, thread_data.child_time, new_capacity);
+        }
+        thread_data.capacity = new_capacity;
+    }
+
+    thread_data.child_time[thread_data.level] = 0.0;
+    thread_data.level++;
+    priv->stack_level = thread_data.level;
+}
 
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
 {
@@ -1815,6 +1940,13 @@ static void peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookS
     }
 
     peak_hook_states[hook_id] = state;
+    if (array_listener != NULL && array_listener[hook_id] != NULL) {
+        PeakGeneralListener* listener =
+            PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        atomic_store_explicit(&listener->callback_hook_state,
+                              state,
+                              memory_order_release);
+    }
     peak_general_listener_publish_legacy_flags_unlocked(hook_id);
 }
 
@@ -3439,6 +3571,46 @@ peak_general_controller_process_pending_batch_unlocked(void)
     return prepared_count > 0;
 }
 
+static void
+peak_general_controller_publish_detach_count_requests_unlocked(void)
+{
+    if (array_listener == NULL) {
+        return;
+    }
+
+    for (size_t hook_id = 0; hook_id < peak_hook_address_count; hook_id++) {
+        if (array_listener[hook_id] == NULL) {
+            continue;
+        }
+
+        PeakGeneralListener* listener =
+            PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        if (!atomic_exchange_explicit(
+                &listener->detach_count_request_pending,
+                FALSE,
+                memory_order_acq_rel)) {
+            continue;
+        }
+
+        gulong total_num_calls = 0;
+        for (size_t thread_id = 0;
+             thread_id < peak_max_num_threads;
+             thread_id++) {
+            total_num_calls += peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, thread_id));
+        }
+
+        (void)peak_general_listener_request_detach_with_context_unlocked(
+            hook_id,
+            PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
+            total_num_calls,
+            0.0,
+            0.0,
+            peak_second() - peak_main_time,
+            0.0);
+    }
+}
+
 static gboolean
 peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
                                                  pthread_t* tid_keys,
@@ -3452,6 +3624,8 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
     if (peak_general_controller_mpi_finalize_requested()) {
         return FALSE;
     }
+
+    peak_general_controller_publish_detach_count_requests_unlocked();
 
     if (peak_detach_controller_strict_batch_supported()) {
         (void)controller_tid;
@@ -3778,7 +3952,7 @@ peak_general_listener_profile_seconds_at_boundary(void)
         for (size_t j = 0; j < peak_max_num_threads; j++) {
             total_calls +=
                 peak_general_listener_num_calls_load(
-                    &pg_listener->num_calls[j]);
+                    peak_general_listener_num_calls_slot(pg_listener, j));
         }
         if (total_calls != 0 &&
             profile_seconds <=
@@ -3911,7 +4085,7 @@ peak_general_listener_refresh_hook_sample_cache_unlocked(
     gulong total_num_calls = 0;
     for (size_t j = 0; j < peak_max_num_threads; j++) {
         total_num_calls += peak_general_listener_num_calls_load(
-            &pg_listener->num_calls[j]);
+            peak_general_listener_num_calls_slot(pg_listener, j));
     }
 
     double profile_seconds =
@@ -4767,13 +4941,16 @@ peak_general_listener_test_checkpoint_mutation_begin(void)
     }
     listener = PEAKGENERAL_LISTENER(array_listener[0]);
     for (size_t index = 0; index < peak_max_num_threads; index++) {
-        if (peak_general_listener_num_calls_load(&listener->num_calls[index]) != 0) {
+        if (peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, index)) != 0) {
             peak_checkpoint_test_mutation_index = index;
             break;
         }
     }
     if (peak_general_listener_num_calls_load(
-            &listener->num_calls[peak_checkpoint_test_mutation_index]) == 0) {
+            peak_general_listener_num_calls_slot(
+                listener,
+                peak_checkpoint_test_mutation_index)) == 0) {
         return EINVAL;
     }
     if (listener->checkpoint_shadow == NULL) {
@@ -4850,24 +5027,14 @@ static void
 peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
                                                  gboolean use_pause_guard)
 {
+    (void)use_pause_guard;
+
     if (priv == NULL || !priv->initialized) {
         return;
     }
 
-    if (!peak_general_listener_pop_invocation(priv, NULL)) {
-        return;
-    }
-    if (thread_data.level == 0) {
-        void* tmp_ptr = thread_data.child_time;
-        thread_data.child_time = NULL;
-        if (use_pause_guard) {
-            pthread_pause_disable();
-        }
-        g_free(tmp_ptr);
-        if (use_pause_guard) {
-            pthread_pause_enable();
-        }
-    } else if (thread_data.child_time != NULL) {
+    if (peak_general_listener_pop_invocation(priv, NULL) &&
+        thread_data.level > 0) {
         thread_data.child_time[thread_data.level] = 0.0;
     }
 }
@@ -4922,236 +5089,120 @@ static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
-    if (!listener || g_object_is_floating(listener)) {
-            return;
+    if (!listener) {
+        return;
     }
-    gum_interceptor_ignore_current_thread(interceptor);
-    PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+    PeakInvocationData* priv =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
     priv->initialized = FALSE;
     priv->stack_level = 0;
+    if (G_UNLIKELY(thread_data.in_callback)) {
+        return;
+    }
+    thread_data.in_callback = TRUE;
     if (atomic_load_explicit(&peak_general_callbacks_suspended,
                              memory_order_acquire)) {
-        gum_interceptor_unignore_current_thread(interceptor);
+        thread_data.in_callback = FALSE;
         return;
     }
 
-    PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-    pthread_t my_tid = pthread_self();
-    gboolean mapped_found = FALSE;
-    size_t mapped_tid = pthread_listener_lookup_thread(my_tid, &mapped_found);
-    if (!mapped_found || mapped_tid >= peak_max_num_threads) {
-        mapped_tid = 0;
-    }
-    thread_data.self_mapped_id = mapped_tid;
-    thread_data.self_mapped_known = mapped_found && mapped_tid < peak_max_num_threads;
-    if (peak_detach_cost == 0 && heartbeat_time == 0 &&
-        !peak_detach_count_overridden) {
-        size_t index = mapped_tid;
-        if (thread_data.child_time == NULL) {
-            thread_data.level = 0;
-            thread_data.capacity = 16;
-            thread_data.child_time = g_new(gdouble, 16);
-        }
-        thread_data.child_time[thread_data.level] = 0.0;
-        thread_data.level++;
-        if (thread_data.level == thread_data.capacity) {
-            thread_data.capacity *= 2;
-            thread_data.child_time = g_renew(double, thread_data.child_time, thread_data.capacity);
-        }
-        (void)peak_general_listener_num_calls_increment(
-            &self->num_calls[index]);
-    } else {
-        size_t index = mapped_tid;
-        if (thread_data.child_time == NULL) {
-            thread_data.level = 0;
-            thread_data.capacity = 16;
-            pthread_pause_disable();
-            thread_data.child_time = g_new(gdouble, 16);
-            pthread_pause_enable();
-        }
-        thread_data.child_time[thread_data.level] = 0.0;
-        thread_data.level++;
-        if (thread_data.level == thread_data.capacity) {
-            thread_data.capacity *= 2;
-            pthread_pause_disable();
-            thread_data.child_time = g_renew(double, thread_data.child_time, thread_data.capacity);
-            pthread_pause_enable();
-        }
-        gulong current_num_calls =
-            peak_general_listener_num_calls_increment(
-                &self->num_calls[index]);
-        size_t hook_id = self->hook_id;
-        gboolean detach_requested = FALSE;
+    peak_general_listener_thread_state_initialize();
 
-        pthread_mutex_lock(&lock);
-        /*
-         * Auxiliary listeners, including the overhead-calibration listener,
-         * share this callback implementation.  Only the listener currently
-         * published for a target may drive that target's lifecycle.
-         */
-        gboolean listener_owns_hook =
-            peak_general_hook_is_published_unlocked(hook_id) &&
-            array_listener[hook_id] == listener;
-        if (listener_owns_hook && current_num_calls >= peak_detach_count) {
-            gulong total_num_calls = 0;
-            for (size_t j = 0; j < peak_max_num_threads; j++) {
-                total_num_calls += peak_general_listener_num_calls_load(
-                    &self->num_calls[j]);
-            }
-            detach_requested =
-                peak_general_listener_request_detach_with_context_unlocked(
-                    hook_id,
-                    PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
-                    total_num_calls,
-                    0.0,
-                    0.0,
-                    peak_second() - peak_main_time,
-                    0.0);
-        }
-        pthread_mutex_unlock(&lock);
-        if (detach_requested) {
+    PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+    size_t index = thread_data.self_mapped_id;
+    peak_general_listener_push_invocation(priv);
+    priv->stack_level = thread_data.level;
+    gulong current_num_calls =
+        peak_general_listener_num_calls_increment(
+            peak_general_listener_num_calls_slot(self, index));
+
+    if (G_UNLIKELY(current_num_calls >= peak_detach_count) &&
+        atomic_load_explicit(&self->callback_hook_state,
+                             memory_order_acquire) == PEAK_HOOK_ATTACHED) {
+        gboolean expected = FALSE;
+        if (atomic_compare_exchange_strong_explicit(
+                &self->detach_count_request_pending,
+                &expected,
+                TRUE,
+                memory_order_acq_rel,
+                memory_order_relaxed)) {
             peak_general_listener_controller_wake();
         }
-
-        if (check_interval != 0) pthread_pause_enable();
-        else pthread_pause_disable();
     }
+
     priv->start_time = peak_second();
-    priv->stack_level = thread_data.level;
     priv->initialized = TRUE;
-    gum_interceptor_unignore_current_thread(interceptor);
+    thread_data.in_callback = FALSE;
 }
 
 static void
 peak_general_listener_on_leave(GumInvocationListener* listener,
                                GumInvocationContext* ic)
 {
-    double end_time = peak_second();
-    gum_interceptor_ignore_current_thread(interceptor);
-    if (peak_detach_cost == 0 && heartbeat_time == 0 &&
-        !peak_detach_count_overridden) {
-        if (!listener || g_object_is_floating(listener)) {
-            thread_data.level--;
-            if (thread_data.level == 0) {
-                void* tmp_ptr = thread_data.child_time;
-                thread_data.child_time = NULL;
-                g_free(tmp_ptr);
-            }
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
-        if (!priv->initialized) {
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        if (atomic_load_explicit(&peak_general_callbacks_suspended,
-                                 memory_order_acquire)) {
-            peak_general_listener_abandon_current_invocation(priv, FALSE);
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-        gboolean mapped_found = FALSE;
-        size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
-        if (!mapped_found || mapped_tid >= peak_max_num_threads) {
-            mapped_tid = 0;
-        }
-        end_time = end_time - priv->start_time;
-        size_t index = mapped_tid;
-        gdouble child_duration = 0.0;
-        if (!peak_general_listener_pop_invocation(priv, &child_duration)) {
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        if (end_time > self->max_time[index])
-            self->max_time[index] = end_time;
-        if (end_time < self->min_time[index] ||
-            peak_general_listener_num_calls_load(&self->num_calls[index]) == 1)
-            self->min_time[index] = end_time;
-        self->total_time[index] += end_time;
-        if (thread_data.level > 0)
-            thread_data.child_time[thread_data.level - 1] += end_time;
-        self->exclusive_time[index] +=
-            peak_general_listener_exclusive_duration(
-                end_time,
-                child_duration);
-        if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
-            peak_general_listener_checkpoint_shadow_update(
-                &self->checkpoint_shadow[index],
-                end_time,
-                peak_general_listener_exclusive_duration(end_time, child_duration));
-        }
-        if (thread_data.level == 0) {
-            void* tmp_ptr = thread_data.child_time;
-            thread_data.child_time = NULL;
-            g_free(tmp_ptr);
-        }
-    } else {
-        pthread_pause_enable();
-        if (!listener || g_object_is_floating(listener)) {
-            thread_data.level--;
-            if (thread_data.level == 0) {
-                void* tmp_ptr = thread_data.child_time;
-                thread_data.child_time = NULL;
-                pthread_pause_disable();
-                g_free(tmp_ptr);
-                pthread_pause_enable();
-            }
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        PeakInvocationData* priv = GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
-        if (!priv->initialized) {
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        if (atomic_load_explicit(&peak_general_callbacks_suspended,
-                                 memory_order_acquire)) {
-            peak_general_listener_abandon_current_invocation(priv, TRUE);
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-        gboolean mapped_found = FALSE;
-        size_t mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
-        if (!mapped_found || mapped_tid >= peak_max_num_threads) {
-            mapped_tid = 0;
-        }
-        end_time = end_time - priv->start_time;
-        size_t index = mapped_tid;
-        gdouble child_duration = 0.0;
-        if (!peak_general_listener_pop_invocation(priv, &child_duration)) {
-            gum_interceptor_unignore_current_thread(interceptor);
-            return;
-        }
-        if (end_time > self->max_time[index])
-            self->max_time[index] = end_time;
-        if (end_time < self->min_time[index] ||
-            peak_general_listener_num_calls_load(&self->num_calls[index]) == 1)
-            self->min_time[index] = end_time;
-        self->total_time[index] += end_time;
-        if (thread_data.level > 0)
-            thread_data.child_time[thread_data.level - 1] += end_time;
-        self->exclusive_time[index] +=
-            peak_general_listener_exclusive_duration(
-                end_time,
-                child_duration);
-        if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
-            peak_general_listener_checkpoint_shadow_update(
-                &self->checkpoint_shadow[index],
-                end_time,
-                peak_general_listener_exclusive_duration(end_time, child_duration));
-        }
-        if (thread_data.level == 0) {
-            void* tmp_ptr = thread_data.child_time;
-            thread_data.child_time = NULL;
-            pthread_pause_disable();
-            g_free(tmp_ptr);
-            pthread_pause_enable();
-        }
+    PeakInvocationData* priv =
+        GUM_IC_GET_INVOCATION_DATA(ic, PeakInvocationData);
+    if (!priv->initialized || G_UNLIKELY(thread_data.in_callback)) {
+        return;
     }
-    gum_interceptor_unignore_current_thread(interceptor);
+    thread_data.in_callback = TRUE;
+    if (!listener) {
+        if (thread_data.initialized && thread_data.level > 0) {
+            thread_data.level--;
+            thread_data.child_time[thread_data.level] = 0.0;
+        }
+        priv->initialized = FALSE;
+        priv->stack_level = 0;
+        thread_data.in_callback = FALSE;
+        return;
+    }
+
+    if (atomic_load_explicit(&peak_general_callbacks_suspended,
+                             memory_order_acquire)) {
+        peak_general_listener_abandon_current_invocation(priv, FALSE);
+        thread_data.in_callback = FALSE;
+        return;
+    }
+
+    double end_time = peak_second();
+    PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+    size_t index = thread_data.self_mapped_id;
+    gulong* num_calls =
+        peak_general_listener_num_calls_slot(self, index);
+    gdouble* total_time =
+        peak_general_listener_total_time_slot(self, index);
+    gdouble* exclusive_time =
+        peak_general_listener_exclusive_time_slot(self, index);
+    gfloat* max_time =
+        peak_general_listener_max_time_slot(self, index);
+    gfloat* min_time =
+        peak_general_listener_min_time_slot(self, index);
+    gdouble child_duration = 0.0;
+    end_time -= priv->start_time;
+    if (!peak_general_listener_pop_invocation(priv, &child_duration)) {
+        thread_data.in_callback = FALSE;
+        return;
+    }
+    if (end_time > *max_time) {
+        *max_time = end_time;
+    }
+    if (end_time < *min_time ||
+        peak_general_listener_num_calls_load(num_calls) == 1) {
+        *min_time = end_time;
+    }
+    *total_time += end_time;
+    if (thread_data.level > 0) {
+        thread_data.child_time[thread_data.level - 1] += end_time;
+    }
+    *exclusive_time +=
+        peak_general_listener_exclusive_duration(end_time, child_duration);
+    if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
+        peak_general_listener_checkpoint_shadow_update(
+            &self->checkpoint_shadow[index],
+            end_time,
+            peak_general_listener_exclusive_duration(end_time,
+                                                     child_duration));
+    }
+    thread_data.in_callback = FALSE;
 }
 
 static void
@@ -5175,11 +5226,28 @@ static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
     size_t total_count = peak_max_num_threads;
-    self->num_calls = g_new0(gulong, total_count);
-    self->total_time = g_new0(gdouble, total_count);
-    self->exclusive_time = g_new0(gdouble, total_count);
-    self->max_time = g_new0(gfloat, total_count);
-    self->min_time = g_new0(gfloat, total_count);
+    atomic_init(&self->callback_hook_state, PEAK_HOOK_UNRESOLVED);
+    atomic_init(&self->detach_count_request_pending, FALSE);
+    self->num_calls = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    self->total_time = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    self->exclusive_time = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    self->max_time = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    self->min_time = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
     if (peak_exec_checkpoint_enabled_at_startup != NULL &&
         peak_exec_checkpoint_enabled_at_startup()) {
         self->checkpoint_shadow = g_aligned_alloc0(
@@ -5197,11 +5265,11 @@ peak_general_listener_init(PeakGeneralListener* self)
 void
 peak_general_listener_free(PeakGeneralListener* self)
 {
-    g_free(self->num_calls);
-    g_free(self->total_time);
-    g_free(self->exclusive_time);
-    g_free(self->max_time);
-    g_free(self->min_time);
+    g_aligned_free(self->num_calls);
+    g_aligned_free(self->total_time);
+    g_aligned_free(self->exclusive_time);
+    g_aligned_free(self->max_time);
+    g_aligned_free(self->min_time);
     g_aligned_free(self->checkpoint_shadow);
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;
@@ -6484,26 +6552,34 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
                 PEAKGENERAL_LISTENER(array_listener[i]);
             for (size_t j = 0; j < peak_max_num_threads; j++) {
                 gulong calls = peak_general_listener_num_calls_load(
-                    &pg_listener->num_calls[j]);
+                    peak_general_listener_num_calls_slot(pg_listener, j));
+                gdouble total_time =
+                    *peak_general_listener_total_time_slot(pg_listener, j);
+                gdouble exclusive_time =
+                    *peak_general_listener_exclusive_time_slot(pg_listener, j);
+                gfloat max_time =
+                    *peak_general_listener_max_time_slot(pg_listener, j);
+                gfloat min_time =
+                    *peak_general_listener_min_time_slot(pg_listener, j);
 
                 sum_num_calls[i] += calls;
-                sum_total_time[i] += pg_listener->total_time[j];
-                sum_exclusive_time[i] += pg_listener->exclusive_time[j];
+                sum_total_time[i] += total_time;
+                sum_exclusive_time[i] += exclusive_time;
                 if (calls != 0) {
                     thread_count[i]++;
-                    if (pg_listener->total_time[j] > max_total_time[i]) {
-                        max_total_time[i] = pg_listener->total_time[j];
+                    if (total_time > max_total_time[i]) {
+                        max_total_time[i] = total_time;
                     }
-                    if (pg_listener->total_time[j] < min_total_time[i] ||
+                    if (total_time < min_total_time[i] ||
                         thread_count[i] == 1) {
-                        min_total_time[i] = pg_listener->total_time[j];
+                        min_total_time[i] = total_time;
                     }
-                    if (pg_listener->max_time[j] > sum_max_time[i]) {
-                        sum_max_time[i] = pg_listener->max_time[j];
+                    if (max_time > sum_max_time[i]) {
+                        sum_max_time[i] = max_time;
                     }
-                    if (pg_listener->min_time[j] < sum_min_time[i] ||
+                    if (min_time < sum_min_time[i] ||
                         thread_count[i] == 1) {
-                        sum_min_time[i] = pg_listener->min_time[j];
+                        sum_min_time[i] = min_time;
                     }
                 }
             }
