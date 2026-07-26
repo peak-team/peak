@@ -1,12 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1290" height="340" viewBox="0 0 1290 340" role="img" aria-labelledby="title desc" shape-rendering="geometricPrecision">
 <title id="title">PEAK — Performance Evaluation and Analysis Kit</title>
 <desc id="desc">PEAK horizontal logo with clean vector contours and a continuous performance trace.</desc>
-<defs><linearGradient id="markGradient" x1="70" y1="310" x2="520" y2="35" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0759D6"/><stop offset="0.52" stop-color="#078DE5"/><stop offset="1" stop-color="#10CDE9"/></linearGradient><linearGradient id="trailGradient" x1="70" y1="0" x2="175" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4B8DE5" stop-opacity="0"/><stop offset="0.22" stop-color="#4B8DE5" stop-opacity="0"/><stop offset="0.52" stop-color="#4B8DE5" stop-opacity="0.52"/><stop offset="0.72" stop-color="#167EE1" stop-opacity="0.88"/><stop offset="1" stop-color="#078DE5"/></linearGradient><linearGradient id="wordGradient" x1="0" y1="90" x2="0" y2="265" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#283645"/><stop offset="0.52" stop-color="#152230"/><stop offset="1" stop-color="#243241"/></linearGradient><linearGradient id="accentGradient" x1="0" y1="180" x2="0" y2="260" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#079BE8"/><stop offset="1" stop-color="#0759D6"/></linearGradient></defs>
+<defs>
+<linearGradient id="markGradient" x1="93" y1="310" x2="441" y2="35" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#003FCB"/><stop offset="0.43" stop-color="#0078E5"/><stop offset="0.7" stop-color="#00AEF0"/><stop offset="1" stop-color="#03C8F3"/></linearGradient>
+<linearGradient id="signalGradient" x1="68" y1="0" x2="506" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#004ACE" stop-opacity="0"/><stop offset="0.02" stop-color="#004ACE" stop-opacity="0"/><stop offset="0.1" stop-color="#0053D1"/><stop offset="0.42" stop-color="#006ADB"/><stop offset="0.68" stop-color="#009BE7"/><stop offset="1" stop-color="#00C0F0"/></linearGradient>
+<linearGradient id="midTrailGradient" x1="55" y1="0" x2="255" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#009CEE" stop-opacity="0"/><stop offset="0.03" stop-color="#009CEE" stop-opacity="0"/><stop offset="0.28" stop-color="#008FE7"/><stop offset="0.65" stop-color="#0080E2"/><stop offset="1" stop-color="#0070D8"/></linearGradient>
+<linearGradient id="lowTrailGradient" x1="45" y1="0" x2="233" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#00A2EF" stop-opacity="0"/><stop offset="0.03" stop-color="#00A2EF" stop-opacity="0"/><stop offset="0.32" stop-color="#0098E9"/><stop offset="1" stop-color="#007EE1"/></linearGradient>
+<linearGradient id="dotTopGradient" x1="40" y1="0" x2="65" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0045CC"/><stop offset="1" stop-color="#0050D8"/></linearGradient>
+<linearGradient id="dotMidGradient" x1="29" y1="0" x2="55" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#009CEE"/><stop offset="1" stop-color="#0490E8"/></linearGradient>
+<linearGradient id="dotLowGradient" x1="19" y1="0" x2="45" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#01A2ED"/><stop offset="1" stop-color="#099BEA"/></linearGradient>
+<linearGradient id="wordGradient" x1="0" y1="90" x2="0" y2="265" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#283645"/><stop offset="0.52" stop-color="#152230"/><stop offset="1" stop-color="#243241"/></linearGradient><linearGradient id="accentGradient" x1="0" y1="180" x2="0" y2="260" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#079BE8"/><stop offset="1" stop-color="#0759D6"/></linearGradient>
+</defs>
 <path d="M93 212 176 97 203 134 278 24 366 153 383 132 441 212H417L383 167 366 189 277 62 203 170 176 133 117 212Z" fill="url(#markGradient)"/>
-<path d="M74 237H263L286 154 320 303 341 237H488" fill="none" stroke="url(#trailGradient)" stroke-width="15" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="20"/>
-<path d="M488 229.5H496L506 244.5H488Z" fill="url(#trailGradient)"/>
-<path d="M63 261H255L245 276H63ZM53 293H233L224 308H53Z" fill="url(#trailGradient)"/>
-<g fill="url(#markGradient)"><rect x="40" y="229" width="25" height="16" rx="8"/><rect x="29" y="260" width="26" height="17" rx="8.5"/><rect x="19" y="292" width="26" height="17" rx="8.5"/></g>
+<path d="M74 237H263L286 154 320 303 341 237H488" fill="none" stroke="url(#signalGradient)" stroke-width="15" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="20"/>
+<path d="M488 229.5H496L506 244.5H488Z" fill="url(#signalGradient)"/>
+<path d="M63 261H255L245 276H53Z" fill="url(#midTrailGradient)"/>
+<path d="M53 293H233L224 308H43Z" fill="url(#lowTrailGradient)"/>
+<rect x="40" y="229" width="25" height="16" rx="8" fill="url(#dotTopGradient)"/>
+<rect x="29" y="260" width="26" height="17" rx="8.5" fill="url(#dotMidGradient)"/>
+<rect x="19" y="292" width="26" height="17" rx="8.5" fill="url(#dotLowGradient)"/>
 <g fill="url(#wordGradient)">
 <path d="M558 113H661C692 113 711 129 711 153S692 194 662 194H587L603 171H661C678 171 686 164 686 153S678 137 661 137H584V254H558Z"/>
 <rect x="740" y="113" width="144" height="24"/>
