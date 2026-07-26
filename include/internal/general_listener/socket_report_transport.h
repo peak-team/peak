@@ -127,6 +127,12 @@ void peak_socket_report_test_telemetry_reset(void);
 void peak_socket_report_test_telemetry_get(
     PeakSocketReportTestTelemetry* telemetry_out);
 
+/**
+ * Returns the default socket aggregation port for the current shared
+ * launcher identity.
+ */
+int peak_socket_report_test_default_port(void);
+
 /** Computes a test-only rolling deadline from an injected clock value. */
 int64_t peak_socket_report_test_progress_deadline_us(
     int64_t now_us,

@@ -239,7 +239,7 @@ peak_socket_reduce_hash_text(uint64_t* hash,
 }
 
 static uint64_t
-peak_socket_reduce_session_token(void)
+peak_socket_reduce_launcher_token(void)
 {
     static const char* shared_env_names[] = {
         "SLURM_JOB_ID",
@@ -256,16 +256,8 @@ peak_socket_reduce_session_token(void)
         "OMPI_COMM_WORLD_JOBID",
         NULL,
     };
-    const char* override = getenv(PEAK_OUTPUT_AGGREGATION_TOKEN_ENV);
     uint64_t hash = 1469598103934665603ULL;
     bool saw_shared_value = false;
-
-    if (override != NULL && override[0] != '\0') {
-        peak_socket_reduce_hash_text(&hash,
-                                     PEAK_OUTPUT_AGGREGATION_TOKEN_ENV,
-                                     override);
-        return hash;
-    }
 
     for (size_t i = 0; shared_env_names[i] != NULL; i++) {
         const char* value = getenv(shared_env_names[i]);
@@ -280,6 +272,21 @@ peak_socket_reduce_session_token(void)
         peak_socket_reduce_hash_text(&hash, "fallback", "single-launcher");
     }
     return hash;
+}
+
+static uint64_t
+peak_socket_reduce_session_token(void)
+{
+    const char* override = getenv(PEAK_OUTPUT_AGGREGATION_TOKEN_ENV);
+    uint64_t hash = 1469598103934665603ULL;
+
+    if (override != NULL && override[0] != '\0') {
+        peak_socket_reduce_hash_text(&hash,
+                                     PEAK_OUTPUT_AGGREGATION_TOKEN_ENV,
+                                     override);
+        return hash;
+    }
+    return peak_socket_reduce_launcher_token();
 }
 
 static void
@@ -427,25 +434,18 @@ peak_socket_reduce_test_gather_chunk_bytes(void)
 static int
 peak_socket_reduce_default_port(void)
 {
-    const char* job_id = getenv("SLURM_JOB_ID");
-    char* end = NULL;
-    long parsed = 0;
-
-    if (job_id != NULL && job_id[0] != '\0') {
-        errno = 0;
-        parsed = strtol(job_id, &end, 10);
-        if (errno != 0 || end == job_id) {
-            parsed = 0;
-        }
-    }
-
-    if (parsed < 0) {
-        parsed = -parsed;
-    }
-
     return PEAK_SOCKET_REDUCE_DEFAULT_PORT_BASE +
-           (int)(parsed % PEAK_SOCKET_REDUCE_DEFAULT_PORT_SPAN);
+           (int)(peak_socket_reduce_launcher_token() %
+                 PEAK_SOCKET_REDUCE_DEFAULT_PORT_SPAN);
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+int
+peak_socket_report_test_default_port(void)
+{
+    return peak_socket_reduce_default_port();
+}
+#endif
 
 static int
 peak_socket_reduce_port(void)
