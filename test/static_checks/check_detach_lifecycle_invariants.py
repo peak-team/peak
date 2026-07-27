@@ -125,7 +125,6 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
         source, "dlopen_interceptor_is_fftw_group_symbol"
     )
     attach = extract_function(source, "dlopen_interceptor_attach_from_request")
-    sync = extract_function(source, "dlopen_interceptor_attach_fftw_before_return")
     admission = extract_function(source, "dlopen_interceptor_callback_is_admitted")
     on_enter = extract_function(source, "dlopen_interceptor_on_enter")
     on_leave = extract_function(source, "dlopen_interceptor_on_leave")
@@ -137,14 +136,8 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
         source, "dlopen_interceptor_shutdown_dynamic_attach"
     )
     detach = extract_function(source, "dlopen_interceptor_dettach")
-    provider_probe = extract_function(
-        source, "dlopen_interceptor_handle_may_resolve_fftw"
-    )
     unresolved_counts = extract_function(
         source, "dlopen_interceptor_unresolved_counts"
-    )
-    completed_scan = extract_function(
-        source, "dlopen_interceptor_fftw_module_scan_completed"
     )
     retain_handle = extract_function(
         source, "dlopen_interceptor_retain_dynamic_handle"
@@ -155,11 +148,23 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     requeue = extract_function(
         source, "dlopen_interceptor_requeue_dynamic_attach_request"
     )
+    begin_drain = extract_function(
+        source, "dlopen_interceptor_begin_dynamic_attach_drain"
+    )
+    begin_callback = extract_function(
+        source, "dlopen_interceptor_begin_callback"
+    )
+    end_drain = extract_function(
+        source, "dlopen_interceptor_end_dynamic_attach_drain"
+    )
+    drain = extract_function(
+        source, "dlopen_interceptor_drain_dynamic_attach_queue_with_budget"
+    )
 
     require("source_target_array_FFTW[i]" in membership and
             "strcmp(name, source_target_array_FFTW[i]) == 0" in membership and
             "strncmp(" not in membership,
-            "synchronous FFTW scope must use exact built-in group membership")
+            "FFTW scope must use exact built-in group membership")
     require("dlopen_interceptor_target_matches_scope_unlocked" in attach and
             "request->scope" in attach,
             "dynamic dlopen resolution must filter every request by scope")
@@ -174,34 +179,17 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             candidate_init != -1 and
             duplicate_check < duplicate_mark < candidate_init,
             "duplicate dynamic addresses must be terminal-skipped before attach")
-    require("request.scope = PEAK_DLOPEN_ATTACH_FFTW_ONLY" in sync and
-            "request.scope = retry_scope" in sync,
-            "synchronous resolution must remain FFTW-only and preserve one retry scope")
     require(on_leave.count("dlopen_interceptor_enqueue_dynamic_attach_request(") == 1,
             "one dlopen callback must have only one asynchronous enqueue site")
-    require("unresolved = dlopen_interceptor_unresolved_counts();" in on_leave and
+    require("dlopen_interceptor_unresolved_counts();" in on_leave and
             "if (dlopen_sync_fftw_enabled)" not in on_leave,
             "all dlopen callbacks must use atomic unresolved hints without a target scan")
-    require("dlopen_interceptor_module_identity" in on_leave and
-            "PEAK_DLOPEN_SYNC_REQUEUED" not in on_leave,
-            "on-leave must use canonical identity and let a successful requeue suppress duplicate work")
-    require("dlerror();" in attach and "dlerror();" in on_leave,
-            "PEAK loader lookups must not leak dlerror state after successful dlopen")
-    probe_position = on_leave.find(
-        "dlopen_interceptor_handle_may_resolve_fftw(handle)"
-    )
-    identity_position = on_leave.find(
-        "dlopen_interceptor_module_identity("
-    )
-    require(probe_position != -1 and identity_position != -1 and
-            probe_position < identity_position and
-            all(name in provider_probe for name in (
-                "fftw_malloc", "fftwf_malloc", "fftwl_malloc",
-                "fftwq_malloc", "rfftw_create_plan", "fftw_threads",
-                "rfftw_threads")) and
-            '"fftw_create_plan"' not in provider_probe and
-            "strstr(" not in provider_probe,
-            "FFTW dlopen must use filename-independent ABI probes before module reopen and full scan")
+    for loader_api in ("dlopen", "dlclose", "dlsym", "dlerror", "dlinfo"):
+        require(re.search(rf"\b{loader_api}\s*\(", on_enter) is None and
+                re.search(rf"\b{loader_api}\s*\(", on_leave) is None,
+                f"dlopen callbacks must not call loader API {loader_api}")
+    require("dlerror(" not in attach,
+            "controller symbol misses must remain conservative without dlerror/gettext")
     require(unresolved_counts.count("atomic_load_explicit(") == 2 and
             "peak_general_listener_controller_lock" not in unresolved_counts and
             "for (" not in unresolved_counts and
@@ -212,12 +200,24 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "max_batch_capacity > 1" in attach and
             "resolved_count < max_batch_capacity" in attach,
             "single-symbol attaches must stay scalar and batch workspaces must be capped by resolved targets")
-    require("peak_general_listener_controller_wake();" in enqueue and
-            "peak_general_listener_controller_wake();" in sync and
+    require("peak_general_listener_controller_wake();" not in enqueue and
+            "peak_general_listener_controller_wake();" in on_leave and
             "peak_general_listener_controller_wake();" not in requeue and
             "pthread_cond_signal" not in enqueue and
             "pthread_cond_signal" not in requeue,
-            "new and first-fallback work must wake the controller while controller retry requeues must not self-wake")
+            "callback work must wake after admission closes while retry requeues must not self-wake")
+    require("active_dlopen_callback_count != 0" in begin_drain,
+            "controller drain must not overlap any admitted dlopen callback")
+    require("while (" in begin_callback and
+            "dynamic_attach_drain_active" in begin_callback and
+            "pthread_cond_wait(&dynamic_attach_gate_cond" in begin_callback and
+            "pthread_cond_broadcast(&dynamic_attach_gate_cond)" in end_drain,
+            "callback admission and controller drain must form a two-way barrier")
+    require(".acquire_handle_after_callback = TRUE" in enqueue and
+            "dlopen_interceptor_open_unobserved(" not in enqueue and
+            "request.acquire_handle_after_callback" in drain and
+            "dlopen_interceptor_open_unobserved(" in drain,
+            "callback enqueue must defer RTLD_NOLOAD ownership to the controller")
 
     pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
     cancel_disable = on_enter.find("pthread_setcancelstate(PTHREAD_CANCEL_DISABLE")
@@ -230,23 +230,15 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require("g_strdup(filename)" not in on_enter and
             "g_free(invocation->filename)" not in on_leave,
             "unrelated dlopen callbacks must not allocate merely to preserve a live call argument")
-    completed_lookup = on_leave.find(
-        "dlopen_interceptor_fftw_module_scan_completed(handle)"
-    )
-    require(completed_lookup != -1 and
-            completed_lookup < identity_position and
-            "dlopen_interceptor_primary_module_token(handle)" in completed_scan and
-            "g_hash_table_contains(dlopen_completed_fftw_modules" in completed_scan,
-            "only an identical completed primary FFTW module may skip a full scan")
     require("request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY" in attach and
             "request->scope == PEAK_DLOPEN_ATTACH_ALL" in attach and
             "resolved_fftw_from_handle" in attach and
             "peak_hook_address_count == target_count" in attach and
             "resolved_targets[i].address != NULL" in attach and
             "dlopen_interceptor_target_is_unresolved_unlocked(i)" in attach and
-            "completed_fftw_scan" in retain_handle and
-            "g_hash_table_add(dlopen_completed_fftw_modules, module_token)" in retain_handle,
-            "FFTW module cache publication must require a complete scan and a retained primary handle")
+            "completed_fftw_scan && filename != NULL" in retain_handle and
+            "g_hash_table_add(dlopen_completed_fftw_filenames" in retain_handle,
+            "FFTW filename cache publication must require a complete scan and a retained handle")
     require("atomic_load_explicit(&dlopen_listener_owner_pid" in admission and
             "getpid() == owner" in admission and
             "pthread_mutex" not in admission and "g_" not in admission,

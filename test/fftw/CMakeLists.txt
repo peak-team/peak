@@ -37,7 +37,9 @@ if(UNIX)
     target_include_directories(test_fftw_runtime_dlopen PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS})
-    target_link_libraries(test_fftw_runtime_dlopen PRIVATE ${CMAKE_DL_LIBS})
+    target_link_libraries(test_fftw_runtime_dlopen PRIVATE
+        ${CMAKE_DL_LIBS}
+        Threads::Threads)
     add_executable(test_dlopen_fork_child_pid_guard
         test_dlopen_fork_child_pid_guard.c)
     target_link_libraries(test_dlopen_fork_child_pid_guard PRIVATE

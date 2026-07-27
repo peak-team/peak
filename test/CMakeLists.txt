@@ -1597,6 +1597,30 @@ if(BUILD_TESTING)
                 TIMEOUT 30
         )
 
+        add_test(NAME test_dlopen_deferred_noload_drop
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    close
+        )
+        set_tests_properties(test_dlopen_deferred_noload_drop
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_runtime_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_runtime_dlopen_ok mode=close deferred_noload_drop=1"
+                TIMEOUT 30
+        )
+
+        add_test(NAME test_dlopen_deferred_concurrent_stress
+            COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
+                    $<TARGET_FILE:test_fftw_runtime_provider>
+                    stress
+        )
+        set_tests_properties(test_dlopen_deferred_concurrent_stress
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_runtime_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fftw_runtime_dlopen_ok mode=stress threads=32 iterations=200"
+                TIMEOUT 60
+        )
+
         add_test(NAME test_fftw_runtime_duplicate_target_group
             COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
                     $<TARGET_FILE:test_fftw_runtime_provider>
@@ -1640,21 +1664,19 @@ if(BUILD_TESTING)
         set_tests_properties(test_fftw_runtime_mixed_scope
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=peak_runtime_non_fftw_target;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
-                FAIL_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|"
+                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|.*fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
                 TIMEOUT 30
         )
 
-        add_test(NAME test_fftw_runtime_sync_timeout_fallback
+        add_test(NAME test_fftw_runtime_deferred_repeat
             COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
                     $<TARGET_FILE:test_fftw_runtime_provider>
                     retry
         )
-        set_tests_properties(test_fftw_runtime_sync_timeout_fallback
+        set_tests_properties(test_fftw_runtime_deferred_repeat
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=peak_runtime_non_fftw_target;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+1\\|.*fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
-                FAIL_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|"
+                PASS_REGULAR_EXPRESSION "peak_runtime_non_fftw_target[*]*\\|[ \t]+2\\|.*fftw_malloc[*]*\\|[ \t]+2\\|.*fftw_free[*]*\\|[ \t]+2\\|"
                 TIMEOUT 30
         )
 
@@ -1724,15 +1746,15 @@ if(BUILD_TESTING)
                 TIMEOUT 30
         )
 
-        add_test(NAME test_fftw_runtime_retry_not_cached
+        add_test(NAME test_fftw_runtime_deferred_cache_repeat
             COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
                     $<TARGET_FILE:test_fftw_runtime_provider>
                     retry-fast
         )
-        set_tests_properties(test_fftw_runtime_retry_not_cached
+        set_tests_properties(test_fftw_runtime_deferred_cache_repeat
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=FFTW;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+1\\|.*fftw_free[*]*\\|[ \t]+1\\|"
+                PASS_REGULAR_EXPRESSION "fftw_malloc[*]*\\|[ \t]+2\\|.*fftw_free[*]*\\|[ \t]+2\\|"
                 TIMEOUT 30
         )
 
