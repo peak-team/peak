@@ -79,6 +79,13 @@ size_t peak_detach_controller_max_batch_requests(void);
 
 void peak_detach_controller_warmup_backend(void);
 
+/*
+ * Auto mode uses the in-process signal backend for MPI applications. This
+ * avoids helper fork/ptrace activity during MPI initialization and progress;
+ * an explicitly requested helper backend is not changed.
+ */
+void peak_detach_controller_configure_mpi_process(gboolean is_mpi_process);
+
 gboolean peak_detach_controller_prepare_hook_mutation_batch(
     const PeakDetachRequest* requests,
     size_t request_count,

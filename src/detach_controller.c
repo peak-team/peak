@@ -47,6 +47,7 @@ static _Atomic unsigned long long
 static _Atomic unsigned long long
     peak_detach_accounting_stop_window_wall_ns = 0;
 static _Atomic unsigned long long peak_detach_accounting_sequence = 0;
+static _Atomic int peak_detach_mpi_process = 0;
 
 static unsigned long long
 peak_detach_controller_seconds_to_ns(double seconds)
@@ -172,6 +173,7 @@ static gboolean warned_helper_unavailable = FALSE;
 static gboolean warned_helper_resume_failed = FALSE;
 static gboolean warned_helper_fatal = FALSE;
 static gboolean warned_auto_helper_ptrace_scope = FALSE;
+static gboolean warned_auto_mpi_signal_backend = FALSE;
 static gboolean helper_state_fatal = FALSE;
 static gboolean warned_signal_gate_unavailable = FALSE;
 static gboolean warned_helper_gate_unavailable = FALSE;
@@ -623,6 +625,15 @@ peak_detach_controller_requested_backend(void)
 static gboolean
 peak_detach_controller_auto_should_use_signal_backend(void)
 {
+    if (atomic_load_explicit(&peak_detach_mpi_process,
+                             memory_order_acquire) != 0) {
+        if (!warned_auto_mpi_signal_backend) {
+            warned_auto_mpi_signal_backend = TRUE;
+            peak_log_info("[peak] auto safe detach using signal backend because MPI runtime is present\n");
+        }
+        return TRUE;
+    }
+
 #ifdef __linux__
     const char* override = g_getenv("PEAK_TEST_PTRACE_SCOPE");
     char buffer[32];
@@ -666,6 +677,14 @@ peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus statu
            status == PEAK_DETACH_STATUS_UNSUPPORTED;
 }
 #endif
+
+void
+peak_detach_controller_configure_mpi_process(gboolean is_mpi_process)
+{
+    atomic_store_explicit(&peak_detach_mpi_process,
+                          is_mpi_process ? 1 : 0,
+                          memory_order_release);
+}
 
 const char*
 peak_detach_controller_operation_string(PeakDetachOperation operation)
