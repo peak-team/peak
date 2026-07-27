@@ -15,6 +15,7 @@
 #include "internal/general_listener/mpi_report_transport.h"
 #endif
 #include "internal/jit_provider.h"
+#include "internal/gum_module_mutation.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "detach_controller.h"
 #include "logging.h"
@@ -2599,6 +2600,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         };
         PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
+        peak_gum_module_mutation_begin();
         if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                           &detach_status)) {
             result = peak_general_controller_status_is_retryable(detach_status) ?
@@ -2612,6 +2614,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                        peak_detach_controller_status_string(detach_status));
             peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
             g_object_unref(new_listener);
+            peak_gum_module_mutation_end();
             pthread_mutex_unlock(&lock);
             return result;
         }
@@ -2629,6 +2632,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             peak_detach_controller_abort_after_failed_finish("JIT attach finish",
                                                             detach_status);
         }
+        peak_gum_module_mutation_end();
 
         if (attach_status == GUM_ATTACH_OK) {
             hook_address[i] = symbol_address;
@@ -2761,6 +2765,7 @@ peak_general_controller_prepare_hook_mutation(size_t hook_id,
         request.blocked_pc_size = attach_plan->mutation_guard_size;
     }
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
     gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
 
     if (status_out != NULL) {
@@ -2768,6 +2773,7 @@ peak_general_controller_prepare_hook_mutation(size_t hook_id,
     }
 
     if (!prepared) {
+        peak_gum_module_mutation_end();
         peak_general_controller_trace_mutation(hook_id,
                                                operation,
                                                "prepare-failed",
@@ -2793,7 +2799,10 @@ peak_general_controller_finish_hook_mutation(size_t hook_id,
         .operation = operation
     };
 
-    return peak_detach_controller_finish_hook_mutation(&request, status_out);
+    gboolean finished =
+        peak_detach_controller_finish_hook_mutation(&request, status_out);
+    peak_gum_module_mutation_end();
+    return finished;
 }
 
 static gboolean
@@ -3568,6 +3577,7 @@ peak_general_controller_process_pending_batch_unlocked(void)
         attach_status[i] = GUM_ATTACH_OK;
     }
 
+    peak_gum_module_mutation_begin();
     (void)peak_detach_controller_prepare_hook_mutation_batch(requests,
                                                              candidate_count,
                                                              results,
@@ -3631,6 +3641,7 @@ peak_general_controller_process_pending_batch_unlocked(void)
                                                             finish_status);
         }
         stop_window_us = peak_detach_controller_last_stop_window_us();
+        peak_gum_module_mutation_end();
 
         for (size_t i = 0; i < candidate_count; i++) {
             if (!results[i].prepared) {
@@ -3706,6 +3717,8 @@ peak_general_controller_process_pending_batch_unlocked(void)
                 candidates[i].last_retry_status);
             peak_general_controller_reset_retry_unlocked(candidates[i].hook_id);
         }
+    } else {
+        peak_gum_module_mutation_end();
     }
 
     for (size_t i = 0; i < candidate_count; i++) {
@@ -5947,6 +5960,7 @@ peak_general_overhead_bootstrapping()
      */
     startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
+    peak_gum_module_mutation_begin();
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
@@ -5955,6 +5969,7 @@ peak_general_overhead_bootstrapping()
         peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
         g_object_unref(listener_bootstrapping);
         peak_general_overhead = 0.0;
+        peak_gum_module_mutation_end();
         return;
     }
 
@@ -5972,6 +5987,7 @@ peak_general_overhead_bootstrapping()
         peak_detach_controller_abort_after_failed_finish("overhead attach finish",
                                                         detach_status);
     }
+    peak_gum_module_mutation_end();
 
     if (attach_status != GUM_ATTACH_OK) {
         g_printerr("[peak] overhead calibration Gum attach failed, status=%d\n",
@@ -5998,6 +6014,7 @@ peak_general_overhead_bootstrapping()
     mutation_request.operation = PEAK_DETACH_OPERATION_DETACH;
     startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
+    peak_gum_module_mutation_begin();
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
@@ -6026,6 +6043,7 @@ peak_general_overhead_bootstrapping()
         peak_detach_controller_abort_after_failed_finish("overhead detach finish",
                                                         detach_status);
     }
+    peak_gum_module_mutation_end();
     if (!peak_general_controller_flush_teardown()) {
         g_printerr("[peak] overhead calibration Gum teardown did not flush; leaving bootstrap listener alive\n");
         g_free(time);
@@ -6344,6 +6362,7 @@ void peak_general_listener_attach()
                 .blocked_pc_size = attach_plan.mutation_guard_size
             };
             PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+            peak_gum_module_mutation_begin();
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                               &detach_status)) {
@@ -6355,6 +6374,7 @@ void peak_general_listener_attach()
                 peak_demangled_strings[i] = NULL;
                 peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
                 g_object_unref(new_listener);
+                peak_gum_module_mutation_end();
                 continue;
             }
             gum_interceptor_begin_transaction(interceptor);
@@ -6370,6 +6390,7 @@ void peak_general_listener_attach()
                 peak_detach_controller_abort_after_failed_finish("initial attach finish",
                                                                 detach_status);
             }
+            peak_gum_module_mutation_end();
             if (attach_status == GUM_ATTACH_OK) {
                 hook_address[i] = resolved_hook_address;
                 array_listener[i] = new_listener;

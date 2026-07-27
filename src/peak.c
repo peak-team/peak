@@ -1085,19 +1085,10 @@ static gpointer exit_address = NULL;
 void exit_interceptor_detach();
 
 static void
-peak_exit(int status) {
-
-    if (peak_runtime_is_fork_child()) {
-        original_exit(status);
-        __builtin_unreachable();
-    }
-
-    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
-        original_exit(status);
-        __builtin_unreachable();
-    }
-
+peak_publish_exit_status(int status)
+{
     int expected = 0;
+
     if (atomic_compare_exchange_strong_explicit(&peak_exit_status_known,
                                                 &expected,
                                                 1,
@@ -1115,6 +1106,22 @@ peak_exit(int status) {
             sched_yield();
         }
     }
+}
+
+static void
+peak_exit(int status) {
+
+    if (peak_runtime_is_fork_child()) {
+        original_exit(status);
+        __builtin_unreachable();
+    }
+
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+        original_exit(status);
+        __builtin_unreachable();
+    }
+
+    peak_publish_exit_status(status);
     peak_fini();
     if (atexit(exit_interceptor_detach) != 0) {
         peak_log_warn("[peak] failed to register deferred exit interceptor teardown\n");
@@ -1178,6 +1185,17 @@ static int main_wrapper(int argc, char** argv, char** envp) {
     }
 
     int ret = real_main(argc, argv, envp);
+
+    /*
+     * Finalize before libc enters exit() and before the dynamic loader starts
+     * running DSO finalizers. In particular, the Gum module-sync worker must
+     * be joined while this thread is outside both an exit replacement and the
+     * loader's teardown critical section. Publish the return status first so
+     * MPI fail-closed handling observes nonzero returns just as it observes
+     * explicit exit(status) calls.
+     */
+    peak_publish_exit_status(ret);
+    peak_fini();
 
     return ret;
 }

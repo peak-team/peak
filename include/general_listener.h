@@ -10,7 +10,7 @@
  * immutable snapshot captured from this state.
  */
 
-#include "frida-gum.h"
+#include "internal/gum_peak_compat.h"
 
 #include <fcntl.h>
 #include <unistd.h>

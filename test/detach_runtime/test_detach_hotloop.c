@@ -2334,6 +2334,7 @@ run_signal_user_collision_check(void)
     memset(&ev, 0, sizeof(ev));
     ev.sigev_notify = SIGEV_SIGNAL;
     ev.sigev_signo = reserved_signum;
+    memset(&timerid, 0xa5, sizeof(timerid));
     errno = 0;
     if (timer_create(CLOCK_MONOTONIC, &ev, &timerid) != 0) {
         perror("timer_create reserved SIGEV_SIGNAL migrated");
@@ -2353,6 +2354,7 @@ run_signal_user_collision_check(void)
     ev.sigev_notify = SIGEV_THREAD_ID;
     ev.sigev_signo = reserved_signum;
     ev._sigev_un._tid = (int)syscall(SYS_gettid);
+    memset(&timerid, 0xa5, sizeof(timerid));
     errno = 0;
     if (timer_create(CLOCK_MONOTONIC, &ev, &timerid) != 0) {
         perror("timer_create reserved SIGEV_THREAD_ID migrated");

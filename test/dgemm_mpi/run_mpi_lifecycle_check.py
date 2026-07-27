@@ -47,6 +47,7 @@ NUMBER_RE = r"[0-9.eE+-]+"
 EXPECTED_LAUNCHER_ABNORMAL_MODES = {
     "no-finalize",
     "no-finalize-nonzero",
+    "no-finalize-return-nonzero",
     "subset-finalize-nonzero",
     "subset-finalize-clean",
     "subset-finalize-clean-collective",
@@ -332,6 +333,7 @@ def parse_args():
         choices=[
             "no-finalize",
             "no-finalize-nonzero",
+            "no-finalize-return-nonzero",
             "no-finalize-collective-disabled",
             "finalize-clean",
             "finalize-clean-output-mpi",
@@ -464,6 +466,11 @@ def main():
     allow_interrupted_peer_temporary_stats = False
     if args.mode == "no-finalize-nonzero":
         app_args.append("no-finalize-then-exit1")
+        expected = "PMPI_Finalize was not observed on every rank"
+        expected_peak_tables = 0
+        expected_stats_files = None
+    elif args.mode == "no-finalize-return-nonzero":
+        app_args.append("no-finalize-then-return1")
         expected = "PMPI_Finalize was not observed on every rank"
         expected_peak_tables = 0
         expected_stats_files = None

@@ -61,6 +61,11 @@ static pthread_t peak_gum_module_sync_thread;
 static guint peak_gum_module_sync_thread_started;
 static guint peak_gum_module_sync_atfork_registered;
 static guint peak_gum_module_sync_forked_child;
+static pthread_mutex_t peak_gum_module_sync_mutation_gate =
+    PTHREAD_MUTEX_INITIALIZER;
+
+extern void peak_gum_module_sync_test_quiesce_cleanup_gate(void)
+    __attribute__((weak));
 
 G_STATIC_ASSERT(sizeof(PeakGumSynchronizeModulesFunc) == sizeof(gpointer));
 /*
@@ -203,7 +208,9 @@ peak_gum_module_sync_try_drain(gboolean allow_quiescing)
                             __ATOMIC_ACQUIRE) != 0) {
         sync = __atomic_load_n(&peak_gum_module_sync, __ATOMIC_ACQUIRE);
         if (sync != NULL) {
+            pthread_mutex_lock(&peak_gum_module_sync_mutation_gate);
             sync();
+            pthread_mutex_unlock(&peak_gum_module_sync_mutation_gate);
             did_work = TRUE;
         }
     }
@@ -286,25 +293,48 @@ peak_gum_module_sync_worker(void* data)
 static void
 peak_gum_module_sync_quiesce(void)
 {
-    guint state = __atomic_load_n(&peak_gum_module_sync_state,
-                                  __ATOMIC_ACQUIRE);
+    guint state;
 
-    if (__atomic_load_n(&peak_gum_module_sync_thread_started,
-                        __ATOMIC_ACQUIRE) == 0 ||
-        (state != PEAK_GUM_MODULE_SYNC_STARTING &&
-         state != PEAK_GUM_MODULE_SYNC_ACTIVE)) {
-        return;
+    for (;;) {
+        state = __atomic_load_n(&peak_gum_module_sync_state,
+                                __ATOMIC_ACQUIRE);
+        if (state == PEAK_GUM_MODULE_SYNC_QUIESCING) {
+            while (__atomic_load_n(&peak_gum_module_sync_state,
+                                   __ATOMIC_ACQUIRE) ==
+                   PEAK_GUM_MODULE_SYNC_QUIESCING) {
+                sched_yield();
+            }
+            return;
+        }
+        /*
+         * INACTIVE is the completion publication. The owner clears
+         * thread_started immediately after join, but still has drain and fd
+         * cleanup to perform before callers may continue into Gum teardown.
+         */
+        if (__atomic_load_n(&peak_gum_module_sync_thread_started,
+                            __ATOMIC_ACQUIRE) == 0) {
+            return;
+        }
+        if (state != PEAK_GUM_MODULE_SYNC_STARTING &&
+            state != PEAK_GUM_MODULE_SYNC_ACTIVE) {
+            return;
+        }
+        if (__atomic_compare_exchange_n(&peak_gum_module_sync_state,
+                                        &state,
+                                        PEAK_GUM_MODULE_SYNC_QUIESCING,
+                                        FALSE,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            break;
+        }
     }
 
-    __atomic_store_n(&peak_gum_module_sync_state,
-                     PEAK_GUM_MODULE_SYNC_QUIESCING,
-                     __ATOMIC_RELEASE);
     peak_gum_module_sync_wake();
     pthread_join(peak_gum_module_sync_thread, NULL);
-    __atomic_store_n(&peak_gum_module_sync_thread_started,
-                     0,
-                     __ATOMIC_RELEASE);
 
+    if (peak_gum_module_sync_test_quiesce_cleanup_gate != NULL) {
+        peak_gum_module_sync_test_quiesce_cleanup_gate();
+    }
     while (__atomic_load_n(&peak_gum_module_sync_active_drains,
                            __ATOMIC_ACQUIRE) != 0) {
         sched_yield();
@@ -319,12 +349,30 @@ peak_gum_module_sync_quiesce(void)
     if (event_fd != -1) {
         close(event_fd);
     }
+    __atomic_store_n(&peak_gum_module_sync_thread_started,
+                     0,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync_state,
+                     PEAK_GUM_MODULE_SYNC_INACTIVE,
+                     __ATOMIC_RELEASE);
 }
 
 void
 gum_interceptor_peak_quiesce_deferred_module_sync(void)
 {
     peak_gum_module_sync_quiesce();
+}
+
+void
+gum_interceptor_peak_begin_module_mutation(void)
+{
+    pthread_mutex_lock(&peak_gum_module_sync_mutation_gate);
+}
+
+void
+gum_interceptor_peak_end_module_mutation(void)
+{
+    pthread_mutex_unlock(&peak_gum_module_sync_mutation_gate);
 }
 
 static void

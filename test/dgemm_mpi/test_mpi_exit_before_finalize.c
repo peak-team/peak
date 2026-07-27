@@ -252,6 +252,10 @@ main(int argc, char** argv)
         exit(1);
     }
 
+    if (argc > 1 && strcmp(argv[1], "no-finalize-then-return1") == 0) {
+        return 1;
+    }
+
     if (argc > 1 && strcmp(argv[1], "subset-finalize-then-exit1") == 0) {
         if (rank == 0) {
             MPI_Finalize();

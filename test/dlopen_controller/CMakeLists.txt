@@ -30,6 +30,8 @@ if(PEAK_GUM_PEAK_API_AVAILABLE)
         test_gum_module_sync_lifecycle.c)
     target_link_libraries(test_gum_module_sync_lifecycle
         PRIVATE peak ${CMAKE_DL_LIBS})
+    target_link_options(test_gum_module_sync_lifecycle
+        PRIVATE -Wl,--export-dynamic)
     target_compile_definitions(test_gum_module_sync_lifecycle PRIVATE
         PEAK_TEST_DEFERRED_MODULE_A="$<TARGET_FILE:test_deferred_module_a>"
         PEAK_TEST_DEFERRED_MODULE_B="$<TARGET_FILE:test_deferred_module_b>"
