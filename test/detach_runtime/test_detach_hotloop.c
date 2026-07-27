@@ -2440,12 +2440,18 @@ run_signal_user_collision_check(void)
 
 #ifdef SYS_timer_create
     reserved_signum = migrated_signum;
+    int raw_timerid = -1;
     memset(&ev, 0, sizeof(ev));
     ev.sigev_notify = SIGEV_SIGNAL;
     ev.sigev_signo = reserved_signum;
     errno = 0;
-    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &timerid) == 0) {
-        timer_delete(timerid);
+    if (syscall(SYS_timer_create,
+                CLOCK_MONOTONIC,
+                &ev,
+                &raw_timerid) == 0) {
+#ifdef SYS_timer_delete
+        (void)syscall(SYS_timer_delete, raw_timerid);
+#endif
     }
     if (!expect_signal_migrated("syscall:timer_create",
                                 selected_signal,
@@ -2710,13 +2716,15 @@ run_signal_forced_collision_check(void)
     }
 #endif
 #ifdef SYS_timer_create
-    timer_t invalid_timerid;
+    int invalid_timerid = -1;
     errno = 0;
     if (syscall(SYS_timer_create,
                 CLOCK_MONOTONIC,
                 (void*)1,
                 &invalid_timerid) != -1) {
-        timer_delete(invalid_timerid);
+#ifdef SYS_timer_delete
+        (void)syscall(SYS_timer_delete, invalid_timerid);
+#endif
         fprintf(stderr, "invalid raw timer_create sigevent pointer was accepted\n");
         return 2;
     }
