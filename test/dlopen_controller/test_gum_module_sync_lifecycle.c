@@ -128,10 +128,12 @@ main(void)
         }
 
         /*
-         * Deactivate while both loader threads are still publishing RTLD
-         * notifications. The overlay must quiesce publishers and its worker
-         * before Gum frees the registry.
+         * Match PEAK's process-final ordering: stop module synchronization
+         * before any listener teardown can take Gum interceptor locks. Loader
+         * threads continue publishing RTLD notifications to exercise the
+         * quiescing admission boundary.
          */
+        gum_interceptor_peak_quiesce_deferred_module_sync();
         gum_deinit_embedded();
         atomic_store_explicit(&stop, 1, memory_order_release);
         for (int i = 0; i < THREADS; i++) {

@@ -321,6 +321,12 @@ peak_gum_module_sync_quiesce(void)
     }
 }
 
+void
+gum_interceptor_peak_quiesce_deferred_module_sync(void)
+{
+    peak_gum_module_sync_quiesce();
+}
+
 static void
 peak_gum_module_sync_atfork_child(void)
 {

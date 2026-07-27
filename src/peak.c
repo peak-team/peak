@@ -582,6 +582,16 @@ peak_fini_impl(void)
         }
     }
 
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 2
+    /*
+     * The module-sync worker may emit Gum registry notifications that acquire
+     * interceptor state. Stop it before controller/listener teardown starts
+     * taking those locks in the opposite order.
+     */
+    gum_interceptor_peak_quiesce_deferred_module_sync();
+#endif
+
     peak_general_listener_controller_stop();
     if (peak_runtime_start_time > 0.0) {
         peak_main_time = peak_second() - peak_runtime_start_time;
