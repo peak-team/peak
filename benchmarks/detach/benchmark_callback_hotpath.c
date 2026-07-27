@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -235,23 +236,53 @@ parse_double_arg(int argc, char** argv, const char* name, double fallback)
     return fallback;
 }
 
+static int
+has_flag(int argc, char** argv, const char* name)
+{
+    for (int index = 1; index < argc; index++) {
+        if (strcmp(argv[index], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int
 main(int argc, char** argv)
 {
     long threads = parse_long_arg(argc, argv, "--threads", 1);
     long target_ns = parse_long_arg(argc, argv, "--target-ns", 10);
+    long requested_work_iterations =
+        parse_long_arg(argc, argv, "--work-iterations", 0);
     double seconds = parse_double_arg(argc, argv, "--seconds", 1.0);
+    int calibrate_only = has_flag(argc, argv, "--calibrate-only");
     pthread_t* tids;
     WorkerState* states;
     int* cpus;
     StartGate gate;
 
-    if (threads <= 0 || target_ns <= 0 || seconds <= 0.0) {
-        fprintf(stderr, "threads, target-ns, and seconds must be positive\n");
+    if (threads <= 0 || target_ns <= 0 || seconds <= 0.0 ||
+        requested_work_iterations < 0 ||
+        requested_work_iterations > (long)UINT_MAX) {
+        fprintf(stderr,
+                "threads, target-ns, seconds, and work-iterations are invalid\n");
         return 2;
     }
 
-    double calibrated_work_ns = calibrate_work(target_ns);
+    double calibrated_work_ns;
+    if (requested_work_iterations > 0) {
+        calibrated_work_ns =
+            measure_raw_work_ns((unsigned int)requested_work_iterations);
+    } else {
+        calibrated_work_ns = calibrate_work(target_ns);
+    }
+    if (calibrate_only) {
+        printf("target_ns=%ld calibrated_work_ns=%.3f work_iterations=%u\n",
+               target_ns,
+               calibrated_work_ns,
+               work_iterations);
+        return 0;
+    }
     tids = calloc((size_t)threads, sizeof(*tids));
     states = calloc((size_t)threads, sizeof(*states));
     cpus = parse_cpu_list(threads);

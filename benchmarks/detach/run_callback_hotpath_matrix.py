@@ -10,9 +10,17 @@ import sys
 
 
 RESULT_RE = re.compile(
+    r"calibrated_work_ns=(?P<calibrated_ns>[0-9.]+).*"
+    r"work_iterations=(?P<work_iterations>[0-9]+).*"
     r"calls_per_sec=(?P<cps>[0-9.]+).*"
     r"ns_per_call=(?P<ns>[0-9.]+).*"
     r"thread_ns_per_call=(?P<thread_ns>[0-9.]+)"
+)
+
+CALIBRATION_RE = re.compile(
+    r"target_ns=(?P<target_ns>[0-9]+).*"
+    r"calibrated_work_ns=(?P<calibrated_ns>[0-9.]+).*"
+    r"work_iterations=(?P<work_iterations>[0-9]+)"
 )
 
 
@@ -114,7 +122,42 @@ def peak_env(libpeak, max_threads):
     return env
 
 
-def run_sample(args, env, threads, target_ns):
+def calibrate_iterations(args, target_ns):
+    completed = subprocess.run(
+        [
+            args.exe,
+            "--target-ns",
+            str(target_ns),
+            "--calibrate-only",
+        ],
+        env=clean_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        timeout=args.timeout,
+        check=False,
+    )
+    match = CALIBRATION_RE.search(completed.stdout)
+    if completed.returncode != 0 or match is None:
+        print(completed.stdout, file=sys.stderr)
+        raise RuntimeError(
+            f"benchmark calibration failed: target_ns={target_ns} "
+            f"rc={completed.returncode}"
+        )
+    iterations = int(match.group("work_iterations"))
+    if iterations <= 0:
+        raise RuntimeError(
+            f"benchmark calibration returned invalid iterations={iterations}"
+        )
+    print(
+        f"HOTPATH_CALIBRATION target_ns={target_ns} "
+        f"calibrated_work_ns={float(match.group('calibrated_ns')):.3f} "
+        f"work_iterations={iterations}"
+    )
+    return iterations
+
+
+def run_sample(args, env, threads, target_ns, work_iterations):
     completed = subprocess.run(
         [
             args.exe,
@@ -122,6 +165,8 @@ def run_sample(args, env, threads, target_ns):
             str(threads),
             "--target-ns",
             str(target_ns),
+            "--work-iterations",
+            str(work_iterations),
             "--seconds",
             str(args.seconds),
         ],
@@ -139,16 +184,26 @@ def run_sample(args, env, threads, target_ns):
             f"benchmark failed: threads={threads} target_ns={target_ns} "
             f"rc={completed.returncode}"
         )
+    measured_iterations = int(match.group("work_iterations"))
+    if measured_iterations != work_iterations:
+        raise RuntimeError(
+            f"benchmark workload mismatch: threads={threads} "
+            f"target_ns={target_ns} expected_iterations={work_iterations} "
+            f"measured_iterations={measured_iterations}"
+        )
     return {
         "cps": float(match.group("cps")),
         "ns": float(match.group("ns")),
         "thread_ns": float(match.group("thread_ns")),
+        "calibrated_ns": float(match.group("calibrated_ns")),
+        "work_iterations": measured_iterations,
     }
 
 
-def run_config(args, name, env, threads, target_ns):
+def run_config(args, name, env, threads, target_ns, work_iterations):
     samples = [
-        run_sample(args, env, threads, target_ns) for _ in range(args.samples)
+        run_sample(args, env, threads, target_ns, work_iterations)
+        for _ in range(args.samples)
     ]
     result = {
         key: statistics.median(sample[key] for sample in samples)
@@ -156,7 +211,8 @@ def run_config(args, name, env, threads, target_ns):
     }
     print(
         f"HOTPATH_RESULT config={name} threads={threads} "
-        f"target_ns={target_ns} ns_per_call={result['ns']:.3f} "
+        f"target_ns={target_ns} work_iterations={work_iterations} "
+        f"ns_per_call={result['ns']:.3f} "
         f"thread_ns_per_call={result['thread_ns']:.3f} "
         f"calls_per_sec={result['cps']:.3f}"
     )
@@ -216,10 +272,11 @@ def main():
 
     results = {}
     for target_ns in args.target_ns:
+        work_iterations = calibrate_iterations(args, target_ns)
         for threads in args.threads:
             for name, env in configs:
                 results[(name, target_ns, threads)] = run_config(
-                    args, name, env, threads, target_ns
+                    args, name, env, threads, target_ns, work_iterations
                 )
 
     failed = False
