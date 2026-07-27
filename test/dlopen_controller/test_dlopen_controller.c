@@ -1,11 +1,23 @@
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
 
+#include <dlfcn.h>
+#include <libgen.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifndef GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION
+static gboolean
+gum_interceptor_peak_drain_deferred_module_sync(void)
+{
+    return FALSE;
+}
+#endif
 
 static int failures = 0;
 
@@ -54,6 +66,184 @@ check_size(const char* label, size_t actual, size_t expected)
                 actual);
         failures++;
     }
+}
+
+typedef struct {
+    const char* name;
+    gboolean found;
+} ModuleSearch;
+
+static gboolean
+find_registry_module(GumModule* module, gpointer user_data)
+{
+    ModuleSearch* search = user_data;
+
+    if (strcmp(gum_module_get_name(module), search->name) == 0) {
+        search->found = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+registry_contains(GumModuleRegistry* registry, const char* path)
+{
+    char* path_copy = strdup(path);
+    ModuleSearch search = {
+        .name = basename(path_copy),
+        .found = FALSE,
+    };
+
+    gum_module_registry_enumerate_modules(registry,
+                                          find_registry_module,
+                                          &search);
+    free(path_copy);
+    return search.found;
+}
+
+static void
+test_deferred_module_registry_sync(void)
+{
+    GumModuleRegistry* registry;
+    void* module_a;
+    void* module_b;
+    gboolean modules_published = FALSE;
+    gboolean modules_removed = FALSE;
+
+    registry = gum_module_registry_obtain();
+
+    module_a = dlopen(PEAK_TEST_DEFERRED_MODULE_A, RTLD_NOW | RTLD_LOCAL);
+    module_b = dlopen(PEAK_TEST_DEFERRED_MODULE_B, RTLD_NOW | RTLD_LOCAL);
+    check_true("first deferred module loaded", module_a != NULL);
+    check_true("second deferred module loaded", module_b != NULL);
+    if (module_a == NULL || module_b == NULL) {
+        if (module_b != NULL) {
+            dlclose(module_b);
+        }
+        if (module_a != NULL) {
+            dlclose(module_a);
+        }
+        (void)gum_interceptor_peak_drain_deferred_module_sync();
+        return;
+    }
+
+    for (unsigned int i = 0; i < 1000; i++) {
+        (void)gum_interceptor_peak_drain_deferred_module_sync();
+        if (registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_A) &&
+            registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_B)) {
+            modules_published = TRUE;
+            break;
+        }
+        usleep(1000);
+    }
+    check_true("deferred module load notifications are eventually published",
+               modules_published);
+
+    check_true("first deferred module unloaded", dlclose(module_a) == 0);
+    check_true("second deferred module unloaded", dlclose(module_b) == 0);
+    for (unsigned int i = 0; i < 1000; i++) {
+        (void)gum_interceptor_peak_drain_deferred_module_sync();
+        if (!registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_A) &&
+            !registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_B)) {
+            modules_removed = TRUE;
+            break;
+        }
+        usleep(1000);
+    }
+    check_true("deferred module unload notifications are eventually applied",
+               modules_removed);
+}
+
+typedef struct {
+    const char* path;
+    atomic_int* start;
+    atomic_int* remaining;
+    atomic_int* failed;
+} DeferredModuleStressArgs;
+
+static void*
+deferred_module_stress_worker(void* data)
+{
+    DeferredModuleStressArgs* args = data;
+
+    while (atomic_load_explicit(args->start, memory_order_acquire) == 0) {
+        sched_yield();
+    }
+
+    for (unsigned int i = 0; i < 500; i++) {
+        void* module = dlopen(args->path, RTLD_NOW | RTLD_LOCAL);
+
+        if (module == NULL) {
+            atomic_store_explicit(args->failed, 1, memory_order_release);
+            break;
+        }
+        sched_yield();
+        if (dlclose(module) != 0) {
+            atomic_store_explicit(args->failed, 1, memory_order_release);
+            break;
+        }
+    }
+
+    atomic_fetch_sub_explicit(args->remaining, 1, memory_order_acq_rel);
+    return NULL;
+}
+
+static void
+test_concurrent_deferred_module_registry_sync(void)
+{
+    enum { THREAD_COUNT = 8 };
+    GumModuleRegistry* registry = gum_module_registry_obtain();
+    pthread_t threads[THREAD_COUNT];
+    DeferredModuleStressArgs args[THREAD_COUNT];
+    atomic_int start = 0;
+    atomic_int remaining = 0;
+    atomic_int failed = 0;
+    int created = 0;
+    gboolean registry_clean = FALSE;
+
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        args[i].path = (i & 1) != 0 ?
+            PEAK_TEST_DEFERRED_MODULE_A :
+            PEAK_TEST_DEFERRED_MODULE_B;
+        args[i].start = &start;
+        args[i].remaining = &remaining;
+        args[i].failed = &failed;
+        atomic_fetch_add_explicit(&remaining, 1, memory_order_relaxed);
+        if (pthread_create(&threads[i],
+                           NULL,
+                           deferred_module_stress_worker,
+                           &args[i]) != 0) {
+            atomic_store_explicit(&failed, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&remaining, 1, memory_order_acq_rel);
+            break;
+        }
+        created++;
+    }
+
+    atomic_store_explicit(&start, 1, memory_order_release);
+    while (atomic_load_explicit(&remaining, memory_order_acquire) != 0) {
+        (void)gum_interceptor_peak_drain_deferred_module_sync();
+        sched_yield();
+    }
+    for (int i = 0; i < created; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    while (gum_interceptor_peak_drain_deferred_module_sync()) {
+    }
+
+    check_true("concurrent deferred module load/unload stress completed",
+               atomic_load_explicit(&failed, memory_order_acquire) == 0);
+    for (unsigned int i = 0; i < 1000; i++) {
+        (void)gum_interceptor_peak_drain_deferred_module_sync();
+        if (!registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_A) &&
+            !registry_contains(registry, PEAK_TEST_DEFERRED_MODULE_B)) {
+            registry_clean = TRUE;
+            break;
+        }
+        usleep(1000);
+    }
+    check_true("modules absent after concurrent deferred stress",
+               registry_clean);
 }
 
 static void
@@ -587,6 +777,8 @@ main(void)
 {
     gum_init_embedded();
 
+    test_deferred_module_registry_sync();
+    test_concurrent_deferred_module_registry_sync();
     test_queue_capacity_and_full_drop();
     test_closed_queue_drop();
     test_bounded_drain_budget();

@@ -17,6 +17,33 @@ RENAMED_REDIRECT_RESOLVER = (
     "_gum_interceptor_backend_resolve_redirect_peak_dispatch"
 )
 INTERCEPTOR_OBJECT_NAME = "guminterceptor.c.o"
+LINUX_MODULE_REGISTRY_OBJECT_NAME = (
+    "backend-linux_gummoduleregistry-linux.c.o"
+)
+ELF_MODULE_REGISTRY_OBJECT_NAME = (
+    "backend-elf_gummoduleregistry-elf.c.o"
+)
+RTLD_NOTIFICATION_HANDLER = (
+    "_gum_module_registry_handle_rtld_notification"
+)
+RENAMED_RTLD_NOTIFICATION_HANDLER = (
+    "_gum_module_registry_handle_rtld_notification_peak_original"
+)
+MODULE_REGISTRY_ACTIVATE = "_gum_module_registry_activate"
+MODULE_REGISTRY_DEACTIVATE = "_gum_module_registry_deactivate"
+RENAMED_MODULE_REGISTRY_ACTIVATE = (
+    "_gum_module_registry_activate_peak_original"
+)
+RENAMED_MODULE_REGISTRY_DEACTIVATE = (
+    "_gum_module_registry_deactivate_peak_original"
+)
+GUM_RUNTIME_OBJECT_NAME = "gum.c.o"
+GUM_DEINIT = "gum_deinit"
+GUM_DEINIT_EMBEDDED = "gum_deinit_embedded"
+GUM_SHUTDOWN = "gum_shutdown"
+RENAMED_GUM_DEINIT = "gum_deinit_peak_original"
+RENAMED_GUM_DEINIT_EMBEDDED = "gum_deinit_embedded_peak_original"
+RENAMED_GUM_SHUTDOWN = "gum_shutdown_peak_original"
 BEGIN_INVOCATION = "_gum_function_context_begin_invocation"
 END_INVOCATION = "_gum_function_context_end_invocation"
 RENAMED_BEGIN_INVOCATION = (
@@ -189,6 +216,178 @@ def route_invocation_dispatch_through_overlay(
 
     replace_archive_member(ar, library, extracted)
     print(f"patched {object_name}: routed PEAK direct listener dispatch")
+
+
+def route_rtld_notification_through_overlay(
+    library: Path,
+    members: list[str],
+    ar: str,
+    nm: str,
+    objcopy: str,
+    work_dir: Path,
+) -> None:
+    object_name = LINUX_MODULE_REGISTRY_OBJECT_NAME
+    if members.count(object_name) != 1:
+        fail(
+            f"expected exactly one {object_name} in {library}, "
+            f"found {members.count(object_name)}"
+        )
+
+    extracted = work_dir / object_name
+    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+    if result.returncode != 0 or not extracted.exists():
+        fail(f"failed to extract {object_name}:\n{result.stdout}\n{result.stderr}")
+
+    before = symbol_kinds(nm, extracted)
+    expected = ("T", RTLD_NOTIFICATION_HANDLER)
+    renamed = ("T", RENAMED_RTLD_NOTIFICATION_HANDLER)
+    if expected not in before or renamed in before:
+        fail(
+            f"unexpected RTLD notification symbols in {object_name}: "
+            f"original={expected in before} renamed={renamed in before}"
+        )
+
+    result = run([
+        objcopy,
+        "--redefine-sym",
+        f"{RTLD_NOTIFICATION_HANDLER}={RENAMED_RTLD_NOTIFICATION_HANDLER}",
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to route RTLD notifications in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    after = symbol_kinds(nm, extracted)
+    if expected in after or renamed not in after:
+        fail(f"RTLD notification rename did not take effect in {object_name}")
+
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed RTLD notifications through PEAK")
+
+
+def route_module_registry_lifecycle_through_overlay(
+    library: Path,
+    members: list[str],
+    ar: str,
+    nm: str,
+    objcopy: str,
+    work_dir: Path,
+) -> None:
+    object_name = ELF_MODULE_REGISTRY_OBJECT_NAME
+    if members.count(object_name) != 1:
+        fail(
+            f"expected exactly one {object_name} in {library}, "
+            f"found {members.count(object_name)}"
+        )
+
+    extracted = work_dir / object_name
+    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+    if result.returncode != 0 or not extracted.exists():
+        fail(f"failed to extract {object_name}:\n{result.stdout}\n{result.stderr}")
+
+    expected = {
+        ("T", MODULE_REGISTRY_ACTIVATE),
+        ("T", MODULE_REGISTRY_DEACTIVATE),
+    }
+    renamed = {
+        ("T", RENAMED_MODULE_REGISTRY_ACTIVATE),
+        ("T", RENAMED_MODULE_REGISTRY_DEACTIVATE),
+    }
+    before = symbol_kinds(nm, extracted)
+    if not expected.issubset(before) or before.intersection(renamed):
+        fail(
+            f"unexpected module registry lifecycle symbols in {object_name}: "
+            f"activate={('T', MODULE_REGISTRY_ACTIVATE) in before} "
+            f"deactivate={('T', MODULE_REGISTRY_DEACTIVATE) in before} "
+            f"renamed_activate="
+            f"{('T', RENAMED_MODULE_REGISTRY_ACTIVATE) in before} "
+            f"renamed_deactivate="
+            f"{('T', RENAMED_MODULE_REGISTRY_DEACTIVATE) in before}"
+        )
+
+    result = run([
+        objcopy,
+        "--redefine-sym",
+        f"{MODULE_REGISTRY_ACTIVATE}={RENAMED_MODULE_REGISTRY_ACTIVATE}",
+        "--redefine-sym",
+        f"{MODULE_REGISTRY_DEACTIVATE}={RENAMED_MODULE_REGISTRY_DEACTIVATE}",
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to route module registry lifecycle in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    after = symbol_kinds(nm, extracted)
+    if after.intersection(expected) or not renamed.issubset(after):
+        fail(
+            f"module registry lifecycle rename did not take effect in "
+            f"{object_name}"
+        )
+
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed module registry lifecycle through PEAK")
+
+
+def route_gum_shutdown_through_overlay(
+    library: Path,
+    members: list[str],
+    ar: str,
+    nm: str,
+    objcopy: str,
+    work_dir: Path,
+) -> None:
+    object_name = GUM_RUNTIME_OBJECT_NAME
+    if members.count(object_name) != 1:
+        fail(
+            f"expected exactly one {object_name} in {library}, "
+            f"found {members.count(object_name)}"
+        )
+
+    extracted = work_dir / object_name
+    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+    if result.returncode != 0 or not extracted.exists():
+        fail(f"failed to extract {object_name}:\n{result.stdout}\n{result.stderr}")
+
+    expected = {
+        ("T", GUM_DEINIT),
+        ("T", GUM_DEINIT_EMBEDDED),
+        ("T", GUM_SHUTDOWN),
+    }
+    renamed = {
+        ("T", RENAMED_GUM_DEINIT),
+        ("T", RENAMED_GUM_DEINIT_EMBEDDED),
+        ("T", RENAMED_GUM_SHUTDOWN),
+    }
+    before = symbol_kinds(nm, extracted)
+    if not expected.issubset(before) or before.intersection(renamed):
+        fail(f"unexpected Gum shutdown lifecycle symbols in {object_name}")
+
+    result = run([
+        objcopy,
+        "--redefine-sym",
+        f"{GUM_DEINIT}={RENAMED_GUM_DEINIT}",
+        "--redefine-sym",
+        f"{GUM_DEINIT_EMBEDDED}={RENAMED_GUM_DEINIT_EMBEDDED}",
+        "--redefine-sym",
+        f"{GUM_SHUTDOWN}={RENAMED_GUM_SHUTDOWN}",
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to route Gum shutdown lifecycle in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    after = symbol_kinds(nm, extracted)
+    if after.intersection(expected) or not renamed.issubset(after):
+        fail(f"Gum shutdown lifecycle rename did not take effect in {object_name}")
+
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed Gum shutdown lifecycle through PEAK")
 
 
 def find_all(data: bytes | bytearray, needle: bytes) -> list[int]:
@@ -961,6 +1160,30 @@ def main() -> int:
         )
 
     route_invocation_dispatch_through_overlay(
+        library,
+        members,
+        args.ar,
+        args.nm,
+        args.objcopy,
+        work_dir,
+    )
+    route_rtld_notification_through_overlay(
+        library,
+        members,
+        args.ar,
+        args.nm,
+        args.objcopy,
+        work_dir,
+    )
+    route_module_registry_lifecycle_through_overlay(
+        library,
+        members,
+        args.ar,
+        args.nm,
+        args.objcopy,
+        work_dir,
+    )
+    route_gum_shutdown_through_overlay(
         library,
         members,
         args.ar,
