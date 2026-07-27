@@ -69,6 +69,27 @@ monotonic_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static int
+sleep_monotonic_seconds(long seconds)
+{
+    struct timespec deadline;
+    int result;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        return -1;
+    }
+    deadline.tv_sec += seconds;
+    do {
+        result =
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+    } while (result == EINTR);
+    if (result != 0) {
+        errno = result;
+        return -1;
+    }
+    return 0;
+}
+
 static long
 parse_long_arg(int argc, char** argv, const char* name, long fallback)
 {
@@ -363,7 +384,19 @@ main(int argc, char** argv)
     pthread_mutex_unlock(&blocker.mutex);
 
     double start = monotonic_seconds();
-    usleep((useconds_t)seconds * 1000000u);
+    if (sleep_monotonic_seconds(seconds) != 0) {
+        perror("clock_nanosleep");
+        atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
+        blocker_release(&blocker);
+        for (long i = 0; i < created_threads; i++) {
+            pthread_join(tids[i], NULL);
+        }
+        start_gate_destroy(&gate);
+        blocker_destroy(&blocker);
+        free(tids);
+        free(states);
+        return 2;
+    }
     atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
     blocker_release(&blocker);
 
