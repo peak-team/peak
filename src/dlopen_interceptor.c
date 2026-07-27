@@ -6,6 +6,7 @@
 #include "detach_controller.h"
 #include "logging.h"
 #include "internal/general_listener/attach_policy.h"
+#include "internal/gum_module_mutation.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "utils/source_target.h"
 
@@ -1423,6 +1424,7 @@ dlopen_interceptor_attach_candidate_scalar(
 {
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
+    peak_gum_module_mutation_begin();
     if (!peak_detach_controller_prepare_hook_mutation(mutation_request,
                                                       &detach_status)) {
         gboolean retryable =
@@ -1435,6 +1437,7 @@ dlopen_interceptor_attach_candidate_scalar(
                                                      detach_status,
                                                      retryable);
         dlopen_interceptor_release_attach_candidate(candidate);
+        peak_gum_module_mutation_end();
         return;
     }
 
@@ -1452,6 +1455,7 @@ dlopen_interceptor_attach_candidate_scalar(
             "dynamic attach finish",
             detach_status);
     }
+    peak_gum_module_mutation_end();
     if (attach_status == GUM_ATTACH_OK) {
         dlopen_interceptor_publish_attach_candidate(candidate,
                                                     mutation_request,
@@ -1479,6 +1483,7 @@ dlopen_interceptor_attach_candidate_batch(
     for (size_t i = 0; i < candidate_count; i++) {
         attach_statuses[i] = GUM_ATTACH_WRONG_SIGNATURE;
     }
+    peak_gum_module_mutation_begin();
     (void)peak_detach_controller_prepare_hook_mutation_batch(
         mutation_requests,
         candidate_count,
@@ -1507,6 +1512,7 @@ dlopen_interceptor_attach_candidate_batch(
                 detach_status);
         }
     }
+    peak_gum_module_mutation_end();
 
     for (size_t i = 0; i < candidate_count; i++) {
         if (batch_results[i].prepared) {
@@ -2219,6 +2225,7 @@ int dlopen_interceptor_attach()
      */
     startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
+    peak_gum_module_mutation_begin();
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
@@ -2230,6 +2237,7 @@ int dlopen_interceptor_attach()
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
         dlopen_interceptor_reset_fftw_target_scope();
+        peak_gum_module_mutation_end();
         return attach_status;
     }
 
@@ -2245,6 +2253,7 @@ int dlopen_interceptor_attach()
         peak_detach_controller_abort_after_failed_finish("dlopen attach finish",
                                                         detach_status);
     }
+    peak_gum_module_mutation_end();
     if (attach_status != GUM_ATTACH_OK) {
         g_object_unref(dlopen_listener);
         g_object_unref(dlopen_interceptor);
@@ -2279,11 +2288,13 @@ gboolean dlopen_interceptor_dettach()
         };
         PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
+        peak_gum_module_mutation_begin();
         if (!dlopen_interceptor_prepare_hook_mutation_with_retry(
                 &mutation_request,
                 &detach_status)) {
             g_printerr("[peak] skipping dlopen Gum listener detach: %s\n",
                        peak_detach_controller_status_string(detach_status));
+            peak_gum_module_mutation_end();
             return FALSE;
         }
         gum_interceptor_begin_transaction(dlopen_interceptor);
@@ -2294,6 +2305,7 @@ gboolean dlopen_interceptor_dettach()
             peak_detach_controller_abort_after_failed_finish("dlopen detach finish",
                                                             detach_status);
         }
+        peak_gum_module_mutation_end();
     }
 
     if (!dlopen_interceptor_shutdown_dynamic_attach()) {

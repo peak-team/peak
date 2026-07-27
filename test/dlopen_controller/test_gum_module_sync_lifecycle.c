@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
@@ -16,6 +18,33 @@ typedef struct {
     atomic_uint* progress;
     atomic_int* failed;
 } LoaderArgs;
+
+typedef struct {
+    atomic_int* returned;
+} QuiesceArgs;
+
+/*
+ * The patched Gum object declares this optional test seam weakly. Holding the
+ * owner after its worker join makes the former
+ * thread_started==0/incomplete-cleanup window deterministic.
+ */
+static atomic_int quiesce_gate_reached;
+static atomic_int quiesce_gate_release;
+static atomic_int quiesce_gate_enabled;
+
+__attribute__((visibility("default"))) void
+peak_gum_module_sync_test_quiesce_cleanup_gate(void)
+{
+    if (atomic_load_explicit(&quiesce_gate_enabled,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+    atomic_store_explicit(&quiesce_gate_reached, 1, memory_order_release);
+    while (atomic_load_explicit(&quiesce_gate_release,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+}
 
 static void*
 loader_main(void* data)
@@ -41,6 +70,16 @@ loader_main(void* data)
     return NULL;
 }
 
+static void*
+quiesce_main(void* data)
+{
+    QuiesceArgs* args = data;
+
+    gum_interceptor_peak_quiesce_deferred_module_sync();
+    atomic_fetch_add_explicit(args->returned, 1, memory_order_release);
+    return NULL;
+}
+
 int
 main(void)
 {
@@ -49,7 +88,7 @@ main(void)
      * second gum_init_embedded() in the same process. CTest repeats this
      * executable to exercise multiple independent lifecycles.
      */
-    enum { CYCLES = 1, THREADS = 2 };
+    enum { CYCLES = 1, THREADS = 2, QUIESCE_THREADS = 8 };
 
     for (int cycle = 0; cycle < CYCLES; cycle++) {
         pthread_t threads[THREADS];
@@ -58,6 +97,7 @@ main(void)
         atomic_int stop = 0;
         atomic_uint progress = 0;
         atomic_int failed = 0;
+        atomic_int quiescers_returned = 0;
 
         gum_init_embedded();
         (void)gum_module_registry_obtain();
@@ -133,7 +173,74 @@ main(void)
          * threads continue publishing RTLD notifications to exercise the
          * quiescing admission boundary.
          */
-        gum_interceptor_peak_quiesce_deferred_module_sync();
+        pthread_t owner;
+        QuiesceArgs owner_args = {
+            .returned = &quiescers_returned,
+        };
+        atomic_store_explicit(&quiesce_gate_reached, 0, memory_order_relaxed);
+        atomic_store_explicit(&quiesce_gate_release, 0, memory_order_relaxed);
+        atomic_store_explicit(&quiesce_gate_enabled, 1, memory_order_release);
+        if (pthread_create(&owner, NULL, quiesce_main, &owner_args) != 0) {
+            fprintf(stderr, "failed to create owner quiesce thread\n");
+            return EXIT_FAILURE;
+        }
+        for (int i = 0;
+             i < 50000 &&
+             atomic_load_explicit(&quiesce_gate_reached,
+                                  memory_order_acquire) == 0;
+             i++) {
+            usleep(100);
+        }
+        if (atomic_load_explicit(&quiesce_gate_reached,
+                                 memory_order_acquire) == 0) {
+            fprintf(stderr, "quiesce owner did not reach cleanup gate\n");
+            atomic_store_explicit(&quiesce_gate_release,
+                                  1,
+                                  memory_order_release);
+            pthread_join(owner, NULL);
+            atomic_store_explicit(&stop, 1, memory_order_release);
+            for (int i = 0; i < THREADS; i++) {
+                pthread_join(threads[i], NULL);
+            }
+            return EXIT_FAILURE;
+        }
+
+        pthread_t quiescers[QUIESCE_THREADS];
+        QuiesceArgs quiesce_args[QUIESCE_THREADS];
+        int quiescers_created = 0;
+        for (int i = 0; i < QUIESCE_THREADS; i++) {
+            quiesce_args[i].returned = &quiescers_returned;
+            if (pthread_create(&quiescers[i],
+                               NULL,
+                               quiesce_main,
+                               &quiesce_args[i]) != 0) {
+                fprintf(stderr, "failed to create quiesce thread %d\n", i);
+                atomic_store_explicit(&failed, 1, memory_order_release);
+                break;
+            }
+            quiescers_created++;
+        }
+        usleep(50000);
+        if (atomic_load_explicit(&quiescers_returned,
+                                 memory_order_acquire) != 0) {
+            fprintf(stderr,
+                    "quiesce caller returned before owner cleanup completed\n");
+            atomic_store_explicit(&failed, 1, memory_order_release);
+        }
+        atomic_store_explicit(&quiesce_gate_release,
+                              1,
+                              memory_order_release);
+        pthread_join(owner, NULL);
+        for (int i = 0; i < quiescers_created; i++) {
+            pthread_join(quiescers[i], NULL);
+        }
+        if (atomic_load_explicit(&quiescers_returned,
+                                 memory_order_acquire) !=
+            quiescers_created + 1) {
+            fprintf(stderr, "not all quiesce callers completed\n");
+            atomic_store_explicit(&failed, 1, memory_order_release);
+        }
+        atomic_store_explicit(&quiesce_gate_enabled, 0, memory_order_release);
         gum_deinit_embedded();
         atomic_store_explicit(&stop, 1, memory_order_release);
         for (int i = 0; i < THREADS; i++) {

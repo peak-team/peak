@@ -95,6 +95,30 @@ peak_signal_policy_resolve(const char* name)
     return dlsym(RTLD_NEXT, name);
 }
 
+static void*
+peak_signal_policy_resolve_timer_create(void)
+{
+#if defined(__GLIBC__)
+    /*
+     * An unversioned RTLD_NEXT lookup may select timer_create@GLIBC_2.2.5,
+     * whose output parameter is the legacy 32-bit timer ID ABI.  Modern
+     * callers use the pointer-sized timer_t ABI and later pass that value to
+     * the default timer_delete symbol, so leaving the upper half unwritten
+     * can turn a valid timer into an invalid pointer.
+     */
+    void* timer_create_fn =
+        dlvsym(RTLD_NEXT, "timer_create", "GLIBC_2.34");
+    if (timer_create_fn == NULL) {
+        timer_create_fn =
+            dlvsym(RTLD_NEXT, "timer_create", "GLIBC_2.3.3");
+    }
+    if (timer_create_fn != NULL) {
+        return timer_create_fn;
+    }
+#endif
+    return peak_signal_policy_resolve("timer_create");
+}
+
 static void
 peak_signal_policy_resolve_real_symbols(void)
 {
@@ -126,7 +150,7 @@ peak_signal_policy_resolve_real_symbols(void)
             peak_signal_policy_resolve("signalfd4");
     real_timer_create_fn =
         (int (*)(clockid_t, struct sigevent*, timer_t*))
-            peak_signal_policy_resolve("timer_create");
+            peak_signal_policy_resolve_timer_create();
     real_mq_notify_fn =
         (int (*)(mqd_t, const struct sigevent*))
             peak_signal_policy_resolve("mq_notify");

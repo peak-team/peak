@@ -14,7 +14,7 @@ typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
 
-#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 2
+#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 3
 
 /*
  * Test/diagnostic helper. Production synchronization is owned by Gum's
@@ -28,6 +28,14 @@ GUM_API gboolean gum_interceptor_peak_drain_deferred_module_sync(void);
  * lock inversion between the sync worker and PEAK's teardown thread.
  */
 GUM_API void gum_interceptor_peak_quiesce_deferred_module_sync(void);
+
+/*
+ * Serialize a PEAK stop-the-world Gum mutation against the deferred module
+ * synchronizer. The begin call must run before peer threads are stopped; the
+ * end call must run after they have been resumed.
+ */
+GUM_API void gum_interceptor_peak_begin_module_mutation(void);
+GUM_API void gum_interceptor_peak_end_module_mutation(void);
 
 /*
  * PEAK-only direct listener dispatch.
