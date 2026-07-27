@@ -51,6 +51,51 @@ def clean_env():
     return env
 
 
+def affinity_topology():
+    allowed = sorted(
+        os.sched_getaffinity(0)
+        if hasattr(os, "sched_getaffinity")
+        else range(os.cpu_count() or 1)
+    )
+    core_groups = {}
+    topology_complete = True
+    for cpu in allowed:
+        try:
+            with open(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id",
+                encoding="ascii",
+            ) as handle:
+                package = int(handle.read())
+            with open(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id",
+                encoding="ascii",
+            ) as handle:
+                core = int(handle.read())
+        except (OSError, ValueError):
+            topology_complete = False
+            break
+        core_groups.setdefault((package, core), []).append(cpu)
+
+    if not topology_complete:
+        return allowed, len(allowed)
+
+    # Fill physical cores first, then SMT siblings. This makes the requested
+    # thread counts comparable across schedulers and prevents a 2-thread run
+    # from accidentally sharing one core.
+    ordered = []
+    sibling = 0
+    while len(ordered) < len(allowed):
+        added = False
+        for cpus in core_groups.values():
+            if sibling < len(cpus):
+                ordered.append(cpus[sibling])
+                added = True
+        if not added:
+            break
+        sibling += 1
+    return ordered, len(core_groups)
+
+
 def peak_env(libpeak, max_threads):
     env = clean_env()
     env.update(
@@ -135,15 +180,17 @@ def main():
     parser.add_argument(
         "--max-slowdown",
         type=parse_limit_map,
-        default=parse_limit_map("10:40,100:8,1000:2"),
+        default=parse_limit_map("10:30,100:5,1000:1.5"),
     )
     parser.add_argument(
         "--max-ns-per-call",
         type=parse_limit_map,
-        default=parse_limit_map("10:500,100:650,1000:1800"),
+        default=parse_limit_map("10:350,100:500,1000:1600"),
     )
-    parser.add_argument("--min-scaling-efficiency", type=float, default=0.02)
-    parser.add_argument("--min-cpus-for-gates", type=int, default=64)
+    parser.add_argument("--min-scaling-efficiency", type=float, default=0.65)
+    parser.add_argument(
+        "--min-relative-scaling-efficiency", type=float, default=0.75
+    )
     args = parser.parse_args()
 
     missing_slowdown = set(args.target_ns) - set(args.max_slowdown)
@@ -154,6 +201,7 @@ def main():
         )
 
     max_threads = max(args.threads)
+    ordered_cpus, physical_cpus = affinity_topology()
     configs = [("no_preload", clean_env())]
     if args.baseline_libpeak:
         configs.append(
@@ -162,6 +210,9 @@ def main():
     configs.append(
         ("current_libpeak", peak_env(args.current_libpeak, max_threads))
     )
+    cpu_list = ",".join(str(cpu) for cpu in ordered_cpus)
+    for _, env in configs:
+        env["PEAK_BENCH_CPU_LIST"] = cpu_list
 
     results = {}
     for target_ns in args.target_ns:
@@ -174,12 +225,22 @@ def main():
     failed = False
     for target_ns in args.target_ns:
         current_one = results[("current_libpeak", target_ns, 1)]["cps"]
+        no_preload_one = results[("no_preload", target_ns, 1)]["cps"]
         for threads in args.threads:
             baseline = results[("no_preload", target_ns, threads)]
             current = results[("current_libpeak", target_ns, threads)]
             slowdown = current["thread_ns"] / baseline["thread_ns"]
             scaling = current["cps"] / current_one
             efficiency = scaling / threads
+            no_preload_efficiency = (
+                baseline["cps"] / no_preload_one / threads
+            )
+            relative_efficiency = (
+                efficiency / no_preload_efficiency
+                if no_preload_efficiency > 0.0
+                else 0.0
+            )
+            physical_gate_active = threads <= physical_cpus
             improvement = None
             if args.baseline_libpeak:
                 before = results[("baseline_libpeak", target_ns, threads)]
@@ -192,30 +253,42 @@ def main():
             print(
                 f"HOTPATH_GATE threads={threads} target_ns={target_ns} "
                 f"slowdown={slowdown:.6f} scaling={scaling:.6f} "
-                f"scaling_efficiency={efficiency:.6f}{before_text}"
+                f"scaling_efficiency={efficiency:.6f} "
+                f"relative_scaling_efficiency={relative_efficiency:.6f} "
+                f"physical_gate_active={int(physical_gate_active)} "
+                f"relative_gate_active=1{before_text}"
             )
             # Gate serial slowdown separately from parallel scalability so
-            # contention is not counted twice against the same sample.
-            if threads == 1 and slowdown > args.max_slowdown[target_ns]:
+            # contention is not counted twice against the same sample. Absolute
+            # scaling is meaningful only while each worker has a physical core.
+            # Relative scaling remains a useful contention gate when CI is
+            # oversubscribed, because the uninstrumented run has the same CPU
+            # allocation and thread count.
+            if (physical_gate_active and threads == 1 and
+                    slowdown > args.max_slowdown[target_ns]):
                 failed = True
-            if current["ns"] > args.max_ns_per_call[target_ns]:
+            if (physical_gate_active and threads == 1 and
+                    current["thread_ns"] >
+                    args.max_ns_per_call[target_ns]):
                 failed = True
-            if threads > 1 and efficiency < args.min_scaling_efficiency:
+            if (physical_gate_active and threads > 1 and
+                    efficiency < args.min_scaling_efficiency):
+                failed = True
+            if (threads > 1 and
+                    relative_efficiency <
+                    args.min_relative_scaling_efficiency):
                 failed = True
 
-    available_cpus = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else (os.cpu_count() or 1)
-    )
-    gates_active = available_cpus >= args.min_cpus_for_gates
     print(
-        f"HOTPATH_SUMMARY cpus={available_cpus} gates_active={int(gates_active)} "
+        f"HOTPATH_SUMMARY logical_cpus={len(ordered_cpus)} "
+        f"physical_cpus={physical_cpus} "
         f"max_slowdown={args.max_slowdown} "
         f"max_ns_per_call={args.max_ns_per_call} "
-        f"min_scaling_efficiency={args.min_scaling_efficiency:.6f}"
+        f"min_scaling_efficiency={args.min_scaling_efficiency:.6f} "
+        f"min_relative_scaling_efficiency="
+        f"{args.min_relative_scaling_efficiency:.6f}"
     )
-    if failed and gates_active:
+    if failed:
         print("steady-state callback performance gate failed", file=sys.stderr)
         return 1
     return 0

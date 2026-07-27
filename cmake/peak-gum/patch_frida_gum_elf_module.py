@@ -17,6 +17,12 @@ RENAMED_REDIRECT_RESOLVER = (
     "_gum_interceptor_backend_resolve_redirect_peak_dispatch"
 )
 INTERCEPTOR_OBJECT_NAME = "guminterceptor.c.o"
+BEGIN_INVOCATION = "_gum_function_context_begin_invocation"
+END_INVOCATION = "_gum_function_context_end_invocation"
+RENAMED_BEGIN_INVOCATION = (
+    "_gum_function_context_begin_invocation_peak_original"
+)
+RENAMED_END_INVOCATION = "_gum_function_context_end_invocation_peak_original"
 LOAD_SECTION = ".text.gum_elf_module_load"
 OLD_MARKER_X86_64 = b"PEAK_GUM_ELF_HEADER_GUARD_X86_64_V1\0"
 OLD_MARKER_AARCH64 = b"PEAK_GUM_ELF_HEADER_GUARD_AARCH64_V1\0"
@@ -119,6 +125,70 @@ def route_redirect_resolver_through_overlay(
 
     replace_archive_member(ar, library, extracted)
     print(f"patched {object_name}: routed exact-entry attach resolver dispatch")
+
+
+def route_invocation_dispatch_through_overlay(
+    library: Path,
+    members: list[str],
+    ar: str,
+    nm: str,
+    objcopy: str,
+    work_dir: Path,
+) -> None:
+    object_name = INTERCEPTOR_OBJECT_NAME
+    if members.count(object_name) != 1:
+        fail(
+            f"expected exactly one {object_name} in {library}, "
+            f"found {members.count(object_name)}"
+        )
+
+    extracted = work_dir / object_name
+    if not extracted.exists():
+        result = run([ar, "x", str(library), object_name], cwd=work_dir)
+        if result.returncode != 0 or not extracted.exists():
+            fail(
+                f"failed to extract {object_name}:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+
+    before = symbol_kinds(nm, extracted)
+    expected = {
+        ("T", BEGIN_INVOCATION),
+        ("T", END_INVOCATION),
+    }
+    renamed = {
+        ("T", RENAMED_BEGIN_INVOCATION),
+        ("T", RENAMED_END_INVOCATION),
+    }
+    if not expected.issubset(before) or before.intersection(renamed):
+        fail(
+            f"unexpected invocation symbols in {object_name}: "
+            f"begin={('T', BEGIN_INVOCATION) in before} "
+            f"end={('T', END_INVOCATION) in before} "
+            f"renamed_begin={('T', RENAMED_BEGIN_INVOCATION) in before} "
+            f"renamed_end={('T', RENAMED_END_INVOCATION) in before}"
+        )
+
+    result = run([
+        objcopy,
+        "--redefine-sym",
+        f"{BEGIN_INVOCATION}={RENAMED_BEGIN_INVOCATION}",
+        "--redefine-sym",
+        f"{END_INVOCATION}={RENAMED_END_INVOCATION}",
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to route invocation dispatch in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+    after = symbol_kinds(nm, extracted)
+    if after.intersection(expected) or not renamed.issubset(after):
+        fail(f"invocation dispatch rename did not take effect in {object_name}")
+
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed PEAK direct listener dispatch")
 
 
 def find_all(data: bytes | bytearray, needle: bytes) -> list[int]:
@@ -877,9 +947,10 @@ def main() -> int:
     if changed:
         replace_archive_member(args.ar, library, extracted)
 
+    if args.nm is None or args.objcopy is None:
+        fail("PEAK invocation dispatch patch requires --nm and --objcopy")
+
     if machine == 62:  # EM_X86_64
-        if args.nm is None or args.objcopy is None:
-            fail("x86_64 exact-entry patch requires --nm and --objcopy")
         route_redirect_resolver_through_overlay(
             library,
             members,
@@ -888,6 +959,15 @@ def main() -> int:
             args.objcopy,
             work_dir,
         )
+
+    route_invocation_dispatch_through_overlay(
+        library,
+        members,
+        args.ar,
+        args.nm,
+        args.objcopy,
+        work_dir,
+    )
 
     if args.ranlib:
         result = run([args.ranlib, str(library)])

@@ -386,7 +386,8 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
             ".blocked_pc_start = attach_plan.mutation_guard_size > 0 ? "
             "attach_plan.mutation_address : NULL" in normalized and
             ".blocked_pc_size = attach_plan.mutation_guard_size" in normalized and
-            "peak_gum_interceptor_attach_target(" in normalized and
+            ("peak_gum_interceptor_attach_target(" in normalized or
+             "peak_general_listener_gum_attach_target(" in normalized) and
             "&attach_plan" in normalized,
             f"{label} attach must use one plan for both strict guard and Gum options",
         )
@@ -403,9 +404,9 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
     dlopen_batch_attach = extract_function(
         dlopen_source, "dlopen_interceptor_attach_candidate_batch"
     )
-    require("peak_gum_interceptor_attach_target(" in dlopen_scalar_attach and
+    require("peak_general_listener_gum_attach_target(" in dlopen_scalar_attach and
             "&candidate->attach_plan" in dlopen_scalar_attach and
-            "peak_gum_interceptor_attach_target(" in dlopen_batch_attach and
+            "peak_general_listener_gum_attach_target(" in dlopen_batch_attach and
             "&candidates[i].attach_plan" in dlopen_batch_attach,
             "dlopen Gum attach must use the same plan as its strict guard")
     dlopen_attach = extract_function(
@@ -1757,7 +1758,7 @@ def check_heartbeat_state_machine_boundary(repo_root):
     detach_state = batch.find("PEAK_HOOK_DETACHING", prepare)
     reattach_state = batch.find("PEAK_HOOK_REATTACHING", prepare)
     detach_gum = batch.find("gum_interceptor_detach", prepare)
-    reattach_gum = batch.find("peak_gum_interceptor_attach_target", prepare)
+    reattach_gum = batch.find("peak_general_listener_gum_attach_target", prepare)
     require(prepare != -1 and finish != -1 and prepare < finish,
             "batch controller must preserve prepare-before-finish ordering")
     require(prepare < detach_state < finish and prepare < reattach_state < finish,

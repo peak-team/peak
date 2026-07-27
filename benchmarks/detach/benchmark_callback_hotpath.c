@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,6 +22,8 @@ typedef struct {
     StartGate* gate;
     uint64_t calls;
     uint64_t seed;
+    int cpu;
+    int affinity_error;
 } WorkerState;
 
 static atomic_int stop_requested;
@@ -108,19 +111,31 @@ start_gate_init(StartGate* gate, long expected)
 }
 
 static void
-start_gate_wait(StartGate* gate)
+start_gate_worker_wait(StartGate* gate)
 {
     pthread_mutex_lock(&gate->mutex);
     gate->arrived++;
     if (gate->arrived == gate->expected) {
-        gate->open = 1;
         pthread_cond_broadcast(&gate->cond);
-    } else {
-        while (!gate->open) {
-            pthread_cond_wait(&gate->cond, &gate->mutex);
-        }
+    }
+    while (!gate->open) {
+        pthread_cond_wait(&gate->cond, &gate->mutex);
     }
     pthread_mutex_unlock(&gate->mutex);
+}
+
+static double
+start_gate_open(StartGate* gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    while (gate->arrived != gate->expected) {
+        pthread_cond_wait(&gate->cond, &gate->mutex);
+    }
+    double start = monotonic_seconds();
+    gate->open = 1;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->mutex);
+    return start;
 }
 
 static void*
@@ -130,7 +145,14 @@ worker_main(void* arg)
     uint64_t calls = 0;
     uint64_t value = state->seed;
 
-    start_gate_wait(state->gate);
+    if (state->cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(state->cpu, &set);
+        state->affinity_error =
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    }
+    start_gate_worker_wait(state->gate);
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
         for (unsigned int burst = 0; burst < 256; burst++) {
             value = peak_callback_hotpath_target(value + calls);
@@ -140,6 +162,43 @@ worker_main(void* arg)
     __asm__ volatile("" : "+r"(value) :: "memory");
     state->calls = calls;
     return NULL;
+}
+
+static int*
+parse_cpu_list(long threads)
+{
+    const char* value = getenv("PEAK_BENCH_CPU_LIST");
+    int* cpus = calloc((size_t)threads, sizeof(*cpus));
+    const char* cursor = value;
+
+    if (cpus == NULL) {
+        return NULL;
+    }
+    for (long index = 0; index < threads; index++) {
+        cpus[index] = -1;
+    }
+    if (value == NULL || *value == '\0') {
+        return cpus;
+    }
+
+    for (long index = 0; index < threads && *cursor != '\0'; index++) {
+        char* end = NULL;
+        errno = 0;
+        long cpu = strtol(cursor, &end, 10);
+        if (errno != 0 || end == cursor || cpu < 0 || cpu >= CPU_SETSIZE) {
+            free(cpus);
+            return NULL;
+        }
+        cpus[index] = (int)cpu;
+        cursor = end;
+        if (*cursor == ',') {
+            cursor++;
+        } else if (*cursor != '\0') {
+            free(cpus);
+            return NULL;
+        }
+    }
+    return cpus;
 }
 
 static long
@@ -184,6 +243,7 @@ main(int argc, char** argv)
     double seconds = parse_double_arg(argc, argv, "--seconds", 1.0);
     pthread_t* tids;
     WorkerState* states;
+    int* cpus;
     StartGate gate;
 
     if (threads <= 0 || target_ns <= 0 || seconds <= 0.0) {
@@ -194,11 +254,13 @@ main(int argc, char** argv)
     double calibrated_work_ns = calibrate_work(target_ns);
     tids = calloc((size_t)threads, sizeof(*tids));
     states = calloc((size_t)threads, sizeof(*states));
-    if (tids == NULL || states == NULL ||
-        start_gate_init(&gate, threads + 1) != 0) {
+    cpus = parse_cpu_list(threads);
+    if (tids == NULL || states == NULL || cpus == NULL ||
+        start_gate_init(&gate, threads) != 0) {
         perror("benchmark setup");
         free(tids);
         free(states);
+        free(cpus);
         return 2;
     }
 
@@ -207,6 +269,7 @@ main(int argc, char** argv)
         states[index].gate = &gate;
         states[index].seed =
             UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)index;
+        states[index].cpu = cpus[index];
         if (pthread_create(&tids[index], NULL, worker_main, &states[index]) != 0) {
             fprintf(stderr, "pthread_create failed at worker %ld\n", index);
             atomic_store_explicit(&stop_requested, 1, memory_order_relaxed);
@@ -214,8 +277,7 @@ main(int argc, char** argv)
         }
     }
 
-    start_gate_wait(&gate);
-    double start = monotonic_seconds();
+    double start = start_gate_open(&gate);
     struct timespec delay = {
         .tv_sec = (time_t)seconds,
         .tv_nsec = (long)((seconds - (double)(time_t)seconds) * 1e9)
@@ -226,6 +288,16 @@ main(int argc, char** argv)
     uint64_t calls = 0;
     for (long index = 0; index < threads; index++) {
         pthread_join(tids[index], NULL);
+        if (states[index].affinity_error != 0) {
+            fprintf(stderr,
+                    "pthread_setaffinity_np failed for worker %ld: %s\n",
+                    index,
+                    strerror(states[index].affinity_error));
+            free(cpus);
+            free(states);
+            free(tids);
+            return 2;
+        }
         calls += states[index].calls;
     }
     double elapsed = monotonic_seconds() - start;
@@ -249,5 +321,6 @@ main(int argc, char** argv)
     pthread_mutex_destroy(&gate.mutex);
     free(states);
     free(tids);
+    free(cpus);
     return 0;
 }

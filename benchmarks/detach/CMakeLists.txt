@@ -38,13 +38,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
   target_link_options(benchmark_callback_hotpath PRIVATE -Wl,--export-dynamic)
 endif()
 
-set(PEAK_HOTPATH_PERF_MAX_SLOWDOWN "10:40,100:8,1000:2" CACHE STRING
+set(PEAK_HOTPATH_PERF_MAX_SLOWDOWN "10:30,100:5,1000:1.5" CACHE STRING
   "Maximum profiled/unprofiled slowdown as target-ns:limit pairs")
-set(PEAK_HOTPATH_PERF_MAX_NS_PER_CALL "10:500,100:650,1000:1800"
+set(PEAK_HOTPATH_PERF_MAX_NS_PER_CALL "10:350,100:500,1000:1600"
   CACHE STRING
-  "Maximum aggregate callback ns/call as target-ns:limit pairs")
-set(PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY "0.02" CACHE STRING
+  "Maximum thread-normalized callback ns/call as target-ns:limit pairs")
+set(PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY "0.65" CACHE STRING
   "Minimum per-thread steady-state throughput scaling efficiency")
+set(PEAK_HOTPATH_PERF_MIN_RELATIVE_SCALING_EFFICIENCY "0.75" CACHE STRING
+  "Minimum PEAK scaling efficiency relative to the uninstrumented target")
 
 set(PEAK_STRICT_DETACH_BENCHMARK_MIN_RATIO "0.80" CACHE STRING
   "Minimum current strict physical-detach throughput as a fraction of no-preload throughput")
@@ -71,14 +73,16 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --max-ns-per-call
               ${PEAK_HOTPATH_PERF_MAX_NS_PER_CALL}
             --min-scaling-efficiency
-              ${PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY})
+              ${PEAK_HOTPATH_PERF_MIN_SCALING_EFFICIENCY}
+            --min-relative-scaling-efficiency
+              ${PEAK_HOTPATH_PERF_MIN_RELATIVE_SCALING_EFFICIENCY})
   set_tests_properties(benchmark_callback_hotpath_matrix
     PROPERTIES
       LABELS benchmark
       RESOURCE_LOCK peak_detach_benchmark
       TIMEOUT 180
       PASS_REGULAR_EXPRESSION
-        "HOTPATH_SUMMARY .*max_ns_per_call=.*min_scaling_efficiency=")
+        "HOTPATH_SUMMARY .*physical_cpus=.*min_relative_scaling_efficiency=")
 
   add_test(NAME benchmark_detach_hotloop_strict
     COMMAND ${Python3_EXECUTABLE}

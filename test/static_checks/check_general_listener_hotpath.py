@@ -36,12 +36,15 @@ def main():
     root = Path(sys.argv[1])
     source = (root / "src/general_listener.c").read_text()
     header = (root / "include/general_listener.h").read_text()
-    enter = function_body(source, "peak_general_listener_on_enter")
-    leave = function_body(source, "peak_general_listener_on_leave")
+    enter = function_body(source, "peak_general_listener_fast_on_enter")
+    leave = function_body(source, "peak_general_listener_fast_on_leave")
     initialize = function_body(
         source, "peak_general_listener_thread_state_initialize"
     )
     push = function_body(source, "peak_general_listener_push_invocation")
+    increment = function_body(
+        source, "peak_general_listener_num_calls_increment"
+    )
     publish = function_body(
         source, "peak_general_controller_publish_detach_count_requests_unlocked"
     )
@@ -74,16 +77,23 @@ def main():
         "thread slot lookup must be cached by one-time TLS initialization",
     )
     require(
-        "child_time_inline[16]" in source
-        and "thread_data.child_time_inline" in push
-        and "g_renew" in push,
+        "entries_inline[16]" in source
+        and "thread_data.entries_inline" in source
+        and "peak_general_listener_grow_invocation_stack" in push,
         "child-time stack must use inline depth 16 and grow only on overflow",
     )
     require(
         "PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64" in source
-        and source.count("g_aligned_alloc0(") >= 6
+        and source.count("g_aligned_alloc0(") >= 7
         and "peak_general_listener_num_calls_slot(self, index)" in enter,
         "per-thread accounting slots must remain cache-line isolated",
+    )
+    require(
+        "__atomic_add_fetch" not in increment
+        and "__atomic_fetch_add" not in increment
+        and "__atomic_load_n" in increment
+        and "__atomic_store_n" in increment,
+        "single-writer call slots must not use a locked atomic RMW",
     )
     require(
         "_Atomic gboolean detach_count_request_pending" in header
@@ -99,6 +109,23 @@ def main():
         "thread_data.self_mapped_id" in enter
         and "thread_data.self_mapped_id" in leave,
         "both callbacks must use the cached TLS slot",
+    )
+    require(
+        "thread_data.self_mapped_valid" in enter
+        and "return GUM_PEAK_FAST_ENTER_SKIP" in enter,
+        "threads without a unique accounting slot must skip fast sampling",
+    )
+    require(
+        "PEAK_LISTENER_FAST_DISPATCH_SECTION" in source
+        and enter.find("peak_general_listener_fast_active_add") <
+        enter.find("peak_general_listener_fast_reap_unwound")
+        and leave.rfind("peak_general_listener_fast_active_remove") >
+        leave.find("peak_general_listener_checkpoint_shadow_update"),
+        "active lifetime must cover every helper outside the classified dispatch",
+    )
+    require(
+        "current_num_calls == peak_detach_count" in enter,
+        "only the detach-threshold crossing call may publish a request",
     )
 
     print("general_listener_hotpath_ok")

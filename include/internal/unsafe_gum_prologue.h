@@ -16,7 +16,7 @@ typedef enum {
     PEAK_UNSAFE_GUM_PROLOGUE_POLICY_CONSERVATIVE = 1
 } PeakUnsafeGumProloguePolicy;
 
-typedef struct {
+typedef struct _PeakGumTargetAttachPlan {
     GumAttachOptions options;
     gpointer mutation_address;
     gsize mutation_guard_size;

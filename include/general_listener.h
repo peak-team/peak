@@ -94,6 +94,9 @@ struct _PeakGeneralListener {
     size_t hook_id;
     _Atomic int callback_hook_state;
     _Atomic gboolean detach_count_request_pending;
+    GumPeakFastListener fast_listener;
+    _Atomic guint* fast_active;
+    gboolean fast_dispatch_enabled;
     gulong* num_calls;
     gdouble* total_time;
     gdouble* exclusive_time;
@@ -102,6 +105,18 @@ struct _PeakGeneralListener {
     gboolean* target_thread_called;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
 };
+
+struct _PeakGumTargetAttachPlan;
+
+GumAttachReturn peak_general_listener_gum_attach_target(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener,
+    const struct _PeakGumTargetAttachPlan* plan);
+
+void peak_general_listener_fast_ignore_current_thread(void);
+void peak_general_listener_fast_unignore_current_thread(void);
+void peak_general_listener_release_current_thread_state(void);
 
 /** Adaptive heartbeat timing and control parameters. */
 typedef struct {

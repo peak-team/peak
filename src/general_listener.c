@@ -882,14 +882,26 @@ G_DEFINE_TYPE_EXTENDED(PeakGeneralListener,
                        0,
                        G_IMPLEMENT_INTERFACE(GUM_TYPE_INVOCATION_LISTENER,
                                              peak_general_listener_iface_init))
+typedef struct _PeakGeneralInvocationEntry {
+    PeakGeneralListener* listener;
+    gpointer function_context;
+    gpointer caller_return_address;
+    gpointer stack_address;
+    guint64 start_ns;
+    gdouble child_time;
+    gboolean fast_dispatch;
+} PeakGeneralInvocationEntry;
+
 typedef struct _PeakGeneralThreadState {
     gulong level;
     gulong capacity;
-    gdouble* child_time;
-    gdouble child_time_inline[16];
+    PeakGeneralInvocationEntry* entries;
+    PeakGeneralInvocationEntry entries_inline[16];
     size_t self_mapped_id;
+    gboolean self_mapped_valid;
     gboolean initialized;
     gboolean in_callback;
+    guint fast_ignore_level;
 } PeakGeneralThreadState;
 
 typedef struct _PeakInvocationData {
@@ -897,6 +909,12 @@ typedef struct _PeakInvocationData {
     gulong stack_level;
     gboolean initialized;
 } PeakInvocationData;
+
+#define PEAK_LISTENER_FAST_DISPATCH_SECTION \
+    __attribute__((section("peak_listener_fast_dispatch"), noinline, noclone))
+
+extern const guint8 __start_peak_listener_fast_dispatch[];
+extern const guint8 __stop_peak_listener_fast_dispatch[];
 
 /*
  * PEAK is loaded during process startup (normally through LD_PRELOAD), so its
@@ -917,10 +935,16 @@ static _Atomic int global_session_counter = 0;
 static int pthread_pause_ack_pipe[2] = { -1, -1 };
 
 static gboolean peak_general_controller_flush_teardown(void);
+static gboolean peak_general_listener_prepare_fast_detach(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener);
 static gboolean peak_general_listener_pop_invocation(PeakInvocationData* priv,
                                                      gdouble* child_duration_out);
 static inline gulong
 peak_general_listener_num_calls_load(const gulong* slot);
+void pthread_pause_enable(void);
+void pthread_pause_disable(void);
 
 #define PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64
 
@@ -964,16 +988,79 @@ peak_general_listener_min_time_slot(PeakGeneralListener* listener,
                      thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
 }
 
+static inline _Atomic guint*
+peak_general_listener_fast_active_slot(PeakGeneralListener* listener,
+                                       size_t thread_id)
+{
+    return (_Atomic guint*)((guint8*)listener->fast_active +
+                            thread_id *
+                                PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+}
+
+static inline void
+peak_general_listener_fast_active_add(PeakGeneralListener* listener,
+                                      size_t thread_id)
+{
+    _Atomic guint* slot =
+        peak_general_listener_fast_active_slot(listener, thread_id);
+    guint active = atomic_load_explicit(slot, memory_order_relaxed);
+
+    atomic_store_explicit(slot, active + 1, memory_order_relaxed);
+}
+
+static inline void
+peak_general_listener_fast_active_remove(PeakGeneralListener* listener,
+                                         size_t thread_id)
+{
+    _Atomic guint* slot =
+        peak_general_listener_fast_active_slot(listener, thread_id);
+    guint active = atomic_load_explicit(slot, memory_order_relaxed);
+
+    if (active > 0) {
+        atomic_store_explicit(slot, active - 1, memory_order_relaxed);
+    }
+}
+
+static void PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_abandon_entry(PeakGeneralThreadState* state,
+                                    PeakGeneralInvocationEntry* entry)
+{
+    if (entry->fast_dispatch && entry->listener != NULL) {
+        peak_general_listener_fast_active_remove(entry->listener,
+                                                 state->self_mapped_id);
+        gum_interceptor_peak_release_fast_invocation(
+            entry->function_context);
+    }
+}
+
 static void
 peak_general_listener_thread_state_destroy(void* data)
 {
     PeakGeneralThreadState* state = data;
 
-    if (state != NULL &&
-        state->child_time != NULL &&
-        state->child_time != state->child_time_inline) {
-        g_free(state->child_time);
-        state->child_time = state->child_time_inline;
+    if (state == NULL) {
+        return;
+    }
+
+    while (state->level > 0) {
+        state->level--;
+        peak_general_listener_abandon_entry(state,
+                                            &state->entries[state->level]);
+    }
+    if (state->entries != NULL &&
+        state->entries != state->entries_inline) {
+        g_free(state->entries);
+        state->entries = state->entries_inline;
+    }
+    state->capacity = G_N_ELEMENTS(state->entries_inline);
+    state->self_mapped_valid = FALSE;
+}
+
+void
+peak_general_listener_release_current_thread_state(void)
+{
+    if (thread_data.initialized) {
+        peak_general_listener_thread_state_destroy(&thread_data);
     }
 }
 
@@ -998,12 +1085,14 @@ peak_general_listener_thread_state_initialize(void)
     mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
     if (!mapped_found || mapped_tid >= peak_max_num_threads) {
         mapped_tid = 0;
+        mapped_found = FALSE;
     }
 
     thread_data.level = 0;
-    thread_data.capacity = G_N_ELEMENTS(thread_data.child_time_inline);
-    thread_data.child_time = thread_data.child_time_inline;
+    thread_data.capacity = G_N_ELEMENTS(thread_data.entries_inline);
+    thread_data.entries = thread_data.entries_inline;
     thread_data.self_mapped_id = mapped_tid;
+    thread_data.self_mapped_valid = mapped_found;
     thread_data.initialized = TRUE;
 
     pthread_once(&peak_general_thread_state_key_once,
@@ -1014,28 +1103,48 @@ peak_general_listener_thread_state_initialize(void)
 }
 
 static void
-peak_general_listener_push_invocation(PeakInvocationData* priv)
+peak_general_listener_grow_invocation_stack(void)
 {
     if (G_UNLIKELY(thread_data.level == thread_data.capacity)) {
         gulong old_capacity = thread_data.capacity;
         gulong new_capacity = old_capacity * 2;
 
-        if (thread_data.child_time == thread_data.child_time_inline) {
-            gdouble* expanded = g_new(gdouble, new_capacity);
+        /*
+         * Expansion is deliberately outside the steady-state inline depth.
+         * Keep the controller's stop signal blocked while the allocator may
+         * hold libc/GLib locks needed by the controller itself.
+         */
+        pthread_pause_disable();
+        if (thread_data.entries == thread_data.entries_inline) {
+            PeakGeneralInvocationEntry* expanded =
+                g_new(PeakGeneralInvocationEntry, new_capacity);
             memcpy(expanded,
-                   thread_data.child_time_inline,
-                   sizeof(gdouble) * old_capacity);
-            thread_data.child_time = expanded;
+                   thread_data.entries_inline,
+                   sizeof(PeakGeneralInvocationEntry) * old_capacity);
+            thread_data.entries = expanded;
         } else {
-            thread_data.child_time =
-                g_renew(gdouble, thread_data.child_time, new_capacity);
+            thread_data.entries = g_renew(PeakGeneralInvocationEntry,
+                                          thread_data.entries,
+                                          new_capacity);
         }
+        pthread_pause_enable();
         thread_data.capacity = new_capacity;
     }
+}
 
-    thread_data.child_time[thread_data.level] = 0.0;
+static PeakGeneralInvocationEntry*
+peak_general_listener_push_invocation(PeakInvocationData* priv)
+{
+    peak_general_listener_grow_invocation_stack();
+    PeakGeneralInvocationEntry* entry =
+        &thread_data.entries[thread_data.level];
+    entry->child_time = 0.0;
+    entry->fast_dispatch = FALSE;
     thread_data.level++;
-    priv->stack_level = thread_data.level;
+    if (priv != NULL) {
+        priv->stack_level = thread_data.level;
+    }
+    return entry;
 }
 
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
@@ -2486,10 +2595,10 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
         gum_interceptor_begin_transaction(interceptor);
         GumAttachReturn attach_status =
-            peak_gum_interceptor_attach_target(interceptor,
-                                               symbol_address,
-                                               new_listener,
-                                               &attach_plan);
+            peak_general_listener_gum_attach_target(interceptor,
+                                                    symbol_address,
+                                                    new_listener,
+                                                    &attach_plan);
         gum_interceptor_end_transaction(interceptor);
 
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
@@ -2817,6 +2926,14 @@ static gboolean peak_general_controller_detach_if_requested_unlocked(
     }
 
     if (!helper_applied_physical_patch) {
+        if (!peak_general_listener_prepare_fast_detach(interceptor,
+                                                       hook_address[hook_id],
+                                                       listener)) {
+            peak_detach_controller_abort_after_failed_finish(
+                "Gum fast detach preparation",
+                PEAK_DETACH_STATUS_ERROR);
+            _exit(128);
+        }
         gum_interceptor_begin_transaction(interceptor);
         gum_interceptor_detach(interceptor, listener);
         gum_interceptor_end_transaction(interceptor);
@@ -2975,10 +3092,10 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
     if (!helper_applied_physical_patch) {
         gum_interceptor_begin_transaction(interceptor);
         attach_status =
-            peak_gum_interceptor_attach_target(interceptor,
-                                               hook_address[hook_id],
-                                               array_listener[hook_id],
-                                               &attach_plan);
+            peak_general_listener_gum_attach_target(interceptor,
+                                                    hook_address[hook_id],
+                                                    array_listener[hook_id],
+                                                    &attach_plan);
         gum_interceptor_end_transaction(interceptor);
     }
     PeakDetachStatus finish_status = PEAK_DETACH_STATUS_ERROR;
@@ -3102,6 +3219,15 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
             return FALSE;
         }
         PeakDetachStatus finish_status = PEAK_DETACH_STATUS_ERROR;
+        if (!peak_general_listener_prepare_fast_detach(
+                interceptor,
+                hook_address[hook_id],
+                array_listener[hook_id])) {
+            peak_detach_controller_abort_after_failed_finish(
+                "Gum fast shutdown preparation",
+                PEAK_DETACH_STATUS_ERROR);
+            _exit(128);
+        }
         gum_interceptor_begin_transaction(interceptor);
         gum_interceptor_detach(interceptor, array_listener[hook_id]);
         gum_interceptor_end_transaction(interceptor);
@@ -3200,6 +3326,15 @@ static gboolean peak_general_controller_shutdown_hook_unlocked(size_t hook_id,
         }
 
         if (!array_listener_gum_detached[hook_id]) {
+            if (!peak_general_listener_prepare_fast_detach(
+                    interceptor,
+                    hook_address[hook_id],
+                    array_listener[hook_id])) {
+                peak_detach_controller_abort_after_failed_finish(
+                    "Gum fast shutdown preparation",
+                    PEAK_DETACH_STATUS_ERROR);
+                _exit(128);
+            }
             gum_interceptor_begin_transaction(interceptor);
             gum_interceptor_detach(interceptor, array_listener[hook_id]);
             gum_interceptor_end_transaction(interceptor);
@@ -3426,6 +3561,15 @@ peak_general_controller_process_pending_batch_unlocked(void)
             peak_general_controller_set_state_unlocked(hook_id,
                                                        PEAK_HOOK_DETACHING);
             if (!results[i].uses_physical_patch) {
+                if (!peak_general_listener_prepare_fast_detach(
+                        interceptor,
+                        hook_address[hook_id],
+                        candidates[i].listener)) {
+                    peak_detach_controller_abort_after_failed_finish(
+                        "Gum fast batch detach preparation",
+                        PEAK_DETACH_STATUS_ERROR);
+                    _exit(128);
+                }
                 gum_interceptor_begin_transaction(interceptor);
                 gum_interceptor_detach(interceptor, candidates[i].listener);
                 gum_interceptor_end_transaction(interceptor);
@@ -3445,7 +3589,7 @@ peak_general_controller_process_pending_batch_unlocked(void)
             if (!results[i].uses_physical_patch) {
                 gum_interceptor_begin_transaction(interceptor);
                 attach_status[i] =
-                    peak_gum_interceptor_attach_target(
+                    peak_general_listener_gum_attach_target(
                         interceptor,
                         hook_address[hook_id],
                         array_listener[hook_id],
@@ -3585,6 +3729,21 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        if (!atomic_load_explicit(
+                &listener->detach_count_request_pending,
+                memory_order_acquire)) {
+            continue;
+        }
+        /*
+         * A target can cross its threshold after Gum activation but before
+         * initial publication reaches ATTACHED. Keep the one-shot latch set
+         * until the hook can actually consume it.
+         */
+        if (atomic_load_explicit(&listener->callback_hook_state,
+                                 memory_order_acquire) !=
+            PEAK_HOOK_ATTACHED) {
+            continue;
+        }
         if (!atomic_exchange_explicit(
                 &listener->detach_count_request_pending,
                 FALSE,
@@ -3704,6 +3863,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     double deadline = peak_second() + ((double)timeout_ms / 1000.0);
     gboolean drained = FALSE;
 
+    peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(interceptor);
 
     for (;;) {
@@ -3736,6 +3896,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     g_free(tid_keys);
 
     gum_interceptor_unignore_current_thread(interceptor);
+    peak_general_listener_fast_unignore_current_thread();
 
     return drained;
 }
@@ -3754,6 +3915,7 @@ peak_general_controller_thread_main(void* arg)
     general_controller_owner_thread = pthread_self();
     atomic_store(&general_controller_owner_known, TRUE);
 
+    peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(interceptor);
 
     for (;;) {
@@ -3804,6 +3966,7 @@ peak_general_controller_thread_main(void* arg)
     }
 
     gum_interceptor_unignore_current_thread(interceptor);
+    peak_general_listener_fast_unignore_current_thread();
     atomic_store(&general_controller_owner_known, FALSE);
 
     g_free(pause_status);
@@ -3917,7 +4080,15 @@ peak_general_listener_num_calls_load(const gulong* slot)
 static inline gulong
 peak_general_listener_num_calls_increment(gulong* slot)
 {
-    return __atomic_add_fetch(slot, 1, __ATOMIC_RELAXED);
+    /*
+     * Each padded slot has exactly one callback-thread writer.  The
+     * controller only observes it, so a locked atomic RMW is unnecessary:
+     * relaxed atomic load/store retains race-free snapshots without forcing
+     * cache-line ownership through the global coherency point on every call.
+     */
+    gulong next = __atomic_load_n(slot, __ATOMIC_RELAXED) + 1;
+    __atomic_store_n(slot, next, __ATOMIC_RELAXED);
+    return next;
 }
 
 static double
@@ -4164,6 +4335,7 @@ void* peak_heartbeat_monitor(void* arg) {
     const unsigned int local_mpi_ranks =
         peak_general_listener_local_mpi_ranks();
 
+    peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(interceptor);
 
     OverheadEntry* entries = g_new0(OverheadEntry, peak_hook_address_count);
@@ -4837,6 +5009,7 @@ cleanup:
     g_free(entries);
 
     gum_interceptor_unignore_current_thread(interceptor);
+    peak_general_listener_fast_unignore_current_thread();
     return NULL;
 }
 
@@ -5035,7 +5208,7 @@ peak_general_listener_abandon_current_invocation(PeakInvocationData* priv,
 
     if (peak_general_listener_pop_invocation(priv, NULL) &&
         thread_data.level > 0) {
-        thread_data.child_time[thread_data.level] = 0.0;
+        thread_data.entries[thread_data.level].child_time = 0.0;
     }
 }
 
@@ -5048,7 +5221,7 @@ peak_general_listener_pop_invocation(PeakInvocationData* priv,
     }
 
     if (priv == NULL || !priv->initialized ||
-        thread_data.child_time == NULL ||
+        thread_data.entries == NULL ||
         thread_data.level == 0 ||
         priv->stack_level == 0 ||
         thread_data.level < priv->stack_level) {
@@ -5061,14 +5234,19 @@ peak_general_listener_pop_invocation(PeakInvocationData* priv,
 
     while (thread_data.level > priv->stack_level) {
         thread_data.level--;
-        thread_data.child_time[thread_data.level] = 0.0;
+        peak_general_listener_abandon_entry(
+            &thread_data,
+            &thread_data.entries[thread_data.level]);
     }
 
     thread_data.level--;
     if (child_duration_out != NULL) {
-        *child_duration_out = thread_data.child_time[thread_data.level];
+        *child_duration_out =
+            thread_data.entries[thread_data.level].child_time;
     }
-    thread_data.child_time[thread_data.level] = 0.0;
+    peak_general_listener_abandon_entry(
+        &thread_data,
+        &thread_data.entries[thread_data.level]);
     priv->initialized = FALSE;
     priv->stack_level = 0;
     return TRUE;
@@ -5083,6 +5261,16 @@ peak_general_listener_exclusive_duration(gdouble total_duration,
     }
 
     return total_duration - child_duration;
+}
+
+static inline guint64
+peak_general_listener_monotonic_ns(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (guint64)now.tv_sec * G_GUINT64_CONSTANT(1000000000) +
+           (guint64)now.tv_nsec;
 }
 
 static void
@@ -5107,18 +5295,22 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     }
 
     peak_general_listener_thread_state_initialize();
+    if (G_UNLIKELY(!thread_data.self_mapped_valid)) {
+        thread_data.in_callback = FALSE;
+        return;
+    }
 
     PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
     size_t index = thread_data.self_mapped_id;
-    peak_general_listener_push_invocation(priv);
+    PeakGeneralInvocationEntry* entry =
+        peak_general_listener_push_invocation(priv);
     priv->stack_level = thread_data.level;
+    entry->listener = self;
     gulong current_num_calls =
         peak_general_listener_num_calls_increment(
             peak_general_listener_num_calls_slot(self, index));
 
-    if (G_UNLIKELY(current_num_calls >= peak_detach_count) &&
-        atomic_load_explicit(&self->callback_hook_state,
-                             memory_order_acquire) == PEAK_HOOK_ATTACHED) {
+    if (G_UNLIKELY(current_num_calls == peak_detach_count)) {
         gboolean expected = FALSE;
         if (atomic_compare_exchange_strong_explicit(
                 &self->detach_count_request_pending,
@@ -5148,7 +5340,9 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     if (!listener) {
         if (thread_data.initialized && thread_data.level > 0) {
             thread_data.level--;
-            thread_data.child_time[thread_data.level] = 0.0;
+            peak_general_listener_abandon_entry(
+                &thread_data,
+                &thread_data.entries[thread_data.level]);
         }
         priv->initialized = FALSE;
         priv->stack_level = 0;
@@ -5191,7 +5385,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
     }
     *total_time += end_time;
     if (thread_data.level > 0) {
-        thread_data.child_time[thread_data.level - 1] += end_time;
+        thread_data.entries[thread_data.level - 1].child_time += end_time;
     }
     *exclusive_time +=
         peak_general_listener_exclusive_duration(end_time, child_duration);
@@ -5203,6 +5397,254 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
                                                      child_duration));
     }
     thread_data.in_callback = FALSE;
+}
+
+static void
+peak_general_listener_fast_reap_unwound(gpointer stack_address)
+{
+    while (thread_data.level > 0) {
+        PeakGeneralInvocationEntry* entry =
+            &thread_data.entries[thread_data.level - 1];
+
+        if (!entry->fast_dispatch || entry->stack_address == NULL ||
+            (guint8*)entry->stack_address >= (guint8*)stack_address) {
+            break;
+        }
+        thread_data.level--;
+        peak_general_listener_abandon_entry(&thread_data, entry);
+    }
+}
+
+static GumPeakFastEnterResult PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_fast_on_enter(gpointer user_data,
+                                    gpointer function_context,
+                                    gpointer stack_address,
+                                    gpointer caller_return_address)
+{
+    PeakGeneralListener* self = user_data;
+
+    if (G_UNLIKELY(thread_data.in_callback) ||
+        G_UNLIKELY(thread_data.fast_ignore_level != 0) ||
+        G_UNLIKELY(atomic_load_explicit(&peak_general_callbacks_suspended,
+                                        memory_order_acquire))) {
+        return GUM_PEAK_FAST_ENTER_SKIP;
+    }
+
+    if (G_UNLIKELY(!thread_data.initialized)) {
+        return GUM_PEAK_FAST_ENTER_FALLBACK;
+    }
+    if (G_UNLIKELY(!thread_data.self_mapped_valid)) {
+        return GUM_PEAK_FAST_ENTER_SKIP;
+    }
+
+    thread_data.in_callback = TRUE;
+    size_t index = thread_data.self_mapped_id;
+    peak_general_listener_fast_active_add(self, index);
+    int saved_errno = errno;
+    peak_general_listener_fast_reap_unwound(stack_address);
+
+    PeakGeneralInvocationEntry* entry =
+        peak_general_listener_push_invocation(NULL);
+    entry->listener = self;
+    entry->function_context = function_context;
+    entry->caller_return_address = caller_return_address;
+    entry->stack_address = stack_address;
+    entry->fast_dispatch = TRUE;
+
+    gulong current_num_calls =
+        peak_general_listener_num_calls_increment(
+            peak_general_listener_num_calls_slot(self, index));
+
+    if (G_UNLIKELY(current_num_calls == peak_detach_count)) {
+        gboolean expected = FALSE;
+        if (atomic_compare_exchange_strong_explicit(
+                &self->detach_count_request_pending,
+                &expected,
+                TRUE,
+                memory_order_acq_rel,
+                memory_order_relaxed)) {
+            peak_general_listener_controller_wake();
+        }
+    }
+
+    entry->start_ns = peak_general_listener_monotonic_ns();
+    errno = saved_errno;
+    thread_data.in_callback = FALSE;
+    return GUM_PEAK_FAST_ENTER_INVOKE;
+}
+
+static gpointer PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_fast_on_leave(gpointer user_data,
+                                    gpointer function_context)
+{
+    PeakGeneralListener* expected_listener = user_data;
+    gpointer caller_return_address = NULL;
+
+    if (G_UNLIKELY(thread_data.in_callback) ||
+        G_UNLIKELY(!thread_data.initialized)) {
+        return NULL;
+    }
+
+    thread_data.in_callback = TRUE;
+    int saved_errno = errno;
+    while (thread_data.level > 0 &&
+           thread_data.entries[thread_data.level - 1].function_context !=
+               function_context) {
+        thread_data.level--;
+        peak_general_listener_abandon_entry(
+            &thread_data,
+            &thread_data.entries[thread_data.level]);
+    }
+
+    if (G_UNLIKELY(thread_data.level == 0)) {
+        errno = saved_errno;
+        thread_data.in_callback = FALSE;
+        return NULL;
+    }
+
+    PeakGeneralInvocationEntry entry =
+        thread_data.entries[thread_data.level - 1];
+    thread_data.level--;
+    caller_return_address = entry.caller_return_address;
+
+    PeakGeneralListener* self = entry.listener;
+    size_t index = thread_data.self_mapped_id;
+
+    if (G_LIKELY(self == expected_listener) &&
+        !atomic_load_explicit(&peak_general_callbacks_suspended,
+                              memory_order_acquire)) {
+        guint64 end_ns = peak_general_listener_monotonic_ns();
+        gdouble duration =
+            (gdouble)(end_ns - entry.start_ns) * 1e-9;
+        gdouble exclusive_duration =
+            peak_general_listener_exclusive_duration(duration,
+                                                     entry.child_time);
+        gulong* num_calls =
+            peak_general_listener_num_calls_slot(self, index);
+        gdouble* total_time =
+            peak_general_listener_total_time_slot(self, index);
+        gdouble* exclusive_time =
+            peak_general_listener_exclusive_time_slot(self, index);
+        gfloat* max_time =
+            peak_general_listener_max_time_slot(self, index);
+        gfloat* min_time =
+            peak_general_listener_min_time_slot(self, index);
+
+        if (duration > *max_time) {
+            *max_time = duration;
+        }
+        if (duration < *min_time ||
+            peak_general_listener_num_calls_load(num_calls) == 1) {
+            *min_time = duration;
+        }
+        *total_time += duration;
+        *exclusive_time += exclusive_duration;
+        if (thread_data.level > 0) {
+            thread_data.entries[thread_data.level - 1].child_time += duration;
+        }
+        if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
+            peak_general_listener_checkpoint_shadow_update(
+                &self->checkpoint_shadow[index],
+                duration,
+                exclusive_duration);
+        }
+    }
+
+    caller_return_address =
+        gum_sign_code_pointer(caller_return_address);
+    errno = saved_errno;
+    peak_general_listener_fast_active_remove(self, index);
+    thread_data.in_callback = FALSE;
+    return caller_return_address;
+}
+
+static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_fast_is_direct_leave(gpointer user_data,
+                                           gpointer function_context)
+{
+    (void)user_data;
+
+    if (!thread_data.initialized || thread_data.level == 0) {
+        return FALSE;
+    }
+
+    PeakGeneralInvocationEntry* entry =
+        &thread_data.entries[thread_data.level - 1];
+    return entry->fast_dispatch &&
+           entry->function_context == function_context;
+}
+
+static guint PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_fast_active_count(gpointer user_data)
+{
+    PeakGeneralListener* self = user_data;
+    guint64 total = 0;
+
+    for (size_t i = 0; i < peak_max_num_threads; i++) {
+        total += atomic_load_explicit(
+            peak_general_listener_fast_active_slot(self, i),
+            memory_order_relaxed);
+    }
+    return total <= G_MAXUINT ? (guint)total : G_MAXUINT;
+}
+
+GumAttachReturn
+peak_general_listener_gum_attach_target(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener,
+    const PeakGumTargetAttachPlan* plan)
+{
+    GumAttachReturn status =
+        peak_gum_interceptor_attach_target(target_interceptor,
+                                           address,
+                                           listener,
+                                           plan);
+
+    if (status == GUM_ATTACH_OK && PEAKGENERAL_IS_LISTENER(listener)) {
+        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+        self->fast_dispatch_enabled =
+            gum_interceptor_peak_enable_fast_listener(
+                target_interceptor,
+                address,
+                listener,
+                &self->fast_listener);
+        if (!self->fast_dispatch_enabled) {
+            peak_log_debug(
+                "[peak] Gum direct listener dispatch unavailable for hook %lu; using generic dispatch\n",
+                (unsigned long)self->hook_id);
+        }
+    }
+
+    return status;
+}
+
+static gboolean
+peak_general_listener_prepare_fast_detach(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener)
+{
+    PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+
+    return !self->fast_dispatch_enabled ||
+           gum_interceptor_peak_prepare_fast_detach(target_interceptor,
+                                                    address,
+                                                    listener);
+}
+
+void
+peak_general_listener_fast_ignore_current_thread(void)
+{
+    thread_data.fast_ignore_level++;
+}
+
+void
+peak_general_listener_fast_unignore_current_thread(void)
+{
+    if (thread_data.fast_ignore_level > 0) {
+        thread_data.fast_ignore_level--;
+    }
 }
 
 static void
@@ -5228,6 +5670,26 @@ peak_general_listener_init(PeakGeneralListener* self)
     size_t total_count = peak_max_num_threads;
     atomic_init(&self->callback_hook_state, PEAK_HOOK_UNRESOLVED);
     atomic_init(&self->detach_count_request_pending, FALSE);
+    self->fast_listener = (GumPeakFastListener){
+        .version = GUM_PEAK_FAST_LISTENER_VERSION,
+        .on_enter = peak_general_listener_fast_on_enter,
+        .on_leave = peak_general_listener_fast_on_leave,
+        .is_direct_leave = peak_general_listener_fast_is_direct_leave,
+        .active_count = peak_general_listener_fast_active_count,
+        .user_data = self,
+        .listener_instance = GUM_INVOCATION_LISTENER(self),
+        .dispatch_start =
+            (gpointer)__start_peak_listener_fast_dispatch,
+        .dispatch_size =
+            (gsize)(__stop_peak_listener_fast_dispatch -
+                    __start_peak_listener_fast_dispatch),
+        .enabled = 0,
+    };
+    self->fast_active = g_aligned_alloc0(
+        total_count,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
+        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    self->fast_dispatch_enabled = FALSE;
     self->num_calls = g_aligned_alloc0(
         total_count,
         PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
@@ -5265,6 +5727,7 @@ peak_general_listener_init(PeakGeneralListener* self)
 void
 peak_general_listener_free(PeakGeneralListener* self)
 {
+    g_aligned_free(self->fast_active);
     g_aligned_free(self->num_calls);
     g_aligned_free(self->total_time);
     g_aligned_free(self->exclusive_time);
@@ -5275,10 +5738,19 @@ peak_general_listener_free(PeakGeneralListener* self)
     self->target_thread_called = NULL;
 }
 
+static volatile guint64 peak_general_overhead_dummy_sink;
+
 __attribute__((noinline)) static void peak_general_overhead_dummy_func()
 {
-    struct timespec ts = { 0, 1 }; /* Sleep for one nanosecond. */
-    nanosleep(&ts, NULL);
+    /*
+     * Keep calibration focused on listener cost.  nanosleep() has
+     * microsecond-scale scheduler jitter on many systems, which swamps the
+     * callback delta and can make the adaptive policy believe a ~200 ns
+     * callback costs several microseconds.
+     */
+    peak_general_overhead_dummy_sink =
+        peak_general_overhead_dummy_sink * G_GUINT64_CONSTANT(6364136223846793005) +
+        G_GUINT64_CONSTANT(1442695040888963407);
 }
 
 /* Listener attachment. */
@@ -5311,10 +5783,11 @@ peak_general_overhead_bootstrapping()
 
     gum_interceptor_begin_transaction(interceptor);
     GumAttachReturn attach_status =
-        gum_interceptor_attach(interceptor,
-                               &peak_general_overhead_dummy_func,
-                               listener_bootstrapping,
-                               NULL);
+        peak_general_listener_gum_attach_target(
+            interceptor,
+            &peak_general_overhead_dummy_func,
+            listener_bootstrapping,
+            NULL);
     gum_interceptor_end_transaction(interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -5331,12 +5804,16 @@ peak_general_overhead_bootstrapping()
         return;
     }
 
-    guint n_tests = 2000;
+    const guint n_tests = 1000;
+    const guint calls_per_test = 32;
     double* time = g_new(double, n_tests * 2);
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
-        peak_general_overhead_dummy_func();
-        time[n_tests + i] = peak_second() - time[n_tests + i];
+        for (guint call = 0; call < calls_per_test; call++) {
+            peak_general_overhead_dummy_func();
+        }
+        time[n_tests + i] =
+            (peak_second() - time[n_tests + i]) / calls_per_test;
     }
 
     mutation_request.listener = listener_bootstrapping;
@@ -5349,6 +5826,15 @@ peak_general_overhead_bootstrapping()
         g_free(time);
         peak_detach_controller_abort_after_failed_finish("overhead detach prepare",
                                                         detach_status);
+    }
+    if (!peak_general_listener_prepare_fast_detach(
+            interceptor,
+            &peak_general_overhead_dummy_func,
+            listener_bootstrapping)) {
+        peak_detach_controller_abort_after_failed_finish(
+            "overhead fast detach preparation",
+            PEAK_DETACH_STATUS_ERROR);
+        _exit(128);
     }
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_detach(interceptor, listener_bootstrapping);
@@ -5368,8 +5854,10 @@ peak_general_overhead_bootstrapping()
 
     for (guint i = 0; i < n_tests; i++) {
         time[i] = peak_second();
-        peak_general_overhead_dummy_func();
-        time[i] = peak_second() - time[i];
+        for (guint call = 0; call < calls_per_test; call++) {
+            peak_general_overhead_dummy_func();
+        }
+        time[i] = (peak_second() - time[i]) / calls_per_test;
     }
 
     peak_general_overhead = (median_double(&time[n_tests], n_tests) - median_double(&time[0], n_tests));
@@ -5673,10 +6161,10 @@ void peak_general_listener_attach()
             }
             gum_interceptor_begin_transaction(interceptor);
             GumAttachReturn attach_status =
-                peak_gum_interceptor_attach_target(interceptor,
-                                                   resolved_hook_address,
-                                                   new_listener,
-                                                   &attach_plan);
+                peak_general_listener_gum_attach_target(interceptor,
+                                                        resolved_hook_address,
+                                                        new_listener,
+                                                        &attach_plan);
             gum_interceptor_end_transaction(interceptor);
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,
@@ -6535,6 +7023,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
     peak_mpi_report_transport_reset_failed_closed();
 #endif
     if (interceptor != NULL) {
+        peak_general_listener_fast_ignore_current_thread();
         gum_interceptor_ignore_current_thread(interceptor);
     }
 
@@ -6681,6 +7170,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
 
     if (interceptor != NULL) {
         gum_interceptor_unignore_current_thread(interceptor);
+        peak_general_listener_fast_unignore_current_thread();
     }
     if (report_write_succeeded != NULL) {
         *report_write_succeeded = write_succeeded;

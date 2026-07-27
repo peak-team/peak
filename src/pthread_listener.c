@@ -56,6 +56,12 @@ peak_pthread_start_cleanup(void* data)
 
     if (context != NULL) {
         if (!context->skip_tracking) {
+            /*
+             * Direct-listener frames own the mapped slot until their TLS
+             * state is drained.  Release them before publishing the slot for
+             * reuse by a newly created thread.
+             */
+            peak_general_listener_release_current_thread_state();
             pthread_listener_remove_thread(pthread_self());
         }
         g_free(context);
