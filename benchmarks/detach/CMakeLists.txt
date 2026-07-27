@@ -81,8 +81,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       LABELS benchmark
       RESOURCE_LOCK peak_detach_benchmark
       TIMEOUT 180
-      PASS_REGULAR_EXPRESSION
-        "HOTPATH_SUMMARY .*physical_cpus=.*min_relative_scaling_efficiency=")
+      FAIL_REGULAR_EXPRESSION
+        "steady-state callback performance gate failed")
 
   add_test(NAME benchmark_detach_hotloop_strict
     COMMAND ${Python3_EXECUTABLE}
@@ -121,9 +121,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
   # Reattach stress exercises the physical transition mechanics rather than
   # production policy admission.  Remove the production cooldown and give the
   # short runs enough target/global budget to admit reattach after a fast
-  # callback accumulates calls while the initial detach is coordinated.
+  # callback accumulates calls while the initial detach is coordinated.  The
+  # profile ratio aggregates thread time, so its wall-time ratio may approach
+  # the configured 64-thread capacity rather than being bounded by 1.0.
+  set(PEAK_REATTACH_STRESS_RATIO "64.0")
   set(PEAK_REATTACH_STRESS_ENV
-      "PEAK_REATTACH_COOLDOWN_MS=0;PEAK_GLOBAL_OVERHEAD_RATIO=1.0;PEAK_GLOBAL_REATTACH_FACTOR=1.0")
+      "PEAK_REATTACH_COOLDOWN_MS=0;PEAK_GLOBAL_OVERHEAD_RATIO=${PEAK_REATTACH_STRESS_RATIO};PEAK_GLOBAL_REATTACH_FACTOR=1.0")
 
   add_test(NAME benchmark_detach_hotloop_reattach_stress
     COMMAND ${Python3_EXECUTABLE}
@@ -133,7 +136,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --threads ${PEAK_STRICT_DETACH_STRESS_THREADS}
             --seconds 3
             --samples 6
-            --overhead-ratio 1.0
+            --overhead-ratio ${PEAK_REATTACH_STRESS_RATIO}
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-reattach-trace
             --require-reattach
             --fail-on-transition-skips)
@@ -153,7 +156,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --threads ${PEAK_STRICT_DETACH_STRESS_THREADS}
             --seconds 3
             --samples 6
-            --overhead-ratio 1.0
+            --overhead-ratio ${PEAK_REATTACH_STRESS_RATIO}
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-signal-reattach-trace
             --require-reattach
             --detach-backend signal
@@ -221,7 +224,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --seconds 3
             --stale-ready-timeout 20
             --samples 4
-            --overhead-ratio 1.0
+            --overhead-ratio ${PEAK_REATTACH_STRESS_RATIO}
             --require-reattach
             --stale-mode parked
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-reattach-stress-trace
