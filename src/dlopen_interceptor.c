@@ -1254,6 +1254,23 @@ dlopen_interceptor_initialize_attach_candidate(
     candidate->listener =
         g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
     PEAKGENERAL_LISTENER(candidate->listener)->hook_id = hook_id;
+    if (!peak_general_listener_is_ready(
+            PEAKGENERAL_LISTENER(candidate->listener))) {
+        g_printerr("[peak] skipping dynamic Gum attach for hook %lu (%s): unable to allocate listener statistics: %s\n",
+                   (unsigned long)hook_id,
+                   peak_hook_strings[hook_id] != NULL
+                       ? peak_hook_strings[hook_id]
+                       : "<unknown>",
+                   g_strerror(PEAKGENERAL_LISTENER(candidate->listener)
+                                  ->fast_stats_errno));
+        peak_general_listener_free(
+            PEAKGENERAL_LISTENER(candidate->listener));
+        g_object_unref(candidate->listener);
+        candidate->listener = NULL;
+        g_free(candidate->demangled_name);
+        candidate->demangled_name = NULL;
+        return FALSE;
+    }
     peak_gum_target_attach_plan(dynamic_hook_address,
                                 &candidate->attach_plan);
 

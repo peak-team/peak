@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -2561,6 +2562,19 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         GumInvocationListener* new_listener =
             g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
         PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
+        if (!peak_general_listener_is_ready(
+                PEAKGENERAL_LISTENER(new_listener))) {
+            g_printerr("[peak] skipping JIT attach for hook %lu (%s) from %s: unable to allocate listener statistics: %s\n",
+                       (unsigned long)i,
+                       symbol_name,
+                       provider_name != NULL ? provider_name : "<unknown>",
+                       g_strerror(PEAKGENERAL_LISTENER(new_listener)
+                                      ->fast_stats_errno));
+            peak_general_listener_free(PEAKGENERAL_LISTENER(new_listener));
+            g_object_unref(new_listener);
+            pthread_mutex_unlock(&lock);
+            return PEAK_DYNAMIC_ATTACH_FAILED;
+        }
 
         PeakGumTargetAttachPlan attach_plan;
         peak_gum_target_attach_plan(symbol_address, &attach_plan);
@@ -3755,7 +3769,7 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         gulong total_num_calls = 0;
         for (size_t thread_id = 0;
-             thread_id < peak_max_num_threads;
+             thread_id < listener->fast_stats_capacity;
              thread_id++) {
             total_num_calls += peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, thread_id));
@@ -4122,7 +4136,7 @@ peak_general_listener_profile_seconds_at_boundary(void)
         PeakGeneralListener* pg_listener =
             PEAKGENERAL_LISTENER(array_listener[i]);
         gulong total_calls = 0;
-        for (size_t j = 0; j < peak_max_num_threads; j++) {
+        for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
             total_calls +=
                 peak_general_listener_num_calls_load(
                     peak_general_listener_num_calls_slot(pg_listener, j));
@@ -4256,7 +4270,7 @@ peak_general_listener_refresh_hook_sample_cache_unlocked(
     PeakGeneralListener* pg_listener =
         PEAKGENERAL_LISTENER(array_listener[hook_id]);
     gulong total_num_calls = 0;
-    for (size_t j = 0; j < peak_max_num_threads; j++) {
+    for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
         total_num_calls += peak_general_listener_num_calls_load(
             peak_general_listener_num_calls_slot(pg_listener, j));
     }
@@ -5115,7 +5129,9 @@ peak_general_listener_test_checkpoint_mutation_begin(void)
         return EINVAL;
     }
     listener = PEAKGENERAL_LISTENER(array_listener[0]);
-    for (size_t index = 0; index < peak_max_num_threads; index++) {
+    for (size_t index = 0;
+         index < listener->fast_stats_capacity;
+         index++) {
         if (peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, index)) != 0) {
             peak_checkpoint_test_mutation_index = index;
@@ -5131,7 +5147,9 @@ peak_general_listener_test_checkpoint_mutation_begin(void)
     if (listener->checkpoint_shadow == NULL) {
         return EINVAL;
     }
-    for (size_t index = 0; index < peak_max_num_threads; index++) {
+    for (size_t index = 0;
+         index < listener->fast_stats_capacity;
+         index++) {
         PeakGeneralListenerCheckpointShadow* current =
             &listener->checkpoint_shadow[index];
 
@@ -5583,7 +5601,7 @@ peak_general_listener_fast_active_count(gpointer user_data)
     PeakGeneralListener* self = user_data;
     guint64 total = 0;
 
-    for (size_t i = 0; i < peak_max_num_threads; i++) {
+    for (size_t i = 0; i < self->fast_stats_capacity; i++) {
         total += atomic_load_explicit(
             peak_general_listener_fast_active_slot(self, i),
             memory_order_relaxed);
@@ -5598,6 +5616,11 @@ peak_general_listener_gum_attach_target(
     GumInvocationListener* listener,
     const PeakGumTargetAttachPlan* plan)
 {
+    if (PEAKGENERAL_IS_LISTENER(listener) &&
+        !peak_general_listener_is_ready(PEAKGENERAL_LISTENER(listener))) {
+        return GUM_ATTACH_WRONG_SIGNATURE;
+    }
+
     GumAttachReturn status =
         peak_gum_interceptor_attach_target(target_interceptor,
                                            address,
@@ -5667,6 +5690,93 @@ peak_general_listener_iface_init(gpointer g_iface,
     iface->on_leave = peak_general_listener_on_leave;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_general_listener_test_mapping_countdown = -1;
+#endif
+
+static gpointer
+peak_general_listener_map_zeroed(gsize n_blocks,
+                                 gsize n_block_bytes,
+                                 size_t* mapping_size_out)
+{
+    gpointer mapping;
+    size_t mapping_size;
+
+    if (mapping_size_out != NULL) {
+        *mapping_size_out = 0;
+    }
+    if (n_blocks == 0 || n_block_bytes == 0 ||
+        n_blocks > G_MAXSIZE / n_block_bytes) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    {
+        int remaining = atomic_load_explicit(
+            &peak_general_listener_test_mapping_countdown,
+            memory_order_relaxed);
+
+        if (remaining == 0) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        if (remaining > 0) {
+            atomic_store_explicit(
+                &peak_general_listener_test_mapping_countdown,
+                remaining - 1,
+                memory_order_relaxed);
+        }
+    }
+#endif
+
+    mapping_size = n_blocks * n_block_bytes;
+    mapping = mmap(NULL,
+                   mapping_size,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1,
+                   0);
+    if (mapping == MAP_FAILED) {
+        return NULL;
+    }
+    if (mapping_size_out != NULL) {
+        *mapping_size_out = mapping_size;
+    }
+    return mapping;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+void
+peak_general_listener_test_fail_mapping_after(int successful_mappings)
+{
+    atomic_store_explicit(&peak_general_listener_test_mapping_countdown,
+                          successful_mappings,
+                          memory_order_relaxed);
+}
+#endif
+
+gboolean
+peak_general_listener_is_ready(const PeakGeneralListener* self)
+{
+    return self != NULL && self->fast_active != NULL &&
+           self->fast_stats_capacity != 0 &&
+           self->fast_stats_capacity <=
+               G_MAXSIZE / PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE &&
+           self->fast_stats_mapping_size ==
+               self->fast_stats_capacity *
+                   PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE &&
+           self->num_calls == (gulong*)((guint8*)self->fast_active + 8) &&
+           self->total_time ==
+               (gdouble*)((guint8*)self->fast_active + 16) &&
+           self->exclusive_time ==
+               (gdouble*)((guint8*)self->fast_active + 24) &&
+           self->max_time ==
+               (gfloat*)((guint8*)self->fast_active + 32) &&
+           self->min_time ==
+               (gfloat*)((guint8*)self->fast_active + 36);
+}
+
 static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
@@ -5693,28 +5803,60 @@ peak_general_listener_init(PeakGeneralListener* self)
      * structure-of-arrays layout padded every field to a separate line, which
      * avoided inter-thread false sharing but made each callback dirty six
      * lines.  These offset pointers preserve the existing accessors while
-     * reducing the per-call working set to one private line.
+     * reducing the per-call working set to one private line. Keep this
+     * long-lived callback storage in its own anonymous mapping so unrelated
+     * allocator-heap activity cannot recycle or trim its backing pages.
      */
-    self->fast_active = g_aligned_alloc0(
+    self->fast_stats_capacity = 0;
+    self->fast_stats_mapping_size = 0;
+    self->fast_stats_errno = 0;
+    self->fast_active = peak_general_listener_map_zeroed(
         total_count,
         PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+        &self->fast_stats_mapping_size);
     self->fast_dispatch_enabled = FALSE;
-    guint8* fast_stats = (guint8*)self->fast_active;
-    self->num_calls = (gulong*)(fast_stats + 8);
-    self->total_time = (gdouble*)(fast_stats + 16);
-    self->exclusive_time = (gdouble*)(fast_stats + 24);
-    self->max_time = (gfloat*)(fast_stats + 32);
-    self->min_time = (gfloat*)(fast_stats + 36);
+    if (self->fast_active != NULL) {
+        self->fast_stats_capacity = total_count;
+        guint8* fast_stats = (guint8*)self->fast_active;
+        self->num_calls = (gulong*)(fast_stats + 8);
+        self->total_time = (gdouble*)(fast_stats + 16);
+        self->exclusive_time = (gdouble*)(fast_stats + 24);
+        self->max_time = (gfloat*)(fast_stats + 32);
+        self->min_time = (gfloat*)(fast_stats + 36);
+        for (size_t index = 0; index < self->fast_stats_capacity; index++) {
+            atomic_init(peak_general_listener_fast_active_slot(self, index),
+                        0);
+        }
+    } else {
+        self->fast_stats_errno = errno;
+        self->num_calls = NULL;
+        self->total_time = NULL;
+        self->exclusive_time = NULL;
+        self->max_time = NULL;
+        self->min_time = NULL;
+        self->checkpoint_shadow = NULL;
+        self->checkpoint_shadow_mapping_size = 0;
+        self->target_thread_called = NULL;
+        return;
+    }
+    self->checkpoint_shadow = NULL;
+    self->checkpoint_shadow_mapping_size = 0;
     if (peak_exec_checkpoint_enabled_at_startup != NULL &&
         peak_exec_checkpoint_enabled_at_startup()) {
-        self->checkpoint_shadow = g_aligned_alloc0(
+        /*
+         * Checkpoint sampling is optional. If this separate mapping cannot be
+         * created, normal listener accounting remains usable and exec
+         * checkpoint capture fails closed through the existing NULL check.
+         */
+        self->checkpoint_shadow = peak_general_listener_map_zeroed(
             total_count,
             sizeof(*self->checkpoint_shadow),
-            64);
-        for (size_t index = 0; index < total_count; index++) {
-            atomic_init(&self->checkpoint_shadow[index].sequence, 0);
-            atomic_init(&self->checkpoint_shadow[index].invalid, 0);
+            &self->checkpoint_shadow_mapping_size);
+        if (self->checkpoint_shadow != NULL) {
+            for (size_t index = 0; index < total_count; index++) {
+                atomic_init(&self->checkpoint_shadow[index].sequence, 0);
+                atomic_init(&self->checkpoint_shadow[index].invalid, 0);
+            }
         }
     }
     self->target_thread_called = g_new0(gboolean, total_count);
@@ -5723,14 +5865,25 @@ peak_general_listener_init(PeakGeneralListener* self)
 void
 peak_general_listener_free(PeakGeneralListener* self)
 {
-    g_aligned_free(self->fast_active);
+    if (self->fast_active != NULL && self->fast_stats_mapping_size != 0) {
+        (void)munmap(self->fast_active, self->fast_stats_mapping_size);
+    }
     self->fast_active = NULL;
+    self->fast_stats_capacity = 0;
+    self->fast_stats_mapping_size = 0;
+    self->fast_stats_errno = 0;
     self->num_calls = NULL;
     self->total_time = NULL;
     self->exclusive_time = NULL;
     self->max_time = NULL;
     self->min_time = NULL;
-    g_aligned_free(self->checkpoint_shadow);
+    if (self->checkpoint_shadow != NULL &&
+        self->checkpoint_shadow_mapping_size != 0) {
+        (void)munmap(self->checkpoint_shadow,
+                     self->checkpoint_shadow_mapping_size);
+    }
+    self->checkpoint_shadow = NULL;
+    self->checkpoint_shadow_mapping_size = 0;
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;
 }
@@ -5757,6 +5910,17 @@ peak_general_overhead_bootstrapping()
     GumInvocationListener* listener_bootstrapping =
         g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
     PEAKGENERAL_LISTENER(listener_bootstrapping)->hook_id = 0;
+    if (!peak_general_listener_is_ready(
+            PEAKGENERAL_LISTENER(listener_bootstrapping))) {
+        g_printerr("[peak] skipping overhead calibration: unable to allocate listener statistics: %s\n",
+                   g_strerror(PEAKGENERAL_LISTENER(listener_bootstrapping)
+                                  ->fast_stats_errno));
+        peak_general_listener_free(
+            PEAKGENERAL_LISTENER(listener_bootstrapping));
+        g_object_unref(listener_bootstrapping);
+        peak_general_overhead = 0.0;
+        return;
+    }
 
     PeakDetachRequest mutation_request = {
         .hook_id = 0,
@@ -6128,6 +6292,22 @@ void peak_general_listener_attach()
             GumInvocationListener* new_listener = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
             PEAKGENERAL_LISTENER(new_listener)->hook_id = i;
             hook_address[i] = NULL;
+            if (!peak_general_listener_is_ready(
+                    PEAKGENERAL_LISTENER(new_listener))) {
+                g_printerr("[peak] skipping initial Gum attach for hook %lu (%s): unable to allocate listener statistics: %s\n",
+                           (unsigned long)i,
+                           peak_hook_strings[i] != NULL
+                               ? peak_hook_strings[i]
+                               : "<unknown>",
+                           g_strerror(PEAKGENERAL_LISTENER(new_listener)
+                                          ->fast_stats_errno));
+                peak_general_listener_free(
+                    PEAKGENERAL_LISTENER(new_listener));
+                g_object_unref(new_listener);
+                g_free(peak_demangled_strings[i]);
+                peak_demangled_strings[i] = NULL;
+                continue;
+            }
             PeakGumTargetAttachPlan attach_plan;
             peak_gum_target_attach_plan(resolved_hook_address, &attach_plan);
             PeakDetachRequest mutation_request = {
@@ -6307,7 +6487,8 @@ peak_exec_checkpoint_copy_listener(
     size_t thread_count)
 {
 #if defined(__linux__) && defined(SYS_process_vm_readv)
-    if (listener->checkpoint_shadow == NULL) {
+    if (listener->checkpoint_shadow == NULL ||
+        thread_count > listener->fast_stats_capacity) {
         errno = EOPNOTSUPP;
         return FALSE;
     }
@@ -7036,7 +7217,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
         if (hook_address[i]) {
             PeakGeneralListener* pg_listener =
                 PEAKGENERAL_LISTENER(array_listener[i]);
-            for (size_t j = 0; j < peak_max_num_threads; j++) {
+            for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
                 gulong calls = peak_general_listener_num_calls_load(
                     peak_general_listener_num_calls_slot(pg_listener, j));
                 gdouble total_time =

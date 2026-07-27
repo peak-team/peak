@@ -96,6 +96,9 @@ struct _PeakGeneralListener {
     _Atomic gboolean detach_count_request_pending;
     GumPeakFastListener fast_listener;
     _Atomic guint* fast_active;
+    size_t fast_stats_capacity;
+    size_t fast_stats_mapping_size;
+    int fast_stats_errno;
     gboolean fast_dispatch_enabled;
     gulong* num_calls;
     gdouble* total_time;
@@ -104,6 +107,7 @@ struct _PeakGeneralListener {
     gfloat* min_time;
     gboolean* target_thread_called;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
+    size_t checkpoint_shadow_mapping_size;
 };
 
 struct _PeakGumTargetAttachPlan;
@@ -117,6 +121,14 @@ GumAttachReturn peak_general_listener_gum_attach_target(
 void peak_general_listener_fast_ignore_current_thread(void);
 void peak_general_listener_fast_unignore_current_thread(void);
 void peak_general_listener_release_current_thread_state(void);
+
+/** Returns whether the listener owns the accounting storage required to attach. */
+gboolean peak_general_listener_is_ready(const PeakGeneralListener* self);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/** Fail the listener mmap after this many successful mappings; -1 disables. */
+void peak_general_listener_test_fail_mapping_after(int successful_mappings);
+#endif
 
 /** Adaptive heartbeat timing and control parameters. */
 typedef struct {
