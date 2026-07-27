@@ -118,6 +118,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       TIMEOUT 240
       PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
 
+  # Reattach stress exercises the physical transition mechanics rather than
+  # production policy admission.  Remove the production cooldown and give the
+  # short runs enough target/global budget to admit reattach after a fast
+  # callback accumulates calls while the initial detach is coordinated.
+  set(PEAK_REATTACH_STRESS_ENV
+      "PEAK_REATTACH_COOLDOWN_MS=0;PEAK_GLOBAL_OVERHEAD_RATIO=1.0;PEAK_GLOBAL_REATTACH_FACTOR=1.0")
+
   add_test(NAME benchmark_detach_hotloop_reattach_stress
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/run_detach_hotloop_stress.py
@@ -126,13 +133,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --threads ${PEAK_STRICT_DETACH_STRESS_THREADS}
             --seconds 3
             --samples 6
-            --overhead-ratio 0.01
+            --overhead-ratio 1.0
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-reattach-trace
             --require-reattach
             --fail-on-transition-skips)
   set_tests_properties(benchmark_detach_hotloop_reattach_stress
     PROPERTIES
       LABELS "benchmark;stress"
+      ENVIRONMENT "${PEAK_REATTACH_STRESS_ENV}"
       RESOURCE_LOCK peak_detach_benchmark
       TIMEOUT 240
       PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
@@ -145,7 +153,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --threads ${PEAK_STRICT_DETACH_STRESS_THREADS}
             --seconds 3
             --samples 6
-            --overhead-ratio 0.01
+            --overhead-ratio 1.0
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-hotloop-signal-reattach-trace
             --require-reattach
             --detach-backend signal
@@ -154,6 +162,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
   set_tests_properties(benchmark_detach_hotloop_signal_reattach_stress
     PROPERTIES
       LABELS "benchmark;stress"
+      ENVIRONMENT "${PEAK_REATTACH_STRESS_ENV}"
       RESOURCE_LOCK peak_detach_benchmark
       TIMEOUT 240
       PASS_REGULAR_EXPRESSION "hotloop_stress_ok")
@@ -212,7 +221,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
             --seconds 3
             --stale-ready-timeout 20
             --samples 4
-            --overhead-ratio 0.01
+            --overhead-ratio 1.0
             --require-reattach
             --stale-mode parked
             --trace-prefix ${PROJECT_BINARY_DIR}/benchmarks/detach/peak-stale-reattach-stress-trace
@@ -222,6 +231,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
   set_tests_properties(benchmark_detach_stale_threads_reattach_stress
     PROPERTIES
       LABELS "benchmark;stress"
+      ENVIRONMENT "${PEAK_REATTACH_STRESS_ENV}"
       RESOURCE_LOCK peak_detach_benchmark
       TIMEOUT 180
       PASS_REGULAR_EXPRESSION "stale_thread_stress_ok")
