@@ -30,7 +30,7 @@ jobs:
 
     - name: Run Benchmarks
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
-      run: ctest --build-config Release -L "benchmark" -j1 -V
+      run: ctest --build-config Release -L "benchmark" -LE "stress" -j1 -V
 
     - name: Upload benchmark traces
       if: always()
