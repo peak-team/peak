@@ -84,9 +84,14 @@ def main():
     )
     require(
         "PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64" in source
-        and source.count("g_aligned_alloc0(") >= 7
+        and "guint8* fast_stats = (guint8*)self->fast_active" in source
+        and "self->num_calls = (gulong*)(fast_stats + 8)" in source
+        and "self->total_time = (gdouble*)(fast_stats + 16)" in source
+        and "self->exclusive_time = (gdouble*)(fast_stats + 24)" in source
+        and "self->max_time = (gfloat*)(fast_stats + 32)" in source
+        and "self->min_time = (gfloat*)(fast_stats + 36)" in source
         and "peak_general_listener_num_calls_slot(self, index)" in enter,
-        "per-thread accounting slots must remain cache-line isolated",
+        "per-thread accounting must remain isolated and coalesced by cache line",
     )
     require(
         "__atomic_add_fetch" not in increment

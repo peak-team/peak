@@ -1132,10 +1132,12 @@ peak_general_listener_grow_invocation_stack(void)
     }
 }
 
-static PeakGeneralInvocationEntry*
+static inline __attribute__((always_inline)) PeakGeneralInvocationEntry*
 peak_general_listener_push_invocation(PeakInvocationData* priv)
 {
-    peak_general_listener_grow_invocation_stack();
+    if (G_UNLIKELY(thread_data.level == thread_data.capacity)) {
+        peak_general_listener_grow_invocation_stack();
+    }
     PeakGeneralInvocationEntry* entry =
         &thread_data.entries[thread_data.level];
     entry->child_time = 0.0;
@@ -5440,7 +5442,6 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     thread_data.in_callback = TRUE;
     size_t index = thread_data.self_mapped_id;
     peak_general_listener_fast_active_add(self, index);
-    int saved_errno = errno;
     peak_general_listener_fast_reap_unwound(stack_address);
 
     PeakGeneralInvocationEntry* entry =
@@ -5463,12 +5464,13 @@ peak_general_listener_fast_on_enter(gpointer user_data,
                 TRUE,
                 memory_order_acq_rel,
                 memory_order_relaxed)) {
+            int saved_errno = errno;
             peak_general_listener_controller_wake();
+            errno = saved_errno;
         }
     }
 
     entry->start_ns = peak_general_listener_monotonic_ns();
-    errno = saved_errno;
     thread_data.in_callback = FALSE;
     return GUM_PEAK_FAST_ENTER_INVOKE;
 }
@@ -5486,7 +5488,6 @@ peak_general_listener_fast_on_leave(gpointer user_data,
     }
 
     thread_data.in_callback = TRUE;
-    int saved_errno = errno;
     while (thread_data.level > 0 &&
            thread_data.entries[thread_data.level - 1].function_context !=
                function_context) {
@@ -5497,7 +5498,6 @@ peak_general_listener_fast_on_leave(gpointer user_data,
     }
 
     if (G_UNLIKELY(thread_data.level == 0)) {
-        errno = saved_errno;
         thread_data.in_callback = FALSE;
         return NULL;
     }
@@ -5543,16 +5543,19 @@ peak_general_listener_fast_on_leave(gpointer user_data,
             thread_data.entries[thread_data.level - 1].child_time += duration;
         }
         if (G_UNLIKELY(self->checkpoint_shadow != NULL)) {
+            int saved_errno = errno;
             peak_general_listener_checkpoint_shadow_update(
                 &self->checkpoint_shadow[index],
                 duration,
                 exclusive_duration);
+            errno = saved_errno;
         }
     }
 
+#if defined(__aarch64__)
     caller_return_address =
         gum_sign_code_pointer(caller_return_address);
-    errno = saved_errno;
+#endif
     peak_general_listener_fast_active_remove(self, index);
     thread_data.in_callback = FALSE;
     return caller_return_address;
@@ -5685,31 +5688,24 @@ peak_general_listener_init(PeakGeneralListener* self)
                     __start_peak_listener_fast_dispatch),
         .enabled = 0,
     };
+    /*
+     * Keep one thread's steady-state counters in one cache line.  The previous
+     * structure-of-arrays layout padded every field to a separate line, which
+     * avoided inter-thread false sharing but made each callback dirty six
+     * lines.  These offset pointers preserve the existing accessors while
+     * reducing the per-call working set to one private line.
+     */
     self->fast_active = g_aligned_alloc0(
         total_count,
         PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
         PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
     self->fast_dispatch_enabled = FALSE;
-    self->num_calls = g_aligned_alloc0(
-        total_count,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
-    self->total_time = g_aligned_alloc0(
-        total_count,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
-    self->exclusive_time = g_aligned_alloc0(
-        total_count,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
-    self->max_time = g_aligned_alloc0(
-        total_count,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
-    self->min_time = g_aligned_alloc0(
-        total_count,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE,
-        PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
+    guint8* fast_stats = (guint8*)self->fast_active;
+    self->num_calls = (gulong*)(fast_stats + 8);
+    self->total_time = (gdouble*)(fast_stats + 16);
+    self->exclusive_time = (gdouble*)(fast_stats + 24);
+    self->max_time = (gfloat*)(fast_stats + 32);
+    self->min_time = (gfloat*)(fast_stats + 36);
     if (peak_exec_checkpoint_enabled_at_startup != NULL &&
         peak_exec_checkpoint_enabled_at_startup()) {
         self->checkpoint_shadow = g_aligned_alloc0(
@@ -5728,11 +5724,12 @@ void
 peak_general_listener_free(PeakGeneralListener* self)
 {
     g_aligned_free(self->fast_active);
-    g_aligned_free(self->num_calls);
-    g_aligned_free(self->total_time);
-    g_aligned_free(self->exclusive_time);
-    g_aligned_free(self->max_time);
-    g_aligned_free(self->min_time);
+    self->fast_active = NULL;
+    self->num_calls = NULL;
+    self->total_time = NULL;
+    self->exclusive_time = NULL;
+    self->max_time = NULL;
+    self->min_time = NULL;
     g_aligned_free(self->checkpoint_shadow);
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;

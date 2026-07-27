@@ -226,12 +226,29 @@ def main():
     for target_ns in args.target_ns:
         current_one = results[("current_libpeak", target_ns, 1)]["cps"]
         no_preload_one = results[("no_preload", target_ns, 1)]["cps"]
+        physical_reference_threads = max(
+            threads for threads in args.threads if threads <= physical_cpus
+        )
+        physical_reference_cps = results[
+            ("current_libpeak", target_ns, physical_reference_threads)
+        ]["cps"]
         for threads in args.threads:
             baseline = results[("no_preload", target_ns, threads)]
             current = results[("current_libpeak", target_ns, threads)]
             slowdown = current["thread_ns"] / baseline["thread_ns"]
             scaling = current["cps"] / current_one
             efficiency = scaling / threads
+            if threads <= physical_cpus:
+                scaling_capacity = float(threads)
+                capacity_efficiency = efficiency
+            else:
+                scaling_capacity = (
+                    float(physical_cpus) / physical_reference_threads
+                )
+                capacity_efficiency = (
+                    current["cps"] / physical_reference_cps /
+                    scaling_capacity
+                )
             no_preload_efficiency = (
                 baseline["cps"] / no_preload_one / threads
             )
@@ -241,6 +258,7 @@ def main():
                 else 0.0
             )
             physical_gate_active = threads <= physical_cpus
+            relative_gate_active = physical_gate_active
             improvement = None
             if args.baseline_libpeak:
                 before = results[("baseline_libpeak", target_ns, threads)]
@@ -254,16 +272,23 @@ def main():
                 f"HOTPATH_GATE threads={threads} target_ns={target_ns} "
                 f"slowdown={slowdown:.6f} scaling={scaling:.6f} "
                 f"scaling_efficiency={efficiency:.6f} "
+                f"scaling_capacity={scaling_capacity:.6f} "
+                f"capacity_scaling_efficiency={capacity_efficiency:.6f} "
                 f"relative_scaling_efficiency={relative_efficiency:.6f} "
                 f"physical_gate_active={int(physical_gate_active)} "
-                f"relative_gate_active=1{before_text}"
+                f"relative_gate_active={int(relative_gate_active)}"
+                f"{before_text}"
             )
             # Gate serial slowdown separately from parallel scalability so
-            # contention is not counted twice against the same sample. Absolute
-            # scaling is meaningful only while each worker has a physical core.
-            # Relative scaling remains a useful contention gate when CI is
-            # oversubscribed, because the uninstrumented run has the same CPU
-            # allocation and thread count.
+            # contention is not counted twice against the same sample.
+            # Normalize absolute scaling by available physical-core capacity so
+            # every requested thread count remains gated on a smaller hosted
+            # runner. Oversubscribed points use the largest measured physical
+            # point as their reference, avoiding single-core turbo as an
+            # unattainable all-core baseline. Relative scaling is comparable
+            # only while each worker has a physical core: SMT and
+            # oversubscription favor the tiny uninstrumented body according to
+            # instruction mix, not merely callback serialization.
             if (physical_gate_active and threads == 1 and
                     slowdown > args.max_slowdown[target_ns]):
                 failed = True
@@ -271,10 +296,10 @@ def main():
                     current["thread_ns"] >
                     args.max_ns_per_call[target_ns]):
                 failed = True
-            if (physical_gate_active and threads > 1 and
-                    efficiency < args.min_scaling_efficiency):
-                failed = True
             if (threads > 1 and
+                    capacity_efficiency < args.min_scaling_efficiency):
+                failed = True
+            if (relative_gate_active and threads > 1 and
                     relative_efficiency <
                     args.min_relative_scaling_efficiency):
                 failed = True
