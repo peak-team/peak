@@ -7,9 +7,9 @@
  *
  * PEAK observes the real `dlopen` entry and return with a Gum invocation
  * listener, preserving caller-sensitive loader behavior.  Resolved targets
- * may be attached synchronously before `dlopen` returns or queued for bounded
- * controller-side processing.  Queue entries and retained dynamic-library
- * handles are owned by this module.
+ * are queued for bounded controller-side processing after the loader callback
+ * exits. Queue entries and retained dynamic-library handles are owned by this
+ * module.
  */
 
 #include "frida-gum.h"
@@ -88,12 +88,12 @@ void dlopen_interceptor_enable_dynamic_attach(void);
 /**
  * @brief Drains queued dynamic attach work on the controller path.
  *
- * On Linux with `RTLD_NOLOAD`, runtime FFTW exports are attached before
- * `dlopen` returns. Other unresolved targets, and FFTW when that synchronous
- * path is unavailable, use this controller-drained fallback queue.  A normal
- * call processes at most 64 requests from the queue length observed at drain
- * start.  Reentrant, concurrent, closed, and empty drains are no-ops.  The
- * function consumes only module-owned queue entries.
+ * On Linux with `RTLD_NOLOAD`, the controller obtains its own reference after
+ * every admitted dlopen callback has exited, then resolves and attaches
+ * targets. A normal call processes at most 64 requests from the queue length
+ * observed at drain start. Reentrant, concurrent, callback-overlapping,
+ * closed, and empty drains are no-ops. The function consumes only
+ * module-owned queue entries.
  */
 void dlopen_interceptor_drain_dynamic_attach_queue(void);
 
@@ -162,14 +162,6 @@ PEAK_DLOPEN_API void dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
  */
 PEAK_DLOPEN_API void dlopen_interceptor_test_set_manual_drain(gboolean enabled);
 
-/** Forces the next synchronous prepare attempt to take its timeout path. */
-PEAK_DLOPEN_API void
-dlopen_interceptor_test_force_sync_prepare_timeout_once(void);
-
-/** @return The cumulative number of synchronous module scans since test reset. */
-PEAK_DLOPEN_API unsigned long long
-dlopen_interceptor_test_sync_scan_count(void);
-
 /** @return `TRUE` when callbacks are currently admitted for this process. */
 PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_callback_is_admitted(void);
@@ -200,6 +192,34 @@ PEAK_DLOPEN_API void dlopen_interceptor_test_drain_dynamic_attach_queue(void);
 /** Runs the normal drain path, including manual-drain suppression. */
 PEAK_DLOPEN_API void
 dlopen_interceptor_test_normal_drain_dynamic_attach_queue(void);
+
+/** Holds/releases a controller drain after it closes callback admission. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_hold_dynamic_attach_drain(gboolean hold);
+
+/** @return `TRUE` while a controller drain is held by the test barrier. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_dynamic_attach_drain_waiting(void);
+
+/** @return `TRUE` while callback admission waits for a controller drain. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_callback_waiting_for_drain(void);
+
+/** Admits one synthetic dlopen callback for controller/callback barrier tests. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_begin_callback(void);
+
+/** Ends one synthetic callback admitted by the matching test helper. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_end_callback(void);
+
+/** Holds/releases admitted callbacks at a test-only cancellation barrier. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_hold_callback(gboolean hold);
+
+/** @return `TRUE` while a callback is waiting at the test-only barrier. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_callback_waiting(void);
 
 /** Increments the synthetic `RTLD_NOLOAD`-drop counter. */
 PEAK_DLOPEN_API void dlopen_interceptor_test_record_noload_drop(void);

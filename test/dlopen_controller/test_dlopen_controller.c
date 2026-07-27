@@ -1,9 +1,11 @@
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures = 0;
 
@@ -149,6 +151,30 @@ test_bounded_drain_budget(void)
 }
 
 static void
+test_duplicate_filename_is_coalesced_before_capacity_check(void)
+{
+    PeakDlopenDynamicAttachDiagnostics diagnostics;
+
+    reset_dynamic_attach_manual(TRUE);
+    for (size_t i = 0; i < 1024; i++) {
+        check_true("duplicate filename accepted",
+                   dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
+                       "same-provider.so"));
+    }
+
+    diagnostics = get_diagnostics();
+    check_ull("duplicate filename has one physical enqueue",
+              diagnostics.enqueued,
+              1);
+    check_size("duplicate filename occupies one queue slot",
+               diagnostics.queue_length,
+               1);
+    check_ull("duplicate filename never reports queue full",
+              diagnostics.dropped_full,
+              0);
+}
+
+static void
 test_retry_requeues_once_per_drain_cycle(void)
 {
     PeakDlopenDynamicAttachDiagnostics diagnostics;
@@ -219,6 +245,151 @@ test_manual_drain_restore_allows_normal_drain(void)
                diagnostics.queue_length,
                0);
     check_ull("manual mode restore drain count", diagnostics.drained, 1);
+}
+
+static void
+test_active_callback_blocks_controller_drain(void)
+{
+    PeakDlopenDynamicAttachDiagnostics diagnostics;
+
+    reset_dynamic_attach_manual(TRUE);
+    check_true("barrier enqueue",
+               dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
+                   "callback-barrier"));
+    check_true("barrier callback admitted",
+               dlopen_interceptor_test_begin_callback());
+
+    dlopen_interceptor_test_drain_dynamic_attach_queue();
+    diagnostics = get_diagnostics();
+    check_size("active callback keeps request queued",
+               diagnostics.queue_length,
+               1);
+    check_ull("active callback prevents loader drain",
+              diagnostics.drained,
+              0);
+
+    dlopen_interceptor_test_end_callback();
+    dlopen_interceptor_test_drain_dynamic_attach_queue();
+    diagnostics = get_diagnostics();
+    check_size("ended callback permits queued work",
+               diagnostics.queue_length,
+               0);
+    check_ull("ended callback permits one drain",
+              diagnostics.drained,
+              1);
+}
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int returned;
+    int admitted;
+} CallbackAdmissionResult;
+
+static void*
+run_explicit_drain(void* unused)
+{
+    (void)unused;
+    dlopen_interceptor_test_drain_dynamic_attach_queue();
+    return NULL;
+}
+
+static void*
+attempt_callback_admission(void* opaque)
+{
+    CallbackAdmissionResult* result = opaque;
+    int admitted = dlopen_interceptor_test_begin_callback();
+
+    pthread_mutex_lock(&result->mutex);
+    result->admitted = admitted;
+    result->returned = 1;
+    pthread_cond_broadcast(&result->cond);
+    pthread_mutex_unlock(&result->mutex);
+    if (admitted) {
+        dlopen_interceptor_test_end_callback();
+    }
+    return NULL;
+}
+
+static void
+test_controller_drain_blocks_new_callback(void)
+{
+    CallbackAdmissionResult admission = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+        .returned = 0,
+        .admitted = 0
+    };
+    pthread_t drain_thread;
+    pthread_t callback_thread;
+    unsigned int attempts;
+    int drain_created;
+    int callback_created;
+
+    reset_dynamic_attach_manual(TRUE);
+    check_true("reverse barrier enqueue",
+               dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
+                   "drain-barrier"));
+    dlopen_interceptor_test_hold_dynamic_attach_drain(TRUE);
+    drain_created = pthread_create(&drain_thread,
+                                   NULL,
+                                   run_explicit_drain,
+                                   NULL) == 0;
+    check_true("start held drain", drain_created);
+    if (!drain_created) {
+        dlopen_interceptor_test_hold_dynamic_attach_drain(FALSE);
+        pthread_cond_destroy(&admission.cond);
+        pthread_mutex_destroy(&admission.mutex);
+        return;
+    }
+
+    for (attempts = 0;
+         attempts < 1000 &&
+         !dlopen_interceptor_test_dynamic_attach_drain_waiting();
+         attempts++) {
+        usleep(1000);
+    }
+    check_true("controller drain reached held barrier", attempts < 1000);
+    if (attempts == 1000) {
+        dlopen_interceptor_test_hold_dynamic_attach_drain(FALSE);
+        pthread_join(drain_thread, NULL);
+        pthread_cond_destroy(&admission.cond);
+        pthread_mutex_destroy(&admission.mutex);
+        return;
+    }
+    callback_created = pthread_create(&callback_thread,
+                                      NULL,
+                                      attempt_callback_admission,
+                                      &admission) == 0;
+    check_true("start callback admission", callback_created);
+    if (!callback_created) {
+        dlopen_interceptor_test_hold_dynamic_attach_drain(FALSE);
+        pthread_join(drain_thread, NULL);
+        pthread_cond_destroy(&admission.cond);
+        pthread_mutex_destroy(&admission.mutex);
+        return;
+    }
+
+    for (attempts = 0;
+         attempts < 1000 &&
+         !dlopen_interceptor_test_callback_waiting_for_drain();
+         attempts++) {
+        usleep(1000);
+    }
+    check_true("callback reached drain admission barrier", attempts < 1000);
+    pthread_mutex_lock(&admission.mutex);
+    check_true("new callback waits while drain owns loader gate",
+               !admission.returned);
+    pthread_mutex_unlock(&admission.mutex);
+
+    dlopen_interceptor_test_hold_dynamic_attach_drain(FALSE);
+    check_true("join held drain", pthread_join(drain_thread, NULL) == 0);
+    check_true("join callback admission",
+               pthread_join(callback_thread, NULL) == 0);
+    check_true("callback admitted after drain exits", admission.admitted);
+
+    pthread_cond_destroy(&admission.cond);
+    pthread_mutex_destroy(&admission.mutex);
 }
 
 static void
@@ -419,9 +590,12 @@ main(void)
     test_queue_capacity_and_full_drop();
     test_closed_queue_drop();
     test_bounded_drain_budget();
+    test_duplicate_filename_is_coalesced_before_capacity_check();
     test_retry_requeues_once_per_drain_cycle();
     test_retry_does_not_block_later_same_cycle_work();
     test_manual_drain_restore_allows_normal_drain();
+    test_active_callback_blocks_controller_drain();
+    test_controller_drain_blocks_new_callback();
     test_extended_drop_and_retained_handle_diagnostics();
     test_trace_contains_queue_shape();
     test_retryable_prepare_statuses();

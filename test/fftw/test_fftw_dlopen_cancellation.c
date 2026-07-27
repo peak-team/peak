@@ -8,9 +8,11 @@
 #include <string.h>
 #include <unistd.h>
 
-typedef int (*gate_epoch_fn)(void);
 typedef void* (*fftw_malloc_fn)(size_t size);
 typedef void (*fftw_free_fn)(void* pointer);
+typedef void (*bool_setter_fn)(int enabled);
+typedef int (*bool_getter_fn)(void);
+typedef void (*plain_hook_fn)(void);
 
 static const char* provider_path;
 
@@ -54,7 +56,9 @@ load_provider(void* unused)
 int
 main(int argc, char** argv)
 {
-    gate_epoch_fn gate_epoch;
+    bool_setter_fn hold_callback;
+    bool_getter_fn callback_waiting;
+    plain_hook_fn explicit_drain;
     pthread_t loader;
     void* loader_result = NULL;
     fftw_malloc_fn fftw_malloc;
@@ -68,17 +72,27 @@ main(int argc, char** argv)
     alarm(15);
 
     load_function(RTLD_DEFAULT,
-                  "peak_detach_controller_test_thread_creation_gate_epoch",
-                  &gate_epoch,
-                  sizeof(gate_epoch));
+                  "dlopen_interceptor_test_hold_callback",
+                  &hold_callback,
+                  sizeof(hold_callback));
+    load_function(RTLD_DEFAULT,
+                  "dlopen_interceptor_test_callback_waiting",
+                  &callback_waiting,
+                  sizeof(callback_waiting));
+    load_function(RTLD_DEFAULT,
+                  "dlopen_interceptor_test_drain_dynamic_attach_queue",
+                  &explicit_drain,
+                  sizeof(explicit_drain));
+    hold_callback(1);
     if (pthread_create(&loader, NULL, load_provider, NULL) != 0) {
         perror("pthread_create");
         return EXIT_FAILURE;
     }
 
-    for (unsigned int attempt = 0; gate_epoch() == 0; attempt++) {
+    for (unsigned int attempt = 0; !callback_waiting(); attempt++) {
         if (attempt >= 5000) {
-            fputs("strict mutation gate did not become active\n", stderr);
+            fputs("dlopen callback cancellation barrier did not become active\n",
+                  stderr);
             return EXIT_FAILURE;
         }
         usleep(1000);
@@ -87,6 +101,7 @@ main(int argc, char** argv)
         fputs("pthread_cancel failed\n", stderr);
         return EXIT_FAILURE;
     }
+    hold_callback(0);
     if (pthread_join(loader, &loader_result) != 0) {
         fputs("pthread_join failed\n", stderr);
         return EXIT_FAILURE;
@@ -97,8 +112,9 @@ main(int argc, char** argv)
                 loader_result);
         return EXIT_FAILURE;
     }
-    if (gate_epoch() != 0) {
-        fputs("strict mutation gate remained active after cancellation\n", stderr);
+    if (callback_waiting()) {
+        fputs("dlopen callback barrier remained active after cancellation\n",
+              stderr);
         return EXIT_FAILURE;
     }
 
@@ -107,6 +123,7 @@ main(int argc, char** argv)
         fprintf(stderr, "follow-up dlopen failed: %s\n", dlerror());
         return EXIT_FAILURE;
     }
+    explicit_drain();
     load_function(handle, "fftw_malloc", &fftw_malloc, sizeof(fftw_malloc));
     load_function(handle, "fftw_free", &fftw_free, sizeof(fftw_free));
     void* allocation = fftw_malloc(64);
