@@ -741,9 +741,11 @@ dlopen_interceptor_open_unobserved(const char* filename, int flags)
         return NULL;
     }
 
+    peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(dlopen_interceptor);
     handle = dlopen(filename, flags);
     gum_interceptor_unignore_current_thread(dlopen_interceptor);
+    peak_general_listener_fast_unignore_current_thread();
     return handle;
 }
 
@@ -1342,10 +1344,11 @@ dlopen_interceptor_attach_candidate_scalar(
 
     gum_interceptor_begin_transaction(mutation_request->interceptor);
     GumAttachReturn attach_status =
-        peak_gum_interceptor_attach_target(mutation_request->interceptor,
-                                           mutation_request->function_address,
-                                           candidate->listener,
-                                           &candidate->attach_plan);
+        peak_general_listener_gum_attach_target(
+            mutation_request->interceptor,
+            mutation_request->function_address,
+            candidate->listener,
+            &candidate->attach_plan);
     gum_interceptor_end_transaction(mutation_request->interceptor);
     if (!peak_detach_controller_finish_hook_mutation(mutation_request,
                                                      &detach_status)) {
@@ -1394,7 +1397,7 @@ dlopen_interceptor_attach_candidate_batch(
                 continue;
             }
             attach_statuses[i] =
-                peak_gum_interceptor_attach_target(
+                peak_general_listener_gum_attach_target(
                     mutation_requests[i].interceptor,
                     mutation_requests[i].function_address,
                     candidates[i].listener,
@@ -1563,6 +1566,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
     }
 #endif
+    peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(target_interceptor);
     for (size_t i = 0; i < target_count; i++) {
         if (resolved_targets[i].name != NULL) {
@@ -1588,6 +1592,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
 
     if (resolved_count == 0) {
         gum_interceptor_unignore_current_thread(target_interceptor);
+        peak_general_listener_fast_unignore_current_thread();
         g_free(resolved_targets);
         return PEAK_DLOPEN_ATTACH_DONE;
     }
@@ -1619,6 +1624,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         g_free(mutation_requests);
         g_free(attach_candidates);
         gum_interceptor_unignore_current_thread(target_interceptor);
+        peak_general_listener_fast_unignore_current_thread();
         g_free(resolved_targets);
         return PEAK_DLOPEN_ATTACH_DONE;
     }
@@ -1632,6 +1638,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
         peak_hook_address_count < target_count) {
         peak_general_listener_controller_unlock();
         gum_interceptor_unignore_current_thread(target_interceptor);
+        peak_general_listener_fast_unignore_current_thread();
         g_free(attach_statuses);
         g_free(batch_results);
         g_free(mutation_requests);
@@ -1741,6 +1748,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
     dlopen_interceptor_refresh_unresolved_non_fftw_unlocked();
     peak_general_listener_controller_unlock();
     gum_interceptor_unignore_current_thread(target_interceptor);
+    peak_general_listener_fast_unignore_current_thread();
     g_free(attach_statuses);
     g_free(batch_results);
     g_free(mutation_requests);
@@ -2044,10 +2052,12 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
 
         unresolved = dlopen_interceptor_unresolved_counts();
         if (unresolved.fftw > 0) {
+            peak_general_listener_fast_ignore_current_thread();
             gum_interceptor_ignore_current_thread(dlopen_interceptor);
             gboolean may_resolve_fftw =
                 dlopen_interceptor_handle_may_resolve_fftw(handle);
             gum_interceptor_unignore_current_thread(dlopen_interceptor);
+            peak_general_listener_fast_unignore_current_thread();
             if (!may_resolve_fftw ||
                 dlopen_interceptor_fftw_module_scan_completed(handle)) {
                 unresolved.fftw = 0;

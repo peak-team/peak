@@ -14,6 +14,70 @@ typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
 
+/*
+ * PEAK-only direct listener dispatch.
+ *
+ * Gum's generic invocation path maintains a shared trampoline counter and a
+ * pthread-keyed invocation stack on every call. PEAK already owns a TLS stack
+ * and stops all relevant threads before mutating a target, so its listeners
+ * can use these callbacks without duplicating that machinery.
+ */
+typedef enum {
+    GUM_PEAK_FAST_ENTER_SKIP = 0,
+    GUM_PEAK_FAST_ENTER_INVOKE = 1,
+    GUM_PEAK_FAST_ENTER_FALLBACK = 2
+} GumPeakFastEnterResult;
+
+typedef GumPeakFastEnterResult (* GumPeakFastEnterFunc)(
+    gpointer user_data,
+    gpointer function_context,
+    gpointer stack_address,
+    gpointer caller_return_address);
+typedef gpointer (* GumPeakFastLeaveFunc)(
+    gpointer user_data,
+    gpointer function_context);
+typedef gboolean (* GumPeakFastIsDirectLeaveFunc)(
+    gpointer user_data,
+    gpointer function_context);
+typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
+
+typedef struct _GumPeakFastListener {
+    guint version;
+    GumPeakFastEnterFunc on_enter;
+    GumPeakFastLeaveFunc on_leave;
+    GumPeakFastIsDirectLeaveFunc is_direct_leave;
+    GumPeakFastActiveCountFunc active_count;
+    gpointer user_data;
+    GumInvocationListener * listener_instance;
+    gpointer dispatch_start;
+    gsize dispatch_size;
+    gpointer listener_entries_cookie;
+    volatile gint enabled;
+    volatile gint release_required;
+} GumPeakFastListener;
+
+#define GUM_PEAK_FAST_LISTENER_VERSION 2u
+
+GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener,
+    GumPeakFastListener * fast_listener);
+
+/*
+ * Called while PEAK's existing stop-the-world mutation guard is active.
+ * Seeds Gum's deferred-destruction counter from PEAK's per-thread active
+ * slots, so the steady state needs no shared atomic reference count.
+ */
+GUM_API gboolean gum_interceptor_peak_prepare_fast_detach(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener);
+
+/* Releases a fast frame skipped by non-local unwind or thread exit. */
+G_GNUC_INTERNAL void gum_interceptor_peak_release_fast_invocation(
+    gpointer function_context);
+
 typedef enum {
     GUM_PEAK_PC_SAFE = 0,
     GUM_PEAK_PC_AT_PATCH_ENTRY,
@@ -36,6 +100,10 @@ typedef struct _GumPeakPcDiagnostics {
     gsize enter_thunk_size;
     gpointer leave_thunk_start;
     gsize leave_thunk_size;
+    gpointer fast_overlay_dispatch_start;
+    gsize fast_overlay_dispatch_size;
+    gpointer fast_listener_dispatch_start;
+    gsize fast_listener_dispatch_size;
 } GumPeakPcDiagnostics;
 
 GUM_API gboolean gum_interceptor_peak_classify_pc(

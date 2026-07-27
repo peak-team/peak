@@ -81,11 +81,9 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
         --ar "${CMAKE_AR}"
         --work-dir "${_output_dir}/frida-gum-elf-module-patch"
     )
-    if(_peak_processor MATCHES "^(x86_64|amd64)$")
-        list(APPEND _patch_command
-            --nm "${CMAKE_NM}"
-            --objcopy "${CMAKE_OBJCOPY}")
-    endif()
+    list(APPEND _patch_command
+        --nm "${CMAKE_NM}"
+        --objcopy "${CMAKE_OBJCOPY}")
     if(CMAKE_RANLIB)
         list(APPEND _patch_command --ranlib "${CMAKE_RANLIB}")
     endif()

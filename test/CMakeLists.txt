@@ -521,6 +521,36 @@ if(BUILD_TESTING)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        PEAK_GUM_PEAK_PC_API_AVAILABLE AND
        TARGET peak_detach_helper)
+        add_test(NAME test_fastpath_thread_exit_slot_reuse
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_slot_reuse
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=4;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_detach_race
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_detach_race
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=8;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_DETACH_COUNT=2;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_second_listener_fanout
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_second_listener)
+        set_tests_properties(test_fastpath_second_listener_fanout
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_second_listener_target;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_second_listener_ok"
+                FAIL_REGULAR_EXPRESSION "fan-out mismatch|attach failed|fatal|Gum [^\\r\\n]* failed"
+                TIMEOUT 20)
+
         add_test(NAME test_detach_hotloop_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 4 --seconds 2)
         set_tests_properties(test_detach_hotloop_strict
@@ -562,10 +592,11 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "not proven safe|leaving listener state alive|fatal|tracked thread snapshot exceeded|thread id .* exceeds|detach helper shutdown failed|timed out draining pending target hook detach/reattach requests|Gum [^\\r\\n]* failed"
                 TIMEOUT 45)
 
-        # Keep this transition-coverage stress test from becoming a policy
-        # gate: lock-free callbacks record many more samples before the
-        # controller completes detach. Dedicated policy tests below retain
-        # their tighter production-like ratios.
+        # This is a physical-transition coverage test. With the lock-free
+        # callback, wake the controller at the first threshold crossing so
+        # transient-thread churn cannot turn scheduling delay into millions of
+        # extra pre-detach samples. The callback benchmark below independently
+        # enforces steady-state overhead and scaling.
         add_test(NAME test_detach_hotloop_signal_wait_stress_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -575,8 +606,9 @@ if(BUILD_TESTING)
                     --seconds 6
                     --samples 2
                     --timeout 90
-                    --overhead-ratio 0.50
-                    --global-overhead-ratio 0.50
+                    --overhead-ratio 0.10
+                    --global-overhead-ratio 0.10
+                    --detach-count 1
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/signal-wait-stress-trace
                     --require-reattach
                     --require-redetach-after-reattach
@@ -1252,7 +1284,7 @@ if(BUILD_TESTING)
                     --seconds 2
                     --samples 1
                     --timeout 60
-                    --overhead-ratio 0.01
+                    --overhead-ratio 0.05
                     --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-reattach-trace
                     --require-reattach
@@ -1265,8 +1297,9 @@ if(BUILD_TESTING)
                 TIMEOUT 75
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok"
                 SKIP_RETURN_CODE 77)
-        # These churn cases validate physical transition safety. Their
-        # reattach headroom accounts for the higher pre-detach sample rate.
+        # Transient-thread churn tests validate lifecycle safety, so their
+        # policy ratio allows the faster pre-detach sampler to reach reattach.
+        # Steady-state cost remains gated by callback_hotpath_matrix.
         add_test(NAME test_detach_hotloop_signal_thread_spawn_reattach_trace_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
@@ -1276,7 +1309,7 @@ if(BUILD_TESTING)
                     --seconds 5
                     --samples 2
                     --timeout 180
-                    --overhead-ratio 0.20
+                    --overhead-ratio 0.10
                     --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-signal-spawn-reattach-trace
                     --require-reattach
@@ -1302,7 +1335,7 @@ if(BUILD_TESTING)
                     --seconds 5
                     --samples 2
                     --timeout 180
-                    --overhead-ratio 0.20
+                    --overhead-ratio 0.10
                     --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-spawn-reattach-trace
                     --require-reattach
@@ -1331,7 +1364,7 @@ if(BUILD_TESTING)
                     --seconds 3
                     --samples 1
                     --timeout 60
-                    --overhead-ratio 0.20
+                    --overhead-ratio 0.10
                     --global-overhead-ratio 0.10
                     --trace-prefix ${PROJECT_BINARY_DIR}/test/detach_runtime/peak-hotloop-helper-sigchld-ignored-reattach-trace
                     --require-reattach

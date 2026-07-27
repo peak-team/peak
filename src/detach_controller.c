@@ -3256,7 +3256,15 @@ peak_detach_controller_classify_pc_from_snapshot(
                                                 diagnostics->enter_thunk_size) ||
         peak_detach_controller_pointer_in_range(pc,
                                                 diagnostics->leave_thunk_start,
-                                                diagnostics->leave_thunk_size)) {
+                                                diagnostics->leave_thunk_size) ||
+        peak_detach_controller_pointer_in_range(
+            pc,
+            diagnostics->fast_overlay_dispatch_start,
+            diagnostics->fast_overlay_dispatch_size) ||
+        peak_detach_controller_pointer_in_range(
+            pc,
+            diagnostics->fast_listener_dispatch_start,
+            diagnostics->fast_listener_dispatch_size)) {
         return GUM_PEAK_PC_IN_DISPATCH;
     }
 

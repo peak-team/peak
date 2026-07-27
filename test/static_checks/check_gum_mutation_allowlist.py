@@ -31,7 +31,6 @@ EXPECTED = {
         "revert": 6,
     },
     ("strict-controller", "src/general_listener.c"): {
-        "attach": 1,
         "detach": 5,
         "begin_transaction": 10,
         "end_transaction": 10,

@@ -9,9 +9,17 @@
  */
 
 #include <setjmp.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 #include "frida-gum.h"
+
+#define PEAK_GUM_FAST_DISPATCH_SECTION \
+    __attribute__((section("peak_gum_fast_dispatch"), noinline, noclone))
+
+extern const guint8 __start_peak_gum_fast_dispatch[];
+extern const guint8 __stop_peak_gum_fast_dispatch[];
 
 #if !defined(__linux__) || \
     !(defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
@@ -218,6 +226,19 @@ typedef struct _PeakGumListenerEntry17 {
     gboolean unignorable;
 } PeakGumListenerEntry17;
 
+G_GNUC_INTERNAL gboolean
+_gum_function_context_begin_invocation_peak_original(
+    PeakGumFunctionContext17 * function_ctx,
+    GumCpuContext * cpu_context,
+    gpointer * caller_ret_addr,
+    gpointer * next_hop);
+
+G_GNUC_INTERNAL void
+_gum_function_context_end_invocation_peak_original(
+    PeakGumFunctionContext17 * function_ctx,
+    GumCpuContext * cpu_context,
+    gpointer * next_hop);
+
 
 G_STATIC_ASSERT(sizeof(PeakGumFunctionContextBackendData17) == 3 * GLIB_SIZEOF_VOID_P);
 #if defined(__x86_64__) || defined(__amd64__)
@@ -284,6 +305,91 @@ peak_gum_context_has_listener(PeakGumFunctionContext17 * context,
 }
 
 static gboolean
+peak_gum_context_has_only_listener(PeakGumFunctionContext17 * context,
+                                   GumInvocationListener * listener)
+{
+    GPtrArray * entries;
+    guint match_count = 0;
+    guint active_count = 0;
+
+    entries = (GPtrArray *)g_atomic_pointer_get(&context->listener_entries);
+    if (entries == NULL) {
+        return FALSE;
+    }
+
+    for (guint i = 0; i < entries->len; i++) {
+        PeakGumListenerEntry17 * entry = g_ptr_array_index(entries, i);
+        if (entry == NULL) {
+            continue;
+        }
+        active_count++;
+        if (entry->listener_instance == listener) {
+            match_count++;
+        }
+    }
+
+    return active_count == 1 && match_count == 1;
+}
+
+static GumPeakFastListener * PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_context_fast_listener(PeakGumFunctionContext17 * context)
+{
+    GumPeakFastListener * fast_listener;
+
+    if (context == NULL || context->write_redirect != NULL) {
+        return NULL;
+    }
+
+    fast_listener = (GumPeakFastListener *)g_atomic_pointer_get(
+        &context->write_redirect_data);
+    if (fast_listener == NULL ||
+        fast_listener->version != GUM_PEAK_FAST_LISTENER_VERSION ||
+        fast_listener->on_enter == NULL ||
+        fast_listener->on_leave == NULL ||
+        fast_listener->is_direct_leave == NULL ||
+        fast_listener->active_count == NULL) {
+        return NULL;
+    }
+
+    return fast_listener;
+}
+
+static GumPeakFastListener * PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_context_fast_listener_for_enter(
+    PeakGumFunctionContext17 * context)
+{
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener(context);
+
+    if (fast_listener == NULL ||
+        g_atomic_int_get(&fast_listener->enabled) == 0) {
+        return NULL;
+    }
+    if (g_atomic_pointer_get(&context->replacement_function) != NULL) {
+        g_atomic_int_set(&fast_listener->enabled, 0);
+        return NULL;
+    }
+    /*
+     * Gum publishes listener-list changes by replacing the GPtrArray pointer.
+     * Comparing the immutable cookie avoids traversing an array that a
+     * concurrent attach transaction may already have retired.  It also keeps
+     * the steady path to one atomic pointer load.
+     */
+    if (g_atomic_pointer_get(&context->listener_entries) !=
+        g_atomic_pointer_get(&fast_listener->listener_entries_cookie)) {
+        /*
+         * A later listener attachment invalidates direct dispatch.  Existing
+         * direct frames still use the descriptor on leave, but all subsequent
+         * entries fall back to Gum's complete listener fan-out.
+        */
+        g_atomic_int_set(&fast_listener->enabled, 0);
+        return NULL;
+    }
+
+    return fast_listener;
+}
+
+static gboolean
 peak_gum_context_is_usable(PeakGumFunctionContext17 * context)
 {
     return context != NULL && !context->destroyed && context->activated;
@@ -317,6 +423,46 @@ peak_gum_find_context_by_listener(PeakGumInterceptor17 * interceptor,
             }
             match = context;
         }
+    }
+
+    return match;
+}
+
+static PeakGumFunctionContext17 *
+peak_gum_find_configurable_context(PeakGumInterceptor17 * interceptor,
+                                   gpointer function_address,
+                                   GumInvocationListener * listener)
+{
+    PeakGumFunctionContext17 * context = NULL;
+    PeakGumFunctionContext17 * match = NULL;
+    GHashTableIter iter;
+    gpointer value;
+
+    if (interceptor == NULL || interceptor->function_by_address == NULL ||
+        listener == NULL) {
+        return NULL;
+    }
+
+    if (function_address != NULL) {
+        context = g_hash_table_lookup(interceptor->function_by_address,
+                                      function_address);
+        if (context != NULL && !context->destroyed &&
+            peak_gum_context_has_listener(context, listener)) {
+            return context;
+        }
+    }
+
+    g_hash_table_iter_init(&iter, interceptor->function_by_address);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        context = value;
+        if (context == NULL || context->destroyed ||
+            !peak_gum_context_has_listener(context, listener)) {
+            continue;
+        }
+        if (match != NULL) {
+            return NULL;
+        }
+        match = context;
     }
 
     return match;
@@ -445,6 +591,203 @@ peak_gum_find_context(GumInterceptor * interceptor,
     return peak_gum_find_context_by_listener(private_interceptor, listener);
 }
 
+gboolean
+gum_interceptor_peak_enable_fast_listener(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener,
+    GumPeakFastListener * fast_listener)
+{
+    PeakGumInterceptor17 * private_interceptor;
+    PeakGumFunctionContext17 * context;
+    gboolean enabled = FALSE;
+
+    if (interceptor == NULL || function_address == NULL || listener == NULL ||
+        fast_listener == NULL ||
+        fast_listener->version != GUM_PEAK_FAST_LISTENER_VERSION ||
+        fast_listener->on_enter == NULL ||
+        fast_listener->on_leave == NULL ||
+        fast_listener->is_direct_leave == NULL ||
+        fast_listener->listener_instance != listener ||
+        fast_listener->dispatch_start == NULL ||
+        fast_listener->dispatch_size == 0 ||
+        fast_listener->active_count == NULL) {
+        return FALSE;
+    }
+
+    private_interceptor = (PeakGumInterceptor17 *)interceptor;
+    g_rec_mutex_lock(&private_interceptor->mutex);
+    context = peak_gum_find_configurable_context(private_interceptor,
+                                                 function_address,
+                                                 listener);
+    if (context != NULL &&
+        context->replacement_function == NULL &&
+        context->write_redirect == NULL &&
+        peak_gum_context_has_only_listener(context, listener) &&
+        context->trampoline_usage_counter == 0 &&
+        (context->write_redirect_data == NULL ||
+         context->write_redirect_data == fast_listener)) {
+        g_atomic_pointer_set(
+            &fast_listener->listener_entries_cookie,
+            g_atomic_pointer_get(&context->listener_entries));
+        g_atomic_int_set(&fast_listener->release_required, 0);
+        g_atomic_pointer_set(&context->write_redirect_data, fast_listener);
+        g_atomic_int_set(&fast_listener->enabled, 1);
+        enabled = TRUE;
+    }
+    g_rec_mutex_unlock(&private_interceptor->mutex);
+
+    return enabled;
+}
+
+gboolean
+gum_interceptor_peak_prepare_fast_detach(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    GumInvocationListener * listener)
+{
+    PeakGumInterceptor17 * private_interceptor;
+    PeakGumFunctionContext17 * context;
+    GumPeakFastListener * fast_listener;
+    guint active;
+    gint current;
+    gboolean prepared = FALSE;
+
+    if (interceptor == NULL || function_address == NULL || listener == NULL) {
+        return FALSE;
+    }
+
+    private_interceptor = (PeakGumInterceptor17 *)interceptor;
+    g_rec_mutex_lock(&private_interceptor->mutex);
+    context = peak_gum_find_context(interceptor, function_address, listener);
+    fast_listener = peak_gum_context_fast_listener(context);
+    if (context != NULL && fast_listener == NULL) {
+        /* Direct dispatch was already disabled and drained. */
+        prepared = TRUE;
+    } else if (fast_listener != NULL) {
+        g_atomic_int_set(&fast_listener->enabled, 0);
+        active = fast_listener->active_count(fast_listener->user_data);
+        current = g_atomic_int_get(&context->trampoline_usage_counter);
+        if (g_atomic_int_get(&fast_listener->release_required) != 0) {
+            prepared = TRUE;
+        } else if (current >= 0 &&
+                   active <= (guint)(G_MAXINT - current)) {
+            if (active != 0) {
+                g_atomic_int_add(&context->trampoline_usage_counter,
+                                 (gint)active);
+                g_atomic_int_set(&fast_listener->release_required, 1);
+            } else {
+                g_atomic_pointer_compare_and_exchange(
+                    &context->write_redirect_data, fast_listener, NULL);
+            }
+            prepared = TRUE;
+        }
+    }
+    g_rec_mutex_unlock(&private_interceptor->mutex);
+
+    return prepared;
+}
+
+void PEAK_GUM_FAST_DISPATCH_SECTION
+gum_interceptor_peak_release_fast_invocation(gpointer function_context)
+{
+    PeakGumFunctionContext17 * context = function_context;
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener(context);
+
+    if (context != NULL && fast_listener != NULL &&
+        g_atomic_int_get(&fast_listener->release_required) != 0) {
+        if (!context->destroyed &&
+            g_atomic_int_get(&fast_listener->enabled) == 0 &&
+            fast_listener->active_count(fast_listener->user_data) == 0) {
+            g_atomic_pointer_compare_and_exchange(
+                &context->write_redirect_data, fast_listener, NULL);
+        }
+        g_atomic_int_dec_and_test(&context->trampoline_usage_counter);
+    }
+}
+
+gboolean PEAK_GUM_FAST_DISPATCH_SECTION
+_gum_function_context_begin_invocation(
+    PeakGumFunctionContext17 * function_ctx,
+    GumCpuContext * cpu_context,
+    gpointer * caller_ret_addr,
+    gpointer * next_hop)
+{
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener_for_enter(function_ctx);
+
+    if (G_LIKELY(fast_listener != NULL)) {
+        gpointer stack_address;
+        gpointer return_address = *caller_ret_addr;
+        GumPeakFastEnterResult result;
+
+#if defined(__x86_64__) || defined(__amd64__)
+        stack_address = (gpointer)(uintptr_t)cpu_context->rsp;
+#elif defined(__aarch64__)
+        stack_address = (gpointer)(uintptr_t)cpu_context->sp;
+#else
+# error "Unsupported PEAK Gum fast-listener architecture"
+#endif
+
+        result = fast_listener->on_enter(fast_listener->user_data,
+                                         function_ctx,
+                                         stack_address,
+                                         return_address);
+        if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
+            return _gum_function_context_begin_invocation_peak_original(
+                function_ctx, cpu_context, caller_ret_addr, next_hop);
+        }
+        *next_hop = function_ctx->on_invoke_trampoline;
+        if (result == GUM_PEAK_FAST_ENTER_INVOKE) {
+            *caller_ret_addr = function_ctx->on_leave_trampoline;
+        }
+        return result == GUM_PEAK_FAST_ENTER_INVOKE;
+    }
+
+    return _gum_function_context_begin_invocation_peak_original(
+        function_ctx, cpu_context, caller_ret_addr, next_hop);
+}
+
+void PEAK_GUM_FAST_DISPATCH_SECTION
+_gum_function_context_end_invocation(
+    PeakGumFunctionContext17 * function_ctx,
+    GumCpuContext * cpu_context,
+    gpointer * next_hop)
+{
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener(function_ctx);
+
+    if (G_LIKELY(fast_listener != NULL) &&
+        fast_listener->is_direct_leave(fast_listener->user_data,
+                                       function_ctx)) {
+        gboolean release_required =
+            g_atomic_int_get(&fast_listener->release_required) != 0;
+        gpointer return_address =
+            fast_listener->on_leave(fast_listener->user_data, function_ctx);
+        gboolean clear_disabled =
+            release_required &&
+            g_atomic_int_get(&fast_listener->enabled) == 0 &&
+            fast_listener->active_count(fast_listener->user_data) == 0;
+        gboolean destroyed = function_ctx->destroyed;
+
+        (void)cpu_context;
+        *next_hop = return_address;
+        if (G_UNLIKELY(clear_disabled && !destroyed)) {
+            g_atomic_pointer_compare_and_exchange(
+                &function_ctx->write_redirect_data, fast_listener, NULL);
+        }
+        if (G_UNLIKELY(release_required)) {
+            g_atomic_int_dec_and_test(
+                &function_ctx->trampoline_usage_counter);
+        }
+        return;
+    }
+
+    _gum_function_context_end_invocation_peak_original(
+        function_ctx, cpu_context, next_hop);
+}
+
 guint
 gum_interceptor_peak_abi_fingerprint(void)
 {
@@ -524,6 +867,19 @@ gum_interceptor_peak_get_pc_diagnostics(GumInterceptor * interceptor,
     diagnostics->on_enter_trampoline = private_context->on_enter_trampoline;
     diagnostics->on_leave_trampoline = private_context->on_leave_trampoline;
     diagnostics->on_invoke_trampoline = private_context->on_invoke_trampoline;
+    diagnostics->fast_overlay_dispatch_start =
+        (gpointer)__start_peak_gum_fast_dispatch;
+    diagnostics->fast_overlay_dispatch_size =
+        (gsize)(__stop_peak_gum_fast_dispatch -
+                __start_peak_gum_fast_dispatch);
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener(private_context);
+    if (fast_listener != NULL) {
+        diagnostics->fast_listener_dispatch_start =
+            fast_listener->dispatch_start;
+        diagnostics->fast_listener_dispatch_size =
+            fast_listener->dispatch_size;
+    }
     peak_gum_fill_shared_thunk_diagnostics(backend, private_context, diagnostics);
 
     return TRUE;
@@ -570,6 +926,21 @@ gum_interceptor_peak_classify_pc(GumInterceptor * interceptor,
     }
 
     if (peak_gum_pc_in_shared_thunk(private_interceptor, private_context, pc)) {
+        *state = GUM_PEAK_PC_IN_DISPATCH;
+        return TRUE;
+    }
+
+    GumPeakFastListener * fast_listener =
+        peak_gum_context_fast_listener(private_context);
+    if (peak_gum_pointer_in_range(
+            pc,
+            (gpointer)__start_peak_gum_fast_dispatch,
+            (gsize)(__stop_peak_gum_fast_dispatch -
+                    __start_peak_gum_fast_dispatch)) ||
+        (fast_listener != NULL &&
+         peak_gum_pointer_in_range(pc,
+                                   fast_listener->dispatch_start,
+                                   fast_listener->dispatch_size))) {
         *state = GUM_PEAK_PC_IN_DISPATCH;
         return TRUE;
     }
