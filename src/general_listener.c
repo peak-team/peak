@@ -639,7 +639,14 @@ peak_general_listener_runtime_accounting_snapshot(
         &peak_general_listener_heartbeat_control_baseline_valid,
         memory_order_acquire);
 
-    return current_valid && baseline_valid;
+    if (!current_valid || !baseline_valid) {
+        if (out != NULL) {
+            *out = peak_general_listener_zero_accounting_snapshot();
+        }
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static void

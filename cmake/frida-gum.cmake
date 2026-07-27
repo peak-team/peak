@@ -249,6 +249,10 @@ function(_peak_validate_frida_gum_peak_api)
 #if !defined(GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_ARM64)
 #error Missing PEAK Gum arm64 private-layout ABI fingerprint
 #endif
+#if !defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) || \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 1
+#error Missing PEAK deferred module-sync lifecycle API
+#endif
 
 int main(void)
 {
@@ -276,6 +280,7 @@ int main(void)
         gpointer,
         GumInvocationListener *,
         GumPeakPcDiagnostics *);
+    typedef gboolean (*PeakDrainDeferredModuleSyncFunc)(void);
     PeakAbiFingerprintFunc abi_fingerprint =
         gum_interceptor_peak_abi_fingerprint;
     PeakClassifyPcFunc classify_pc = gum_interceptor_peak_classify_pc;
@@ -284,6 +289,8 @@ int main(void)
         gum_interceptor_peak_get_function_patch;
     PeakGetPcDiagnosticsFunc get_pc_diagnostics =
         gum_interceptor_peak_get_pc_diagnostics;
+    PeakDrainDeferredModuleSyncFunc drain_deferred_module_sync =
+        gum_interceptor_peak_drain_deferred_module_sync;
 
     (void) GUM_PEAK_PC_API_VERSION;
     (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64;
@@ -320,6 +327,7 @@ int main(void)
     (void) safe_pc;
     (void) get_function_patch;
     (void) get_pc_diagnostics;
+    (void) drain_deferred_module_sync;
     return 0;
 }
 ")

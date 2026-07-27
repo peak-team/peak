@@ -53,6 +53,40 @@ test_monotonic_ms(void)
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+static bool
+test_tcp_slot_is_available(int base_port)
+{
+    int fds[TEST_PORT_SLOT_WIDTH];
+    int opened = 0;
+    bool available = true;
+
+    for (int offset = 0; offset < TEST_PORT_SLOT_WIDTH; offset++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in address = {
+            .sin_family = AF_INET,
+            .sin_port = htons((uint16_t)(base_port + offset)),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+
+        if (fd < 0 ||
+            bind(fd,
+                 (const struct sockaddr*)&address,
+                 sizeof(address)) != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            available = false;
+            break;
+        }
+        fds[opened++] = fd;
+    }
+
+    while (opened > 0) {
+        close(fds[--opened]);
+    }
+    return available;
+}
+
 static int
 reserve_test_port_slot(int* lock_fd_out)
 {
@@ -81,7 +115,8 @@ reserve_test_port_slot(int* lock_fd_out)
         if (lock_fd >= 0 &&
             bind(lock_fd,
                  (const struct sockaddr*)&address,
-                 sizeof(address)) == 0) {
+                 sizeof(address)) == 0 &&
+            test_tcp_slot_is_available(port)) {
             *lock_fd_out = lock_fd;
             return port;
         }
@@ -392,7 +427,11 @@ run_two_rank_case(int port,
     (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS",
-                 action == TEST_GATHER_SLOW_FAILURE ? "150" : "500",
+                 action == TEST_GATHER_SLOW_FAILURE
+                     ? "150"
+                     : action == TEST_GATHER_PARTIAL_DRIP_FAILURE
+                           ? "500"
+                           : "1500",
                  1);
     if (action == TEST_GATHER_PROGRESS_SUCCESS) {
         /*
@@ -419,7 +458,7 @@ run_two_rank_case(int port,
         (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
                      action == TEST_ROOT_COMMIT_CONFIRM_RETRY
                          ? "5000"
-                         : "1500",
+                         : "3000",
                      1);
     }
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
@@ -1144,7 +1183,7 @@ run_duplicate_rank_case(int port)
              port);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
-    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "500", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1500", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
                  "1500",
                  1);

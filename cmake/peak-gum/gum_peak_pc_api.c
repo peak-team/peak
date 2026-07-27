@@ -11,8 +11,14 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "frida-gum.h"
 
 #define PEAK_GUM_FAST_DISPATCH_SECTION \
@@ -33,6 +39,480 @@ extern const guint8 __stop_peak_gum_fast_dispatch[];
 #ifndef GUM_MAX_LISTENERS_PER_FUNCTION
 # error "Unexpected Frida Gum devkit header: missing listener constants"
 #endif
+
+typedef void (* PeakGumSynchronizeModulesFunc)(void);
+
+typedef enum {
+    PEAK_GUM_MODULE_SYNC_PASS_THROUGH = 0,
+    PEAK_GUM_MODULE_SYNC_STARTING,
+    PEAK_GUM_MODULE_SYNC_ACTIVE,
+    PEAK_GUM_MODULE_SYNC_QUIESCING,
+    PEAK_GUM_MODULE_SYNC_INACTIVE
+} PeakGumModuleSyncState;
+
+static PeakGumSynchronizeModulesFunc peak_gum_module_sync;
+static guint peak_gum_module_sync_state = PEAK_GUM_MODULE_SYNC_PASS_THROUGH;
+static guint peak_gum_module_sync_pending;
+static guint peak_gum_module_sync_draining;
+static guint peak_gum_module_sync_publishers;
+static guint peak_gum_module_sync_active_drains;
+static gint peak_gum_module_sync_event_fd = -1;
+static pthread_t peak_gum_module_sync_thread;
+static guint peak_gum_module_sync_thread_started;
+static guint peak_gum_module_sync_atfork_registered;
+static guint peak_gum_module_sync_forked_child;
+
+G_STATIC_ASSERT(sizeof(PeakGumSynchronizeModulesFunc) == sizeof(gpointer));
+G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(gpointer), NULL));
+G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(guint), NULL));
+G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(gint), NULL));
+
+G_GNUC_INTERNAL void
+_gum_module_registry_handle_rtld_notification_peak_original(
+    PeakGumSynchronizeModulesFunc sync,
+    GumInvocationContext * ic);
+G_GNUC_INTERNAL void
+_gum_module_registry_activate_peak_original(GumModuleRegistry * registry);
+G_GNUC_INTERNAL void
+_gum_module_registry_deactivate_peak_original(GumModuleRegistry * registry);
+G_GNUC_INTERNAL void gum_deinit_peak_original(void);
+G_GNUC_INTERNAL void gum_deinit_embedded_peak_original(void);
+G_GNUC_INTERNAL void gum_shutdown_peak_original(void);
+
+static inline __attribute__((always_inline)) void
+peak_gum_module_sync_wake(void)
+{
+    gint fd = __atomic_load_n(&peak_gum_module_sync_event_fd,
+                              __ATOMIC_RELAXED);
+    uint64_t value = 1;
+
+    if (fd == -1) {
+        return;
+    }
+
+#if defined(__x86_64__) || defined(__amd64__)
+    long result;
+
+    do {
+        __asm__ volatile(
+            "syscall"
+            : "=a"(result)
+            : "0"((long)SYS_write),
+              "D"((long)fd),
+              "S"(&value),
+              "d"((long)sizeof(value))
+            : "rcx", "r11", "memory");
+    } while (result == -(long)EINTR);
+    (void)result;
+#elif defined(__aarch64__)
+    long result;
+
+    do {
+        register long x0 __asm__("x0") = (long)fd;
+        register long x1 __asm__("x1") = (long)&value;
+        register long x2 __asm__("x2") = (long)sizeof(value);
+        register long x8 __asm__("x8") = (long)SYS_write;
+
+        __asm__ volatile(
+            "svc 0"
+            : "+r"(x0)
+            : "r"(x1), "r"(x2), "r"(x8)
+            : "memory");
+        result = x0;
+    } while (result == -(long)EINTR);
+#endif
+}
+
+static inline __attribute__((always_inline)) void
+peak_gum_module_sync_close_after_fork(gint fd)
+{
+#if defined(__x86_64__) || defined(__amd64__)
+    long result;
+
+    __asm__ volatile(
+        "syscall"
+        : "=a"(result)
+        : "0"((long)SYS_close),
+          "D"((long)fd)
+        : "rcx", "r11", "memory");
+    (void)result;
+#elif defined(__aarch64__)
+    register long x0 __asm__("x0") = (long)fd;
+    register long x8 __asm__("x8") = (long)SYS_close;
+
+    __asm__ volatile(
+        "svc 0"
+        : "+r"(x0)
+        : "r"(x8)
+        : "memory");
+#endif
+}
+
+static gboolean
+peak_gum_module_sync_try_drain(gboolean allow_quiescing)
+{
+    PeakGumSynchronizeModulesFunc sync;
+    guint expected = 0;
+    guint state = __atomic_load_n(&peak_gum_module_sync_state,
+                                  __ATOMIC_ACQUIRE);
+    gboolean allowed =
+        state == PEAK_GUM_MODULE_SYNC_ACTIVE ||
+        (allow_quiescing && state == PEAK_GUM_MODULE_SYNC_QUIESCING);
+    gboolean did_work = FALSE;
+
+    if (!allowed) {
+        return FALSE;
+    }
+
+    __atomic_fetch_add(&peak_gum_module_sync_active_drains,
+                       1,
+                       __ATOMIC_ACQ_REL);
+    state = __atomic_load_n(&peak_gum_module_sync_state, __ATOMIC_ACQUIRE);
+    allowed =
+        state == PEAK_GUM_MODULE_SYNC_ACTIVE ||
+        (allow_quiescing && state == PEAK_GUM_MODULE_SYNC_QUIESCING);
+    if (!allowed) {
+        __atomic_fetch_sub(&peak_gum_module_sync_active_drains,
+                           1,
+                           __ATOMIC_RELEASE);
+        return FALSE;
+    }
+
+    if (!__atomic_compare_exchange_n(&peak_gum_module_sync_draining,
+                                     &expected,
+                                     1,
+                                     FALSE,
+                                     __ATOMIC_ACQUIRE,
+                                     __ATOMIC_RELAXED)) {
+        __atomic_fetch_sub(&peak_gum_module_sync_active_drains,
+                           1,
+                           __ATOMIC_RELEASE);
+        return FALSE;
+    }
+
+    if (__atomic_exchange_n(&peak_gum_module_sync_pending,
+                            0,
+                            __ATOMIC_ACQUIRE) != 0) {
+        sync = __atomic_load_n(&peak_gum_module_sync, __ATOMIC_ACQUIRE);
+        if (sync != NULL) {
+            sync();
+            did_work = TRUE;
+        }
+    }
+
+    __atomic_store_n(&peak_gum_module_sync_draining, 0, __ATOMIC_RELEASE);
+    __atomic_fetch_sub(&peak_gum_module_sync_active_drains,
+                       1,
+                       __ATOMIC_RELEASE);
+    return did_work;
+}
+
+static void*
+peak_gum_module_sync_worker(void* data)
+{
+    GumInterceptor* worker_interceptor = NULL;
+    struct pollfd event = {
+        .fd = GPOINTER_TO_INT(data),
+        .events = POLLIN,
+        .revents = 0,
+    };
+
+    for (;;) {
+        uint64_t value;
+        guint state;
+        int poll_result;
+
+        if (__atomic_load_n(&peak_gum_module_sync_forked_child,
+                            __ATOMIC_ACQUIRE) != 0) {
+            break;
+        }
+        do {
+            poll_result = poll(&event, 1, -1);
+        } while (poll_result == -1 && errno == EINTR);
+        if (poll_result == -1) {
+            break;
+        }
+        while (read(event.fd, &value, sizeof(value)) == -1 &&
+               errno == EINTR) {
+        }
+
+        state = __atomic_load_n(&peak_gum_module_sync_state,
+                                __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&peak_gum_module_sync_forked_child,
+                            __ATOMIC_ACQUIRE) != 0 ||
+            state == PEAK_GUM_MODULE_SYNC_INACTIVE) {
+            break;
+        }
+        if (state == PEAK_GUM_MODULE_SYNC_STARTING) {
+            continue;
+        }
+        if (worker_interceptor == NULL &&
+            (state == PEAK_GUM_MODULE_SYNC_ACTIVE ||
+             state == PEAK_GUM_MODULE_SYNC_QUIESCING)) {
+            worker_interceptor = gum_interceptor_obtain();
+            gum_interceptor_ignore_current_thread(worker_interceptor);
+        }
+
+        if (state == PEAK_GUM_MODULE_SYNC_QUIESCING) {
+            while (__atomic_load_n(&peak_gum_module_sync_publishers,
+                                   __ATOMIC_ACQUIRE) != 0) {
+                sched_yield();
+            }
+            while (peak_gum_module_sync_try_drain(TRUE)) {
+            }
+            break;
+        }
+
+        while (peak_gum_module_sync_try_drain(FALSE)) {
+        }
+    }
+
+    if (worker_interceptor != NULL &&
+        __atomic_load_n(&peak_gum_module_sync_forked_child,
+                        __ATOMIC_ACQUIRE) == 0) {
+        gum_interceptor_unignore_current_thread(worker_interceptor);
+    }
+    return NULL;
+}
+
+static void
+peak_gum_module_sync_quiesce(void)
+{
+    guint state = __atomic_load_n(&peak_gum_module_sync_state,
+                                  __ATOMIC_ACQUIRE);
+
+    if (__atomic_load_n(&peak_gum_module_sync_thread_started,
+                        __ATOMIC_ACQUIRE) == 0 ||
+        (state != PEAK_GUM_MODULE_SYNC_STARTING &&
+         state != PEAK_GUM_MODULE_SYNC_ACTIVE)) {
+        return;
+    }
+
+    __atomic_store_n(&peak_gum_module_sync_state,
+                     PEAK_GUM_MODULE_SYNC_QUIESCING,
+                     __ATOMIC_RELEASE);
+    peak_gum_module_sync_wake();
+    pthread_join(peak_gum_module_sync_thread, NULL);
+    __atomic_store_n(&peak_gum_module_sync_thread_started,
+                     0,
+                     __ATOMIC_RELEASE);
+
+    while (__atomic_load_n(&peak_gum_module_sync_active_drains,
+                           __ATOMIC_ACQUIRE) != 0) {
+        sched_yield();
+    }
+    __atomic_store_n(&peak_gum_module_sync_pending, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync, NULL, __ATOMIC_RELEASE);
+
+    gint event_fd =
+        __atomic_exchange_n(&peak_gum_module_sync_event_fd,
+                            -1,
+                            __ATOMIC_ACQ_REL);
+    if (event_fd != -1) {
+        close(event_fd);
+    }
+}
+
+static void
+peak_gum_module_sync_atfork_child(void)
+{
+    gint event_fd;
+
+    /*
+     * Never wait in an atfork prepare handler: fork may run from a DSO
+     * constructor while its thread owns the loader lock, and the sync worker
+     * may be waiting for that same lock.  The child cannot safely use or tear
+     * down Gum because any of its private locks may have been owned by a
+     * vanished thread at the snapshot.  Fail closed and let process exit
+     * reclaim the inherited mappings.
+     */
+    __atomic_store_n(&peak_gum_module_sync_forked_child,
+                     1,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync_state,
+                     PEAK_GUM_MODULE_SYNC_INACTIVE,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync_pending, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&peak_gum_module_sync_thread_started,
+                     0,
+                     __ATOMIC_RELEASE);
+
+    event_fd = __atomic_exchange_n(&peak_gum_module_sync_event_fd,
+                                   -1,
+                                   __ATOMIC_ACQ_REL);
+    if (event_fd != -1) {
+        peak_gum_module_sync_close_after_fork(event_fd);
+    }
+}
+
+/*
+ * Gum 17.15.3 normally synchronizes its module registry directly from the
+ * _dl_debug_state interception callback. On glibc that executes while loader
+ * link_map nodes are being mutated. Besides allocating and taking Gum locks,
+ * the upstream implementation uses a process-global "syncing from rtld" flag,
+ * so an unrelated thread may walk an unstable link_map and dereference a stale
+ * l_name. In deferred mode this callback must remain leaf-like: publish the
+ * callback before the pending bit and return.
+ */
+G_GNUC_INTERNAL void
+_gum_module_registry_handle_rtld_notification(
+    PeakGumSynchronizeModulesFunc sync,
+    GumInvocationContext * ic)
+{
+    guint state = __atomic_load_n(&peak_gum_module_sync_state,
+                                  __ATOMIC_ACQUIRE);
+
+    if (state == PEAK_GUM_MODULE_SYNC_PASS_THROUGH) {
+        _gum_module_registry_handle_rtld_notification_peak_original(sync, ic);
+        return;
+    }
+    if (state != PEAK_GUM_MODULE_SYNC_STARTING &&
+        state != PEAK_GUM_MODULE_SYNC_ACTIVE) {
+        return;
+    }
+
+    (void)ic;
+    __atomic_fetch_add(&peak_gum_module_sync_publishers,
+                       1,
+                       __ATOMIC_ACQ_REL);
+    state = __atomic_load_n(&peak_gum_module_sync_state, __ATOMIC_ACQUIRE);
+    if (state == PEAK_GUM_MODULE_SYNC_STARTING ||
+        state == PEAK_GUM_MODULE_SYNC_ACTIVE) {
+        __atomic_store_n(&peak_gum_module_sync, sync, __ATOMIC_RELEASE);
+        __atomic_store_n(&peak_gum_module_sync_pending, 1, __ATOMIC_RELEASE);
+        peak_gum_module_sync_wake();
+    }
+    __atomic_fetch_sub(&peak_gum_module_sync_publishers,
+                       1,
+                       __ATOMIC_RELEASE);
+}
+
+gboolean
+gum_interceptor_peak_drain_deferred_module_sync(void)
+{
+    return peak_gum_module_sync_try_drain(FALSE);
+}
+
+G_GNUC_INTERNAL __attribute__((no_sanitize_address)) void
+_gum_module_registry_activate(GumModuleRegistry * registry)
+{
+    gint event_fd = -1;
+    gboolean worker_unavailable = FALSE;
+
+    if (__atomic_load_n(&peak_gum_module_sync_atfork_registered,
+                        __ATOMIC_ACQUIRE) == 0) {
+        if (pthread_atfork(NULL,
+                           NULL,
+                           peak_gum_module_sync_atfork_child) == 0) {
+            __atomic_store_n(&peak_gum_module_sync_atfork_registered,
+                             1,
+                             __ATOMIC_RELEASE);
+        } else {
+            worker_unavailable = TRUE;
+        }
+    }
+    if (!worker_unavailable) {
+        event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    }
+
+    __atomic_store_n(&peak_gum_module_sync, NULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_gum_module_sync_pending, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_gum_module_sync_draining, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_gum_module_sync_publishers, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_gum_module_sync_active_drains, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_gum_module_sync_thread_started,
+                     0,
+                     __ATOMIC_RELAXED);
+
+    if (event_fd != -1) {
+        __atomic_store_n(&peak_gum_module_sync_event_fd,
+                         event_fd,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&peak_gum_module_sync_state,
+                         PEAK_GUM_MODULE_SYNC_STARTING,
+                         __ATOMIC_RELEASE);
+        if (pthread_create(&peak_gum_module_sync_thread,
+                           NULL,
+                           peak_gum_module_sync_worker,
+                           GINT_TO_POINTER(event_fd)) == 0) {
+            __atomic_store_n(&peak_gum_module_sync_thread_started,
+                             1,
+                             __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&peak_gum_module_sync_state,
+                             PEAK_GUM_MODULE_SYNC_INACTIVE,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&peak_gum_module_sync_event_fd,
+                             -1,
+                             __ATOMIC_RELEASE);
+            close(event_fd);
+            worker_unavailable = TRUE;
+        }
+    } else {
+        __atomic_store_n(&peak_gum_module_sync_state,
+                         PEAK_GUM_MODULE_SYNC_INACTIVE,
+                         __ATOMIC_RELEASE);
+        worker_unavailable = TRUE;
+    }
+
+    _gum_module_registry_activate_peak_original(registry);
+
+    if (__atomic_load_n(&peak_gum_module_sync_thread_started,
+                        __ATOMIC_ACQUIRE) != 0) {
+        __atomic_store_n(&peak_gum_module_sync_state,
+                         PEAK_GUM_MODULE_SYNC_ACTIVE,
+                         __ATOMIC_RELEASE);
+        peak_gum_module_sync_wake();
+    } else if (worker_unavailable) {
+        g_warning("PEAK deferred Gum module-sync worker unavailable; "
+                  "dynamic module-registry updates are disabled");
+    }
+}
+
+G_GNUC_INTERNAL void
+_gum_module_registry_deactivate(GumModuleRegistry * registry)
+{
+    peak_gum_module_sync_quiesce();
+
+    _gum_module_registry_deactivate_peak_original(registry);
+    __atomic_store_n(&peak_gum_module_sync_state,
+                     PEAK_GUM_MODULE_SYNC_INACTIVE,
+                     __ATOMIC_RELEASE);
+}
+
+void
+gum_deinit(void)
+{
+    if (__atomic_load_n(&peak_gum_module_sync_forked_child,
+                        __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    peak_gum_module_sync_quiesce();
+    gum_deinit_peak_original();
+}
+
+void
+gum_deinit_embedded(void)
+{
+    if (__atomic_load_n(&peak_gum_module_sync_forked_child,
+                        __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    peak_gum_module_sync_quiesce();
+    gum_deinit_embedded_peak_original();
+}
+
+void
+gum_shutdown(void)
+{
+    if (__atomic_load_n(&peak_gum_module_sync_forked_child,
+                        __ATOMIC_ACQUIRE) != 0) {
+        return;
+    }
+    peak_gum_module_sync_quiesce();
+    gum_shutdown_peak_original();
+}
 
 typedef guint8 PeakGumInterceptorType17;
 

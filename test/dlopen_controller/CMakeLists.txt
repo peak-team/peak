@@ -1,7 +1,22 @@
+add_library(test_deferred_module_a MODULE deferred_module_fixture.c)
+add_library(test_deferred_module_b MODULE deferred_module_fixture.c)
+add_library(test_forking_module MODULE forking_module_fixture.c)
+set_target_properties(test_deferred_module_a test_deferred_module_b
+    test_forking_module
+    PROPERTIES
+        PREFIX ""
+        C_VISIBILITY_PRESET hidden)
+
 add_executable(test_dlopen_controller test_dlopen_controller.c)
-target_link_libraries(test_dlopen_controller PRIVATE peak)
+target_link_libraries(test_dlopen_controller PRIVATE peak ${CMAKE_DL_LIBS})
 target_include_directories(test_dlopen_controller PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_definitions(test_dlopen_controller PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+target_compile_definitions(test_dlopen_controller PRIVATE
+    PEAK_TEST_DEFERRED_MODULE_A="$<TARGET_FILE:test_deferred_module_a>"
+    PEAK_TEST_DEFERRED_MODULE_B="$<TARGET_FILE:test_deferred_module_b>")
+add_dependencies(test_dlopen_controller
+    test_deferred_module_a
+    test_deferred_module_b)
 
 add_test(NAME test_dlopen_controller_diagnostics
     COMMAND $<TARGET_FILE:test_dlopen_controller>)
@@ -9,3 +24,25 @@ set_tests_properties(test_dlopen_controller_diagnostics
     PROPERTIES
         ENVIRONMENT "PEAK_DLOPEN_TRACE_PATH=${PROJECT_BINARY_DIR}/test/dlopen_controller/peak-dlopen-diagnostics-trace.csv"
         PASS_REGULAR_EXPRESSION "dlopen_controller_diagnostics_ok")
+
+if(PEAK_GUM_PEAK_API_AVAILABLE)
+    add_executable(test_gum_module_sync_lifecycle
+        test_gum_module_sync_lifecycle.c)
+    target_link_libraries(test_gum_module_sync_lifecycle
+        PRIVATE peak ${CMAKE_DL_LIBS})
+    target_compile_definitions(test_gum_module_sync_lifecycle PRIVATE
+        PEAK_TEST_DEFERRED_MODULE_A="$<TARGET_FILE:test_deferred_module_a>"
+        PEAK_TEST_DEFERRED_MODULE_B="$<TARGET_FILE:test_deferred_module_b>"
+        PEAK_TEST_FORKING_MODULE="$<TARGET_FILE:test_forking_module>")
+    add_dependencies(test_gum_module_sync_lifecycle
+        test_deferred_module_a
+        test_deferred_module_b
+        test_forking_module)
+
+    add_test(NAME test_gum_module_sync_lifecycle
+        COMMAND $<TARGET_FILE:test_gum_module_sync_lifecycle>)
+    set_tests_properties(test_gum_module_sync_lifecycle
+        PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "gum_module_sync_lifecycle_ok")
+endif()
