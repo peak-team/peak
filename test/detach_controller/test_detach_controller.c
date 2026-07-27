@@ -3512,7 +3512,7 @@ run_fake_helper_fail_closed(void)
 }
 
 static int
-run_fake_helper_auto_fallback(void)
+run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     fprintf(stderr, "fake-helper-auto-fallback requires PEAK_HAVE_GUM_PEAK_PC_API\n");
@@ -3537,6 +3537,7 @@ run_fake_helper_auto_fallback(void)
     if (log_path != NULL && log_path[0] != '\0') {
         unlink(log_path);
     }
+    peak_detach_controller_configure_mpi_process(mpi_process);
 
     gum_init_embedded();
     interceptor = gum_interceptor_obtain();
@@ -3584,11 +3585,16 @@ run_fake_helper_auto_fallback(void)
                  shutdown_status,
                  PEAK_DETACH_STATUS_SAFE);
     if (log_path != NULL && log_path[0] != '\0') {
-        check_helper_log_count(log_path, "START", 1);
-        check_helper_log_count(log_path, "STOP", 1);
-        check_helper_log_count(log_path, "EVACUATE", 0);
-        check_helper_log_count(log_path, "RESUME", 0);
-        check_helper_log_count(log_path, "SHUTDOWN", 0);
+        if (mpi_process) {
+            check_true("MPI auto backend never creates helper log",
+                       access(log_path, F_OK) != 0);
+        } else {
+            check_helper_log_count(log_path, "START", 1);
+            check_helper_log_count(log_path, "STOP", 1);
+            check_helper_log_count(log_path, "EVACUATE", 0);
+            check_helper_log_count(log_path, "RESUME", 0);
+            check_helper_log_count(log_path, "SHUTDOWN", 0);
+        }
         unlink(log_path);
     }
 
@@ -3601,6 +3607,18 @@ run_fake_helper_auto_fallback(void)
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 #endif
+}
+
+static int
+run_fake_helper_auto_fallback(void)
+{
+    return run_fake_helper_auto_fallback_with_mpi(FALSE);
+}
+
+static int
+run_fake_helper_auto_mpi(void)
+{
+    return run_fake_helper_auto_fallback_with_mpi(TRUE);
 }
 
 static int
@@ -3820,7 +3838,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
+                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -3891,6 +3909,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-auto-fallback") == 0) {
         return run_fake_helper_auto_fallback();
+    }
+    if (strcmp(argv[1], "fake-helper-auto-mpi") == 0) {
+        return run_fake_helper_auto_mpi();
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();

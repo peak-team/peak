@@ -1595,17 +1595,39 @@ def check_stop_window_accounting_sidecar(repo_root):
 
 def check_mpi_startup_helper_warmup(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    controller = (repo_root / "src/detach_controller.c").read_text(encoding="utf-8")
+    controller_tests = (
+        repo_root / "test/detach_controller/test_detach_controller.c"
+    ).read_text(encoding="utf-8")
+    controller_tests_cmake = (
+        repo_root / "test/detach_controller/CMakeLists.txt"
+    ).read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
 
     check_mpi_position = body.find("found_MPI = check_MPI();")
+    configure_position = body.find(
+        "peak_detach_controller_configure_mpi_process(found_MPI != 0);"
+    )
+    pthread_attach_position = body.find("pthread_listener_attach();")
     warmup_position = body.find("peak_detach_controller_warmup_backend();")
-    require(check_mpi_position != -1 and warmup_position != -1,
-            "peak_init must keep explicit MPI detection and helper warmup")
-    require(check_mpi_position < warmup_position,
-            "helper warmup must not run before MPI detection")
+    require(check_mpi_position != -1 and
+            configure_position != -1 and
+            pthread_attach_position != -1 and
+            warmup_position != -1,
+            "peak_init must keep explicit MPI detection, backend configuration, and helper warmup")
+    require(check_mpi_position < configure_position <
+            pthread_attach_position < warmup_position,
+            "MPI auto-backend containment must be configured before helper warmup or listener mutation")
     warmup_context = body[max(0, warmup_position - 180):warmup_position + 80]
     require("!found_MPI" in warmup_context,
             "helper warmup must be suppressed for MPI-linked programs before PMPI_Init")
+    require("peak_detach_mpi_process" in controller and
+            "auto safe detach using signal backend because MPI runtime is present" in controller,
+            "auto mode must select the in-process signal backend for MPI applications")
+    require("test_detach_controller_auto_mpi_uses_signal" in controller_tests_cmake and
+            "fake-helper-auto-mpi" in controller_tests and
+            "MPI auto backend never creates helper log" in controller_tests,
+            "MPI auto-backend containment must prove that an available helper is never started")
 
 
 def check_detach_profile_accounting_order(repo_root):

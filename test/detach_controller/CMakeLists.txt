@@ -343,6 +343,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       PASS_REGULAR_EXPRESSION "auto safe detach using signal backend because ptrace_scope=2"
       SKIP_RETURN_CODE 77)
 
+  add_test(NAME test_detach_controller_auto_mpi_uses_signal
+    COMMAND test_detach_controller fake-helper-auto-mpi)
+  set_tests_properties(test_detach_controller_auto_mpi_uses_signal
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_VERBOSITY=info;PEAK_TEST_PTRACE_SCOPE=0;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=stop-permission;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_controller/auto-mpi-helper.log"
+      PASS_REGULAR_EXPRESSION "auto safe detach using signal backend because MPI runtime is present"
+      SKIP_RETURN_CODE 77)
+
   foreach(_fake_scenario IN ITEMS stop-permission stop-timeout stop-timeout-delayed bad-snapshot duplicate-snapshot blocked-pc)
     add_test(NAME test_detach_controller_fake_helper_${_fake_scenario}
       COMMAND test_detach_controller fake-helper-fail-closed)

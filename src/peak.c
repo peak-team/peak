@@ -464,6 +464,7 @@ void peak_init()
             found_MPI = 0;
         }
     }
+    peak_detach_controller_configure_mpi_process(found_MPI != 0);
 #endif
     pthread_listener_attach();
     /*
