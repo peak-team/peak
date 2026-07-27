@@ -63,9 +63,17 @@ static guint peak_gum_module_sync_atfork_registered;
 static guint peak_gum_module_sync_forked_child;
 
 G_STATIC_ASSERT(sizeof(PeakGumSynchronizeModulesFunc) == sizeof(gpointer));
-G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(gpointer), NULL));
-G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(guint), NULL));
-G_STATIC_ASSERT(__atomic_always_lock_free(sizeof(gint), NULL));
+/*
+ * The overlay is restricted above to 64-bit x86 and Arm, where naturally
+ * aligned word-sized loads/stores and 32-bit read-modify-write operations are
+ * lock-free.  Spell this as ABI size assertions instead of using
+ * __atomic_always_lock_free() in G_STATIC_ASSERT: Intel C 19 implements the
+ * __atomic builtins used below, but rejects that predicate in an integer
+ * constant-expression context.
+ */
+G_STATIC_ASSERT(sizeof(gpointer) == 8);
+G_STATIC_ASSERT(sizeof(guint) == 4);
+G_STATIC_ASSERT(sizeof(gint) == 4);
 
 G_GNUC_INTERNAL void
 _gum_module_registry_handle_rtld_notification_peak_original(
