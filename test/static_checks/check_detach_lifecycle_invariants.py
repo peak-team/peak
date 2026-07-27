@@ -963,6 +963,9 @@ def check_stop_window_accounting_sidecar(repo_root):
     general_listener_attach = extract_function(
         general, "peak_general_listener_attach"
     )
+    overhead_bootstrap = extract_function(
+        general, "peak_general_overhead_bootstrapping"
+    )
     startup_skip = extract_function(
         attach_policy, "peak_general_listener_startup_attach_can_skip_stop"
     )
@@ -1542,12 +1545,20 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and
+            "errno = 0;" in startup_skip and
+            "read_errno = errno;" in startup_skip and
             "task_count > 1" in startup_skip and
-            "return task_count == 1;" in startup_skip,
-            "startup attach stop-skip must be proven by single-thread /proc task count")
+            "return read_errno == 0 && task_count == 1;" in startup_skip,
+            "startup attach stop-skip must fail closed on /proc read errors and be proven by a single-thread task count")
     require("startup_attach_can_skip_stop" in general_listener_attach and
             "!startup_attach_can_skip_stop &&" in general_listener_attach,
             "initial attach must skip the stop backend only after a single-thread proof")
+    require("startup_attach_can_skip_stop" in overhead_bootstrap and
+            overhead_bootstrap.count(
+                "peak_general_listener_startup_attach_can_skip_stop()"
+            ) >= 2 and
+            overhead_bootstrap.count("!startup_attach_can_skip_stop &&") >= 4,
+            "startup overhead calibration attach/detach must independently prove single-thread safety before skipping the stop backend")
 
     support_attach_supported = extract_function(
         attach_policy,
@@ -1573,6 +1584,9 @@ def check_stop_window_accounting_sidecar(repo_root):
             "dlopen listener must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
             "dlopen listener must not use support-only prologue policy")
+    require("startup_attach_can_skip_stop" in dlopen_attach and
+            dlopen_attach.count("!startup_attach_can_skip_stop &&") >= 2,
+            "startup dlopen listener attach must not start the stop backend after a single-thread proof")
     require("peak_general_listener_attach_target_is_supported" in dlopen_dynamic,
             "dynamic dlopen user targets must use normal target prologue policy")
     require("peak_general_listener_support_attach_target_is_supported" not in dlopen_dynamic,

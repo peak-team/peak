@@ -5,6 +5,7 @@
 #include "logging.h"
 
 #include <dirent.h>
+#include <errno.h>
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -98,12 +99,19 @@ peak_general_listener_startup_attach_can_skip_stop(void)
     DIR* dir = opendir("/proc/self/task");
     struct dirent* entry;
     unsigned int task_count = 0;
+    int read_errno;
 
     if (dir == NULL) {
         return FALSE;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            read_errno = errno;
+            break;
+        }
         const char* name = entry->d_name;
 
         if (name[0] == '.') {
@@ -117,5 +125,5 @@ peak_general_listener_startup_attach_can_skip_stop(void)
     }
 
     closedir(dir);
-    return task_count == 1;
+    return read_errno == 0 && task_count == 1;
 }
