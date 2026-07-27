@@ -3,10 +3,12 @@
 #include "internal/general_listener_internal.h"
 #include "pthread_listener.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 gboolean* peak_need_detach;
@@ -36,6 +38,13 @@ extern gpointer* hook_address;
 extern GumInvocationListener** array_listener;
 
 static int failures;
+static int checkpoint_mapping_enabled;
+
+int
+peak_exec_checkpoint_enabled_at_startup(void)
+{
+    return checkpoint_mapping_enabled;
+}
 
 static void
 clear_mpi_launcher_environment(void)
@@ -816,6 +825,123 @@ run_uint64_saturation(void)
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+static int
+run_general_listener_mapping_lifecycle(void)
+{
+    const size_t capacity = 112;
+    const size_t expected_size = capacity * 64;
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char residency;
+    GumInvocationListener* base;
+    PeakGeneralListener* listener;
+    void* fast_stats_mapping;
+    void* checkpoint_mapping;
+
+    gum_init_embedded();
+    peak_max_num_threads = capacity;
+    checkpoint_mapping_enabled = 1;
+    peak_general_listener_test_fail_mapping_after(-1);
+    base = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+    listener = PEAKGENERAL_LISTENER(base);
+    check_true("listener mapping ready",
+               peak_general_listener_is_ready(listener));
+    check_true("listener mapping capacity",
+               listener->fast_stats_capacity == capacity);
+    check_true("listener mapping size",
+               listener->fast_stats_mapping_size == expected_size);
+    check_true("listener checkpoint mapping allocated",
+               listener->checkpoint_shadow != NULL &&
+                   listener->checkpoint_shadow_mapping_size == expected_size);
+    check_true("listener first active initialized",
+               atomic_load_explicit(&listener->fast_active[0],
+                                    memory_order_relaxed) == 0);
+    check_true(
+        "listener last active initialized",
+        atomic_load_explicit(
+            (_Atomic guint*)((guint8*)listener->fast_active +
+                            (capacity - 1) * 64),
+            memory_order_relaxed) == 0);
+    listener->num_calls[(capacity - 1) * 64 / sizeof(gulong)] = 17;
+    check_true("listener last call slot writable",
+               listener->num_calls[(capacity - 1) * 64 / sizeof(gulong)] ==
+                   17);
+    fast_stats_mapping = listener->fast_active;
+    checkpoint_mapping = listener->checkpoint_shadow;
+    errno = 0;
+    check_true("listener stats mapping resident before free",
+               page_size > 0 &&
+                   mincore(fast_stats_mapping, page_size, &residency) == 0);
+    errno = 0;
+    check_true("listener checkpoint mapping resident before free",
+               mincore(checkpoint_mapping, page_size, &residency) == 0);
+    peak_general_listener_free(listener);
+    errno = 0;
+    check_true("listener stats mapping unmapped by free",
+               mincore(fast_stats_mapping, page_size, &residency) == -1 &&
+                   errno == ENOMEM);
+    errno = 0;
+    check_true("listener checkpoint mapping unmapped by free",
+               mincore(checkpoint_mapping, page_size, &residency) == -1 &&
+                   errno == ENOMEM);
+    peak_general_listener_free(listener);
+    g_object_unref(base);
+
+    peak_general_listener_test_fail_mapping_after(0);
+    base = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+    listener = PEAKGENERAL_LISTENER(base);
+    check_true("first mapping failure is not ready",
+               !peak_general_listener_is_ready(listener));
+    check_true("first mapping failure records ENOMEM",
+               listener->fast_stats_errno == ENOMEM);
+    check_true("first mapping failure has no aliases",
+               listener->num_calls == NULL &&
+                   listener->checkpoint_shadow == NULL &&
+                   listener->target_thread_called == NULL);
+    peak_general_listener_free(listener);
+    g_object_unref(base);
+
+    peak_general_listener_test_fail_mapping_after(1);
+    base = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+    listener = PEAKGENERAL_LISTENER(base);
+    check_true("checkpoint mapping failure keeps listener ready",
+               peak_general_listener_is_ready(listener));
+    check_true("checkpoint mapping failure is fail-open",
+               listener->checkpoint_shadow == NULL &&
+                   listener->checkpoint_shadow_mapping_size == 0);
+    peak_general_listener_free(listener);
+    g_object_unref(base);
+
+    peak_general_listener_test_fail_mapping_after(-1);
+    for (unsigned int iteration = 0; iteration < 32; iteration++) {
+        base = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+        listener = PEAKGENERAL_LISTENER(base);
+        check_true("repeated listener mapping ready",
+                   peak_general_listener_is_ready(listener));
+        fast_stats_mapping = listener->fast_active;
+        checkpoint_mapping = listener->checkpoint_shadow;
+        peak_general_listener_free(listener);
+        errno = 0;
+        check_true("repeated stats mapping unmapped",
+                   mincore(fast_stats_mapping,
+                           page_size,
+                           &residency) == -1 &&
+                       errno == ENOMEM);
+        errno = 0;
+        check_true("repeated checkpoint mapping unmapped",
+                   mincore(checkpoint_mapping,
+                           page_size,
+                           &residency) == -1 &&
+                       errno == ENOMEM);
+        g_object_unref(base);
+    }
+
+    checkpoint_mapping_enabled = 0;
+    peak_general_listener_test_fail_mapping_after(-1);
+    gum_deinit_embedded();
+    fprintf(stderr, "general-listener-mapping-lifecycle-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int
 main(int argc, char** argv)
 {
@@ -846,6 +972,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "general-listener-uint64-saturation") == 0) {
         return run_uint64_saturation();
+    }
+    if (strcmp(argv[1], "general-listener-mapping-lifecycle") == 0) {
+        return run_general_listener_mapping_lifecycle();
     }
 
     fprintf(stderr, "unknown scenario: %s\n", argv[1]);

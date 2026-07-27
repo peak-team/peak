@@ -41,6 +41,8 @@ def main():
     initialize = function_body(
         source, "peak_general_listener_thread_state_initialize"
     )
+    listener_init = function_body(source, "peak_general_listener_init")
+    listener_ready = function_body(source, "peak_general_listener_is_ready")
     push = function_body(source, "peak_general_listener_push_invocation")
     increment = function_body(
         source, "peak_general_listener_num_calls_increment"
@@ -92,6 +94,20 @@ def main():
         and "self->min_time = (gfloat*)(fast_stats + 36)" in source
         and "peak_general_listener_num_calls_slot(self, index)" in enter,
         "per-thread accounting must remain isolated and coalesced by cache line",
+    )
+    require(
+        "peak_general_listener_map_zeroed(" in listener_init
+        and "MAP_PRIVATE | MAP_ANONYMOUS" in source
+        and "atomic_init(peak_general_listener_fast_active_slot" in listener_init
+        and "fast_stats_capacity" in listener_init
+        and "fast_stats_mapping_size ==" in listener_ready
+        and "self->num_calls ==" in listener_ready
+        and "self->min_time ==" in listener_ready
+        and "munmap(self->fast_active, self->fast_stats_mapping_size)" in source
+        and "peak_general_listener_is_ready" in source
+        and "g_aligned_alloc0(" not in listener_init,
+        "packed listener statistics must use persistent anonymous mappings "
+        "with guarded publication and matching teardown",
     )
     require(
         "__atomic_add_fetch" not in increment
