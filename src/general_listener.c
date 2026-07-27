@@ -5907,6 +5907,7 @@ __attribute__((noinline)) static void peak_general_overhead_dummy_func()
 static void
 peak_general_overhead_bootstrapping()
 {
+    gboolean startup_attach_can_skip_stop;
     GumInvocationListener* listener_bootstrapping =
         g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
     PEAKGENERAL_LISTENER(listener_bootstrapping)->hook_id = 0;
@@ -5932,7 +5933,15 @@ peak_general_overhead_bootstrapping()
     };
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
-    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+    /*
+     * Calibration runs before application main and PMPI_Init.  When the
+     * process still has one task, Gum can mutate directly; starting the auto
+     * backend's helper here would fork every MPI rank during fragile startup.
+     */
+    startup_attach_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
         peak_log_debug("[peak] skipping overhead calibration Gum attach: %s\n",
                    peak_detach_controller_status_string(detach_status));
@@ -5950,7 +5959,8 @@ peak_general_overhead_bootstrapping()
             listener_bootstrapping,
             NULL);
     gum_interceptor_end_transaction(interceptor);
-    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish("overhead attach finish",
                                                         detach_status);
@@ -5979,7 +5989,10 @@ peak_general_overhead_bootstrapping()
 
     mutation_request.listener = listener_bootstrapping;
     mutation_request.operation = PEAK_DETACH_OPERATION_DETACH;
-    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+    startup_attach_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
         g_printerr("[peak] fatal overhead calibration Gum detach prepare failed after attach: %s\n",
                    peak_detach_controller_status_string(detach_status));
@@ -6000,7 +6013,8 @@ peak_general_overhead_bootstrapping()
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_detach(interceptor, listener_bootstrapping);
     gum_interceptor_end_transaction(interceptor);
-    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish("overhead detach finish",
                                                         detach_status);

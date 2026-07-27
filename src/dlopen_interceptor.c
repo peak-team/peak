@@ -5,6 +5,7 @@
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
 #include "logging.h"
+#include "internal/general_listener/attach_policy.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "utils/source_target.h"
 
@@ -2170,6 +2171,7 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
 int dlopen_interceptor_attach()
 {
     GumAttachReturn attach_status = GUM_ATTACH_WRONG_SIGNATURE;
+    gboolean startup_attach_can_skip_stop;
     dlopen_interceptor = gum_interceptor_obtain();
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
     dlopen_interceptor_initialize_fftw_target_scope();
@@ -2210,7 +2212,15 @@ int dlopen_interceptor_attach()
     };
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
-    if (!peak_detach_controller_prepare_hook_mutation(&mutation_request,
+    /*
+     * Install this startup-only listener before PMPI_Init without eagerly
+     * starting one helper per MPI rank. Runtime dynamic target mutations still
+     * use the controller protocol after peer threads exist.
+     */
+    startup_attach_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&mutation_request,
                                                       &detach_status)) {
         g_printerr("[peak] skipping dlopen Gum listener: %s\n",
                    peak_detach_controller_status_string(detach_status));
@@ -2229,7 +2239,8 @@ int dlopen_interceptor_attach()
                                            dlopen_listener,
                                            NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
-    if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish("dlopen attach finish",
                                                         detach_status);
