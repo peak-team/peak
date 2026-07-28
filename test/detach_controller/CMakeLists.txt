@@ -231,6 +231,15 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
       TIMEOUT 15
   )
 
+  add_test(NAME test_detach_controller_signal_event_futex
+    COMMAND test_detach_controller signal-event-futex
+  )
+  set_tests_properties(test_detach_controller_signal_event_futex
+    PROPERTIES
+      TIMEOUT 5
+      PASS_REGULAR_EXPRESSION "signal_event_futex_ok"
+  )
+
   add_test(NAME test_detach_controller_signal_backend_missing_thread_gate
     COMMAND test_detach_controller signal-backend-missing-thread-gate
   )

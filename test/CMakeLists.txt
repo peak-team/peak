@@ -1041,7 +1041,8 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "milc_like_ab_check_ok")
         # Fixed-topology acceptance needs 14 CPUs and stable performance.
         # Keep these tests intact but out of generic hosted CI via the
-        # stress label.
+        # stress label.  A lower observed overhead is a success, so coverage
+        # is guarded explicitly instead of imposing a minimum slowdown.
         add_test(NAME test_detach_milc_like_acceptance_strict_long
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py
@@ -1064,15 +1065,18 @@ if(BUILD_TESTING)
                     --target-overhead-ratio 0.005
                     --global-overhead-ratio 0.05
                     --max-overhead-ratio 0.06
-                    --min-overhead-ratio 0.04
+                    --min-overhead-ratio -1.0
                     --min-max-accounting-ratio 0.0
                     --max-stable-accounting-ratio 0.06
                     --max-final-accounting-ratio 0.06
                     --max-final-profile-denominator-error 0.01
                     --max-reported-profile-control-denominator-error 0.01
                     --max-baseline-drift 0.05
-                    --min-weighted-call-coverage 0.0
-                    --min-phase-target-breadth 0.0
+                    --min-weighted-call-coverage 0.001
+                    --min-phase-target-breadth 1.0
+                    --min-final-detached-targets 832
+                    --min-final-reattached-targets 832
+                    --min-final-revisited-targets 832
                     --disable-trace)
         set_tests_properties(test_detach_milc_like_acceptance_strict_long
             PROPERTIES
@@ -1102,15 +1106,18 @@ if(BUILD_TESTING)
                     --target-overhead-ratio 0.005
                     --global-overhead-ratio 0.05
                     --max-overhead-ratio 0.06
-                    --min-overhead-ratio 0.04
+                    --min-overhead-ratio -1.0
                     --min-max-accounting-ratio 0.0
                     --max-stable-accounting-ratio 0.06
                     --max-final-accounting-ratio 0.06
                     --max-final-profile-denominator-error 0.01
                     --max-reported-profile-control-denominator-error 0.01
                     --max-baseline-drift 0.05
-                    --min-weighted-call-coverage 0.0
-                    --min-phase-target-breadth 0.0
+                    --min-weighted-call-coverage 0.001
+                    --min-phase-target-breadth 1.0
+                    --min-final-detached-targets 832
+                    --min-final-reattached-targets 832
+                    --min-final-revisited-targets 832
                     --disable-trace)
         set_tests_properties(test_detach_milc_like_acceptance_signal_long
             PROPERTIES

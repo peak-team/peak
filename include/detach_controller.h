@@ -125,6 +125,20 @@ peak_detach_controller_test_gate_waiter_count(void);
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
 
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_signal_wait_sequence(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API int
+peak_detach_controller_test_signal_wait_count(void);
+
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_wait_for_signal_event(int expected_sequence);
+
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_wake_signal_waiters(void);
+#endif
+
 /*
  * Replace an already-snapshotted helper environment entry after the
  * controller and helper have both stopped.  This is an explicit-value test

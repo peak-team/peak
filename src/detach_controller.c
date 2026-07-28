@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "detach_controller.h"
 #include "detach_helper_protocol.h"
+#include "internal/exec_raw_syscall.h"
 #include "logging.h"
 #include "internal/signal_policy_internal.h"
 
@@ -199,6 +200,10 @@ static int signal_trap_handler_installed = 0;
 static _Atomic int signal_epoch_counter = 1;
 static _Atomic int signal_hold_epoch = 0;
 static _Atomic int signal_release_epoch = 0;
+static _Atomic int signal_wait_sequence = 0;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int signal_test_wait_count = 0;
+#endif
 static _Atomic int strict_mutation_thread_gate = 0;
 static _Atomic int strict_mutation_thread_gate_epoch = 1;
 static _Atomic int strict_mutation_thread_gate_installed = 0;
@@ -218,19 +223,19 @@ static double strict_gate_wait_timeout_s =
  * This same-address futex access is an explicit supported Linux compiler ABI
  * contract for _Atomic int, not a universal C11 representation proof.
  */
-_Static_assert(sizeof(signal_release_epoch) == sizeof(int),
-               "futex release word must match int storage");
+_Static_assert(sizeof(signal_wait_sequence) == sizeof(int),
+               "futex wait word must match int storage");
 _Static_assert(sizeof(int) * CHAR_BIT == 32,
-               "Linux futex release word must be exactly 32 bits");
+               "Linux futex wait word must be exactly 32 bits");
 _Static_assert(_Alignof(_Atomic int) == _Alignof(int),
-               "futex release word must retain int alignment");
+               "futex wait word must retain int alignment");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
-               "Linux futex release word must be always lock-free");
+               "Linux futex wait word must be always lock-free");
 
 static int*
-peak_detach_controller_signal_release_futex_word(void)
+peak_detach_controller_signal_wait_futex_word(void)
 {
-    return (int*)(void*)&signal_release_epoch;
+    return (int*)(void*)&signal_wait_sequence;
 }
 #endif
 
@@ -1592,6 +1597,7 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_backend_signum) &&
            atomic_is_lock_free(&signal_hold_epoch) &&
            atomic_is_lock_free(&signal_release_epoch) &&
+           atomic_is_lock_free(&signal_wait_sequence) &&
            atomic_is_lock_free(&signal_slot_count) &&
            atomic_is_lock_free(&signal_slots[0].active_epoch) &&
            atomic_is_lock_free(&signal_slots[0].arrived_epoch) &&
@@ -1881,26 +1887,40 @@ peak_detach_controller_signal_alloc_slot(pid_t tid, int epoch)
 }
 
 static void
-peak_detach_controller_signal_wait_release_epoch(int expected_release_epoch)
+peak_detach_controller_signal_wait_event(int expected_sequence)
 {
 #if defined(__linux__)
-    const struct timespec timeout = {
-        .tv_sec = 0,
-        .tv_nsec = 1000000L,
+    const struct timespec failsafe_timeout = {
+        .tv_sec = 1,
+        .tv_nsec = 0,
     };
     int saved_errno = errno;
 
-    /* EINTR, EAGAIN, and ETIMEDOUT are all rechecked by the caller's predicate. */
-    (void)syscall(SYS_futex,
-                  peak_detach_controller_signal_release_futex_word(),
-                  FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                  expected_release_epoch,
-                  &timeout,
-                  NULL,
-                  0);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    (void)atomic_fetch_add_explicit(&signal_test_wait_count,
+                                    1,
+                                    memory_order_release);
+#endif
+
+    /*
+     * The event sequence is changed before every release or evacuation wake.
+     * This makes a wake that races the wait visible through the futex value,
+     * so normal waits are event-driven instead of polling every millisecond.
+     * The long timeout is only a fail-safe for an unexpected lost wake or
+     * restricted futex implementation. EINTR, EAGAIN, and ETIMEDOUT are all
+     * rechecked by the caller's predicate.
+     */
+    (void)peak_exec_raw_syscall6(
+        SYS_futex,
+        (long)(uintptr_t)peak_detach_controller_signal_wait_futex_word(),
+        FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+        expected_sequence,
+        (long)(uintptr_t)&failsafe_timeout,
+        0,
+        0);
     errno = saved_errno;
 #else
-    (void)expected_release_epoch;
+    (void)expected_sequence;
 #endif
 }
 
@@ -1910,16 +1930,49 @@ peak_detach_controller_signal_wake_release_waiters(void)
 #if defined(__linux__)
     int saved_errno = errno;
 
-    (void)syscall(SYS_futex,
-                  peak_detach_controller_signal_release_futex_word(),
-                  FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-                  INT_MAX,
-                  NULL,
-                  NULL,
-                  0);
+    (void)atomic_fetch_add_explicit(&signal_wait_sequence,
+                                    1,
+                                    memory_order_release);
+    (void)peak_exec_raw_syscall6(
+        SYS_futex,
+        (long)(uintptr_t)peak_detach_controller_signal_wait_futex_word(),
+        FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+        INT_MAX,
+        0,
+        0,
+        0);
     errno = saved_errno;
 #endif
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+int
+peak_detach_controller_test_signal_wait_sequence(void)
+{
+    return atomic_load_explicit(&signal_wait_sequence, memory_order_acquire);
+}
+
+int
+peak_detach_controller_test_signal_wait_count(void)
+{
+    return atomic_load_explicit(&signal_test_wait_count, memory_order_acquire);
+}
+
+void
+peak_detach_controller_test_wait_for_signal_event(int expected_sequence)
+{
+    while (atomic_load_explicit(&signal_wait_sequence,
+                                memory_order_acquire) == expected_sequence) {
+        peak_detach_controller_signal_wait_event(expected_sequence);
+    }
+}
+
+void
+peak_detach_controller_test_wake_signal_waiters(void)
+{
+    peak_detach_controller_signal_wake_release_waiters();
+}
+#endif
 
 static gboolean
 peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
@@ -1928,6 +1981,9 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                                gboolean allow_evacuation)
 {
     for (;;) {
+        int expected_sequence =
+            atomic_load_explicit(&signal_wait_sequence,
+                                 memory_order_acquire);
         int expected_release_epoch =
             atomic_load_explicit(&signal_release_epoch, memory_order_acquire);
         if (expected_release_epoch == epoch ||
@@ -1941,7 +1997,7 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                   memory_order_release);
             return FALSE;
         }
-        peak_detach_controller_signal_wait_release_epoch(expected_release_epoch);
+        peak_detach_controller_signal_wait_event(expected_sequence);
     }
 
     if (atomic_load_explicit(&signal_hold_epoch, memory_order_acquire) == epoch &&
@@ -1968,7 +2024,7 @@ peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
     }
 
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
-    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pid_t tid = (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
     if (epoch == 0 ||
         !peak_signal_policy_cookie_matches_async(info, epoch, tid)) {
         peak_signal_policy_note_unexpected_delivery();
@@ -2013,7 +2069,15 @@ peak_detach_controller_forward_unhandled_trap(int signo,
     if (previous_trap_action.sa_handler == SIG_DFL ||
         previous_trap_action.sa_handler == NULL) {
         (void)sigaction(SIGTRAP, &previous_trap_action, NULL);
-        (void)syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGTRAP);
+        pid_t tid =
+            (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+        (void)peak_exec_raw_syscall6(SYS_tgkill,
+                                     (long)getpid(),
+                                     (long)tid,
+                                     SIGTRAP,
+                                     0,
+                                     0,
+                                     0);
         return;
     }
 
@@ -2034,7 +2098,7 @@ peak_detach_controller_signal_trap_handler(int signo, siginfo_t* info, void* con
         return;
     }
 
-    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pid_t tid = (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
     PeakDetachSignalSlot* slot =
         peak_detach_controller_signal_find_slot(tid, epoch);
     if (slot == NULL ||
