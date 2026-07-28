@@ -36,6 +36,7 @@ def main():
     root = Path(sys.argv[1])
     source = (root / "src/general_listener.c").read_text()
     header = (root / "include/general_listener.h").read_text()
+    generic_enter = function_body(source, "peak_general_listener_on_enter")
     enter = function_body(source, "peak_general_listener_fast_on_enter")
     leave = function_body(source, "peak_general_listener_fast_on_leave")
     initialize = function_body(
@@ -46,6 +47,18 @@ def main():
     push = function_body(source, "peak_general_listener_push_invocation")
     increment = function_body(
         source, "peak_general_listener_num_calls_increment"
+    )
+    controller_wake = function_body(
+        source, "peak_general_listener_controller_wake"
+    )
+    controller_wait = function_body(
+        source, "peak_general_listener_controller_wait"
+    )
+    controller_main = function_body(
+        source, "peak_general_controller_thread_main"
+    )
+    controller_stop = function_body(
+        source, "peak_general_listener_controller_stop"
     )
     publish = function_body(
         source, "peak_general_controller_publish_detach_count_requests_unlocked"
@@ -118,8 +131,79 @@ def main():
     )
     require(
         "_Atomic gboolean detach_count_request_pending" in header
-        and "atomic_compare_exchange_strong_explicit" in enter,
-        "callback must publish the detach-count request through a CAS latch",
+        and "atomic_compare_exchange_strong_explicit" in generic_enter
+        and "atomic_compare_exchange_strong_explicit" in enter
+        and "peak_general_listener_controller_wake" in generic_enter
+        and "peak_general_listener_controller_wake" in enter,
+        "generic and fast threshold-crossing callbacks must publish the "
+        "detach-count CAS latch and issue the lock-free controller wake",
+    )
+    for token in (
+        "pthread_mutex",
+        "pthread_cond",
+        "pthread_sigmask",
+        "g_mutex",
+        "g_new",
+        "g_renew",
+        "g_free",
+        "malloc",
+        "calloc",
+    ):
+        require(
+            token not in controller_wake,
+            f"threshold controller wake contains forbidden operation {token}",
+        )
+    require(
+        "atomic_fetch_add_explicit" in controller_wake
+        and "memory_order_release" in controller_wake
+        and "peak_exec_raw_syscall6" in controller_wake
+        and "FUTEX_WAKE | FUTEX_PRIVATE_FLAG" in controller_wake
+        and "saved_errno = errno" in controller_wake
+        and "errno = saved_errno" in controller_wake,
+        "threshold crossing must use a release sequence and a private raw "
+        "futex wake without changing callback errno",
+    )
+    require(
+        "FUTEX_WAIT | FUTEX_PRIVATE_FLAG" in controller_wait
+        and "expected_wake_sequence" in controller_wait
+        and ".tv_nsec = 10000000L" in controller_wait,
+        "controller wait must use the pre-scan sequence with a bounded "
+        "private futex wait",
+    )
+    sequence_snapshot = controller_main.find(
+        "atomic_load_explicit(&general_controller_wake_sequence"
+    )
+    process_pending = controller_main.find(
+        "peak_general_controller_process_pending_unlocked"
+    )
+    wait_for_wake = controller_main.find(
+        "peak_general_listener_controller_wait(expected_wake_sequence)"
+    )
+    require(
+        sequence_snapshot != -1
+        and process_pending != -1
+        and wait_for_wake != -1
+        and sequence_snapshot < process_pending < wait_for_wake,
+        "controller must snapshot the wake sequence before scanning requests "
+        "and wait on that exact older value",
+    )
+    stop_running = controller_stop.find(
+        "general_controller_running = FALSE"
+    )
+    stop_unlock = controller_stop.find(
+        "pthread_mutex_unlock(&general_controller_wake_mutex)",
+        stop_running,
+    )
+    stop_wake = controller_stop.find(
+        "peak_general_listener_controller_wake()",
+        stop_unlock,
+    )
+    require(
+        stop_running != -1
+        and stop_unlock != -1
+        and stop_wake != -1
+        and stop_running < stop_unlock < stop_wake,
+        "controller stop must publish running=false before its lock-free wake",
     )
     require(
         "atomic_exchange_explicit" in publish

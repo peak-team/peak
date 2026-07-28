@@ -38,6 +38,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <linux/futex.h>
+#endif
+
+#if defined(__linux__) && defined(SYS_futex) && \
+    (defined(__x86_64__) || defined(__aarch64__))
+#define PEAK_GENERAL_CONTROLLER_RAW_FUTEX 1
+#else
+#define PEAK_GENERAL_CONTROLLER_RAW_FUTEX 0
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 extern int peak_exec_checkpoint_enabled_at_startup(void) __attribute__((weak));
 #endif
@@ -159,7 +170,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 _Atomic gboolean heartbeat_running = true;
 static pthread_t general_controller_thread;
 static pthread_mutex_t general_controller_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t general_controller_wake_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int general_controller_wake_sequence = 0;
 static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
 static pthread_t general_controller_owner_thread;
@@ -330,11 +341,70 @@ void peak_general_listener_controller_unlock(void)
     pthread_mutex_unlock(&lock);
 }
 
-void peak_general_listener_controller_wake(void)
+#if PEAK_GENERAL_CONTROLLER_RAW_FUTEX
+/*
+ * Linux futexes compare the first 32 bits at the supplied address.  This is
+ * the same supported C11/compiler ABI contract used by detach_controller.c.
+ */
+_Static_assert(sizeof(general_controller_wake_sequence) == sizeof(int),
+               "controller wake futex word must match int storage");
+_Static_assert(sizeof(int) * CHAR_BIT == 32,
+               "controller wake futex word must be exactly 32 bits");
+_Static_assert(_Alignof(_Atomic int) == _Alignof(int),
+               "controller wake futex word must retain int alignment");
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "controller wake futex word must be always lock-free");
+
+static int*
+peak_general_listener_controller_wake_futex_word(void)
 {
-    pthread_mutex_lock(&general_controller_wake_mutex);
-    pthread_cond_signal(&general_controller_wake_cond);
-    pthread_mutex_unlock(&general_controller_wake_mutex);
+    return (int*)(void*)&general_controller_wake_sequence;
+}
+#endif
+
+void
+peak_general_listener_controller_wake(void)
+{
+    atomic_fetch_add_explicit(&general_controller_wake_sequence,
+                              1,
+                              memory_order_release);
+#if PEAK_GENERAL_CONTROLLER_RAW_FUTEX
+    int saved_errno = errno;
+    (void)peak_exec_raw_syscall6(
+        (long)SYS_futex,
+        (long)peak_general_listener_controller_wake_futex_word(),
+        (long)(FUTEX_WAKE | FUTEX_PRIVATE_FLAG),
+        1L,
+        0L,
+        0L,
+        0L);
+    errno = saved_errno;
+#endif
+}
+
+static void
+peak_general_listener_controller_wait(int expected_wake_sequence)
+{
+    const struct timespec timeout = {
+        .tv_sec = 0,
+        .tv_nsec = 10000000L,
+    };
+
+#if PEAK_GENERAL_CONTROLLER_RAW_FUTEX
+    int saved_errno = errno;
+    (void)peak_exec_raw_syscall6(
+        (long)SYS_futex,
+        (long)peak_general_listener_controller_wake_futex_word(),
+        (long)(FUTEX_WAIT | FUTEX_PRIVATE_FLAG),
+        (long)expected_wake_sequence,
+        (long)&timeout,
+        0L,
+        0L);
+    errno = saved_errno;
+#else
+    (void)expected_wake_sequence;
+    (void)nanosleep(&timeout, NULL);
+#endif
 }
 
 /* Runtime and controller accounting. */
@@ -4056,6 +4126,7 @@ peak_general_controller_thread_main(void* arg)
 
     for (;;) {
         gboolean should_run;
+        int expected_wake_sequence;
 
         pthread_mutex_lock(&general_controller_wake_mutex);
         should_run = general_controller_running;
@@ -4074,6 +4145,10 @@ peak_general_controller_thread_main(void* arg)
             break;
         }
 
+        expected_wake_sequence =
+            atomic_load_explicit(&general_controller_wake_sequence,
+                                 memory_order_acquire);
+
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
                                                                tid_keys,
@@ -4086,19 +4161,11 @@ peak_general_controller_thread_main(void* arg)
         peak_jit_provider_drain_pending();
 
         pthread_mutex_lock(&general_controller_wake_mutex);
-        if (general_controller_running) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 10000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec += 1;
-                ts.tv_nsec -= 1000000000L;
-            }
-            (void)pthread_cond_timedwait(&general_controller_wake_cond,
-                                         &general_controller_wake_mutex,
-                                         &ts);
-        }
+        should_run = general_controller_running;
         pthread_mutex_unlock(&general_controller_wake_mutex);
+        if (should_run) {
+            peak_general_listener_controller_wait(expected_wake_sequence);
+        }
     }
 
     gum_interceptor_unignore_current_thread(interceptor);
@@ -4149,11 +4216,11 @@ peak_general_listener_controller_stop(void)
     if (should_join) {
         general_controller_running = FALSE;
         thread = general_controller_thread;
-        pthread_cond_broadcast(&general_controller_wake_cond);
     }
     pthread_mutex_unlock(&general_controller_wake_mutex);
 
     if (should_join) {
+        peak_general_listener_controller_wake();
         pthread_join(thread, NULL);
         pthread_mutex_lock(&general_controller_wake_mutex);
         general_controller_thread_started = FALSE;
@@ -5606,9 +5673,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
                 TRUE,
                 memory_order_acq_rel,
                 memory_order_relaxed)) {
-            int saved_errno = errno;
             peak_general_listener_controller_wake();
-            errno = saved_errno;
         }
     }
 
