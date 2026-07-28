@@ -89,7 +89,7 @@ int syscall_interceptor_attach()
     hook_address = peak_general_listener_find_function("close");
     if (hook_address) {
         if (peak_close_overlaps_nocancel_entry(hook_address)) {
-            g_printerr("[peak] skipping close support hook: close and __close_nocancel have overlapping or nearby entries that a wide Gum redirect could overwrite\n");
+            peak_log_info("[peak] skipping close support hook: close and __close_nocancel have overlapping or nearby entries that a wide Gum redirect could overwrite\n");
             hook_address = NULL;
         } else if (peak_general_listener_support_attach_target_is_supported(
                 "close", hook_address)) {

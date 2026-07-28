@@ -67,6 +67,7 @@ INTEL_MPI_ONLY_MODES = {
 }
 NON_INTEL_MPI_ONLY_MODES = {
     "finalize-clean-output-mpi-real-finalize-default",
+    "finalize-clean-output-mpi-completion-warn",
     "finalize-clean-output-mpi-writer-fail",
 }
 STATS_FIELDS = [
@@ -90,14 +91,18 @@ REPORT_RELEASE_SKIP_DIAGNOSTIC = (
     "All-rank report publication release completed: "
     "all_reports_succeeded=1 all_real_finalize_allowed=0"
 )
+REPORT_COMPLETION_DIAGNOSTIC = (
+    "PEAK output is complete; report publication and release succeeded"
+)
 REPORT_REAL_FINALIZE_DIAGNOSTIC = (
-    "PEAK output is complete; returning to real PMPI_Finalize"
+    "Returning to real PMPI_Finalize after successful PEAK report release"
 )
 REPORT_INTEL_SKIP_DIAGNOSTIC = (
     "PEAK output release is complete; skipping real PMPI_Finalize "
     "for Intel MPI 2019 compatibility"
 )
 REPORT_COMPLETION_DIAGNOSTICS = (
+    REPORT_COMPLETION_DIAGNOSTIC,
     "All-rank report publication release completed:",
     REPORT_REAL_FINALIZE_DIAGNOSTIC,
     "PEAK output release is complete; skipping real PMPI_Finalize",
@@ -239,12 +244,14 @@ def require_complete_stats_evidence(name, evidence):
 
 def report_clean_completion_policy(output):
     continued_real = (
+        output.count(REPORT_COMPLETION_DIAGNOSTIC) == 1 and
         REPORT_RELEASE_REAL_DIAGNOSTIC in output and
         REPORT_REAL_FINALIZE_DIAGNOSTIC in output and
         REPORT_RELEASE_SKIP_DIAGNOSTIC not in output and
         REPORT_INTEL_SKIP_DIAGNOSTIC not in output
     )
     continued_intel_skip = (
+        output.count(REPORT_COMPLETION_DIAGNOSTIC) == 1 and
         REPORT_RELEASE_SKIP_DIAGNOSTIC in output and
         REPORT_INTEL_SKIP_DIAGNOSTIC in output and
         REPORT_RELEASE_REAL_DIAGNOSTIC not in output and
@@ -343,6 +350,7 @@ def parse_args():
             "finalize-clean-output-mpi-intel-default",
             "finalize-clean-output-mpi-intel-real-finalize",
             "finalize-clean-output-mpi-real-finalize-default",
+            "finalize-clean-output-mpi-completion-warn",
             "finalize-clean-output-mpi-real-finalize-explicit",
             "finalize-clean-output-local",
             "finalize-clean-output-socket-bad-host",
@@ -501,6 +509,8 @@ def main():
         expected_extra.append(
             "owner/local control stop-window overhead: owner_rank="
         )
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
         expected_peak_tables = 1
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-publish-before-root-return":
@@ -543,7 +553,7 @@ def main():
             MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC
         ] = nprocs
         forbidden_output.append(
-            "PEAK output is complete; returning to real PMPI_Finalize"
+            REPORT_COMPLETION_DIAGNOSTIC
         )
         forbidden_output.append(
             "All-rank report publication release completed:"
@@ -572,6 +582,7 @@ def main():
         forbidden_output.append(
             "All-rank report publication release failed"
         )
+        forbidden_output.append(REPORT_COMPLETION_DIAGNOSTIC)
         forbidden_output.append(
             "skipping real PMPI_Finalize for Intel MPI 2019 compatibility"
         )
@@ -592,8 +603,10 @@ def main():
             "all_reports_succeeded=1"
         )
         expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
         forbidden_output.append(
-            "PEAK output is complete; returning to real PMPI_Finalize"
+            REPORT_REAL_FINALIZE_DIAGNOSTIC
         )
         expected_peak_tables = 0
         expected_stats_files = 1
@@ -603,12 +616,14 @@ def main():
         env["PEAK_MPI_REAL_FINALIZE"] = "1"
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
-        expected = "PEAK output is complete; returning to real PMPI_Finalize"
+        expected = REPORT_REAL_FINALIZE_DIAGNOSTIC
         expected_extra.append(
             "All-rank report publication release completed: "
             "all_reports_succeeded=1"
         )
         expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
         expected_peak_tables = 0
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-real-finalize-default":
@@ -616,8 +631,21 @@ def main():
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
-        expected = "PEAK output is complete; returning to real PMPI_Finalize"
+        expected = REPORT_REAL_FINALIZE_DIAGNOSTIC
         expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
+        expected_peak_tables = 0
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-completion-warn":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env.pop("PEAK_MPI_REAL_FINALIZE", None)
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        env["PEAK_VERBOSITY"] = "warn"
+        app_args.append("finalize-then-exit0")
+        expected = REPORT_COMPLETION_DIAGNOSTIC
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
+        forbidden_output.append(REPORT_REAL_FINALIZE_DIAGNOSTIC)
         expected_peak_tables = 0
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-real-finalize-explicit":
@@ -625,8 +653,10 @@ def main():
         env["PEAK_MPI_REAL_FINALIZE"] = "1"
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
-        expected = "PEAK output is complete; returning to real PMPI_Finalize"
+        expected = REPORT_REAL_FINALIZE_DIAGNOSTIC
         expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
         expected_peak_tables = 0
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-local":

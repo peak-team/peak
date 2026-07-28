@@ -578,6 +578,45 @@ def check_x86_patched_gum_requires_exact_attach(repo_root):
             "Linux x86 PEAK-patched Gum must fail configuration without exact-entry attach")
 
 
+def check_fast_listener_unwind_abi(repo_root):
+    cmake = (repo_root / "cmake/frida-gum.cmake").read_text(
+        encoding="utf-8"
+    )
+    api = (repo_root / "cmake/peak-gum/frida-gum-peak-api.h").read_text(
+        encoding="utf-8"
+    )
+    overlay = (repo_root / "cmake/peak-gum/gum_peak_pc_api.c").read_text(
+        encoding="utf-8"
+    )
+    patcher = (
+        repo_root / "cmake/peak-gum/patch_frida_gum_elf_module.py"
+    ).read_text(encoding="utf-8")
+    listener = read_source(repo_root, "src/general_listener.c")
+    unwind_test = (
+        repo_root / "test/detach_runtime/test_fastpath_nonlocal_unwind.c"
+    ).read_text(encoding="utf-8")
+
+    require("GUM_PEAK_FAST_LISTENER_VERSION 5u" in api and
+            "GUM_PEAK_FAST_LISTENER_VERSION != 5" in cmake,
+            "patched Gum configuration must reject an older fast-listener callback ABI")
+    require("peak_gum_get_interceptor_thread_context" in patcher and
+            '"--globalize-symbol"' in patcher and
+            'tls_model("initial-exec")' in overlay and
+            "peak_gum_cached_invocation_stack" in overlay and
+            "peak_gum_invocation_stack_depth()" in overlay and
+            "peak_gum_invocation_stack_reap_to_depth(gum_stack_depth)"
+            in overlay,
+            "direct dispatch must cache, snapshot, and restore Gum's generic "
+            "invocation-stack depth without a steady-state Gum TLS lookup")
+    require("entry->gum_stack_depth = gum_stack_depth" in listener and
+            "*gum_stack_depth_out = entry.gum_stack_depth" in listener,
+            "the PEAK direct invocation entry must carry its Gum stack boundary")
+    require("install_mixed_listener()" in unwind_test and
+            "(gpointer)peak_fastpath_unwind_inner" in unwind_test and
+            "mixed_listener_leaves" in unwind_test,
+            "non-local-unwind regression must cover direct outer and generic inner frames")
+
+
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
@@ -655,6 +694,19 @@ def check_mpi_finalize_trampoline_default(repo_root):
             "Intel MPI" in vendor and
             'strstr(text, "2019")' in vendor,
             "Intel MPI 2019 containment must inspect the MPI library version")
+    fini = extract_function(peak_source, "peak_fini_impl")
+    completion = (
+        'peak_log_report("[peak] PEAK output is complete; '
+        'report publication and release succeeded\\n")'
+    )
+    require(completion in fini and
+            "report_release_protocol_completed &&\n"
+            "                all_reports_succeeded" in fini,
+            "successful all-rank report release must emit one "
+            "default-visible completion marker")
+    require(fini.count("PEAK output is complete;") == 1,
+            "MPI finalization policy diagnostics must not duplicate the "
+            "canonical PEAK completion marker")
 
 
 def check_final_report_snapshot_order(repo_root):
@@ -1692,6 +1744,11 @@ def check_stop_window_accounting_sidecar(repo_root):
             "Gum attach support predicate must use cached attach policy")
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
+    require(general_attach_supported.count("peak_log_info(") == 2 and
+            "g_printerr(" not in general_attach_supported and
+            "peak_log_warn(" not in general_attach_supported,
+            "expected target safety-policy skips must remain INFO diagnostics "
+            "instead of producing one WARN per MPI rank")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and
@@ -1730,6 +1787,14 @@ def check_stop_window_accounting_sidecar(repo_root):
             "support replacements must not apply user-target prologue guards")
     require("peak_general_listener_support_attach_target_is_supported" in syscall,
             "close support replacement must call the support attach predicate")
+    syscall_attach = extract_function(syscall, "syscall_interceptor_attach")
+    require(
+        "skipping close support hook:" in syscall_attach and
+        "peak_log_info(" in syscall_attach and
+        "g_printerr(" not in syscall_attach,
+        "the expected close/__close_nocancel overlap fallback must remain an "
+        "INFO diagnostic instead of producing one WARN per MPI rank",
+    )
     require('peak_general_listener_attach_target_is_supported("dlopen"' in
             dlopen_attach,
             "dlopen listener must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
@@ -2801,6 +2866,7 @@ def main():
     check_dlopen_fftw_scope_and_fork_guard(repo_root)
     check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root)
     check_x86_patched_gum_requires_exact_attach(repo_root)
+    check_fast_listener_unwind_abi(repo_root)
     check_peak_init_heartbeat_order(repo_root)
     check_mpi_finalize_trampoline_default(repo_root)
     check_final_report_snapshot_order(repo_root)

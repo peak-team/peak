@@ -61,21 +61,21 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     }
 
     if (peak_gum_prologue_too_short_for_attach(address, &reason)) {
-        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is too small for Gum entry patch (reason=%s); target will remain unprofiled\n",
-                   symbol_name != NULL ? symbol_name : "<unknown>",
-                   reason != NULL ? reason : "unknown");
+        peak_log_info("[peak] skipping Gum attach for hook %s: target prologue is too small for Gum entry patch (reason=%s); target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>",
+                      reason != NULL ? reason : "unknown");
         return FALSE;
     }
 
     if (peak_unsafe_gum_prologue_check(address,
                                        peak_unsafe_gum_prologue_policy,
                                        &reason)) {
-        g_printerr("[peak] skipping Gum attach for hook %s: target prologue is not safe for Gum relocation (reason=%s, policy=%s); set %s=1 to override\n",
-                   symbol_name != NULL ? symbol_name : "<unknown>",
-                   reason != NULL ? reason : "unknown",
-                   peak_unsafe_gum_prologue_policy_name(
-                       peak_unsafe_gum_prologue_policy),
-                   PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
+        peak_log_info("[peak] skipping Gum attach for hook %s: target prologue is not safe for Gum relocation (reason=%s, policy=%s); set %s=1 to override\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>",
+                      reason != NULL ? reason : "unknown",
+                      peak_unsafe_gum_prologue_policy_name(
+                          peak_unsafe_gum_prologue_policy),
+                      PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV);
         return FALSE;
     }
 

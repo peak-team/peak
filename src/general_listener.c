@@ -998,6 +998,7 @@ typedef struct _PeakGeneralInvocationEntry {
     gpointer function_context;
     gpointer caller_return_address;
     gpointer stack_address;
+    guint gum_stack_depth;
     guint64 start_ns;
     gdouble child_time;
     gboolean fast_dispatch;
@@ -5804,7 +5805,8 @@ static GumPeakFastEnterResult PEAK_LISTENER_FAST_DISPATCH_SECTION
 peak_general_listener_fast_on_enter(gpointer user_data,
                                     gpointer function_context,
                                     gpointer stack_address,
-                                    gpointer caller_return_address)
+                                    gpointer caller_return_address,
+                                    guint gum_stack_depth)
 {
     PeakGeneralListener* self = user_data;
 
@@ -5837,6 +5839,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     entry->function_context = function_context;
     entry->caller_return_address = caller_return_address;
     entry->stack_address = stack_address;
+    entry->gum_stack_depth = gum_stack_depth;
     entry->fast_dispatch = TRUE;
 
     gulong current_num_calls =
@@ -5857,6 +5860,8 @@ peak_general_listener_fast_on_enter(gpointer user_data,
 static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
 peak_general_listener_fast_on_leave(gpointer user_data,
                                     gpointer function_context,
+                                    gpointer stack_address,
+                                    guint* gum_stack_depth_out,
                                     gpointer* caller_return_address_out)
 {
     PeakGeneralListener* expected_listener = user_data;
@@ -5864,14 +5869,19 @@ peak_general_listener_fast_on_leave(gpointer user_data,
 
     if (G_UNLIKELY(thread_data.in_callback) ||
         G_UNLIKELY(!thread_data.initialized)) {
+        *gum_stack_depth_out = 0;
         *caller_return_address_out = NULL;
         return FALSE;
     }
 
     thread_data.in_callback = TRUE;
     while (thread_data.level > 0 &&
-           thread_data.entries[thread_data.level - 1].function_context !=
-               function_context) {
+           (thread_data.entries[thread_data.level - 1].listener !=
+                expected_listener ||
+            thread_data.entries[thread_data.level - 1].function_context !=
+                function_context ||
+            thread_data.entries[thread_data.level - 1].stack_address !=
+                stack_address)) {
         thread_data.level--;
         peak_general_listener_abandon_entry(
             &thread_data,
@@ -5880,6 +5890,7 @@ peak_general_listener_fast_on_leave(gpointer user_data,
 
     if (G_UNLIKELY(thread_data.level == 0)) {
         thread_data.in_callback = FALSE;
+        *gum_stack_depth_out = 0;
         *caller_return_address_out = NULL;
         return FALSE;
     }
@@ -5888,6 +5899,7 @@ peak_general_listener_fast_on_leave(gpointer user_data,
         thread_data.entries[thread_data.level - 1];
     thread_data.level--;
     caller_return_address = entry.caller_return_address;
+    *gum_stack_depth_out = entry.gum_stack_depth;
 
     PeakGeneralListener* self = entry.listener;
     size_t index = thread_data.self_mapped_id;
@@ -5949,18 +5961,37 @@ peak_general_listener_fast_on_leave(gpointer user_data,
 
 static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
 peak_general_listener_fast_is_direct_leave(gpointer user_data,
-                                           gpointer function_context)
+                                           gpointer function_context,
+                                           gpointer stack_address)
 {
-    (void)user_data;
+    PeakGeneralListener* expected_listener = user_data;
 
     if (!thread_data.initialized || thread_data.level == 0) {
         return FALSE;
     }
 
-    PeakGeneralInvocationEntry* entry =
-        &thread_data.entries[thread_data.level - 1];
-    return entry->fast_dispatch &&
-           entry->function_context == function_context;
+    /*
+     * A non-local unwind may bypass one or more direct leave trampolines.
+     * Gum has no invocation-stack entry for any of those direct frames, so
+     * routing a surviving outer frame through Gum's generic leave path would
+     * read an unrelated or empty invocation-stack entry.  Search only the
+     * entries before completing the matching frame. Gum snapshots its
+     * invocation-stack depth on each direct entry, so the overlay can also
+     * discard any bypassed generic entries before continuing the direct
+     * return.
+     */
+    for (gulong level = thread_data.level; level > 0; level--) {
+        PeakGeneralInvocationEntry* entry =
+            &thread_data.entries[level - 1];
+
+        if (entry->listener == expected_listener &&
+            entry->fast_dispatch &&
+            entry->function_context == function_context &&
+            entry->stack_address == stack_address) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static guint PEAK_LISTENER_FAST_DISPATCH_SECTION

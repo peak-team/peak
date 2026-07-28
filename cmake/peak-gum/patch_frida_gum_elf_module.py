@@ -50,6 +50,10 @@ RENAMED_BEGIN_INVOCATION = (
     "_gum_function_context_begin_invocation_peak_original"
 )
 RENAMED_END_INVOCATION = "_gum_function_context_end_invocation_peak_original"
+GET_INTERCEPTOR_THREAD_CONTEXT = "get_interceptor_thread_context"
+EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT = (
+    "peak_gum_get_interceptor_thread_context"
+)
 LOAD_SECTION = ".text.gum_elf_module_load"
 OLD_MARKER_X86_64 = b"PEAK_GUM_ELF_HEADER_GUARD_X86_64_V1\0"
 OLD_MARKER_AARCH64 = b"PEAK_GUM_ELF_HEADER_GUARD_AARCH64_V1\0"
@@ -187,13 +191,21 @@ def route_invocation_dispatch_through_overlay(
         ("T", RENAMED_BEGIN_INVOCATION),
         ("T", RENAMED_END_INVOCATION),
     }
-    if not expected.issubset(before) or before.intersection(renamed):
+    thread_context_getter = ("t", GET_INTERCEPTOR_THREAD_CONTEXT)
+    exported_thread_context_getter = (
+        "T",
+        EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT,
+    )
+    if (not expected.issubset(before) or before.intersection(renamed) or
+            thread_context_getter not in before or
+            exported_thread_context_getter in before):
         fail(
             f"unexpected invocation symbols in {object_name}: "
             f"begin={('T', BEGIN_INVOCATION) in before} "
             f"end={('T', END_INVOCATION) in before} "
             f"renamed_begin={('T', RENAMED_BEGIN_INVOCATION) in before} "
-            f"renamed_end={('T', RENAMED_END_INVOCATION) in before}"
+            f"renamed_end={('T', RENAMED_END_INVOCATION) in before} "
+            f"thread_context_getter={thread_context_getter in before}"
         )
 
     result = run([
@@ -202,6 +214,9 @@ def route_invocation_dispatch_through_overlay(
         f"{BEGIN_INVOCATION}={RENAMED_BEGIN_INVOCATION}",
         "--redefine-sym",
         f"{END_INVOCATION}={RENAMED_END_INVOCATION}",
+        "--redefine-sym",
+        f"{GET_INTERCEPTOR_THREAD_CONTEXT}="
+        f"{EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT}",
         str(extracted),
     ])
     if result.returncode != 0:
@@ -210,8 +225,22 @@ def route_invocation_dispatch_through_overlay(
             f"{result.stdout}\n{result.stderr}"
         )
 
+    result = run([
+        objcopy,
+        "--globalize-symbol",
+        EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT,
+        str(extracted),
+    ])
+    if result.returncode != 0:
+        fail(
+            f"failed to export interceptor thread context in {object_name}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
     after = symbol_kinds(nm, extracted)
-    if after.intersection(expected) or not renamed.issubset(after):
+    if (after.intersection(expected) or not renamed.issubset(after) or
+            ("t", GET_INTERCEPTOR_THREAD_CONTEXT) in after or
+            exported_thread_context_getter not in after):
         fail(f"invocation dispatch rename did not take effect in {object_name}")
 
     replace_archive_member(ar, library, extracted)
