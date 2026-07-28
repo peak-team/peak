@@ -1124,6 +1124,7 @@ static int
 test_dlclose_guard_revert_lifetime(const PeakTestHooks* hooks,
                                    const char* module_path)
 {
+    PeakDlopenDynamicAttachDiagnostics before = get_diagnostics(hooks);
     void* application_handle = load_with_callback_phase(module_path);
     CloseThreadArgs close_args = {
         .handle = application_handle,
@@ -1142,7 +1143,17 @@ test_dlclose_guard_revert_lifetime(const PeakTestHooks* hooks,
     check_true("guard-revert broker ownership completed",
                application_handle != NULL &&
                wait_for_ownership_idle(hooks));
+    PeakDlopenDynamicAttachDiagnostics after_ownership =
+        get_diagnostics(hooks);
+    check_ull("guard-revert callback enqueued ownership work",
+              after_ownership.enqueued,
+              before.enqueued + 1);
     drain_once(hooks);
+    PeakDlopenDynamicAttachDiagnostics after_drain =
+        get_diagnostics(hooks);
+    check_ull("guard-revert ownership work drained",
+              after_drain.drained,
+              before.drained + 1);
     check_true("guard-revert drain left application reference loaded",
                atomic_load_explicit(&fixture_unloads,
                                     memory_order_relaxed) == 0);
