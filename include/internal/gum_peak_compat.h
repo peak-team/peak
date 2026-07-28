@@ -56,6 +56,18 @@ typedef struct _GumPeakFastListener {
 #define GUM_PEAK_FAST_LISTENER_VERSION 0u
 
 static inline gboolean
+gum_interceptor_peak_invocation_stack_entry_matches(
+    guint depth,
+    gpointer function_address,
+    gpointer stack_address)
+{
+    (void)depth;
+    (void)function_address;
+    (void)stack_address;
+    return FALSE;
+}
+
+static inline gboolean
 gum_interceptor_peak_enable_fast_listener(
     GumInterceptor* interceptor,
     gpointer function_address,

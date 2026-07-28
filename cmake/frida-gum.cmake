@@ -276,7 +276,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 #if !defined(GUM_PEAK_FAST_LISTENER_VERSION) || \
-    GUM_PEAK_FAST_LISTENER_VERSION != 7
+    GUM_PEAK_FAST_LISTENER_VERSION != 8
 #error Unsupported PEAK Gum fast-listener ABI
 #endif
 
@@ -307,6 +307,10 @@ int main(void)
         GumInvocationListener *,
         GumPeakPcDiagnostics *);
     typedef gboolean (*PeakDrainDeferredModuleSyncFunc)(void);
+    typedef gboolean (*PeakInvocationStackEntryMatchesFunc)(
+        guint,
+        gpointer,
+        gpointer);
     PeakAbiFingerprintFunc abi_fingerprint =
         gum_interceptor_peak_abi_fingerprint;
     PeakClassifyPcFunc classify_pc = gum_interceptor_peak_classify_pc;
@@ -317,6 +321,8 @@ int main(void)
         gum_interceptor_peak_get_pc_diagnostics;
     PeakDrainDeferredModuleSyncFunc drain_deferred_module_sync =
         gum_interceptor_peak_drain_deferred_module_sync;
+    PeakInvocationStackEntryMatchesFunc invocation_stack_entry_matches =
+        gum_interceptor_peak_invocation_stack_entry_matches;
 
     (void) GUM_PEAK_PC_API_VERSION;
     (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64;
@@ -354,6 +360,7 @@ int main(void)
     (void) get_function_patch;
     (void) get_pc_diagnostics;
     (void) drain_deferred_module_sync;
+    (void) invocation_stack_entry_matches;
     gum_interceptor_peak_begin_module_mutation();
     gum_interceptor_peak_end_module_mutation();
     gum_interceptor_peak_quiesce_deferred_module_sync();

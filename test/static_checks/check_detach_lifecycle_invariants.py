@@ -596,8 +596,8 @@ def check_fast_listener_unwind_abi(repo_root):
         repo_root / "test/detach_runtime/test_fastpath_nonlocal_unwind.c"
     ).read_text(encoding="utf-8")
 
-    require("GUM_PEAK_FAST_LISTENER_VERSION 7u" in api and
-            "GUM_PEAK_FAST_LISTENER_VERSION != 7" in cmake,
+    require("GUM_PEAK_FAST_LISTENER_VERSION 8u" in api and
+            "GUM_PEAK_FAST_LISTENER_VERSION != 8" in cmake,
             "patched Gum configuration must reject an older fast-listener callback ABI")
     require("peak_gum_get_interceptor_thread_context" in patcher and
             '"--globalize-symbol"' in patcher and
@@ -605,6 +605,7 @@ def check_fast_listener_unwind_abi(repo_root):
             "peak_gum_cached_invocation_stack" in overlay and
             "peak_gum_invocation_stack_reap_unwound(stack_address)"
             in overlay and
+            "gum_interceptor_peak_invocation_stack_entry_matches" in overlay and
             "peak_gum_invocation_stack_depth()" in overlay and
             "peak_gum_invocation_stack_reap_to_depth(gum_stack_depth)"
             in overlay,
@@ -615,6 +616,8 @@ def check_fast_listener_unwind_abi(repo_root):
             "the PEAK direct invocation entry must carry its Gum stack boundary")
     require("peak_general_listener_invocation_stack_address(ic)" in listener and
             "gum_invocation_context_get_depth(ic)" in listener and
+            "gum_interceptor_peak_invocation_stack_entry_matches("
+            in listener and
             "peak_general_listener_fast_reap_unwound(stack_address)"
             in listener,
             "the next direct entry must independently reconcile escaped PEAK "
@@ -626,7 +629,10 @@ def check_fast_listener_unwind_abi(repo_root):
             "escape_generic_from_deeper_frame()" in unwind_test and
             "escape-all recovery direct call failed" in unwind_test and
             "peak_fastpath_unwind_unrelated_bridge()" in unwind_test and
-            "unrelated listener count mismatch" in unwind_test,
+            "unrelated listener count mismatch" in unwind_test and
+            "peak_general_listener_test_current_invocation_level"
+            in unwind_test and
+            "PEAK invocation stack was not fully reaped" in unwind_test,
             "non-local-unwind regression must cover surviving and fully "
             "escaped mixed frames plus a generic-only escape followed by a "
             "live unrelated Gum invocation")

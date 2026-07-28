@@ -918,6 +918,23 @@ peak_gum_invocation_stack_reap_unwound(gpointer live_stack_address)
     }
 }
 
+gboolean PEAK_GUM_FAST_DISPATCH_SECTION
+gum_interceptor_peak_invocation_stack_entry_matches(
+    guint depth,
+    gpointer function_address,
+    gpointer stack_address)
+{
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+    PeakGumInvocationStackEntry17 * entry;
+
+    if (stack == NULL || depth >= stack->len) {
+        return FALSE;
+    }
+    entry = &g_array_index(stack, PeakGumInvocationStackEntry17, depth);
+    return entry->invocation_context.function == function_address &&
+           entry->stack_address == stack_address;
+}
+
 static gboolean
 peak_gum_pointer_between_labels(gpointer pointer, gpointer start, gpointer end)
 {

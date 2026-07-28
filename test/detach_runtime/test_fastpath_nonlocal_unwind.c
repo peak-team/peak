@@ -274,6 +274,8 @@ require_fast_dispatch(void)
 int
 main(void)
 {
+    typedef gulong (*StackLevelFunc)(void);
+
     /*
      * The first call initializes PEAK's per-thread state through Gum's
      * complete listener path.  The second call verifies the ordinary direct
@@ -291,6 +293,12 @@ main(void)
         return 1;
     }
     if (!require_fast_dispatch()) {
+        return 1;
+    }
+    StackLevelFunc stack_level =
+        (StackLevelFunc)required_symbol(
+            "peak_general_listener_test_current_invocation_level");
+    if (stack_level == NULL) {
         return 1;
     }
     /*
@@ -370,6 +378,12 @@ main(void)
                                      memory_order_relaxed),
                 atomic_load_explicit(&unrelated_listener_leaves,
                                      memory_order_relaxed));
+        return 1;
+    }
+    if (stack_level() != 0) {
+        fprintf(stderr,
+                "PEAK invocation stack was not fully reaped: level=%lu\n",
+                stack_level());
         return 1;
     }
 
