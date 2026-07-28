@@ -555,6 +555,15 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       PASS_REGULAR_EXPRESSION "general-listener-uint64-saturation-ok")
 
+  add_test(NAME test_detach_controller_general_listener_detach_count_latch_state_gate
+    COMMAND test_detach_listener_shutdown
+            general-listener-detach-count-latch-state-gate)
+  set_tests_properties(
+    test_detach_controller_general_listener_detach_count_latch_state_gate
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+        "general-listener-detach-count-latch-state-gate-ok")
+
   add_test(NAME test_detach_controller_general_listener_mapping_lifecycle
     COMMAND test_detach_listener_shutdown general-listener-mapping-lifecycle)
   set_tests_properties(test_detach_controller_general_listener_mapping_lifecycle

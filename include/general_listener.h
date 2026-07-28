@@ -92,8 +92,13 @@ struct _PeakGeneralListener {
     GObject parent;
 
     size_t hook_id;
-    _Atomic int callback_hook_state;
-    _Atomic gboolean detach_count_request_pending;
+    /*
+     * Callback-visible state, detach-count request/initial-crossing bits, and
+     * lifecycle generation share one atomic word.  Keeping them in one CAS
+     * domain prevents delayed callbacks from losing the first-activation
+     * crossing or publishing against a later ATTACHED generation.
+     */
+    _Atomic unsigned long long callback_hook_control;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
@@ -251,6 +256,7 @@ PEAK_API int peak_general_listener_test_mpi_uint64_type_size(void);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
                                                           uint64_t rhs);
+PEAK_API int peak_general_listener_test_detach_count_latch_state_gate(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_hold(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_release(void);
 PEAK_API int peak_general_listener_test_checkpoint_mutation_begin(void);

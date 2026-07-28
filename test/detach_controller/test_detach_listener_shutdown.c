@@ -826,6 +826,15 @@ run_uint64_saturation(void)
 }
 
 static int
+run_detach_count_latch_state_gate(void)
+{
+    check_true("detach-count latch obeys callback hook state",
+               peak_general_listener_test_detach_count_latch_state_gate() == 0);
+    fprintf(stderr, "general-listener-detach-count-latch-state-gate-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
 run_general_listener_mapping_lifecycle(void)
 {
     const size_t capacity = 112;
@@ -947,7 +956,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-rank-local-mpi-text-default|general-listener-slurm-host-parser|general-listener-uint64-saturation\n",
+                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-rank-local-mpi-text-default|general-listener-slurm-host-parser|general-listener-uint64-saturation|general-listener-detach-count-latch-state-gate\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -975,6 +984,10 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "general-listener-uint64-saturation") == 0) {
         return run_uint64_saturation();
+    }
+    if (strcmp(argv[1],
+               "general-listener-detach-count-latch-state-gate") == 0) {
+        return run_detach_count_latch_state_gate();
     }
     if (strcmp(argv[1], "general-listener-mapping-lifecycle") == 0) {
         return run_general_listener_mapping_lifecycle();
