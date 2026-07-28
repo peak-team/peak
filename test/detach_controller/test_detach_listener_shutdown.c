@@ -952,6 +952,9 @@ main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    /* Match PEAK's production initialization contract before any mutation. */
+    peak_detach_controller_configure_mpi_process(FALSE);
+
     if (strcmp(argv[1], "general-listener-shutdown-prepare-fail-closed") == 0) {
         return run_shutdown_prepare_fail_closed();
     }

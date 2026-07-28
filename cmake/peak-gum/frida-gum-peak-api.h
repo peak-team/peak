@@ -14,7 +14,7 @@ typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
 
-#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 3
+#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 4
 
 /*
  * Test/diagnostic helper. Production synchronization is owned by Gum's

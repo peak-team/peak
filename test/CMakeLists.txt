@@ -227,6 +227,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_runtime_config PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(test_runtime_config PRIVATE
+        PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV=1)
     add_test(NAME test_runtime_config COMMAND test_runtime_config)
     set_tests_properties(test_runtime_config
         PROPERTIES

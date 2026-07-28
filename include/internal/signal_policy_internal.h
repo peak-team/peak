@@ -18,6 +18,7 @@
 #endif
 
 PEAK_SIGNAL_POLICY_INTERNAL int peak_signal_policy_choose_reserved_signal(void);
+PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_configure(void);
 PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_set_reserved_signal(int signum);
 PEAK_SIGNAL_POLICY_INTERNAL void peak_signal_policy_clear_reserved_signal(void);
 PEAK_SIGNAL_POLICY_INTERNAL int peak_signal_policy_reserved_signal(void);

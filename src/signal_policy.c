@@ -36,7 +36,10 @@ static _Atomic(uintptr_t) last_conflict_api;
 static _Atomic(unsigned long) cookie_base;
 static __thread int internal_depth;
 static pthread_once_t cookie_once = PTHREAD_ONCE_INIT;
+static pthread_once_t signal_configuration_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t migration_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int configured_signal_parse_result;
+static int configured_forced_signal;
 
 static int (*real_sigaction_fn)(int, const struct sigaction*, struct sigaction*);
 static void (*(*real_signal_fn)(int, void (*)(int)))(int);
@@ -411,9 +414,8 @@ peak_signal_policy_leave_internal(void)
 static int
 peak_signal_policy_env_forces_signal(void)
 {
-    int forced = 0;
-    return peak_signal_policy_parse_signal_env(getenv("PEAK_DETACH_SIGNAL"),
-                                               &forced) > 0;
+    peak_signal_policy_configure();
+    return configured_signal_parse_result > 0;
 }
 
 static int
@@ -997,6 +999,24 @@ peak_signal_policy_parse_signal_env(const char* value, int* out)
     return 1;
 }
 
+static void
+peak_signal_policy_configure_once(void)
+{
+    int forced = 0;
+
+    configured_signal_parse_result =
+        peak_signal_policy_parse_signal_env(getenv("PEAK_DETACH_SIGNAL"),
+                                            &forced);
+    configured_forced_signal = forced;
+}
+
+void
+peak_signal_policy_configure(void)
+{
+    (void)pthread_once(&signal_configuration_once,
+                       peak_signal_policy_configure_once);
+}
+
 static int
 peak_signal_policy_signal_is_available(int signum)
 {
@@ -1055,17 +1075,16 @@ peak_signal_policy_choose_reserved_signal(void)
         return current;
     }
 
-    int forced = 0;
-    int parse_rc =
-        peak_signal_policy_parse_signal_env(getenv("PEAK_DETACH_SIGNAL"),
-                                            &forced);
-    if (parse_rc > 0) {
-        if (peak_signal_policy_signal_is_available(forced)) {
-            return peak_signal_policy_commit_reserved_signal(forced);
+    peak_signal_policy_configure();
+    if (configured_signal_parse_result > 0) {
+        if (peak_signal_policy_signal_is_available(
+                configured_forced_signal)) {
+            return peak_signal_policy_commit_reserved_signal(
+                configured_forced_signal);
         }
         return 0;
     }
-    if (parse_rc < 0) {
+    if (configured_signal_parse_result < 0) {
         return 0;
     }
 
@@ -2185,6 +2204,7 @@ __attribute__((constructor))
 static void
 peak_signal_policy_constructor(void)
 {
+    peak_signal_policy_configure();
     if (peak_signal_policy_enabled_for_process() &&
         peak_signal_policy_should_reserve_early()) {
         (void)peak_signal_policy_choose_reserved_signal();

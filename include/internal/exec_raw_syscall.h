@@ -96,6 +96,23 @@ int peak_exec_raw_syscall_execveat(int dirfd,
 /** @name Direct raw syscall primitive
  * @{ */
 
+#if defined(__linux__) && defined(__aarch64__)
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((visibility("hidden"))) long
+peak_aarch64_raw_syscall6_raw(long number,
+                              long arg1,
+                              long arg2,
+                              long arg3,
+                              long arg4,
+                              long arg5,
+                              long arg6);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 /**
  * @brief Issues a six-argument syscall without a libc syscall wrapper.
  *
@@ -145,28 +162,19 @@ peak_exec_raw_syscall6(long number,
     }
     return result;
 #elif defined(__linux__) && defined(__aarch64__)
-    register long x0 __asm__("x0") = arg1;
-    register long x1 __asm__("x1") = arg2;
-    register long x2 __asm__("x2") = arg3;
-    register long x3 __asm__("x3") = arg4;
-    register long x4 __asm__("x4") = arg5;
-    register long x5 __asm__("x5") = arg6;
-    register long x8 __asm__("x8") = number;
+    long result = peak_aarch64_raw_syscall6_raw(number,
+                                                arg1,
+                                                arg2,
+                                                arg3,
+                                                arg4,
+                                                arg5,
+                                                arg6);
 
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1),
-                       "r"(x2),
-                       "r"(x3),
-                       "r"(x4),
-                       "r"(x5),
-                       "r"(x8)
-                     : "cc", "memory");
-    if (x0 < 0 && x0 >= -4095) {
-        errno = (int)-x0;
+    if (result < 0 && result >= -4095) {
+        errno = (int)-result;
         return -1;
     }
-    return x0;
+    return result;
 #else
     (void)number;
     (void)arg1;

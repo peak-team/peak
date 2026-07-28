@@ -117,6 +117,7 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
          "\n\n/* PEAK local extension ABI. */\n${_peak_gum_api_header}\n")
 
     set(_overlay_object "${_output_dir}/gum_peak_pc_api.c.o")
+    set(_overlay_objects "${_overlay_object}")
     string(TOUPPER "${CMAKE_BUILD_TYPE}" _peak_build_type_upper)
     set(_peak_overlay_c_flags
         "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_peak_build_type_upper}}")
@@ -149,8 +150,29 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
             "Failed to compile PEAK Frida Gum PC overlay:\n${_compile_stdout}\n${_compile_stderr}")
     endif()
 
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_overlay_processor)
+    if(_peak_overlay_processor MATCHES "^(aarch64|arm64)$")
+        set(_overlay_syscall_object
+            "${_output_dir}/peak_aarch64_raw_syscall.S.o")
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}"
+                ${_peak_overlay_toolchain_flags}
+                -fPIC
+                -c "${_source_dir}/peak-gum/peak_aarch64_raw_syscall.S"
+                -o "${_overlay_syscall_object}"
+            RESULT_VARIABLE _syscall_compile_result
+            OUTPUT_VARIABLE _syscall_compile_stdout
+            ERROR_VARIABLE _syscall_compile_stderr)
+        if(NOT _syscall_compile_result EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to compile PEAK Frida Gum AArch64 raw-syscall stub:\n${_syscall_compile_stdout}\n${_syscall_compile_stderr}")
+        endif()
+        list(APPEND _overlay_objects "${_overlay_syscall_object}")
+    endif()
+
     execute_process(
-        COMMAND "${CMAKE_AR}" qcs "${_output_dir}/libfrida-gum.a" "${_overlay_object}"
+        COMMAND "${CMAKE_AR}" qcs
+            "${_output_dir}/libfrida-gum.a" ${_overlay_objects}
         RESULT_VARIABLE _ar_result
         OUTPUT_VARIABLE _ar_stdout
         ERROR_VARIABLE _ar_stderr)
@@ -250,7 +272,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK Gum arm64 private-layout ABI fingerprint
 #endif
 #if !defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) || \
-    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 3
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 4
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 

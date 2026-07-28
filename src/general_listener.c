@@ -181,9 +181,11 @@ static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
 static gsize peak_controller_retry_limits_initialized = 0;
 static gsize peak_reattach_policy_initialized = 0;
+static gsize peak_controller_shutdown_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
 static gboolean peak_controller_trace_enabled = FALSE;
@@ -249,8 +251,8 @@ typedef struct {
 static double peak_general_controller_pending_age_for_trace_unlocked(size_t hook_id,
                                                                      double now);
 
-static unsigned int
-peak_general_controller_shutdown_drain_ms(void)
+static void
+peak_general_controller_init_shutdown_policy_once(void)
 {
 #ifdef PEAK_ENABLE_TEST_HOOKS
     const char* value = g_getenv("PEAK_TEST_CONTROLLER_SHUTDOWN_DRAIN_MS");
@@ -260,12 +262,28 @@ peak_general_controller_shutdown_drain_ms(void)
         unsigned long parsed = strtoul(value, &end, 10);
 
         if (end != value && *end == '\0' && parsed <= G_MAXUINT) {
-            return (unsigned int)parsed;
+            peak_controller_configured_shutdown_drain_ms =
+                (unsigned int)parsed;
         }
     }
 #endif
+}
 
-    return peak_controller_shutdown_drain_ms;
+static void
+peak_general_controller_init_shutdown_policy(void)
+{
+    if (g_once_init_enter(&peak_controller_shutdown_policy_initialized)) {
+        peak_controller_configured_shutdown_drain_ms =
+            peak_controller_shutdown_drain_ms;
+        peak_general_controller_init_shutdown_policy_once();
+        g_once_init_leave(&peak_controller_shutdown_policy_initialized, 1);
+    }
+}
+
+static unsigned int
+peak_general_controller_shutdown_drain_ms(void)
+{
+    return peak_controller_configured_shutdown_drain_ms;
 }
 
 static void
@@ -2062,8 +2080,6 @@ static gboolean
 peak_general_listener_reattach_cooldown_ready_unlocked(size_t hook_id,
                                                        double now)
 {
-    peak_general_listener_init_reattach_policy();
-
     if (peak_reattach_cooldown_s <= 0.0 ||
         peak_hook_last_detach_time == NULL ||
         hook_id >= peak_hook_address_count ||
@@ -2112,8 +2128,6 @@ peak_general_controller_retry_budget_exceeded_unlocked(size_t hook_id,
     if (hook_id >= peak_hook_address_count) {
         return FALSE;
     }
-
-    peak_general_controller_init_retry_limits();
 
     retry_count = peak_hook_retry_count != NULL ? peak_hook_retry_count[hook_id] : 0;
     pending_age_s = peak_general_controller_pending_age_for_trace_unlocked(hook_id, now);
@@ -6441,6 +6455,10 @@ static void peak_build_symbol_map_once(size_t first_target_index) {
 
 void peak_general_listener_attach()
 {
+    peak_general_listener_runtime_configure();
+    peak_general_listener_init_reattach_policy();
+    peak_general_controller_init_retry_limits();
+    peak_general_controller_init_shutdown_policy();
     peak_general_controller_init_trace_config();
     peak_general_listener_init_attach_policy();
     peak_general_listener_final_heartbeat_overhead_seconds = 0.0;

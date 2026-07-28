@@ -24,6 +24,8 @@
 #define PEAK_SOCKET_POST_GATHER_PHASE_COUNT 2U
 #define PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT 2U
 
+static unsigned int configured_local_mpi_ranks = 1U;
+
 static bool
 peak_general_listener_unsigned_text_is_negative(const char* value)
 {
@@ -278,8 +280,8 @@ peak_general_listener_parse_positive_uint_text(const char* value,
     return true;
 }
 
-unsigned int
-peak_general_listener_local_mpi_ranks(void)
+static unsigned int
+peak_general_listener_detect_local_mpi_ranks(void)
 {
     static const char* local_size_envs[] = {
         "MPI_LOCALNRANKS",
@@ -299,6 +301,23 @@ peak_general_listener_local_mpi_ranks(void)
         }
     }
     return 1U;
+}
+
+void
+peak_general_listener_runtime_configure(void)
+{
+    configured_local_mpi_ranks =
+        peak_general_listener_detect_local_mpi_ranks();
+}
+
+unsigned int
+peak_general_listener_local_mpi_ranks(void)
+{
+#ifdef PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV
+    return peak_general_listener_detect_local_mpi_ranks();
+#else
+    return configured_local_mpi_ranks;
+#endif
 }
 
 static bool

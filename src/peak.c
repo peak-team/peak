@@ -403,7 +403,7 @@ peak_deduplicate_target_names(char** targets, size_t count)
 
 void peak_init()
 {
-
+    peak_log_configure();
     gulong default_max_threads = (gulong)sysconf(_SC_NPROCESSORS_ONLN) * 2;
     peak_max_num_threads =
         parse_env_to_uint_default(PEAK_MAX_NUM_THREADS_ENV,
@@ -465,6 +465,8 @@ void peak_init()
         }
     }
     peak_detach_controller_configure_mpi_process(found_MPI != 0);
+#else
+    peak_detach_controller_configure_mpi_process(FALSE);
 #endif
     pthread_listener_attach();
     /*

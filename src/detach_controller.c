@@ -38,8 +38,6 @@ typedef enum {
     PEAK_SAFE_DETACH_MODE_STRICT
 } PeakSafeDetachMode;
 
-static gsize mode_initialized = 0;
-static PeakSafeDetachMode configured_mode = PEAK_SAFE_DETACH_MODE_STRICT;
 static _Atomic unsigned long long
     peak_detach_accounting_completed_stop_window_count = 0;
 static _Atomic unsigned long long
@@ -80,6 +78,12 @@ typedef enum {
     PEAK_DETACH_REQUESTED_BACKEND_HELPER,
     PEAK_DETACH_REQUESTED_BACKEND_SIGNAL
 } PeakDetachRequestedBackend;
+
+static pthread_once_t backend_configuration_initialized = PTHREAD_ONCE_INIT;
+static PeakDetachRequestedBackend configured_requested_backend =
+    PEAK_DETACH_REQUESTED_BACKEND_AUTO;
+static gboolean configured_auto_ptrace_requires_signal = FALSE;
+static long configured_auto_ptrace_scope = -1;
 
 typedef enum {
     PEAK_DETACH_HOLD_BACKEND_NONE = 0,
@@ -155,6 +159,7 @@ static void peak_detach_controller_signal_trap_handler(int signo,
                                                        siginfo_t* info,
                                                        void* context);
 static void peak_detach_controller_init_signal_backend_once(void);
+static void peak_detach_controller_cache_helper_configuration(void);
 static int peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid);
 static PeakDetachStatus peak_detach_controller_errno_status(void);
 static double peak_detach_controller_monotonic_second(void);
@@ -181,6 +186,8 @@ static gboolean warned_strict_gate_wait_timeout = FALSE;
 static gboolean signal_breakpoint_supported = FALSE;
 static struct sigaction previous_trap_action;
 static char resolved_helper_path[PATH_MAX];
+static char** configured_helper_env = NULL;
+static pthread_once_t helper_configuration_initialized = PTHREAD_ONCE_INIT;
 static PeakDetachHeldMutation held_mutation = { 0 };
 static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS];
 static double held_mutation_started_at = 0.0;
@@ -195,10 +202,14 @@ static _Atomic int signal_release_epoch = 0;
 static _Atomic int strict_mutation_thread_gate = 0;
 static _Atomic int strict_mutation_thread_gate_epoch = 1;
 static _Atomic int strict_mutation_thread_gate_installed = 0;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static useconds_t configured_test_gate_delay_us = 0;
+#endif
 static PeakDetachSignalSlot signal_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static PeakDetachGateWaiterSlot gate_waiter_slots[PEAK_DETACH_HELPER_MAX_THREADS];
 static _Atomic uint32_t signal_slot_count = 0;
-static gsize strict_gate_wait_timeout_initialized = 0;
+static pthread_once_t strict_gate_wait_timeout_initialized =
+    PTHREAD_ONCE_INIT;
 static double strict_gate_wait_timeout_s =
     (double)PEAK_STRICT_GATE_WAIT_DEFAULT_TIMEOUT_MS / 1000.0;
 
@@ -280,10 +291,8 @@ peak_detach_controller_init_strict_gate_wait_timeout_once(void)
 static void
 peak_detach_controller_init_strict_gate_wait_timeout(void)
 {
-    if (g_once_init_enter(&strict_gate_wait_timeout_initialized)) {
-        peak_detach_controller_init_strict_gate_wait_timeout_once();
-        g_once_init_leave(&strict_gate_wait_timeout_initialized, 1);
-    }
+    (void)pthread_once(&strict_gate_wait_timeout_initialized,
+                       peak_detach_controller_init_strict_gate_wait_timeout_once);
 }
 #endif
 
@@ -356,30 +365,9 @@ peak_detach_controller_begin_thread_creation_gate(void)
 static void
 peak_detach_controller_test_delay_after_gate_begin(void)
 {
-    const char* enabled_env = getenv("PEAK_TEST_ENABLE_STRICT_GATE_DELAY");
-    if (enabled_env == NULL ||
-        !(strcmp(enabled_env, "1") == 0 ||
-          g_ascii_strcasecmp(enabled_env, "true") == 0 ||
-          g_ascii_strcasecmp(enabled_env, "yes") == 0 ||
-          g_ascii_strcasecmp(enabled_env, "on") == 0)) {
-        return;
+    if (configured_test_gate_delay_us != 0) {
+        usleep(configured_test_gate_delay_us);
     }
-
-    const char* delay_env = getenv("PEAK_TEST_STRICT_GATE_DELAY_US");
-    if (delay_env == NULL || delay_env[0] == '\0') {
-        return;
-    }
-
-    char* end = NULL;
-    errno = 0;
-    unsigned long delay_us = strtoul(delay_env, &end, 10);
-    if (errno != 0 || end == delay_env || *end != '\0' || delay_us == 0) {
-        return;
-    }
-    if (delay_us > 1000000UL) {
-        delay_us = 1000000UL;
-    }
-    usleep((useconds_t)delay_us);
 }
 #else
 static void
@@ -574,52 +562,111 @@ peak_detach_controller_reset_inherited_helper_if_needed(void)
 static PeakSafeDetachMode
 peak_detach_controller_mode(void)
 {
-    if (g_once_init_enter(&mode_initialized)) {
-        const char* mode_env = g_getenv("PEAK_SAFE_DETACH_MODE");
-        PeakSafeDetachMode mode = PEAK_SAFE_DETACH_MODE_STRICT;
-
-        if (mode_env == NULL || mode_env[0] == '\0' ||
-            g_ascii_strcasecmp(mode_env, "strict") == 0 ||
-            g_ascii_strcasecmp(mode_env, "auto") == 0 ||
-            g_ascii_strcasecmp(mode_env, "helper") == 0 ||
-            g_ascii_strcasecmp(mode_env, "debugger") == 0 ||
-            g_ascii_strcasecmp(mode_env, "ptrace") == 0 ||
-            g_ascii_strcasecmp(mode_env, "signal") == 0 ||
-            g_ascii_strcasecmp(mode_env, "signals") == 0 ||
-            g_ascii_strcasecmp(mode_env, "in-process") == 0) {
-            mode = PEAK_SAFE_DETACH_MODE_STRICT;
-        }
-
-        configured_mode = mode;
-        g_once_init_leave(&mode_initialized, 1);
-    }
-
-    return configured_mode;
+    /*
+     * Compatibility mode is no longer selectable. Keep this helper as the
+     * single policy query used by callers, without rereading configuration in
+     * controller mutation paths.
+     */
+    return PEAK_SAFE_DETACH_MODE_STRICT;
 }
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
-static PeakDetachRequestedBackend
-peak_detach_controller_requested_backend(void)
+static void
+peak_detach_controller_init_backend_configuration_once(void)
 {
     const char* backend_env = g_getenv("PEAK_DETACH_BACKEND");
     const char* mode_env = g_getenv("PEAK_SAFE_DETACH_MODE");
-    const char* value = backend_env != NULL && backend_env[0] != '\0' ?
-        backend_env : mode_env;
+    const char* value =
+        backend_env != NULL && backend_env[0] != '\0' ?
+            backend_env : mode_env;
+    PeakDetachRequestedBackend requested_backend =
+        PEAK_DETACH_REQUESTED_BACKEND_AUTO;
+    gboolean ptrace_requires_signal = FALSE;
+    long ptrace_scope = -1;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* test_delay_enabled =
+        g_getenv("PEAK_TEST_ENABLE_STRICT_GATE_DELAY");
+    const char* test_delay_value =
+        g_getenv("PEAK_TEST_STRICT_GATE_DELAY_US");
+    if (test_delay_enabled != NULL &&
+        (strcmp(test_delay_enabled, "1") == 0 ||
+         g_ascii_strcasecmp(test_delay_enabled, "true") == 0 ||
+         g_ascii_strcasecmp(test_delay_enabled, "yes") == 0 ||
+         g_ascii_strcasecmp(test_delay_enabled, "on") == 0) &&
+        test_delay_value != NULL && test_delay_value[0] != '\0') {
+        char* end = NULL;
+
+        errno = 0;
+        unsigned long parsed_delay = strtoul(test_delay_value, &end, 10);
+        if (errno == 0 && end != test_delay_value && *end == '\0' &&
+            parsed_delay != 0) {
+            if (parsed_delay > 1000000UL) {
+                parsed_delay = 1000000UL;
+            }
+            configured_test_gate_delay_us = (useconds_t)parsed_delay;
+        }
+    }
+#endif
 
     if (value != NULL) {
         if (g_ascii_strcasecmp(value, "signal") == 0 ||
             g_ascii_strcasecmp(value, "signals") == 0 ||
             g_ascii_strcasecmp(value, "in-process") == 0) {
-            return PEAK_DETACH_REQUESTED_BACKEND_SIGNAL;
-        }
-        if (g_ascii_strcasecmp(value, "helper") == 0 ||
-            g_ascii_strcasecmp(value, "debugger") == 0 ||
-            g_ascii_strcasecmp(value, "ptrace") == 0) {
-            return PEAK_DETACH_REQUESTED_BACKEND_HELPER;
+            requested_backend = PEAK_DETACH_REQUESTED_BACKEND_SIGNAL;
+        } else if (g_ascii_strcasecmp(value, "helper") == 0 ||
+                   g_ascii_strcasecmp(value, "debugger") == 0 ||
+                   g_ascii_strcasecmp(value, "ptrace") == 0) {
+            requested_backend = PEAK_DETACH_REQUESTED_BACKEND_HELPER;
         }
     }
 
-    return PEAK_DETACH_REQUESTED_BACKEND_AUTO;
+#ifdef __linux__
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_AUTO) {
+        const char* override = g_getenv("PEAK_TEST_PTRACE_SCOPE");
+        char buffer[32];
+        const char* scope_value = override;
+
+        if (scope_value == NULL || scope_value[0] == '\0') {
+            FILE* fp =
+                fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
+
+            if (fp != NULL) {
+                if (fgets(buffer, sizeof(buffer), fp) != NULL) {
+                    scope_value = buffer;
+                }
+                fclose(fp);
+            }
+        }
+
+        if (scope_value != NULL && scope_value[0] != '\0') {
+            char* end = NULL;
+
+            errno = 0;
+            long parsed_scope = strtol(scope_value, &end, 10);
+            if (errno == 0 && end != scope_value) {
+                ptrace_scope = parsed_scope;
+                ptrace_requires_signal = parsed_scope >= 2;
+            }
+        }
+    }
+#endif
+
+    configured_requested_backend = requested_backend;
+    configured_auto_ptrace_requires_signal = ptrace_requires_signal;
+    configured_auto_ptrace_scope = ptrace_scope;
+}
+
+static void
+peak_detach_controller_cache_backend_configuration(void)
+{
+    (void)pthread_once(&backend_configuration_initialized,
+                       peak_detach_controller_init_backend_configuration_once);
+}
+
+static PeakDetachRequestedBackend
+peak_detach_controller_requested_backend(void)
+{
+    return configured_requested_backend;
 }
 
 static gboolean
@@ -634,38 +681,15 @@ peak_detach_controller_auto_should_use_signal_backend(void)
         return TRUE;
     }
 
-#ifdef __linux__
-    const char* override = g_getenv("PEAK_TEST_PTRACE_SCOPE");
-    char buffer[32];
-    const char* value = override;
-
-    if (value == NULL || value[0] == '\0') {
-        FILE* fp = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
-
-        if (fp == NULL) {
-            return FALSE;
-        }
-        if (fgets(buffer, sizeof(buffer), fp) == NULL) {
-            fclose(fp);
-            return FALSE;
-        }
-        fclose(fp);
-        value = buffer;
-    }
-
-    char* end = NULL;
-    errno = 0;
-    long scope = strtol(value, &end, 10);
-
-    if (errno == 0 && end != value && scope >= 2) {
+    if (configured_auto_ptrace_requires_signal) {
         if (!warned_auto_helper_ptrace_scope) {
             warned_auto_helper_ptrace_scope = TRUE;
             peak_log_info("[peak] auto safe detach using signal backend because ptrace_scope=%ld blocks helper attachment\n",
-                       scope);
+                          configured_auto_ptrace_scope);
         }
         return TRUE;
     }
-#endif
+
     return FALSE;
 }
 
@@ -681,9 +705,16 @@ peak_detach_controller_status_allows_auto_signal_fallback(PeakDetachStatus statu
 void
 peak_detach_controller_configure_mpi_process(gboolean is_mpi_process)
 {
+    peak_log_configure();
+    peak_signal_policy_configure();
     atomic_store_explicit(&peak_detach_mpi_process,
                           is_mpi_process ? 1 : 0,
                           memory_order_release);
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+    peak_detach_controller_init_strict_gate_wait_timeout();
+    peak_detach_controller_cache_backend_configuration();
+    peak_detach_controller_cache_helper_configuration();
+#endif
 }
 
 const char*
@@ -966,62 +997,20 @@ peak_detach_controller_mark_helper_fatal(const char* reason,
     _exit(128);
 }
 
-static const char*
-peak_detach_controller_helper_path(void)
+static gboolean
+peak_detach_controller_store_helper_path(const char* path)
 {
-    const char* path = g_getenv("PEAK_DETACH_HELPER");
-
-    if (path != NULL && path[0] != '\0') {
-        return path;
+    if (path == NULL || path[0] == '\0') {
+        return FALSE;
     }
-
-    Dl_info info;
-    if (dladdr((void*)peak_detach_controller_helper_path, &info) != 0 &&
-        info.dli_fname != NULL) {
-        gchar* lib_dir = g_path_get_dirname(info.dli_fname);
-        if (lib_dir != NULL) {
-            gchar* install_root = g_path_get_dirname(lib_dir);
-            gchar* candidates[3] = {
-                g_build_filename(install_root, "bin", "peak_detach_helper", NULL),
-                g_build_filename(lib_dir, "peak_detach_helper", NULL),
-                NULL
-            };
-
-            for (size_t i = 0; candidates[i] != NULL; i++) {
-                if (access(candidates[i], X_OK) == 0) {
-                    g_strlcpy(resolved_helper_path,
-                              candidates[i],
-                              sizeof(resolved_helper_path));
-                    for (size_t j = 0; candidates[j] != NULL; j++) {
-                        g_free(candidates[j]);
-                    }
-                    g_free(install_root);
-                    g_free(lib_dir);
-                    return resolved_helper_path;
-                }
-            }
-
-            for (size_t i = 0; candidates[i] != NULL; i++) {
-                g_free(candidates[i]);
-            }
-            g_free(install_root);
-            g_free(lib_dir);
-        }
+    if (g_strlcpy(resolved_helper_path,
+                  path,
+                  sizeof(resolved_helper_path)) >=
+        sizeof(resolved_helper_path)) {
+        resolved_helper_path[0] = '\0';
+        return FALSE;
     }
-
-#ifdef PEAK_INSTALL_DETACH_HELPER_PATH
-    if (access(PEAK_INSTALL_DETACH_HELPER_PATH, X_OK) == 0) {
-        return PEAK_INSTALL_DETACH_HELPER_PATH;
-    }
-#endif
-
-#ifdef PEAK_DEFAULT_DETACH_HELPER_PATH
-    if (access(PEAK_DEFAULT_DETACH_HELPER_PATH, X_OK) == 0) {
-        return PEAK_DEFAULT_DETACH_HELPER_PATH;
-    }
-#endif
-
-    return NULL;
+    return TRUE;
 }
 
 static gboolean
@@ -1033,7 +1022,7 @@ peak_detach_controller_env_should_strip(const char* entry)
 }
 
 static char**
-peak_detach_controller_build_helper_env(void)
+peak_detach_controller_snapshot_helper_env(void)
 {
     size_t count = 0;
     size_t kept = 0;
@@ -1080,16 +1069,129 @@ peak_detach_controller_build_helper_env(void)
 }
 
 static void
-peak_detach_controller_free_helper_env(char** helper_env)
+peak_detach_controller_init_helper_configuration_once(void)
+{
+    const char* path = g_getenv("PEAK_DETACH_HELPER");
+
+    if (path != NULL && path[0] != '\0') {
+        (void)peak_detach_controller_store_helper_path(path);
+        configured_helper_env =
+            peak_detach_controller_snapshot_helper_env();
+        return;
+    }
+
+    Dl_info info;
+    if (dladdr((void*)peak_detach_controller_init_helper_configuration_once,
+               &info) != 0 &&
+        info.dli_fname != NULL) {
+        char lib_dir[PATH_MAX];
+        char install_root[PATH_MAX];
+        char candidate[PATH_MAX];
+
+        if (g_strlcpy(lib_dir, info.dli_fname, sizeof(lib_dir)) <
+            sizeof(lib_dir)) {
+            char* slash = strrchr(lib_dir, '/');
+            if (slash != NULL) {
+                *slash = '\0';
+                if (g_strlcpy(install_root,
+                              lib_dir,
+                              sizeof(install_root)) <
+                    sizeof(install_root)) {
+                    slash = strrchr(install_root, '/');
+                    if (slash != NULL) {
+                        *slash = '\0';
+                        int length = snprintf(candidate,
+                                              sizeof(candidate),
+                                              "%s/bin/peak_detach_helper",
+                                              install_root);
+                        if (length > 0 &&
+                            (size_t)length < sizeof(candidate) &&
+                            access(candidate, X_OK) == 0 &&
+                            peak_detach_controller_store_helper_path(
+                                candidate)) {
+                            configured_helper_env =
+                                peak_detach_controller_snapshot_helper_env();
+                            return;
+                        }
+                    }
+                }
+                int length = snprintf(candidate,
+                                      sizeof(candidate),
+                                      "%s/peak_detach_helper",
+                                      lib_dir);
+                if (length > 0 &&
+                    (size_t)length < sizeof(candidate) &&
+                    access(candidate, X_OK) == 0 &&
+                    peak_detach_controller_store_helper_path(candidate)) {
+                    configured_helper_env =
+                        peak_detach_controller_snapshot_helper_env();
+                    return;
+                }
+            }
+        }
+    }
+
+#ifdef PEAK_INSTALL_DETACH_HELPER_PATH
+    if (access(PEAK_INSTALL_DETACH_HELPER_PATH, X_OK) == 0 &&
+        peak_detach_controller_store_helper_path(
+            PEAK_INSTALL_DETACH_HELPER_PATH)) {
+        configured_helper_env =
+            peak_detach_controller_snapshot_helper_env();
+        return;
+    }
+#endif
+
+#ifdef PEAK_DEFAULT_DETACH_HELPER_PATH
+    if (access(PEAK_DEFAULT_DETACH_HELPER_PATH, X_OK) == 0) {
+        (void)peak_detach_controller_store_helper_path(
+            PEAK_DEFAULT_DETACH_HELPER_PATH);
+    }
+#endif
+
+    configured_helper_env = peak_detach_controller_snapshot_helper_env();
+}
+
+static void
+peak_detach_controller_cache_helper_configuration(void)
+{
+    (void)pthread_once(&helper_configuration_initialized,
+                       peak_detach_controller_init_helper_configuration_once);
+}
+
+static const char*
+peak_detach_controller_helper_path(void)
+{
+    return resolved_helper_path[0] != '\0' ? resolved_helper_path : NULL;
+}
+
+#ifdef PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV
+static void
+peak_detach_controller_free_helper_env_snapshot(char** helper_env)
 {
     if (helper_env == NULL) {
         return;
     }
-
     for (size_t i = 0; helper_env[i] != NULL; i++) {
         free(helper_env[i]);
     }
     free(helper_env);
+}
+#endif
+
+static char**
+peak_detach_controller_helper_env(void)
+{
+#ifdef PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV
+    /*
+     * The standalone controller test installs fake-helper controls after
+     * process initialization.  This target-only switch is intentionally not
+     * enabled for libpeak, even when the product is built with test hooks:
+     * every libpeak build consumes only the immutable pre-MPI snapshot above.
+     */
+    peak_detach_controller_free_helper_env_snapshot(configured_helper_env);
+    configured_helper_env = peak_detach_controller_snapshot_helper_env();
+#endif
+    return configured_helper_env;
 }
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
@@ -1198,7 +1300,7 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
-    helper_env = peak_detach_controller_build_helper_env();
+    helper_env = peak_detach_controller_helper_env();
     if (helper_env == NULL) {
         peak_detach_controller_note_failure_detail(
             "helper-env-build",
@@ -1217,7 +1319,6 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
             0,
             (uintptr_t)errno,
             0);
-        peak_detach_controller_free_helper_env(helper_env);
         if (status_out != NULL) {
             *status_out = errno == EACCES || errno == EPERM ?
                 PEAK_DETACH_STATUS_PERMISSION_DENIED :
@@ -1234,7 +1335,6 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
             0,
             (uintptr_t)errno,
             0);
-        peak_detach_controller_free_helper_env(helper_env);
         peak_detach_controller_raw_close(sockets[0]);
         peak_detach_controller_raw_close(sockets[1]);
         if (status_out != NULL) {
@@ -1251,7 +1351,6 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         _exit(127);
     }
 
-    peak_detach_controller_free_helper_env(helper_env);
     peak_detach_controller_raw_close(sockets[1]);
     helper_fd = sockets[0];
     helper_pid = pid;
@@ -4119,6 +4218,9 @@ peak_detach_controller_warmup_backend(void)
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     return;
 #else
+    peak_detach_controller_init_strict_gate_wait_timeout();
+    peak_detach_controller_cache_backend_configuration();
+    peak_detach_controller_cache_helper_configuration();
     if (peak_detach_controller_mode() == PEAK_SAFE_DETACH_MODE_COMPATIBILITY) {
         return;
     }
@@ -4611,7 +4713,6 @@ peak_detach_controller_wait_for_mutation_window(void)
     int published_epoch = 0;
     double wait_started_at = peak_detach_controller_monotonic_second();
 
-    peak_detach_controller_init_strict_gate_wait_timeout();
     for (;;) {
         int gate_epoch = atomic_load_explicit(&strict_mutation_thread_gate,
                                               memory_order_acquire);
@@ -4774,6 +4875,54 @@ peak_detach_controller_test_accounting_update_tuple(
         completed ? &peak_detach_accounting_completed_stop_window_count :
                     &peak_detach_accounting_failed_stop_window_count,
         1);
+}
+#endif
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+gboolean
+peak_detach_controller_test_replace_helper_env(const char* name,
+                                               const char* value)
+{
+    gboolean replaced = FALSE;
+    size_t name_length;
+
+    if (name == NULL || name[0] == '\0' || strchr(name, '=') != NULL ||
+        value == NULL) {
+        return FALSE;
+    }
+    name_length = strlen(name);
+
+    peak_detach_controller_lock_mutation_guard();
+    if (helper_fd >= 0 || helper_pid > 0 || held_mutation.active ||
+        configured_helper_env == NULL) {
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+
+    for (size_t i = 0; configured_helper_env[i] != NULL; i++) {
+        const char* entry = configured_helper_env[i];
+
+        if (strncmp(entry, name, name_length) != 0 ||
+            entry[name_length] != '=') {
+            continue;
+        }
+
+        size_t replacement_size = name_length + 1 + strlen(value) + 1;
+        char* replacement = malloc(replacement_size);
+        if (replacement != NULL) {
+            (void)snprintf(replacement,
+                           replacement_size,
+                           "%s=%s",
+                           name,
+                           value);
+            free(configured_helper_env[i]);
+            configured_helper_env[i] = replacement;
+            replaced = TRUE;
+        }
+        break;
+    }
+    peak_detach_controller_unlock_mutation_guard();
+    return replaced;
 }
 #endif
 

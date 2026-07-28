@@ -92,6 +92,16 @@ G_GNUC_INTERNAL void gum_deinit_peak_original(void);
 G_GNUC_INTERNAL void gum_deinit_embedded_peak_original(void);
 G_GNUC_INTERNAL void gum_shutdown_peak_original(void);
 
+#if defined(__aarch64__)
+G_GNUC_INTERNAL long peak_aarch64_raw_syscall6_raw(long number,
+                                                   long arg1,
+                                                   long arg2,
+                                                   long arg3,
+                                                   long arg4,
+                                                   long arg5,
+                                                   long arg6);
+#endif
+
 static inline __attribute__((always_inline)) void
 peak_gum_module_sync_wake(void)
 {
@@ -121,18 +131,15 @@ peak_gum_module_sync_wake(void)
     long result;
 
     do {
-        register long x0 __asm__("x0") = (long)fd;
-        register long x1 __asm__("x1") = (long)&value;
-        register long x2 __asm__("x2") = (long)sizeof(value);
-        register long x8 __asm__("x8") = (long)SYS_write;
-
-        __asm__ volatile(
-            "svc 0"
-            : "+r"(x0)
-            : "r"(x1), "r"(x2), "r"(x8)
-            : "memory");
-        result = x0;
+        result = peak_aarch64_raw_syscall6_raw((long)SYS_write,
+                                               (long)fd,
+                                               (long)&value,
+                                               (long)sizeof(value),
+                                               0,
+                                               0,
+                                               0);
     } while (result == -(long)EINTR);
+    (void)result;
 #endif
 }
 
@@ -150,14 +157,13 @@ peak_gum_module_sync_close_after_fork(gint fd)
         : "rcx", "r11", "memory");
     (void)result;
 #elif defined(__aarch64__)
-    register long x0 __asm__("x0") = (long)fd;
-    register long x8 __asm__("x8") = (long)SYS_close;
-
-    __asm__ volatile(
-        "svc 0"
-        : "+r"(x0)
-        : "r"(x8)
-        : "memory");
+    (void)peak_aarch64_raw_syscall6_raw((long)SYS_close,
+                                        (long)fd,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0);
 #endif
 }
 

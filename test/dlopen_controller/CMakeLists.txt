@@ -26,6 +26,18 @@ set_tests_properties(test_dlopen_controller_diagnostics
         PASS_REGULAR_EXPRESSION "dlopen_controller_diagnostics_ok")
 
 if(PEAK_GUM_PEAK_API_AVAILABLE)
+    add_executable(test_gum_module_sync_idle_quiesce
+        test_gum_module_sync_idle_quiesce.c)
+    target_link_libraries(test_gum_module_sync_idle_quiesce
+        PRIVATE peak ${CMAKE_DL_LIBS})
+
+    add_test(NAME test_gum_module_sync_idle_quiesce
+        COMMAND $<TARGET_FILE:test_gum_module_sync_idle_quiesce>)
+    set_tests_properties(test_gum_module_sync_idle_quiesce
+        PROPERTIES
+            TIMEOUT 5
+            PASS_REGULAR_EXPRESSION "gum_module_sync_idle_quiesce_ok")
+
     add_executable(test_gum_module_sync_lifecycle
         test_gum_module_sync_lifecycle.c)
     target_link_libraries(test_gum_module_sync_lifecycle
@@ -47,4 +59,19 @@ if(PEAK_GUM_PEAK_API_AVAILABLE)
         PROPERTIES
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION "gum_module_sync_lifecycle_ok")
+
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        add_executable(test_gum_raw_syscall_aarch64
+            test_gum_raw_syscall_aarch64.c
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+        target_include_directories(test_gum_raw_syscall_aarch64
+            PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        add_test(NAME test_gum_raw_syscall_aarch64
+            COMMAND $<TARGET_FILE:test_gum_raw_syscall_aarch64>)
+        set_tests_properties(test_gum_raw_syscall_aarch64
+            PROPERTIES
+                TIMEOUT 5
+                PASS_REGULAR_EXPRESSION "gum_raw_syscall_aarch64_ok")
+    endif()
 endif()

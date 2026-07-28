@@ -1,5 +1,6 @@
 #include "detach_controller.h"
 #include "detach_helper_protocol.h"
+#include "internal/signal_policy_internal.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "signal_policy.h"
 
@@ -16,8 +17,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-
-int peak_signal_policy_reserved_signal(void);
 
 static int failures = 0;
 
@@ -900,6 +899,16 @@ run_strict_helper_empty(void)
     pthread_join(worker, NULL);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 #endif
+}
+
+static int
+run_cached_helper_configuration(void)
+{
+    check_true("change helper path after configuration",
+               g_setenv("PEAK_DETACH_HELPER",
+                        "/no/such/peak_detach_helper",
+                        TRUE));
+    return run_strict_helper_empty();
 }
 
 static int
@@ -3512,7 +3521,8 @@ run_fake_helper_fail_closed(void)
 }
 
 static int
-run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process)
+run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process,
+                                       gboolean mutate_after_configuration)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     fprintf(stderr, "fake-helper-auto-fallback requires PEAK_HAVE_GUM_PEAK_PC_API\n");
@@ -3538,6 +3548,12 @@ run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process)
         unlink(log_path);
     }
     peak_detach_controller_configure_mpi_process(mpi_process);
+    if (mutate_after_configuration) {
+        check_true("change backend environment after configuration",
+                   g_setenv("PEAK_DETACH_BACKEND", "helper", TRUE));
+        check_true("change ptrace scope after configuration",
+                   g_setenv("PEAK_TEST_PTRACE_SCOPE", "0", TRUE));
+    }
 
     gum_init_embedded();
     interceptor = gum_interceptor_obtain();
@@ -3588,6 +3604,9 @@ run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process)
         if (mpi_process) {
             check_true("MPI auto backend never creates helper log",
                        access(log_path, F_OK) != 0);
+        } else if (mutate_after_configuration) {
+            check_true("cached auto backend never creates helper log",
+                       access(log_path, F_OK) != 0);
         } else {
             check_helper_log_count(log_path, "START", 1);
             check_helper_log_count(log_path, "STOP", 1);
@@ -3612,13 +3631,19 @@ run_fake_helper_auto_fallback_with_mpi(gboolean mpi_process)
 static int
 run_fake_helper_auto_fallback(void)
 {
-    return run_fake_helper_auto_fallback_with_mpi(FALSE);
+    return run_fake_helper_auto_fallback_with_mpi(FALSE, FALSE);
 }
 
 static int
 run_fake_helper_auto_mpi(void)
 {
-    return run_fake_helper_auto_fallback_with_mpi(TRUE);
+    return run_fake_helper_auto_fallback_with_mpi(TRUE, FALSE);
+}
+
+static int
+run_cached_auto_backend_configuration(void)
+{
+    return run_fake_helper_auto_fallback_with_mpi(FALSE, TRUE);
 }
 
 static int
@@ -3627,6 +3652,12 @@ run_signal_reserve_early_never(void)
     check_int("PEAK_SIGNAL_RESERVE_EARLY=never leaves signal unreserved",
               peak_signal_policy_reserved_signal(),
               0);
+    check_true("change detach signal after configuration",
+               g_setenv("PEAK_DETACH_SIGNAL", "invalid-after-config", TRUE));
+    int reserved = peak_signal_policy_choose_reserved_signal();
+    check_true("cached auto signal selection ignores later invalid environment",
+               reserved >= SIGRTMIN && reserved <= SIGRTMAX);
+    peak_signal_policy_clear_reserved_signal();
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -3838,10 +3869,12 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
+                "usage: %s strict|strict-helper-empty|cached-helper-configuration|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|cached-auto-backend-configuration|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
+
+    peak_detach_controller_configure_mpi_process(FALSE);
 
     if (strcmp(argv[1], "strict") != 0) {
         peak_detach_controller_note_thread_creation_gate_installed(TRUE);
@@ -3852,6 +3885,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "strict-helper-empty") == 0) {
         return run_strict_helper_empty();
+    }
+    if (strcmp(argv[1], "cached-helper-configuration") == 0) {
+        return run_cached_helper_configuration();
     }
     if (strcmp(argv[1], "strict-helper-stale-caller") == 0) {
         return run_strict_helper_stale_caller();
@@ -3912,6 +3948,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "fake-helper-auto-mpi") == 0) {
         return run_fake_helper_auto_mpi();
+    }
+    if (strcmp(argv[1], "cached-auto-backend-configuration") == 0) {
+        return run_cached_auto_backend_configuration();
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();
