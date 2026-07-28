@@ -1347,6 +1347,22 @@ peak_general_listener_push_invocation(PeakInvocationData* priv)
     return entry;
 }
 
+static inline gpointer
+peak_general_listener_invocation_stack_address(
+    const GumInvocationContext* context)
+{
+    if (context == NULL || context->cpu_context == NULL) {
+        return NULL;
+    }
+#if defined(__x86_64__) || defined(__amd64__)
+    return (gpointer)(uintptr_t)context->cpu_context->rsp;
+#elif defined(__aarch64__)
+    return (gpointer)(uintptr_t)context->cpu_context->sp;
+#else
+    return NULL;
+#endif
+}
+
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
 {
     struct timespec now;
@@ -5698,6 +5714,9 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         peak_general_listener_push_invocation(priv);
     priv->stack_level = thread_data.level;
     entry->listener = self;
+    entry->stack_address =
+        peak_general_listener_invocation_stack_address(ic);
+    entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
     gulong current_num_calls =
         peak_general_listener_num_calls_increment(
             peak_general_listener_num_calls_slot(self, index));
@@ -5790,31 +5809,19 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address,
                                         guint* gum_stack_depth)
 {
     while (thread_data.level > 0) {
-        gulong direct_level = thread_data.level;
-
-        while (direct_level > 0 &&
-               !thread_data.entries[direct_level - 1].fast_dispatch) {
-            direct_level--;
-        }
-        if (direct_level == 0) {
-            break;
-        }
-
-        PeakGeneralInvocationEntry* direct_entry =
-            &thread_data.entries[direct_level - 1];
-        if (direct_entry->stack_address == NULL ||
-            (guint8*)direct_entry->stack_address >=
+        PeakGeneralInvocationEntry* entry =
+            &thread_data.entries[thread_data.level - 1];
+        if (entry->stack_address == NULL ||
+            (guint8*)entry->stack_address >=
                 (guint8*)stack_address) {
             break;
         }
 
-        *gum_stack_depth = direct_entry->gum_stack_depth;
-        while (thread_data.level >= direct_level) {
-            thread_data.level--;
-            peak_general_listener_abandon_entry(
-                &thread_data,
-                &thread_data.entries[thread_data.level]);
-        }
+        *gum_stack_depth = entry->gum_stack_depth;
+        thread_data.level--;
+        peak_general_listener_abandon_entry(
+            &thread_data,
+            &thread_data.entries[thread_data.level]);
     }
 }
 

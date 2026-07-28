@@ -573,9 +573,9 @@ if(BUILD_TESTING)
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)
         set_tests_properties(test_fastpath_nonlocal_unwind
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_fastpath_unwind_outer,peak_fastpath_unwind_inner,peak_fastpath_unwind_recursive,peak_fastpath_unwind_escape_outer;PEAK_MAX_NUM_THREADS=4;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_unwind_outer,peak_fastpath_unwind_inner,peak_fastpath_unwind_recursive,peak_fastpath_unwind_escape_outer,peak_fastpath_unwind_generic_escape;PEAK_MAX_NUM_THREADS=4;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "fastpath_nonlocal_unwind_ok"
-                FAIL_REGULAR_EXPRESSION "result mismatch|fatal|Gum [^\\r\\n]* failed"
+                FAIL_REGULAR_EXPRESSION "result mismatch|did not flush|in-flight callbacks|fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 20)
 
         add_test(NAME test_detach_hotloop_strict

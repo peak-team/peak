@@ -611,17 +611,20 @@ def check_fast_listener_unwind_abi(repo_root):
     require("entry->gum_stack_depth = *gum_stack_depth" in listener and
             "*gum_stack_depth_out = entry.gum_stack_depth" in listener,
             "the PEAK direct invocation entry must carry its Gum stack boundary")
-    require("while (direct_level > 0" in listener and
-            "*gum_stack_depth = direct_entry->gum_stack_depth" in listener,
-            "the next direct entry must reap escaped direct and generic "
-            "frames back to their recorded Gum stack boundary")
+    require("peak_general_listener_invocation_stack_address(ic)" in listener and
+            "gum_invocation_context_get_depth(ic)" in listener and
+            "*gum_stack_depth = entry->gum_stack_depth" in listener,
+            "the next direct entry must reap escaped direct or generic frames "
+            "back to each entry's recorded Gum stack boundary")
     require("install_mixed_listener()" in unwind_test and
             "(gpointer)peak_fastpath_unwind_inner" in unwind_test and
             "mixed_listener_leaves" in unwind_test and
-            "peak_fastpath_unwind_escape_outer(2)" in unwind_test and
-            "escape-all recovery direct call failed" in unwind_test,
+            "escape_all_from_deeper_frame()" in unwind_test and
+            "escape_generic_from_deeper_frame()" in unwind_test and
+            "escape-all recovery direct call failed" in unwind_test and
+            "generic-only recovery direct call failed" in unwind_test,
             "non-local-unwind regression must cover surviving and fully "
-            "escaped direct outer/generic inner frames")
+            "escaped mixed frames plus a fully escaped generic-only frame")
 
 
 def check_peak_init_heartbeat_order(repo_root):
