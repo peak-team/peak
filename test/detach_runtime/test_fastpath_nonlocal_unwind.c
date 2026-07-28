@@ -11,6 +11,7 @@
 static _Thread_local jmp_buf unwind_target;
 static _Thread_local jmp_buf recursive_unwind_target;
 static _Thread_local jmp_buf escape_target;
+static _Thread_local jmp_buf generic_escape_target;
 static atomic_ulong target_sink;
 static atomic_ulong mixed_listener_enters;
 static atomic_ulong mixed_listener_leaves;
@@ -52,6 +53,34 @@ uintptr_t
 peak_fastpath_unwind_escape_outer(uintptr_t unwind)
 {
     return peak_fastpath_unwind_inner(unwind) + 1;
+}
+
+__attribute__((noinline, noclone, used, externally_visible,
+               visibility("default")))
+uintptr_t
+peak_fastpath_unwind_generic_escape(uintptr_t unwind)
+{
+    atomic_fetch_add_explicit(&target_sink, 1, memory_order_relaxed);
+    if (unwind != 0) {
+        longjmp(generic_escape_target, 1);
+    }
+    return 3;
+}
+
+__attribute__((noinline, noclone))
+static void
+escape_all_from_deeper_frame(void)
+{
+    uintptr_t result = peak_fastpath_unwind_escape_outer(2);
+    atomic_fetch_add_explicit(&target_sink, result, memory_order_relaxed);
+}
+
+__attribute__((noinline, noclone))
+static void
+escape_generic_from_deeper_frame(void)
+{
+    uintptr_t result = peak_fastpath_unwind_generic_escape(1);
+    atomic_fetch_add_explicit(&target_sink, result, memory_order_relaxed);
 }
 
 __attribute__((noinline, noclone, used, externally_visible,
@@ -136,6 +165,10 @@ install_mixed_listener(void)
         attach(*interceptor,
                (gpointer)peak_fastpath_unwind_inner,
                listener,
+               NULL) != GUM_ATTACH_OK ||
+        attach(*interceptor,
+               (gpointer)peak_fastpath_unwind_generic_escape,
+               listener,
                NULL) != GUM_ATTACH_OK) {
         fputs("failed to install mixed generic listener\n", stderr);
         return NULL;
@@ -166,6 +199,7 @@ require_fast_dispatch(void)
         required_symbol("peak_fastpath_unwind_inner"),
         required_symbol("peak_fastpath_unwind_recursive"),
         required_symbol("peak_fastpath_unwind_escape_outer"),
+        required_symbol("peak_fastpath_unwind_generic_escape"),
     };
 
     if (interceptor == NULL || listeners == NULL || addresses == NULL ||
@@ -211,7 +245,9 @@ main(void)
         peak_fastpath_unwind_recursive(2, 0) != 3 ||
         peak_fastpath_unwind_recursive(2, 0) != 3 ||
         peak_fastpath_unwind_escape_outer(0) != 2 ||
-        peak_fastpath_unwind_escape_outer(0) != 2) {
+        peak_fastpath_unwind_escape_outer(0) != 2 ||
+        peak_fastpath_unwind_generic_escape(0) != 3 ||
+        peak_fastpath_unwind_generic_escape(0) != 3) {
         fputs("fastpath unwind warm-up failed\n", stderr);
         return 1;
     }
@@ -245,7 +281,7 @@ main(void)
      * invocation stack before starting its own frame.
      */
     if (setjmp(escape_target) == 0) {
-        (void)peak_fastpath_unwind_escape_outer(2);
+        escape_all_from_deeper_frame();
         fputs("escape-all unwind unexpectedly returned\n", stderr);
         return 1;
     }
@@ -254,14 +290,29 @@ main(void)
         return 1;
     }
 
+    /*
+     * Also escape a generic-only PEAK frame. Its recorded stack address and
+     * Gum depth must be enough for the next direct entry to clear it without
+     * relying on a stale direct frame as an anchor.
+     */
+    if (setjmp(generic_escape_target) == 0) {
+        escape_generic_from_deeper_frame();
+        fputs("generic-only unwind unexpectedly returned\n", stderr);
+        return 1;
+    }
+    if (peak_fastpath_unwind_escape_outer(0) != 2) {
+        fputs("generic-only recovery direct call failed\n", stderr);
+        return 1;
+    }
+
     if (atomic_load_explicit(&target_sink, memory_order_relaxed) == 0) {
         fputs("fastpath unwind target was not executed\n", stderr);
         return 1;
     }
     if (atomic_load_explicit(&mixed_listener_enters,
-                             memory_order_relaxed) != 2002 ||
+                             memory_order_relaxed) != 2004 ||
         atomic_load_explicit(&mixed_listener_leaves,
-                             memory_order_relaxed) != 1001) {
+                             memory_order_relaxed) != 1002) {
         fprintf(stderr,
                 "mixed listener count mismatch: enters=%lu leaves=%lu\n",
                 atomic_load_explicit(&mixed_listener_enters,
