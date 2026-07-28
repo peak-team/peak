@@ -2374,6 +2374,10 @@ if(BUILD_TESTING)
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_completion_warn
+                PROPERTIES
+                    ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
                 PROPERTIES
                     ENVIRONMENT "OMP_NUM_THREADS=1;PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
@@ -2499,6 +2503,10 @@ if(BUILD_TESTING)
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
             set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
+            )
+            set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_completion_warn
                 PROPERTIES
                     ENVIRONMENT "PEAK_TARGET=peak_mpi_exit_target;${HEARTBEAT_OFF_ENV}"
             )
