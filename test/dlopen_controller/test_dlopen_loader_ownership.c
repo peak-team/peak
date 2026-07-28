@@ -85,6 +85,7 @@ typedef struct {
 
 static pthread_once_t real_loader_once = PTHREAD_ONCE_INIT;
 static DlopenFunction real_dlopen_function;
+static DlopenFunction application_dlopen_function;
 static DlmopenFunction real_dlmopen_function;
 static DlinfoFunction real_dlinfo_function;
 static _Thread_local LoaderPhase loader_phase = LOADER_PHASE_IDLE;
@@ -256,7 +257,8 @@ peak_dlopen_owned_fixture_destructor_loader(void)
 
     previous_phase = loader_phase;
     loader_phase = LOADER_PHASE_DESTRUCTOR;
-    handle = dlopen("libm.so.6", RTLD_NOW | RTLD_LOCAL);
+    handle = application_dlopen_function("libm.so.6",
+                                         RTLD_NOW | RTLD_LOCAL);
     if (handle != NULL) {
         atomic_fetch_add_explicit(&destructor_loader_successes,
                                   1,
@@ -477,7 +479,14 @@ load_with_callback_phase_flags(const char* path, int flags)
     void* handle;
 
     loader_phase = LOADER_PHASE_CALLBACK;
-    handle = dlopen(path, flags);
+    /*
+     * Resolve this call at runtime instead of relying on a same-translation-
+     * unit call to the executable's dlopen interposer.  ICC and NVHPC may
+     * bind or clone that direct call locally at -O3, bypassing the exported
+     * entry that Gum patches.  A runtime function-pointer call exercises the
+     * same public application entry on every supported compiler.
+     */
+    handle = application_dlopen_function(path, flags);
     loader_phase = LOADER_PHASE_IDLE;
     return handle;
 }
@@ -1203,6 +1212,9 @@ main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    resolve_hook("dlopen",
+                 &application_dlopen_function,
+                 sizeof(application_dlopen_function));
     PeakTestHooks hooks = load_peak_test_hooks();
     hooks.set_manual_drain(TRUE);
 
