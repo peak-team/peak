@@ -15,6 +15,8 @@ static _Thread_local jmp_buf generic_escape_target;
 static atomic_ulong target_sink;
 static atomic_ulong mixed_listener_enters;
 static atomic_ulong mixed_listener_leaves;
+static atomic_ulong unrelated_listener_enters;
+static atomic_ulong unrelated_listener_leaves;
 
 __attribute__((noinline, noclone, used, externally_visible,
                visibility("default")))
@@ -65,6 +67,14 @@ peak_fastpath_unwind_generic_escape(uintptr_t unwind)
         longjmp(generic_escape_target, 1);
     }
     return 3;
+}
+
+__attribute__((noinline, noclone, used, externally_visible,
+               visibility("default")))
+uintptr_t
+peak_fastpath_unwind_unrelated_bridge(void)
+{
+    return peak_fastpath_unwind_escape_outer(0) + 1;
 }
 
 __attribute__((noinline, noclone))
@@ -131,6 +141,26 @@ mixed_listener_on_leave(GumInvocationContext* context, gpointer user_data)
                               memory_order_relaxed);
 }
 
+static void
+unrelated_listener_on_enter(GumInvocationContext* context,
+                            gpointer user_data)
+{
+    (void)context;
+    (void)user_data;
+    atomic_fetch_add_explicit(&unrelated_listener_enters, 1,
+                              memory_order_relaxed);
+}
+
+static void
+unrelated_listener_on_leave(GumInvocationContext* context,
+                            gpointer user_data)
+{
+    (void)context;
+    (void)user_data;
+    atomic_fetch_add_explicit(&unrelated_listener_leaves, 1,
+                              memory_order_relaxed);
+}
+
 static GumInvocationListener*
 install_mixed_listener(void)
 {
@@ -152,6 +182,7 @@ install_mixed_listener(void)
     AttachFunc attach =
         (AttachFunc)required_symbol("gum_interceptor_attach");
     GumInvocationListener* listener;
+    GumInvocationListener* unrelated_listener;
 
     if (interceptor == NULL || *interceptor == NULL ||
         make_listener == NULL || attach == NULL) {
@@ -161,7 +192,11 @@ install_mixed_listener(void)
                              mixed_listener_on_leave,
                              NULL,
                              NULL);
-    if (listener == NULL ||
+    unrelated_listener = make_listener(unrelated_listener_on_enter,
+                                       unrelated_listener_on_leave,
+                                       NULL,
+                                       NULL);
+    if (listener == NULL || unrelated_listener == NULL ||
         attach(*interceptor,
                (gpointer)peak_fastpath_unwind_inner,
                listener,
@@ -169,6 +204,10 @@ install_mixed_listener(void)
         attach(*interceptor,
                (gpointer)peak_fastpath_unwind_generic_escape,
                listener,
+               NULL) != GUM_ATTACH_OK ||
+        attach(*interceptor,
+               (gpointer)peak_fastpath_unwind_unrelated_bridge,
+               unrelated_listener,
                NULL) != GUM_ATTACH_OK) {
         fputs("failed to install mixed generic listener\n", stderr);
         return NULL;
@@ -300,8 +339,8 @@ main(void)
         fputs("generic-only unwind unexpectedly returned\n", stderr);
         return 1;
     }
-    if (peak_fastpath_unwind_escape_outer(0) != 2) {
-        fputs("generic-only recovery direct call failed\n", stderr);
+    if (peak_fastpath_unwind_unrelated_bridge() != 3) {
+        fputs("generic-only unrelated recovery call failed\n", stderr);
         return 1;
     }
 
@@ -318,6 +357,18 @@ main(void)
                 atomic_load_explicit(&mixed_listener_enters,
                                      memory_order_relaxed),
                 atomic_load_explicit(&mixed_listener_leaves,
+                                     memory_order_relaxed));
+        return 1;
+    }
+    if (atomic_load_explicit(&unrelated_listener_enters,
+                             memory_order_relaxed) != 1 ||
+        atomic_load_explicit(&unrelated_listener_leaves,
+                             memory_order_relaxed) != 1) {
+        fprintf(stderr,
+                "unrelated listener count mismatch: enters=%lu leaves=%lu\n",
+                atomic_load_explicit(&unrelated_listener_enters,
+                                     memory_order_relaxed),
+                atomic_load_explicit(&unrelated_listener_leaves,
                                      memory_order_relaxed));
         return 1;
     }

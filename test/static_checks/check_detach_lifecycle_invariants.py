@@ -596,35 +596,40 @@ def check_fast_listener_unwind_abi(repo_root):
         repo_root / "test/detach_runtime/test_fastpath_nonlocal_unwind.c"
     ).read_text(encoding="utf-8")
 
-    require("GUM_PEAK_FAST_LISTENER_VERSION 6u" in api and
-            "GUM_PEAK_FAST_LISTENER_VERSION != 6" in cmake,
+    require("GUM_PEAK_FAST_LISTENER_VERSION 7u" in api and
+            "GUM_PEAK_FAST_LISTENER_VERSION != 7" in cmake,
             "patched Gum configuration must reject an older fast-listener callback ABI")
     require("peak_gum_get_interceptor_thread_context" in patcher and
             '"--globalize-symbol"' in patcher and
             'tls_model("initial-exec")' in overlay and
             "peak_gum_cached_invocation_stack" in overlay and
+            "peak_gum_invocation_stack_reap_unwound(stack_address)"
+            in overlay and
             "peak_gum_invocation_stack_depth()" in overlay and
             "peak_gum_invocation_stack_reap_to_depth(gum_stack_depth)"
             in overlay,
             "direct dispatch must cache, snapshot, and restore Gum's generic "
             "invocation-stack depth without a steady-state Gum TLS lookup")
-    require("entry->gum_stack_depth = *gum_stack_depth" in listener and
+    require("entry->gum_stack_depth = gum_stack_depth" in listener and
             "*gum_stack_depth_out = entry.gum_stack_depth" in listener,
             "the PEAK direct invocation entry must carry its Gum stack boundary")
     require("peak_general_listener_invocation_stack_address(ic)" in listener and
             "gum_invocation_context_get_depth(ic)" in listener and
-            "*gum_stack_depth = entry->gum_stack_depth" in listener,
-            "the next direct entry must reap escaped direct or generic frames "
-            "back to each entry's recorded Gum stack boundary")
+            "peak_general_listener_fast_reap_unwound(stack_address)"
+            in listener,
+            "the next direct entry must independently reconcile escaped PEAK "
+            "frames after Gum synchronizes its own live stack boundary")
     require("install_mixed_listener()" in unwind_test and
             "(gpointer)peak_fastpath_unwind_inner" in unwind_test and
             "mixed_listener_leaves" in unwind_test and
             "escape_all_from_deeper_frame()" in unwind_test and
             "escape_generic_from_deeper_frame()" in unwind_test and
             "escape-all recovery direct call failed" in unwind_test and
-            "generic-only recovery direct call failed" in unwind_test,
+            "peak_fastpath_unwind_unrelated_bridge()" in unwind_test and
+            "unrelated listener count mismatch" in unwind_test,
             "non-local-unwind regression must cover surviving and fully "
-            "escaped mixed frames plus a fully escaped generic-only frame")
+            "escaped mixed frames plus a generic-only escape followed by a "
+            "live unrelated Gum invocation")
 
 
 def check_peak_init_heartbeat_order(repo_root):
