@@ -72,6 +72,22 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_fastpath_second_listener PRIVATE -Wl,--export-dynamic)
 endif()
 
+add_executable(test_fastpath_lifetime_handoff
+  test_fastpath_lifetime_handoff.c)
+target_include_directories(test_fastpath_lifetime_handoff
+  PRIVATE
+    ${FRIDA_GUM_INCLUDE_DIRS}
+)
+target_link_libraries(test_fastpath_lifetime_handoff
+  PRIVATE
+    Threads::Threads
+    ${DL_LIBRARY}
+)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_fastpath_lifetime_handoff
+      PRIVATE -Wl,--export-dynamic)
+endif()
+
 add_executable(test_unsafe_gum_prologue test_unsafe_gum_prologue.c)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     enable_language(ASM)

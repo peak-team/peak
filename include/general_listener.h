@@ -94,6 +94,8 @@ struct _PeakGeneralListener {
     size_t hook_id;
     _Atomic int callback_hook_state;
     _Atomic gboolean detach_count_request_pending;
+    _Atomic guint fast_lifetime_closing;
+    _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
     _Atomic guint* fast_active;
     size_t fast_stats_capacity;

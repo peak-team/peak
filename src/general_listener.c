@@ -936,6 +936,24 @@ static pthread_key_t peak_general_thread_state_key;
 static pthread_once_t peak_general_thread_state_key_once = PTHREAD_ONCE_INIT;
 static gboolean peak_general_thread_state_key_created = FALSE;
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_general_listener_test_fast_close_pause = 0;
+static _Atomic int peak_general_listener_test_fast_close_held = 0;
+static _Atomic int peak_general_listener_test_fast_close_released = 0;
+static _Atomic int peak_general_listener_test_fast_abandon_pause = 0;
+static _Atomic int peak_general_listener_test_fast_abandon_held = 0;
+static _Atomic int peak_general_listener_test_fast_abandon_released = 0;
+static _Atomic int peak_general_listener_test_fast_abandon_waiting = 0;
+static _Atomic int peak_general_listener_test_fast_preclose_pause = 0;
+static _Atomic int peak_general_listener_test_fast_preclose_held = 0;
+static _Atomic int peak_general_listener_test_fast_preclose_released = 0;
+static _Atomic int peak_general_listener_test_fast_close_waiting = 0;
+static void peak_general_listener_test_fast_pause(
+    _Atomic int* pause,
+    _Atomic int* held,
+    _Atomic int* released);
+#endif
+
 pthread_once_t pthread_pause_once_ctrl = PTHREAD_ONCE_INIT;
 pthread_mutex_t heartbeat_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  heartbeat_cond  = PTHREAD_COND_INITIALIZER;
@@ -1006,7 +1024,7 @@ peak_general_listener_fast_active_slot(PeakGeneralListener* listener,
                                 PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE);
 }
 
-static inline void
+static inline gboolean
 peak_general_listener_fast_active_add(PeakGeneralListener* listener,
                                       size_t thread_id)
 {
@@ -1014,7 +1032,11 @@ peak_general_listener_fast_active_add(PeakGeneralListener* listener,
         peak_general_listener_fast_active_slot(listener, thread_id);
     guint active = atomic_load_explicit(slot, memory_order_relaxed);
 
-    atomic_store_explicit(slot, active + 1, memory_order_relaxed);
+    if (G_UNLIKELY(active == G_MAXUINT)) {
+        return FALSE;
+    }
+    atomic_store_explicit(slot, active + 1U, memory_order_relaxed);
+    return TRUE;
 }
 
 static inline void
@@ -1026,7 +1048,61 @@ peak_general_listener_fast_active_remove(PeakGeneralListener* listener,
     guint active = atomic_load_explicit(slot, memory_order_relaxed);
 
     if (active > 0) {
-        atomic_store_explicit(slot, active - 1, memory_order_relaxed);
+        atomic_store_explicit(slot, active - 1U, memory_order_relaxed);
+    }
+}
+
+static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
+peak_general_listener_fast_abandon_remove(PeakGeneralListener* listener,
+                                          size_t thread_id)
+{
+    /*
+     * Normal enter/leave callbacks are covered by the mutation guard's full
+     * trampoline/dispatch PC classification. Thread cleanup and non-local
+     * unwind are the exception: publish them in a slow-path reader count so
+     * active_close can choose exactly one side of the seed boundary.
+     */
+    for (;;) {
+        if (atomic_load_explicit(&listener->fast_lifetime_closing,
+                                 memory_order_seq_cst) != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            atomic_fetch_add_explicit(
+                &peak_general_listener_test_fast_abandon_waiting,
+                1,
+                memory_order_acq_rel);
+#endif
+            while (g_atomic_int_get(
+                       &listener->fast_listener.release_required) == 0) {
+#if defined(__x86_64__) || defined(__amd64__)
+                __asm__ volatile("pause");
+#elif defined(__aarch64__)
+                __asm__ volatile("yield");
+#endif
+            }
+            peak_general_listener_fast_active_remove(listener, thread_id);
+            return TRUE;
+        }
+
+        atomic_fetch_add_explicit(&listener->fast_lifetime_abandoners,
+                                  1,
+                                  memory_order_seq_cst);
+        if (atomic_load_explicit(&listener->fast_lifetime_closing,
+                                 memory_order_seq_cst) == 0) {
+            peak_general_listener_fast_active_remove(listener, thread_id);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            peak_general_listener_test_fast_pause(
+                &peak_general_listener_test_fast_preclose_pause,
+                &peak_general_listener_test_fast_preclose_held,
+                &peak_general_listener_test_fast_preclose_released);
+#endif
+            atomic_fetch_sub_explicit(&listener->fast_lifetime_abandoners,
+                                      1,
+                                      memory_order_seq_cst);
+            return FALSE;
+        }
+        atomic_fetch_sub_explicit(&listener->fast_lifetime_abandoners,
+                                  1,
+                                  memory_order_seq_cst);
     }
 }
 
@@ -1035,10 +1111,20 @@ peak_general_listener_abandon_entry(PeakGeneralThreadState* state,
                                     PeakGeneralInvocationEntry* entry)
 {
     if (entry->fast_dispatch && entry->listener != NULL) {
-        peak_general_listener_fast_active_remove(entry->listener,
-                                                 state->self_mapped_id);
-        gum_interceptor_peak_release_fast_invocation(
-            entry->function_context);
+        gboolean release_required =
+            peak_general_listener_fast_abandon_remove(
+                entry->listener, state->self_mapped_id);
+        if (release_required) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            peak_general_listener_test_fast_pause(
+                &peak_general_listener_test_fast_abandon_pause,
+                &peak_general_listener_test_fast_abandon_held,
+                &peak_general_listener_test_fast_abandon_released);
+#endif
+            gum_interceptor_peak_release_fast_invocation(
+                entry->function_context,
+                &entry->listener->fast_listener);
+        }
     }
 }
 
@@ -5479,7 +5565,11 @@ peak_general_listener_fast_on_enter(gpointer user_data,
 
     thread_data.in_callback = TRUE;
     size_t index = thread_data.self_mapped_id;
-    peak_general_listener_fast_active_add(self, index);
+    if (G_UNLIKELY(
+            !peak_general_listener_fast_active_add(self, index))) {
+        thread_data.in_callback = FALSE;
+        return GUM_PEAK_FAST_ENTER_FALLBACK;
+    }
     peak_general_listener_fast_reap_unwound(stack_address);
 
     PeakGeneralInvocationEntry* entry =
@@ -5513,16 +5603,18 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     return GUM_PEAK_FAST_ENTER_INVOKE;
 }
 
-static gpointer PEAK_LISTENER_FAST_DISPATCH_SECTION
+static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
 peak_general_listener_fast_on_leave(gpointer user_data,
-                                    gpointer function_context)
+                                    gpointer function_context,
+                                    gpointer* caller_return_address_out)
 {
     PeakGeneralListener* expected_listener = user_data;
     gpointer caller_return_address = NULL;
 
     if (G_UNLIKELY(thread_data.in_callback) ||
         G_UNLIKELY(!thread_data.initialized)) {
-        return NULL;
+        *caller_return_address_out = NULL;
+        return FALSE;
     }
 
     thread_data.in_callback = TRUE;
@@ -5537,7 +5629,8 @@ peak_general_listener_fast_on_leave(gpointer user_data,
 
     if (G_UNLIKELY(thread_data.level == 0)) {
         thread_data.in_callback = FALSE;
-        return NULL;
+        *caller_return_address_out = NULL;
+        return FALSE;
     }
 
     PeakGeneralInvocationEntry entry =
@@ -5595,8 +5688,12 @@ peak_general_listener_fast_on_leave(gpointer user_data,
         gum_sign_code_pointer(caller_return_address);
 #endif
     peak_general_listener_fast_active_remove(self, index);
+    gboolean release_required =
+        atomic_load_explicit(&self->fast_lifetime_closing,
+                             memory_order_acquire) != 0;
     thread_data.in_callback = FALSE;
-    return caller_return_address;
+    *caller_return_address_out = caller_return_address;
+    return release_required;
 }
 
 static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
@@ -5627,6 +5724,67 @@ peak_general_listener_fast_active_count(gpointer user_data)
             memory_order_relaxed);
     }
     return total <= G_MAXUINT ? (guint)total : G_MAXUINT;
+}
+
+static guint
+peak_general_listener_fast_active_close(gpointer user_data)
+{
+    PeakGeneralListener* self = user_data;
+    guint64 total = 0;
+
+    /*
+     * Stop new abandon readers, then wait for any reader that committed to
+     * the pre-seed side. A later abandon waits for release_required and owns
+     * one of the frames counted below.
+     */
+    atomic_store_explicit(&self->fast_lifetime_closing,
+                          1,
+                          memory_order_seq_cst);
+    while (atomic_load_explicit(&self->fast_lifetime_abandoners,
+                                memory_order_seq_cst) != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_store_explicit(
+            &peak_general_listener_test_fast_close_waiting,
+            1,
+            memory_order_release);
+#endif
+#if defined(__x86_64__) || defined(__amd64__)
+        __asm__ volatile("pause");
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+    for (size_t i = 0; i < self->fast_stats_capacity; i++) {
+        total += atomic_load_explicit(
+            peak_general_listener_fast_active_slot(self, i),
+            memory_order_acquire);
+    }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_general_listener_test_fast_pause(
+        &peak_general_listener_test_fast_close_pause,
+        &peak_general_listener_test_fast_close_held,
+        &peak_general_listener_test_fast_close_released);
+#endif
+    return total <= G_MAXUINT ? (guint)total : G_MAXUINT;
+}
+
+static void
+peak_general_listener_fast_active_reset(gpointer user_data)
+{
+    PeakGeneralListener* self = user_data;
+
+    for (size_t i = 0; i < self->fast_stats_capacity; i++) {
+        atomic_store_explicit(
+            peak_general_listener_fast_active_slot(self, i),
+            0,
+            memory_order_release);
+    }
+    atomic_store_explicit(&self->fast_lifetime_abandoners,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&self->fast_lifetime_closing,
+                          0,
+                          memory_order_release);
 }
 
 GumAttachReturn
@@ -5712,6 +5870,148 @@ peak_general_listener_iface_init(gpointer g_iface,
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_general_listener_test_mapping_countdown = -1;
+
+static void
+peak_general_listener_test_fast_pause(_Atomic int* pause,
+                                      _Atomic int* held,
+                                      _Atomic int* released)
+{
+    if (atomic_load_explicit(pause, memory_order_acquire) == 0) {
+        return;
+    }
+    atomic_store_explicit(held, 1, memory_order_release);
+    while (atomic_load_explicit(released, memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    atomic_store_explicit(pause, 0, memory_order_release);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_close_pause_enable(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_abandon_waiting,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_close_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_close_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_close_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_fast_close_is_held(void)
+{
+    return atomic_load_explicit(&peak_general_listener_test_fast_close_held,
+                                memory_order_acquire);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_close_release(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_close_released,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_abandon_pause_enable(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_abandon_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_abandon_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_abandon_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_fast_abandon_is_held(void)
+{
+    return atomic_load_explicit(&peak_general_listener_test_fast_abandon_held,
+                                memory_order_acquire);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_abandon_release(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_abandon_released,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_fast_abandon_waiting_count(void)
+{
+    return atomic_load_explicit(
+        &peak_general_listener_test_fast_abandon_waiting,
+        memory_order_acquire);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_preclose_pause_enable(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_close_waiting,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_preclose_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_preclose_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_general_listener_test_fast_preclose_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_fast_preclose_is_held(void)
+{
+    return atomic_load_explicit(&peak_general_listener_test_fast_preclose_held,
+                                memory_order_acquire);
+}
+
+PEAK_API void
+peak_general_listener_test_fast_preclose_release(void)
+{
+    atomic_store_explicit(&peak_general_listener_test_fast_preclose_released,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_API int
+peak_general_listener_test_fast_close_is_waiting(void)
+{
+    return atomic_load_explicit(&peak_general_listener_test_fast_close_waiting,
+                                memory_order_acquire);
+}
+
+PEAK_API GumAttachReturn
+peak_general_listener_test_gum_attach_target(
+    GumInterceptor* target_interceptor,
+    gpointer address,
+    GumInvocationListener* listener,
+    const struct _PeakGumTargetAttachPlan* plan)
+{
+    return peak_general_listener_gum_attach_target(target_interceptor,
+                                                   address,
+                                                   listener,
+                                                   plan);
+}
+
+PEAK_API void
+peak_general_listener_test_release_current_thread_state(void)
+{
+    peak_general_listener_release_current_thread_state();
+}
 #endif
 
 static gpointer
@@ -5803,12 +6103,16 @@ peak_general_listener_init(PeakGeneralListener* self)
     size_t total_count = peak_max_num_threads;
     atomic_init(&self->callback_hook_state, PEAK_HOOK_UNRESOLVED);
     atomic_init(&self->detach_count_request_pending, FALSE);
+    atomic_init(&self->fast_lifetime_closing, 0);
+    atomic_init(&self->fast_lifetime_abandoners, 0);
     self->fast_listener = (GumPeakFastListener){
         .version = GUM_PEAK_FAST_LISTENER_VERSION,
         .on_enter = peak_general_listener_fast_on_enter,
         .on_leave = peak_general_listener_fast_on_leave,
         .is_direct_leave = peak_general_listener_fast_is_direct_leave,
         .active_count = peak_general_listener_fast_active_count,
+        .active_close = peak_general_listener_fast_active_close,
+        .active_reset = peak_general_listener_fast_active_reset,
         .user_data = self,
         .listener_instance = GUM_INVOCATION_LISTENER(self),
         .dispatch_start =
