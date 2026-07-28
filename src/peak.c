@@ -898,9 +898,13 @@ peak_fini_impl(void)
     if (found_MPI && mpi_finalize_path) {
         mpi_interceptor_set_real_finalize_allowed(allow_real_mpi_finalize);
         if (mpi_log_rank) {
+            if (report_release_protocol_completed &&
+                all_reports_succeeded) {
+                peak_log_report("[peak] PEAK output is complete; report publication and release succeeded\n");
+            }
             if (allow_real_mpi_finalize) {
                 if (all_reports_succeeded) {
-                    peak_log_info("[peak] PEAK output is complete; returning to real PMPI_Finalize\n");
+                    peak_log_info("[peak] Returning to real PMPI_Finalize after successful PEAK report release\n");
                 } else {
                     g_printerr("[peak] PEAK report publication failed on at least one rank; returning to real PMPI_Finalize for clean MPI teardown\n");
                 }
@@ -913,7 +917,7 @@ peak_fini_impl(void)
             } else if (intel_2019_finalize_workaround) {
                 peak_log_info("[peak] PEAK output release is complete; skipping real PMPI_Finalize for Intel MPI 2019 compatibility; set PEAK_MPI_REAL_FINALIZE=1 to override\n");
             } else if (!real_mpi_finalize_config_allowed) {
-                g_printerr("[peak] PEAK output is complete; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
+                g_printerr("[peak] PEAK report release succeeded; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
             } else if (!all_real_mpi_finalize_config_allowed) {
                 g_printerr("[peak] At least one rank disabled real PMPI_Finalize by runtime or environment policy; all ranks are skipping it\n");
             } else {

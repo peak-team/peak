@@ -760,6 +760,29 @@ struct _PeakGumFunctionContext17 {
     GumInterceptor * interceptor;
 };
 
+typedef GArray PeakGumInvocationStack17;
+
+typedef struct _PeakGumInvocationStackEntry17 {
+    PeakGumFunctionContext17 * function_ctx;
+    gpointer caller_ret_addr;
+    gpointer stack_address;
+    GumInvocationContext invocation_context;
+    GumCpuContext cpu_context;
+    guint8 listener_invocation_data[GUM_MAX_LISTENERS_PER_FUNCTION]
+        [GUM_MAX_LISTENER_DATA];
+    gboolean calling_replacement;
+    gboolean only_invoke_unignorable_listeners;
+    gint original_system_error;
+} PeakGumInvocationStackEntry17;
+
+typedef struct _PeakGumInterceptorThreadContext17 {
+    GumInvocationBackend listener_backend;
+    GumInvocationBackend replacement_backend;
+    gint ignore_level;
+    PeakGumInvocationStack17 * stack;
+    GArray * listener_data_slots;
+} PeakGumInterceptorThreadContext17;
+
 typedef struct _PeakGumListenerEntry17 {
 #ifndef GUM_DIET
     GumInvocationListenerInterface * listener_interface;
@@ -787,6 +810,9 @@ _gum_function_context_end_invocation_peak_original(
     GumCpuContext * cpu_context,
     gpointer * next_hop);
 
+G_GNUC_INTERNAL PeakGumInterceptorThreadContext17 *
+peak_gum_get_interceptor_thread_context(void);
+
 
 G_STATIC_ASSERT(sizeof(PeakGumFunctionContextBackendData17) == 3 * GLIB_SIZEOF_VOID_P);
 #if defined(__x86_64__) || defined(__amd64__)
@@ -796,6 +822,10 @@ G_STATIC_ASSERT(sizeof(PeakGumArm64Relocator17) >= 8 * GLIB_SIZEOF_VOID_P);
 G_STATIC_ASSERT(sizeof(PeakGumArm64FunctionContextData17) <=
                 sizeof(PeakGumFunctionContextBackendData17));
 #endif
+
+static _Thread_local PeakGumInvocationStack17 *
+    peak_gum_cached_invocation_stack
+        __attribute__((tls_model("initial-exec")));
 
 static gboolean
 peak_gum_pointer_in_range(gpointer pointer, gpointer start, gsize size)
@@ -810,6 +840,58 @@ peak_gum_pointer_in_range(gpointer pointer, gpointer start, gsize size)
 
     end = begin + (uintptr_t)size;
     return value >= begin && value < end && end >= begin;
+}
+
+static PeakGumInvocationStack17 * PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_invocation_stack(void)
+{
+    PeakGumInvocationStack17 * stack = peak_gum_cached_invocation_stack;
+
+    if (G_UNLIKELY(stack == NULL)) {
+        PeakGumInterceptorThreadContext17 * thread_context =
+            peak_gum_get_interceptor_thread_context();
+
+        if (thread_context != NULL) {
+            stack = thread_context->stack;
+            peak_gum_cached_invocation_stack = stack;
+        }
+    }
+    return stack;
+}
+
+static guint PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_invocation_stack_depth(void)
+{
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+
+    if (stack == NULL) {
+        return 0;
+    }
+    return stack->len;
+}
+
+static void PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_invocation_stack_reap_to_depth(guint target_depth)
+{
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+
+    if (stack == NULL) {
+        return;
+    }
+    if (target_depth > stack->len) {
+        return;
+    }
+
+    while (stack->len > target_depth) {
+        PeakGumInvocationStackEntry17 * entry =
+            &g_array_index(stack,
+                           PeakGumInvocationStackEntry17,
+                           stack->len - 1);
+
+        g_atomic_int_dec_and_test(
+            &entry->function_ctx->trampoline_usage_counter);
+        g_array_set_size(stack, stack->len - 1);
+    }
 }
 
 static gboolean
@@ -1279,10 +1361,17 @@ _gum_function_context_begin_invocation(
     if (G_LIKELY(fast_listener != NULL)) {
         gpointer stack_address;
         gpointer return_address = *caller_ret_addr;
+        guint gum_stack_depth = peak_gum_invocation_stack_depth();
         GumPeakFastEnterResult result;
 
 #if defined(__x86_64__) || defined(__amd64__)
-        stack_address = (gpointer)(uintptr_t)cpu_context->rsp;
+        /*
+         * The enter thunk may temporarily bias the reconstructed RSP by one
+         * word depending on its redirect form.  caller_ret_addr is the exact
+         * application return slot and matches the RSP reconstructed by the
+         * leave thunk.
+         */
+        stack_address = caller_ret_addr;
 #elif defined(__aarch64__)
         stack_address = (gpointer)(uintptr_t)cpu_context->sp;
 #else
@@ -1292,7 +1381,8 @@ _gum_function_context_begin_invocation(
         result = fast_listener->on_enter(fast_listener->user_data,
                                          function_ctx,
                                          stack_address,
-                                         return_address);
+                                         return_address,
+                                         gum_stack_depth);
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             return _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);
@@ -1316,15 +1406,34 @@ _gum_function_context_end_invocation(
 {
     GumPeakFastListener * fast_listener =
         peak_gum_context_fast_listener(function_ctx);
+    gpointer stack_address;
+
+#if defined(__x86_64__) || defined(__amd64__)
+    /*
+     * Gum's x86 leave thunk reconstructs the caller context with RSP pointing
+     * at the same return-address slot reported by the entry thunk.
+     */
+    stack_address = (gpointer)(uintptr_t)cpu_context->rsp;
+#elif defined(__aarch64__)
+    /* AArch64 returns through LR without changing SP. */
+    stack_address = (gpointer)(uintptr_t)cpu_context->sp;
+#else
+# error "Unsupported PEAK Gum fast-listener architecture"
+#endif
 
     if (G_LIKELY(fast_listener != NULL) &&
         fast_listener->is_direct_leave(fast_listener->user_data,
-                                       function_ctx)) {
+                                       function_ctx,
+                                       stack_address)) {
         gpointer return_address = NULL;
+        guint gum_stack_depth = 0;
         gboolean release_required =
             fast_listener->on_leave(fast_listener->user_data,
                                     function_ctx,
+                                    stack_address,
+                                    &gum_stack_depth,
                                     &return_address);
+        peak_gum_invocation_stack_reap_to_depth(gum_stack_depth);
         if (G_UNLIKELY(release_required)) {
             while (g_atomic_int_get(&fast_listener->release_required) == 0) {
 #if defined(__x86_64__) || defined(__amd64__)

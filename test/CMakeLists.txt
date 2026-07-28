@@ -568,6 +568,16 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "handoff did not flush|restore failed|fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 20)
 
+        add_test(NAME test_fastpath_nonlocal_unwind
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)
+        set_tests_properties(test_fastpath_nonlocal_unwind
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_unwind_outer,peak_fastpath_unwind_inner,peak_fastpath_unwind_recursive;PEAK_MAX_NUM_THREADS=4;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_nonlocal_unwind_ok"
+                FAIL_REGULAR_EXPRESSION "result mismatch|fatal|Gum [^\\r\\n]* failed"
+                TIMEOUT 20)
+
         add_test(NAME test_detach_hotloop_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 4 --seconds 2)
         set_tests_properties(test_detach_hotloop_strict
@@ -2090,6 +2100,17 @@ if(BUILD_TESTING)
                     --mode finalize-clean-output-mpi-real-finalize-default
                     --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
                     --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
+        add_test(NAME test_mpi_finalize_clean_exit_output_mpi_completion_warn
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                    --mpiexec ${MPIEXEC_EXECUTABLE}
+                    --nproc-flag=${MPIEXEC_NUMPROC_FLAG}
+                    --nprocs ${_PEAK_MPI_TEST_NPROCS}
+                    --exe ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_mpi_exit_before_finalize
+                    --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                    --mode finalize-clean-output-mpi-completion-warn
+                    --preflags="${_PEAK_MPIEXEC_PREFLAGS_STRING}"
+                    --postflags="${_PEAK_MPIEXEC_POSTFLAGS_STRING}")
         add_test(NAME test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
@@ -2642,6 +2663,11 @@ if(BUILD_TESTING)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_default
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-real-finalize-default"
+                FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
+                TIMEOUT 30)
+        set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_completion_warn
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "mpi_lifecycle_check_ok mode=finalize-clean-output-mpi-completion-warn"
                 FAIL_REGULAR_EXPRESSION "${_PEAK_MPI_LIFECYCLE_FATAL_REGEX}"
                 TIMEOUT 30)
         set_tests_properties(test_mpi_finalize_clean_exit_output_mpi_real_finalize_explicit

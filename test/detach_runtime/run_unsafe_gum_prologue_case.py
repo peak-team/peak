@@ -37,6 +37,10 @@ def run_case(args):
     env["PEAK_ENABLE_PER_TARGET_HEARTBEAT"] = "0"
     env["PEAK_ENABLE_GLOBAL_HEARTBEAT"] = "0"
     env["PEAK_HEARTBEAT_INTERVAL"] = "0"
+    if args.mode == "guard":
+        # Expected safety-policy skips are INFO diagnostics. Keep the guard
+        # tests diagnostic while production's default WARN level stays quiet.
+        env["PEAK_VERBOSITY"] = "info"
 
     if args.mode == "override-exercises":
         env["PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"] = "1"
