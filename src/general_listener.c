@@ -5805,8 +5805,7 @@ peak_general_listener_on_leave(GumInvocationListener* listener,
 }
 
 static void
-peak_general_listener_fast_reap_unwound(gpointer stack_address,
-                                        guint* gum_stack_depth)
+peak_general_listener_fast_reap_unwound(gpointer stack_address)
 {
     while (thread_data.level > 0) {
         PeakGeneralInvocationEntry* entry =
@@ -5817,7 +5816,6 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address,
             break;
         }
 
-        *gum_stack_depth = entry->gum_stack_depth;
         thread_data.level--;
         peak_general_listener_abandon_entry(
             &thread_data,
@@ -5830,7 +5828,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
                                     gpointer function_context,
                                     gpointer stack_address,
                                     gpointer caller_return_address,
-                                    guint* gum_stack_depth)
+                                    guint gum_stack_depth)
 {
     PeakGeneralListener* self = user_data;
 
@@ -5855,8 +5853,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
         thread_data.in_callback = FALSE;
         return GUM_PEAK_FAST_ENTER_FALLBACK;
     }
-    peak_general_listener_fast_reap_unwound(stack_address,
-                                            gum_stack_depth);
+    peak_general_listener_fast_reap_unwound(stack_address);
 
     PeakGeneralInvocationEntry* entry =
         peak_general_listener_push_invocation(NULL);
@@ -5864,7 +5861,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     entry->function_context = function_context;
     entry->caller_return_address = caller_return_address;
     entry->stack_address = stack_address;
-    entry->gum_stack_depth = *gum_stack_depth;
+    entry->gum_stack_depth = gum_stack_depth;
     entry->fast_dispatch = TRUE;
 
     gulong current_num_calls =

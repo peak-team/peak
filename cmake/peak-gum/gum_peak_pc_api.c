@@ -894,6 +894,30 @@ peak_gum_invocation_stack_reap_to_depth(guint target_depth)
     }
 }
 
+static void PEAK_GUM_FAST_DISPATCH_SECTION
+peak_gum_invocation_stack_reap_unwound(gpointer live_stack_address)
+{
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+
+    if (stack == NULL) {
+        return;
+    }
+    while (stack->len > 0) {
+        PeakGumInvocationStackEntry17 * entry =
+            &g_array_index(stack,
+                           PeakGumInvocationStackEntry17,
+                           stack->len - 1);
+
+        if ((guint8 *)entry->stack_address >=
+            (guint8 *)live_stack_address) {
+            break;
+        }
+        g_atomic_int_dec_and_test(
+            &entry->function_ctx->trampoline_usage_counter);
+        g_array_set_size(stack, stack->len - 1);
+    }
+}
+
 static gboolean
 peak_gum_pointer_between_labels(gpointer pointer, gpointer start, gpointer end)
 {
@@ -1361,7 +1385,7 @@ _gum_function_context_begin_invocation(
     if (G_LIKELY(fast_listener != NULL)) {
         gpointer stack_address;
         gpointer return_address = *caller_ret_addr;
-        guint gum_stack_depth = peak_gum_invocation_stack_depth();
+        guint gum_stack_depth;
         GumPeakFastEnterResult result;
 
 #if defined(__x86_64__) || defined(__amd64__)
@@ -1378,12 +1402,19 @@ _gum_function_context_begin_invocation(
 # error "Unsupported PEAK Gum fast-listener architecture"
 #endif
 
+        /*
+         * Gum normally performs this synchronization in its generic begin
+         * path. Direct dispatch must do the same before snapshotting the live
+         * generic boundary, otherwise PEAK's TLS stack can lag behind Gum's
+         * independently reaped invocation stack.
+         */
+        peak_gum_invocation_stack_reap_unwound(stack_address);
+        gum_stack_depth = peak_gum_invocation_stack_depth();
         result = fast_listener->on_enter(fast_listener->user_data,
                                          function_ctx,
                                          stack_address,
                                          return_address,
-                                         &gum_stack_depth);
-        peak_gum_invocation_stack_reap_to_depth(gum_stack_depth);
+                                         gum_stack_depth);
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             return _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);

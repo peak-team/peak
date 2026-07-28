@@ -56,7 +56,7 @@ typedef GumPeakFastEnterResult (* GumPeakFastEnterFunc)(
     gpointer function_context,
     gpointer stack_address,
     gpointer caller_return_address,
-    guint * gum_stack_depth);
+    guint gum_stack_depth);
 typedef gboolean (* GumPeakFastLeaveFunc)(
     gpointer user_data,
     gpointer function_context,
@@ -88,7 +88,7 @@ typedef struct _GumPeakFastListener {
     volatile gint release_required;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 6u
+#define GUM_PEAK_FAST_LISTENER_VERSION 7u
 
 GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
     GumInterceptor * interceptor,
