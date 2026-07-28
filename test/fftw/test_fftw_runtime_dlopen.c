@@ -10,12 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef void* (*fftw_malloc_fn)(size_t size);
 typedef void (*fftw_free_fn)(void* pointer);
 typedef void (*plain_target_fn)(void);
 typedef void (*set_manual_drain_fn)(gboolean enabled);
 typedef void (*plain_hook_fn)(void);
+typedef size_t (*pending_ownership_count_fn)(void);
 typedef void (*get_diagnostics_fn)(
     PeakDlopenDynamicAttachDiagnostics* diagnostics);
 
@@ -74,6 +76,29 @@ call_fftw_pair(fftw_malloc_fn fftw_malloc, fftw_free_fn fftw_free)
     return 0;
 }
 
+static void
+drain_after_ownership(plain_hook_fn explicit_drain,
+                      pending_ownership_count_fn pending_ownership_count)
+{
+    struct timespec start;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (pending_ownership_count() != 0) {
+        struct timespec now;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > 5 ||
+            (now.tv_sec - start.tv_sec == 5 &&
+             now.tv_nsec >= start.tv_nsec)) {
+            fputs("timed out waiting for dlopen ownership handoff\n",
+                  stderr);
+            exit(EXIT_FAILURE);
+        }
+        sched_yield();
+    }
+    explicit_drain();
+}
+
 int
 main(int argc, char** argv)
 {
@@ -82,6 +107,7 @@ main(int argc, char** argv)
     plain_target_fn non_fftw_target = NULL;
     set_manual_drain_fn set_manual_drain;
     plain_hook_fn explicit_drain;
+    pending_ownership_count_fn pending_ownership_count;
     get_diagnostics_fn get_diagnostics;
     PeakDlopenDynamicAttachDiagnostics before = { 0 };
     PeakDlopenDynamicAttachDiagnostics after = { 0 };
@@ -118,6 +144,10 @@ main(int argc, char** argv)
                   "dlopen_interceptor_get_dynamic_attach_diagnostics",
                   &get_diagnostics,
                   sizeof(get_diagnostics));
+    load_function(RTLD_DEFAULT,
+                  "dlopen_interceptor_test_pending_ownership_count",
+                  &pending_ownership_count,
+                  sizeof(pending_ownership_count));
 
     /* Make deferred controller attachment deterministic before target calls. */
     set_manual_drain(1);
@@ -129,7 +159,7 @@ main(int argc, char** argv)
             fputs("immediate-close setup failed\n", stderr);
             return EXIT_FAILURE;
         }
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         get_diagnostics(&after);
         if (after.enqueued != before.enqueued + 1 ||
             after.drained != before.drained + 1 ||
@@ -175,7 +205,8 @@ main(int argc, char** argv)
         }
         set_manual_drain(1);
         for (unsigned int i = 0; i < 4096; i++) {
-            explicit_drain();
+            drain_after_ownership(explicit_drain,
+                                  pending_ownership_count);
             get_diagnostics(&after);
             if (after.queue_length == 0) {
                 break;
@@ -213,7 +244,7 @@ main(int argc, char** argv)
             fprintf(stderr, "unrelated dlopen failed: %s\n", dlerror());
             return EXIT_FAILURE;
         }
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         if (dlclose(unrelated_handle) != 0) {
             fprintf(stderr, "unrelated dlclose failed: %s\n", dlerror());
             return EXIT_FAILURE;
@@ -225,7 +256,7 @@ main(int argc, char** argv)
         fprintf(stderr, "dlopen failed: %s\n", dlerror());
         return EXIT_FAILURE;
     }
-    explicit_drain();
+    drain_after_ownership(explicit_drain, pending_ownership_count);
 
     if (strcmp(mode, "single") == 0) {
         plain_target_fn single_target;
@@ -263,7 +294,7 @@ main(int argc, char** argv)
         PeakDlopenDynamicAttachDiagnostics post_drain_after;
         void* second_handle;
 
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         non_fftw_target();
         get_diagnostics(&post_drain_before);
         second_handle = dlopen(argv[1], RTLD_LAZY | RTLD_LOCAL);
@@ -282,7 +313,7 @@ main(int argc, char** argv)
             return EXIT_FAILURE;
         }
     } else if (strcmp(mode, "retry") == 0) {
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         non_fftw_target();
         if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
             return EXIT_FAILURE;
@@ -306,7 +337,7 @@ main(int argc, char** argv)
             fprintf(stderr, "retry dlclose failed: %s\n", dlerror());
             return EXIT_FAILURE;
         }
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         if (call_fftw_pair(fftw_malloc, fftw_free) != 0) {
             return EXIT_FAILURE;
         }
@@ -327,7 +358,7 @@ main(int argc, char** argv)
             fprintf(stderr, "extension dlopen failed: %s\n", dlerror());
             return EXIT_FAILURE;
         }
-        explicit_drain();
+        drain_after_ownership(explicit_drain, pending_ownership_count);
         load_function(extension_handle,
                       "fftw_mpi_init",
                       &extension_target,

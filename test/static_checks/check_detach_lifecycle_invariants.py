@@ -135,6 +135,7 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     shutdown = extract_function(
         source, "dlopen_interceptor_shutdown_dynamic_attach"
     )
+    listener_attach = extract_function(source, "dlopen_interceptor_attach")
     detach = extract_function(source, "dlopen_interceptor_dettach")
     unresolved_counts = extract_function(
         source, "dlopen_interceptor_unresolved_counts"
@@ -145,8 +146,17 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     enqueue = extract_function(
         source, "dlopen_interceptor_enqueue_dynamic_attach_request"
     )
-    duplicate_handle = extract_function(
-        source, "dlopen_interceptor_duplicate_dynamic_handle_reference"
+    pin_handle = extract_function(
+        source, "dlopen_interceptor_pin_dynamic_handle_reference"
+    )
+    ownership_thread = extract_function(
+        source, "dlopen_interceptor_ownership_thread_main"
+    )
+    guarded_dlclose = extract_function(
+        source, "dlopen_interceptor_guarded_dlclose"
+    )
+    revert_dlclose_guard = extract_function(
+        source, "dlopen_interceptor_revert_dlclose_guard"
     )
     loaded_identity = extract_function(
         source, "dlopen_interceptor_loaded_module_identity"
@@ -190,10 +200,40 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require("dlopen_interceptor_unresolved_counts();" in on_leave and
             "if (dlopen_sync_fftw_enabled)" not in on_leave,
             "all dlopen callbacks must use atomic unresolved hints without a target scan")
-    for loader_api in ("dlopen", "dlclose", "dlsym", "dlerror", "dlinfo"):
-        require(re.search(rf"\b{loader_api}\s*\(", on_enter) is None and
-                re.search(rf"\b{loader_api}\s*\(", on_leave) is None,
-                f"dlopen callbacks must keep direct loader API {loader_api} calls in the owned-handle enqueue helper")
+    end_callback_body = extract_function(
+        source, "dlopen_interceptor_end_callback"
+    )
+    callback_reachable = (
+        admission +
+        begin_callback_body +
+        end_callback_body +
+        unresolved_counts +
+        on_enter +
+        on_leave +
+        enqueue
+    )
+    for loader_api in (
+        "dlopen",
+        "dlmopen",
+        "dlinfo",
+        "dlsym",
+        "dlvsym",
+        "dlclose",
+        "dlerror",
+        "dladdr",
+        "dl_iterate_phdr",
+    ):
+        require(re.search(rf"\b{loader_api}\s*\(", callback_reachable) is None,
+                f"dlopen callback-reachable code must not call loader API {loader_api}")
+    require("dlopen_interceptor_pin_dynamic_handle_reference(" not in
+            callback_reachable and
+            "dlopen_interceptor_wait_for_owned_request(" not in
+            callback_reachable and
+            "dlopen_interceptor_fftw_module_scan_completed(" not in
+            callback_reachable and
+            "g_printerr(" not in on_leave and
+            "peak_log_" not in on_leave,
+            "dlopen callback must only publish borrowed work without pinning, waiting, cache scans, or logging")
     require("dlerror(" not in attach,
             "controller symbol misses must remain conservative without dlerror/gettext")
     require(unresolved_counts.count("atomic_load_explicit(") == 2 and
@@ -220,18 +260,65 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "pthread_cond_broadcast(&dynamic_attach_gate_cond)" in end_drain,
             "callback admission and controller drain must form a two-way barrier")
     require("application_handle" in enqueue and
-            "dlopen_interceptor_duplicate_dynamic_handle_reference(" in enqueue and
-            "module_token" in enqueue and
-            "dlmopen((Lmid_t)namespace_id" in duplicate_handle and
+            "PEAK_DLOPEN_REQUEST_BORROWED" in enqueue and
+            "dynamic_attach_pending_ownership_count" in enqueue and
+            "dlopen_interceptor_pin_dynamic_handle_reference(" in
+            ownership_thread and
+            "dlmopen((Lmid_t)namespace_id" in pin_handle and
             "RTLD_DI_LMID" in loaded_identity and
-            "retained_token != module_token" in duplicate_handle and
+            "retained_token != module_token" in pin_handle and
             re.search(r"\b(dlopen|dlmopen)\s*\(", drain) is None,
-            "callback enqueue must pin the exact loader namespace and the controller drain must never reopen by filename")
+            "callback enqueue must publish borrowed work, the broker must pin the exact loader namespace, and the controller drain must never reopen by filename")
+    require("atomic_load_explicit(&dlclose_guard_owner_pid" in
+            guarded_dlclose and
+            "atomic_load_explicit(&dlclose_guard_install_pid" in
+            guarded_dlclose and
+            "getpid() != install_pid" in guarded_dlclose and
+            "PEAK_DLCLOSE_GUARD_REVERTING" in guarded_dlclose and
+            "PEAK_DLCLOSE_GUARD_REVERTED" in guarded_dlclose and
+            "dynamic_attach_pending_ownership_count" in guarded_dlclose and
+            "request->reference_transferred = TRUE" in guarded_dlclose and
+            "request->handle_owned = TRUE" in guarded_dlclose and
+            guarded_dlclose.count("result = close_function(handle);") >= 2 and
+            "atomic_fetch_add_explicit(&active_dlclose_guard_count" in
+            guarded_dlclose and
+            guarded_dlclose.count(
+                "atomic_fetch_sub_explicit(&active_dlclose_guard_count"
+            ) >= 3 and
+            guarded_dlclose.count("memory_order_seq_cst") >= 5 and
+            re.search(r"\bdlclose\s*\(", guarded_dlclose) is None,
+            "dlclose guard must fail open in fork children, use an SC route/readers gate, and transfer pending references without loader calls")
+    reverting_publish = revert_dlclose_guard.find(
+        "PEAK_DLCLOSE_GUARD_REVERTING"
+    )
+    active_wait = revert_dlclose_guard.find(
+        "dlopen_interceptor_wait_for_dlclose_guard_idle()"
+    )
+    gum_revert = revert_dlclose_guard.find(
+        "gum_interceptor_revert(dlopen_interceptor, dlclose_hook_address)"
+    )
+    reverted_publish = revert_dlclose_guard.find(
+        "PEAK_DLCLOSE_GUARD_REVERTED"
+    )
+    require(reverting_publish != -1 and active_wait != -1 and
+            gum_revert != -1 and reverted_publish != -1 and
+            reverting_publish < active_wait < gum_revert < reverted_publish and
+            revert_dlclose_guard.count("memory_order_seq_cst") >= 4,
+            "dlclose revert must publish an SC closing gate, drain admitted trampoline readers, revert, then publish the restored route")
+    replace_position = listener_attach.find("gum_interceptor_replace_fast(")
+    broker_start_position = listener_attach.find(
+        "dlopen_interceptor_start_ownership_thread()"
+    )
+    require(replace_position != -1 and broker_start_position != -1 and
+            replace_position < broker_start_position,
+            "ownership broker must start only after startup dlopen/dlclose Gum mutations preserve their single-thread proof")
     drain_release = drain.find(
         "dlopen_interceptor_release_dynamic_attach_request_metadata("
     )
     drain_end = drain.find("dlopen_interceptor_end_dynamic_attach_drain();")
-    drain_close = drain.find("dlclose(handles_to_close[i]);")
+    drain_close = drain.find(
+        "dlopen_interceptor_internal_dlclose(handles_to_close[i]);"
+    )
     require(drain_release != -1 and drain_end != -1 and drain_close != -1 and
             drain_release < drain_end < drain_close,
             "queue-owned handles must be closed only after the controller reopens callback admission")
@@ -263,6 +350,10 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     require("atomic_store_explicit(&dlopen_listener_owner_pid" in enable and
             "getpid()" in enable,
             "dlopen callback admission must open only with dynamic attach")
+    require("dlopen_listener_attached" in enable and
+            "dlclose_guard_replaced" in enable and
+            "original_dlclose != NULL" in enable,
+            "dynamic admission must require both installed loader hooks and a published dlclose trampoline")
     owner_open = enable.find(
         "atomic_store_explicit(&dlopen_listener_owner_pid"
     )
@@ -307,6 +398,33 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             pinned_unlock != -1 and
             pinned_owner_close < pinned_state_close < pinned_unlock,
             "pinned dlopen shutdown must make the listener inert under the gate mutex")
+    pending_idle = shutdown.find(
+        "dlopen_interceptor_wait_for_pending_ownership_idle()"
+    )
+    guard_close = shutdown.find(
+        "atomic_store_explicit(&dlclose_guard_owner_pid"
+    )
+    broker_stop = shutdown.find(
+        "dlopen_interceptor_stop_ownership_thread()"
+    )
+    queue_discard = shutdown.find(
+        "dlopen_interceptor_discard_dynamic_attach_queue()"
+    )
+    require(pending_idle != -1 and guard_close != -1 and
+            broker_stop != -1 and queue_discard != -1 and
+            pending_idle < guard_close < broker_stop < queue_discard,
+            "shutdown must resolve handoffs before disabling the guard, stopping the broker, and discarding owned work")
+    detach_shutdown = detach.find(
+        "dlopen_interceptor_shutdown_dynamic_attach()"
+    )
+    guard_revert = detach.find(
+        "dlopen_interceptor_revert_dlclose_guard("
+    )
+    teardown_flush = detach.find("dlopen_interceptor_flush_teardown()")
+    require(detach_shutdown != -1 and guard_revert != -1 and
+            teardown_flush != -1 and
+            detach_shutdown < guard_revert < teardown_flush,
+            "teardown must resolve ownership, safely revert dlclose, and only then flush")
 
     peak_source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
     fini = extract_function(peak_source, "peak_fini_impl")
@@ -1612,10 +1730,13 @@ def check_stop_window_accounting_sidecar(repo_root):
             "support replacements must not apply user-target prologue guards")
     require("peak_general_listener_support_attach_target_is_supported" in syscall,
             "close support replacement must call the support attach predicate")
-    require("peak_general_listener_attach_target_is_supported" in dlopen_attach,
+    require('peak_general_listener_attach_target_is_supported("dlopen"' in
+            dlopen_attach,
             "dlopen listener must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
-    require("peak_general_listener_support_attach_target_is_supported" not in dlopen_attach,
-            "dlopen listener must not use support-only prologue policy")
+    require('peak_general_listener_support_attach_target_is_supported(' in
+            dlopen_attach and
+            '"dlclose",' in dlopen_attach,
+            "dlclose ownership guard must use the support-hook prologue policy")
     require("startup_attach_can_skip_stop" in dlopen_attach and
             dlopen_attach.count("!startup_attach_can_skip_stop &&") >= 2,
             "startup dlopen listener attach must not start the stop backend after a single-thread proof")

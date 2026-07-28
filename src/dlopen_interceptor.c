@@ -15,11 +15,20 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
 typedef void (*fn_void)(void);
+typedef int (*PeakDlcloseFunction)(void*);
+
+typedef enum {
+    PEAK_DLCLOSE_GUARD_INACTIVE = 0,
+    PEAK_DLCLOSE_GUARD_ROUTED,
+    PEAK_DLCLOSE_GUARD_REVERTING,
+    PEAK_DLCLOSE_GUARD_REVERTED
+} PeakDlcloseGuardRouteState;
 
 #define PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY 256U
 #define PEAK_DLOPEN_DYNAMIC_ATTACH_DRAIN_BUDGET 64U
@@ -37,10 +46,19 @@ static size_t dlopen_fftw_scope_target_count = 0;
 static _Atomic size_t dlopen_unresolved_fftw_count = 0;
 static _Atomic gboolean dlopen_may_have_unresolved_non_fftw = FALSE;
 static _Atomic pid_t dlopen_listener_owner_pid = 0;
+static _Atomic pid_t dlclose_guard_owner_pid = 0;
 extern GumInterceptor* interceptor;
 extern GumInvocationListener** array_listener;
 extern gpointer* hook_address;
 static gpointer* dlopen_hook_address = NULL;
+static gpointer dlclose_hook_address = NULL;
+static PeakDlcloseFunction original_dlclose = NULL;
+static PeakDlcloseFunction restored_dlclose = NULL;
+static gboolean dlopen_listener_attached = FALSE;
+static gboolean dlclose_guard_replaced = FALSE;
+static _Atomic PeakDlcloseGuardRouteState dlclose_guard_route_state =
+    PEAK_DLCLOSE_GUARD_INACTIVE;
+static _Atomic pid_t dlclose_guard_install_pid = 0;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
 extern char** peak_demangled_strings;
@@ -57,12 +75,25 @@ typedef enum {
     PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY
 } PeakDlopenAttachScope;
 
+typedef enum {
+    PEAK_DLOPEN_REQUEST_EMPTY = 0,
+    PEAK_DLOPEN_REQUEST_BORROWED,
+    PEAK_DLOPEN_REQUEST_PINNING,
+    PEAK_DLOPEN_REQUEST_READY,
+    PEAK_DLOPEN_REQUEST_PIN_FAILED
+} PeakDlopenRequestState;
+
 typedef struct {
     void* handle;
     char* filename;
     int binding_flags;
     PeakDlopenAttachScope scope;
     gpointer module_token;
+    gpointer source_handle_token;
+    uint64_t ownership_ticket;
+    PeakDlopenRequestState state;
+    gboolean handle_owned;
+    gboolean reference_transferred;
     gboolean handle_retained;
 } PeakDlopenDynamicAttachRequest;
 
@@ -94,6 +125,10 @@ typedef enum {
 static pthread_mutex_t dynamic_attach_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t dynamic_attach_gate_cond = PTHREAD_COND_INITIALIZER;
 static PeakDlopenControllerState dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_CLOSED;
+static pthread_t dynamic_attach_ownership_thread;
+static gboolean dynamic_attach_ownership_thread_started = FALSE;
+static gboolean dynamic_attach_ownership_thread_running = FALSE;
+static gboolean dynamic_attach_ownership_thread_ready = FALSE;
 static unsigned int active_dynamic_attach_count = 0;
 static unsigned int active_dlopen_callback_count = 0;
 static gboolean dynamic_attach_drain_active = FALSE;
@@ -101,10 +136,10 @@ static PeakDlopenDynamicAttachRequest dynamic_attach_queue[PEAK_DLOPEN_DYNAMIC_A
 static size_t dynamic_attach_queue_head = 0;
 static size_t dynamic_attach_queue_tail = 0;
 static size_t dynamic_attach_queue_length = 0;
-static gboolean dynamic_attach_queue_overflow_reported = FALSE;
 static GPtrArray* dynamic_attach_retained_handles = NULL;
 static GHashTable* dlopen_completed_fftw_modules = NULL;
 static __thread gboolean dynamic_attach_drain_reentrant = FALSE;
+static __thread gboolean dynamic_attach_internal_dlclose = FALSE;
 static unsigned long long dynamic_attach_enqueue_count = 0;
 static unsigned long long dynamic_attach_drain_count = 0;
 static unsigned long long dynamic_attach_requeue_count = 0;
@@ -114,6 +149,9 @@ static unsigned long long dynamic_attach_drop_noload_count = 0;
 static unsigned long long dynamic_attach_drop_requeue_count = 0;
 static unsigned long long dynamic_attach_partial_success_count = 0;
 static unsigned long long dynamic_attach_retained_handle_count = 0;
+static uint64_t dynamic_attach_next_ownership_ticket = 1;
+static _Atomic size_t dynamic_attach_pending_ownership_count = 0;
+static _Atomic size_t active_dlclose_guard_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static gsize dlopen_runtime_config_initialized = 0;
 static gboolean configured_dlopen_debug_enabled = FALSE;
@@ -130,6 +168,12 @@ static gboolean dynamic_attach_test_callback_is_waiting = FALSE;
 static gboolean dynamic_attach_test_hold_drain = FALSE;
 static gboolean dynamic_attach_test_drain_is_waiting = FALSE;
 static gboolean dynamic_attach_test_callback_waiting_for_drain = FALSE;
+static gboolean dynamic_attach_test_hold_ownership = FALSE;
+static gboolean dynamic_attach_test_ownership_is_waiting = FALSE;
+static gboolean dynamic_attach_test_hold_ownership_pin = FALSE;
+static gboolean dynamic_attach_test_ownership_pin_is_waiting = FALSE;
+static gboolean dynamic_attach_test_hold_dlclose_guard = FALSE;
+static gboolean dynamic_attach_test_dlclose_guard_is_waiting = FALSE;
 #endif
 
 static gboolean
@@ -287,31 +331,10 @@ dlopen_interceptor_unresolved_counts(void)
 }
 
 static gboolean
-dlopen_interceptor_fftw_module_scan_completed(void* handle)
+dlopen_interceptor_fftw_module_scan_completed(gpointer module_token)
 {
-    gpointer module_token = NULL;
     gboolean completed = FALSE;
 
-    if (handle == NULL) {
-        return FALSE;
-    }
-#if defined(__linux__)
-    struct link_map* module_map = NULL;
-
-    peak_general_listener_fast_ignore_current_thread();
-    if (dlopen_interceptor != NULL) {
-        gum_interceptor_ignore_current_thread(dlopen_interceptor);
-    }
-    if (dlinfo(handle, RTLD_DI_LINKMAP, &module_map) == 0) {
-        module_token = module_map;
-    }
-    if (dlopen_interceptor != NULL) {
-        gum_interceptor_unignore_current_thread(dlopen_interceptor);
-    }
-    peak_general_listener_fast_unignore_current_thread();
-#else
-    module_token = handle;
-#endif
     if (module_token == NULL) {
         return FALSE;
     }
@@ -571,6 +594,22 @@ dlopen_interceptor_add_milliseconds(struct timespec* ts, long milliseconds)
     }
 }
 
+static int
+dlopen_interceptor_internal_dlclose(void* handle)
+{
+    gboolean previous_internal = dynamic_attach_internal_dlclose;
+    int result;
+
+    dynamic_attach_internal_dlclose = TRUE;
+    if (original_dlclose != NULL) {
+        result = original_dlclose(handle);
+    } else {
+        result = dlclose(handle);
+    }
+    dynamic_attach_internal_dlclose = previous_internal;
+    return result;
+}
+
 static void
 dlopen_interceptor_close_retained_handle(gpointer handle)
 {
@@ -580,7 +619,7 @@ dlopen_interceptor_close_retained_handle(gpointer handle)
             return;
         }
 #endif
-        dlclose(handle);
+        (void)dlopen_interceptor_internal_dlclose(handle);
     }
 }
 
@@ -601,8 +640,15 @@ dlopen_interceptor_find_queued_request_unlocked(const char* filename,
         PeakDlopenDynamicAttachRequest* queued =
             &dynamic_attach_queue[index];
 
+        if (queued->state == PEAK_DLOPEN_REQUEST_PIN_FAILED ||
+            queued->state == PEAK_DLOPEN_REQUEST_EMPTY) {
+            index =
+                (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+            continue;
+        }
         if (module_token != NULL) {
-            if (queued->module_token == module_token) {
+            if (queued->source_handle_token == module_token ||
+                queued->module_token == module_token) {
                 return queued;
             }
         } else if (queued->module_token == NULL &&
@@ -614,6 +660,257 @@ dlopen_interceptor_find_queued_request_unlocked(const char* filename,
         index = (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
     }
     return NULL;
+}
+
+static PeakDlopenDynamicAttachRequest*
+dlopen_interceptor_find_ticket_unlocked(uint64_t ownership_ticket)
+{
+    size_t index = dynamic_attach_queue_head;
+
+    if (ownership_ticket == 0) {
+        return NULL;
+    }
+    for (size_t offset = 0; offset < dynamic_attach_queue_length; offset++) {
+        PeakDlopenDynamicAttachRequest* queued =
+            &dynamic_attach_queue[index];
+
+        if (queued->ownership_ticket == ownership_ticket) {
+            return queued;
+        }
+        index = (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+    }
+    return NULL;
+}
+
+static PeakDlopenDynamicAttachRequest*
+dlopen_interceptor_find_borrowed_request_unlocked(void)
+{
+    size_t index = dynamic_attach_queue_head;
+
+    for (size_t offset = 0; offset < dynamic_attach_queue_length; offset++) {
+        PeakDlopenDynamicAttachRequest* queued =
+            &dynamic_attach_queue[index];
+
+        if (queued->state == PEAK_DLOPEN_REQUEST_BORROWED) {
+            return queued;
+        }
+        index = (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+    }
+    return NULL;
+}
+
+static PeakDlopenDynamicAttachRequest*
+dlopen_interceptor_find_pending_handle_unlocked(void* handle)
+{
+    size_t index = dynamic_attach_queue_head;
+
+    for (size_t offset = 0; offset < dynamic_attach_queue_length; offset++) {
+        PeakDlopenDynamicAttachRequest* queued =
+            &dynamic_attach_queue[index];
+
+        if ((queued->state == PEAK_DLOPEN_REQUEST_BORROWED ||
+             (queued->state == PEAK_DLOPEN_REQUEST_PINNING &&
+              !queued->reference_transferred)) &&
+            queued->source_handle_token == handle) {
+            return queued;
+        }
+        index = (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+    }
+    return NULL;
+}
+
+static void
+dlopen_interceptor_resolve_pending_ownership_unlocked(
+    PeakDlopenDynamicAttachRequest* request)
+{
+    if (request == NULL ||
+        (request->state != PEAK_DLOPEN_REQUEST_BORROWED &&
+         request->state != PEAK_DLOPEN_REQUEST_PINNING)) {
+        return;
+    }
+    size_t pending =
+        atomic_load_explicit(&dynamic_attach_pending_ownership_count,
+                             memory_order_relaxed);
+    if (pending > 0) {
+        atomic_fetch_sub_explicit(&dynamic_attach_pending_ownership_count,
+                                  1,
+                                  memory_order_release);
+    }
+}
+
+static uint64_t
+dlopen_interceptor_next_ownership_ticket_unlocked(void)
+{
+    uint64_t ticket = dynamic_attach_next_ownership_ticket++;
+
+    if (ticket == 0) {
+        ticket = dynamic_attach_next_ownership_ticket++;
+    }
+    return ticket;
+}
+
+static int
+dlopen_interceptor_guarded_dlclose(void* handle)
+{
+    PeakDlcloseFunction close_function;
+    PeakDlcloseGuardRouteState route_state;
+    pid_t install_pid;
+    pid_t owner_pid;
+    PeakDlopenDynamicAttachRequest* request;
+    int result;
+    int saved_errno;
+    gboolean transferred = FALSE;
+
+    /*
+     * Count every routed invocation, including fast pass-through calls.
+     * Teardown first reverts the target, then waits for this count before
+     * flushing or releasing the Gum trampoline.
+     */
+    atomic_fetch_add_explicit(&active_dlclose_guard_count,
+                              1,
+                              memory_order_seq_cst);
+    route_state =
+        atomic_load_explicit(&dlclose_guard_route_state,
+                             memory_order_seq_cst);
+    if (route_state == PEAK_DLCLOSE_GUARD_REVERTED) {
+        close_function = restored_dlclose;
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        if (close_function == NULL) {
+            errno = ENOSYS;
+            return -1;
+        }
+        return close_function(handle);
+    }
+
+    close_function = original_dlclose;
+    if (close_function == NULL) {
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        errno = ENOSYS;
+        return -1;
+    }
+
+    /*
+     * A fork child owns a private copy of the still-valid trampoline and must
+     * never wait for a parent-only route transition or touch inherited locks.
+     */
+    install_pid = atomic_load_explicit(&dlclose_guard_install_pid,
+                                       memory_order_acquire);
+    if (install_pid != 0 && getpid() != install_pid) {
+        result = close_function(handle);
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        return result;
+    }
+
+    if (route_state == PEAK_DLCLOSE_GUARD_REVERTING) {
+        /*
+         * Withdraw from the trampoline-reader count so teardown can revert.
+         * If revert fails, ROUTED republishes the still-valid trampoline. If
+         * it succeeds, call the restored public target directly.
+         */
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        do {
+            sched_yield();
+            route_state =
+                atomic_load_explicit(&dlclose_guard_route_state,
+                                     memory_order_seq_cst);
+        } while (route_state == PEAK_DLCLOSE_GUARD_REVERTING);
+        if (route_state == PEAK_DLCLOSE_GUARD_REVERTED) {
+            close_function = restored_dlclose;
+        }
+        if (close_function == NULL) {
+            errno = ENOSYS;
+            return -1;
+        }
+        return close_function(handle);
+    }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    while (dynamic_attach_test_hold_dlclose_guard) {
+        dynamic_attach_test_dlclose_guard_is_waiting = TRUE;
+        pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+        pthread_cond_wait(&dynamic_attach_test_callback_cond,
+                          &dynamic_attach_test_callback_mutex);
+    }
+    dynamic_attach_test_dlclose_guard_is_waiting = FALSE;
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+#endif
+
+    if (dynamic_attach_internal_dlclose) {
+        result = close_function(handle);
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        return result;
+    }
+
+    /*
+     * Fork children must fail open without touching mutex state inherited
+     * from a vanished parent thread. The parent keeps this PID published
+     * through shutdown until every borrowed handoff has been resolved.
+     */
+    owner_pid = atomic_load_explicit(&dlclose_guard_owner_pid,
+                                     memory_order_acquire);
+    if (owner_pid == 0 ||
+        atomic_load_explicit(&dynamic_attach_pending_ownership_count,
+                             memory_order_acquire) == 0) {
+        result = close_function(handle);
+        atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                                  1,
+                                  memory_order_seq_cst);
+        return result;
+    }
+
+    saved_errno = errno;
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    request = dlopen_interceptor_find_pending_handle_unlocked(handle);
+    if (request != NULL) {
+        /*
+         * Transfer the application's successful dlopen reference directly to
+         * PEAK. Skipping this one real dlclose is reference-count equivalent
+         * to acquiring a PEAK pin and then closing the application reference,
+         * but requires no loader API and never waits for another thread.
+         */
+        if (request->state == PEAK_DLOPEN_REQUEST_BORROWED) {
+            dlopen_interceptor_resolve_pending_ownership_unlocked(request);
+            request->state = PEAK_DLOPEN_REQUEST_READY;
+        } else {
+            /*
+             * The broker is already inside dlinfo/dlmopen. Keep the request
+             * non-drainable until that access ends, but transfer the
+             * application reference now so this close remains nonblocking.
+             */
+            request->reference_transferred = TRUE;
+        }
+        request->handle = handle;
+        request->module_token = request->source_handle_token;
+        request->handle_owned = TRUE;
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
+        transferred = TRUE;
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (transferred) {
+        peak_general_listener_controller_wake();
+        result = 0;
+    } else {
+        result = close_function(handle);
+    }
+    atomic_fetch_sub_explicit(&active_dlclose_guard_count,
+                              1,
+                              memory_order_seq_cst);
+    if (transferred) {
+        errno = saved_errno;
+    }
+    return result;
 }
 
 static void
@@ -754,12 +1051,129 @@ dlopen_interceptor_wait_for_callbacks_idle(void)
     return idle;
 }
 
+static gboolean
+dlopen_interceptor_wait_for_pending_ownership_idle(void)
+{
+    struct timespec deadline;
+    gboolean idle = TRUE;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    dlopen_interceptor_add_milliseconds(&deadline,
+                                        PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    while (atomic_load_explicit(&dynamic_attach_pending_ownership_count,
+                                memory_order_acquire) != 0) {
+        int wait_status =
+            pthread_cond_timedwait(&dynamic_attach_gate_cond,
+                                   &dynamic_attach_gate_mutex,
+                                   &deadline);
+        if (wait_status == ETIMEDOUT) {
+            idle = FALSE;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return idle;
+}
+
+static gboolean
+dlopen_interceptor_wait_for_dlclose_guard_idle(void)
+{
+    struct timespec deadline;
+    const struct timespec retry_sleep = {
+        .tv_sec = 0,
+        .tv_nsec = PEAK_DLOPEN_PREPARE_RETRY_SLEEP_NS
+    };
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    dlopen_interceptor_add_milliseconds(&deadline,
+                                        PEAK_DLOPEN_SHUTDOWN_DRAIN_TIMEOUT_MS);
+    while (atomic_load_explicit(&active_dlclose_guard_count,
+                                memory_order_seq_cst) != 0) {
+        struct timespec now;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec &&
+             now.tv_nsec >= deadline.tv_nsec)) {
+            return FALSE;
+        }
+        (void)nanosleep(&retry_sleep, NULL);
+    }
+    return TRUE;
+}
+
+static gboolean
+dlopen_interceptor_revert_dlclose_guard(
+    PeakDetachRequest* request,
+    gboolean mutation_can_skip_stop,
+    const char* finish_context,
+    PeakDetachStatus* status_out)
+{
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+
+    if (request == NULL || !dlclose_guard_replaced) {
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_SAFE;
+        }
+        return TRUE;
+    }
+
+    atomic_store_explicit(&dlclose_guard_route_state,
+                          PEAK_DLCLOSE_GUARD_REVERTING,
+                          memory_order_seq_cst);
+    if (!dlopen_interceptor_wait_for_dlclose_guard_idle()) {
+        atomic_store_explicit(&dlclose_guard_route_state,
+                              PEAK_DLCLOSE_GUARD_ROUTED,
+                              memory_order_seq_cst);
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_TIMEOUT;
+        }
+        return FALSE;
+    }
+
+    peak_gum_module_mutation_begin();
+    if (!mutation_can_skip_stop &&
+        !dlopen_interceptor_prepare_hook_mutation_with_retry(request,
+                                                             &status)) {
+        peak_gum_module_mutation_end();
+        atomic_store_explicit(&dlclose_guard_route_state,
+                              PEAK_DLCLOSE_GUARD_ROUTED,
+                              memory_order_seq_cst);
+        if (status_out != NULL) {
+            *status_out = status;
+        }
+        return FALSE;
+    }
+
+    gum_interceptor_begin_transaction(dlopen_interceptor);
+    gum_interceptor_revert(dlopen_interceptor, dlclose_hook_address);
+    gum_interceptor_end_transaction(dlopen_interceptor);
+    if (!mutation_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(request, &status)) {
+        peak_detach_controller_abort_after_failed_finish(finish_context,
+                                                        status);
+    }
+    peak_gum_module_mutation_end();
+
+    dlclose_guard_replaced = FALSE;
+    atomic_store_explicit(&dlclose_guard_route_state,
+                          PEAK_DLCLOSE_GUARD_REVERTED,
+                          memory_order_seq_cst);
+    if (status_out != NULL) {
+        *status_out = PEAK_DETACH_STATUS_SAFE;
+    }
+    return TRUE;
+}
+
 static void
 dlopen_interceptor_retain_dynamic_handle(
     PeakDlopenDynamicAttachRequest* request,
     gboolean completed_fftw_scan)
 {
-    if (request == NULL || request->handle == NULL) {
+    if (request == NULL || request->handle == NULL ||
+        !request->handle_owned) {
         return;
     }
 
@@ -837,7 +1251,7 @@ dlopen_interceptor_loaded_module_identity(void* handle,
 }
 
 static void*
-dlopen_interceptor_duplicate_dynamic_handle_reference(
+dlopen_interceptor_pin_dynamic_handle_reference(
     void* application_handle,
     const char* fallback_filename,
     int binding_flags,
@@ -888,7 +1302,7 @@ dlopen_interceptor_duplicate_dynamic_handle_reference(
         retained_token = retained_handle;
 #endif
         if (retained_token != module_token) {
-            dlclose(retained_handle);
+            (void)dlopen_interceptor_internal_dlclose(retained_handle);
             retained_handle = NULL;
         }
     }
@@ -914,13 +1328,265 @@ dlopen_interceptor_duplicate_dynamic_handle_reference(
 #endif
 }
 
+static gboolean
+dlopen_interceptor_wait_for_owned_request(uint64_t ownership_ticket)
+{
+    gboolean owned = FALSE;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    for (;;) {
+        PeakDlopenDynamicAttachRequest* request =
+            dlopen_interceptor_find_ticket_unlocked(ownership_ticket);
+
+        if (request == NULL) {
+            break;
+        }
+        if (request->state == PEAK_DLOPEN_REQUEST_READY) {
+            owned = request->handle_owned;
+            break;
+        }
+        if (request->state == PEAK_DLOPEN_REQUEST_PIN_FAILED ||
+            request->state == PEAK_DLOPEN_REQUEST_EMPTY) {
+            break;
+        }
+        pthread_cond_wait(&dynamic_attach_gate_cond,
+                          &dynamic_attach_gate_mutex);
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return owned;
+}
+
+static void
+dlopen_interceptor_close_ownership_reference(void* handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+
+    peak_general_listener_fast_ignore_current_thread();
+    if (dlopen_interceptor != NULL) {
+        gum_interceptor_ignore_current_thread(dlopen_interceptor);
+    }
+    (void)dlopen_interceptor_internal_dlclose(handle);
+    if (dlopen_interceptor != NULL) {
+        gum_interceptor_unignore_current_thread(dlopen_interceptor);
+    }
+    peak_general_listener_fast_unignore_current_thread();
+}
+
+static void*
+dlopen_interceptor_ownership_thread_main(void* user_data)
+{
+    (void)user_data;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_attach_ownership_thread_ready = TRUE;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    for (;;) {
+        PeakDlopenDynamicAttachRequest* queued;
+        uint64_t ownership_ticket;
+        void* application_handle;
+        const char* fallback_filename;
+        int binding_flags;
+        void* retained_handle;
+        char* module_filename = NULL;
+        char* replaced_filename = NULL;
+        gpointer module_token = NULL;
+        gboolean ownership_resolved = FALSE;
+
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        while (dynamic_attach_ownership_thread_running &&
+               (queued =
+                    dlopen_interceptor_find_borrowed_request_unlocked()) ==
+                   NULL) {
+            pthread_cond_wait(&dynamic_attach_gate_cond,
+                              &dynamic_attach_gate_mutex);
+        }
+        if (!dynamic_attach_ownership_thread_running) {
+            pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+            break;
+        }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+        if (dynamic_attach_test_hold_ownership) {
+            dynamic_attach_test_ownership_is_waiting = TRUE;
+            pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+            pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+            while (dynamic_attach_test_hold_ownership) {
+                pthread_cond_wait(&dynamic_attach_test_callback_cond,
+                                  &dynamic_attach_test_callback_mutex);
+            }
+            dynamic_attach_test_ownership_is_waiting = FALSE;
+            pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+            continue;
+        }
+        pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+#endif
+
+        queued->state = PEAK_DLOPEN_REQUEST_PINNING;
+        ownership_ticket = queued->ownership_ticket;
+        application_handle = queued->handle;
+        fallback_filename = queued->filename;
+        binding_flags = queued->binding_flags;
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+        while (dynamic_attach_test_hold_ownership_pin) {
+            dynamic_attach_test_ownership_pin_is_waiting = TRUE;
+            pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+            pthread_cond_wait(&dynamic_attach_test_callback_cond,
+                              &dynamic_attach_test_callback_mutex);
+        }
+        dynamic_attach_test_ownership_pin_is_waiting = FALSE;
+        pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+#endif
+
+        /*
+         * This thread normally duplicates the exact reference outside the
+         * callback. An application dlclose racing this work may
+         * transfer its existing reference instead; commit below detects that
+         * state and releases the now-redundant duplicate.
+         */
+        retained_handle =
+            dlopen_interceptor_pin_dynamic_handle_reference(
+                application_handle,
+                fallback_filename,
+                binding_flags,
+                &module_filename,
+                &module_token);
+
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        queued =
+            dlopen_interceptor_find_ticket_unlocked(ownership_ticket);
+        if (queued != NULL &&
+            queued->state == PEAK_DLOPEN_REQUEST_PINNING &&
+            queued->reference_transferred &&
+            retained_handle != NULL) {
+            /*
+             * Keep this request PINNING and pending until every loader access
+             * is complete. The transferred application reference prevents
+             * unload while the redundant exact pin is closed outside locks.
+             */
+            pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+            dlopen_interceptor_close_ownership_reference(retained_handle);
+            retained_handle = NULL;
+            pthread_mutex_lock(&dynamic_attach_gate_mutex);
+            queued =
+                dlopen_interceptor_find_ticket_unlocked(ownership_ticket);
+        }
+        if (queued != NULL &&
+            queued->state == PEAK_DLOPEN_REQUEST_PINNING) {
+            dlopen_interceptor_resolve_pending_ownership_unlocked(queued);
+            if (queued->reference_transferred) {
+                if (retained_handle != NULL) {
+                    replaced_filename = queued->filename;
+                    queued->filename = module_filename;
+                    queued->module_token = module_token;
+                    module_filename = NULL;
+                }
+                queued->state = PEAK_DLOPEN_REQUEST_READY;
+                queued->handle_owned = TRUE;
+            } else if (retained_handle != NULL) {
+                replaced_filename = queued->filename;
+                queued->handle = retained_handle;
+                queued->filename = module_filename;
+                queued->module_token = module_token;
+                queued->state = PEAK_DLOPEN_REQUEST_READY;
+                queued->handle_owned = TRUE;
+                retained_handle = NULL;
+                module_filename = NULL;
+            } else {
+                queued->handle = NULL;
+                queued->module_token = NULL;
+                queued->state = PEAK_DLOPEN_REQUEST_PIN_FAILED;
+                queued->handle_owned = FALSE;
+                dynamic_attach_drop_noload_count++;
+            }
+            ownership_resolved = TRUE;
+        }
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+        if (ownership_resolved) {
+            peak_general_listener_controller_wake();
+        }
+        g_free(replaced_filename);
+        g_free(module_filename);
+        if (retained_handle != NULL) {
+            dlopen_interceptor_close_ownership_reference(retained_handle);
+        }
+    }
+
+    return NULL;
+}
+
+static gboolean
+dlopen_interceptor_start_ownership_thread(void)
+{
+    gboolean started;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    if (dynamic_attach_ownership_thread_started) {
+        started = dynamic_attach_ownership_thread_running;
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        return started;
+    }
+    dynamic_attach_ownership_thread_running = TRUE;
+    if (pthread_create(&dynamic_attach_ownership_thread,
+                       NULL,
+                       dlopen_interceptor_ownership_thread_main,
+                       NULL) == 0) {
+        dynamic_attach_ownership_thread_started = TRUE;
+        while (!dynamic_attach_ownership_thread_ready) {
+            pthread_cond_wait(&dynamic_attach_gate_cond,
+                              &dynamic_attach_gate_mutex);
+        }
+        started = TRUE;
+    } else {
+        dynamic_attach_ownership_thread_running = FALSE;
+        started = FALSE;
+    }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    return started;
+}
+
+static void
+dlopen_interceptor_stop_ownership_thread(void)
+{
+    pthread_t thread;
+    gboolean should_join;
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    should_join = dynamic_attach_ownership_thread_started;
+    thread = dynamic_attach_ownership_thread;
+    dynamic_attach_ownership_thread_running = FALSE;
+    pthread_cond_broadcast(&dynamic_attach_gate_cond);
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+
+    if (should_join) {
+        pthread_join(thread, NULL);
+    }
+
+    pthread_mutex_lock(&dynamic_attach_gate_mutex);
+    dynamic_attach_ownership_thread_started = FALSE;
+    dynamic_attach_ownership_thread_ready = FALSE;
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+}
+
 static void*
 dlopen_interceptor_release_dynamic_attach_request_metadata(
     PeakDlopenDynamicAttachRequest* request)
 {
     void* handle_to_close = NULL;
 
-    if (request->handle != NULL && !request->handle_retained) {
+    if (request->handle != NULL &&
+        request->handle_owned &&
+        !request->handle_retained) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         if (request->handle != PEAK_DLOPEN_TEST_RETRY_HANDLE)
 #endif
@@ -935,6 +1601,11 @@ dlopen_interceptor_release_dynamic_attach_request_metadata(
     request->binding_flags = 0;
     request->scope = PEAK_DLOPEN_ATTACH_ALL;
     request->module_token = NULL;
+    request->source_handle_token = NULL;
+    request->ownership_ticket = 0;
+    request->state = PEAK_DLOPEN_REQUEST_EMPTY;
+    request->handle_owned = FALSE;
+    request->reference_transferred = FALSE;
     request->handle_retained = FALSE;
     return handle_to_close;
 }
@@ -947,7 +1618,7 @@ dlopen_interceptor_release_dynamic_attach_request(
         dlopen_interceptor_release_dynamic_attach_request_metadata(request);
 
     if (handle_to_close != NULL) {
-        dlclose(handle_to_close);
+        (void)dlopen_interceptor_internal_dlclose(handle_to_close);
     }
 }
 
@@ -977,7 +1648,11 @@ dlopen_interceptor_begin_dynamic_attach_drain(size_t* initial_queue_length)
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN ||
         dynamic_attach_drain_active ||
         active_dlopen_callback_count != 0 ||
-        dynamic_attach_queue_length == 0) {
+        dynamic_attach_queue_length == 0 ||
+        (dynamic_attach_queue[dynamic_attach_queue_head].state !=
+             PEAK_DLOPEN_REQUEST_READY &&
+         dynamic_attach_queue[dynamic_attach_queue_head].state !=
+             PEAK_DLOPEN_REQUEST_PIN_FAILED)) {
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
         return FALSE;
     }
@@ -1013,19 +1688,18 @@ static gboolean
 dlopen_interceptor_pop_dynamic_attach_request(PeakDlopenDynamicAttachRequest* request)
 {
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
-    if (dynamic_attach_queue_length == 0) {
+    if (dynamic_attach_queue_length == 0 ||
+        (dynamic_attach_queue[dynamic_attach_queue_head].state !=
+             PEAK_DLOPEN_REQUEST_READY &&
+         dynamic_attach_queue[dynamic_attach_queue_head].state !=
+             PEAK_DLOPEN_REQUEST_PIN_FAILED)) {
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
         return FALSE;
     }
 
     *request = dynamic_attach_queue[dynamic_attach_queue_head];
-    dynamic_attach_queue[dynamic_attach_queue_head].handle = NULL;
-    dynamic_attach_queue[dynamic_attach_queue_head].filename = NULL;
-    dynamic_attach_queue[dynamic_attach_queue_head].binding_flags = 0;
-    dynamic_attach_queue[dynamic_attach_queue_head].scope =
-        PEAK_DLOPEN_ATTACH_ALL;
-    dynamic_attach_queue[dynamic_attach_queue_head].module_token = NULL;
-    dynamic_attach_queue[dynamic_attach_queue_head].handle_retained = FALSE;
+    dynamic_attach_queue[dynamic_attach_queue_head] =
+        (PeakDlopenDynamicAttachRequest){ 0 };
     dynamic_attach_queue_head =
         (dynamic_attach_queue_head + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
     dynamic_attach_queue_length--;
@@ -1039,7 +1713,8 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
 {
     gboolean requeued = FALSE;
 
-    if (request->handle == NULL) {
+    if (request->handle == NULL || !request->handle_owned ||
+        request->state != PEAK_DLOPEN_REQUEST_READY) {
         return FALSE;
     }
 
@@ -1056,6 +1731,11 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
         request->handle = NULL;
         request->filename = NULL;
         request->module_token = NULL;
+        request->source_handle_token = NULL;
+        request->ownership_ticket = 0;
+        request->state = PEAK_DLOPEN_REQUEST_EMPTY;
+        request->handle_owned = FALSE;
+        request->reference_transferred = FALSE;
         request->handle_retained = FALSE;
         requeued = TRUE;
     } else {
@@ -1076,7 +1756,7 @@ dlopen_interceptor_discard_dynamic_attach_queue(void)
     }
 }
 
-static gboolean
+static uint64_t
 dlopen_interceptor_enqueue_dynamic_attach_request(
     void* application_handle,
     const char* filename,
@@ -1084,61 +1764,69 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
     PeakDlopenAttachScope scope)
 {
 #ifdef RTLD_NOLOAD
-    void* retained_handle;
-    char* module_filename = NULL;
-    gpointer module_token = NULL;
+    char* filename_copy;
+    size_t filename_length;
     PeakDlopenDynamicAttachRequest* queued;
-    gboolean accepted = FALSE;
+    uint64_t ownership_ticket = 0;
 
     if (application_handle == NULL || filename == NULL) {
-        return FALSE;
+        return 0;
     }
+    filename_length = strlen(filename);
+    if (filename_length == G_MAXSIZE) {
+        return 0;
+    }
+    filename_copy = g_try_malloc(filename_length + 1);
+    if (filename_copy == NULL) {
+        return 0;
+    }
+    memcpy(filename_copy, filename, filename_length + 1);
+
     /*
      * The real application dlopen has returned, but its result has not yet
-     * been handed back to the caller. Pin that exact link-map now, while the
-     * application's handle proves both loader namespace and object identity.
-     * The controller must never try to reconstruct this identity later from a
-     * caller-sensitive filename.
+     * been handed back to the caller. Publish only the borrowed result and
+     * copied argument here. The ownership thread will pin and validate this
+     * exact link-map asynchronously; a racing application dlclose transfers
+     * the just-acquired reference instead of waiting for that work.
      */
-    retained_handle =
-        dlopen_interceptor_duplicate_dynamic_handle_reference(
-            application_handle,
-            filename,
-            binding_flags,
-            &module_filename,
-            &module_token);
-    if (retained_handle == NULL) {
-        pthread_mutex_lock(&dynamic_attach_gate_mutex);
-        dynamic_attach_drop_noload_count++;
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-        return FALSE;
-    }
-
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_OPEN) {
         dynamic_attach_drop_closed_count++;
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+    } else if (!dynamic_attach_ownership_thread_started ||
+               !dynamic_attach_ownership_thread_running) {
+        dynamic_attach_drop_closed_count++;
     } else if ((queued = dlopen_interceptor_find_queued_request_unlocked(
-                    module_filename,
-                    module_token)) != NULL) {
+                    filename,
+                    application_handle)) != NULL) {
         dlopen_interceptor_merge_queued_request_unlocked(queued,
                                                          binding_flags,
                                                          scope);
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-        accepted = TRUE;
+        ownership_ticket = queued->ownership_ticket;
     } else if (!dlopen_interceptor_queue_can_accept_unlocked()) {
-        dynamic_attach_drop_full_count++;
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        if (dynamic_attach_queue_length >=
+            PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY) {
+            dynamic_attach_drop_full_count++;
+        } else {
+            dynamic_attach_drop_closed_count++;
+        }
     } else {
         dynamic_attach_queue[dynamic_attach_queue_tail].handle =
-            retained_handle;
+            application_handle;
         dynamic_attach_queue[dynamic_attach_queue_tail].filename =
-            module_filename;
+            filename_copy;
         dynamic_attach_queue[dynamic_attach_queue_tail].binding_flags =
             binding_flags;
         dynamic_attach_queue[dynamic_attach_queue_tail].scope = scope;
-        dynamic_attach_queue[dynamic_attach_queue_tail].module_token =
-            module_token;
+        dynamic_attach_queue[dynamic_attach_queue_tail].module_token = NULL;
+        dynamic_attach_queue[dynamic_attach_queue_tail].source_handle_token =
+            application_handle;
+        ownership_ticket =
+            dlopen_interceptor_next_ownership_ticket_unlocked();
+        dynamic_attach_queue[dynamic_attach_queue_tail].ownership_ticket =
+            ownership_ticket;
+        dynamic_attach_queue[dynamic_attach_queue_tail].state =
+            PEAK_DLOPEN_REQUEST_BORROWED;
+        dynamic_attach_queue[dynamic_attach_queue_tail].handle_owned = FALSE;
         dynamic_attach_queue[dynamic_attach_queue_tail].handle_retained =
             FALSE;
         dynamic_attach_queue_tail =
@@ -1146,34 +1834,25 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
             PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
         dynamic_attach_queue_length++;
         dynamic_attach_enqueue_count++;
+        atomic_fetch_add_explicit(&dynamic_attach_pending_ownership_count,
+                                  1,
+                                  memory_order_release);
         if (dynamic_attach_queue_length > dynamic_attach_queue_max_depth) {
             dynamic_attach_queue_max_depth = dynamic_attach_queue_length;
         }
-        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-        retained_handle = NULL;
-        module_filename = NULL;
-        accepted = TRUE;
+        filename_copy = NULL;
+        pthread_cond_broadcast(&dynamic_attach_gate_cond);
     }
+    pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
-    if (retained_handle != NULL) {
-        peak_general_listener_fast_ignore_current_thread();
-        if (dlopen_interceptor != NULL) {
-            gum_interceptor_ignore_current_thread(dlopen_interceptor);
-        }
-        dlclose(retained_handle);
-        if (dlopen_interceptor != NULL) {
-            gum_interceptor_unignore_current_thread(dlopen_interceptor);
-        }
-        peak_general_listener_fast_unignore_current_thread();
-    }
-    g_free(module_filename);
-    return accepted;
+    g_free(filename_copy);
+    return ownership_ticket;
 #else
     (void)application_handle;
     (void)filename;
     (void)binding_flags;
     (void)scope;
-    return FALSE;
+    return 0;
 #endif
 }
 
@@ -1195,7 +1874,7 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_queue_head = 0;
     dynamic_attach_queue_tail = 0;
     dynamic_attach_queue_length = 0;
-    dynamic_attach_queue_overflow_reported = FALSE;
+    memset(dynamic_attach_queue, 0, sizeof(dynamic_attach_queue));
     dynamic_attach_test_callback_waiting_for_drain = FALSE;
     dynamic_attach_enqueue_count = 0;
     dynamic_attach_drain_count = 0;
@@ -1206,8 +1885,15 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_drop_requeue_count = 0;
     dynamic_attach_partial_success_count = 0;
     dynamic_attach_retained_handle_count = 0;
+    dynamic_attach_next_ownership_ticket = 1;
+    atomic_store_explicit(&dynamic_attach_pending_ownership_count,
+                          0,
+                          memory_order_release);
     dynamic_attach_queue_max_depth = 0;
     atomic_store_explicit(&dlopen_listener_owner_pid,
+                          open ? getpid() : 0,
+                          memory_order_release);
+    atomic_store_explicit(&dlclose_guard_owner_pid,
                           open ? getpid() : 0,
                           memory_order_release);
     retained_handles = dynamic_attach_retained_handles;
@@ -1227,6 +1913,12 @@ dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
     dynamic_attach_test_callback_is_waiting = FALSE;
     dynamic_attach_test_hold_drain = FALSE;
     dynamic_attach_test_drain_is_waiting = FALSE;
+    dynamic_attach_test_hold_ownership = FALSE;
+    dynamic_attach_test_ownership_is_waiting = FALSE;
+    dynamic_attach_test_hold_ownership_pin = FALSE;
+    dynamic_attach_test_ownership_pin_is_waiting = FALSE;
+    dynamic_attach_test_hold_dlclose_guard = FALSE;
+    dynamic_attach_test_dlclose_guard_is_waiting = FALSE;
     pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
     pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
 }
@@ -1269,6 +1961,14 @@ dlopen_interceptor_test_enqueue_dynamic_attach(
         dynamic_attach_queue[dynamic_attach_queue_tail].scope =
             PEAK_DLOPEN_ATTACH_ALL;
         dynamic_attach_queue[dynamic_attach_queue_tail].module_token = NULL;
+        dynamic_attach_queue[dynamic_attach_queue_tail].source_handle_token =
+            NULL;
+        dynamic_attach_queue[dynamic_attach_queue_tail].ownership_ticket =
+            dlopen_interceptor_next_ownership_ticket_unlocked();
+        dynamic_attach_queue[dynamic_attach_queue_tail].state =
+            PEAK_DLOPEN_REQUEST_READY;
+        dynamic_attach_queue[dynamic_attach_queue_tail].handle_owned =
+            handle != NULL;
         dynamic_attach_queue[dynamic_attach_queue_tail].handle_retained =
             FALSE;
         filename_copy = NULL;
@@ -1313,11 +2013,15 @@ dlopen_interceptor_test_enqueue_loaded_dynamic_attach(
     const char* filename,
     void* application_handle)
 {
-    return dlopen_interceptor_enqueue_dynamic_attach_request(
-        application_handle,
-        filename,
-        RTLD_LAZY,
-        PEAK_DLOPEN_ATTACH_ALL);
+    uint64_t ownership_ticket =
+        dlopen_interceptor_enqueue_dynamic_attach_request(
+            application_handle,
+            filename,
+            RTLD_LAZY,
+            PEAK_DLOPEN_ATTACH_ALL);
+
+    return ownership_ticket != 0 &&
+        dlopen_interceptor_wait_for_owned_request(ownership_ticket);
 }
 
 void
@@ -1343,6 +2047,87 @@ dlopen_interceptor_test_hold_dynamic_attach_drain(gboolean hold)
         pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
     }
     pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+}
+
+void
+dlopen_interceptor_test_hold_ownership_broker(gboolean hold)
+{
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    dynamic_attach_test_hold_ownership = hold;
+    if (!hold) {
+        pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+    }
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+}
+
+gboolean
+dlopen_interceptor_test_ownership_broker_waiting(void)
+{
+    gboolean waiting;
+
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    waiting = dynamic_attach_test_ownership_is_waiting;
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+    return waiting;
+}
+
+void
+dlopen_interceptor_test_hold_ownership_pin(gboolean hold)
+{
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    dynamic_attach_test_hold_ownership_pin = hold;
+    if (!hold) {
+        pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+    }
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+}
+
+gboolean
+dlopen_interceptor_test_ownership_pin_waiting(void)
+{
+    gboolean waiting;
+
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    waiting = dynamic_attach_test_ownership_pin_is_waiting;
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+    return waiting;
+}
+
+void
+dlopen_interceptor_test_hold_dlclose_guard(gboolean hold)
+{
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    dynamic_attach_test_hold_dlclose_guard = hold;
+    if (!hold) {
+        pthread_cond_broadcast(&dynamic_attach_test_callback_cond);
+    }
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+}
+
+gboolean
+dlopen_interceptor_test_dlclose_guard_waiting(void)
+{
+    gboolean waiting;
+
+    pthread_mutex_lock(&dynamic_attach_test_callback_mutex);
+    waiting = dynamic_attach_test_dlclose_guard_is_waiting;
+    pthread_mutex_unlock(&dynamic_attach_test_callback_mutex);
+    return waiting;
+}
+
+gboolean
+dlopen_interceptor_test_dlclose_guard_reverting(void)
+{
+    return atomic_load_explicit(&dlclose_guard_route_state,
+                                memory_order_seq_cst) ==
+        PEAK_DLCLOSE_GUARD_REVERTING;
+}
+
+size_t
+dlopen_interceptor_test_pending_ownership_count(void)
+{
+    return atomic_load_explicit(&dynamic_attach_pending_ownership_count,
+                                memory_order_acquire);
 }
 
 gboolean
@@ -1435,7 +2220,9 @@ void
 dlopen_interceptor_test_record_partial_success_with_retained_handle(void)
 {
     PeakDlopenDynamicAttachRequest request = {
-        .handle = PEAK_DLOPEN_TEST_RETAINED_HANDLE
+        .handle = PEAK_DLOPEN_TEST_RETAINED_HANDLE,
+        .state = PEAK_DLOPEN_REQUEST_READY,
+        .handle_owned = TRUE
     };
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
@@ -1799,6 +2586,15 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     if (request->handle == NULL) {
         return PEAK_DLOPEN_ATTACH_DONE;
     }
+    if ((request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY ||
+         request->scope == PEAK_DLOPEN_ATTACH_ALL) &&
+        dlopen_interceptor_fftw_module_scan_completed(
+            request->module_token)) {
+        if (request->scope == PEAK_DLOPEN_ATTACH_FFTW_ONLY) {
+            return PEAK_DLOPEN_ATTACH_DONE;
+        }
+        request->scope = PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY;
+    }
 
     peak_general_listener_controller_lock();
     if (interceptor == NULL ||
@@ -2119,7 +2915,7 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
      * initiated by application destructors.
      */
     for (size_t i = 0; i < close_count; i++) {
-        dlclose(handles_to_close[i]);
+        (void)dlopen_interceptor_internal_dlclose(handles_to_close[i]);
     }
 }
 
@@ -2149,8 +2945,17 @@ dlopen_interceptor_enable_dynamic_attach(void)
     if (dynamic_attach_state != PEAK_DLOPEN_CONTROLLER_SHUTTING_DOWN &&
         dlopen_interceptor != NULL &&
         dlopen_hook_address != NULL &&
-        dlopen_listener != NULL) {
+        dlopen_listener != NULL &&
+        dlopen_listener_attached &&
+        dlclose_hook_address != NULL &&
+        original_dlclose != NULL &&
+        dlclose_guard_replaced &&
+        dynamic_attach_ownership_thread_started &&
+        dynamic_attach_ownership_thread_running) {
         atomic_store_explicit(&dlopen_listener_owner_pid,
+                              getpid(),
+                              memory_order_release);
+        atomic_store_explicit(&dlclose_guard_owner_pid,
                               getpid(),
                               memory_order_release);
         dynamic_attach_state = PEAK_DLOPEN_CONTROLLER_OPEN;
@@ -2180,7 +2985,16 @@ dlopen_interceptor_shutdown_dynamic_attach(void)
         dlopen_interceptor_trace_counters("shutdown-callback-timeout");
         return FALSE;
     }
+    if (!dlopen_interceptor_wait_for_pending_ownership_idle()) {
+        g_printerr("[peak] dlopen ownership handoff timed out; leaving loader support hooks alive\n");
+        dlopen_interceptor_trace_counters("shutdown-ownership-timeout");
+        return FALSE;
+    }
 
+    atomic_store_explicit(&dlclose_guard_owner_pid,
+                          0,
+                          memory_order_release);
+    dlopen_interceptor_stop_ownership_thread();
     dlopen_interceptor_discard_dynamic_attach_queue();
     dlopen_interceptor_trace_counters("shutdown");
     return TRUE;
@@ -2235,6 +3049,12 @@ dlopen_interceptor_test_shutdown_dynamic_attach(void)
 {
     return dlopen_interceptor_shutdown_dynamic_attach();
 }
+
+gboolean
+dlopen_interceptor_test_dettach(void)
+{
+    return dlopen_interceptor_dettach();
+}
 #endif
 
 static void
@@ -2278,7 +3098,7 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
     PeakDlopenInvocationData* invocation =
         GUM_IC_GET_INVOCATION_DATA(context, PeakDlopenInvocationData);
     void* handle = gum_invocation_context_get_return_value(context);
-    gboolean enqueued = FALSE;
+    uint64_t ownership_ticket = 0;
 
     (void)user_data;
     if (!invocation->callback_admitted) {
@@ -2294,45 +3114,25 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
             dlopen_interceptor_unresolved_counts();
         PeakDlopenAttachScope scope = PEAK_DLOPEN_ATTACH_ALL;
 
-        if (unresolved.fftw > 0 &&
-            dlopen_interceptor_fftw_module_scan_completed(handle)) {
-            unresolved.fftw = 0;
-        }
         if (unresolved.fftw == 0 && unresolved.non_fftw > 0) {
             scope = PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY;
         }
         if (unresolved.fftw > 0 || unresolved.non_fftw > 0) {
             /*
-             * The real dlopen has returned and released the loader lock, while
-             * the application still cannot dlclose its result. Acquire only a
-             * same-namespace ownership reference here. Symbol lookup and every
-             * Gum mutation remain deferred to the controller.
+             * Publish a borrowed handoff. The ownership thread pins it
+             * asynchronously; a racing application dlclose transfers its
+             * existing reference without waiting. No dynamic-loader API is
+             * reachable from this Gum callback.
              */
-            enqueued = dlopen_interceptor_enqueue_dynamic_attach_request(
-                handle,
-                invocation->filename,
-                invocation->binding_flags,
-                scope);
+            ownership_ticket =
+                dlopen_interceptor_enqueue_dynamic_attach_request(
+                    handle,
+                    invocation->filename,
+                    invocation->binding_flags,
+                    scope);
         }
 
-        if (!enqueued &&
-            (unresolved.fftw > 0 || unresolved.non_fftw > 0)) {
-            gboolean should_report_overflow = FALSE;
-
-            pthread_mutex_lock(&dynamic_attach_gate_mutex);
-            if (dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN &&
-                dynamic_attach_queue_length >=
-                    PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY &&
-                !dynamic_attach_queue_overflow_reported) {
-                dynamic_attach_queue_overflow_reported = TRUE;
-                should_report_overflow = TRUE;
-            }
-            pthread_mutex_unlock(&dynamic_attach_gate_mutex);
-
-            if (should_report_overflow) {
-                g_printerr("[peak] dlopen dynamic attach queue full; dropping later dynamic attach requests\n");
-            }
-        }
+        (void)ownership_ticket;
     }
 
     invocation->filename = NULL;
@@ -2351,13 +3151,20 @@ dlopen_interceptor_on_leave(GumInvocationContext* context, gpointer user_data)
 int dlopen_interceptor_attach()
 {
     GumAttachReturn attach_status = GUM_ATTACH_WRONG_SIGNATURE;
+    GumReplaceReturn replace_status = GUM_REPLACE_WRONG_SIGNATURE;
     gboolean startup_attach_can_skip_stop;
     dlopen_interceptor_init_runtime_config();
     dlopen_interceptor = gum_interceptor_obtain();
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
+    dlclose_hook_address = peak_general_listener_find_function("dlclose");
+    restored_dlclose = (PeakDlcloseFunction)dlclose_hook_address;
     dlopen_interceptor_initialize_fftw_target_scope();
 
-    if (dlopen_hook_address == NULL) {
+    if (dlopen_hook_address == NULL || dlclose_hook_address == NULL) {
+        g_object_unref(dlopen_interceptor);
+        dlopen_interceptor = NULL;
+        dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
         dlopen_interceptor_reset_fftw_target_scope();
         return attach_status;
     }
@@ -2367,6 +3174,18 @@ int dlopen_interceptor_attach()
         g_object_unref(dlopen_interceptor);
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
+        dlopen_interceptor_reset_fftw_target_scope();
+        return attach_status;
+    }
+    if (!peak_general_listener_support_attach_target_is_supported(
+            "dlclose",
+            dlclose_hook_address)) {
+        g_printerr("[peak] skipping dynamic loader listener: unsupported dlclose target prologue\n");
+        g_object_unref(dlopen_interceptor);
+        dlopen_interceptor = NULL;
+        dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
         dlopen_interceptor_reset_fftw_target_scope();
         return attach_status;
     }
@@ -2379,9 +3198,12 @@ int dlopen_interceptor_attach()
         g_object_unref(dlopen_interceptor);
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
         dlopen_interceptor_reset_fftw_target_scope();
         return attach_status;
     }
+    startup_attach_can_skip_stop =
+        peak_general_listener_startup_attach_can_skip_stop();
 
     PeakDetachRequest mutation_request = {
         .hook_id = 0,
@@ -2398,8 +3220,6 @@ int dlopen_interceptor_attach()
      * starting one helper per MPI rank. Runtime dynamic target mutations still
      * use the controller protocol after peer threads exist.
      */
-    startup_attach_can_skip_stop =
-        peak_general_listener_startup_attach_can_skip_stop();
     peak_gum_module_mutation_begin();
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_prepare_hook_mutation(&mutation_request,
@@ -2411,6 +3231,7 @@ int dlopen_interceptor_attach()
         dlopen_listener = NULL;
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
         dlopen_interceptor_reset_fftw_target_scope();
         peak_gum_module_mutation_end();
         return attach_status;
@@ -2435,12 +3256,126 @@ int dlopen_interceptor_attach()
         dlopen_listener = NULL;
         dlopen_interceptor = NULL;
         dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
+        original_dlclose = NULL;
         atomic_store_explicit(&dlopen_listener_owner_pid,
                               0,
                               memory_order_release);
         dlopen_interceptor_reset_fftw_target_scope();
+        return attach_status;
     }
-    return attach_status;
+    dlopen_listener_attached = TRUE;
+
+    PeakDetachRequest replace_request = {
+        .hook_id = 0,
+        .symbol_name = "dlclose",
+        .function_address = dlclose_hook_address,
+        .interceptor = dlopen_interceptor,
+        .listener = NULL,
+        .operation = PEAK_DETACH_OPERATION_REPLACE
+    };
+    detach_status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_prepare_hook_mutation(&replace_request,
+                                                      &detach_status)) {
+        g_printerr("[peak] unable to install dlclose ownership guard: %s\n",
+                   peak_detach_controller_status_string(detach_status));
+        peak_gum_module_mutation_end();
+        goto rollback_dlopen_listener;
+    }
+    gum_interceptor_begin_transaction(dlopen_interceptor);
+    replace_status =
+        gum_interceptor_replace_fast(
+            dlopen_interceptor,
+            dlclose_hook_address,
+            (gpointer)&dlopen_interceptor_guarded_dlclose,
+            (gpointer*)&original_dlclose,
+            NULL);
+    gum_interceptor_end_transaction(dlopen_interceptor);
+    if (!startup_attach_can_skip_stop &&
+        !peak_detach_controller_finish_hook_mutation(&replace_request,
+                                                     &detach_status)) {
+        peak_detach_controller_abort_after_failed_finish(
+            "dlclose replace finish",
+            detach_status);
+    }
+    peak_gum_module_mutation_end();
+    if (replace_status == GUM_REPLACE_OK) {
+        dlclose_guard_replaced = TRUE;
+        atomic_store_explicit(&dlclose_guard_install_pid,
+                              getpid(),
+                              memory_order_release);
+        atomic_store_explicit(&dlclose_guard_route_state,
+                              PEAK_DLCLOSE_GUARD_ROUTED,
+                              memory_order_seq_cst);
+        /*
+         * Preserve the startup single-thread proof through both Gum
+         * mutations. The broker is started only after the entry patches are
+         * fully published and remains unreachable until admission opens.
+         */
+        if (dlopen_interceptor_start_ownership_thread()) {
+            return attach_status;
+        }
+        g_printerr("[peak] unable to start dlopen ownership broker\n");
+        goto rollback_dlclose_guard;
+    }
+
+    g_printerr("[peak] unable to install dlclose ownership guard, status=%d\n",
+               replace_status);
+    goto rollback_dlopen_listener;
+
+rollback_dlclose_guard:
+    replace_request.operation = PEAK_DETACH_OPERATION_REVERT;
+    detach_status = PEAK_DETACH_STATUS_ERROR;
+    if (!dlopen_interceptor_revert_dlclose_guard(
+            &replace_request,
+            startup_attach_can_skip_stop,
+            "dlclose rollback finish",
+            &detach_status)) {
+        g_printerr("[peak] dlclose ownership guard rollback was not proven safe: %s\n",
+                   peak_detach_controller_status_string(detach_status));
+        return GUM_ATTACH_WRONG_SIGNATURE;
+    }
+
+rollback_dlopen_listener:
+    mutation_request.operation = PEAK_DETACH_OPERATION_SHUTDOWN;
+    detach_status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
+    if (startup_attach_can_skip_stop ||
+        dlopen_interceptor_prepare_hook_mutation_with_retry(
+            &mutation_request,
+            &detach_status)) {
+        gum_interceptor_begin_transaction(dlopen_interceptor);
+        gum_interceptor_detach(dlopen_interceptor, dlopen_listener);
+        gum_interceptor_end_transaction(dlopen_interceptor);
+        if (!startup_attach_can_skip_stop &&
+            !peak_detach_controller_finish_hook_mutation(&mutation_request,
+                                                         &detach_status)) {
+            peak_detach_controller_abort_after_failed_finish(
+                "dlopen rollback finish",
+                detach_status);
+        }
+        peak_gum_module_mutation_end();
+        dlopen_listener_attached = FALSE;
+        if (!dlopen_interceptor_flush_teardown()) {
+            g_printerr("[peak] dlopen listener rollback did not flush; preserving Gum state\n");
+            return GUM_ATTACH_WRONG_SIGNATURE;
+        }
+        g_object_unref(dlopen_listener);
+        g_object_unref(dlopen_interceptor);
+        dlopen_listener = NULL;
+        dlopen_interceptor = NULL;
+        dlopen_hook_address = NULL;
+        dlclose_hook_address = NULL;
+        original_dlclose = NULL;
+        dlopen_interceptor_reset_fftw_target_scope();
+    } else {
+        g_printerr("[peak] dlopen listener rollback was not proven safe: %s\n",
+                   peak_detach_controller_status_string(detach_status));
+        peak_gum_module_mutation_end();
+    }
+    return GUM_ATTACH_WRONG_SIGNATURE;
 }
 
 gboolean dlopen_interceptor_dettach()
@@ -2452,7 +3387,8 @@ gboolean dlopen_interceptor_dettach()
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
     if (dlopen_interceptor != NULL &&
         dlopen_hook_address != NULL &&
-        dlopen_listener != NULL) {
+        dlopen_listener != NULL &&
+        dlopen_listener_attached) {
         PeakDetachRequest mutation_request = {
             .hook_id = 0,
             .symbol_name = "dlopen",
@@ -2481,10 +3417,36 @@ gboolean dlopen_interceptor_dettach()
                                                             detach_status);
         }
         peak_gum_module_mutation_end();
+        dlopen_listener_attached = FALSE;
     }
 
     if (!dlopen_interceptor_shutdown_dynamic_attach()) {
         return FALSE;
+    }
+
+    if (dlopen_interceptor != NULL &&
+        dlclose_hook_address != NULL &&
+        original_dlclose != NULL &&
+        dlclose_guard_replaced) {
+        PeakDetachRequest revert_request = {
+            .hook_id = 0,
+            .symbol_name = "dlclose",
+            .function_address = dlclose_hook_address,
+            .interceptor = dlopen_interceptor,
+            .listener = NULL,
+            .operation = PEAK_DETACH_OPERATION_REVERT
+        };
+        PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
+
+        if (!dlopen_interceptor_revert_dlclose_guard(
+                &revert_request,
+                FALSE,
+                "dlclose revert finish",
+                &detach_status)) {
+            g_printerr("[peak] skipping dlclose ownership guard revert: %s\n",
+                       peak_detach_controller_status_string(detach_status));
+            return FALSE;
+        }
     }
 
     if (!dlopen_interceptor_flush_teardown()) {
@@ -2503,13 +3465,22 @@ gboolean dlopen_interceptor_dettach()
     dynamic_attach_queue_head = 0;
     dynamic_attach_queue_tail = 0;
     dynamic_attach_queue_length = 0;
-    dynamic_attach_queue_overflow_reported = FALSE;
     pthread_mutex_unlock(&dynamic_attach_gate_mutex);
 
     dlopen_interceptor = NULL;
     dlopen_listener = NULL;
     dlopen_hook_address = NULL;
+    dlclose_hook_address = NULL;
+    original_dlclose = NULL;
+    dlopen_listener_attached = FALSE;
+    dlclose_guard_replaced = FALSE;
     atomic_store_explicit(&dlopen_listener_owner_pid,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&dlclose_guard_owner_pid,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&dynamic_attach_pending_ownership_count,
                           0,
                           memory_order_release);
     dlopen_interceptor_reset_fftw_target_scope();

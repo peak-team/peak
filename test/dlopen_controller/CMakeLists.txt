@@ -79,6 +79,33 @@ if(PEAK_GUM_PEAK_API_AVAILABLE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
             ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
             FAIL_REGULAR_EXPRESSION "not ok -"
             TIMEOUT 60)
+
+    add_test(NAME test_dlopen_fork_pending_dlclose
+        COMMAND $<TARGET_FILE:test_dlopen_loader_ownership> fork)
+    set_tests_properties(test_dlopen_fork_pending_dlclose
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "dlopen_loader_fork_pending_close_ok"
+            FAIL_REGULAR_EXPRESSION "not ok -"
+            TIMEOUT 30)
+
+    add_test(NAME test_dlopen_shutdown_pending_transfer
+        COMMAND $<TARGET_FILE:test_dlopen_loader_ownership> shutdown)
+    set_tests_properties(test_dlopen_shutdown_pending_transfer
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "dlopen_loader_shutdown_pending_transfer_ok"
+            FAIL_REGULAR_EXPRESSION "not ok -"
+            TIMEOUT 30)
+
+    add_test(NAME test_dlopen_guard_revert_lifetime
+        COMMAND $<TARGET_FILE:test_dlopen_loader_ownership> guard-revert)
+    set_tests_properties(test_dlopen_guard_revert_lifetime
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "dlopen_loader_guard_revert_lifetime_ok"
+            FAIL_REGULAR_EXPRESSION "not ok -"
+            TIMEOUT 30)
 endif()
 
 if(PEAK_GUM_PEAK_API_AVAILABLE)

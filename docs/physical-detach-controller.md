@@ -71,12 +71,12 @@ outside the code and state being mutated.
    apply to detach, reattach, dynamic/JIT attach, or shutdown. The controller
    thread owns steady-state detach/reattach transitions, queued dynamic and JIT
    attaches, and deferred destruction. The
-   synchronous FFTW `dlopen` path is an intentional execution-context
-   exception, but not a guard exception: the application callback thread
-   performs its initial ATTACH while holding the same mutation guard and
-   general-listener publication lock. It
+   deferred `dlopen` path does not add a mutation owner: its callback only
+   publishes borrowed work, its ownership thread only obtains exact module
+   references, and the controller performs every resulting target ATTACH. It
    does not introduce another detach/reattach state machine. `dlopen` listener
-   attach and detach also go through the controller guard. JIT metadata
+   attach, `dlclose` ownership-guard replace/revert, and loader-hook teardown
+   also go through the controller guard. JIT metadata
    providers publish only name/address/size candidates; the controller thread
    performs any resulting Gum attach. Process-lifetime support hooks are
    allowed to use direct Gum calls only when they cannot overlap an active
@@ -108,8 +108,7 @@ outside the code and state being mutated.
 
 The controller thread owns steady-state target lifecycle and queued attach
 work. The controller API and strict mutation guard remain the serialization
-authority for the synchronous FFTW before-return exception. The controller
-thread owns:
+authority for every runtime target mutation. The controller thread owns:
 
 - steady-state detach/reattach hook-state transitions;
 - Gum transactions for controller-thread work;
@@ -848,8 +847,10 @@ Runtime target discovery is documented separately in
 invariants are:
 
 - the real loader call is observed, not replaced;
-- synchronous FFTW and queued dynamic attaches both use the existing guarded
-  ATTACH operation and publish metadata only after successful release;
+- every deferred dynamic target uses the existing guarded ATTACH operation and
+  publishes metadata only after successful release;
+- the `dlopen` callback calls no loader API; exact same-namespace ownership is
+  resolved asynchronously or by a nonblocking `dlclose` reference transfer;
 - target detach/reattach work is serviced before the separate bounded dynamic
   queue, so loader activity cannot change or starve the lifecycle state
   machine;
@@ -898,9 +899,10 @@ the original sequence. Initial attach, runtime attach, and reattach all select
 the same option. Both the exported branch and computed PLT destination are read
 with Gum's safe memory API and integer overflow checks; an unreadable, partially
 unreadable cross-page, or malformed destination keeps the default relocation policy.
-Other Arm64 targets retain Gum's default relocation policy. This exception
-provides first-call visibility, but does not claim that every Arm64 loader thunk
-is attributed at the exact four-byte exported-wrapper boundary.
+Other Arm64 targets retain Gum's default relocation policy. Once the deferred
+attach completes, this exception provides exact exported-wrapper attribution;
+it does not claim that every Arm64 loader thunk is attributed at its four-byte
+wrapper boundary.
 
 PEAK's optional `close` support replacement is skipped on Linux x86 when Gum's
 symbol ranges show `close` and `__close_nocancel` overlapping in either
