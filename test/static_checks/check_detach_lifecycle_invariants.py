@@ -145,6 +145,12 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     enqueue = extract_function(
         source, "dlopen_interceptor_enqueue_dynamic_attach_request"
     )
+    duplicate_handle = extract_function(
+        source, "dlopen_interceptor_duplicate_dynamic_handle_reference"
+    )
+    loaded_identity = extract_function(
+        source, "dlopen_interceptor_loaded_module_identity"
+    )
     requeue = extract_function(
         source, "dlopen_interceptor_requeue_dynamic_attach_request"
     )
@@ -187,7 +193,7 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
     for loader_api in ("dlopen", "dlclose", "dlsym", "dlerror", "dlinfo"):
         require(re.search(rf"\b{loader_api}\s*\(", on_enter) is None and
                 re.search(rf"\b{loader_api}\s*\(", on_leave) is None,
-                f"dlopen callbacks must not call loader API {loader_api}")
+                f"dlopen callbacks must keep direct loader API {loader_api} calls in the owned-handle enqueue helper")
     require("dlerror(" not in attach,
             "controller symbol misses must remain conservative without dlerror/gettext")
     require(unresolved_counts.count("atomic_load_explicit(") == 2 and
@@ -213,11 +219,22 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "pthread_cond_wait(&dynamic_attach_gate_cond" in begin_callback and
             "pthread_cond_broadcast(&dynamic_attach_gate_cond)" in end_drain,
             "callback admission and controller drain must form a two-way barrier")
-    require(".acquire_handle_after_callback = TRUE" in enqueue and
-            "dlopen_interceptor_open_unobserved(" not in enqueue and
-            "request.acquire_handle_after_callback" in drain and
-            "dlopen_interceptor_open_unobserved(" in drain,
-            "callback enqueue must defer RTLD_NOLOAD ownership to the controller")
+    require("application_handle" in enqueue and
+            "dlopen_interceptor_duplicate_dynamic_handle_reference(" in enqueue and
+            "module_token" in enqueue and
+            "dlmopen((Lmid_t)namespace_id" in duplicate_handle and
+            "RTLD_DI_LMID" in loaded_identity and
+            "retained_token != module_token" in duplicate_handle and
+            re.search(r"\b(dlopen|dlmopen)\s*\(", drain) is None,
+            "callback enqueue must pin the exact loader namespace and the controller drain must never reopen by filename")
+    drain_release = drain.find(
+        "dlopen_interceptor_release_dynamic_attach_request_metadata("
+    )
+    drain_end = drain.find("dlopen_interceptor_end_dynamic_attach_drain();")
+    drain_close = drain.find("dlclose(handles_to_close[i]);")
+    require(drain_release != -1 and drain_end != -1 and drain_close != -1 and
+            drain_release < drain_end < drain_close,
+            "queue-owned handles must be closed only after the controller reopens callback admission")
 
     pid_check = on_enter.find("dlopen_interceptor_callback_is_admitted()")
     cancel_disable = on_enter.find("pthread_setcancelstate(PTHREAD_CANCEL_DISABLE")
@@ -236,9 +253,9 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "peak_hook_address_count == target_count" in attach and
             "resolved_targets[i].address != NULL" in attach and
             "dlopen_interceptor_target_is_unresolved_unlocked(i)" in attach and
-            "completed_fftw_scan && filename != NULL" in retain_handle and
-            "g_hash_table_add(dlopen_completed_fftw_filenames" in retain_handle,
-            "FFTW filename cache publication must require a complete scan and a retained handle")
+            "completed_fftw_scan && request->module_token != NULL" in retain_handle and
+            "g_hash_table_add(dlopen_completed_fftw_modules" in retain_handle,
+            "FFTW module cache publication must require a complete scan and a retained exact module")
     require("atomic_load_explicit(&dlopen_listener_owner_pid" in admission and
             "getpid() == owner" in admission and
             "pthread_mutex" not in admission and "g_" not in admission,

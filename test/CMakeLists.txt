@@ -1621,15 +1621,15 @@ if(BUILD_TESTING)
                 TIMEOUT 30
         )
 
-        add_test(NAME test_dlopen_deferred_noload_drop
+        add_test(NAME test_dlopen_queue_owned_reference
             COMMAND $<TARGET_FILE:test_fftw_runtime_dlopen>
                     $<TARGET_FILE:test_fftw_runtime_provider>
                     close
         )
-        set_tests_properties(test_dlopen_deferred_noload_drop
+        set_tests_properties(test_dlopen_queue_owned_reference
             PROPERTIES
                 ENVIRONMENT "PEAK_TARGET=peak_runtime_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
-                PASS_REGULAR_EXPRESSION "fftw_runtime_dlopen_ok mode=close deferred_noload_drop=1"
+                PASS_REGULAR_EXPRESSION "fftw_runtime_dlopen_ok mode=close queue_owned_reference=1"
                 TIMEOUT 30
         )
 

@@ -133,14 +133,14 @@ main(int argc, char** argv)
         get_diagnostics(&after);
         if (after.enqueued != before.enqueued + 1 ||
             after.drained != before.drained + 1 ||
-            after.dropped_noload != before.dropped_noload + 1 ||
+            after.dropped_noload != before.dropped_noload ||
             after.queue_length != 0) {
-            fputs("immediate dlclose did not fail safe at RTLD_NOLOAD\n",
+            fputs("queue-owned module reference did not survive immediate dlclose\n",
                   stderr);
             return EXIT_FAILURE;
         }
         set_manual_drain(0);
-        puts("fftw_runtime_dlopen_ok mode=close deferred_noload_drop=1");
+        puts("fftw_runtime_dlopen_ok mode=close queue_owned_reference=1");
         return EXIT_SUCCESS;
     }
 
