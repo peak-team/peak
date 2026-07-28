@@ -21,7 +21,7 @@ typedef GumPeakFastEnterResult (* GumPeakFastEnterFunc)(
     gpointer function_context,
     gpointer stack_address,
     gpointer caller_return_address,
-    guint gum_stack_depth);
+    guint* gum_stack_depth);
 typedef gboolean (* GumPeakFastLeaveFunc)(
     gpointer user_data,
     gpointer function_context,

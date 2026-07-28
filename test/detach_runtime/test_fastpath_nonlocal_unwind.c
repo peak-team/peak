@@ -10,6 +10,7 @@
 
 static _Thread_local jmp_buf unwind_target;
 static _Thread_local jmp_buf recursive_unwind_target;
+static _Thread_local jmp_buf escape_target;
 static atomic_ulong target_sink;
 static atomic_ulong mixed_listener_enters;
 static atomic_ulong mixed_listener_leaves;
@@ -20,8 +21,11 @@ uintptr_t
 peak_fastpath_unwind_inner(uintptr_t unwind)
 {
     atomic_fetch_add_explicit(&target_sink, 1, memory_order_relaxed);
-    if (unwind != 0) {
+    if (unwind == 1) {
         longjmp(unwind_target, 1);
+    }
+    if (unwind == 2) {
+        longjmp(escape_target, 1);
     }
     return unwind + 1;
 }
@@ -40,6 +44,14 @@ peak_fastpath_unwind_outer(uintptr_t unwind)
     }
     atomic_fetch_add_explicit(&target_sink, result, memory_order_relaxed);
     return result;
+}
+
+__attribute__((noinline, noclone, used, externally_visible,
+               visibility("default")))
+uintptr_t
+peak_fastpath_unwind_escape_outer(uintptr_t unwind)
+{
+    return peak_fastpath_unwind_inner(unwind) + 1;
 }
 
 __attribute__((noinline, noclone, used, externally_visible,
@@ -153,6 +165,7 @@ require_fast_dispatch(void)
         required_symbol("peak_fastpath_unwind_outer"),
         required_symbol("peak_fastpath_unwind_inner"),
         required_symbol("peak_fastpath_unwind_recursive"),
+        required_symbol("peak_fastpath_unwind_escape_outer"),
     };
 
     if (interceptor == NULL || listeners == NULL || addresses == NULL ||
@@ -196,7 +209,9 @@ main(void)
     if (peak_fastpath_unwind_outer(0) != 1 ||
         peak_fastpath_unwind_outer(0) != 1 ||
         peak_fastpath_unwind_recursive(2, 0) != 3 ||
-        peak_fastpath_unwind_recursive(2, 0) != 3) {
+        peak_fastpath_unwind_recursive(2, 0) != 3 ||
+        peak_fastpath_unwind_escape_outer(0) != 2 ||
+        peak_fastpath_unwind_escape_outer(0) != 2) {
         fputs("fastpath unwind warm-up failed\n", stderr);
         return 1;
     }
@@ -224,14 +239,29 @@ main(void)
         }
     }
 
+    /*
+     * Escape both the generic inner and the direct outer. The next direct
+     * entry must clean both stale PEAK entries and restore Gum's generic
+     * invocation stack before starting its own frame.
+     */
+    if (setjmp(escape_target) == 0) {
+        (void)peak_fastpath_unwind_escape_outer(2);
+        fputs("escape-all unwind unexpectedly returned\n", stderr);
+        return 1;
+    }
+    if (peak_fastpath_unwind_escape_outer(0) != 2) {
+        fputs("escape-all recovery direct call failed\n", stderr);
+        return 1;
+    }
+
     if (atomic_load_explicit(&target_sink, memory_order_relaxed) == 0) {
         fputs("fastpath unwind target was not executed\n", stderr);
         return 1;
     }
     if (atomic_load_explicit(&mixed_listener_enters,
-                             memory_order_relaxed) != 2000 ||
+                             memory_order_relaxed) != 2002 ||
         atomic_load_explicit(&mixed_listener_leaves,
-                             memory_order_relaxed) != 1000) {
+                             memory_order_relaxed) != 1001) {
         fprintf(stderr,
                 "mixed listener count mismatch: enters=%lu leaves=%lu\n",
                 atomic_load_explicit(&mixed_listener_enters,
