@@ -88,7 +88,12 @@ typedef struct _GumPeakFastListener {
     volatile gint release_required;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 7u
+#define GUM_PEAK_FAST_LISTENER_VERSION 8u
+
+GUM_API gboolean gum_interceptor_peak_invocation_stack_entry_matches(
+    guint depth,
+    gpointer function_address,
+    gpointer stack_address);
 
 GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
     GumInterceptor * interceptor,

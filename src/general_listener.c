@@ -1262,6 +1262,14 @@ peak_general_listener_release_current_thread_state(void)
     }
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API gulong
+peak_general_listener_test_current_invocation_level(void)
+{
+    return thread_data.initialized ? thread_data.level : 0;
+}
+#endif
+
 static void
 peak_general_listener_thread_state_key_create(void)
 {
@@ -5714,6 +5722,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         peak_general_listener_push_invocation(priv);
     priv->stack_level = thread_data.level;
     entry->listener = self;
+    entry->function_context = ic->function;
     entry->stack_address =
         peak_general_listener_invocation_stack_address(ic);
     entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
@@ -5810,9 +5819,17 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address)
     while (thread_data.level > 0) {
         PeakGeneralInvocationEntry* entry =
             &thread_data.entries[thread_data.level - 1];
-        if (entry->stack_address == NULL ||
-            (guint8*)entry->stack_address >=
-                (guint8*)stack_address) {
+        if (entry->fast_dispatch) {
+            if (entry->stack_address == NULL ||
+                (guint8*)entry->stack_address >=
+                    (guint8*)stack_address) {
+                break;
+            }
+        } else if (
+            gum_interceptor_peak_invocation_stack_entry_matches(
+                entry->gum_stack_depth,
+                entry->function_context,
+                entry->stack_address)) {
             break;
         }
 
