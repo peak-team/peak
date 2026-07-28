@@ -7,21 +7,33 @@
 #include <link.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 typedef void* (*DlopenFunction)(const char*, int);
 typedef void* (*DlmopenFunction)(Lmid_t, const char*, int);
+typedef int (*DlinfoFunction)(void*, int, void*);
 typedef void (*SetManualDrainFunction)(gboolean);
 typedef void (*DrainFunction)(void);
 typedef void (*GetDiagnosticsFunction)(
     PeakDlopenDynamicAttachDiagnostics*);
 typedef gboolean (*EnqueueLoadedFunction)(const char*, void*);
-typedef gboolean (*BeginCallbackFunction)(void);
-typedef void (*EndCallbackFunction)(void);
+typedef void (*HoldOwnershipBrokerFunction)(gboolean);
+typedef gboolean (*OwnershipBrokerWaitingFunction)(void);
+typedef void (*HoldOwnershipPinFunction)(gboolean);
+typedef gboolean (*OwnershipPinWaitingFunction)(void);
+typedef size_t (*PendingOwnershipCountFunction)(void);
+typedef gboolean (*ShutdownDynamicAttachFunction)(void);
+typedef gboolean (*CallbackIsAdmittedFunction)(void);
+typedef gboolean (*DetachDlopenInterceptorFunction)(void);
+typedef void (*HoldDlcloseGuardFunction)(gboolean);
+typedef gboolean (*DlcloseGuardStateFunction)(void);
 
 typedef enum {
     LOADER_PHASE_IDLE = 0,
@@ -35,37 +47,60 @@ typedef struct {
     DrainFunction drain;
     GetDiagnosticsFunction get_diagnostics;
     EnqueueLoadedFunction enqueue_loaded;
-    BeginCallbackFunction begin_callback;
-    EndCallbackFunction end_callback;
+    HoldOwnershipBrokerFunction hold_ownership_broker;
+    OwnershipBrokerWaitingFunction ownership_broker_waiting;
+    HoldOwnershipPinFunction hold_ownership_pin;
+    OwnershipPinWaitingFunction ownership_pin_waiting;
+    PendingOwnershipCountFunction pending_ownership_count;
+    ShutdownDynamicAttachFunction shutdown_dynamic_attach;
+    CallbackIsAdmittedFunction callback_is_admitted;
+    DetachDlopenInterceptorFunction detach_dlopen_interceptor;
+    HoldDlcloseGuardFunction hold_dlclose_guard;
+    DlcloseGuardStateFunction dlclose_guard_waiting;
+    DlcloseGuardStateFunction dlclose_guard_reverting;
 } PeakTestHooks;
 
 typedef struct {
     const char* module_path;
     unsigned int iterations;
-    EnqueueLoadedFunction enqueue_loaded;
     atomic_int* start;
     atomic_int* remaining;
     atomic_int* failures;
 } StressWorkerArgs;
 
+typedef struct {
+    ShutdownDynamicAttachFunction shutdown_dynamic_attach;
+    gboolean result;
+} ShutdownThreadArgs;
+
+typedef struct {
+    void* handle;
+    int result;
+} CloseThreadArgs;
+
+typedef struct {
+    DetachDlopenInterceptorFunction detach_dlopen_interceptor;
+    gboolean result;
+} DetachThreadArgs;
+
 static pthread_once_t real_loader_once = PTHREAD_ONCE_INIT;
 static DlopenFunction real_dlopen_function;
 static DlmopenFunction real_dlmopen_function;
+static DlinfoFunction real_dlinfo_function;
 static _Thread_local LoaderPhase loader_phase = LOADER_PHASE_IDLE;
 static atomic_ullong callback_loader_calls;
 static atomic_ullong callback_noload_calls;
 static atomic_ullong drain_loader_calls;
 static atomic_ullong drain_noload_calls;
+static atomic_ullong broker_noload_calls;
+static atomic_ullong callback_dlinfo_calls;
+static atomic_ullong broker_dlinfo_calls;
 static atomic_ullong destructor_loader_calls;
 static atomic_ullong destructor_noload_calls;
 static atomic_uint destructor_loader_enabled;
 static atomic_uint destructor_loader_successes;
-static atomic_uint destructor_enqueue_successes;
 static atomic_uint fixture_loads;
 static atomic_uint fixture_unloads;
-static EnqueueLoadedFunction destructor_enqueue_loaded;
-static BeginCallbackFunction destructor_begin_callback;
-static EndCallbackFunction destructor_end_callback;
 static int failures;
 
 static void
@@ -93,6 +128,11 @@ resolve_real_loader_functions(void)
     copy_function_pointer(symbol,
                           &real_dlmopen_function,
                           sizeof(real_dlmopen_function));
+    dlerror();
+    symbol = dlsym(RTLD_NEXT, "dlinfo");
+    copy_function_pointer(symbol,
+                          &real_dlinfo_function,
+                          sizeof(real_dlinfo_function));
 }
 
 static void
@@ -125,6 +165,10 @@ record_loader_call(int flags)
                                       1,
                                       memory_order_relaxed);
         }
+    } else if ((flags & RTLD_NOLOAD) != 0) {
+        atomic_fetch_add_explicit(&broker_noload_calls,
+                                  1,
+                                  memory_order_relaxed);
     }
 }
 
@@ -167,6 +211,27 @@ dlmopen(Lmid_t namespace_id, const char* filename, int flags)
 }
 
 __attribute__((visibility("default")))
+int
+dlinfo(void* handle, int request, void* argument)
+{
+    if (pthread_once(&real_loader_once, resolve_real_loader_functions) != 0 ||
+        real_dlinfo_function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (loader_phase == LOADER_PHASE_CALLBACK) {
+        atomic_fetch_add_explicit(&callback_dlinfo_calls,
+                                  1,
+                                  memory_order_relaxed);
+    } else if (loader_phase == LOADER_PHASE_IDLE) {
+        atomic_fetch_add_explicit(&broker_dlinfo_calls,
+                                  1,
+                                  memory_order_relaxed);
+    }
+    return real_dlinfo_function(handle, request, argument);
+}
+
+__attribute__((visibility("default")))
 void
 peak_dlopen_owned_fixture_event(int loaded)
 {
@@ -183,8 +248,6 @@ peak_dlopen_owned_fixture_destructor_loader(void)
 {
     void* handle;
     LoaderPhase previous_phase;
-    gboolean callback_admitted = FALSE;
-    gboolean enqueued = FALSE;
 
     if (atomic_load_explicit(&destructor_loader_enabled,
                              memory_order_acquire) == 0) {
@@ -198,20 +261,6 @@ peak_dlopen_owned_fixture_destructor_loader(void)
         atomic_fetch_add_explicit(&destructor_loader_successes,
                                   1,
                                   memory_order_relaxed);
-        if (destructor_begin_callback != NULL &&
-            destructor_end_callback != NULL &&
-            destructor_enqueue_loaded != NULL) {
-            callback_admitted = destructor_begin_callback();
-            if (callback_admitted) {
-                enqueued = destructor_enqueue_loaded("libm.so.6", handle);
-                destructor_end_callback();
-            }
-        }
-        if (enqueued) {
-            atomic_fetch_add_explicit(&destructor_enqueue_successes,
-                                      1,
-                                      memory_order_relaxed);
-        }
         dlclose(handle);
     }
     loader_phase = previous_phase;
@@ -292,12 +341,39 @@ load_peak_test_hooks(void)
     resolve_hook("dlopen_interceptor_test_enqueue_loaded_dynamic_attach",
                  &hooks.enqueue_loaded,
                  sizeof(hooks.enqueue_loaded));
-    resolve_hook("dlopen_interceptor_test_begin_callback",
-                 &hooks.begin_callback,
-                 sizeof(hooks.begin_callback));
-    resolve_hook("dlopen_interceptor_test_end_callback",
-                 &hooks.end_callback,
-                 sizeof(hooks.end_callback));
+    resolve_hook("dlopen_interceptor_test_hold_ownership_broker",
+                 &hooks.hold_ownership_broker,
+                 sizeof(hooks.hold_ownership_broker));
+    resolve_hook("dlopen_interceptor_test_ownership_broker_waiting",
+                 &hooks.ownership_broker_waiting,
+                 sizeof(hooks.ownership_broker_waiting));
+    resolve_hook("dlopen_interceptor_test_hold_ownership_pin",
+                 &hooks.hold_ownership_pin,
+                 sizeof(hooks.hold_ownership_pin));
+    resolve_hook("dlopen_interceptor_test_ownership_pin_waiting",
+                 &hooks.ownership_pin_waiting,
+                 sizeof(hooks.ownership_pin_waiting));
+    resolve_hook("dlopen_interceptor_test_pending_ownership_count",
+                 &hooks.pending_ownership_count,
+                 sizeof(hooks.pending_ownership_count));
+    resolve_hook("dlopen_interceptor_test_shutdown_dynamic_attach",
+                 &hooks.shutdown_dynamic_attach,
+                 sizeof(hooks.shutdown_dynamic_attach));
+    resolve_hook("dlopen_interceptor_test_callback_is_admitted",
+                 &hooks.callback_is_admitted,
+                 sizeof(hooks.callback_is_admitted));
+    resolve_hook("dlopen_interceptor_test_dettach",
+                 &hooks.detach_dlopen_interceptor,
+                 sizeof(hooks.detach_dlopen_interceptor));
+    resolve_hook("dlopen_interceptor_test_hold_dlclose_guard",
+                 &hooks.hold_dlclose_guard,
+                 sizeof(hooks.hold_dlclose_guard));
+    resolve_hook("dlopen_interceptor_test_dlclose_guard_waiting",
+                 &hooks.dlclose_guard_waiting,
+                 sizeof(hooks.dlclose_guard_waiting));
+    resolve_hook("dlopen_interceptor_test_dlclose_guard_reverting",
+                 &hooks.dlclose_guard_reverting,
+                 sizeof(hooks.dlclose_guard_reverting));
     return hooks;
 }
 
@@ -319,92 +395,257 @@ drain_once(const PeakTestHooks* hooks)
     loader_phase = LOADER_PHASE_IDLE;
 }
 
+static gboolean
+wait_for_ownership_idle(const PeakTestHooks* hooks)
+{
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        if (hooks->pending_ownership_count() == 0) {
+            return TRUE;
+        }
+        sched_yield();
+    }
+    return FALSE;
+}
+
+static gboolean
+wait_for_broker_barrier(const PeakTestHooks* hooks)
+{
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        if (hooks->ownership_broker_waiting()) {
+            return TRUE;
+        }
+        sched_yield();
+    }
+    return FALSE;
+}
+
+static gboolean
+wait_for_ownership_pin_barrier(const PeakTestHooks* hooks)
+{
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        if (hooks->ownership_pin_waiting()) {
+            return TRUE;
+        }
+        sched_yield();
+    }
+    return FALSE;
+}
+
+static gboolean
+wait_for_callback_admission(const PeakTestHooks* hooks, gboolean admitted)
+{
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        if (hooks->callback_is_admitted() == admitted) {
+            return TRUE;
+        }
+        sched_yield();
+    }
+    return FALSE;
+}
+
+static gboolean
+wait_for_dlclose_guard_state(DlcloseGuardStateFunction state)
+{
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        if (state()) {
+            return TRUE;
+        }
+        sched_yield();
+    }
+    return FALSE;
+}
+
+static PeakDlopenDynamicAttachDiagnostics
+drain_until_empty(const PeakTestHooks* hooks)
+{
+    PeakDlopenDynamicAttachDiagnostics diagnostics = { 0 };
+
+    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+        drain_once(hooks);
+        diagnostics = get_diagnostics(hooks);
+        if (diagnostics.queue_length == 0) {
+            break;
+        }
+        sched_yield();
+    }
+    return diagnostics;
+}
+
 static void*
-load_with_callback_phase(const char* path)
+load_with_callback_phase_flags(const char* path, int flags)
 {
     void* handle;
 
     loader_phase = LOADER_PHASE_CALLBACK;
-    handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    handle = dlopen(path, flags);
     loader_phase = LOADER_PHASE_IDLE;
     return handle;
+}
+
+static void*
+load_with_callback_phase(const char* path)
+{
+    return load_with_callback_phase_flags(path, RTLD_NOW | RTLD_LOCAL);
 }
 
 static int
 test_callback_owned_handle(const PeakTestHooks* hooks, const char* module_path)
 {
     PeakDlopenDynamicAttachDiagnostics before = get_diagnostics(hooks);
+    unsigned long long broker_noload_before =
+        atomic_load_explicit(&broker_noload_calls, memory_order_relaxed);
+    unsigned long long broker_dlinfo_before =
+        atomic_load_explicit(&broker_dlinfo_calls, memory_order_relaxed);
     void* application_handle;
 
+    /*
+     * Hold the broker so the application close deterministically wins the
+     * ownership race. The dlopen callback must return without waiting and the
+    * guarded dlclose must transfer, rather than release, that reference.
+     */
+    hooks->hold_ownership_broker(TRUE);
     application_handle = load_with_callback_phase(module_path);
     check_true("ownership fixture loaded", application_handle != NULL);
     if (application_handle == NULL) {
+        hooks->hold_ownership_broker(FALSE);
         return 1;
     }
-    /*
-     * Run the exact production pin/identity enqueue helper at the point where
-     * a Gum on-leave callback still owns the returned application handle.
-     * A real listener callback may already have enqueued the same identity;
-     * the helper must safely coalesce that case.
-     */
-    loader_phase = LOADER_PHASE_CALLBACK;
-    check_true("callback-time loaded handle enqueue succeeded",
-               hooks->enqueue_loaded(module_path, application_handle));
-    loader_phase = LOADER_PHASE_IDLE;
+    check_true("ownership broker reached deterministic hold barrier",
+               wait_for_broker_barrier(hooks));
 
     PeakDlopenDynamicAttachDiagnostics queued = get_diagnostics(hooks);
-    check_ull("callback enqueued one owned request",
+    check_ull("real callback enqueued one borrowed request",
               queued.enqueued,
               before.enqueued + 1);
-    check_size("callback left one request queued",
+    check_size("real callback left one request queued",
                queued.queue_length,
                before.queue_length + 1);
     check_true("fixture constructor ran",
                atomic_load_explicit(&fixture_loads,
                                     memory_order_relaxed) == 1);
-    check_true("callback acquired a queue-owned RTLD_NOLOAD reference",
-               atomic_load_explicit(&callback_noload_calls,
-                                    memory_order_relaxed) > 0);
+    check_ull("callback made no RTLD_NOLOAD loader call",
+              atomic_load_explicit(&callback_noload_calls,
+                                   memory_order_relaxed),
+              0);
+    check_ull("callback made no dlinfo call",
+              atomic_load_explicit(&callback_dlinfo_calls,
+                                   memory_order_relaxed),
+              0);
 
-    check_true("application dlclose succeeded",
+    check_true("pending application dlclose transferred its reference",
                dlclose(application_handle) == 0);
-    check_true("queue-owned handle kept module loaded after application dlclose",
+    check_true("transferred reference kept module loaded",
                atomic_load_explicit(&fixture_unloads,
                                     memory_order_relaxed) == 0);
+    check_size("ownership transfer resolved pending broker work",
+               hooks->pending_ownership_count(),
+               0);
+    hooks->hold_ownership_broker(FALSE);
 
-    unsigned long long drain_calls_before =
-        atomic_load_explicit(&drain_loader_calls, memory_order_relaxed);
-    unsigned long long drain_noload_before =
-        atomic_load_explicit(&drain_noload_calls, memory_order_relaxed);
-    drain_once(hooks);
+    PeakDlopenDynamicAttachDiagnostics after_transfer =
+        drain_until_empty(hooks);
+    check_ull("transferred request drained",
+              after_transfer.drained,
+              before.drained + 1);
+    check_true("drain released transferred module handle",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 1);
 
-    PeakDlopenDynamicAttachDiagnostics after = get_diagnostics(hooks);
-    check_ull("owned request drained", after.drained, before.drained + 1);
+    /*
+     * Exercise the other race outcome: allow the broker to obtain its exact
+     * LMID pin before the application closes its own reference.
+     */
+    application_handle = load_with_callback_phase(module_path);
+    check_true("broker-pin fixture reloaded", application_handle != NULL);
+    check_true("broker completed exact ownership pin",
+               wait_for_ownership_idle(hooks));
+    check_true("broker performed RTLD_NOLOAD outside callback",
+               atomic_load_explicit(&broker_noload_calls,
+                                    memory_order_relaxed) >
+                   broker_noload_before);
+    check_true("broker performed dlinfo outside callback",
+               atomic_load_explicit(&broker_dlinfo_calls,
+                                    memory_order_relaxed) >
+                   broker_dlinfo_before);
+    check_true("post-pin application dlclose used real close",
+               application_handle != NULL &&
+               dlclose(application_handle) == 0);
+    check_true("broker pin kept reloaded fixture alive",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 1);
+
+    PeakDlopenDynamicAttachDiagnostics after =
+        drain_until_empty(hooks);
+    check_ull("broker-owned request drained",
+              after.drained,
+              before.drained + 2);
     check_size("owned queue empty after drain", after.queue_length, 0);
-    check_ull("owned request did not report RTLD_NOLOAD drop",
+    check_ull("owned requests did not report RTLD_NOLOAD drop",
               after.dropped_noload,
               before.dropped_noload);
     check_ull("controller drain made no dlopen or dlmopen call",
               atomic_load_explicit(&drain_loader_calls,
                                    memory_order_relaxed),
-              drain_calls_before);
-    check_ull("controller drain made no RTLD_NOLOAD call",
-              atomic_load_explicit(&drain_noload_calls,
-                                   memory_order_relaxed),
-              drain_noload_before);
-    check_true("drain released queue-owned module handle",
+              0);
+    check_true("second drain released broker-owned handle",
                atomic_load_explicit(&fixture_unloads,
-                                    memory_order_relaxed) == 1);
+                                    memory_order_relaxed) == 2);
+
+    /*
+     * Hold the broker after it publishes PINNING. This deterministically
+     * covers the third race: dlclose transfers the application reference
+     * while the broker is already committed to loader access. Pending must
+     * remain nonzero until that access ends, and the redundant exact pin must
+     * be released without unloading the transferred module.
+     */
+    hooks->hold_ownership_pin(TRUE);
+    application_handle = load_with_callback_phase(module_path);
+    check_true("pinning-race fixture reloaded", application_handle != NULL);
+    check_true("ownership broker published PINNING",
+               wait_for_ownership_pin_barrier(hooks));
+    check_size("PINNING handoff remains pending before close",
+               hooks->pending_ownership_count(),
+               1);
+    check_true("PINNING application dlclose transferred without waiting",
+               application_handle != NULL &&
+               dlclose(application_handle) == 0);
+    check_size("PINNING transfer remains pending through loader access",
+               hooks->pending_ownership_count(),
+               1);
+    check_true("PINNING transfer kept fixture loaded",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 2);
+    hooks->hold_ownership_pin(FALSE);
+    check_true("PINNING broker completion resolved ownership",
+               wait_for_ownership_idle(hooks));
+    check_true("redundant broker pin did not unload transferred fixture",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 2);
+
+    PeakDlopenDynamicAttachDiagnostics after_pinning =
+        drain_until_empty(hooks);
+    check_ull("PINNING-transferred request drained",
+              after_pinning.drained,
+              before.drained + 3);
+    check_true("PINNING drain released exactly one final reference",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 3);
+    check_ull("callback path made only the three outer application loads",
+              atomic_load_explicit(&callback_loader_calls,
+                                   memory_order_relaxed),
+              3);
 
     if (failures == 0) {
-        printf("dlopen_loader_ownership_ok callback_loader_calls=%llu callback_noload_calls=%llu drain_loader_calls=%llu drain_noload_calls=%llu\n",
+        printf("dlopen_loader_ownership_ok callback_loader_calls=%llu callback_noload_calls=%llu callback_dlinfo_calls=%llu broker_noload_calls=%llu drain_loader_calls=%llu\n",
                atomic_load_explicit(&callback_loader_calls,
                                     memory_order_relaxed),
                atomic_load_explicit(&callback_noload_calls,
                                     memory_order_relaxed),
-               atomic_load_explicit(&drain_loader_calls,
+               atomic_load_explicit(&callback_dlinfo_calls,
                                     memory_order_relaxed),
-               atomic_load_explicit(&drain_noload_calls,
+               atomic_load_explicit(&broker_noload_calls,
+                                    memory_order_relaxed),
+               atomic_load_explicit(&drain_loader_calls,
                                     memory_order_relaxed));
     }
     return failures == 0 ? 0 : 1;
@@ -425,10 +666,8 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
     if (application_handle == NULL) {
         return 1;
     }
-    loader_phase = LOADER_PHASE_CALLBACK;
-    check_true("destructor fixture exact handle enqueued",
-               hooks->enqueue_loaded(module_path, application_handle));
-    loader_phase = LOADER_PHASE_IDLE;
+    check_true("destructor fixture broker pin completed",
+               wait_for_ownership_idle(hooks));
     check_true("destructor application handle closed",
                dlclose(application_handle) == 0);
     check_true("queue pin delayed fixture destructor",
@@ -451,10 +690,17 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
               atomic_load_explicit(&destructor_loader_successes,
                                    memory_order_relaxed),
               1);
-    check_ull("fixture destructor crossed the callback barrier and enqueued",
-              atomic_load_explicit(&destructor_enqueue_successes,
+    check_ull("fixture destructor made only its outer application load",
+              atomic_load_explicit(&destructor_loader_calls,
                                    memory_order_relaxed),
               1);
+    check_ull("fixture destructor callback made no RTLD_NOLOAD call",
+              atomic_load_explicit(&destructor_noload_calls,
+                                   memory_order_relaxed),
+              0);
+    check_ull("fixture destructor real dlopen callback enqueued",
+              after_first.enqueued,
+              before.enqueued + 2);
     check_ull("controller itself made no loader open during drain",
               atomic_load_explicit(&drain_loader_calls,
                                    memory_order_relaxed),
@@ -466,8 +712,10 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
                after_first.queue_length,
                before.queue_length + 1);
 
-    drain_once(hooks);
-    PeakDlopenDynamicAttachDiagnostics after_second = get_diagnostics(hooks);
+    check_true("destructor-created ownership handoff completed",
+               wait_for_ownership_idle(hooks));
+    PeakDlopenDynamicAttachDiagnostics after_second =
+        drain_until_empty(hooks);
     check_ull("destructor-created request drained separately",
               after_second.drained,
               before.drained + 2);
@@ -528,8 +776,16 @@ test_namespace_identity(const PeakTestHooks* hooks, const char* module_path)
     check_size("same filename in two namespaces occupies two queue slots",
                queued.queue_length,
                before.queue_length + 2);
-    check_true("namespace pins traversed the loader-call detector",
-               atomic_load_explicit(&callback_noload_calls,
+    check_ull("namespace callback simulation made no RTLD_NOLOAD call",
+              atomic_load_explicit(&callback_noload_calls,
+                                   memory_order_relaxed),
+              0);
+    check_ull("namespace callback simulation made no dlinfo call",
+              atomic_load_explicit(&callback_dlinfo_calls,
+                                   memory_order_relaxed),
+              0);
+    check_true("namespace pins ran in broker thread",
+               atomic_load_explicit(&broker_noload_calls,
                                     memory_order_relaxed) > 0);
 
     for (size_t i = 0; i < 2; i++) {
@@ -541,8 +797,8 @@ test_namespace_identity(const PeakTestHooks* hooks, const char* module_path)
 
     unsigned long long drain_calls_before =
         atomic_load_explicit(&drain_loader_calls, memory_order_relaxed);
-    drain_once(hooks);
-    PeakDlopenDynamicAttachDiagnostics after = get_diagnostics(hooks);
+    PeakDlopenDynamicAttachDiagnostics after =
+        drain_until_empty(hooks);
     check_ull("both namespace requests drained",
               after.drained,
               before.drained + 2);
@@ -553,10 +809,14 @@ test_namespace_identity(const PeakTestHooks* hooks, const char* module_path)
               drain_calls_before);
 
     if (failures == 0) {
-        printf("dlopen_loader_namespace_identity_ok enqueued_delta=%llu drained_delta=%llu callback_noload_calls=%llu drain_loader_calls=%llu\n",
+        printf("dlopen_loader_namespace_identity_ok enqueued_delta=%llu drained_delta=%llu callback_noload_calls=%llu callback_dlinfo_calls=%llu broker_noload_calls=%llu drain_loader_calls=%llu\n",
                after.enqueued - before.enqueued,
                after.drained - before.drained,
                atomic_load_explicit(&callback_noload_calls,
+                                    memory_order_relaxed),
+               atomic_load_explicit(&callback_dlinfo_calls,
+                                    memory_order_relaxed),
+               atomic_load_explicit(&broker_noload_calls,
                                     memory_order_relaxed),
                atomic_load_explicit(&drain_loader_calls,
                                     memory_order_relaxed));
@@ -574,7 +834,6 @@ stress_worker(void* opaque)
     }
     for (unsigned int i = 0; i < args->iterations; i++) {
         void* handle = load_with_callback_phase(args->module_path);
-        gboolean enqueued;
         int close_result;
 
         if (handle == NULL) {
@@ -583,16 +842,8 @@ stress_worker(void* opaque)
                                       memory_order_relaxed);
             break;
         }
-        /*
-         * Exercise the exact production pin/identity enqueue helper even if a
-         * platform's Gum listener does not dispatch callbacks on every worker
-         * thread. The application still closes its own handle immediately.
-         */
-        loader_phase = LOADER_PHASE_CALLBACK;
-        enqueued = args->enqueue_loaded(args->module_path, handle);
-        loader_phase = LOADER_PHASE_IDLE;
         close_result = dlclose(handle);
-        if (!enqueued || close_result != 0) {
+        if (close_result != 0) {
             atomic_fetch_add_explicit(args->failures,
                                       1,
                                       memory_order_relaxed);
@@ -610,7 +861,7 @@ static int
 test_concurrent_loader_and_drain(const PeakTestHooks* hooks,
                                  const char* module_path)
 {
-    enum { THREAD_COUNT = 8, ITERATIONS = 250 };
+    enum { THREAD_COUNT = 32, ITERATIONS = 200 };
     PeakDlopenDynamicAttachDiagnostics before = get_diagnostics(hooks);
     StressWorkerArgs args;
     pthread_t threads[THREAD_COUNT];
@@ -621,7 +872,6 @@ test_concurrent_loader_and_drain(const PeakTestHooks* hooks,
 
     args.module_path = module_path;
     args.iterations = ITERATIONS;
-    args.enqueue_loaded = hooks->enqueue_loaded;
     args.start = &start;
     args.remaining = &remaining;
     args.failures = &worker_failures;
@@ -674,13 +924,22 @@ test_concurrent_loader_and_drain(const PeakTestHooks* hooks,
     check_ull("concurrent queue-owned handles never dropped at RTLD_NOLOAD",
               after.dropped_noload,
               before.dropped_noload);
-    check_true("concurrent pins traversed the loader-call detector",
-               atomic_load_explicit(&callback_noload_calls,
-                                    memory_order_relaxed) > 0);
+    check_ull("concurrent callbacks made no RTLD_NOLOAD call",
+              atomic_load_explicit(&callback_noload_calls,
+                                   memory_order_relaxed),
+              0);
+    check_ull("concurrent callbacks made no dlinfo call",
+              atomic_load_explicit(&callback_dlinfo_calls,
+                                   memory_order_relaxed),
+              0);
     check_ull("concurrent drain thread made no loader open call",
               atomic_load_explicit(&drain_loader_calls,
                                    memory_order_relaxed),
               0);
+    check_ull("concurrent callback phase made only outer application loads",
+              atomic_load_explicit(&callback_loader_calls,
+                                   memory_order_relaxed),
+              (unsigned long long)THREAD_COUNT * ITERATIONS);
     check_true("concurrent fixture loaded at least once",
                atomic_load_explicit(&fixture_loads,
                                     memory_order_relaxed) > 0);
@@ -691,15 +950,238 @@ test_concurrent_loader_and_drain(const PeakTestHooks* hooks,
                                    memory_order_relaxed));
 
     if (failures == 0) {
-        printf("dlopen_loader_concurrent_stress_ok threads=%u iterations=%u enqueued=%llu drained=%llu callback_noload_calls=%llu drain_loader_calls=%llu\n",
+        printf("dlopen_loader_concurrent_stress_ok threads=%u iterations=%u enqueued=%llu drained=%llu callback_noload_calls=%llu callback_dlinfo_calls=%llu drain_loader_calls=%llu\n",
                THREAD_COUNT,
                ITERATIONS,
                after.enqueued - before.enqueued,
                after.drained - before.drained,
                atomic_load_explicit(&callback_noload_calls,
                                     memory_order_relaxed),
+               atomic_load_explicit(&callback_dlinfo_calls,
+                                    memory_order_relaxed),
                atomic_load_explicit(&drain_loader_calls,
                                     memory_order_relaxed));
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+static int
+test_fork_pending_dlclose(const PeakTestHooks* hooks,
+                          const char* module_path)
+{
+    PeakDlopenDynamicAttachDiagnostics before = get_diagnostics(hooks);
+    void* application_handle;
+    pid_t child;
+    int status = 0;
+
+    hooks->hold_ownership_broker(TRUE);
+    /*
+     * This test covers PEAK's fork-child PID bypass, not Frida Gum's general
+     * post-fork module-unload support. NODELETE prevents the child close from
+     * emitting a module-registry unload while preserving the exact pending
+     * handle match exercised by the guard.
+     */
+    application_handle =
+        load_with_callback_phase_flags(module_path,
+                                       RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    check_true("fork fixture loaded", application_handle != NULL);
+    check_true("fork fixture left BORROWED handoff",
+               application_handle != NULL &&
+               wait_for_broker_barrier(hooks));
+    if (application_handle == NULL) {
+        hooks->hold_ownership_broker(FALSE);
+        return 1;
+    }
+
+    child = fork();
+    check_true("fork with pending ownership succeeded", child >= 0);
+    if (child == 0) {
+        alarm(5);
+        _exit(dlclose(application_handle) == 0 ? 0 : 2);
+    }
+    if (child > 0) {
+        check_true("fork child wait succeeded",
+                   waitpid(child, &status, 0) == child);
+        check_true("fork child dlclose failed open without hang",
+                   WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+    check_size("parent pending handoff survived child close",
+               hooks->pending_ownership_count(),
+               1);
+    check_true("parent close transferred pending reference",
+               dlclose(application_handle) == 0);
+    hooks->hold_ownership_broker(FALSE);
+    PeakDlopenDynamicAttachDiagnostics after =
+        drain_until_empty(hooks);
+    check_ull("fork parent request drained",
+              after.drained,
+              before.drained + 1);
+    check_true("NODELETE kept fork fixture mapped after balanced closes",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 0);
+
+    if (failures == 0) {
+        puts("dlopen_loader_fork_pending_close_ok");
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+static void*
+shutdown_dynamic_attach_thread(void* opaque)
+{
+    ShutdownThreadArgs* args = opaque;
+
+    args->result = args->shutdown_dynamic_attach();
+    return NULL;
+}
+
+static int
+test_shutdown_pending_transfer(const PeakTestHooks* hooks,
+                               const char* module_path)
+{
+    void* application_handle;
+    pthread_t shutdown_thread;
+    ShutdownThreadArgs args = {
+        .shutdown_dynamic_attach = hooks->shutdown_dynamic_attach,
+        .result = FALSE
+    };
+    int create_status;
+
+    hooks->hold_ownership_broker(TRUE);
+    application_handle = load_with_callback_phase(module_path);
+    check_true("shutdown fixture loaded", application_handle != NULL);
+    check_true("shutdown fixture left BORROWED handoff",
+               application_handle != NULL &&
+               wait_for_broker_barrier(hooks));
+    if (application_handle == NULL) {
+        hooks->hold_ownership_broker(FALSE);
+        return 1;
+    }
+
+    create_status = pthread_create(&shutdown_thread,
+                                   NULL,
+                                   shutdown_dynamic_attach_thread,
+                                   &args);
+    check_true("shutdown peer started", create_status == 0);
+    if (create_status != 0) {
+        hooks->hold_ownership_broker(FALSE);
+        (void)dlclose(application_handle);
+        return 1;
+    }
+    check_true("shutdown closed callback admission",
+               wait_for_callback_admission(hooks, FALSE));
+    check_size("shutdown kept ownership handoff pending",
+               hooks->pending_ownership_count(),
+               1);
+    check_true("shutdown-time dlclose transferred pending reference",
+               dlclose(application_handle) == 0);
+    check_size("shutdown-time transfer resolved pending ownership",
+               hooks->pending_ownership_count(),
+               0);
+    hooks->hold_ownership_broker(FALSE);
+    check_true("shutdown peer joined",
+               pthread_join(shutdown_thread, NULL) == 0);
+
+    check_true("pending ownership shutdown completed", args.result);
+    check_true("shutdown discarded and closed transferred reference",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 1);
+    if (failures == 0) {
+        puts("dlopen_loader_shutdown_pending_transfer_ok");
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+static void*
+close_handle_thread(void* opaque)
+{
+    CloseThreadArgs* args = opaque;
+
+    args->result = dlclose(args->handle);
+    return NULL;
+}
+
+static void*
+detach_dlopen_interceptor_thread(void* opaque)
+{
+    DetachThreadArgs* args = opaque;
+
+    args->result = args->detach_dlopen_interceptor();
+    return NULL;
+}
+
+static int
+test_dlclose_guard_revert_lifetime(const PeakTestHooks* hooks,
+                                   const char* module_path)
+{
+    void* application_handle = load_with_callback_phase(module_path);
+    CloseThreadArgs close_args = {
+        .handle = application_handle,
+        .result = -1
+    };
+    DetachThreadArgs detach_args = {
+        .detach_dlopen_interceptor = hooks->detach_dlopen_interceptor,
+        .result = FALSE
+    };
+    pthread_t close_thread;
+    pthread_t detach_thread;
+    int close_created;
+    int detach_created;
+
+    check_true("guard-revert fixture loaded", application_handle != NULL);
+    check_true("guard-revert broker ownership completed",
+               application_handle != NULL &&
+               wait_for_ownership_idle(hooks));
+    drain_once(hooks);
+    check_true("guard-revert drain left application reference loaded",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 0);
+    if (application_handle == NULL) {
+        return 1;
+    }
+
+    hooks->hold_dlclose_guard(TRUE);
+    close_created = pthread_create(&close_thread,
+                                   NULL,
+                                   close_handle_thread,
+                                   &close_args);
+    check_true("guarded close peer started", close_created == 0);
+    if (close_created != 0) {
+        hooks->hold_dlclose_guard(FALSE);
+        (void)dlclose(application_handle);
+        return 1;
+    }
+    check_true("guarded close reached active-reader barrier",
+               wait_for_dlclose_guard_state(hooks->dlclose_guard_waiting));
+
+    detach_created = pthread_create(&detach_thread,
+                                    NULL,
+                                    detach_dlopen_interceptor_thread,
+                                    &detach_args);
+    check_true("dlclose revert peer started", detach_created == 0);
+    if (detach_created == 0) {
+        check_true("dlclose revert waited for admitted reader",
+                   wait_for_dlclose_guard_state(
+                       hooks->dlclose_guard_reverting));
+    }
+    hooks->hold_dlclose_guard(FALSE);
+    check_true("guarded close peer joined",
+               pthread_join(close_thread, NULL) == 0);
+    if (detach_created == 0) {
+        check_true("dlclose revert peer joined",
+                   pthread_join(detach_thread, NULL) == 0);
+    }
+
+    check_true("admitted guarded close used valid trampoline",
+               close_args.result == 0);
+    check_true("dlclose guard revert completed after reader exit",
+               detach_created == 0 && detach_args.result);
+    check_true("guard-revert fixture unloaded exactly once",
+               atomic_load_explicit(&fixture_unloads,
+                                    memory_order_relaxed) == 1);
+    if (failures == 0) {
+        puts("dlopen_loader_guard_revert_lifetime_ok");
     }
     return failures == 0 ? 0 : 1;
 }
@@ -711,17 +1193,17 @@ main(int argc, char** argv)
         (strcmp(argv[1], "ownership") != 0 &&
          strcmp(argv[1], "destructor") != 0 &&
          strcmp(argv[1], "namespace") != 0 &&
-         strcmp(argv[1], "stress") != 0)) {
+         strcmp(argv[1], "stress") != 0 &&
+         strcmp(argv[1], "fork") != 0 &&
+         strcmp(argv[1], "shutdown") != 0 &&
+         strcmp(argv[1], "guard-revert") != 0)) {
         fprintf(stderr,
-                "usage: %s ownership|destructor|namespace|stress\n",
+                "usage: %s ownership|destructor|namespace|stress|fork|shutdown|guard-revert\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
 
     PeakTestHooks hooks = load_peak_test_hooks();
-    destructor_enqueue_loaded = hooks.enqueue_loaded;
-    destructor_begin_callback = hooks.begin_callback;
-    destructor_end_callback = hooks.end_callback;
     hooks.set_manual_drain(TRUE);
 
     int result;
@@ -735,9 +1217,19 @@ main(int argc, char** argv)
     } else if (strcmp(argv[1], "namespace") == 0) {
         result = test_namespace_identity(&hooks,
                                          PEAK_TEST_OWNED_MODULE);
-    } else {
+    } else if (strcmp(argv[1], "stress") == 0) {
         result = test_concurrent_loader_and_drain(&hooks,
                                                   PEAK_TEST_OWNED_MODULE);
+    } else if (strcmp(argv[1], "fork") == 0) {
+        result = test_fork_pending_dlclose(&hooks,
+                                           PEAK_TEST_OWNED_MODULE);
+    } else if (strcmp(argv[1], "shutdown") == 0) {
+        result = test_shutdown_pending_transfer(&hooks,
+                                                 PEAK_TEST_OWNED_MODULE);
+    } else {
+        result = test_dlclose_guard_revert_lifetime(
+            &hooks,
+            PEAK_TEST_OWNED_MODULE);
     }
 
     hooks.set_manual_drain(FALSE);

@@ -6,10 +6,12 @@
  * @brief Dynamic-library load observation and deferred target attachment.
  *
  * PEAK observes the real `dlopen` entry and return with a Gum invocation
- * listener, preserving caller-sensitive loader behavior.  Resolved targets
- * are queued for bounded controller-side processing after the loader callback
- * exits. Queue entries and retained dynamic-library handles are owned by this
- * module.
+ * listener, preserving caller-sensitive loader behavior. The callback only
+ * publishes a borrowed result. A loader-API-free `dlclose` guard transfers a
+ * racing application reference, while a separate ownership thread otherwise
+ * obtains an exact module reference. Resolved targets are then queued for
+ * bounded controller-side processing. Queue entries and retained
+ * dynamic-library handles are owned by this module.
  */
 
 #include "frida-gum.h"
@@ -53,13 +55,14 @@ typedef struct {
  * @{ */
 
 /**
- * @brief Attaches the `dlopen` invocation listener.
+ * @brief Attaches dynamic-loader observation and ownership support.
  *
- * The function locates `dlopen`, validates that Gum may attach safely, creates
- * the call listener, and performs the attach through the detach-controller
- * mutation protocol.  It does not open dynamic-attach admission; call
- * `dlopen_interceptor_enable_dynamic_attach()` after the general-listener
- * target arrays have been published.
+ * The function locates `dlopen` and `dlclose`, validates that Gum may mutate
+ * both safely, attaches the `dlopen` call listener, installs the nonblocking
+ * `dlclose` ownership guard through the detach-controller mutation protocol,
+ * and then starts the ownership thread. It does not open dynamic-attach
+ * admission; call `dlopen_interceptor_enable_dynamic_attach()` after the
+ * general-listener target arrays have been published.
  *
  * @return `GUM_ATTACH_OK` on success; otherwise the `GumAttachReturn` produced
  *         by Gum, or `GUM_ATTACH_WRONG_SIGNATURE` when setup or safety
@@ -88,10 +91,11 @@ void dlopen_interceptor_enable_dynamic_attach(void);
 /**
  * @brief Drains queued dynamic attach work on the controller path.
  *
- * On Linux with `RTLD_NOLOAD`, the controller obtains its own reference after
- * every admitted dlopen callback has exited, then resolves and attaches
- * targets. A normal call processes at most 64 requests from the queue length
- * observed at drain start. Reentrant, concurrent, callback-overlapping,
+ * Each request becomes drainable only after the ownership thread obtains an
+ * exact `RTLD_NOLOAD` reference or a racing application `dlclose` transfers
+ * its existing reference. The controller then resolves and attaches targets.
+ * A normal call processes at most 64 requests from the queue length observed
+ * at drain start. Reentrant, concurrent, callback-overlapping, unresolved,
  * closed, and empty drains are no-ops. The function consumes only
  * module-owned queue entries.
  */
@@ -101,16 +105,17 @@ void dlopen_interceptor_drain_dynamic_attach_queue(void);
  * @brief Closes callback admission and releases dynamic attach work.
  *
  * The function first closes callback admission permanently for this listener
- * lifecycle, then waits up to 5,000 milliseconds for active controller drains
- * and, separately, up to 5,000 milliseconds for callbacks.  After both become
- * idle, queued requests and their module-owned handle references are discarded
- * without installing new hooks.  The Gum listener itself is not physically
- * detached.
+ * lifecycle, then waits up to 5,000 milliseconds each for active controller
+ * drains, callbacks, and asynchronous ownership handoffs. After all become
+ * idle, the ownership thread stops and queued requests plus their module-owned
+ * handle references are discarded without installing new hooks. The Gum
+ * listener and `dlclose` guard are not physically detached by this operation.
  *
- * @retval TRUE Active work and callbacks drained and the queue was discarded.
- * @retval FALSE A drain or callback wait timed out.  The controller remains in
- *               the shutting-down state and all state needed by active users
- *               is deliberately retained.
+ * @retval TRUE Active work, callbacks, and handoffs drained and the queue was
+ *               discarded.
+ * @retval FALSE A drain, callback, or handoff wait timed out. The controller
+ *               remains in the shutting-down state and all state needed by
+ *               active users is deliberately retained.
  */
 gboolean dlopen_interceptor_shutdown_dynamic_attach(void);
 
@@ -170,6 +175,10 @@ dlopen_interceptor_test_callback_is_admitted(void);
 PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_shutdown_dynamic_attach(void);
 
+/** @return The result of the complete production loader-hook teardown. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_dettach(void);
+
 /**
  * Enqueues a request without a real handle; the filename is copied on success.
  * @param[in] filename Borrowed label; NULL selects the internal test label.
@@ -187,8 +196,9 @@ PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_retry_dynamic_attach(
     const char* filename);
 
 /**
- * Pins and enqueues the exact loaded module represented by an application
- * handle. The caller retains ownership of `application_handle`.
+ * Enqueues the exact loaded module represented by an application handle and
+ * waits for the ownership broker to resolve the handoff. The caller retains
+ * ownership of `application_handle`.
  */
 PEAK_DLOPEN_API gboolean
 dlopen_interceptor_test_enqueue_loaded_dynamic_attach(
@@ -205,6 +215,38 @@ dlopen_interceptor_test_normal_drain_dynamic_attach_queue(void);
 /** Holds/releases a controller drain after it closes callback admission. */
 PEAK_DLOPEN_API void
 dlopen_interceptor_test_hold_dynamic_attach_drain(gboolean hold);
+
+/** Holds/releases the ownership broker before it claims borrowed work. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_hold_ownership_broker(gboolean hold);
+
+/** @return `TRUE` while the ownership broker is held by its test barrier. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_ownership_broker_waiting(void);
+
+/** Holds/releases the ownership broker after it publishes PINNING. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_hold_ownership_pin(gboolean hold);
+
+/** @return `TRUE` while the ownership broker is held in PINNING state. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_ownership_pin_waiting(void);
+
+/** Holds/releases an admitted dlclose guard invocation before pass-through. */
+PEAK_DLOPEN_API void
+dlopen_interceptor_test_hold_dlclose_guard(gboolean hold);
+
+/** @return `TRUE` while a dlclose guard invocation is held by the test hook. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_dlclose_guard_waiting(void);
+
+/** @return `TRUE` while teardown is closing dlclose guard admission. */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_dlclose_guard_reverting(void);
+
+/** @return Number of borrowed or in-progress ownership handoffs. */
+PEAK_DLOPEN_API size_t
+dlopen_interceptor_test_pending_ownership_count(void);
 
 /** @return `TRUE` while a controller drain is held by the test barrier. */
 PEAK_DLOPEN_API gboolean
@@ -267,12 +309,13 @@ PEAK_DLOPEN_API void dlopen_interceptor_test_trace_counters(const char* event);
  * @{ */
 
 /**
- * @brief Detaches the dlopen invocation listener.
+ * @brief Detaches dynamic-loader observation and ownership support.
  *
- * Callback admission is closed before the Gum listener is detached.  The
- * operation uses the mutation safety protocol, drains dynamic work and
- * callbacks, and requires Gum to flush before releasing listener and
- * interceptor references.
+ * Callback admission is closed before the Gum listener is detached. The
+ * operation uses the mutation safety protocol, drains dynamic work, callbacks,
+ * and ownership handoffs, reverts the `dlclose` guard after all routed readers
+ * exit, and requires Gum to flush before releasing listener and interceptor
+ * references.
  *
  * @retval TRUE Physical detach, shutdown drain, and Gum flush all completed;
  *              listener state was released.

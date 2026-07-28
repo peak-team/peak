@@ -13,6 +13,7 @@ typedef void (*fftw_free_fn)(void* pointer);
 typedef void (*bool_setter_fn)(int enabled);
 typedef int (*bool_getter_fn)(void);
 typedef void (*plain_hook_fn)(void);
+typedef size_t (*size_getter_fn)(void);
 
 static const char* provider_path;
 
@@ -59,6 +60,7 @@ main(int argc, char** argv)
     bool_setter_fn hold_callback;
     bool_getter_fn callback_waiting;
     plain_hook_fn explicit_drain;
+    size_getter_fn pending_ownership_count;
     pthread_t loader;
     void* loader_result = NULL;
     fftw_malloc_fn fftw_malloc;
@@ -83,6 +85,10 @@ main(int argc, char** argv)
                   "dlopen_interceptor_test_drain_dynamic_attach_queue",
                   &explicit_drain,
                   sizeof(explicit_drain));
+    load_function(RTLD_DEFAULT,
+                  "dlopen_interceptor_test_pending_ownership_count",
+                  &pending_ownership_count,
+                  sizeof(pending_ownership_count));
     hold_callback(1);
     if (pthread_create(&loader, NULL, load_provider, NULL) != 0) {
         perror("pthread_create");
@@ -121,6 +127,15 @@ main(int argc, char** argv)
     void* handle = dlopen(provider_path, RTLD_LAZY | RTLD_LOCAL);
     if (handle == NULL) {
         fprintf(stderr, "follow-up dlopen failed: %s\n", dlerror());
+        return EXIT_FAILURE;
+    }
+    for (unsigned int attempt = 0;
+         pending_ownership_count() != 0 && attempt < 5000;
+         attempt++) {
+        usleep(1000);
+    }
+    if (pending_ownership_count() != 0) {
+        fputs("follow-up ownership handoff did not complete\n", stderr);
         return EXIT_FAILURE;
     }
     explicit_drain();
