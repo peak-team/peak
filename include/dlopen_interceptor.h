@@ -186,6 +186,15 @@ PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_dummy_dynamic_attach(
 PEAK_DLOPEN_API gboolean dlopen_interceptor_test_enqueue_retry_dynamic_attach(
     const char* filename);
 
+/**
+ * Pins and enqueues the exact loaded module represented by an application
+ * handle. The caller retains ownership of `application_handle`.
+ */
+PEAK_DLOPEN_API gboolean
+dlopen_interceptor_test_enqueue_loaded_dynamic_attach(
+    const char* filename,
+    void* application_handle);
+
 /** Runs a drain that bypasses manual-drain suppression for the current thread. */
 PEAK_DLOPEN_API void dlopen_interceptor_test_drain_dynamic_attach_queue(void);
 
