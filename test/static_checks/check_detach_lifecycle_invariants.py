@@ -2158,6 +2158,15 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_wait_for_release = extract_function(
         controller, "peak_detach_controller_signal_wait_for_release"
     )
+    signal_wait_event = extract_function(
+        controller, "peak_detach_controller_signal_wait_event"
+    )
+    signal_wake_waiters = extract_function(
+        controller, "peak_detach_controller_signal_wake_release_waiters"
+    )
+    signal_trap_handler = extract_function(
+        controller, "peak_detach_controller_signal_trap_handler"
+    )
     signal_release = extract_function(
         controller, "peak_detach_controller_signal_release"
     )
@@ -2291,22 +2300,62 @@ def check_signal_backend_strict_invariants(repo_root):
     require("FUTEX_WAIT | FUTEX_PRIVATE_FLAG" in controller and
             "FUTEX_WAKE | FUTEX_PRIVATE_FLAG" in controller and
             "INT_MAX" in controller and
-            ".tv_nsec = 1000000L" in controller,
-            "Linux signal waits must use a bounded private futex wait and wake-all")
-    require("_Static_assert(sizeof(signal_release_epoch) == sizeof(int)" in controller and
+            ".tv_sec = 1" in signal_wait_event and
+            ".tv_nsec = 0" in signal_wait_event and
+            "peak_exec_raw_syscall6" in signal_wait_event and
+            "syscall(" not in signal_wait_event and
+            "peak_exec_raw_syscall6" in signal_wake_waiters and
+            "syscall(" not in signal_wake_waiters,
+            "Linux signal waits must use raw, bounded private event futex waits and wake-all")
+    require("_Static_assert(sizeof(signal_wait_sequence) == sizeof(int)" in controller and
             "_Static_assert(sizeof(int) * CHAR_BIT == 32" in controller and
             "_Static_assert(_Alignof(_Atomic int) == _Alignof(int)" in controller and
             "_Static_assert(ATOMIC_INT_LOCK_FREE == 2" in controller and
             "explicit supported Linux compiler ABI" in controller and
             "not a universal C11 representation proof" in controller and
-            "peak_detach_controller_signal_release_futex_word()" in controller and
-            "(int*)&signal_release_epoch" not in controller,
+            "peak_detach_controller_signal_wait_futex_word()" in controller and
+            "(int*)&signal_wait_sequence" not in controller,
             "Linux futex waits must enforce the supported compiler ABI contract for an always-lock-free, aligned 32-bit word")
-    require("expected_release_epoch" in signal_wait_for_release and
-            "peak_detach_controller_signal_wait_release_epoch(expected_release_epoch)" in signal_wait_for_release and
+    require("expected_sequence" in signal_wait_for_release and
+            "expected_release_epoch" in signal_wait_for_release and
+            "peak_detach_controller_signal_wait_event(expected_sequence)" in
+            signal_wait_for_release and
+            signal_wait_for_release.find("expected_sequence") <
+            signal_wait_for_release.find("expected_release_epoch") and
             signal_wait_for_release.find("evacuate_epoch") <
-            signal_wait_for_release.find("peak_detach_controller_signal_wait_release_epoch"),
-            "signal wait must check evacuation before a futex wait using the current release word")
+            signal_wait_for_release.find(
+                "peak_detach_controller_signal_wait_event"),
+            "signal wait must snapshot the event sequence before checking release and evacuation predicates")
+    require(signal_wake_waiters.find(
+                "atomic_fetch_add_explicit(&signal_wait_sequence") <
+            signal_wake_waiters.find("FUTEX_WAKE | FUTEX_PRIVATE_FLAG"),
+            "signal wake must advance the futex event sequence before wake-all")
+    require("peak_exec_raw_syscall6(SYS_gettid" in signal_handler and
+            "syscall(" not in signal_handler and
+            "peak_exec_raw_syscall6(SYS_gettid" in signal_trap_handler and
+            "syscall(" not in signal_trap_handler,
+            "signal handlers must bypass the interposed libc syscall symbol")
+    require("test_detach_controller_signal_event_futex" in
+            controller_tests_cmake and
+            "signal-event-futex" in controller_tests and
+            "signal event waiter remains parked without polling" in
+            controller_tests and
+            "signal event waiter performs one event-driven wait" in
+            controller_tests and
+            "peak_detach_controller_test_signal_wait_count()" in
+            controller_tests and
+            "peak_detach_controller_test_wake_signal_waiters();" in
+            controller_tests and
+            "peak_detach_controller_test_wait_for_signal_event(stale_sequence)"
+            in controller_tests,
+            "signal event futex must test both event-driven parking and wake-before-wait")
+    require("--min-overhead-ratio 0.04" not in tests and
+            tests.count("--min-final-detached-targets 832") >= 2 and
+            tests.count("--min-final-reattached-targets 832") >= 2 and
+            tests.count("--min-final-revisited-targets 832") >= 2 and
+            tests.count("--min-weighted-call-coverage 0.001") >= 2 and
+            tests.count("--min-phase-target-breadth 1.0") >= 2,
+            "long acceptance must cap slowdown while proving explicit target coverage instead of requiring overhead")
     require(signal_release.find("atomic_store_explicit(&signal_release_epoch, epoch") <
             signal_release.find("peak_detach_controller_signal_wake_release_waiters"),
             "release publication must wake signal waiters")
@@ -2316,8 +2365,9 @@ def check_signal_backend_strict_invariants(repo_root):
     require(signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
             signal_temp_breakpoint.find("peak_detach_controller_signal_wake_release_waiters"),
             "evacuation publication must wake signal waiters")
-    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 3,
-            "signal futex wake-all must occur only after release, reset, and evacuation publications")
+    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 4 and
+            "peak_detach_controller_test_wake_signal_waiters" in controller,
+            "production signal futex wake-all must occur only after release, reset, and evacuation publications")
     require(signal_wait_for_release.find("rewrite_epoch") <
             signal_wait_for_release.find("done_epoch"),
             "signal PC rewrite must remain ordered before done publication")

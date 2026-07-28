@@ -20,6 +20,26 @@
 
 static int failures = 0;
 
+#ifdef PEAK_HAVE_GUM_PEAK_PC_API
+typedef struct {
+    int expected_sequence;
+    atomic_int started;
+    atomic_int returned;
+} SignalEventWaitContext;
+
+static void*
+signal_event_wait_worker(void* argument)
+{
+    SignalEventWaitContext* context = argument;
+
+    atomic_store_explicit(&context->started, 1, memory_order_release);
+    peak_detach_controller_test_wait_for_signal_event(
+        context->expected_sequence);
+    atomic_store_explicit(&context->returned, 1, memory_order_release);
+    return NULL;
+}
+#endif
+
 static void
 check_true(const char* label, int condition)
 {
@@ -3291,6 +3311,62 @@ run_signal_backend_blocked_thread(void)
 }
 
 static int
+run_signal_event_futex(void)
+{
+#ifndef PEAK_HAVE_GUM_PEAK_PC_API
+    fprintf(stderr, "signal-event-futex requires PEAK_HAVE_GUM_PEAK_PC_API\n");
+    return 77;
+#else
+    SignalEventWaitContext context = {
+        .expected_sequence =
+            peak_detach_controller_test_signal_wait_sequence(),
+        .started = ATOMIC_VAR_INIT(0),
+        .returned = ATOMIC_VAR_INIT(0),
+    };
+    pthread_t waiter;
+    int initial_wait_count =
+        peak_detach_controller_test_signal_wait_count();
+    int create_status =
+        pthread_create(&waiter, NULL, signal_event_wait_worker, &context);
+
+    check_int("signal event waiter create",
+              create_status,
+              0);
+    if (create_status != 0) {
+        return EXIT_FAILURE;
+    }
+    while (atomic_load_explicit(&context.started, memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    while (peak_detach_controller_test_signal_wait_count() ==
+           initial_wait_count) {
+        sched_yield();
+    }
+    usleep(20000);
+    check_int("signal event waiter remains parked without polling",
+              atomic_load_explicit(&context.returned, memory_order_acquire),
+              0);
+    check_int("signal event waiter performs one event-driven wait",
+              peak_detach_controller_test_signal_wait_count(),
+              initial_wait_count + 1);
+    peak_detach_controller_test_wake_signal_waiters();
+    check_int("signal event waiter join", pthread_join(waiter, NULL), 0);
+    check_int("signal event waiter observes wake",
+              atomic_load_explicit(&context.returned, memory_order_acquire),
+              1);
+
+    int stale_sequence = peak_detach_controller_test_signal_wait_sequence();
+    peak_detach_controller_test_wake_signal_waiters();
+    peak_detach_controller_test_wait_for_signal_event(stale_sequence);
+
+    if (failures == 0) {
+        puts("signal_event_futex_ok");
+    }
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
 run_signal_backend_missing_thread_gate(void)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
@@ -3869,7 +3945,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s strict|strict-helper-empty|cached-helper-configuration|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|cached-auto-backend-configuration|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
+                "usage: %s strict|strict-helper-empty|cached-helper-configuration|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|cached-auto-backend-configuration|signal-event-futex|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -3951,6 +4027,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "cached-auto-backend-configuration") == 0) {
         return run_cached_auto_backend_configuration();
+    }
+    if (strcmp(argv[1], "signal-event-futex") == 0) {
+        return run_signal_event_futex();
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();
