@@ -276,7 +276,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 #if !defined(GUM_PEAK_FAST_LISTENER_VERSION) || \
-    GUM_PEAK_FAST_LISTENER_VERSION != 5
+    GUM_PEAK_FAST_LISTENER_VERSION != 6
 #error Unsupported PEAK Gum fast-listener ABI
 #endif
 

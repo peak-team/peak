@@ -1382,7 +1382,8 @@ _gum_function_context_begin_invocation(
                                          function_ctx,
                                          stack_address,
                                          return_address,
-                                         gum_stack_depth);
+                                         &gum_stack_depth);
+        peak_gum_invocation_stack_reap_to_depth(gum_stack_depth);
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             return _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);

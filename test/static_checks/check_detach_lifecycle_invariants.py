@@ -596,8 +596,8 @@ def check_fast_listener_unwind_abi(repo_root):
         repo_root / "test/detach_runtime/test_fastpath_nonlocal_unwind.c"
     ).read_text(encoding="utf-8")
 
-    require("GUM_PEAK_FAST_LISTENER_VERSION 5u" in api and
-            "GUM_PEAK_FAST_LISTENER_VERSION != 5" in cmake,
+    require("GUM_PEAK_FAST_LISTENER_VERSION 6u" in api and
+            "GUM_PEAK_FAST_LISTENER_VERSION != 6" in cmake,
             "patched Gum configuration must reject an older fast-listener callback ABI")
     require("peak_gum_get_interceptor_thread_context" in patcher and
             '"--globalize-symbol"' in patcher and
@@ -608,13 +608,20 @@ def check_fast_listener_unwind_abi(repo_root):
             in overlay,
             "direct dispatch must cache, snapshot, and restore Gum's generic "
             "invocation-stack depth without a steady-state Gum TLS lookup")
-    require("entry->gum_stack_depth = gum_stack_depth" in listener and
+    require("entry->gum_stack_depth = *gum_stack_depth" in listener and
             "*gum_stack_depth_out = entry.gum_stack_depth" in listener,
             "the PEAK direct invocation entry must carry its Gum stack boundary")
+    require("while (direct_level > 0" in listener and
+            "*gum_stack_depth = direct_entry->gum_stack_depth" in listener,
+            "the next direct entry must reap escaped direct and generic "
+            "frames back to their recorded Gum stack boundary")
     require("install_mixed_listener()" in unwind_test and
             "(gpointer)peak_fastpath_unwind_inner" in unwind_test and
-            "mixed_listener_leaves" in unwind_test,
-            "non-local-unwind regression must cover direct outer and generic inner frames")
+            "mixed_listener_leaves" in unwind_test and
+            "peak_fastpath_unwind_escape_outer(2)" in unwind_test and
+            "escape-all recovery direct call failed" in unwind_test,
+            "non-local-unwind regression must cover surviving and fully "
+            "escaped direct outer/generic inner frames")
 
 
 def check_peak_init_heartbeat_order(repo_root):
