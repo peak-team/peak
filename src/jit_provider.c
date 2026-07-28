@@ -27,6 +27,15 @@
 
 static gboolean peak_jit_provider_enabled = FALSE;
 static gboolean peak_jit_perfmap_enabled = FALSE;
+static gsize peak_jit_runtime_config_initialized = 0;
+static gboolean configured_jit_enabled = FALSE;
+static char* configured_jit_providers = NULL;
+static char* configured_jit_map_path = NULL;
+static char* configured_jit_trace_path = NULL;
+static unsigned long configured_jit_not_exec_retry_timeout_ms =
+    PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS;
+static unsigned long configured_jit_drain_record_budget =
+    PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET;
 static char* peak_jit_perfmap_path = NULL;
 static off_t peak_jit_perfmap_offset = 0;
 static gboolean peak_jit_perfmap_identity_known = FALSE;
@@ -36,6 +45,7 @@ static off_t peak_jit_perfmap_last_size = 0;
 static GPtrArray* peak_jit_pending_records = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static unsigned int peak_jit_test_attach_sequence_index = 0;
+static char* configured_jit_test_attach_sequence = NULL;
 #endif
 
 typedef enum {
@@ -112,8 +122,7 @@ peak_jit_parse_ulong_env(const char* name, unsigned long fallback)
 static const char*
 peak_jit_trace_path(void)
 {
-    const char* path = g_getenv(PEAK_JIT_TRACE_PATH_ENV);
-    return path != NULL && path[0] != '\0' ? path : NULL;
+    return configured_jit_trace_path;
 }
 
 static void
@@ -328,18 +337,13 @@ peak_jit_range_is_executable(uintptr_t address, size_t size)
 static unsigned long
 peak_jit_not_exec_retry_timeout_ms(void)
 {
-    return peak_jit_parse_ulong_env(PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV,
-                                    PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS);
+    return configured_jit_not_exec_retry_timeout_ms;
 }
 
 static unsigned long
 peak_jit_drain_record_budget(void)
 {
-    unsigned long budget =
-        peak_jit_parse_ulong_env(PEAK_JIT_DRAIN_RECORD_BUDGET_ENV,
-                                 PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET);
-
-    return budget == 0 ? PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET : budget;
+    return configured_jit_drain_record_budget;
 }
 
 static void
@@ -460,7 +464,7 @@ peak_jit_consume_overlong_line(FILE* fp, off_t* next_offset_out)
 static gboolean
 peak_jit_test_forced_attach_result(PeakDynamicAttachResult* result_out)
 {
-    const char* sequence = g_getenv(PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV);
+    const char* sequence = configured_jit_test_attach_sequence;
     char** parts;
     char* token;
     gboolean forced = TRUE;
@@ -500,6 +504,51 @@ peak_jit_test_forced_attach_result(PeakDynamicAttachResult* result_out)
     return forced;
 }
 #endif
+
+static void
+peak_jit_init_runtime_config_once(void)
+{
+    const char* providers = g_getenv(PEAK_JIT_PROVIDER_ENV);
+    const char* map_path = g_getenv(PEAK_JIT_MAP_PATH_ENV);
+    const char* trace_path = g_getenv(PEAK_JIT_TRACE_PATH_ENV);
+    unsigned long budget;
+
+    configured_jit_enabled =
+        peak_jit_env_truthy(g_getenv(PEAK_JIT_ENABLE_ENV));
+    if (providers != NULL && providers[0] != '\0') {
+        configured_jit_providers = g_strdup(providers);
+    }
+    if (map_path != NULL && map_path[0] != '\0') {
+        configured_jit_map_path = g_strdup(map_path);
+    }
+    if (trace_path != NULL && trace_path[0] != '\0') {
+        configured_jit_trace_path = g_strdup(trace_path);
+    }
+    configured_jit_not_exec_retry_timeout_ms =
+        peak_jit_parse_ulong_env(PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV,
+                                 PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS);
+    budget =
+        peak_jit_parse_ulong_env(PEAK_JIT_DRAIN_RECORD_BUDGET_ENV,
+                                 PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET);
+    configured_jit_drain_record_budget =
+        budget == 0 ? PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET : budget;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* attach_sequence =
+        g_getenv(PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV);
+    if (attach_sequence != NULL && attach_sequence[0] != '\0') {
+        configured_jit_test_attach_sequence = g_strdup(attach_sequence);
+    }
+#endif
+}
+
+static void
+peak_jit_init_runtime_config(void)
+{
+    if (g_once_init_enter(&peak_jit_runtime_config_initialized)) {
+        peak_jit_init_runtime_config_once();
+        g_once_init_leave(&peak_jit_runtime_config_initialized, 1);
+    }
+}
 
 static PeakDynamicAttachResult
 peak_jit_attach_perfmap_symbol(const char* name, uintptr_t address, size_t size)
@@ -778,16 +827,16 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
 void
 peak_jit_provider_enable(void)
 {
-    const char* enable = g_getenv(PEAK_JIT_ENABLE_ENV);
-    const char* providers = g_getenv(PEAK_JIT_PROVIDER_ENV);
-    const char* map_path = g_getenv(PEAK_JIT_MAP_PATH_ENV);
+    peak_jit_init_runtime_config();
+    const char* providers = configured_jit_providers;
+    const char* map_path = configured_jit_map_path;
 
     peak_jit_provider_disable();
 #ifdef PEAK_ENABLE_TEST_HOOKS
     peak_jit_test_attach_sequence_index = 0;
 #endif
 
-    if (!peak_jit_env_truthy(enable)) {
+    if (!configured_jit_enabled) {
         return;
     }
 

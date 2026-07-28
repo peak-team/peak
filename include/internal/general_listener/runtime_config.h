@@ -78,6 +78,14 @@ unsigned int peak_general_listener_parse_uint_env_default(
     const char* name,
     unsigned int default_value);
 
+/**
+ * Snapshots launcher-local rank metadata before controller threads start.
+ *
+ * Call once during listener initialization. Later heartbeat and controller
+ * reads consume only the immutable cached value.
+ */
+void peak_general_listener_runtime_configure(void);
+
 /** Returns the first valid launcher-provided local MPI rank count, or one. */
 unsigned int peak_general_listener_local_mpi_ranks(void);
 

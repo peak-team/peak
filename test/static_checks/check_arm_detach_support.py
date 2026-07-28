@@ -32,10 +32,14 @@ def main():
     frida_cmake = read(root, "cmake/frida-gum.cmake")
     peak_api = read(root, "cmake/peak-gum/frida-gum-peak-api.h")
     gum_overlay = read(root, "cmake/peak-gum/gum_peak_pc_api.c")
+    raw_syscall = read(root, "cmake/peak-gum/peak_aarch64_raw_syscall.S")
     helper = read(root, "src/detach_helper.c")
+    exec_header = read(root, "include/internal/exec_raw_syscall.h")
+    exec_interceptor = read(root, "src/exec_interceptor.c")
     platform_cmake = read(root, "cmake/exec-platform.cmake")
     source_cmake = read(root, "src/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
+    dlopen_tests_cmake = read(root, "test/dlopen_controller/CMakeLists.txt")
 
     require("peak_exec_configure_platform_support()" in top_cmake and
             "set(PEAK_DETACH_HELPER_SUPPORTED" not in top_cmake,
@@ -101,6 +105,44 @@ def main():
         require(token in gum_overlay, f"Gum overlay missing Arm64 token: {token}")
     require(re.search(r"thunks_by_scratch_reg[\s\S]{0,360}gum_query_page_size", gum_overlay),
             "Arm64 shared thunk classification must conservatively cover the selected thunk page")
+    for token in [
+        ".hidden peak_aarch64_raw_syscall6_raw",
+        "mov x8, x0",
+        "mov x0, x1",
+        "mov x5, x6",
+        "svc #0",
+        "ret",
+    ]:
+        require(token in raw_syscall,
+                f"AArch64 raw-syscall ABI stub missing token: {token}")
+    require("peak_aarch64_raw_syscall6_raw" in gum_overlay and
+            "peak_aarch64_raw_syscall6_raw" in exec_header and
+            "peak_aarch64_raw_syscall6_raw" in exec_interceptor,
+            "Gum wake and exec/vfork probes must share the external AArch64 raw-syscall stub")
+    require(re.search(
+                r"#if defined\(__linux__\) && defined\(__aarch64__\)"
+                r"[\s\S]{0,160}extern \"C\" \{"
+                r"[^}]{0,600}peak_aarch64_raw_syscall6_raw",
+                exec_header),
+            "AArch64 raw-syscall assembly declaration must retain C linkage for C++ users")
+    require("GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 4" in peak_api and
+            "GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 4" in frida_cmake,
+            "patched-devkit validation must reject pre-fix module-sync overlays")
+    for rel, source in [
+        ("cmake/peak-gum/gum_peak_pc_api.c", gum_overlay),
+        ("include/internal/exec_raw_syscall.h", exec_header),
+        ("src/exec_interceptor.c", exec_interceptor),
+    ]:
+        require("register long x" not in source and
+                "__asm__ volatile(\"svc" not in source,
+                f"{rel} must not retain compiler-dependent AArch64 fixed-register syscall asm")
+    require("peak_aarch64_raw_syscall.S" in frida_cmake and
+            "peak_aarch64_raw_syscall.S" in source_cmake and
+            "peak_aarch64_raw_syscall.S" in detach_tests_cmake,
+            "patched Gum, libpeak, and standalone controller tests must all link the raw-syscall stub")
+    require("test_gum_raw_syscall_aarch64" in dlopen_tests_cmake and
+            "test_gum_module_sync_idle_quiesce" in dlopen_tests_cmake,
+            "Arm64 raw syscall and idle module-sync quiesce regressions must remain enabled")
 
     for rel in [
         "test/detach_controller/test_detach_controller.c",

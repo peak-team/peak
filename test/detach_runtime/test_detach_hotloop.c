@@ -487,6 +487,8 @@ typedef gboolean (*PeakRequestReattachFn)(size_t hook_id);
 typedef gboolean (*PeakControllerDrainFn)(unsigned int timeout_ms);
 typedef void (*PeakControllerStopFn)(void);
 typedef gboolean (*PeakControllerShutdownHelperFn)(PeakDetachStatus* status_out);
+typedef gboolean (*PeakControllerReplaceHelperEnvFn)(const char* name,
+                                                     const char* value);
 typedef PeakHookState (*PeakHookStateFn)(size_t hook_id);
 typedef int (*PeakControllerGateEpochFn)(void);
 typedef size_t (*PeakControllerGateWaiterCountFn)(void);
@@ -1375,6 +1377,9 @@ run_controller_no_trace_pending_age_check(void)
     PeakControllerShutdownHelperFn shutdown_helper =
         (PeakControllerShutdownHelperFn)required_symbol(
             "peak_detach_controller_shutdown_helper");
+    PeakControllerReplaceHelperEnvFn replace_helper_env =
+        (PeakControllerReplaceHelperEnvFn)required_symbol(
+            "peak_detach_controller_test_replace_helper_env");
     PeakHookStateFn hook_state =
         (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
     GumInterceptor** interceptor_slot =
@@ -1390,6 +1395,7 @@ run_controller_no_trace_pending_age_check(void)
         controller_drain == NULL ||
         controller_stop == NULL ||
         shutdown_helper == NULL ||
+        replace_helper_env == NULL ||
         hook_state == NULL ||
         interceptor_slot == NULL ||
         listeners_slot == NULL ||
@@ -1412,16 +1418,18 @@ run_controller_no_trace_pending_age_check(void)
         return 2;
     }
     unsetenv("PEAK_DETACH_TRACE_PATH");
+    controller_stop();
     if (!shutdown_helper(NULL)) {
         fprintf(stderr, "failed to close startup helper before no-trace retry check\n");
         return 2;
     }
-    if (setenv("FAKE_DETACH_HELPER_SCENARIO", "stop-timeout", 1) != 0) {
-        perror("setenv FAKE_DETACH_HELPER_SCENARIO");
+    if (!replace_helper_env("FAKE_DETACH_HELPER_SCENARIO",
+                            "stop-timeout")) {
+        fprintf(stderr,
+                "failed to replace cached fake-helper scenario for no-trace retry check\n");
         return 2;
     }
 
-    controller_stop();
     if (!request_detach(0)) {
         fprintf(stderr, "failed to queue no-trace pending-age detach request\n");
         return 2;

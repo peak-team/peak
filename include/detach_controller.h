@@ -82,7 +82,10 @@ void peak_detach_controller_warmup_backend(void);
 /*
  * Auto mode uses the in-process signal backend for MPI applications. This
  * avoids helper fork/ptrace activity during MPI initialization and progress;
- * an explicitly requested helper backend is not changed.
+ * an explicitly requested helper backend is not changed. PEAK calls this once
+ * during initialization, before MPI startup or controller mutations; the call
+ * also freezes all environment-derived controller policy, helper launch
+ * inputs, and timeout configuration for the process.
  */
 void peak_detach_controller_configure_mpi_process(gboolean is_mpi_process);
 
@@ -121,6 +124,15 @@ peak_detach_controller_test_gate_waiter_count(void);
 
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
+
+/*
+ * Replace an already-snapshotted helper environment entry after the
+ * controller and helper have both stopped.  This is an explicit-value test
+ * hook: it never rereads environ and is absent from production builds.
+ */
+PEAK_DETACH_CONTROLLER_TEST_API gboolean
+peak_detach_controller_test_replace_helper_env(const char* name,
+                                               const char* value);
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 PEAK_DETACH_CONTROLLER_TEST_API void

@@ -111,6 +111,9 @@ static unsigned long long dynamic_attach_drop_requeue_count = 0;
 static unsigned long long dynamic_attach_partial_success_count = 0;
 static unsigned long long dynamic_attach_retained_handle_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
+static gsize dlopen_runtime_config_initialized = 0;
+static gboolean configured_dlopen_debug_enabled = FALSE;
+static gchar* configured_dlopen_trace_path = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
 static __thread gboolean dynamic_attach_test_explicit_drain = FALSE;
@@ -126,14 +129,40 @@ static gboolean dynamic_attach_test_callback_waiting_for_drain = FALSE;
 #endif
 
 static gboolean
-dlopen_interceptor_debug_enabled(void)
+dlopen_interceptor_parse_truthy(const char* value)
 {
-    const char* value = g_getenv("PEAK_DLOPEN_DEBUG");
     return value != NULL &&
            (g_ascii_strcasecmp(value, "1") == 0 ||
             g_ascii_strcasecmp(value, "true") == 0 ||
             g_ascii_strcasecmp(value, "yes") == 0 ||
             g_ascii_strcasecmp(value, "on") == 0);
+}
+
+static void
+dlopen_interceptor_init_runtime_config_once(void)
+{
+    const char* trace_path = g_getenv("PEAK_DLOPEN_TRACE_PATH");
+
+    configured_dlopen_debug_enabled =
+        dlopen_interceptor_parse_truthy(g_getenv("PEAK_DLOPEN_DEBUG"));
+    if (trace_path != NULL && trace_path[0] != '\0') {
+        configured_dlopen_trace_path = g_strdup(trace_path);
+    }
+}
+
+static void
+dlopen_interceptor_init_runtime_config(void)
+{
+    if (g_once_init_enter(&dlopen_runtime_config_initialized)) {
+        dlopen_interceptor_init_runtime_config_once();
+        g_once_init_leave(&dlopen_runtime_config_initialized, 1);
+    }
+}
+
+static gboolean
+dlopen_interceptor_debug_enabled(void)
+{
+    return configured_dlopen_debug_enabled;
 }
 
 typedef struct {
@@ -375,7 +404,7 @@ dlopen_interceptor_get_dynamic_attach_diagnostics(
 static void
 dlopen_interceptor_trace_counters(const char* event)
 {
-    const char* path = g_getenv("PEAK_DLOPEN_TRACE_PATH");
+    const char* path = configured_dlopen_trace_path;
     gboolean debug = dlopen_interceptor_debug_enabled();
     unsigned long long enqueued;
     unsigned long long drained;
@@ -1286,6 +1315,7 @@ dlopen_interceptor_test_retryable_prepare_status(int status)
 void
 dlopen_interceptor_test_trace_counters(const char* event)
 {
+    dlopen_interceptor_init_runtime_config();
     dlopen_interceptor_trace_counters(event);
 }
 
@@ -2178,6 +2208,7 @@ int dlopen_interceptor_attach()
 {
     GumAttachReturn attach_status = GUM_ATTACH_WRONG_SIGNATURE;
     gboolean startup_attach_can_skip_stop;
+    dlopen_interceptor_init_runtime_config();
     dlopen_interceptor = gum_interceptor_obtain();
     dlopen_hook_address = peak_general_listener_find_function("dlopen");
     dlopen_interceptor_initialize_fftw_target_scope();

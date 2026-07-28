@@ -1,13 +1,15 @@
 #include "logging.h"
 
 #include <ctype.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PEAK_VERBOSITY_ENV "PEAK_VERBOSITY"
 
-static int peak_log_cached_verbosity = -1;
+static pthread_once_t peak_log_configuration_once = PTHREAD_ONCE_INIT;
+static PeakVerbosity peak_log_cached_verbosity = PEAK_VERBOSITY_WARN;
 
 static int
 peak_log_streq_ci(const char* left, const char* right)
@@ -84,23 +86,33 @@ peak_log_parse_verbosity(const char* value, int* valid)
     return PEAK_VERBOSITY_WARN;
 }
 
+static void
+peak_log_configure_once(void)
+{
+    const char* value = getenv(PEAK_VERBOSITY_ENV);
+    int valid = 1;
+    PeakVerbosity verbosity = peak_log_parse_verbosity(value, &valid);
+
+    peak_log_cached_verbosity = verbosity;
+    if (!valid) {
+        fprintf(stderr,
+                "[peak] ignoring invalid %s=%s; using warn verbosity\n",
+                PEAK_VERBOSITY_ENV,
+                value != NULL ? value : "");
+    }
+}
+
+void
+peak_log_configure(void)
+{
+    (void)pthread_once(&peak_log_configuration_once,
+                       peak_log_configure_once);
+}
+
 static PeakVerbosity
 peak_log_verbosity(void)
 {
-    if (peak_log_cached_verbosity < 0) {
-        const char* value = getenv(PEAK_VERBOSITY_ENV);
-        int valid = 1;
-        PeakVerbosity verbosity = peak_log_parse_verbosity(value, &valid);
-
-        peak_log_cached_verbosity = (int)verbosity;
-        if (!valid) {
-            fprintf(stderr,
-                    "[peak] ignoring invalid %s=%s; using warn verbosity\n",
-                    PEAK_VERBOSITY_ENV,
-                    value != NULL ? value : "");
-        }
-    }
-
+    peak_log_configure();
     return (PeakVerbosity)peak_log_cached_verbosity;
 }
 

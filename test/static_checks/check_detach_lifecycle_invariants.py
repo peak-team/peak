@@ -560,6 +560,15 @@ def check_final_report_snapshot_order(repo_root):
     local_ranks = extract_function(
         runtime_config, "peak_general_listener_local_mpi_ranks"
     )
+    detect_local_ranks = extract_function(
+        runtime_config, "peak_general_listener_detect_local_mpi_ranks"
+    )
+    configure_runtime = extract_function(
+        runtime_config, "peak_general_listener_runtime_configure"
+    )
+    listener_attach = extract_function(
+        general, "peak_general_listener_attach"
+    )
     parse_positive_uint = extract_function(
         runtime_config, "peak_general_listener_parse_positive_uint_text"
     )
@@ -627,13 +636,19 @@ def check_final_report_snapshot_order(repo_root):
 
     require("parsed == 0" in parse_positive_uint and
             "parsed > UINT_MAX" in parse_positive_uint and
-            "MPI_LOCALNRANKS" in local_ranks and
-            "OMPI_COMM_WORLD_LOCAL_SIZE" in local_ranks and
-            "MV2_COMM_WORLD_LOCAL_SIZE" in local_ranks and
-            "PMI_LOCAL_SIZE" in local_ranks and
-            "return parsed;" in local_ranks and
-            "return 1U;" in local_ranks,
+            "MPI_LOCALNRANKS" in detect_local_ranks and
+            "OMPI_COMM_WORLD_LOCAL_SIZE" in detect_local_ranks and
+            "MV2_COMM_WORLD_LOCAL_SIZE" in detect_local_ranks and
+            "PMI_LOCAL_SIZE" in detect_local_ranks and
+            "return parsed;" in detect_local_ranks and
+            "return 1U;" in detect_local_ranks,
             "local MPI rank discovery must reject invalid values and fall back to one")
+    require("configured_local_mpi_ranks" in local_ranks and
+            "getenv" not in local_ranks and
+            "peak_general_listener_detect_local_mpi_ranks()" in
+            configure_runtime and
+            "peak_general_listener_runtime_configure();" in listener_attach,
+            "heartbeat local-rank policy must be snapshotted before the controller starts")
     require("peak_general_listener_multiply_nonnegative_finite" in control_risk and
             "peak_general_listener_local_mpi_ranks()" in control_risk and
             "return DBL_MAX;" in control_risk,
@@ -1618,6 +1633,12 @@ def check_mpi_startup_helper_warmup(repo_root):
     require(check_mpi_position < configure_position <
             pthread_attach_position < warmup_position,
             "MPI auto-backend containment must be configured before helper warmup or listener mutation")
+    non_mpi_configure_position = body.find(
+        "peak_detach_controller_configure_mpi_process(FALSE);"
+    )
+    require(non_mpi_configure_position != -1 and
+            non_mpi_configure_position < pthread_attach_position,
+            "non-MPI builds must freeze controller configuration explicitly before listener mutation")
     warmup_context = body[max(0, warmup_position - 180):warmup_position + 80]
     require("!found_MPI" in warmup_context,
             "helper warmup must be suppressed for MPI-linked programs before PMPI_Init")
@@ -1906,6 +1927,177 @@ def check_dlopen_test_hook_visibility(repo_root):
             "PEAK_ENABLE_TEST_HOOKS must be private to libpeak test builds")
 
 
+def check_runtime_configuration_freeze(repo_root):
+    logging = read_source(repo_root, "src/logging.c")
+    signal_policy = read_source(repo_root, "src/signal_policy.c")
+    controller = read_source(repo_root, "src/detach_controller.c")
+    peak = read_source(repo_root, "src/peak.c")
+    general = read_source(repo_root, "src/general_listener.c")
+    runtime_config = read_source(
+        repo_root, "src/general_listener/runtime_config.c"
+    )
+    dlopen = read_source(repo_root, "src/dlopen_interceptor.c")
+    jit = read_source(repo_root, "src/jit_provider.c")
+    product_cmake = read_source(repo_root, "src/CMakeLists.txt")
+    test_cmake = read_source(repo_root, "test/CMakeLists.txt")
+    hotloop_test = read_source(
+        repo_root, "test/detach_runtime/test_detach_hotloop.c"
+    )
+
+    log_configure_once = extract_function(logging, "peak_log_configure_once")
+    log_configure = extract_function(logging, "peak_log_configure")
+    log_verbosity = extract_function(logging, "peak_log_verbosity")
+    peak_init = extract_function(peak, "peak_init")
+    controller_configure = extract_function(
+        controller, "peak_detach_controller_configure_mpi_process"
+    )
+    require("getenv(PEAK_VERBOSITY_ENV)" in log_configure_once and
+            "pthread_once(&peak_log_configuration_once" in log_configure and
+            "getenv" not in log_verbosity and
+            "peak_log_configure();" in peak_init and
+            "peak_log_configure();" in controller_configure,
+            "logging verbosity must be frozen before controller threads and "
+            "later log sites must only consume the immutable cache")
+
+    signal_configure_once = extract_function(
+        signal_policy, "peak_signal_policy_configure_once"
+    )
+    signal_configure = extract_function(
+        signal_policy, "peak_signal_policy_configure"
+    )
+    signal_choose = extract_function(
+        signal_policy, "peak_signal_policy_choose_reserved_signal"
+    )
+    signal_forced = extract_function(
+        signal_policy, "peak_signal_policy_env_forces_signal"
+    )
+    signal_constructor = extract_function(
+        signal_policy, "peak_signal_policy_constructor"
+    )
+    require('getenv("PEAK_DETACH_SIGNAL")' in signal_configure_once and
+            "pthread_once(&signal_configuration_once" in signal_configure and
+            "getenv" not in signal_choose and
+            "getenv" not in signal_forced and
+            "peak_signal_policy_configure();" in signal_constructor and
+            "peak_signal_policy_configure();" in controller_configure,
+            "reserved-signal selection must snapshot its environment before "
+            "controller use")
+
+    general_attach = extract_function(general, "peak_general_listener_attach")
+    reattach_ready = extract_function(
+        general, "peak_general_listener_reattach_cooldown_ready_unlocked"
+    )
+    retry_exceeded = extract_function(
+        general, "peak_general_controller_retry_budget_exceeded_unlocked"
+    )
+    shutdown_drain = extract_function(
+        general, "peak_general_controller_shutdown_drain_ms"
+    )
+    trace_enabled = extract_function(
+        general, "peak_general_controller_trace_enabled"
+    )
+    general_initializers = (
+        "peak_general_listener_runtime_configure();",
+        "peak_general_listener_init_reattach_policy();",
+        "peak_general_controller_init_retry_limits();",
+        "peak_general_controller_init_shutdown_policy();",
+        "peak_general_controller_init_trace_config();",
+    )
+    require(all(initializer in general_attach
+                for initializer in general_initializers),
+            "general-listener policy must be frozen during attach before the "
+            "controller starts")
+    for label, body in (
+        ("reattach cooldown", reattach_ready),
+        ("retry budget", retry_exceeded),
+        ("shutdown drain", shutdown_drain),
+        ("controller trace gate", trace_enabled),
+    ):
+        require("getenv" not in body and "g_getenv" not in body,
+                f"{label} runtime decision must only read cached configuration")
+
+    runtime_configure = extract_function(
+        runtime_config, "peak_general_listener_runtime_configure"
+    )
+    local_ranks = extract_function(
+        runtime_config, "peak_general_listener_local_mpi_ranks"
+    )
+    require("peak_general_listener_detect_local_mpi_ranks()" in
+            runtime_configure and
+            "getenv" not in local_ranks and
+            "configured_local_mpi_ranks" in local_ranks,
+            "heartbeat local-rank policy must be snapshotted before thread "
+            "startup")
+
+    dlopen_config_once = extract_function(
+        dlopen, "dlopen_interceptor_init_runtime_config_once"
+    )
+    dlopen_config = extract_function(
+        dlopen, "dlopen_interceptor_init_runtime_config"
+    )
+    dlopen_debug = extract_function(
+        dlopen, "dlopen_interceptor_debug_enabled"
+    )
+    dlopen_trace = extract_function(
+        dlopen, "dlopen_interceptor_trace_counters"
+    )
+    dlopen_attach = extract_function(dlopen, "dlopen_interceptor_attach")
+    require("PEAK_DLOPEN_TRACE_PATH" in dlopen_config_once and
+            "PEAK_DLOPEN_DEBUG" in dlopen_config_once and
+            "g_once_init_enter(&dlopen_runtime_config_initialized)" in
+            dlopen_config and
+            "getenv" not in dlopen_debug and
+            "g_getenv" not in dlopen_debug and
+            "getenv" not in dlopen_trace and
+            "g_getenv" not in dlopen_trace and
+            "dlopen_interceptor_init_runtime_config();" in dlopen_attach,
+            "dlopen diagnostics must be frozen before loader/controller "
+            "callbacks can consume them")
+
+    jit_config_once = extract_function(
+        jit, "peak_jit_init_runtime_config_once"
+    )
+    jit_config = extract_function(jit, "peak_jit_init_runtime_config")
+    jit_trace_path = extract_function(jit, "peak_jit_trace_path")
+    jit_retry_timeout = extract_function(
+        jit, "peak_jit_not_exec_retry_timeout_ms"
+    )
+    jit_drain_budget = extract_function(jit, "peak_jit_drain_record_budget")
+    jit_provider_enable = extract_function(jit, "peak_jit_provider_enable")
+    require("g_getenv" in jit_config_once and
+            "g_once_init_enter(&peak_jit_runtime_config_initialized)" in
+            jit_config and
+            "g_getenv" not in jit_trace_path and
+            "g_getenv" not in jit_retry_timeout and
+            "g_getenv" not in jit_drain_budget and
+            "peak_jit_init_runtime_config();" in jit_provider_enable,
+            "JIT controller policy must be snapshotted before provider work")
+
+    require("PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV" in test_cmake and
+            "PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV" not in product_cmake and
+            "PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV" not in
+            product_cmake,
+            "mutable environment refresh hooks must remain isolated from "
+            "libpeak product targets")
+    replace_helper_env = extract_function(
+        controller, "peak_detach_controller_test_replace_helper_env"
+    )
+    no_trace_pending_age = extract_function(
+        hotloop_test, "run_controller_no_trace_pending_age_check"
+    )
+    require("getenv" not in replace_helper_env and
+            "g_getenv" not in replace_helper_env and
+            "helper_fd >= 0" in replace_helper_env and
+            "helper_pid > 0" in replace_helper_env and
+            "held_mutation.active" in replace_helper_env and
+            "peak_detach_controller_test_replace_helper_env" in
+            no_trace_pending_age and
+            'setenv("FAKE_DETACH_HELPER_SCENARIO"' not in
+            no_trace_pending_age,
+            "the no-trace failure test must update only an explicit stopped-"
+            "helper test snapshot, never reread live process environment")
+
+
 def check_shutdown_fail_closed_docs(repo_root):
     docs = (repo_root / "docs/physical-detach-controller.md").read_text(
         encoding="utf-8"
@@ -1983,11 +2175,112 @@ def check_signal_backend_strict_invariants(repo_root):
     )
     pthread_start = extract_function(pthread_listener, "peak_pthread_start")
     controller_mode = extract_function(controller, "peak_detach_controller_mode")
+    backend_configuration = extract_function(
+        controller, "peak_detach_controller_init_backend_configuration_once"
+    )
+    helper_configuration = extract_function(
+        controller, "peak_detach_controller_init_helper_configuration_once"
+    )
+    helper_environment = extract_function(
+        controller, "peak_detach_controller_snapshot_helper_env"
+    )
+    helper_path = extract_function(
+        controller, "peak_detach_controller_helper_path"
+    )
+    helper_env = extract_function(
+        controller, "peak_detach_controller_helper_env"
+    )
+    requested_backend = extract_function(
+        controller, "peak_detach_controller_requested_backend"
+    )
+    auto_backend = extract_function(
+        controller, "peak_detach_controller_auto_should_use_signal_backend"
+    )
+    configure_mpi = extract_function(
+        controller, "peak_detach_controller_configure_mpi_process"
+    )
+    warmup_backend = extract_function(
+        controller, "peak_detach_controller_warmup_backend"
+    )
+    prepare_mutation = extract_function(
+        controller, "peak_detach_controller_prepare_hook_mutation"
+    )
+    prepare_batch = extract_function(
+        controller, "peak_detach_controller_prepare_hook_mutation_batch"
+    )
+    wait_for_mutation = extract_function(
+        controller, "peak_detach_controller_wait_for_mutation_window"
+    )
+    test_gate_delay = extract_function(
+        controller, "peak_detach_controller_test_delay_after_gate_begin"
+    )
 
     require("PEAK_SAFE_DETACH_MODE_STRICT" in controller_mode and
+            "getenv" not in controller_mode and
             '"compatibility"' not in controller_mode and
             '"legacy"' not in controller_mode,
-            "strict-auto must be the only runtime-selected detach mode")
+            "strict-auto must be the only runtime-selected detach mode and must not reread its environment")
+    require('g_getenv("PEAK_DETACH_BACKEND")' in backend_configuration and
+            'g_getenv("PEAK_SAFE_DETACH_MODE")' in backend_configuration and
+            'g_getenv("PEAK_TEST_PTRACE_SCOPE")' in backend_configuration and
+            'fopen("/proc/sys/kernel/yama/ptrace_scope", "r")'
+            in backend_configuration and
+            "strtol(scope_value, &end, 10)" in backend_configuration,
+            "detach backend and ptrace policy must be parsed by the initialization cache")
+    require("getenv" not in test_gate_delay and
+            "strtoul" not in test_gate_delay and
+            "configured_test_gate_delay_us" in test_gate_delay,
+            "test-only mutation delay must consume initialization-time configuration without rereading the environment")
+    for name, body in (
+        ("requested backend", requested_backend),
+        ("auto backend", auto_backend),
+        ("helper path", helper_path),
+        ("helper environment", helper_env),
+    ):
+        require("getenv" not in body and
+                "fopen" not in body and
+                "strtol" not in body,
+                f"{name} mutation decision must only read cached configuration")
+    require('g_getenv("PEAK_DETACH_HELPER")' in helper_configuration and
+            "peak_detach_controller_snapshot_helper_env()" in
+            helper_configuration and
+            "while (environ[count] != NULL)" in helper_environment,
+            "helper path and sanitized environment must be snapshotted during initialization")
+    require("peak_detach_controller_cache_backend_configuration();"
+            in configure_mpi and
+            "peak_detach_controller_cache_backend_configuration();"
+            in warmup_backend and
+            "peak_detach_controller_cache_helper_configuration();"
+            in configure_mpi and
+            "peak_detach_controller_cache_helper_configuration();"
+            in warmup_backend and
+            "peak_detach_controller_init_strict_gate_wait_timeout();"
+            in configure_mpi and
+            "peak_detach_controller_init_strict_gate_wait_timeout();"
+            in warmup_backend,
+            "PEAK initialization entry points must cache all environment-derived controller policy before runtime mutations")
+    require("pthread_once(&backend_configuration_initialized" in controller and
+            "pthread_once(&helper_configuration_initialized" in controller and
+            "peak_detach_controller_cache_backend_configuration" not in prepare_mutation and
+            "peak_detach_controller_cache_backend_configuration" not in prepare_batch and
+            "peak_detach_controller_cache_helper_configuration" not in prepare_mutation and
+            "peak_detach_controller_cache_helper_configuration" not in prepare_batch and
+            "peak_detach_controller_init_strict_gate_wait_timeout" not in
+            wait_for_mutation,
+            "controller mutations must consume the one-time initialization cache without lazy configuration parsing")
+    controller_tests_cmake = read_source(
+        repo_root, "test/detach_controller/CMakeLists.txt"
+    )
+    product_cmake = read_source(repo_root, "src/CMakeLists.txt")
+    require("PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV" in
+            controller_tests_cmake and
+            "PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV" not in
+            product_cmake and
+            "#ifdef PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV" in
+            controller and
+            "#ifdef PEAK_ENABLE_TEST_HOOKS\nstatic void\npeak_detach_controller_free_helper_env_snapshot"
+            not in controller,
+            "helper-environment refresh must remain isolated to standalone controller test executables, never libpeak test builds")
     require("_Atomic int rewrite_status" in controller,
             "signal backend must keep observable per-thread rewrite status")
     require("peak_detach_controller_signal_wait_for_release" in signal_handler and
@@ -2331,6 +2624,7 @@ def main():
     check_general_controller_dlopen_drain_order(repo_root)
     check_exclusive_time_nonnegative(repo_root)
     check_dlopen_test_hook_visibility(repo_root)
+    check_runtime_configuration_freeze(repo_root)
     check_shutdown_fail_closed_docs(repo_root)
     check_signal_backend_strict_invariants(repo_root)
     print("detach_lifecycle_invariants_ok")

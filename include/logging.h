@@ -25,6 +25,15 @@ typedef enum {
     PEAK_VERBOSITY_DEBUG = 4,
 } PeakVerbosity;
 
+/**
+ * @brief Freeze `PEAK_VERBOSITY` for the lifetime of the process.
+ *
+ * PEAK calls this during single-threaded runtime initialization so later
+ * controller and callback diagnostics never inspect a concurrently changing
+ * process environment. Repeated calls are thread-safe no-ops.
+ */
+void peak_log_configure(void);
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_PRINTF_FORMAT(fmt_index, first_arg) \
     __attribute__((format(printf, fmt_index, first_arg)))

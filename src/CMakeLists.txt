@@ -32,6 +32,11 @@ set(sources_peak
 # the shared platform contract used at the project root and in platform tests.
 peak_exec_append_raw_syscall_trampoline(
     sources_peak exec_raw_syscall_trampoline.S)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    list(APPEND sources_peak
+        ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
     add_library(cuda_interceptor_obj OBJECT cuda_interceptor.cpp)

@@ -418,11 +418,13 @@ peak_exec_child_pid(void)
                      : "rcx", "r11", "memory");
     return pid;
 #elif defined(SYS_getpid) && defined(__aarch64__)
-    register long x0 __asm__("x0");
-    register long x8 __asm__("x8") = (long)SYS_getpid;
-
-    __asm__ volatile("svc #0" : "=r"(x0) : "r"(x8) : "cc", "memory");
-    return x0;
+    return peak_aarch64_raw_syscall6_raw((long)SYS_getpid,
+                                         0,
+                                         0,
+                                         0,
+                                         0,
+                                         0,
+                                         0);
 #else
     return (long)getpid();
 #endif
@@ -452,19 +454,14 @@ peak_exec_child_read(const void* remote, void* local, size_t length)
                        "r"(r9)
                      : "rcx", "r11", "memory");
 #elif defined(SYS_process_vm_readv) && defined(__aarch64__)
-    register long x0 __asm__("x0") = peak_exec_child_pid();
-    register long x1 __asm__("x1") = (long)&local_iov;
-    register long x2 __asm__("x2") = 1L;
-    register long x3 __asm__("x3") = (long)&remote_iov;
-    register long x4 __asm__("x4") = 1L;
-    register long x5 __asm__("x5") = 0L;
-    register long x8 __asm__("x8") = (long)SYS_process_vm_readv;
-
-    __asm__ volatile("svc #0"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
-                     : "cc", "memory");
-    copied = x0;
+    copied = peak_aarch64_raw_syscall6_raw(
+        (long)SYS_process_vm_readv,
+        peak_exec_child_pid(),
+        (long)&local_iov,
+        1L,
+        (long)&remote_iov,
+        1L,
+        0L);
 #else
     copied = -1;
 #endif

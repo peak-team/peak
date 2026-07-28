@@ -45,6 +45,15 @@ if(PEAK_EXEC_RAW_SYSCALL_SUPPORTED)
       ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall_trampoline.S)
   endif()
 endif()
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  target_sources(test_detach_controller PRIVATE
+    ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+  if(TARGET test_detach_listener_shutdown)
+    target_sources(test_detach_listener_shutdown PRIVATE
+      ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+  endif()
+endif()
 
 target_include_directories(test_detach_fake_helper
   PRIVATE
@@ -60,7 +69,8 @@ target_include_directories(test_detach_controller
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   target_compile_definitions(test_detach_controller PRIVATE
     PEAK_HAVE_GUM_PEAK_PC_API=1
-    PEAK_ENABLE_TEST_HOOKS=1)
+    PEAK_ENABLE_TEST_HOOKS=1
+    PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV=1)
 endif()
 target_compile_definitions(test_detach_controller PRIVATE
   PEAK_EXEC_RAW_SYSCALL_STANDALONE=1)
@@ -74,6 +84,7 @@ if(TARGET test_detach_listener_shutdown)
     PRIVATE
       PEAK_HAVE_GUM_PEAK_PC_API=1
       PEAK_ENABLE_TEST_HOOKS=1
+      PEAK_DETACH_CONTROLLER_TEST_REFRESH_HELPER_ENV=1
       PEAK_EXEC_RAW_SYSCALL_STANDALONE=1)
 endif()
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -165,6 +176,15 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
   set_tests_properties(test_detach_controller_strict_helper_empty
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_HELPER=$<TARGET_FILE:peak_detach_helper>"
+      SKIP_RETURN_CODE 77
+  )
+
+  add_test(NAME test_detach_controller_cached_helper_configuration
+    COMMAND test_detach_controller cached-helper-configuration
+  )
+  set_tests_properties(test_detach_controller_cached_helper_configuration
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:peak_detach_helper>"
       SKIP_RETURN_CODE 77
   )
 
@@ -340,6 +360,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_auto_ptrace_scope_uses_signal
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_VERBOSITY=info;PEAK_TEST_PTRACE_SCOPE=2;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;FAKE_DETACH_HELPER_SCENARIO=stop-permission"
+      PASS_REGULAR_EXPRESSION "auto safe detach using signal backend because ptrace_scope=2"
+      SKIP_RETURN_CODE 77)
+
+  add_test(NAME test_detach_controller_cached_auto_backend_configuration
+    COMMAND test_detach_controller cached-auto-backend-configuration)
+  set_tests_properties(test_detach_controller_cached_auto_backend_configuration
+    PROPERTIES
+      ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=auto;PEAK_VERBOSITY=info;PEAK_TEST_PTRACE_SCOPE=2;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=stop-permission;FAKE_DETACH_HELPER_LOG=${PROJECT_BINARY_DIR}/test/detach_controller/cached-auto-backend.log"
       PASS_REGULAR_EXPRESSION "auto safe detach using signal backend because ptrace_scope=2"
       SKIP_RETURN_CODE 77)
 
