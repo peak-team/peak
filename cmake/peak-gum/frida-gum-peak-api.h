@@ -56,13 +56,16 @@ typedef GumPeakFastEnterResult (* GumPeakFastEnterFunc)(
     gpointer function_context,
     gpointer stack_address,
     gpointer caller_return_address);
-typedef gpointer (* GumPeakFastLeaveFunc)(
+typedef gboolean (* GumPeakFastLeaveFunc)(
     gpointer user_data,
-    gpointer function_context);
+    gpointer function_context,
+    gpointer * caller_return_address);
 typedef gboolean (* GumPeakFastIsDirectLeaveFunc)(
     gpointer user_data,
     gpointer function_context);
 typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
+typedef guint (* GumPeakFastActiveCloseFunc)(gpointer user_data);
+typedef void (* GumPeakFastActiveResetFunc)(gpointer user_data);
 
 typedef struct _GumPeakFastListener {
     guint version;
@@ -70,6 +73,8 @@ typedef struct _GumPeakFastListener {
     GumPeakFastLeaveFunc on_leave;
     GumPeakFastIsDirectLeaveFunc is_direct_leave;
     GumPeakFastActiveCountFunc active_count;
+    GumPeakFastActiveCloseFunc active_close;
+    GumPeakFastActiveResetFunc active_reset;
     gpointer user_data;
     GumInvocationListener * listener_instance;
     gpointer dispatch_start;
@@ -79,7 +84,7 @@ typedef struct _GumPeakFastListener {
     volatile gint release_required;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 2u
+#define GUM_PEAK_FAST_LISTENER_VERSION 3u
 
 GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
     GumInterceptor * interceptor,
@@ -88,9 +93,16 @@ GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
     GumPeakFastListener * fast_listener);
 
 /*
- * Called while PEAK's existing stop-the-world mutation guard is active.
- * Seeds Gum's deferred-destruction counter from PEAK's per-thread active
- * slots, so the steady state needs no shared atomic reference count.
+ * Called while PEAK's existing stop-the-world mutation guard is active. The
+ * guard must hold every tracked thread whose PC is in the function's enter,
+ * invoke, or leave trampoline, or in either PEAK fast-dispatch section. This
+ * closes the small boundary before the listener claims its slot and after it
+ * releases the slot without adding a shared reference count to every call.
+ *
+ * Thread-exit and non-local-unwind cleanup can run outside that PC snapshot.
+ * The listener's active_close callback therefore performs a separate slow
+ * handoff with those abandon paths before returning the active-frame total.
+ * This function then seeds Gum's deferred-destruction counter from that total.
  */
 GUM_API gboolean gum_interceptor_peak_prepare_fast_detach(
     GumInterceptor * interceptor,
@@ -99,7 +111,8 @@ GUM_API gboolean gum_interceptor_peak_prepare_fast_detach(
 
 /* Releases a fast frame skipped by non-local unwind or thread exit. */
 G_GNUC_INTERNAL void gum_interceptor_peak_release_fast_invocation(
-    gpointer function_context);
+    gpointer function_context,
+    GumPeakFastListener * fast_listener);
 
 typedef enum {
     GUM_PEAK_PC_SAFE = 0,

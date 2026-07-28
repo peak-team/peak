@@ -551,6 +551,16 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "fan-out mismatch|attach failed|fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 20)
 
+        add_test(NAME test_fastpath_lifetime_handoff
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_lifetime_handoff)
+        set_tests_properties(test_fastpath_lifetime_handoff
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_lifetime_handoff_target;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_lifetime_handoff_ok"
+                FAIL_REGULAR_EXPRESSION "handoff did not flush|restore failed|fatal|Gum [^\\r\\n]* failed"
+                TIMEOUT 20)
+
         add_test(NAME test_detach_hotloop_strict
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop --threads 4 --seconds 2)
         set_tests_properties(test_detach_hotloop_strict

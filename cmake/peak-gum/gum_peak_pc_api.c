@@ -1153,7 +1153,9 @@ gum_interceptor_peak_enable_fast_listener(
         fast_listener->listener_instance != listener ||
         fast_listener->dispatch_start == NULL ||
         fast_listener->dispatch_size == 0 ||
-        fast_listener->active_count == NULL) {
+        fast_listener->active_count == NULL ||
+        fast_listener->active_close == NULL ||
+        fast_listener->active_reset == NULL) {
         return FALSE;
     }
 
@@ -1172,6 +1174,7 @@ gum_interceptor_peak_enable_fast_listener(
         g_atomic_pointer_set(
             &fast_listener->listener_entries_cookie,
             g_atomic_pointer_get(&context->listener_entries));
+        fast_listener->active_reset(fast_listener->user_data);
         g_atomic_int_set(&fast_listener->release_required, 0);
         g_atomic_pointer_set(&context->write_redirect_data, fast_listener);
         g_atomic_int_set(&fast_listener->enabled, 1);
@@ -1208,7 +1211,7 @@ gum_interceptor_peak_prepare_fast_detach(
         prepared = TRUE;
     } else if (fast_listener != NULL) {
         g_atomic_int_set(&fast_listener->enabled, 0);
-        active = fast_listener->active_count(fast_listener->user_data);
+        active = fast_listener->active_close(fast_listener->user_data);
         current = g_atomic_int_get(&context->trampoline_usage_counter);
         if (g_atomic_int_get(&fast_listener->release_required) != 0) {
             prepared = TRUE;
@@ -1219,6 +1222,7 @@ gum_interceptor_peak_prepare_fast_detach(
                                  (gint)active);
                 g_atomic_int_set(&fast_listener->release_required, 1);
             } else {
+                g_atomic_int_set(&fast_listener->release_required, 1);
                 g_atomic_pointer_compare_and_exchange(
                     &context->write_redirect_data, fast_listener, NULL);
             }
@@ -1231,14 +1235,21 @@ gum_interceptor_peak_prepare_fast_detach(
 }
 
 void PEAK_GUM_FAST_DISPATCH_SECTION
-gum_interceptor_peak_release_fast_invocation(gpointer function_context)
+gum_interceptor_peak_release_fast_invocation(
+    gpointer function_context,
+    GumPeakFastListener * fast_listener)
 {
     PeakGumFunctionContext17 * context = function_context;
-    GumPeakFastListener * fast_listener =
-        peak_gum_context_fast_listener(context);
 
     if (context != NULL && fast_listener != NULL &&
-        g_atomic_int_get(&fast_listener->release_required) != 0) {
+        fast_listener->version == GUM_PEAK_FAST_LISTENER_VERSION) {
+        while (g_atomic_int_get(&fast_listener->release_required) == 0) {
+#if defined(__x86_64__) || defined(__amd64__)
+            __asm__ volatile("pause");
+#elif defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
         if (!context->destroyed &&
             g_atomic_int_get(&fast_listener->enabled) == 0 &&
             fast_listener->active_count(fast_listener->user_data) == 0) {
@@ -1303,10 +1314,20 @@ _gum_function_context_end_invocation(
     if (G_LIKELY(fast_listener != NULL) &&
         fast_listener->is_direct_leave(fast_listener->user_data,
                                        function_ctx)) {
+        gpointer return_address = NULL;
         gboolean release_required =
-            g_atomic_int_get(&fast_listener->release_required) != 0;
-        gpointer return_address =
-            fast_listener->on_leave(fast_listener->user_data, function_ctx);
+            fast_listener->on_leave(fast_listener->user_data,
+                                    function_ctx,
+                                    &return_address);
+        if (G_UNLIKELY(release_required)) {
+            while (g_atomic_int_get(&fast_listener->release_required) == 0) {
+#if defined(__x86_64__) || defined(__amd64__)
+                __asm__ volatile("pause");
+#elif defined(__aarch64__)
+                __asm__ volatile("yield");
+#endif
+            }
+        }
         gboolean clear_disabled =
             release_required &&
             g_atomic_int_get(&fast_listener->enabled) == 0 &&
