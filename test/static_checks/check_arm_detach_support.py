@@ -38,6 +38,7 @@ def main():
     exec_interceptor = read(root, "src/exec_interceptor.c")
     platform_cmake = read(root, "cmake/exec-platform.cmake")
     source_cmake = read(root, "src/CMakeLists.txt")
+    tests_cmake = read(root, "test/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
     dlopen_tests_cmake = read(root, "test/dlopen_controller/CMakeLists.txt")
 
@@ -138,8 +139,16 @@ def main():
                 f"{rel} must not retain compiler-dependent AArch64 fixed-register syscall asm")
     require("peak_aarch64_raw_syscall.S" in frida_cmake and
             "peak_aarch64_raw_syscall.S" in source_cmake and
+            "peak_aarch64_raw_syscall.S" in tests_cmake and
             "peak_aarch64_raw_syscall.S" in detach_tests_cmake,
-            "patched Gum, libpeak, and standalone controller tests must all link the raw-syscall stub")
+            "patched Gum, libpeak, checkpoint-writer tests, and standalone "
+            "controller tests must all link the raw-syscall stub")
+    require(re.search(
+                r"target_sources\(test_exec_checkpoint_writer\s+PRIVATE"
+                r"[\s\S]{0,180}peak_aarch64_raw_syscall\.S",
+                tests_cmake),
+            "the standalone checkpoint-writer test must link the AArch64 "
+            "raw-syscall stub")
     require("test_gum_raw_syscall_aarch64" in dlopen_tests_cmake and
             "test_gum_module_sync_idle_quiesce" in dlopen_tests_cmake,
             "Arm64 raw syscall and idle module-sync quiesce regressions must remain enabled")

@@ -258,6 +258,11 @@ if(BUILD_TESTING)
     add_executable(test_exec_checkpoint_writer
         report/test_exec_checkpoint_writer.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        target_sources(test_exec_checkpoint_writer PRIVATE
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+    endif()
     target_include_directories(test_exec_checkpoint_writer PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     add_test(NAME test_exec_checkpoint_writer
@@ -605,10 +610,10 @@ if(BUILD_TESTING)
                 TIMEOUT 45)
 
         # This is a physical-transition coverage test. With the lock-free
-        # callback, wake the controller at the first threshold crossing so
-        # transient-thread churn cannot turn scheduling delay into millions of
-        # extra pre-detach samples. The callback benchmark below independently
-        # enforces steady-state overhead and scaling.
+        # callback, issue a lock-free futex wake at the first threshold
+        # crossing so transient-thread churn cannot turn scheduling delay into
+        # millions of extra pre-detach samples. The callback benchmark below
+        # independently enforces steady-state overhead and scaling.
         add_test(NAME test_detach_hotloop_signal_wait_stress_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py
