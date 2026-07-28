@@ -65,6 +65,20 @@ extern int peak_exec_checkpoint_enabled_at_startup(void) __attribute__((weak));
 #define PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV "PEAK_CONTROLLER_MAX_RETRY_COUNT"
 #define PEAK_REATTACH_COOLDOWN_MS_ENV "PEAK_REATTACH_COOLDOWN_MS"
 
+#define PEAK_CALLBACK_HOOK_STATE_MASK 0x0fULL
+#define PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT 0x10ULL
+#define PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT 0x20ULL
+#define PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK \
+    (PEAK_CALLBACK_HOOK_STATE_MASK | \
+     PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT | \
+     PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT)
+#define PEAK_CALLBACK_HOOK_GENERATION_INCREMENT 0x40ULL
+
+_Static_assert(PEAK_HOOK_SHUTDOWN <= PEAK_CALLBACK_HOOK_STATE_MASK,
+               "callback hook state must fit in its packed control word");
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
+               "callback hook control must always be lock-free");
+
 PEAK_API GumInterceptor* interceptor;
 PEAK_API GumInvocationListener** array_listener;
 static gboolean* array_listener_detached;
@@ -2223,21 +2237,130 @@ peak_general_controller_retry_ready_unlocked(size_t hook_id, double now)
            peak_hook_next_retry_time[hook_id] <= now;
 }
 
-static void peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookState state)
+static inline __attribute__((always_inline)) PeakHookState
+peak_general_listener_callback_hook_state(unsigned long long control)
+{
+    return (PeakHookState)(control & PEAK_CALLBACK_HOOK_STATE_MASK);
+}
+
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_first_attached_generation_is_adjacent(
+    unsigned long long unresolved_control,
+    unsigned long long attached_control)
+{
+    return peak_general_listener_callback_hook_state(unresolved_control) ==
+               PEAK_HOOK_UNRESOLVED &&
+           peak_general_listener_callback_hook_state(attached_control) ==
+               PEAK_HOOK_ATTACHED &&
+           (attached_control & ~PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK) ==
+               (unresolved_control &
+                ~PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK) +
+                   PEAK_CALLBACK_HOOK_GENERATION_INCREMENT;
+}
+
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_try_publish_detach_count_request_snapshot(
+    PeakGeneralListener* listener,
+    unsigned long long control)
+{
+    if (peak_general_listener_callback_hook_state(control) !=
+            PEAK_HOOK_ATTACHED ||
+        (control & PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) != 0) {
+        return FALSE;
+    }
+
+    unsigned long long desired =
+        control | PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT;
+    return atomic_compare_exchange_strong_explicit(
+        &listener->callback_hook_control,
+        &control,
+        desired,
+        memory_order_acq_rel,
+        memory_order_relaxed);
+}
+
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_try_publish_initial_detach_count_crossing_snapshot(
+    PeakGeneralListener* listener,
+    unsigned long long* control)
+{
+    if (peak_general_listener_callback_hook_state(*control) !=
+            PEAK_HOOK_UNRESOLVED ||
+        (*control & (PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT |
+                     PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT)) != 0) {
+        return FALSE;
+    }
+
+    unsigned long long desired =
+        *control | PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT;
+    return atomic_compare_exchange_strong_explicit(
+        &listener->callback_hook_control,
+        control,
+        desired,
+        memory_order_acq_rel,
+        memory_order_relaxed);
+}
+
+static gboolean
+peak_general_listener_publish_callback_hook_state(
+    PeakGeneralListener* listener,
+    PeakHookState state)
+{
+    unsigned long long control =
+        atomic_load_explicit(&listener->callback_hook_control,
+                             memory_order_relaxed);
+    gboolean carried_initial_crossing;
+    unsigned long long desired;
+    do {
+        unsigned long long generation =
+            (control & ~PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK) +
+            PEAK_CALLBACK_HOOK_GENERATION_INCREMENT;
+        carried_initial_crossing =
+            state == PEAK_HOOK_ATTACHED &&
+            peak_general_listener_callback_hook_state(control) ==
+                PEAK_HOOK_UNRESOLVED &&
+            (control &
+             PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT) != 0;
+        desired =
+            generation |
+            (unsigned long long)state |
+            (carried_initial_crossing ?
+                 PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT :
+                 0);
+        /*
+         * A callback may publish the initial-crossing bit while the first
+         * ATTACHED state is being published.  Retrying this state-writer CAS
+         * carries that bit into the new generation's request; every other
+         * transition advances the generation and clears both callback bits.
+         */
+    } while (!atomic_compare_exchange_weak_explicit(
+        &listener->callback_hook_control,
+        &control,
+        desired,
+        memory_order_release,
+        memory_order_relaxed));
+    return carried_initial_crossing;
+}
+
+static void
+peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookState state)
 {
     if (peak_hook_states == NULL || hook_id >= peak_hook_address_count) {
         return;
     }
 
     peak_hook_states[hook_id] = state;
+    gboolean detach_count_request_published = FALSE;
     if (array_listener != NULL && array_listener[hook_id] != NULL) {
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
-        atomic_store_explicit(&listener->callback_hook_state,
-                              state,
-                              memory_order_release);
+        detach_count_request_published =
+            peak_general_listener_publish_callback_hook_state(listener, state);
     }
     peak_general_listener_publish_legacy_flags_unlocked(hook_id);
+    if (detach_count_request_published) {
+        peak_general_listener_controller_wake();
+    }
 }
 
 static gboolean
@@ -2247,7 +2370,8 @@ peak_general_controller_mpi_finalize_requested(void)
                                 memory_order_acquire);
 }
 
-void peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
+void
+peak_general_listener_controller_mark_attached_unlocked(size_t hook_id)
 {
     peak_general_controller_set_state_unlocked(hook_id, PEAK_HOOK_ATTACHED);
 }
@@ -3921,6 +4045,29 @@ peak_general_controller_process_pending_batch_unlocked(void)
     return prepared_count > 0;
 }
 
+static gboolean
+peak_general_listener_take_detach_count_request(
+    PeakGeneralListener* listener)
+{
+    unsigned long long control =
+        atomic_load_explicit(&listener->callback_hook_control,
+                             memory_order_acquire);
+    if (peak_general_listener_callback_hook_state(control) !=
+            PEAK_HOOK_ATTACHED ||
+        (control & PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) == 0) {
+        return FALSE;
+    }
+
+    unsigned long long desired =
+        control & ~PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT;
+    return atomic_compare_exchange_strong_explicit(
+        &listener->callback_hook_control,
+        &control,
+        desired,
+        memory_order_acq_rel,
+        memory_order_relaxed);
+}
+
 static void
 peak_general_controller_publish_detach_count_requests_unlocked(void)
 {
@@ -3935,25 +4082,7 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
-        if (!atomic_load_explicit(
-                &listener->detach_count_request_pending,
-                memory_order_acquire)) {
-            continue;
-        }
-        /*
-         * A target can cross its threshold after Gum activation but before
-         * initial publication reaches ATTACHED. Keep the one-shot latch set
-         * until the hook can actually consume it.
-         */
-        if (atomic_load_explicit(&listener->callback_hook_state,
-                                 memory_order_acquire) !=
-            PEAK_HOOK_ATTACHED) {
-            continue;
-        }
-        if (!atomic_exchange_explicit(
-                &listener->detach_count_request_pending,
-                FALSE,
-                memory_order_acq_rel)) {
+        if (!peak_general_listener_take_detach_count_request(listener)) {
             continue;
         }
 
@@ -5480,6 +5609,61 @@ peak_general_listener_monotonic_ns(void)
            (guint64)now.tv_nsec;
 }
 
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_try_publish_detach_count_request(
+    PeakGeneralListener* listener,
+    gulong current_num_calls)
+{
+    if (G_LIKELY(current_num_calls != peak_detach_count)) {
+        return FALSE;
+    }
+
+    /*
+     * State, request, and lifecycle generation share one atomic word.  A
+     * callback delayed across any state transition retains an old generation,
+     * so its single snapshot CAS fails even if the hook is ATTACHED again.
+     * A threshold crossing observed while the mirror is non-ATTACHED is
+     * intentionally scoped to that already-active lifecycle and is not
+     * replayed after reattach.  Startup/JIT/dlopen activation is different:
+     * no prior lifecycle exists, so an UNRESOLVED crossing is carried by the
+     * packed initial-crossing bit into the first ATTACHED generation.
+     */
+    unsigned long long control =
+        atomic_load_explicit(&listener->callback_hook_control,
+                             memory_order_acquire);
+    if (peak_general_listener_callback_hook_state(control) ==
+        PEAK_HOOK_ATTACHED) {
+        return peak_general_listener_try_publish_detach_count_request_snapshot(
+            listener,
+            control);
+    }
+    if (peak_general_listener_callback_hook_state(control) !=
+        PEAK_HOOK_UNRESOLVED) {
+        return FALSE;
+    }
+    unsigned long long unresolved_control = control;
+
+    /*
+     * Before the first canonical ATTACHED publication, record the crossing in
+     * the same CAS domain.  If the state writer won the race, the failed CAS
+     * updates control; retry exactly once only when that new generation is
+     * ATTACHED.  Never retry across a detach/reattach lifecycle.
+     */
+    if (peak_general_listener_try_publish_initial_detach_count_crossing_snapshot(
+            listener,
+            &control)) {
+        return FALSE;
+    }
+    if (!peak_general_listener_first_attached_generation_is_adjacent(
+            unresolved_control,
+            control)) {
+        return FALSE;
+    }
+    return peak_general_listener_try_publish_detach_count_request_snapshot(
+        listener,
+        control);
+}
+
 static void
 peak_general_listener_on_enter(GumInvocationListener* listener,
                                GumInvocationContext* ic)
@@ -5517,16 +5701,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
         peak_general_listener_num_calls_increment(
             peak_general_listener_num_calls_slot(self, index));
 
-    if (G_UNLIKELY(current_num_calls == peak_detach_count)) {
-        gboolean expected = FALSE;
-        if (atomic_compare_exchange_strong_explicit(
-                &self->detach_count_request_pending,
-                &expected,
-                TRUE,
-                memory_order_acq_rel,
-                memory_order_relaxed)) {
-            peak_general_listener_controller_wake();
-        }
+    if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
+            self,
+            current_num_calls))) {
+        peak_general_listener_controller_wake();
     }
 
     priv->start_time = peak_second();
@@ -5665,16 +5843,10 @@ peak_general_listener_fast_on_enter(gpointer user_data,
         peak_general_listener_num_calls_increment(
             peak_general_listener_num_calls_slot(self, index));
 
-    if (G_UNLIKELY(current_num_calls == peak_detach_count)) {
-        gboolean expected = FALSE;
-        if (atomic_compare_exchange_strong_explicit(
-                &self->detach_count_request_pending,
-                &expected,
-                TRUE,
-                memory_order_acq_rel,
-                memory_order_relaxed)) {
-            peak_general_listener_controller_wake();
-        }
+    if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
+            self,
+            current_num_calls))) {
+        peak_general_listener_controller_wake();
     }
 
     entry->start_ns = peak_general_listener_monotonic_ns();
@@ -6180,8 +6352,7 @@ static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
     size_t total_count = peak_max_num_threads;
-    atomic_init(&self->callback_hook_state, PEAK_HOOK_UNRESOLVED);
-    atomic_init(&self->detach_count_request_pending, FALSE);
+    atomic_init(&self->callback_hook_control, PEAK_HOOK_UNRESOLVED);
     atomic_init(&self->fast_lifetime_closing, 0);
     atomic_init(&self->fast_lifetime_abandoners, 0);
     self->fast_listener = (GumPeakFastListener){
@@ -6451,6 +6622,37 @@ peak_general_overhead_bootstrapping()
 }
 
 static void
+peak_general_listener_configure_detach_threshold(void)
+{
+    if (peak_hook_address_count == 0) {
+        return;
+    }
+
+    peak_detach_count_overridden =
+        peak_general_listener_parse_detach_count_override(&peak_detach_count);
+    gboolean need_overhead_calibration =
+        peak_detach_cost > 0 ||
+        heartbeat_time != 0 ||
+        peak_detach_count_overridden;
+    if (need_overhead_calibration) {
+        peak_general_overhead_bootstrapping();
+    } else {
+        peak_general_overhead = 0.0;
+    }
+    if (!peak_detach_count_overridden && peak_detach_cost > 0) {
+        if (peak_general_overhead > 0.0) {
+            peak_detach_count =
+                (peak_detach_cost > peak_general_overhead) ?
+                    peak_detach_cost / peak_general_overhead :
+                    1;
+        } else {
+            peak_detach_count = G_MAXULONG;
+        }
+    }
+    peak_need_detach[0] = false;
+}
+
+static void
 peak_symbol_map_add_target(GHashTable* table, const char* symbol)
 {
     if (symbol == NULL || g_hash_table_contains(table, symbol)) {
@@ -6518,7 +6720,8 @@ static void peak_build_symbol_map_once(size_t first_target_index) {
     g_array_free(addresses, TRUE);
 }
 
-void peak_general_listener_attach()
+void
+peak_general_listener_attach()
 {
     peak_general_listener_runtime_configure();
     peak_general_listener_init_reattach_policy();
@@ -6569,6 +6772,13 @@ void peak_general_listener_attach()
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
     peak_demangled_strings = g_new0(char*, peak_hook_address_count);
+    /*
+     * Freeze the threshold before any target hook becomes executable.  The
+     * callback reads this value without synchronization and publishes only the
+     * exact crossing, so changing it after Gum activation would both race and
+     * allow an early caller to step over the final threshold permanently.
+     */
+    peak_general_listener_configure_detach_threshold();
     gboolean startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
     for (size_t i = 0; i < peak_hook_address_count; i++) {
@@ -6803,33 +7013,206 @@ void peak_general_listener_attach()
         gum_symbol_short_mapping = NULL;
         gum_find_functions_matching_initialize = false;
     }
-    if (peak_hook_address_count) {
-        peak_detach_count_overridden =
-            peak_general_listener_parse_detach_count_override(&peak_detach_count);
-        gboolean need_overhead_calibration =
-            peak_detach_cost > 0 ||
-            heartbeat_time != 0 ||
-            peak_detach_count_overridden;
-        if (need_overhead_calibration) {
-            peak_general_overhead_bootstrapping();
-        } else {
-            peak_general_overhead = 0.0;
-        }
-        if (!peak_detach_count_overridden && peak_detach_cost > 0) {
-            if (peak_general_overhead > 0.0) {
-                peak_detach_count =
-                    (peak_detach_cost > peak_general_overhead) ?
-                    peak_detach_cost / peak_general_overhead : 1;
-            } else {
-                peak_detach_count = G_MAXULONG;
-            }
-        }
-        peak_need_detach[0] = false;
-    }
 }
 
 /* Checkpoint and report snapshot capture. */
 #ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API int
+peak_general_listener_test_detach_count_latch_state_gate(void)
+{
+    PeakGeneralListener listener = {0};
+    gulong saved_detach_count = peak_detach_count;
+    unsigned long long initial_unresolved;
+    unsigned long long initial_snapshot;
+    unsigned long long stale_attached;
+    unsigned long long current_attached;
+    int result = 0;
+
+    atomic_init(&listener.callback_hook_control, PEAK_HOOK_UNRESOLVED);
+    peak_detach_count = 7;
+
+    /*
+     * Callback-first initial activation: the crossing bit must be converted
+     * into a request by the first ATTACHED state publication.
+     */
+    if (peak_general_listener_try_publish_detach_count_request(&listener, 7) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT) == 0 ||
+        !peak_general_listener_publish_callback_hook_state(
+            &listener,
+            PEAK_HOOK_ATTACHED) ||
+        !peak_general_listener_take_detach_count_request(&listener)) {
+        result = 1;
+        goto out;
+    }
+
+    /*
+     * State-writer-first initial activation: a stale UNRESOLVED CAS must fail
+     * and expose the new ATTACHED snapshot for the callback's one retry.
+     */
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_UNRESOLVED);
+    initial_snapshot =
+        atomic_load_explicit(&listener.callback_hook_control,
+                             memory_order_acquire);
+    initial_unresolved = initial_snapshot;
+    if (peak_general_listener_publish_callback_hook_state(
+            &listener,
+            PEAK_HOOK_ATTACHED) ||
+        peak_general_listener_try_publish_initial_detach_count_crossing_snapshot(
+            &listener,
+            &initial_snapshot) ||
+        !peak_general_listener_first_attached_generation_is_adjacent(
+            initial_unresolved,
+            initial_snapshot) ||
+        !peak_general_listener_try_publish_detach_count_request_snapshot(
+            &listener,
+            initial_snapshot) ||
+        !peak_general_listener_take_detach_count_request(&listener)) {
+        result = 2;
+        goto out;
+    }
+
+    /*
+     * A callback paused in UNRESOLVED must not treat an ATTACHED state from a
+     * later detach/reattach generation as the adjacent first publication.
+     */
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_UNRESOLVED);
+    initial_unresolved =
+        atomic_load_explicit(&listener.callback_hook_control,
+                             memory_order_acquire);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_ATTACHED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACH_REQUESTED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACHING);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACHED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_REATTACH_REQUESTED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_REATTACHING);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_ATTACHED);
+    initial_snapshot = initial_unresolved;
+    if (peak_general_listener_try_publish_initial_detach_count_crossing_snapshot(
+            &listener,
+            &initial_snapshot) ||
+        peak_general_listener_first_attached_generation_is_adjacent(
+            initial_unresolved,
+            initial_snapshot) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) != 0) {
+        result = 3;
+        goto out;
+    }
+
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACHING);
+    if (peak_general_listener_try_publish_detach_count_request(&listener, 7) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) != 0) {
+        result = 4;
+        goto out;
+    }
+
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_ATTACHED);
+    if (peak_general_listener_try_publish_detach_count_request(&listener, 6) ||
+        !peak_general_listener_try_publish_detach_count_request(&listener, 7) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) == 0 ||
+        !peak_general_listener_take_detach_count_request(&listener) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) != 0) {
+        result = 5;
+        goto out;
+    }
+
+    /*
+     * Deterministically model a callback paused after loading generation A.
+     * A complete detach/reattach lifecycle must make that stale snapshot
+     * unable to publish against generation B's ATTACHED state.
+     */
+    stale_attached =
+        atomic_load_explicit(&listener.callback_hook_control,
+                             memory_order_acquire);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACH_REQUESTED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACHING);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_DETACHED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_REATTACH_REQUESTED);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_REATTACHING);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_ATTACHED);
+    current_attached =
+        atomic_load_explicit(&listener.callback_hook_control,
+                             memory_order_acquire);
+    if ((stale_attached & ~PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK) ==
+            (current_attached & ~PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK) ||
+        peak_general_listener_try_publish_detach_count_request_snapshot(
+            &listener,
+            stale_attached) ||
+        (atomic_load_explicit(&listener.callback_hook_control,
+                              memory_order_acquire) &
+         PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) != 0) {
+        result = 6;
+        goto out;
+    }
+
+    if (!peak_general_listener_try_publish_detach_count_request(&listener, 7) ||
+        !peak_general_listener_take_detach_count_request(&listener)) {
+        result = 7;
+        goto out;
+    }
+
+    if (!peak_general_listener_try_publish_detach_count_request(&listener, 7)) {
+        result = 8;
+        goto out;
+    }
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_REATTACHING);
+    peak_general_listener_publish_callback_hook_state(
+        &listener,
+        PEAK_HOOK_ATTACHED);
+    if (peak_general_listener_take_detach_count_request(&listener)) {
+        result = 9;
+    }
+
+out:
+    peak_detach_count = saved_detach_count;
+    return result;
+}
+
 PEAK_API int
 peak_general_listener_test_checkpoint_snapshot_lock_hold(void)
 {

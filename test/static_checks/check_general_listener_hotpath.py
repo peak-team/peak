@@ -48,6 +48,34 @@ def main():
     increment = function_body(
         source, "peak_general_listener_num_calls_increment"
     )
+    threshold_publish = function_body(
+        source, "peak_general_listener_try_publish_detach_count_request"
+    )
+    threshold_publish_snapshot = function_body(
+        source,
+        "peak_general_listener_try_publish_detach_count_request_snapshot",
+    )
+    threshold_initial_snapshot = function_body(
+        source,
+        "peak_general_listener_try_publish_initial_detach_count_crossing_snapshot",
+    )
+    threshold_adjacent_generation = function_body(
+        source,
+        "peak_general_listener_first_attached_generation_is_adjacent",
+    )
+    threshold_take = function_body(
+        source, "peak_general_listener_take_detach_count_request"
+    )
+    state_publish = function_body(
+        source, "peak_general_controller_set_state_unlocked"
+    )
+    callback_state_publish = function_body(
+        source, "peak_general_listener_publish_callback_hook_state"
+    )
+    threshold_configure = function_body(
+        source, "peak_general_listener_configure_detach_threshold"
+    )
+    attach = function_body(source, "peak_general_listener_attach")
     controller_wake = function_body(
         source, "peak_general_listener_controller_wake"
     )
@@ -78,7 +106,13 @@ def main():
         "g_renew",
         "g_free",
     )
-    for name, body in (("enter", enter), ("leave", leave)):
+    for name, body in (
+        ("enter", enter),
+        ("leave", leave),
+        ("threshold publish", threshold_publish),
+        ("threshold snapshot publish", threshold_publish_snapshot),
+        ("threshold initial snapshot", threshold_initial_snapshot),
+    ):
         for token in forbidden:
             require(
                 token not in body,
@@ -130,13 +164,77 @@ def main():
         "single-writer call slots must not use a locked atomic RMW",
     )
     require(
-        "_Atomic gboolean detach_count_request_pending" in header
-        and "atomic_compare_exchange_strong_explicit" in generic_enter
-        and "atomic_compare_exchange_strong_explicit" in enter
+        "_Atomic unsigned long long callback_hook_control" in header
+        and "peak_general_listener_try_publish_detach_count_request"
+        in generic_enter
+        and "peak_general_listener_try_publish_detach_count_request" in enter
         and "peak_general_listener_controller_wake" in generic_enter
         and "peak_general_listener_controller_wake" in enter,
         "generic and fast threshold-crossing callbacks must publish the "
         "detach-count CAS latch and issue the lock-free controller wake",
+    )
+    require(
+        "current_num_calls != peak_detach_count" in threshold_publish
+        and "callback_hook_control" in threshold_publish
+        and "peak_general_listener_try_publish_detach_count_request_snapshot"
+        in threshold_publish
+        and "PEAK_HOOK_UNRESOLVED" in threshold_publish
+        and "peak_general_listener_try_publish_initial_detach_count_crossing_snapshot"
+        in threshold_publish
+        and "unresolved_control" in threshold_publish
+        and "peak_general_listener_first_attached_generation_is_adjacent"
+        in threshold_publish
+        and threshold_publish.count(
+            "peak_general_listener_try_publish_detach_count_request_snapshot"
+        ) == 2
+        and "PEAK_HOOK_ATTACHED" in threshold_publish_snapshot
+        and "PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT"
+        in threshold_publish_snapshot
+        and "atomic_compare_exchange_strong_explicit"
+        in threshold_publish_snapshot
+        and "PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT"
+        in threshold_initial_snapshot
+        and "atomic_compare_exchange_strong_explicit"
+        in threshold_initial_snapshot,
+        "the exact threshold crosser must publish through the packed "
+        "ATTACHED request or first-activation crossing CAS",
+    )
+    require(
+        "PEAK_HOOK_UNRESOLVED" in threshold_adjacent_generation
+        and "PEAK_HOOK_ATTACHED" in threshold_adjacent_generation
+        and "PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK"
+        in threshold_adjacent_generation
+        and "PEAK_CALLBACK_HOOK_GENERATION_INCREMENT"
+        in threshold_adjacent_generation,
+        "a failed initial-crossing CAS may retry only against the immediately "
+        "adjacent first ATTACHED generation",
+    )
+    require(
+        "callback_hook_control" in threshold_take
+        and "PEAK_HOOK_ATTACHED" in threshold_take
+        and "PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT" in threshold_take
+        and "atomic_compare_exchange_strong_explicit" in threshold_take
+        and "peak_general_listener_publish_callback_hook_state"
+        in state_publish
+        and "PEAK_CALLBACK_HOOK_GENERATION_INCREMENT"
+        in callback_state_publish
+        and "PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK"
+        in callback_state_publish
+        and "PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT"
+        in callback_state_publish
+        and "PEAK_HOOK_UNRESOLVED" in callback_state_publish
+        and "PEAK_HOOK_ATTACHED" in callback_state_publish
+        and "PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT"
+        in callback_state_publish
+        and "atomic_compare_exchange_weak_explicit"
+        in callback_state_publish
+        and "detach_count_request_published" in state_publish
+        and "peak_general_listener_controller_wake" in state_publish
+        and "_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2" in source
+        and "callback_hook_state" not in header
+        and "detach_count_request_pending" not in header,
+        "callback state, initial crossing, and request must share an "
+        "always-lock-free generation-tagged atomic word",
     )
     for token in (
         "pthread_mutex",
@@ -206,9 +304,30 @@ def main():
         "controller stop must publish running=false before its lock-free wake",
     )
     require(
-        "atomic_exchange_explicit" in publish
+        "peak_general_listener_take_detach_count_request" in publish
         and "peak_general_listener_request_detach_with_context_unlocked" in publish,
         "controller must consume the CAS latch under its existing request path",
+    )
+    configure_call = attach.find(
+        "peak_general_listener_configure_detach_threshold()"
+    )
+    first_target_attach = attach.find(
+        "for (size_t i = 0; i < peak_hook_address_count"
+    )
+    require(
+        "peak_general_listener_parse_detach_count_override" in threshold_configure
+        and "peak_general_overhead_bootstrapping" in threshold_configure
+        and configure_call != -1
+        and first_target_attach != -1
+        and configure_call < first_target_attach,
+        "detach threshold must be frozen before any target hook is activated",
+    )
+    require(
+        "peak_general_listener_catch_up_initial_detach_count_unlocked"
+        not in source
+        and "callback_mark_physically_attached" not in source,
+        "first-activation crossing must remain in the packed CAS domain "
+        "without early ATTACHED publication or a racy counter scan",
     )
     require(
         "thread_data.self_mapped_id" in enter
@@ -228,11 +347,6 @@ def main():
         leave.find("peak_general_listener_checkpoint_shadow_update"),
         "active lifetime must cover every helper outside the classified dispatch",
     )
-    require(
-        "current_num_calls == peak_detach_count" in enter,
-        "only the detach-threshold crossing call may publish a request",
-    )
-
     print("general_listener_hotpath_ok")
 
 
