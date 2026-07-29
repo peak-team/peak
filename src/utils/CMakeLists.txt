@@ -2,6 +2,7 @@
 # the PEAK library merely by appearing in this directory.
 set(sources_utils_c
     env_parser.c
+    ../logging.c
     mpi_utils.c
     parent_registry.c
     process_filter.c
@@ -18,5 +19,8 @@ set(sources_utils_cxx
 add_library(utils_c OBJECT ${sources_utils_c})
 add_library(utils_cxx OBJECT ${sources_utils_cxx})
 
-target_include_directories(utils_c PUBLIC ${PROJECT_SOURCE_DIR}/include/utils)
+target_include_directories(utils_c PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/include/utils)
 target_include_directories(utils_cxx PUBLIC ${PROJECT_SOURCE_DIR}/include/utils)
+target_link_libraries(utils_c PUBLIC Threads::Threads)
