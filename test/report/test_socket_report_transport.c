@@ -26,8 +26,7 @@ typedef enum {
     TEST_ROOT_COMMIT = 0,
     TEST_ROOT_ABORT,
     TEST_ROOT_COMMIT_FAILURE,
-    TEST_ROOT_COMMIT_DELAYED_DEFAULT,
-    TEST_ROOT_COMMIT_DELAYED_CLAMP,
+    TEST_ROOT_COMMIT_AFTER_PEER_READY,
     TEST_ROOT_COMMIT_DROP_ONCE,
     TEST_ROOT_COMMIT_RESOLVE_AGAIN,
     TEST_ROOT_COMMIT_CONFIRM_RETRY,
@@ -377,14 +376,69 @@ aggregate_matches(const PeakReportSnapshot* aggregate)
 }
 
 static int
-wait_for_expected_child(pid_t child, PeakSocketReportStatus expected)
+wait_for_expected_child(pid_t child,
+                        PeakSocketReportStatus expected,
+                        int* status_out)
 {
-    int status;
+    int status = -1;
+
+    if (status_out != NULL) {
+        *status_out = status;
+    }
 
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) {
+        if (status_out != NULL) {
+            *status_out = status;
+        }
         return 1;
     }
+    if (status_out != NULL) {
+        *status_out = status;
+    }
     return WEXITSTATUS(status) == (int)expected ? 0 : 1;
+}
+
+static void
+report_two_rank_case_diagnostic(
+    TestRootAction action,
+    PeakSocketReportStatus root_status,
+    bool commit_attempted,
+    bool committed,
+    int peer_wait_status,
+    bool port_rebound_checked,
+    bool port_rebound_ok,
+    const PeakSocketReportTestTelemetry* telemetry)
+{
+    fprintf(stderr,
+            "socket two-rank diagnostic: action=%d root_status=%d "
+            "commit_attempted=%d commit_result=%d peer_wait_status=%d "
+            "peer_exited=%d peer_exit=%d peer_signal=%d "
+            "port_rebound_checked=%d port_rebound_ok=%d "
+            "root={wire=%u payload=%u receipt=%u confirmation=%u "
+            "max_active=%u release_targets=%u release_confirmed=%u "
+            "release_decision=%u}\n",
+            action,
+            root_status,
+            commit_attempted,
+            committed,
+            peer_wait_status,
+            peer_wait_status >= 0 && WIFEXITED(peer_wait_status),
+            peer_wait_status >= 0 && WIFEXITED(peer_wait_status)
+                ? WEXITSTATUS(peer_wait_status)
+                : -1,
+            peer_wait_status >= 0 && WIFSIGNALED(peer_wait_status)
+                ? WTERMSIG(peer_wait_status)
+                : -1,
+            port_rebound_checked,
+            port_rebound_ok,
+            telemetry->wire_version,
+            telemetry->root_payload_count,
+            telemetry->root_receipt_count,
+            telemetry->root_confirmation_count,
+            telemetry->root_max_active,
+            telemetry->root_release_target_count,
+            telemetry->root_release_confirmed_count,
+            telemetry->root_release_decision);
 }
 
 static int
@@ -399,8 +453,7 @@ run_two_rank_case(int port,
     PeakSocketReportTestTelemetry root_telemetry;
     PeakSocketReportStatus expected_peer =
         (action == TEST_ROOT_COMMIT ||
-         action == TEST_ROOT_COMMIT_DELAYED_DEFAULT ||
-         action == TEST_ROOT_COMMIT_DELAYED_CLAMP ||
+         action == TEST_ROOT_COMMIT_AFTER_PEER_READY ||
          action == TEST_ROOT_COMMIT_DROP_ONCE ||
          action == TEST_ROOT_COMMIT_RESOLVE_AGAIN ||
          action == TEST_ROOT_COMMIT_CONFIRM_RETRY ||
@@ -426,6 +479,12 @@ run_two_rank_case(int port,
     char token_text[64];
     pid_t child;
     int64_t case_started_ms;
+    int peer_wait_status = -1;
+    bool peer_wait_complete = false;
+    bool commit_attempted = false;
+    bool committed = false;
+    bool port_rebound_checked = false;
+    bool port_rebound_ok = false;
     int result = 0;
 
     if (root == NULL) {
@@ -461,11 +520,14 @@ run_two_rank_case(int port,
                            ? "2000"
                            : "10",
                  1);
-    if (action == TEST_ROOT_COMMIT_DELAYED_DEFAULT) {
-        (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
-    } else if (action == TEST_ROOT_COMMIT_DELAYED_CLAMP) {
+    if (action == TEST_ROOT_COMMIT_AFTER_PEER_READY) {
+        /*
+         * This integration case exercises the peer's prepared-to-release
+         * state, not timeout configuration arithmetic.  The runtime-config
+         * test covers default and clamped budget calculations exactly.
+         */
         (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
-                     "100",
+                     "10000",
                      1);
     } else {
         (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
@@ -715,16 +777,29 @@ run_two_rank_case(int port,
             close(competing_fd);
             result = 1;
         }
-        if (action == TEST_ROOT_COMMIT_DELAYED_DEFAULT ||
-            action == TEST_ROOT_COMMIT_DELAYED_CLAMP) {
+        if (action == TEST_ROOT_COMMIT_AFTER_PEER_READY) {
+            int child_poll_status = -1;
+            pid_t child_poll;
+
             /*
-             * Exceed two base phase budgets after root preparation. Both the
-             * default and a too-small override must retain the complete
-             * scaled gather/publication/release budget.
+             * Root preparation proves that the peer's payload, receipt, and
+             * confirmation are complete.  Verify the peer remains alive for
+             * the release decision, then delay well inside the explicit
+             * 10-second release budget.  This avoids testing scheduler jitter
+             * against a computed deadline.
              */
-            usleep(1250000);
+            child_poll = waitpid(child, &child_poll_status, WNOHANG);
+            if (child_poll > 0) {
+                peer_wait_status = child_poll_status;
+                peer_wait_complete = true;
+                result = 1;
+            } else if (child_poll < 0) {
+                result = 1;
+            }
+            usleep(250000);
         }
-        bool committed = peak_socket_report_transport_commit(session);
+        commit_attempted = true;
+        committed = peak_socket_report_transport_commit(session);
 
         session = NULL;
         if (committed != (action != TEST_ROOT_COMMIT_FAILURE)) {
@@ -748,15 +823,23 @@ run_two_rank_case(int port,
           root_telemetry.root_release_confirmed_count != 0U))) {
         result = 1;
     }
-    if (wait_for_expected_child(child, expected_peer) != 0) {
+    if (!peer_wait_complete &&
+        wait_for_expected_child(child, expected_peer, &peer_wait_status) !=
+            0) {
+        result = 1;
+    } else if (peer_wait_complete &&
+               (!WIFEXITED(peer_wait_status) ||
+                WEXITSTATUS(peer_wait_status) != (int)expected_peer)) {
         result = 1;
     }
     if (session == NULL) {
         int rebound_fd = bind_test_tcp_port(port + 1, true);
 
+        port_rebound_checked = true;
         if (rebound_fd < 0) {
             result = 1;
         } else {
+            port_rebound_ok = true;
             close(rebound_fd);
         }
     }
@@ -809,6 +892,16 @@ run_two_rank_case(int port,
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_DROP_RANK");
     (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    if (result != 0) {
+        report_two_rank_case_diagnostic(action,
+                                        root_status,
+                                        commit_attempted,
+                                        committed,
+                                        peer_wait_status,
+                                        port_rebound_checked,
+                                        port_rebound_ok,
+                                        &root_telemetry);
+    }
     return result;
 }
 
@@ -1171,7 +1264,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
 
     for (int i = 0; i < started; i++) {
         if (wait_for_expected_child(
-                children[i], PEAK_SOCKET_REPORT_PEER_RELEASED) != 0) {
+                children[i], PEAK_SOCKET_REPORT_PEER_RELEASED, NULL) != 0) {
             result = 1;
         }
     }
@@ -1274,7 +1367,7 @@ run_duplicate_rank_case(int port)
     for (int i = 0; i < 2; i++) {
         if (children[i] > 0 &&
             wait_for_expected_child(
-                children[i], PEAK_SOCKET_REPORT_FAILED) != 0) {
+                children[i], PEAK_SOCKET_REPORT_FAILED, NULL) != 0) {
             result = 1;
         }
     }
@@ -1466,14 +1559,9 @@ main(void)
         "identity-mismatch",
         run_two_rank_case(base_port + 6, TEST_ROOT_COMMIT, true));
     CHECK_SOCKET_CASE(
-        "delayed-default",
+        "commit-after-peer-ready",
         run_two_rank_case(base_port + 8,
-                          TEST_ROOT_COMMIT_DELAYED_DEFAULT,
-                          false));
-    CHECK_SOCKET_CASE(
-        "delayed-clamp",
-        run_two_rank_case(base_port + 10,
-                          TEST_ROOT_COMMIT_DELAYED_CLAMP,
+                          TEST_ROOT_COMMIT_AFTER_PEER_READY,
                           false));
     CHECK_SOCKET_CASE(
         "release-drop-once",
