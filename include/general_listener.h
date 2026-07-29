@@ -393,6 +393,11 @@ PEAK_API gboolean peak_general_listener_request_reattach(size_t hook_id);
  */
 PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/** Returns the current local call count for one hook in test builds. */
+PEAK_API gulong peak_general_listener_test_call_count(size_t hook_id);
+#endif
+
 /**
  * @brief Monitors the heartbeat of the Peak profiling system.
  *

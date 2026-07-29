@@ -89,6 +89,15 @@ PEAK_EXEC_API int peak_test_fini_waiting_for_checkpoint_reader(void);
 /** Invokes the normal `peak_fini()` path for lifetime-gate testing. */
 PEAK_EXEC_API void peak_test_fini(void);
 
+/** Pauses the next runtime activation immediately before it claims READY. */
+PEAK_EXEC_API void peak_test_activation_pause_enable(void);
+
+/** @return Nonzero once activation is paused before its READY transition. */
+PEAK_EXEC_API int peak_test_activation_is_held(void);
+
+/** Releases an activation paused by `peak_test_activation_pause_enable()`. */
+PEAK_EXEC_API void peak_test_activation_release(void);
+
 /** @} */
 #endif
 

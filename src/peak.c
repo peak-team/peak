@@ -64,6 +64,7 @@
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
+#define PEAK_MPI_ACTIVATION_POLICY_ENV          "PEAK_MPI_ACTIVATION_POLICY"
 #define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
 #ifdef PEAK_ENABLE_TEST_HOOKS
 #define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
@@ -115,6 +116,18 @@ static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
 static _Atomic int peak_runtime_active = 0;
 static _Atomic pid_t peak_runtime_owner_pid = 0;
+typedef enum {
+    PEAK_RUNTIME_ACTIVATION_NOT_READY = 0,
+    PEAK_RUNTIME_ACTIVATION_READY = 1,
+    PEAK_RUNTIME_ACTIVATION_IN_PROGRESS = 2,
+    PEAK_RUNTIME_ACTIVATION_ACTIVE = 3,
+    PEAK_RUNTIME_ACTIVATION_CANCELED = 4,
+} PeakRuntimeActivationState;
+static _Atomic int peak_runtime_activation_state =
+    PEAK_RUNTIME_ACTIVATION_NOT_READY;
+static _Atomic int peak_deferred_activation_warning_emitted = 0;
+static pthread_t peak_runtime_activation_owner;
+static _Atomic int peak_runtime_activation_owner_known = 0;
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
 #define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
@@ -137,11 +150,57 @@ peak_runtime_is_fork_child(void)
     return owner > 0 && getpid() != owner;
 }
 
+/*
+ * Close the READY -> IN_PROGRESS race against process teardown.  Once this
+ * function changes READY to CANCELED, an MPI completion can no longer start
+ * Gum/controller activation.  If activation won first, teardown waits for it
+ * to publish ACTIVE before continuing.
+ */
+static PeakRuntimeActivationState
+peak_runtime_close_activation_for_teardown(void)
+{
+    if (peak_runtime_is_fork_child()) {
+        return (PeakRuntimeActivationState)atomic_load_explicit(
+            &peak_runtime_activation_state, memory_order_acquire);
+    }
+
+    for (;;) {
+        int state = atomic_load_explicit(&peak_runtime_activation_state,
+                                         memory_order_acquire);
+
+        if (state == PEAK_RUNTIME_ACTIVATION_READY) {
+            int expected = PEAK_RUNTIME_ACTIVATION_READY;
+
+            if (atomic_compare_exchange_weak_explicit(
+                    &peak_runtime_activation_state,
+                    &expected,
+                    PEAK_RUNTIME_ACTIVATION_CANCELED,
+                    memory_order_acq_rel,
+                    memory_order_acquire)) {
+                return PEAK_RUNTIME_ACTIVATION_CANCELED;
+            }
+            continue;
+        }
+        if (state != PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+            return (PeakRuntimeActivationState)state;
+        }
+        if (atomic_load_explicit(&peak_runtime_activation_owner_known,
+                                 memory_order_acquire) != 0 &&
+            pthread_equal(pthread_self(), peak_runtime_activation_owner)) {
+            return PEAK_RUNTIME_ACTIVATION_IN_PROGRESS;
+        }
+        sched_yield();
+    }
+}
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_test_checkpoint_reader_pause = 0;
 static _Atomic int peak_test_checkpoint_reader_held = 0;
 static _Atomic int peak_test_checkpoint_reader_released = 0;
 static _Atomic int peak_test_fini_waiting_for_reader = 0;
+static _Atomic int peak_test_activation_pause = 0;
+static _Atomic int peak_test_activation_held = 0;
+static _Atomic int peak_test_activation_released = 0;
 
 void peak_fini(void);
 
@@ -190,6 +249,35 @@ peak_test_fini_waiting_for_checkpoint_reader(void)
                                 memory_order_acquire);
 }
 
+PEAK_EXEC_API void
+peak_test_activation_pause_enable(void)
+{
+    atomic_store_explicit(&peak_test_activation_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_activation_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_activation_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_EXEC_API int
+peak_test_activation_is_held(void)
+{
+    return atomic_load_explicit(&peak_test_activation_held,
+                                memory_order_acquire);
+}
+
+PEAK_EXEC_API void
+peak_test_activation_release(void)
+{
+    atomic_store_explicit(&peak_test_activation_released,
+                          1,
+                          memory_order_release);
+}
+
 static void
 peak_test_checkpoint_reader_pause_after_acquire(void)
 {
@@ -205,6 +293,26 @@ peak_test_checkpoint_reader_pause_after_acquire(void)
                                 memory_order_acquire) == 0) {
         sched_yield();
     }
+}
+
+static void
+peak_test_activation_pause_before_claim(void)
+{
+    if (atomic_load_explicit(&peak_test_activation_pause,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+
+    atomic_store_explicit(&peak_test_activation_held,
+                          1,
+                          memory_order_release);
+    while (atomic_load_explicit(&peak_test_activation_released,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    atomic_store_explicit(&peak_test_activation_pause,
+                          0,
+                          memory_order_release);
 }
 #endif
 
@@ -401,6 +509,168 @@ peak_deduplicate_target_names(char** targets, size_t count)
     return unique_count;
 }
 
+#ifdef HAVE_MPI
+static gboolean
+peak_mpi_activation_policy_post_init(void)
+{
+    const char* value = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
+
+    if (value == NULL || value[0] == '\0' ||
+        g_ascii_strcasecmp(value, "immediate") == 0) {
+        return FALSE;
+    }
+    if (g_ascii_strcasecmp(value, "post-init") == 0 ||
+        g_ascii_strcasecmp(value, "defer") == 0 ||
+        g_ascii_strcasecmp(value, "deferred") == 0) {
+        return TRUE;
+    }
+
+    peak_log_warn(
+        "[peak] invalid %s=%s; using immediate activation\n",
+        PEAK_MPI_ACTIVATION_POLICY_ENV,
+        value);
+    return FALSE;
+}
+#endif
+
+static void
+peak_activate_runtime(void)
+{
+    int expected = PEAK_RUNTIME_ACTIVATION_READY;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_test_activation_pause_before_claim();
+#endif
+    if (!atomic_compare_exchange_strong_explicit(
+            &peak_runtime_activation_state,
+            &expected,
+            PEAK_RUNTIME_ACTIVATION_IN_PROGRESS,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        while (expected == PEAK_RUNTIME_ACTIVATION_IN_PROGRESS &&
+               atomic_load_explicit(&peak_runtime_activation_state,
+                                    memory_order_acquire) ==
+                   PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+            sched_yield();
+        }
+        return;
+    }
+    peak_runtime_activation_owner = pthread_self();
+    atomic_store_explicit(&peak_runtime_activation_owner_known,
+                          1,
+                          memory_order_release);
+
+    /*
+     * The default path reaches this point before application main. An MPI rank
+     * using PEAK_MPI_ACTIVATION_POLICY=post-init reaches it only after a
+     * successful MPI_Init* return, with no earlier Gum state or code mutation.
+     */
+    gum_init_embedded();
+
+    atomic_store_explicit(&peak_runtime_owner_pid,
+                          getpid(),
+                          memory_order_release);
+
+    pthread_listener_attach();
+    if (peak_hook_address_count > 0
+#ifdef HAVE_MPI
+        && !found_MPI
+#endif
+    ) {
+        peak_detach_controller_warmup_backend();
+    }
+#ifdef HAVE_MPI
+    if (found_MPI && mpi_interceptor_attach() != 0) {
+        found_MPI = 0;
+    }
+#endif
+#ifdef HAVE_CUDA
+    cuda_interceptor_attach();
+#endif
+    /* General-listener hooks depend on pthread and MPI interception setup. */
+    peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
+    peak_target_thread_called_count = peak_hook_address_count;
+    for (gint i = 0; i < peak_hook_address_count; i++) {
+        peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
+    }
+    peak_need_detach = g_new0(gboolean, peak_hook_address_count);
+    peak_detached = g_new0(gboolean, peak_hook_address_count);
+    peak_jit_provider_enable();
+    /*
+     * This is the post-MPI module rescan. Gum initialization and this scan
+     * both occur in the deferred activation, so symbol lookup sees UCX,
+     * libfabric, libnuma, and any other providers that MPI_Init loaded before
+     * target attachment begins.
+     */
+    peak_general_listener_attach();
+    syscall_interceptor_attach();
+    gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
+    gboolean dynamic_attach_listener_ready = FALSE;
+    if (need_dynamic_attach) {
+        dynamic_attach_listener_ready = dlopen_interceptor_attach() == 0;
+    }
+    peak_main_time = peak_second();
+    peak_general_listener_note_runtime_start(peak_main_time);
+    if (heartbeat_time != 0) {
+        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
+        args = g_new0(PeakHeartbeatArgs, 1);
+        args->heartbeat_time = heartbeat_time;
+        args->check_interval = check_interval;
+        args->hb_min_us = hb_min_us;
+        args->hb_max_us = hb_max_us;
+        args->hb_k_err = hb_k_err;
+        args->hb_k_rate = hb_k_rate;
+        args->hb_ema_a = hb_ema_a;
+    }
+    if (peak_memory_profile) {
+        malloc_interceptor_attach();
+    }
+    peak_general_listener_controller_start();
+    if (dynamic_attach_listener_ready) {
+        dlopen_interceptor_enable_dynamic_attach();
+    }
+    if (heartbeat_time != 0) {
+        pthread_mutex_lock(&heartbeat_mutex);
+        atomic_store(&heartbeat_running, true);
+        pthread_mutex_unlock(&heartbeat_mutex);
+        if (pthread_create(&heartbeat_thread,
+                           NULL,
+                           peak_heartbeat_monitor,
+                           args) != 0) {
+            perror("Failed to create heartbeat thread");
+            g_free(args);
+            args = NULL;
+            g_free(heartbeat_overhead);
+            heartbeat_overhead = NULL;
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
+    atomic_store_explicit(&peak_runtime_activation_state,
+                          PEAK_RUNTIME_ACTIVATION_ACTIVE,
+                          memory_order_release);
+}
+
+#ifdef HAVE_MPI
+PEAK_API void
+peak_mpi_init_completed(int result)
+{
+    if (result == MPI_SUCCESS) {
+        peak_activate_runtime();
+    } else if (atomic_load_explicit(&peak_runtime_activation_state,
+                                    memory_order_acquire) ==
+               PEAK_RUNTIME_ACTIVATION_READY) {
+        peak_log_warn(
+            "[peak] MPI initialization failed while runtime activation was "
+            "deferred; falling back to immediate non-MPI activation\n");
+        found_MPI = 0;
+        peak_detach_controller_configure_mpi_process(FALSE);
+        peak_activate_runtime();
+    }
+}
+#endif
+
 void peak_init()
 {
     peak_log_configure();
@@ -451,10 +721,13 @@ void peak_init()
     if (!has_requested_work) {
         return;
     }
+    /*
+     * Publish process ownership before READY can be inherited across fork().
+     * A child must never wait for a parent thread that was activating PEAK.
+     */
     atomic_store_explicit(&peak_runtime_owner_pid,
                           getpid(),
                           memory_order_release);
-    atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
 
 #ifdef HAVE_MPI
     found_MPI = check_MPI();
@@ -464,85 +737,47 @@ void peak_init()
             found_MPI = 0;
         }
     }
+    gboolean activate_post_mpi_init =
+        peak_mpi_activation_policy_post_init();
+    /*
+     * An explicit post-init policy is authoritative even for singleton MPI
+     * launches whose runtime provides none of the rank environment variables
+     * used by check_MPI(). Programs without a traditional interposable
+     * MPI_Init* lifecycle must leave the default immediate policy selected.
+     */
+    if (activate_post_mpi_init) {
+        found_MPI = 1;
+    }
     peak_detach_controller_configure_mpi_process(found_MPI != 0);
 #else
     peak_detach_controller_configure_mpi_process(FALSE);
 #endif
-    pthread_listener_attach();
-    /*
-     * Do not fork/exec the helper before MPI runtime initialization. Large
-     * Intel MPI jobs initialize OFI/UCX/libnuma after PEAK startup; adding one
-     * helper child per rank before PMPI_Init_thread perturbs that fragile
-     * phase at scale. Auto mode still tries the helper first when the first
-     * mutation needs a backend; this only removes eager pre-MPI warmup.
-     */
-    if (peak_hook_address_count > 0
+    atomic_store_explicit(&peak_runtime_activation_state,
+                          PEAK_RUNTIME_ACTIVATION_READY,
+                          memory_order_release);
 #ifdef HAVE_MPI
-        && !found_MPI
-#endif
-    ) {
-        peak_detach_controller_warmup_backend();
-    }
-#ifdef HAVE_MPI
-    if (found_MPI && mpi_interceptor_attach() != 0) {
-        found_MPI = 0;
-    }
-#endif
-#ifdef HAVE_CUDA
-    cuda_interceptor_attach();
-#endif
-    /* General-listener hooks depend on pthread and MPI interception setup. */
-    peak_target_thread_called = g_new0(gboolean*, peak_hook_address_count);
-    peak_target_thread_called_count = peak_hook_address_count;
-    for (gint i = 0; i < peak_hook_address_count; i++) {
-        peak_target_thread_called[i] = g_new0(gboolean, peak_max_num_threads);
-    }
-    peak_need_detach = g_new0(gboolean, peak_hook_address_count);
-    peak_detached = g_new0(gboolean, peak_hook_address_count);
-    peak_jit_provider_enable();
-    peak_general_listener_attach();
-    syscall_interceptor_attach();
-    gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
-    gboolean dynamic_attach_listener_ready = FALSE;
-    if (need_dynamic_attach) {
-        dynamic_attach_listener_ready = dlopen_interceptor_attach() == 0;
-    }
-    peak_main_time = peak_second();
-    peak_general_listener_note_runtime_start(peak_main_time);
-    if (heartbeat_time != 0) {
-        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
-        args = g_new0(PeakHeartbeatArgs, 1);
-        args->heartbeat_time = heartbeat_time;
-        args->check_interval = check_interval;
-        args->hb_min_us = hb_min_us;
-        args->hb_max_us = hb_max_us;
-        args->hb_k_err = hb_k_err;
-        args->hb_k_rate = hb_k_rate;
-        args->hb_ema_a = hb_ema_a;
-    }
-    if (peak_memory_profile) {
-        malloc_interceptor_attach();
-    }
-    peak_general_listener_controller_start();
-    if (dynamic_attach_listener_ready) {
-        dlopen_interceptor_enable_dynamic_attach();
-    }
-    if (heartbeat_time != 0) {
-        pthread_mutex_lock(&heartbeat_mutex);
-        atomic_store(&heartbeat_running, true);
-        pthread_mutex_unlock(&heartbeat_mutex);
-        if (pthread_create(&heartbeat_thread,
-                           NULL,
-                           peak_heartbeat_monitor,
-                           args) != 0) {
-            perror("Failed to create heartbeat thread");
-            g_free(args);
-            args = NULL;
-            g_free(heartbeat_overhead);
-            heartbeat_overhead = NULL;
-            exit(EXIT_FAILURE);
+    if (activate_post_mpi_init) {
+        int initialized = 0;
+        int query_result = MPI_Initialized(&initialized);
+
+        if (query_result == MPI_SUCCESS && !initialized) {
+            /*
+             * A non-Gum PMPI_Init* interposer calls peak_mpi_init_completed()
+             * after the real runtime returns. This opt-in policy intentionally
+             * omits pre-MPI profiling so there are no Gum mutations, module
+             * ownership/pinning, controller threads, or heartbeat until then.
+             */
+            return;
+        }
+        if (query_result != MPI_SUCCESS) {
+            peak_log_warn(
+                "[peak] MPI_Initialized failed under %s=post-init; using "
+                "immediate activation\n",
+                PEAK_MPI_ACTIVATION_POLICY_ENV);
         }
     }
+#endif
+    peak_activate_runtime();
 }
 
 #ifdef HAVE_MPI
@@ -979,9 +1214,27 @@ peak_fini_impl(void)
 void peak_fini()
 {
     int expected = PEAK_FINI_NOT_STARTED;
+    PeakRuntimeActivationState activation_state;
 
-    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0 ||
-        peak_runtime_is_fork_child()) {
+    if (peak_runtime_is_fork_child()) {
+        return;
+    }
+    activation_state = peak_runtime_close_activation_for_teardown();
+    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+        int warning_expected = 0;
+
+        if (activation_state == PEAK_RUNTIME_ACTIVATION_CANCELED &&
+            atomic_compare_exchange_strong_explicit(
+                &peak_deferred_activation_warning_emitted,
+                &warning_expected,
+                1,
+                memory_order_acq_rel,
+                memory_order_acquire)) {
+            peak_log_warn(
+                "[peak] post-init activation was requested, but no "
+                "interposed MPI_Init* completion was observed; no profile "
+                "was collected\n");
+        }
         return;
     }
 
@@ -1086,9 +1339,14 @@ peak_should_wrap_main(int argc, char** argv)
 
 /* Original function pointer for exit(). */
 static void (*original_exit)(int) = NULL;
-static GumInterceptor* exit_interceptor = NULL;
-static gpointer exit_address = NULL;
-void exit_interceptor_detach();
+
+static void
+peak_resolve_real_exit(void)
+{
+    if (original_exit == NULL) {
+        original_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
+    }
+}
 
 static void
 peak_publish_exit_status(int status)
@@ -1114,81 +1372,46 @@ peak_publish_exit_status(int status)
     }
 }
 
-static void
-peak_exit(int status) {
+PEAK_API void
+peak_exit(int status)
+{
+    PeakRuntimeActivationState activation_state;
+
+    peak_resolve_real_exit();
+    if (original_exit == NULL) {
+        _exit(status);
+    }
 
     if (peak_runtime_is_fork_child()) {
         original_exit(status);
         __builtin_unreachable();
     }
+    activation_state = peak_runtime_close_activation_for_teardown();
 
-    if (atomic_load_explicit(&peak_runtime_active, memory_order_acquire) == 0) {
+    if (activation_state != PEAK_RUNTIME_ACTIVATION_ACTIVE) {
+        peak_fini();
         original_exit(status);
         __builtin_unreachable();
     }
 
     peak_publish_exit_status(status);
     peak_fini();
-    if (atexit(exit_interceptor_detach) != 0) {
-        peak_log_warn("[peak] failed to register deferred exit interceptor teardown\n");
-    }
 
     /* Terminate through the original exit(). */
     original_exit(status);
     __builtin_unreachable();
 }
 
-/**
- * @brief Attaches the interceptor to the `exit` function.
- *
- * This function uses the Gum API to intercept calls to the `exit` function,
- * replacing it with a custom implementation (`peak_exit`).
- *
- * @return 0 on success, -1 on failure.
- */
-int exit_interceptor_attach() {
-    gum_init_embedded();
-    GumReplaceReturn replace_check = -1;
-    exit_interceptor = gum_interceptor_obtain();
-
-    gum_interceptor_begin_transaction(exit_interceptor);
-    exit_address = peak_general_listener_find_function("exit");
-    if (exit_address) {
-        replace_check = gum_interceptor_replace_fast(exit_interceptor,
-                                      exit_address, (gpointer)&peak_exit,
-                                      (gpointer*)(&original_exit),
-                                      NULL);
-    }
-    gum_interceptor_end_transaction(exit_interceptor);
-    return replace_check;
-}
-
-/**
- * @brief Detaches the interceptor from the `exit` function.
- *
- * This function reverts the interception of the `exit` function, restoring its
- * original behavior.
- */
-void exit_interceptor_detach() {
-    if (exit_interceptor == NULL || exit_address == NULL) {
-        return;
-    }
-
-    gum_interceptor_begin_transaction(exit_interceptor);
-    gum_interceptor_revert(exit_interceptor, exit_address);
-    gum_interceptor_end_transaction(exit_interceptor);
-    if (!gum_interceptor_flush(exit_interceptor)) {
-        g_printerr("[peak] exit interceptor teardown did not flush; leaving exit interceptor state alive\n");
-        return;
-    }
-    exit_address = NULL;
+PEAK_API void
+exit(int status)
+{
+    peak_exit(status);
+    __builtin_unreachable();
 }
 
 static int main_wrapper(int argc, char** argv, char** envp) {
     /* Initialize PEAK immediately before the application main(). */
-    if (!exit_interceptor_attach()) {
-        peak_init();
-    }
+    peak_init();
 
     int ret = real_main(argc, argv, envp);
 
@@ -1217,6 +1440,7 @@ int __libc_start_main(main_fn main, int argc, char** argv,
             _exit(1);
         }
     }
+    peak_resolve_real_exit();
 
     /* Retain the application entry point for main_wrapper(). */
     real_main = main;

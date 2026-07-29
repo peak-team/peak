@@ -2574,6 +2574,28 @@ PeakHookState peak_general_listener_hook_state(size_t hook_id)
     return state;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+gulong
+peak_general_listener_test_call_count(size_t hook_id)
+{
+    gulong total = 0;
+
+    pthread_mutex_lock(&lock);
+    if (array_listener != NULL && hook_id < peak_hook_address_count &&
+        array_listener[hook_id] != NULL) {
+        PeakGeneralListener* listener =
+            PEAKGENERAL_LISTENER(array_listener[hook_id]);
+
+        for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
+            total += peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, index));
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return total;
+}
+#endif
+
 static gboolean
 peak_general_controller_is_current_thread(void)
 {
@@ -6578,9 +6600,11 @@ peak_general_overhead_bootstrapping()
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
     /*
-     * Calibration runs before application main and PMPI_Init.  When the
-     * process still has one task, Gum can mutate directly; starting the auto
-     * backend's helper here would fork every MPI rank during fragile startup.
+     * Calibration runs during PEAK activation: normally before application
+     * main and PMPI_Init, or after PMPI_Init under the explicit post-init
+     * policy. When the process still has one task, Gum can mutate directly;
+     * starting the auto backend's helper here would fork every MPI rank during
+     * fragile startup.
      */
     startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();

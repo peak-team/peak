@@ -248,6 +248,16 @@ main(int argc, char** argv)
         fflush(stderr);
     }
 
+    /*
+     * In the default no-finalize case, keep one peer alive briefly while rank
+     * zero exercises PEAK's exit interposer. MPICH/Hydra may otherwise tear
+     * down the proxy as soon as either improper MPI process exits and discard
+     * rank zero's already-flushed diagnostic stream.
+     */
+    if (argc == 1 && rank != 0) {
+        usleep(100000);
+    }
+
     if (argc > 1 && strcmp(argv[1], "no-finalize-then-exit1") == 0) {
         exit(1);
     }

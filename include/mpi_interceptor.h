@@ -3,12 +3,37 @@
 
 /**
  * @file mpi_interceptor.h
- * @brief Intercept PMPI_Finalize while PEAK emits its final report.
+ * @brief Intercept MPI initialization completion and PMPI_Finalize.
+ *
+ * MPI_Init/PMPI_Init and their thread-level variants are interposed with
+ * ordinary dynamic symbols rather than Gum patches. By default PEAK is already
+ * active when they run. With PEAK_MPI_ACTIVATION_POLICY=post-init, PEAK remains
+ * configured but inactive while the real initializer loads transport
+ * providers, then activates Gum hooks from the outermost return path.
  */
 
 #include "frida-gum.h"
 
 #include <mpi.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_MPI_INTERCEPTOR_API __attribute__((visibility("default")))
+#else
+#define PEAK_MPI_INTERCEPTOR_API
+#endif
+
+/**
+ * @brief Activates a configured PEAK MPI runtime after MPI initialization.
+ *
+ * This internal cross-translation-unit callback is invoked by the MPI
+ * initialization interposers only after the outermost real initializer
+ * returns.
+ * A failed initializer makes the opt-in deferred path fall back to non-MPI
+ * activation after the initializer has returned.
+ *
+ * @param result Return code from the real MPI or PMPI initializer.
+ */
+PEAK_MPI_INTERCEPTOR_API void peak_mpi_init_completed(int result);
 
 /**
  * @brief Attach MPI function interception
