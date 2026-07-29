@@ -18,7 +18,6 @@ set(sources_peak
     peak.c
     detach_controller.c
     jit_provider.c
-    logging.c
     signal_policy.c
     pthread_listener.c
     syscall_interceptor.c
