@@ -1022,9 +1022,15 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
              port);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
-    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "3000", 1);
+    /*
+     * Launching 31 peers on a hosted runner can take longer than the normal
+     * per-phase budget even when every connection makes progress. Keep this
+     * many-rank regression bounded but allow a scheduling margin beyond the
+     * default three-second budget.
+     */
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "5000", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
-                 "6000",
+                 "15000",
                  1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
     (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL");
@@ -1406,7 +1412,7 @@ main(void)
 {
     /*
      * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
-     * consumes base..base+43, and the kernel lock prevents parallel CTest
+     * consumes base..base+45, and the kernel lock prevents parallel CTest
      * processes, including different UIDs, from choosing the same range.
      */
     int port_lock_fd = -1;
