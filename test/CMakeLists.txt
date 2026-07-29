@@ -75,6 +75,14 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "header_guard_style_ok")
 
+    add_test(NAME test_cmake_portability
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_test_cmake_portability.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_cmake_portability
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "test_cmake_portability_ok")
+
     add_test(NAME test_mpi_lifecycle_checker_policy
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/test_mpi_lifecycle_checker_policy.py)

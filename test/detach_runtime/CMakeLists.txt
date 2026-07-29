@@ -53,7 +53,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 add_executable(test_fastpath_thread_exit test_fastpath_thread_exit.c)
-target_link_libraries(test_fastpath_thread_exit PRIVATE Threads::Threads)
+target_link_libraries(test_fastpath_thread_exit
+    PRIVATE Threads::Threads ${DL_LIBRARY})
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_fastpath_thread_exit PRIVATE -Wl,--export-dynamic)
 endif()

@@ -30,7 +30,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     $<TARGET_OBJECTS:utils_c>
     $<TARGET_OBJECTS:utils_cxx>
   )
-  if(MPI_FOUND)
+  if(PEAK_ENABLE_MPI AND MPI_FOUND)
     target_sources(test_detach_listener_shutdown PRIVATE
       ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c)
   endif()
@@ -110,7 +110,7 @@ if(TARGET test_detach_listener_shutdown)
       ${M_LIBRARY}
       ${LIBIBERTY_LIB}
   )
-  if(MPI_FOUND)
+  if(PEAK_ENABLE_MPI AND MPI_FOUND)
     target_link_libraries(test_detach_listener_shutdown
       PRIVATE
         MPI::MPI_C
