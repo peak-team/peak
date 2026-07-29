@@ -48,8 +48,9 @@ user_destructor_target(void* value)
                                          1,
                                          memory_order_relaxed);
     (void)peak_fastpath_thread_exit_target(0);
+    const char* max_threads = getenv("PEAK_MAX_NUM_THREADS");
     if (pass % 4 == 3 &&
-        strcmp(getenv("PEAK_MAX_NUM_THREADS"), "0") != 0 &&
+        max_threads != NULL && strcmp(max_threads, "0") != 0 &&
         !thread_is_tracked(pthread_self())) {
         atomic_store_explicit(&destructor_tracking_failed, 1,
                               memory_order_release);
