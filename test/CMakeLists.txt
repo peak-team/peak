@@ -82,6 +82,14 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "mpi_lifecycle_checker_policy_ok")
 
+    add_test(NAME test_mpi_lifecycle_synthetic_stats_diagnostics
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                --synthetic-stats-diagnostics)
+    set_tests_properties(test_mpi_lifecycle_synthetic_stats_diagnostics
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "mpi_lifecycle_synthetic_stats_diagnostics_ok")
+
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
         add_test(NAME test_peak_shared_unwinder
             COMMAND ${Python3_EXECUTABLE}

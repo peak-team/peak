@@ -118,6 +118,7 @@ struct _PeakGeneralListener {
     gboolean* target_thread_called;
     /* Exit-only aggregate for logical threads whose reusable slot was reset. */
     GMutex retired_mutex;
+    gboolean retired_mutex_initialized;
     gulong retired_num_calls;
     gulong retired_thread_count;
     gdouble retired_total_time;

@@ -27,7 +27,12 @@ STATS_CSV_FIELDS = (
     "thread_max_s",
     "thread_min_s",
     "overhead_s",
+    "dropped_calls",
+    "dropped_threads",
 )
+STATS_CSV_METRIC_FIELDS = STATS_CSV_FIELDS[4:11]
+STATS_CSV_DIAGNOSTIC_FIELDS = STATS_CSV_FIELDS[11:]
+ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
 HOT_TARGETS = [
     f"peak_milc_hot_{phase}_s{slot:02d}"
     for phase in range(TARGET_PHASES)
@@ -905,12 +910,36 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
         )
     rows = []
     seen = set()
+    diagnostics = None
+    target_diagnostics = None
     for row in reader:
         if (None in row or
                 any(row[field] is None or not row[field].strip()
                     for field in STATS_CSV_FIELDS)):
             raise AssertionError(f"stats CSV row has missing/extra values: {row}")
         function = row["function"]
+        if function == ACCOUNTING_DIAGNOSTICS_FUNCTION:
+            if diagnostics is not None:
+                raise AssertionError("duplicate accounting diagnostics row")
+            for field in STATS_CSV_FIELDS[1:11]:
+                try:
+                    if float(row[field]) != 0.0:
+                        raise AssertionError(
+                            f"nonzero diagnostics metric {field}: {row}"
+                        )
+                except ValueError as exc:
+                    raise AssertionError(
+                        f"invalid diagnostics metric {field}: {row}"
+                    ) from exc
+            for field in STATS_CSV_DIAGNOSTIC_FIELDS:
+                if not re.fullmatch(r"[0-9]+", row[field]):
+                    raise AssertionError(
+                        f"invalid accounting diagnostic {field}: {row}"
+                    )
+            diagnostics = tuple(
+                int(row[field]) for field in STATS_CSV_DIAGNOSTIC_FIELDS
+            )
+            continue
         if function not in allowed_targets:
             raise AssertionError(f"stats CSV row is not a target: {function!r}")
         if function in seen:
@@ -938,7 +967,7 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
                 "invalid per-rank average "
                 f"(expected {expected_per_rank:.12g}): {row}"
             )
-        for field in STATS_CSV_FIELDS[4:]:
+        for field in STATS_CSV_METRIC_FIELDS:
             try:
                 value = float(row[field])
             except ValueError as exc:
@@ -947,8 +976,32 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
                 ) from exc
             if not math.isfinite(value):
                 raise AssertionError(f"nonfinite stats field {field}: {row}")
+        for field in STATS_CSV_DIAGNOSTIC_FIELDS:
+            if not re.fullmatch(r"[0-9]+", row[field]):
+                raise AssertionError(
+                    f"invalid accounting diagnostic {field}: {row}"
+                )
+        row_diagnostics = tuple(
+            int(row[field]) for field in STATS_CSV_DIAGNOSTIC_FIELDS
+        )
+        if target_diagnostics is None:
+            target_diagnostics = row_diagnostics
+        elif target_diagnostics != row_diagnostics:
+            raise AssertionError("inconsistent target accounting diagnostics")
         seen.add(function)
         rows.append(row)
+    if target_diagnostics is None:
+        if diagnostics is None:
+            raise AssertionError("missing target or accounting diagnostics row")
+        if diagnostics == (0, 0):
+            raise AssertionError("spurious zero accounting diagnostics row")
+    elif target_diagnostics == (0, 0):
+        if diagnostics is not None:
+            raise AssertionError("spurious accounting diagnostics row")
+    elif diagnostics is None:
+        raise AssertionError("missing accounting diagnostics row")
+    elif diagnostics != target_diagnostics:
+        raise AssertionError("accounting diagnostics mismatch")
     return rows
 
 
@@ -2400,16 +2453,18 @@ def run_synthetic_policy_diagnostics():
         ),
     )
 
-    def synthetic_stats_csv(fields, values):
+    def synthetic_stats_csv(fields, values, extra_rows=()):
         output = io.StringIO()
         writer = csv.writer(output, lineterminator="\n")
         writer.writerow(fields)
         writer.writerow(values)
+        writer.writerows(extra_rows)
         output.seek(0)
         return output
 
     valid_stats_values = [
-        "target", "1", "1", "1", "0", "0", "0", "0", "0", "0", "1e-6"
+        "target", "1", "1", "1", "0", "0", "0", "0", "0", "0", "1e-6",
+        "0", "0",
     ]
     valid_stats_rows = validated_profiled_stats_rows(
         synthetic_stats_csv(STATS_CSV_FIELDS, valid_stats_values),
@@ -2417,6 +2472,100 @@ def run_synthetic_policy_diagnostics():
     )
     if len(valid_stats_rows) != 1:
         raise AssertionError("valid stats CSV row was not accepted")
+    diagnostics_stats_rows = validated_profiled_stats_rows(
+        synthetic_stats_csv(
+            STATS_CSV_FIELDS,
+            valid_stats_values[:-2] + ["7", "3"],
+            [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"]],
+        ),
+        {"target"},
+    )
+    if len(diagnostics_stats_rows) != 1:
+        raise AssertionError("accounting diagnostics row affected target metrics")
+    expect_assertion(
+        "missing nonzero accounting diagnostics",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values[:-2] + ["7", "3"],
+            ),
+            {"target"},
+        ),
+    )
+    expect_assertion(
+        "mismatched accounting diagnostics",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values[:-2] + ["7", "3"],
+                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["8", "3"]],
+            ),
+            {"target"},
+        ),
+    )
+    expect_assertion(
+        "duplicate accounting diagnostics",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values[:-2] + ["7", "3"],
+                [
+                    [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
+                    [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
+                ],
+            ),
+            {"target"},
+        ),
+    )
+    expect_assertion(
+        "spurious zero accounting diagnostics",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values,
+                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 12],
+            ),
+            {"target"},
+        ),
+    )
+    expect_assertion(
+        "inconsistent target accounting diagnostics",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values[:-2] + ["7", "3"],
+                [["target-two"] + valid_stats_values[1:-2] + ["8", "3"]],
+            ),
+            {"target", "target-two"},
+        ),
+    )
+    expect_assertion(
+        "nonzero accounting diagnostics metric",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(
+                STATS_CSV_FIELDS,
+                valid_stats_values[:-2] + ["7", "3"],
+                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["1"] + ["0"] * 9 + ["7", "3"]],
+            ),
+            {"target"},
+        ),
+    )
+    diagnostics_only_rows = validated_profiled_stats_rows(
+        synthetic_stats_csv(
+            STATS_CSV_FIELDS,
+            [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
+        ),
+        {"target"},
+    )
+    if diagnostics_only_rows:
+        raise AssertionError("diagnostics-only CSV produced target metrics")
+    expect_assertion(
+        "empty stats CSV",
+        lambda: validated_profiled_stats_rows(
+            io.StringIO(",".join(STATS_CSV_FIELDS) + "\n"),
+            {"target"},
+        ),
+    )
     expect_assertion(
         "malformed stats field set",
         lambda: validated_profiled_stats_rows(
@@ -2454,6 +2603,15 @@ def run_synthetic_policy_diagnostics():
         "malformed stats integer",
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(STATS_CSV_FIELDS, malformed_integer_values),
+            {"target"},
+        ),
+    )
+    malformed_diagnostic_values = list(valid_stats_values)
+    malformed_diagnostic_values[-1] = "3.5"
+    expect_assertion(
+        "malformed accounting diagnostic",
+        lambda: validated_profiled_stats_rows(
+            synthetic_stats_csv(STATS_CSV_FIELDS, malformed_diagnostic_values),
             {"target"},
         ),
     )

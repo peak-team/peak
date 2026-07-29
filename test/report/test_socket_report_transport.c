@@ -42,6 +42,8 @@ typedef enum {
     TEST_GATHER_CONFIRM_DROP_FAILURE,
 } TestRootAction;
 
+static bool test_saturate_dropped_counters;
+
 static int64_t
 test_monotonic_ms(void)
 {
@@ -261,8 +263,13 @@ fixture_snapshot(int rank, bool mismatch_name)
     snapshot->min_time[1] = rank == 0 ? FLT_MAX : 0.1f;
     snapshot->thread_count[0] = rank == 0 ? 2UL : 1UL;
     snapshot->thread_count[1] = rank == 0 ? 0UL : 3UL;
-    snapshot->dropped_calls = rank == 0 ? 7U : 11U;
-    snapshot->dropped_threads = rank == 0 ? 2U : 3U;
+    if (test_saturate_dropped_counters) {
+        snapshot->dropped_calls = rank == 0 ? UINT64_MAX - 2 : 2U;
+        snapshot->dropped_threads = rank == 0 ? UINT64_MAX - 1 : 1U;
+    } else {
+        snapshot->dropped_calls = rank == 0 ? 7U : 11U;
+        snapshot->dropped_threads = rank == 0 ? 2U : 3U;
+    }
 
     snapshot->overhead_per_call = rank == 0 ? 1e-7 : 9e-7;
     snapshot->overhead.valid = true;
@@ -324,8 +331,10 @@ aggregate_matches(const PeakReportSnapshot* aggregate)
         aggregate->min_time[1] != 0.1f ||
         aggregate->thread_count[0] != 3UL ||
         aggregate->thread_count[1] != 3UL ||
-        aggregate->dropped_calls != 18U ||
-        aggregate->dropped_threads != 5U) {
+        aggregate->dropped_calls !=
+            (test_saturate_dropped_counters ? UINT64_MAX - 1 : 18U) ||
+        aggregate->dropped_threads !=
+            (test_saturate_dropped_counters ? UINT64_MAX - 1 : 5U)) {
         return false;
     }
 
@@ -800,6 +809,17 @@ run_two_rank_case(int port,
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_DROP_RANK");
     (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    return result;
+}
+
+static int
+run_dropped_counter_saturation_case(int port)
+{
+    int result;
+
+    test_saturate_dropped_counters = true;
+    result = run_two_rank_case(port, TEST_ROOT_COMMIT, false);
+    test_saturate_dropped_counters = false;
     return result;
 }
 
@@ -1426,6 +1446,9 @@ main(void)
     CHECK_SOCKET_CASE(
         "commit",
         run_two_rank_case(base_port, TEST_ROOT_COMMIT, false));
+    CHECK_SOCKET_CASE(
+        "dropped-counter-saturation",
+        run_dropped_counter_saturation_case(base_port + 44));
     CHECK_SOCKET_CASE(
         "abort",
         run_two_rank_case(base_port + 2, TEST_ROOT_ABORT, false));

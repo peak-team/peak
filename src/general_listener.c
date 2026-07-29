@@ -6691,6 +6691,7 @@ peak_general_listener_init(PeakGeneralListener* self)
 {
     size_t total_count = peak_max_num_threads;
     g_mutex_init(&self->retired_mutex);
+    self->retired_mutex_initialized = TRUE;
     atomic_init(&self->callback_hook_control, PEAK_HOOK_UNRESOLVED);
     atomic_init(&self->detach_count_total, 0);
     atomic_init(&self->fast_lifetime_closing, 0);
@@ -6800,7 +6801,10 @@ peak_general_listener_free(PeakGeneralListener* self)
     self->checkpoint_shadow_mapping_size = 0;
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;
-    g_mutex_clear(&self->retired_mutex);
+    if (self->retired_mutex_initialized) {
+        g_mutex_clear(&self->retired_mutex);
+        self->retired_mutex_initialized = FALSE;
+    }
 }
 
 static volatile guint64 peak_general_overhead_dummy_sink;

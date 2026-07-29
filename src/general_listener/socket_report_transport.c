@@ -142,7 +142,7 @@ typedef struct {
 } PeakSocketReduceRecord;
 
 /*
- * Wire-v11 intentionally targets a homogeneous job: every rank must use the
+ * Wire-v12 intentionally targets a homogeneous job: every rank must use the
  * same byte order, floating-point representation, and 64-bit Linux C ABI.
  * Lock the layouts so an accidental field or packing change cannot silently
  * corrupt a report without another wire-version bump.
