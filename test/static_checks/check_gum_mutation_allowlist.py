@@ -90,17 +90,6 @@ EXPECTED = {
         "flush": 1,
         "revert": 1,
     },
-    ("support-init", "src/peak.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "replace_fast": 1,
-    },
-    ("support-shutdown-debt", "src/peak.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "flush": 1,
-        "revert": 1,
-    },
 }
 
 FUNCTION_ANCHORS = {
@@ -136,10 +125,6 @@ FUNCTION_ANCHORS = {
     "src/cuda_interceptor.cpp": {
         "cuda_interceptor_attach": "support-init",
         "cuda_interceptor_dettach": "support-shutdown-debt",
-    },
-    "src/peak.c": {
-        "exit_interceptor_attach": "support-init",
-        "exit_interceptor_detach": "support-shutdown-debt",
     },
     "src/unsafe_gum_prologue.c": {
         "peak_gum_interceptor_attach_target": "strict-target-attach",

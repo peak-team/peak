@@ -3216,9 +3216,10 @@ int dlopen_interceptor_attach()
     PeakDetachStatus detach_status = PEAK_DETACH_STATUS_ERROR;
 
     /*
-     * Install this startup-only listener before PMPI_Init without eagerly
-     * starting one helper per MPI rank. Runtime dynamic target mutations still
-     * use the controller protocol after peer threads exist.
+     * Install this startup-only listener during PEAK activation. That is
+     * normally before PMPI_Init, or after it when post-init activation is
+     * explicitly selected. Runtime dynamic target mutations still use the
+     * controller protocol after peer threads exist.
      */
     peak_gum_module_mutation_begin();
     if (!startup_attach_can_skip_stop &&

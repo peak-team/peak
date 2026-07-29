@@ -1,8 +1,12 @@
+#define _GNU_SOURCE
 #include "mpi_interceptor.h"
 #include "general_listener.h"
 #include "logging.h"
 
+#include <dlfcn.h>
+#include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +32,137 @@ static gpointer hook_address;
 
 static int (*original_pmpi_finalize)(void);
 extern void peak_fini(void);
+
+typedef int (*PeakMpiInitFunction)(int*, char***);
+typedef int (*PeakMpiInitThreadFunction)(int*, char***, int, int*);
+
+static PeakMpiInitFunction real_mpi_init;
+static PeakMpiInitFunction real_pmpi_init;
+static PeakMpiInitThreadFunction real_mpi_init_thread;
+static PeakMpiInitThreadFunction real_pmpi_init_thread;
+static pthread_once_t real_mpi_init_once = PTHREAD_ONCE_INIT;
+static pthread_once_t real_pmpi_init_once = PTHREAD_ONCE_INIT;
+static pthread_once_t real_mpi_init_thread_once = PTHREAD_ONCE_INIT;
+static pthread_once_t real_pmpi_init_thread_once = PTHREAD_ONCE_INIT;
+static _Thread_local unsigned int peak_mpi_init_wrapper_depth;
+
+static void
+mpi_interceptor_resolve_mpi_init_once(void)
+{
+    real_mpi_init = (PeakMpiInitFunction)dlsym(RTLD_NEXT, "MPI_Init");
+}
+
+static void
+mpi_interceptor_resolve_pmpi_init_once(void)
+{
+    real_pmpi_init = (PeakMpiInitFunction)dlsym(RTLD_NEXT, "PMPI_Init");
+}
+
+static void
+mpi_interceptor_resolve_mpi_init_thread_once(void)
+{
+    real_mpi_init_thread =
+        (PeakMpiInitThreadFunction)dlsym(RTLD_NEXT, "MPI_Init_thread");
+}
+
+static void
+mpi_interceptor_resolve_pmpi_init_thread_once(void)
+{
+    real_pmpi_init_thread =
+        (PeakMpiInitThreadFunction)dlsym(RTLD_NEXT, "PMPI_Init_thread");
+}
+
+static int
+mpi_interceptor_call_init(PeakMpiInitFunction init,
+                          const char* symbol,
+                          int* argc,
+                          char*** argv)
+{
+    int result;
+
+    peak_mpi_init_wrapper_depth++;
+    if (init == NULL) {
+        fprintf(stderr, "[peak] unable to resolve next %s\n", symbol);
+        result = MPI_ERR_OTHER;
+    } else {
+        result = init(argc, argv);
+    }
+    peak_mpi_init_wrapper_depth--;
+    if (peak_mpi_init_wrapper_depth == 0) {
+        peak_mpi_init_completed(result);
+    }
+    return result;
+}
+
+static int
+mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
+                                 const char* symbol,
+                                 int* argc,
+                                 char*** argv,
+                                 int required,
+                                 int* provided)
+{
+    int result;
+
+    peak_mpi_init_wrapper_depth++;
+    if (init == NULL) {
+        fprintf(stderr, "[peak] unable to resolve next %s\n", symbol);
+        result = MPI_ERR_OTHER;
+    } else {
+        result = init(argc, argv, required, provided);
+    }
+    peak_mpi_init_wrapper_depth--;
+    if (peak_mpi_init_wrapper_depth == 0) {
+        peak_mpi_init_completed(result);
+    }
+    return result;
+}
+
+/*
+ * These dynamic symbol interposers deliberately use no Gum state. They are the
+ * only PEAK code around MPI startup. In post-init mode they activate the
+ * runtime only after the real initializer has finished loading
+ * OFI/UCX/libnuma providers.
+ */
+PEAK_API int
+MPI_Init(int* argc, char*** argv)
+{
+    pthread_once(&real_mpi_init_once, mpi_interceptor_resolve_mpi_init_once);
+    return mpi_interceptor_call_init(real_mpi_init, "MPI_Init", argc, argv);
+}
+
+PEAK_API int
+PMPI_Init(int* argc, char*** argv)
+{
+    pthread_once(&real_pmpi_init_once, mpi_interceptor_resolve_pmpi_init_once);
+    return mpi_interceptor_call_init(real_pmpi_init, "PMPI_Init", argc, argv);
+}
+
+PEAK_API int
+MPI_Init_thread(int* argc, char*** argv, int required, int* provided)
+{
+    pthread_once(&real_mpi_init_thread_once,
+                 mpi_interceptor_resolve_mpi_init_thread_once);
+    return mpi_interceptor_call_init_thread(real_mpi_init_thread,
+                                            "MPI_Init_thread",
+                                            argc,
+                                            argv,
+                                            required,
+                                            provided);
+}
+
+PEAK_API int
+PMPI_Init_thread(int* argc, char*** argv, int required, int* provided)
+{
+    pthread_once(&real_pmpi_init_thread_once,
+                 mpi_interceptor_resolve_pmpi_init_thread_once);
+    return mpi_interceptor_call_init_thread(real_pmpi_init_thread,
+                                            "PMPI_Init_thread",
+                                            argc,
+                                            argv,
+                                            required,
+                                            provided);
+}
 
 static int
 mpi_interceptor_env_truthy(const char* value)

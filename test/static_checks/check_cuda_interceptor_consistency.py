@@ -113,7 +113,6 @@ def main():
     support_sources = {
         "src/dlopen_interceptor.c": ["dlopen"],
         "src/mpi_interceptor.c": ["PMPI_Finalize"],
-        "src/peak.c": ["exit"],
         "src/pthread_listener.c": ["pthread_create", "pthread_join"],
         "src/syscall_interceptor.c": ["close"],
     }
@@ -139,6 +138,17 @@ def main():
                     f"{relpath} must use Frida-native support lookup for {symbol}")
             require(f'gum_find_function("{symbol}")' not in source,
                     f"{relpath} must not broad-scan support hook {symbol}")
+
+    peak = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    require(re.search(r"PEAK_API\s+void\s+exit\s*\(", peak) is not None,
+            "ELF exit handling must use an ordinary exported interposer")
+    require(re.search(r"PEAK_API\s+void\s+peak_exit\s*\(", peak) is not None,
+            "the exit target must retain an exported profiling handler")
+    require('dlsym(RTLD_NEXT, "exit")' in peak,
+            "the exit interposer must resolve the real function with RTLD_NEXT")
+    require('peak_general_listener_find_function("exit")' not in peak and
+            'gum_find_function("exit")' not in peak,
+            "exit handling must not install a Gum support hook")
 
     require('gum_find_function("' not in cuda,
             "CUDA support hooks must use the Frida-native lookup helper")

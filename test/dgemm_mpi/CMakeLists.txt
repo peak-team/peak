@@ -1,6 +1,33 @@
 
 add_executable(test_dgemm_mpi test_dgemm_mpi.c)
 add_executable(test_mpi_exit_before_finalize test_mpi_exit_before_finalize.c)
+add_library(test_mpi_init_deferred_module MODULE
+    mpi_init_deferred_module.c)
+set_target_properties(test_mpi_init_deferred_module
+    PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "test_mpi_init_deferred_module")
+add_executable(test_mpi_init_deferred_activation
+    test_mpi_init_deferred_activation.c)
+target_compile_definitions(test_mpi_init_deferred_activation
+    PRIVATE
+        PEAK_TEST_MPI_INIT_DEFERRED_MODULE="$<TARGET_FILE:test_mpi_init_deferred_module>")
+target_link_libraries(test_mpi_init_deferred_activation
+    PRIVATE MPI::MPI_C ${CMAKE_DL_LIBS})
+add_dependencies(test_mpi_init_deferred_activation
+    test_mpi_init_deferred_module)
+add_executable(test_mpi_init_no_completion
+    test_mpi_init_no_completion.c)
+target_link_libraries(test_mpi_init_no_completion
+    PRIVATE ${CMAKE_DL_LIBS})
+add_executable(test_mpi_activation_exit_race
+    test_mpi_activation_exit_race.c)
+target_link_libraries(test_mpi_activation_exit_race
+    PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+add_library(test_mpi_init_chain_wrapper MODULE
+    mpi_init_chain_wrapper.c)
+target_link_libraries(test_mpi_init_chain_wrapper
+    PRIVATE MPI::MPI_C ${CMAKE_DL_LIBS})
 add_executable(test_mpi_report_reduction test_mpi_report_reduction.c)
 add_executable(test_mpi_report_transport
     test_mpi_report_transport.c

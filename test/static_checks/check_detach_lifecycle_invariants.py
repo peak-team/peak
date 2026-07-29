@@ -78,7 +78,6 @@ def check_support_hook_lifetimes(repo_root):
     checks = [
         ("src/mpi_interceptor.c", "mpi_interceptor_dettach", "mpi_interceptor"),
         ("src/syscall_interceptor.c", "syscall_interceptor_dettach", "syscall_interceptor"),
-        ("src/peak.c", "exit_interceptor_detach", "exit_interceptor"),
     ]
     for rel, function, object_name in checks:
         source = (repo_root / rel).read_text(encoding="utf-8")
@@ -640,11 +639,12 @@ def check_fast_listener_unwind_abi(repo_root):
 
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
-    body = extract_function(source, "peak_init")
+    init = extract_function(source, "peak_init")
+    body = extract_function(source, "peak_activate_runtime")
     fini = extract_function(source, "peak_fini_impl")
 
-    group_load_position = body.find("load_symbols_from_array(PEAK_TARGET_GROUP_ENV")
-    deduplicate_position = body.find("peak_deduplicate_target_names(")
+    group_load_position = init.find("load_symbols_from_array(PEAK_TARGET_GROUP_ENV")
+    deduplicate_position = init.find("peak_deduplicate_target_names(")
     require(group_load_position != -1 and deduplicate_position != -1 and
             group_load_position < deduplicate_position,
             "explicit and group target names must be deduplicated before setup")
@@ -666,6 +666,7 @@ def check_peak_init_heartbeat_order(repo_root):
     general_attach = extract_function(general, "peak_general_listener_attach")
     require("peak_general_listener_controller_start" not in general_attach,
             "general listener attach must not start mutation processing")
+    gum_init_position = body.find("gum_init_embedded()")
     general_attach_position = body.find("peak_general_listener_attach()")
     syscall_attach_position = body.find("syscall_interceptor_attach()")
     dlopen_attach_position = body.find("dlopen_interceptor_attach()")
@@ -674,14 +675,111 @@ def check_peak_init_heartbeat_order(repo_root):
         "peak_general_listener_controller_start()"
     )
     dynamic_enable_position = body.find("dlopen_interceptor_enable_dynamic_attach()")
-    require(-1 not in (general_attach_position, syscall_attach_position,
+    require(-1 not in (gum_init_position, general_attach_position,
+                       syscall_attach_position,
                        dlopen_attach_position, malloc_attach_position,
                        controller_start_position, dynamic_enable_position) and
-            general_attach_position < syscall_attach_position <
+            gum_init_position < general_attach_position <
+            syscall_attach_position <
             dlopen_attach_position < malloc_attach_position <
             controller_start_position < dynamic_enable_position <
             heartbeat_position,
             "startup Gum hooks must finish before controller and dlopen admission")
+    for forbidden in (
+        "gum_init_embedded()",
+        "pthread_listener_attach()",
+        "mpi_interceptor_attach()",
+        "peak_general_listener_attach()",
+        "syscall_interceptor_attach()",
+        "dlopen_interceptor_attach()",
+        "malloc_interceptor_attach()",
+        "peak_general_listener_controller_start()",
+        "pthread_create(&heartbeat_thread",
+    ):
+        require(forbidden not in init,
+                f"MPI pre-init configuration must not perform {forbidden}")
+    main_wrapper = extract_function(source, "main_wrapper")
+    require("peak_init();" in main_wrapper,
+            "main_wrapper must configure PEAK before application main")
+    require("exit_interceptor_attach" not in source and
+            "exit_interceptor_detach" not in source,
+            "ELF exit handling must not use a post-MPI Gum replacement")
+    exit_interposer = extract_function(source, "exit")
+    exit_handler = extract_function(source, "peak_exit")
+    require("peak_exit(status);" in exit_interposer and
+            "peak_runtime_close_activation_for_teardown();" in exit_handler and
+            "peak_fini();" in exit_handler and
+            "original_exit(status);" in exit_handler,
+            "the ordinary ELF exit interposer must remain inert before "
+            "activation and finalize PEAK afterward")
+    activation_close = extract_function(
+        source, "peak_runtime_close_activation_for_teardown"
+    )
+    require("PEAK_RUNTIME_ACTIVATION_CANCELED" in source and
+            "PEAK_RUNTIME_ACTIVATION_READY" in activation_close and
+            "PEAK_RUNTIME_ACTIVATION_CANCELED" in activation_close and
+            "atomic_compare_exchange_weak_explicit(" in activation_close,
+            "inactive teardown must atomically claim READY -> CANCELED")
+    require("PEAK_RUNTIME_ACTIVATION_IN_PROGRESS" in activation_close and
+            "sched_yield();" in activation_close,
+            "teardown must wait if activation wins the READY transition")
+    require("peak_runtime_close_activation_for_teardown();" in
+            extract_function(source, "peak_fini"),
+            "main-return finalization must close deferred activation")
+    libc_start_main_position = source.find("int __libc_start_main(")
+    resolve_exit_position = source.find(
+        "peak_resolve_real_exit();",
+        libc_start_main_position,
+    )
+    require(libc_start_main_position != -1 and
+            resolve_exit_position != -1,
+            "the real exit symbol must be resolved without a Gum patch "
+            "before application main")
+    policy = extract_function(
+        source, "peak_mpi_activation_policy_post_init"
+    )
+    require('g_ascii_strcasecmp(value, "post-init")' in policy and
+            'g_ascii_strcasecmp(value, "immediate")' in policy and
+            "return FALSE;" in policy,
+            "post-MPI activation must be explicit and default fail-open to "
+            "immediate activation")
+    pending_policy_position = init.find("if (activate_post_mpi_init)")
+    pending_position = init.find(
+        "query_result == MPI_SUCCESS && !initialized",
+        pending_policy_position,
+    )
+    pending_return = init.find("return;", pending_position)
+    fallback_activation = init.rfind("peak_activate_runtime();")
+    require(pending_policy_position != -1 and pending_position != -1 and
+            pending_return != -1 and
+            fallback_activation != -1 and
+            pending_policy_position < pending_position < pending_return <
+            fallback_activation,
+            "only the explicit post-init policy may defer runtime activation "
+            "until an init-return interposer reports completion")
+
+    mpi = read_source(repo_root, "src/mpi_interceptor.c")
+    init_call = extract_function(mpi, "mpi_interceptor_call_init")
+    init_thread_call = extract_function(
+        mpi, "mpi_interceptor_call_init_thread"
+    )
+    for label, interposer in (("MPI_Init", init_call),
+                              ("MPI_Init_thread", init_thread_call)):
+        real_call = interposer.find("result = init(")
+        completion = interposer.find("peak_mpi_init_completed(result);")
+        outermost = interposer.find("peak_mpi_init_wrapper_depth == 0")
+        require(real_call != -1 and outermost != -1 and completion != -1 and
+                real_call < outermost < completion,
+                f"{label} must activate PEAK only after the outermost real "
+                "initializer returns")
+    require("gum_" not in init_call and "gum_" not in init_thread_call,
+            "MPI initialization interposers must remain independent of Gum")
+    for symbol in ("MPI_Init", "PMPI_Init",
+                   "MPI_Init_thread", "PMPI_Init_thread"):
+        require(f'dlsym(RTLD_NEXT, "{symbol}")' in mpi,
+                f"{symbol} must preserve the next same-name wrapper chain")
+    require(mpi.count("pthread_once(") >= 4,
+            "MPI initialization symbol resolution must be thread-safe")
     elapsed_position = fini.find("peak_main_time = peak_second() - peak_runtime_start_time")
     controller_stop_position = fini.find("peak_general_listener_controller_stop()")
     require(elapsed_position != -1 and controller_stop_position != -1 and
@@ -1842,28 +1940,41 @@ def check_mpi_startup_helper_warmup(repo_root):
         repo_root / "test/detach_controller/CMakeLists.txt"
     ).read_text(encoding="utf-8")
     body = extract_function(source, "peak_init")
+    activation = extract_function(source, "peak_activate_runtime")
 
     check_mpi_position = body.find("found_MPI = check_MPI();")
     configure_position = body.find(
         "peak_detach_controller_configure_mpi_process(found_MPI != 0);"
     )
-    pthread_attach_position = body.find("pthread_listener_attach();")
-    warmup_position = body.find("peak_detach_controller_warmup_backend();")
+    pending_return_position = body.find(
+        "query_result == MPI_SUCCESS && !initialized"
+    )
+    pthread_attach_position = activation.find("pthread_listener_attach();")
+    warmup_position = activation.find(
+        "peak_detach_controller_warmup_backend();"
+    )
     require(check_mpi_position != -1 and
             configure_position != -1 and
             pthread_attach_position != -1 and
-            warmup_position != -1,
+            warmup_position != -1 and
+            pending_return_position != -1,
             "peak_init must keep explicit MPI detection, backend configuration, and helper warmup")
     require(check_mpi_position < configure_position <
-            pthread_attach_position < warmup_position,
-            "MPI auto-backend containment must be configured before helper warmup or listener mutation")
+            pending_return_position,
+            "MPI auto-backend containment must be configured before pending "
+            "for MPI_Init completion")
+    require(pthread_attach_position < warmup_position,
+            "runtime activation must install pthread containment before "
+            "non-MPI helper warmup")
     non_mpi_configure_position = body.find(
         "peak_detach_controller_configure_mpi_process(FALSE);"
     )
     require(non_mpi_configure_position != -1 and
-            non_mpi_configure_position < pthread_attach_position,
-            "non-MPI builds must freeze controller configuration explicitly before listener mutation")
-    warmup_context = body[max(0, warmup_position - 180):warmup_position + 80]
+            non_mpi_configure_position != -1,
+            "non-MPI builds must freeze controller configuration explicitly")
+    warmup_context = activation[
+        max(0, warmup_position - 180):warmup_position + 80
+    ]
     require("!found_MPI" in warmup_context,
             "helper warmup must be suppressed for MPI-linked programs before PMPI_Init")
     require("peak_detach_mpi_process" in controller and

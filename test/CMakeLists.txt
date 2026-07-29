@@ -1503,6 +1503,12 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
+    add_test(NAME test_non_mpi_fake_rank_default_activation
+        COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
+    set_tests_properties(test_non_mpi_fake_rank_default_activation
+        PROPERTIES
+            ENVIRONMENT "PMI_RANK=0;PEAK_TARGET=dgemm_;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|")
 
     # Add test of TARGET_CONFIG
     add_test(NAME test_target_config COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
@@ -1839,6 +1845,30 @@ if(BUILD_TESTING)
 
     if(MPI_FOUND)
         add_subdirectory(dgemm_mpi)
+        add_test(NAME test_post_init_without_mpi_diagnostic
+            COMMAND $<TARGET_FILE:test_mpi_init_no_completion>)
+        set_tests_properties(test_post_init_without_mpi_diagnostic
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_no_completion_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_VERBOSITY=warn;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "post-init activation was requested, but no interposed MPI_Init.*completion was observed"
+                FAIL_REGULAR_EXPRESSION "mpi_init_no_completion_error|Caught signal|Segmentation fault|SIGSEGV|signal 11")
+        add_test(NAME test_post_init_without_mpi_explicit_exit_diagnostic
+            COMMAND $<TARGET_FILE:test_mpi_init_no_completion> exit)
+        set_tests_properties(
+            test_post_init_without_mpi_explicit_exit_diagnostic
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_no_completion_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_VERBOSITY=warn;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "post-init activation was requested, but no interposed MPI_Init.*completion was observed"
+                FAIL_REGULAR_EXPRESSION "mpi_init_no_completion_error|Caught signal|Segmentation fault|SIGSEGV|signal 11")
+        add_test(NAME test_mpi_activation_vs_exit_cancels_deferred_start
+            COMMAND $<TARGET_FILE:test_mpi_activation_exit_race>)
+        set_tests_properties(
+            test_mpi_activation_vs_exit_cancels_deferred_start
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_activation_exit_race_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_VERBOSITY=warn;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "mpi_activation_exit_race_ok"
+                FAIL_REGULAR_EXPRESSION "mpi_activation_exit_race_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 15)
         set(_PEAK_MPI_TEST_NPROCS 2)
         if(MPIEXEC_MAX_NUMPROCS AND MPIEXEC_MAX_NUMPROCS LESS _PEAK_MPI_TEST_NPROCS)
             set(_PEAK_MPI_TEST_NPROCS ${MPIEXEC_MAX_NUMPROCS})
@@ -1910,6 +1940,99 @@ if(BUILD_TESTING)
                     ${MPIEXEC_PREFLAGS}
                     ${PROJECT_BINARY_DIR}/test/dgemm_mpi/test_dgemm_mpi
                     ${MPIEXEC_POSTFLAGS})
+        foreach(_peak_mpi_init_mode
+                mpi-init
+                pmpi-init
+                mpi-init-thread
+                pmpi-init-thread)
+            add_test(NAME test_mpi_init_post_init_activation_${_peak_mpi_init_mode}
+                COMMAND ${MPIEXEC_EXECUTABLE}
+                        ${MPIEXEC_NUMPROC_FLAG} ${_PEAK_MPI_TEST_NPROCS}
+                        ${MPIEXEC_PREFLAGS}
+                        $<TARGET_FILE:test_mpi_init_deferred_activation>
+                        ${_peak_mpi_init_mode}
+                        post-init
+                        ${MPIEXEC_POSTFLAGS})
+            set_tests_properties(
+                test_mpi_init_post_init_activation_${_peak_mpi_init_mode}
+                PROPERTIES
+                    ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                    PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=${_peak_mpi_init_mode} policy=post-init"
+                    FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                    TIMEOUT 30)
+        endforeach()
+        add_test(NAME test_mpi_init_default_immediate_activation
+            COMMAND ${MPIEXEC_EXECUTABLE}
+                    ${MPIEXEC_NUMPROC_FLAG} ${_PEAK_MPI_TEST_NPROCS}
+                    ${MPIEXEC_PREFLAGS}
+                    $<TARGET_FILE:test_mpi_init_deferred_activation>
+                    mpi-init-thread
+                    immediate
+                    ${MPIEXEC_POSTFLAGS})
+        set_tests_properties(test_mpi_init_default_immediate_activation
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=mpi-init-thread policy=immediate"
+                FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 30)
+        add_test(NAME test_mpi_init_invalid_policy_falls_back_immediate
+            COMMAND ${MPIEXEC_EXECUTABLE}
+                    ${MPIEXEC_NUMPROC_FLAG} ${_PEAK_MPI_TEST_NPROCS}
+                    ${MPIEXEC_PREFLAGS}
+                    $<TARGET_FILE:test_mpi_init_deferred_activation>
+                    mpi-init
+                    immediate
+                    ${MPIEXEC_POSTFLAGS})
+        set_tests_properties(test_mpi_init_invalid_policy_falls_back_immediate
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=invalid;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=mpi-init policy=immediate"
+                FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 30)
+        add_test(NAME test_mpi_init_post_init_singleton
+            COMMAND $<TARGET_FILE:test_mpi_init_deferred_activation>
+                    mpi-init
+                    post-init)
+        set_tests_properties(test_mpi_init_post_init_singleton
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=mpi-init policy=post-init"
+                FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 30)
+        add_test(NAME test_mpi_init_failure_falls_back_non_mpi
+            COMMAND $<TARGET_FILE:test_mpi_init_deferred_activation>
+                    synthetic-failure
+                    post-init)
+        set_tests_properties(test_mpi_init_failure_falls_back_non_mpi
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=synthetic-failure policy=post-init"
+                FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 30)
+        if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+            foreach(_peak_mpi_chain_mode mpi-init mpi-init-thread)
+                if(_peak_mpi_chain_mode STREQUAL "mpi-init")
+                    set(_peak_mpi_chain_symbol MPI_Init)
+                else()
+                    set(_peak_mpi_chain_symbol MPI_Init_thread)
+                endif()
+                add_test(NAME test_mpi_init_wrapper_chain_${_peak_mpi_chain_mode}
+                    COMMAND ${MPIEXEC_EXECUTABLE}
+                            ${MPIEXEC_NUMPROC_FLAG} ${_PEAK_MPI_TEST_NPROCS}
+                            ${MPIEXEC_PREFLAGS}
+                            $<TARGET_FILE:test_mpi_init_deferred_activation>
+                            ${_peak_mpi_chain_mode}
+                            post-init
+                            ${MPIEXEC_POSTFLAGS})
+                set_tests_properties(
+                    test_mpi_init_wrapper_chain_${_peak_mpi_chain_mode}
+                    PROPERTIES
+                        ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_OUTPUT_AGGREGATION=local;${HEARTBEAT_OFF_ENV};LD_PRELOAD=$<TARGET_FILE:peak>:$<TARGET_FILE:test_mpi_init_chain_wrapper>"
+                        PASS_REGULAR_EXPRESSION "mpi_init_chain_wrapper_seen symbol=${_peak_mpi_chain_symbol}"
+                        FAIL_REGULAR_EXPRESSION "mpi_init_chain_wrapper_error|mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                        TIMEOUT 30)
+            endforeach()
+        endif()
         add_test(NAME test_mpi_exit_before_finalize
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py

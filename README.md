@@ -147,6 +147,7 @@ in detail.
 
 | Variable | Purpose |
 | --- | --- |
+| `PEAK_MPI_ACTIVATION_POLICY` | Runtime activation timing: `immediate` (default) preserves complete startup and pre-MPI profiling. `post-init` is an explicit large-scale MPI loader-safety mode that performs no Gum mutation, module pinning, controller startup, or heartbeat work until the outermost intercepted `MPI_Init`, `PMPI_Init`, `MPI_Init_thread`, or `PMPI_Init_thread` returns. It intentionally omits all earlier behavior, including a target invocation that contains MPI initialization; `defer` and `deferred` are accepted aliases. Use the default for non-MPI, MPI Sessions-only, static/hidden MPI bindings, and any runtime whose traditional C init symbols cannot be dynamically interposed. |
 | `PEAK_OUTPUT_AGGREGATION` | Final output transport: `mpi` (default), `socket`, or `local`, with documented aliases. On the intercepted-finalize path, socket/local publish before MPI teardown coordination and fold participation into the long release gate; MPI aggregation remains proof-first. |
 | `PEAK_MPI_COLLECTIVE_OUTPUT` | Legacy aggregate-output switch; `PEAK_OUTPUT_AGGREGATION` takes precedence. |
 | `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer immediately and therefore bypasses the Intel MPI 2019 compatibility skip. |
