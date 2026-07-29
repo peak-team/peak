@@ -99,6 +99,16 @@ def main():
     publish = function_body(
         source, "peak_general_controller_publish_detach_count_requests_unlocked"
     )
+    retire_slot = function_body(
+        source, "peak_general_listener_retire_listener_slot"
+    )
+    total_calls = function_body(source, "peak_general_listener_total_calls")
+    local_report = function_body(
+        source, "peak_general_listener_print_with_mpi_job_policy"
+    )
+    test_call_count = function_body(
+        source, "peak_general_listener_test_call_count"
+    )
 
     forbidden = (
         "pthread_listener_lookup_thread",
@@ -177,10 +187,18 @@ def main():
         and "peak_general_listener_try_publish_detach_count_request"
         in generic_enter
         and "peak_general_listener_try_publish_detach_count_request" in enter
+        and "gulong current_num_calls = peak_general_listener_num_calls_increment"
+        in generic_enter
+        and "gulong current_num_calls = peak_general_listener_num_calls_increment"
+        in enter
+        and "self,\n            current_num_calls" in generic_enter
+        and "self,\n            current_num_calls" in enter
+        and "detach_count_total" not in source
         and "peak_general_listener_controller_wake" in generic_enter
         and "peak_general_listener_controller_wake" in enter,
-        "generic and fast threshold-crossing callbacks must publish the "
-        "detach-count CAS latch and issue the lock-free controller wake",
+        "generic and fast threshold-crossing callbacks must publish their "
+        "own slot's exact count through the detach-count CAS latch and issue "
+        "the lock-free controller wake",
     )
     require(
         "current_num_calls != peak_detach_count" in threshold_publish
@@ -207,6 +225,16 @@ def main():
         in threshold_initial_snapshot,
         "the exact threshold crosser must publish through the packed "
         "ATTACHED request or first-activation crossing CAS",
+    )
+    require(
+        "peak_general_listener_add_calls_saturating" not in source
+        and "listener->retired_num_calls += calls" in retire_slot
+        and "calls += peak_general_listener_num_calls_load" in total_calls
+        and "total_num_calls += peak_general_listener_num_calls_load" in publish
+        and "sum_num_calls[i] += calls" in local_report
+        and "total += calls" in test_call_count,
+        "call totals must preserve origin's unsigned modular aggregation in "
+        "retirement, controller, heartbeat, report, and test snapshots",
     )
     require(
         "PEAK_HOOK_UNRESOLVED" in threshold_adjacent_generation

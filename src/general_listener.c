@@ -1075,8 +1075,7 @@ static inline __attribute__((always_inline)) gboolean
 peak_general_listener_try_publish_detach_count_request_snapshot(
     PeakGeneralListener* listener,
     unsigned long long control);
-static gulong peak_general_listener_add_calls_saturating(gulong lhs,
-                                                         gulong rhs);
+static gulong peak_general_listener_total_calls(PeakGeneralListener* listener);
 static inline gulong
 peak_general_listener_num_calls_load(const gulong* slot);
 void pthread_pause_enable(void);
@@ -2630,7 +2629,7 @@ peak_general_listener_test_call_count(size_t hook_id)
         for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
             gulong calls = peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, index));
-            total = G_MAXULONG - total < calls ? G_MAXULONG : total + calls;
+            total += calls;
         }
         g_mutex_unlock(&listener->retired_mutex);
     }
@@ -4219,10 +4218,8 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
         for (size_t thread_id = 0;
              thread_id < listener->fast_stats_capacity;
              thread_id++) {
-            total_num_calls = peak_general_listener_add_calls_saturating(
-                total_num_calls,
-                peak_general_listener_num_calls_load(
-                    peak_general_listener_num_calls_slot(listener, thread_id)));
+            total_num_calls += peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, thread_id));
         }
         g_mutex_unlock(&listener->retired_mutex);
 
@@ -4557,40 +4554,6 @@ peak_general_listener_num_calls_increment(gulong* slot)
     return next;
 }
 
-static inline gulong
-peak_general_listener_detach_count_increment(PeakGeneralListener* listener)
-{
-    gulong observed;
-
-    if (G_LIKELY(peak_detach_count == G_MAXULONG)) {
-        return 0;
-    }
-
-    observed = atomic_load_explicit(&listener->detach_count_total,
-                                    memory_order_relaxed);
-    while (observed != G_MAXULONG) {
-        gulong next = observed + 1;
-
-        if (atomic_compare_exchange_weak_explicit(&listener->detach_count_total,
-                                                  &observed,
-                                                  next,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            return next;
-        }
-    }
-    return G_MAXULONG;
-}
-
-static gulong
-peak_general_listener_add_calls_saturating(gulong lhs, gulong rhs)
-{
-    if (G_MAXULONG - lhs < rhs) {
-        return G_MAXULONG;
-    }
-    return lhs + rhs;
-}
-
 static gboolean
 peak_general_listener_retire_listener_slot(PeakGeneralListener* listener,
                                            size_t slot)
@@ -4615,12 +4578,10 @@ peak_general_listener_retire_listener_slot(PeakGeneralListener* listener,
      * never both and never neither. */
     g_mutex_lock(&listener->retired_mutex);
     if (calls != 0) {
-        listener->retired_num_calls =
-            peak_general_listener_add_calls_saturating(
-                listener->retired_num_calls, calls);
-        listener->retired_thread_count =
-            peak_general_listener_add_calls_saturating(
-                listener->retired_thread_count, 1);
+        listener->retired_num_calls += calls;
+        if (listener->retired_thread_count != G_MAXULONG) {
+            listener->retired_thread_count++;
+        }
         listener->retired_total_time += total;
         listener->retired_exclusive_time += exclusive;
         if (total > listener->retired_max_total_time) {
@@ -4706,15 +4667,21 @@ peak_general_listener_total_calls(PeakGeneralListener* listener)
         g_mutex_lock(&listener->retired_mutex);
         calls = listener->retired_num_calls;
         for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
-            calls = peak_general_listener_add_calls_saturating(
-                calls,
-                peak_general_listener_num_calls_load(
-                    peak_general_listener_num_calls_slot(listener, index)));
+            calls += peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, index));
         }
         g_mutex_unlock(&listener->retired_mutex);
     }
     return calls;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API gulong
+peak_general_listener_test_total_calls(PeakGeneralListener* listener)
+{
+    return peak_general_listener_total_calls(listener);
+}
+#endif
 
 static double
 peak_general_listener_profile_seconds_for_calls_unlocked(size_t hook_id,
@@ -5990,14 +5957,12 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     entry->stack_address =
         peak_general_listener_invocation_stack_address(ic);
     entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
-    peak_general_listener_num_calls_increment(
+    gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
-    gulong detach_count_calls =
-        peak_general_listener_detach_count_increment(self);
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
-            detach_count_calls))) {
+            current_num_calls))) {
         peak_general_listener_controller_wake();
     }
 
@@ -6148,14 +6113,12 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     entry->gum_stack_depth = gum_stack_depth;
     entry->fast_dispatch = TRUE;
 
-    peak_general_listener_num_calls_increment(
+    gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
-    gulong detach_count_calls =
-        peak_general_listener_detach_count_increment(self);
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
-            detach_count_calls))) {
+            current_num_calls))) {
         peak_general_listener_controller_wake();
     }
 
@@ -6693,7 +6656,6 @@ peak_general_listener_init(PeakGeneralListener* self)
     g_mutex_init(&self->retired_mutex);
     self->retired_mutex_initialized = TRUE;
     atomic_init(&self->callback_hook_control, PEAK_HOOK_UNRESOLVED);
-    atomic_init(&self->detach_count_total, 0);
     atomic_init(&self->fast_lifetime_closing, 0);
     atomic_init(&self->fast_lifetime_abandoners, 0);
     self->fast_listener = (GumPeakFastListener){
@@ -8363,7 +8325,8 @@ peak_general_listener_mpi_reducer_failed_closed(void)
 #endif
 }
 
-gboolean peak_general_listener_print_with_mpi_job_policy(
+gboolean
+peak_general_listener_print_with_mpi_job_policy(
     PeakOutputAggregationMode aggregation_mode,
     gboolean active_mpi_job,
     gboolean* report_write_succeeded)
@@ -8420,8 +8383,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
                 gfloat min_time =
                     *peak_general_listener_min_time_slot(pg_listener, j);
 
-                sum_num_calls[i] = peak_general_listener_add_calls_saturating(
-                    sum_num_calls[i], calls);
+                sum_num_calls[i] += calls;
                 sum_total_time[i] += total_time;
                 sum_exclusive_time[i] += exclusive_time;
                 if (calls != 0) {

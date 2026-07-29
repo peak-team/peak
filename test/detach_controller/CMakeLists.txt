@@ -572,6 +572,15 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
       PASS_REGULAR_EXPRESSION
         "general-listener-detach-count-latch-state-gate-ok")
 
+  add_test(NAME test_detach_controller_general_listener_call_count_modular_aggregation
+    COMMAND test_detach_listener_shutdown
+            general-listener-call-count-modular-aggregation)
+  set_tests_properties(
+    test_detach_controller_general_listener_call_count_modular_aggregation
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+        "general-listener-call-count-modular-aggregation-ok")
+
   add_test(NAME test_detach_controller_general_listener_mapping_lifecycle
     COMMAND test_detach_listener_shutdown general-listener-mapping-lifecycle)
   set_tests_properties(test_detach_controller_general_listener_mapping_lifecycle

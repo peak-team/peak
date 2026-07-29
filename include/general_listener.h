@@ -99,9 +99,6 @@ struct _PeakGeneralListener {
      * crossing or publishing against a later ATTACHED generation.
      */
     _Atomic unsigned long long callback_hook_control;
-    /* Monotonic callback total used only when detach-count sampling is
-     * enabled. It spans retired and currently active reusable slots. */
-    _Atomic gulong detach_count_total;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
@@ -422,6 +419,8 @@ PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the current local call count for one hook in test builds. */
 PEAK_API gulong peak_general_listener_test_call_count(size_t hook_id);
+PEAK_API gulong peak_general_listener_test_total_calls(
+    PeakGeneralListener* listener);
 PEAK_API gulong peak_general_listener_test_thread_count(size_t hook_id);
 PEAK_API uint64_t peak_general_listener_test_dropped_calls(void);
 PEAK_API uint64_t peak_general_listener_test_dropped_threads(void);

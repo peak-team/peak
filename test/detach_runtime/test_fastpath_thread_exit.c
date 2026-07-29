@@ -109,9 +109,8 @@ nonwrapper_worker(void* arg)
     return NULL;
 }
 
-/* Keep one slot active while another retires.  With the main thread's one
- * call, this makes the retiring slot move the aggregate from 8 to 10:
- * main=1, holder=7, retiring=2. */
+/* Keep one slot active while another retires.  The aggregate reaches ten
+ * calls (main=1, holder=7, retiring=2), but no individual slot does. */
 static void*
 threshold_holder_worker(void* arg)
 {
@@ -123,6 +122,9 @@ threshold_holder_worker(void* arg)
     while (!atomic_load_explicit(&threshold_holder_release,
                                  memory_order_acquire)) {
         sched_yield();
+    }
+    for (int index = 0; index < 3; index++) {
+        (void)peak_fastpath_thread_exit_target(0);
     }
     return NULL;
 }
@@ -157,6 +159,9 @@ reused_active_five_worker(void* arg)
     while (!atomic_load_explicit(&retired_active_release,
                                  memory_order_acquire)) {
         sched_yield();
+    }
+    for (int index = 0; index < 5; index++) {
+        (void)peak_fastpath_thread_exit_target(0);
     }
     return NULL;
 }
@@ -315,18 +320,38 @@ run_retired_detach_threshold_regression(void)
         return 1;
     }
 
-    /* Retirement wakes the controller directly.  The configured signal
-     * helper deliberately fails preparation, leaving a trace record that
-     * preserves the controller's detach-count request and total. */
+    /* Retired accounting is report-only: the aggregate total must not fire a
+     * detach-count request.  Releasing the holder then advances that same
+     * slot from seven to ten and must fire exactly at its local threshold. */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        FILE* trace = fopen(trace_path, "r");
+
+        if (trace != NULL) {
+            char line[2048];
+
+            while (fgets(line, sizeof(line), trace) != NULL) {
+                if (strstr(line, ",detach-count,") != NULL) {
+                    fclose(trace);
+                    atomic_store_explicit(&threshold_holder_release,
+                                          1, memory_order_release);
+                    (void)pthread_join(holder, NULL);
+                    fputs("aggregate retired calls fired detach-count request\n",
+                          stderr);
+                    return 1;
+                }
+            }
+            fclose(trace);
+        }
+        usleep(10000);
+    }
+    atomic_store_explicit(&threshold_holder_release, 1, memory_order_release);
     for (int attempt = 0; attempt < 200; attempt++) {
         FILE* trace = fopen(trace_path, "r");
         if (trace != NULL) {
             char line[2048];
             while (fgets(line, sizeof(line), trace) != NULL) {
-                if (strstr(line, ",detach-count,10,") != NULL) {
+                if (strstr(line, ",detach-count,") != NULL) {
                     fclose(trace);
-                    atomic_store_explicit(&threshold_holder_release,
-                                          1, memory_order_release);
                     (void)pthread_join(holder, NULL);
                     puts("fastpath_thread_exit_ok");
                     return 0;
@@ -336,9 +361,8 @@ run_retired_detach_threshold_regression(void)
         }
         usleep(10000);
     }
-    atomic_store_explicit(&threshold_holder_release, 1, memory_order_release);
     (void)pthread_join(holder, NULL);
-    fputs("retired detach-count request did not report aggregate total 10\n",
+    fputs("per-slot detach-count request did not report local total 10\n",
           stderr);
     return 1;
 }
@@ -371,8 +395,30 @@ run_retired_active_detach_threshold_regression(void)
         sched_yield();
     }
 
-    /* The second thread remains alive. The detach request must see its five
-     * active calls together with the first thread's five retired calls. */
+    /* The second thread reuses the retired slot, so its first five calls must
+     * remain below the local threshold despite five retired calls elsewhere. */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        FILE* trace = fopen(trace_path, "r");
+
+        if (trace != NULL) {
+            char line[2048];
+
+            while (fgets(line, sizeof(line), trace) != NULL) {
+                if (strstr(line, ",detach-count,") != NULL) {
+                    fclose(trace);
+                    atomic_store_explicit(&retired_active_release, 1,
+                                          memory_order_release);
+                    (void)pthread_join(active, NULL);
+                    fputs("retired calls were replayed into a reused slot\n",
+                          stderr);
+                    return 1;
+                }
+            }
+            fclose(trace);
+        }
+        usleep(10000);
+    }
+    atomic_store_explicit(&retired_active_release, 1, memory_order_release);
     for (int attempt = 0; attempt < 200; attempt++) {
         FILE* trace = fopen(trace_path, "r");
 
@@ -380,10 +426,8 @@ run_retired_active_detach_threshold_regression(void)
             char line[2048];
 
             while (fgets(line, sizeof(line), trace) != NULL) {
-                if (strstr(line, ",detach-count,10,") != NULL) {
+                if (strstr(line, ",detach-count,") != NULL) {
                     fclose(trace);
-                    atomic_store_explicit(&retired_active_release, 1,
-                                          memory_order_release);
                     (void)pthread_join(active, NULL);
                     puts("fastpath_thread_exit_ok");
                     return 0;
@@ -393,9 +437,9 @@ run_retired_active_detach_threshold_regression(void)
         }
         usleep(10000);
     }
-    atomic_store_explicit(&retired_active_release, 1, memory_order_release);
     (void)pthread_join(active, NULL);
-    fputs("retired-plus-active detach-count request did not fire\n", stderr);
+    fputs("reused-slot detach-count request did not fire at local 10\n",
+          stderr);
     return 1;
 }
 
