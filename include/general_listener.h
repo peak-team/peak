@@ -99,6 +99,9 @@ struct _PeakGeneralListener {
      * crossing or publishing against a later ATTACHED generation.
      */
     _Atomic unsigned long long callback_hook_control;
+    /* Monotonic callback total used only when detach-count sampling is
+     * enabled. It spans retired and currently active reusable slots. */
+    _Atomic gulong detach_count_total;
     _Atomic guint fast_lifetime_closing;
     _Atomic guint fast_lifetime_abandoners;
     GumPeakFastListener fast_listener;
@@ -113,6 +116,16 @@ struct _PeakGeneralListener {
     gfloat* max_time;
     gfloat* min_time;
     gboolean* target_thread_called;
+    /* Exit-only aggregate for logical threads whose reusable slot was reset. */
+    GMutex retired_mutex;
+    gulong retired_num_calls;
+    gulong retired_thread_count;
+    gdouble retired_total_time;
+    gdouble retired_exclusive_time;
+    gdouble retired_max_total_time;
+    gdouble retired_min_total_time;
+    gfloat retired_max_time;
+    gfloat retired_min_time;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
     size_t checkpoint_shadow_mapping_size;
 };
@@ -128,6 +141,18 @@ GumAttachReturn peak_general_listener_gum_attach_target(
 void peak_general_listener_fast_ignore_current_thread(void);
 void peak_general_listener_fast_unignore_current_thread(void);
 void peak_general_listener_release_current_thread_state(void);
+
+/** Releases invocation frames but preserves the TLS slot across destructor passes. */
+void peak_general_listener_release_current_thread_frames_preserve_slot(void);
+
+/** Transfers a finished thread's slot into retired aggregates before reuse. */
+gboolean peak_general_listener_retire_current_thread_slot(size_t slot);
+
+/** Records a callback skipped because the caller has no PEAK user slot. */
+void peak_general_listener_note_dropped_current_thread(void);
+
+/** Ensures a PEAK helper cannot be attributed as a user thread. */
+void peak_general_listener_exclude_current_thread(void);
 
 /** Returns whether the listener owns the accounting storage required to attach. */
 gboolean peak_general_listener_is_ready(const PeakGeneralListener* self);
@@ -396,6 +421,9 @@ PEAK_API PeakHookState peak_general_listener_hook_state(size_t hook_id);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the current local call count for one hook in test builds. */
 PEAK_API gulong peak_general_listener_test_call_count(size_t hook_id);
+PEAK_API gulong peak_general_listener_test_thread_count(size_t hook_id);
+PEAK_API uint64_t peak_general_listener_test_dropped_calls(void);
+PEAK_API uint64_t peak_general_listener_test_dropped_threads(void);
 #endif
 
 /**

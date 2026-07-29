@@ -261,6 +261,8 @@ fixture_snapshot(int rank, bool mismatch_name)
     snapshot->min_time[1] = rank == 0 ? FLT_MAX : 0.1f;
     snapshot->thread_count[0] = rank == 0 ? 2UL : 1UL;
     snapshot->thread_count[1] = rank == 0 ? 0UL : 3UL;
+    snapshot->dropped_calls = rank == 0 ? 7U : 11U;
+    snapshot->dropped_threads = rank == 0 ? 2U : 3U;
 
     snapshot->overhead_per_call = rank == 0 ? 1e-7 : 9e-7;
     snapshot->overhead.valid = true;
@@ -321,7 +323,9 @@ aggregate_matches(const PeakReportSnapshot* aggregate)
         aggregate->min_time[0] != 0.15f ||
         aggregate->min_time[1] != 0.1f ||
         aggregate->thread_count[0] != 3UL ||
-        aggregate->thread_count[1] != 3UL) {
+        aggregate->thread_count[1] != 3UL ||
+        aggregate->dropped_calls != 18U ||
+        aggregate->dropped_threads != 5U) {
         return false;
     }
 
@@ -553,8 +557,8 @@ run_two_rank_case(int port,
         action == TEST_GATHER_PAYLOAD_DROP_FAILURE) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_AFTER_BYTES",
-            /* wire-v11 header (152 bytes) plus 17 payload bytes. */
-            action == TEST_GATHER_DROP_FAILURE ? "1" : "169",
+            /* wire-v12 header (168 bytes) plus 17 payload bytes. */
+            action == TEST_GATHER_DROP_FAILURE ? "1" : "185",
             1);
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_RANK",
@@ -615,7 +619,7 @@ run_two_rank_case(int port,
             &peer_aggregate);
         memset(&telemetry, 0, sizeof(telemetry));
         peak_socket_report_test_telemetry_get(&telemetry);
-        if (telemetry.wire_version != 11U ||
+        if (telemetry.wire_version != 12U ||
             telemetry.peer_receipt_received !=
                 peer_registration_expected ||
             telemetry.peer_confirmation_sent !=
@@ -656,7 +660,7 @@ run_two_rank_case(int port,
         &aggregate);
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
-    if (root_telemetry.wire_version != 11U ||
+    if (root_telemetry.wire_version != 12U ||
         root_telemetry.root_max_active != 1U ||
         (gather_must_fail &&
          (root_telemetry.root_payload_count !=
@@ -1067,7 +1071,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
                 &peer_aggregate);
             memset(&telemetry, 0, sizeof(telemetry));
             peak_socket_report_test_telemetry_get(&telemetry);
-            if (telemetry.wire_version != 11U ||
+            if (telemetry.wire_version != 12U ||
                 !telemetry.peer_receipt_received ||
                 !telemetry.peer_confirmation_sent ||
                 !telemetry.peer_release_started ||
@@ -1101,7 +1105,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
         peak_socket_report_test_telemetry_get(&telemetry);
         if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
             session == NULL || aggregate == NULL ||
-            telemetry.wire_version != 11U ||
+            telemetry.wire_version != 12U ||
             telemetry.root_payload_count != (uint32_t)(size - 1) ||
             telemetry.root_receipt_count != (uint32_t)(size - 1) ||
             telemetry.root_confirmation_count !=
@@ -1231,7 +1235,7 @@ run_duplicate_rank_case(int port)
         peak_socket_report_test_telemetry_get(&telemetry);
         if (status != PEAK_SOCKET_REPORT_FAILED ||
             session != NULL || aggregate != NULL ||
-            telemetry.wire_version != 11U ||
+            telemetry.wire_version != 12U ||
             telemetry.root_payload_count > 1U ||
             telemetry.root_receipt_count >
                 telemetry.root_payload_count ||

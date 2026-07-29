@@ -15,8 +15,8 @@ enum {
     TEST_COLLECTIVE_ALLREDUCE = 0,
     TEST_COLLECTIVE_REDUCE = 1,
     TEST_COLLECTIVE_BCAST = 2,
-    TEST_COLLECTIVE_COUNT = 54,
-    TEST_UNIQUE_LABEL_COUNT = 29,
+    TEST_COLLECTIVE_COUNT = 58,
+    TEST_UNIQUE_LABEL_COUNT = 33,
 };
 
 typedef enum {
@@ -330,6 +330,8 @@ fixture_snapshot(void)
     snapshot->min_time[1] = 0.2f;
     snapshot->thread_count[0] = 1;
     snapshot->thread_count[1] = 2;
+    snapshot->dropped_calls = 7;
+    snapshot->dropped_threads = 3;
     snapshot->overhead_per_call = 1e-7;
     snapshot->overhead.valid = true;
     snapshot->overhead.accounting_valid = true;
@@ -425,19 +427,23 @@ validate_golden_trace(void)
     EXPECT(39, "profile-seconds", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_SUM, 0);
     EXPECT(40, "failed-stop-window-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
     EXPECT(41, "failed-stop-window-count", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(42, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(43, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(44, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(45, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(46, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(47, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(48, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(49, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
-    EXPECT(50, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
-    EXPECT(51, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(52, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(53, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(54, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(42, "dropped-calls-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(43, "dropped-threads-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(44, "dropped-calls", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(45, "dropped-threads", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(46, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(47, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(48, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(49, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(50, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(51, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(52, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(53, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
+    EXPECT(54, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
+    EXPECT(55, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(56, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(57, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(58, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
 
 #undef EXPECT
 
@@ -484,6 +490,8 @@ run_success_case(int rank, int size)
             aggregate->max_time[1] != local->max_time[1] ||
             aggregate->detached[0] != local->detached[0] ||
             aggregate->reattached[1] != local->reattached[1] ||
+            aggregate->dropped_calls != local->dropped_calls ||
+            aggregate->dropped_threads != local->dropped_threads ||
             !aggregate->overhead.per_rank_max ||
             aggregate->overhead.per_rank_maxima.owner_ranks[0] != 0) {
             failures++;
@@ -596,6 +604,6 @@ main(void)
                 failures);
         return EXIT_FAILURE;
     }
-    puts("mpi_report_request_lifetime_ok operations=54 labels=29 failures=108");
+    puts("mpi_report_request_lifetime_ok operations=58 labels=33 failures=116");
     return EXIT_SUCCESS;
 }

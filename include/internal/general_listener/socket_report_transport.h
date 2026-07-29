@@ -3,7 +3,7 @@
 
 /**
  * @file socket_report_transport.h
- * @brief Aggregate immutable final-report snapshots through PEAK wire-v11.
+ * @brief Aggregate immutable final-report snapshots through PEAK wire-v12.
  */
 
 #include "internal/general_listener/report_snapshot.h"
@@ -38,7 +38,7 @@ typedef enum {
 typedef struct PeakSocketReportSession PeakSocketReportSession;
 
 /**
- * Gathers immutable report snapshots through the established wire-v11 socket
+ * Gathers immutable report snapshots through the established wire-v12 socket
  * protocol.
  *
  * Root advances a bounded set of nonblocking peer connections under both a

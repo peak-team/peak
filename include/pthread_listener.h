@@ -11,6 +11,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_PTHREAD_LISTENER_API __attribute__((visibility("default")))
+#else
+#define PEAK_PTHREAD_LISTENER_API
+#endif
+
 /**
  * @struct _PthreadListener
  * @brief Gum invocation listener used to wrap pthread_create calls.
@@ -30,7 +36,9 @@ typedef struct _PthreadState PthreadState;
 
 /**
  * Tracks the child ID argument and wrapper context until pthread_create
- * returns.
+ * returns.  Only successful joins release slots for reuse; detached or
+ * otherwise unjoined threads retain quarantined slots because POSIX does not
+ * provide a post-destructor notification with a safe ordering guarantee.
  */
 struct _PthreadState {
     pthread_t* child_tid;
@@ -43,8 +51,8 @@ struct _PthreadState {
  *
  * The function initializes the thread-ID map, registers the main thread, and
  * installs Gum hooks for pthread_create and pthread_join. Created threads
- * receive compact PEAK IDs when their wrapped start routine begins; IDs may be
- * reused after cleanup or a successful join. The hooks are removed by
+ * receive compact PEAK IDs when their wrapped start routine begins; IDs are
+ * reused only after a successful join. The hooks are removed by
  * pthread_listener_dettach(), but the mapping remains available because
  * wrapped start routines may finish after interception has stopped.
  */
@@ -63,8 +71,6 @@ void pthread_listener_attach();
  */
 gboolean pthread_listener_dettach();
 
-extern GHashTable* peak_tid_mapping;
-
 /**
  * @brief Thread-safe lookup from pthread_t to mapped thread id.
  *
@@ -73,6 +79,28 @@ extern GHashTable* peak_tid_mapping;
  * @return mapped thread id when found, 0 otherwise.
  */
 size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found);
+
+/** Returns the calling thread's TLS slot without consulting the hash table. */
+gboolean pthread_listener_current_thread_slot(size_t* slot_out);
+
+/** Marks the calling PEAK helper thread as ineligible for user accounting. */
+void pthread_listener_exclude_current_thread(void);
+
+/** Tags the next pthread_create issued by this thread as a PEAK helper. */
+PEAK_PTHREAD_LISTENER_API void pthread_listener_mark_next_created_thread_helper(void);
+
+/** Returns TRUE for a PEAK helper thread that must silently bypass accounting. */
+gboolean pthread_listener_current_thread_excluded(void);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+void pthread_listener_test_fail_slot_publish(unsigned int count);
+void pthread_listener_test_clear_current_thread_slot(void);
+int pthread_listener_test_thread_is_tracked(pthread_t thread);
+int pthread_listener_test_stale_generation_remove_preserves_mapping(
+    pthread_t thread);
+int pthread_listener_test_untracked_create_removes_ambiguous_mapping(
+    pthread_t thread);
+#endif
 
 /**
  * @brief Thread-safe snapshot of tracked threads and mapped ids.
@@ -91,5 +119,7 @@ size_t pthread_listener_snapshot_threads(pthread_t* tids,
                                          size_t* mapped,
                                          size_t capacity,
                                          gboolean* complete);
+
+#undef PEAK_PTHREAD_LISTENER_API
 
 #endif /* PEAK_PTHREAD_LISTENER_H */

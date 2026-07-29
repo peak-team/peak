@@ -11,6 +11,14 @@ def function_body(source, name):
     if start < 0:
         raise AssertionError(f"missing function {name}")
     brace = source.find("{", start)
+    declaration_end = source.find(";", start)
+    # Some hot-path helpers need a forward declaration.  Do not mistake the
+    # next unrelated function body for the declaration's body.
+    if declaration_end >= 0 and declaration_end < brace:
+        start = source.find(marker, declaration_end)
+        if start < 0:
+            raise AssertionError(f"missing definition for {name}")
+        brace = source.find("{", start)
     if brace < 0:
         raise AssertionError(f"missing body for {name}")
     depth = 0
@@ -120,10 +128,11 @@ def main():
             )
 
     require(
-        "pthread_listener_lookup_thread" in initialize
+        "pthread_listener_current_thread_slot" in initialize
+        and "pthread_listener_lookup_thread" not in initialize
         and "thread_data.initialized" in initialize
         and 'tls_model("initial-exec")' in source,
-        "thread slot lookup must be cached by one-time TLS initialization",
+        "thread slot identity must be read from one-time initial-exec TLS initialization",
     )
     require(
         "entries_inline[16]" in source

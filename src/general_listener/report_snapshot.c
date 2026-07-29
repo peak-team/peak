@@ -158,6 +158,8 @@ peak_report_snapshot_clone(
 
 #undef PEAK_REPORT_COPY
     copy->overhead_per_call = source->overhead_per_call;
+    copy->dropped_calls = source->dropped_calls;
+    copy->dropped_threads = source->dropped_threads;
     copy->rank_count = source->rank_count;
     copy->overhead = source->overhead;
     return copy;

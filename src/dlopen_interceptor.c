@@ -7,6 +7,7 @@
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
+#include "pthread_listener.h"
 #include "logging.h"
 #include "internal/general_listener/attach_policy.h"
 #include "internal/gum_module_mutation.h"
@@ -1378,6 +1379,7 @@ static void*
 dlopen_interceptor_ownership_thread_main(void* user_data)
 {
     (void)user_data;
+    peak_general_listener_exclude_current_thread();
     (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
@@ -1537,6 +1539,7 @@ dlopen_interceptor_start_ownership_thread(void)
         return started;
     }
     dynamic_attach_ownership_thread_running = TRUE;
+    pthread_listener_mark_next_created_thread_helper();
     if (pthread_create(&dynamic_attach_ownership_thread,
                        NULL,
                        dlopen_interceptor_ownership_thread_main,

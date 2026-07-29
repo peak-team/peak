@@ -35,6 +35,9 @@ typedef struct {
     float* max_time;
     float* min_time;
     unsigned long* thread_count;
+    /* Global diagnostics for user callers that had no assignable PEAK slot. */
+    uint64_t dropped_calls;
+    uint64_t dropped_threads;
     double overhead_per_call;
     int rank_count;
     PeakReportOverhead overhead;

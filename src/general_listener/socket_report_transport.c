@@ -65,7 +65,7 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL"
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 11U
+#define PEAK_SOCKET_REDUCE_VERSION 12U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT 0x41U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM 0x42U
 #define PEAK_SOCKET_REDUCE_GATHER_REGISTERED 0x01U
@@ -109,6 +109,8 @@ typedef struct {
     double management_ratio;
     uint64_t stop_window_count;
     uint64_t failed_stop_window_count;
+    uint64_t dropped_calls;
+    uint64_t dropped_threads;
     uint32_t local_ranks;
     uint32_t accounting_valid;
 } PeakSocketReduceHeader;
@@ -145,14 +147,14 @@ typedef struct {
  * Lock the layouts so an accidental field or packing change cannot silently
  * corrupt a report without another wire-version bump.
  */
-_Static_assert(sizeof(PeakSocketReduceHeader) == 152,
-               "wire-v11 header layout changed");
+_Static_assert(sizeof(PeakSocketReduceHeader) == 168,
+               "wire-v12 header layout changed");
 _Static_assert(sizeof(PeakSocketReduceReleaseFrame) == 40,
-               "wire-v11 control-frame layout changed");
+               "wire-v12 control-frame layout changed");
 _Static_assert(sizeof(PeakSocketReduceRecord) == 80,
-               "wire-v11 record layout changed");
+               "wire-v12 record layout changed");
 _Static_assert(sizeof(unsigned long) == sizeof(uint64_t),
-               "wire-v11 requires a 64-bit unsigned long");
+               "wire-v12 requires a 64-bit unsigned long");
 
 struct PeakSocketReportSession {
     bool* release_targets;
@@ -2034,6 +2036,8 @@ typedef struct {
     double* min_elapsed_seconds;
     double* max_elapsed_seconds;
     uint64_t* failed_stop_window_count;
+    uint64_t* dropped_calls;
+    uint64_t* dropped_threads;
     bool* accounting_valid;
 } PeakSocketGatherAggregate;
 
@@ -2090,6 +2094,10 @@ peak_socket_gather_prepare_receipt(
         peak_socket_add_uint64_saturated(
             *aggregate->failed_stop_window_count,
             tuple->failed_stop_window_count);
+    *aggregate->dropped_calls = peak_socket_add_uint64_saturated(
+        *aggregate->dropped_calls, connection->header.dropped_calls);
+    *aggregate->dropped_threads = peak_socket_add_uint64_saturated(
+        *aggregate->dropped_threads, connection->header.dropped_threads);
     *aggregate->accounting_valid =
         *aggregate->accounting_valid && tuple->accounting_valid;
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -2998,6 +3006,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     header.rank = (uint32_t)rank;
     header.hook_count = (uint64_t)local->hook_count;
     header.session_token = session_token;
+    header.dropped_calls = local->dropped_calls;
+    header.dropped_threads = local->dropped_threads;
     peak_socket_reduce_header_set_report_tuple(&header, &local_report_tuple);
 
     if (rank != 0) {
@@ -3048,6 +3058,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     PeakReportMaxima socket_maxima;
     uint64_t socket_failed_stop_window_count =
         local->overhead.failed_stop_window_count;
+    uint64_t socket_dropped_calls = local->dropped_calls;
+    uint64_t socket_dropped_threads = local->dropped_threads;
     bool socket_accounting_valid = local->overhead.accounting_valid;
     unsigned int received = 0;
     bool failed;
@@ -3089,6 +3101,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         &socket_max_elapsed_seconds;
     gather_aggregate.failed_stop_window_count =
         &socket_failed_stop_window_count;
+    gather_aggregate.dropped_calls = &socket_dropped_calls;
+    gather_aggregate.dropped_threads = &socket_dropped_threads;
     gather_aggregate.accounting_valid = &socket_accounting_valid;
     failed = !peak_socket_reduce_root_gather(listener,
                                              size,
@@ -3136,6 +3150,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     }
     peak_socket_reduce_records_to_snapshot(aggregate_records, aggregate);
     free(aggregate_records);
+    aggregate->dropped_calls = socket_dropped_calls;
+    aggregate->dropped_threads = socket_dropped_threads;
     aggregate->rank_count = size;
     peak_socket_report_set_aggregate_overhead(
         aggregate,

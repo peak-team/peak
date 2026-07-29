@@ -378,6 +378,9 @@ peak_report_formatter_write_csv_name(FILE* csv, const char* name)
 static bool
 peak_report_formatter_has_csv_output(const PeakReportSnapshot* snapshot)
 {
+    if (snapshot->dropped_calls != 0 || snapshot->dropped_threads != 0) {
+        return true;
+    }
     for (size_t i = 0; i < snapshot->hook_count; i++) {
         if (peak_report_formatter_slot_is_instrumented(snapshot, i) &&
             snapshot->num_calls[i] != 0) {
@@ -536,6 +539,8 @@ peak_report_formatter_summarize(const PeakReportSnapshot* snapshot)
         summary.have_output = overhead->valid ||
                               summary.detached_targets > 0 ||
                               summary.reattached_targets > 0 ||
+                              snapshot->dropped_calls != 0 ||
+                              snapshot->dropped_threads != 0 ||
                               peak_report_formatter_positive_finite(
                                   summary.stop_window_seconds);
     }
@@ -550,7 +555,8 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     static const char header[] =
         "function,"
         "count,per_thread,per_rank,call_max_s,call_min_s,"
-        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s\n";
+        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,"
+        "dropped_calls,dropped_threads\n";
     char* out_csv;
     char* temp_csv;
     FILE* csv;
@@ -621,7 +627,8 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, peak_report_formatter_name(snapshot, i)) &&
                   fprintf(
                       csv,
-                      ",%lu,%lu,%.12Lg,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e\n",
+                      ",%lu,%lu,%.12Lg,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,"
+                      "%llu,%llu\n",
                       snapshot->num_calls[i],
                       peak_report_calls_per_active_thread(
                           snapshot->num_calls[i], snapshot->thread_count[i]),
@@ -633,7 +640,18 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       snapshot->exclusive_time[i],
                       snapshot->max_total_time[i],
                       snapshot->min_total_time[i],
-                      hook_profile_overhead) >= 0;
+                      hook_profile_overhead,
+                      (unsigned long long)snapshot->dropped_calls,
+                      (unsigned long long)snapshot->dropped_threads) >= 0;
+    }
+    if (success && (snapshot->dropped_calls != 0 ||
+                    snapshot->dropped_threads != 0)) {
+        success = peak_report_formatter_write_csv_name(
+                      csv, "PEAK_ACCOUNTING_DIAGNOSTICS") &&
+                  fprintf(csv,
+                          ",0,0,0,0,0,0,0,0,0,0,%llu,%llu\n",
+                          (unsigned long long)snapshot->dropped_calls,
+                          (unsigned long long)snapshot->dropped_threads) >= 0;
     }
     if (!success || ferror(csv)) {
         success = false;
@@ -752,6 +770,12 @@ peak_report_formatter_write_text(
     peak_log_report("Recorded calls: %s%llu\n",
                     summary.total_calls_saturated ? ">=" : "",
                     (unsigned long long)summary.total_calls);
+    if (snapshot->dropped_calls != 0 || snapshot->dropped_threads != 0) {
+        peak_log_report("Accounting diagnostics: dropped_calls=%llu dropped_threads=%llu "
+                        "(untracked, overflow, or unowned callers excluded)\n",
+                        (unsigned long long)snapshot->dropped_calls,
+                        (unsigned long long)snapshot->dropped_threads);
+    }
 
     peak_report_formatter_print_text_section("Overhead summary",
                                              row_separator);

@@ -23,6 +23,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/jit_provider.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
+    ${PROJECT_SOURCE_DIR}/src/pthread_slot_registry.c
     ${PROJECT_SOURCE_DIR}/src/detach_controller.c
     ${PROJECT_SOURCE_DIR}/src/signal_policy.c
     ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall.c
