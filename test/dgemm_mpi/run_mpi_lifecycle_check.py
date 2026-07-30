@@ -4,8 +4,10 @@ import argparse
 import csv
 import os
 import re
+import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,22 @@ STATS_FIELDS = [
     "dropped_threads",
 ]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
+SOCKET_TEST_PORT_MIN = 20000
+SOCKET_TEST_PORT_MAX = 30000
+SOCKET_TEST_PORT_ATTEMPTS = 128
+SOCKET_TRANSPORT_MODES = {
+    "finalize-clean-output-socket-bad-host",
+    "finalize-clean-output-socket-bad-host-no-fallback",
+    "finalize-clean-output-socket-release-fail",
+    "finalize-clean-output-socket-token-mismatch",
+    "finalize-clean-output-socket-token-mismatch-no-fallback",
+    "finalize-socket-post-work",
+    "finalize-defer-socket-post-work",
+}
+SOCKET_TRANSPORT_FALLBACK_MODES = {
+    "finalize-clean-output-mpi-reducer-fail",
+}
+ALLOCATED_SOCKET_TEST_PORT_BASES = set()
 
 
 def require_valid_accounting_diagnostics(name, rows):
@@ -289,6 +307,54 @@ MPI_REDUCER_SOCKET_FALLBACK_DIAGNOSTIC = (
 
 def split_flags(value):
     return [flag for flag in shlex.split(value) if flag]
+
+
+def reserve_socket_port_pair():
+    """Return a preflighted, contiguous gather/release TCP port pair.
+
+    The process cannot retain these listeners through mpiexec because the
+    root rank must bind them itself. `RESOURCE_LOCK` serializes lifecycle
+    cases. Pairs are not reused within this checker process; fresh random
+    pairs and immediate preflight make the remaining external TOCTOU window
+    small, but cannot eliminate it.
+    """
+    port_span = SOCKET_TEST_PORT_MAX - SOCKET_TEST_PORT_MIN
+
+    for _ in range(SOCKET_TEST_PORT_ATTEMPTS):
+        base_port = SOCKET_TEST_PORT_MIN + secrets.randbelow(port_span)
+        if base_port in ALLOCATED_SOCKET_TEST_PORT_BASES:
+            continue
+        listeners = []
+        try:
+            for port in (base_port, base_port + 1):
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listeners.append(listener)
+                listener.bind(("0.0.0.0", port))
+                listener.listen(1)
+            ALLOCATED_SOCKET_TEST_PORT_BASES.add(base_port)
+            return base_port
+        except OSError:
+            pass
+        finally:
+            for listener in listeners:
+                listener.close()
+
+    raise RuntimeError(
+        "could not reserve a preflighted contiguous socket test port pair"
+    )
+
+
+def configure_socket_transport_ports(env):
+    base_port = reserve_socket_port_pair()
+    env["PEAK_OUTPUT_AGGREGATION_PORT"] = str(base_port)
+    return base_port
+
+
+def configure_lifecycle_socket_ports(mode, env):
+    if (mode not in SOCKET_TRANSPORT_MODES and
+            mode not in SOCKET_TRANSPORT_FALLBACK_MODES):
+        return None
+    return configure_socket_transport_ports(env)
 
 
 def launcher_version_text(mpiexec):
@@ -1054,6 +1120,7 @@ def main():
             env["PEAK_MPI_FINALIZE_RETURN_MARKER_PREFIX"] = str(
                 Path(stats_dir) / "finalize-return"
             )
+        configure_lifecycle_socket_ports(args.mode, env)
         returncode, output, timed_out = run_mpi_command(
             command,
             env=env,

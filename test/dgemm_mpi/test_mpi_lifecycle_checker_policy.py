@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 CHECKER_PATH = Path(__file__).with_name("run_mpi_lifecycle_check.py")
@@ -131,6 +132,134 @@ class ReportInterruptionPolicyTest(unittest.TestCase):
             "all_reports_succeeded=1 all_real_finalize_allowed=1\n"
         )
         self.assertFalse(CHECKER.report_release_was_interrupted(output))
+
+
+class SocketPortIsolationTest(unittest.TestCase):
+    def test_busy_port_in_either_contiguous_pair_slot_retries(self) -> None:
+        first_base = 21000
+        second_base = 22000
+
+        for busy_port in (first_base, first_base + 1):
+            with self.subTest(busy_port=busy_port):
+                created = []
+
+                class FakeSocket:
+                    def __init__(self, *_args):
+                        self.closed = False
+                        created.append(self)
+
+                    def bind(self, address):
+                        if address == ("0.0.0.0", busy_port):
+                            raise OSError("simulated TIME_WAIT collision")
+
+                    def listen(self, _backlog):
+                        pass
+
+                    def close(self):
+                        self.closed = True
+
+                CHECKER.ALLOCATED_SOCKET_TEST_PORT_BASES.clear()
+                try:
+                    with mock.patch.object(
+                            CHECKER.secrets,
+                            "randbelow",
+                            side_effect=[
+                                first_base - CHECKER.SOCKET_TEST_PORT_MIN,
+                                second_base - CHECKER.SOCKET_TEST_PORT_MIN,
+                            ]), mock.patch.object(
+                                CHECKER.socket,
+                                "socket",
+                                side_effect=FakeSocket):
+                        self.assertEqual(
+                            CHECKER.reserve_socket_port_pair(), second_base
+                        )
+                finally:
+                    CHECKER.ALLOCATED_SOCKET_TEST_PORT_BASES.clear()
+
+                self.assertTrue(all(listener.closed for listener in created))
+
+    def test_adjacent_invocations_do_not_reuse_a_preflighted_pair(self) -> None:
+        first_base = 24000
+        second_base = 25000
+        created = []
+
+        class FakeSocket:
+            def __init__(self, *_args):
+                created.append(self)
+
+            def bind(self, _address):
+                pass
+
+            def listen(self, _backlog):
+                pass
+
+            def close(self):
+                pass
+
+        CHECKER.ALLOCATED_SOCKET_TEST_PORT_BASES.clear()
+        try:
+            with mock.patch.object(
+                    CHECKER.secrets,
+                    "randbelow",
+                    side_effect=[
+                        first_base - CHECKER.SOCKET_TEST_PORT_MIN,
+                        first_base - CHECKER.SOCKET_TEST_PORT_MIN,
+                        second_base - CHECKER.SOCKET_TEST_PORT_MIN,
+                    ]), mock.patch.object(
+                        CHECKER.socket,
+                        "socket",
+                        side_effect=FakeSocket):
+                first = CHECKER.reserve_socket_port_pair()
+                second = CHECKER.reserve_socket_port_pair()
+        finally:
+            CHECKER.ALLOCATED_SOCKET_TEST_PORT_BASES.clear()
+
+        self.assertEqual((first, second), (first_base, second_base))
+        self.assertEqual(len(created), 4)
+
+    def test_all_socket_modes_and_reducer_labels_get_port_pairs(self) -> None:
+        explicit_socket_modes = {
+            "finalize-clean-output-socket-bad-host",
+            "finalize-clean-output-socket-bad-host-no-fallback",
+            "finalize-clean-output-socket-release-fail",
+            "finalize-clean-output-socket-token-mismatch",
+            "finalize-clean-output-socket-token-mismatch-no-fallback",
+            "finalize-socket-post-work",
+            "finalize-defer-socket-post-work",
+        }
+        reducer_labels = (
+            "profile-control-ratio-tuple-doubles",
+            "profile-control-ratio-owner",
+            "profile-control-ratio-tuple-valid",
+            "profile-control-ratio-tuple-local-ranks",
+            "profile-control-ratio-tuple-counts",
+        )
+        self.assertSetEqual(
+            CHECKER.SOCKET_TRANSPORT_MODES,
+            explicit_socket_modes,
+        )
+        modes = list(explicit_socket_modes)
+        modes.extend(
+            "finalize-clean-output-mpi-reducer-fail"
+            for _ in reducer_labels
+        )
+        environments = [{} for _ in modes]
+
+        with mock.patch.object(
+                CHECKER,
+                "reserve_socket_port_pair",
+                return_value=26000) as reserve:
+            for mode, env in zip(modes, environments):
+                self.assertEqual(
+                    CHECKER.configure_lifecycle_socket_ports(mode, env),
+                    26000,
+                )
+
+        self.assertEqual(reserve.call_count, len(modes))
+        self.assertTrue(all(
+            env.get("PEAK_OUTPUT_AGGREGATION_PORT") == "26000"
+            for env in environments
+        ))
 
 
 if __name__ == "__main__":
