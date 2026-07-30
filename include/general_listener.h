@@ -321,13 +321,7 @@ gboolean peak_general_listener_support_attach_target_is_supported(
  * processes. The PEAK-patched Frida Gum devkit validates Gum's online ELF
  * memory fallback before Gum parses a memory source as an ELF object.
  */
-#ifdef __cplusplus
-extern "C" {
-#endif
 gpointer peak_general_listener_find_function(const char* symbol);
-#ifdef __cplusplus
-}
-#endif
 
 /**
  * @brief Returns whether unresolved requested targets require dlopen rescans.

@@ -1,7 +1,6 @@
 #include <algorithm>
 
 #include "cuda_interceptor.h"
-#include "general_listener.h"
 #include "internal/cuda_profiler_state.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/socket_report_transport.h"
@@ -11,6 +10,14 @@
 #include "logging.h"
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
+
+extern "C" gpointer peak_general_listener_find_function(const char* symbol);
+
+enum PeakCudaOutputAggregationMode {
+    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL = 0,
+    PEAK_CUDA_OUTPUT_AGGREGATION_MPI = 1,
+    PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2,
+};
 
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
@@ -1526,7 +1533,7 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
     PeakReportSnapshot* local = peak_cuda_build_report_snapshot();
     if (local != NULL) {
 #ifdef HAVE_MPI
-        if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
+        if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local, &aggregate);
@@ -1538,7 +1545,7 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
             peak_report_snapshot_destroy(aggregate);
         } else
 #endif
-        if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
+        if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET) {
             PeakSocketReportSession* session = NULL;
             PeakReportSnapshot* aggregate = NULL;
             PeakSocketReportRankSource socket_rank_source = active_mpi_job
@@ -1573,6 +1580,7 @@ extern "C" void
 cuda_interceptor_print(int is_MPI)
 {
     cuda_interceptor_print_with_mpi_job_policy(
-        is_MPI ? PEAK_OUTPUT_AGGREGATION_MPI : PEAK_OUTPUT_AGGREGATION_LOCAL,
+        is_MPI ? PEAK_CUDA_OUTPUT_AGGREGATION_MPI :
+                 PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL,
         FALSE);
 }

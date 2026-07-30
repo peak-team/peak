@@ -110,8 +110,6 @@ def main():
     cuda = (repo_root / "src" / "cuda_interceptor.cpp").read_text(
         encoding="utf-8")
     general = read_general_listener_source(repo_root)
-    general_header = (repo_root / "include" / "general_listener.h").read_text(
-        encoding="utf-8")
     cuda_header = (repo_root / "include" / "cuda_interceptor.h").read_text(
         encoding="utf-8")
     support_sources = {
@@ -158,12 +156,14 @@ def main():
             "CUDA support hooks must use the Frida-native lookup helper")
     require('gum_find_function("' not in general,
             "general listener special cases must use the Frida-native lookup helper")
-    require("extern \"C\" gpointer peak_general_listener_find_function" not in cuda,
-            "CUDA must not redeclare the general-listener lookup with conflicting linkage")
-    require(re.search(r'#ifdef __cplusplus\s+extern "C" \{\s+#endif\s+'
-                      r'gpointer peak_general_listener_find_function',
-                      general_header) is not None,
-            "general-listener lookup must retain C linkage for CUDA C++ callers")
+    require('#include "general_listener.h"' not in cuda and
+            'extern "C" gpointer peak_general_listener_find_function('
+            'const char* symbol);' in cuda,
+            "CUDA must avoid C-only general-listener declarations and keep its C lookup ABI")
+    require("PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL = 0" in cuda and
+            "PEAK_CUDA_OUTPUT_AGGREGATION_MPI = 1" in cuda and
+            "PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2" in cuda,
+            "CUDA transport mode values must match PeakOutputAggregationMode")
 
     for hook in CUDA_HOOKS:
         require(f'peak_general_listener_find_function("{hook}")' in cuda,
@@ -339,7 +339,7 @@ def main():
             "active-MPI CUDA socket output must require launcher rank metadata")
     mpi_transport = printer.find("peak_mpi_report_transport_reduce(local, &aggregate)")
     mpi_guard = printer.rfind(
-        "if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI)", 0,
+        "if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI)", 0,
         mpi_transport)
     require(mpi_transport != -1 and mpi_guard != -1 and
             mpi_guard < mpi_transport,
@@ -351,9 +351,9 @@ def main():
     require(re.search(r"cuda_interceptor_print\s*\(\s*int is_MPI\s*\)",
                       cuda) is not None and
             "cuda_interceptor_print_with_mpi_job_policy(" in legacy_printer and
-            "is_MPI ? PEAK_OUTPUT_AGGREGATION_MPI : "
-            "PEAK_OUTPUT_AGGREGATION_LOCAL" in legacy_printer and
-            "PEAK_OUTPUT_AGGREGATION_SOCKET" not in legacy_printer,
+            "is_MPI ? PEAK_CUDA_OUTPUT_AGGREGATION_MPI :" in legacy_printer and
+            "PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL" in legacy_printer and
+            "PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET" not in legacy_printer,
             "legacy CUDA reporting ABI must retain boolean MPI/local semantics")
 
     attach = function_body(cuda, "cuda_interceptor_attach")
