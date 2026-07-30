@@ -201,6 +201,8 @@ static const double peak_controller_default_max_pending_age_s = 30.0;
 static const unsigned int peak_controller_shutdown_drain_ms = 1000;
 static _Atomic gboolean peak_general_callbacks_suspended = FALSE;
 static _Atomic gboolean peak_general_mpi_finalize_requested = FALSE;
+static _Atomic uint64_t peak_general_listener_dropped_calls = 0;
+static _Atomic uint64_t peak_general_listener_dropped_threads = 0;
 static const unsigned int peak_reattach_default_cooldown_ms = 60000;
 static size_t peak_general_controller_batch_cursor = 0;
 static unsigned int peak_general_controller_next_batch_id = 1;
@@ -1013,6 +1015,7 @@ typedef struct _PeakGeneralThreadState {
     gboolean self_mapped_valid;
     gboolean initialized;
     gboolean in_callback;
+    gboolean dropped_thread_noted;
     guint fast_ignore_level;
 } PeakGeneralThreadState;
 
@@ -1035,9 +1038,6 @@ extern const guint8 __stop_peak_listener_fast_dispatch[];
  */
 static __thread PeakGeneralThreadState thread_data
     __attribute__((tls_model("initial-exec")));
-static pthread_key_t peak_general_thread_state_key;
-static pthread_once_t peak_general_thread_state_key_once = PTHREAD_ONCE_INIT;
-static gboolean peak_general_thread_state_key_created = FALSE;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_general_listener_test_fast_close_pause = 0;
@@ -1071,6 +1071,11 @@ static gboolean peak_general_listener_prepare_fast_detach(
     GumInvocationListener* listener);
 static gboolean peak_general_listener_pop_invocation(PeakInvocationData* priv,
                                                      gdouble* child_duration_out);
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_try_publish_detach_count_request_snapshot(
+    PeakGeneralListener* listener,
+    unsigned long long control);
+static gulong peak_general_listener_total_calls(PeakGeneralListener* listener);
 static inline gulong
 peak_general_listener_num_calls_load(const gulong* slot);
 void pthread_pause_enable(void);
@@ -1232,10 +1237,8 @@ peak_general_listener_abandon_entry(PeakGeneralThreadState* state,
 }
 
 static void
-peak_general_listener_thread_state_destroy(void* data)
+peak_general_listener_thread_state_release_frames(PeakGeneralThreadState* state)
 {
-    PeakGeneralThreadState* state = data;
-
     if (state == NULL) {
         return;
     }
@@ -1251,7 +1254,22 @@ peak_general_listener_thread_state_destroy(void* data)
         state->entries = state->entries_inline;
     }
     state->capacity = G_N_ELEMENTS(state->entries_inline);
+    state->level = 0;
+    state->in_callback = FALSE;
+}
+
+static void
+peak_general_listener_thread_state_destroy(void* data)
+{
+    PeakGeneralThreadState* state = data;
+
+    peak_general_listener_thread_state_release_frames(state);
+    if (state == NULL) {
+        return;
+    }
     state->self_mapped_valid = FALSE;
+    state->initialized = FALSE;
+    state->dropped_thread_noted = FALSE;
 }
 
 void
@@ -1260,6 +1278,19 @@ peak_general_listener_release_current_thread_state(void)
     if (thread_data.initialized) {
         peak_general_listener_thread_state_destroy(&thread_data);
     }
+}
+
+void
+peak_general_listener_release_current_thread_frames_preserve_slot(void)
+{
+    if (!thread_data.initialized) {
+        return;
+    }
+    peak_general_listener_thread_state_release_frames(&thread_data);
+    /* Keep the slot identity live through later application TLS destructors.
+     * A destructor is allowed to enter an instrumented target after PEAK's
+     * key has run in the same iteration; it must take the normal fast path
+     * rather than becoming an untracked fallback caller. */
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -1271,14 +1302,6 @@ peak_general_listener_test_current_invocation_level(void)
 #endif
 
 static void
-peak_general_listener_thread_state_key_create(void)
-{
-    peak_general_thread_state_key_created =
-        pthread_key_create(&peak_general_thread_state_key,
-                           peak_general_listener_thread_state_destroy) == 0;
-}
-
-static void
 peak_general_listener_thread_state_initialize(void)
 {
     gboolean mapped_found = FALSE;
@@ -1288,9 +1311,9 @@ peak_general_listener_thread_state_initialize(void)
         return;
     }
 
-    mapped_tid = pthread_listener_lookup_thread(pthread_self(), &mapped_found);
+    mapped_found = pthread_listener_current_thread_slot(&mapped_tid);
     if (!mapped_found || mapped_tid >= peak_max_num_threads) {
-        mapped_tid = 0;
+        mapped_tid = SIZE_MAX;
         mapped_found = FALSE;
     }
 
@@ -1301,11 +1324,27 @@ peak_general_listener_thread_state_initialize(void)
     thread_data.self_mapped_valid = mapped_found;
     thread_data.initialized = TRUE;
 
-    pthread_once(&peak_general_thread_state_key_once,
-                 peak_general_listener_thread_state_key_create);
-    if (peak_general_thread_state_key_created) {
-        (void)pthread_setspecific(peak_general_thread_state_key, &thread_data);
+    thread_data.dropped_thread_noted = FALSE;
+}
+
+void
+peak_general_listener_note_dropped_current_thread(void)
+{
+    atomic_fetch_add_explicit(&peak_general_listener_dropped_calls,
+                              1,
+                              memory_order_relaxed);
+    if (!thread_data.dropped_thread_noted) {
+        thread_data.dropped_thread_noted = TRUE;
+        atomic_fetch_add_explicit(&peak_general_listener_dropped_threads,
+                                  1,
+                                  memory_order_relaxed);
     }
+}
+
+void
+peak_general_listener_exclude_current_thread(void)
+{
+    pthread_listener_exclude_current_thread();
 }
 
 static void
@@ -2585,14 +2624,54 @@ peak_general_listener_test_call_count(size_t hook_id)
         array_listener[hook_id] != NULL) {
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
-
+        g_mutex_lock(&listener->retired_mutex);
+        total = listener->retired_num_calls;
         for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
-            total += peak_general_listener_num_calls_load(
+            gulong calls = peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, index));
+            total += calls;
         }
+        g_mutex_unlock(&listener->retired_mutex);
     }
     pthread_mutex_unlock(&lock);
     return total;
+}
+
+PEAK_API gulong
+peak_general_listener_test_thread_count(size_t hook_id)
+{
+    gulong total = 0;
+    pthread_mutex_lock(&lock);
+    if (array_listener != NULL && hook_id < peak_hook_address_count &&
+        array_listener[hook_id] != NULL) {
+        PeakGeneralListener* listener =
+            PEAKGENERAL_LISTENER(array_listener[hook_id]);
+        g_mutex_lock(&listener->retired_mutex);
+        total = listener->retired_thread_count;
+        for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
+            if (peak_general_listener_num_calls_load(
+                    peak_general_listener_num_calls_slot(listener, index)) != 0) {
+                total++;
+            }
+        }
+        g_mutex_unlock(&listener->retired_mutex);
+    }
+    pthread_mutex_unlock(&lock);
+    return total;
+}
+
+PEAK_API uint64_t
+peak_general_listener_test_dropped_calls(void)
+{
+    return atomic_load_explicit(&peak_general_listener_dropped_calls,
+                                memory_order_relaxed);
+}
+
+PEAK_API uint64_t
+peak_general_listener_test_dropped_threads(void)
+{
+    return atomic_load_explicit(&peak_general_listener_dropped_threads,
+                                memory_order_relaxed);
 }
 #endif
 
@@ -4133,13 +4212,16 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
             continue;
         }
 
-        gulong total_num_calls = 0;
+        gulong total_num_calls;
+        g_mutex_lock(&listener->retired_mutex);
+        total_num_calls = listener->retired_num_calls;
         for (size_t thread_id = 0;
              thread_id < listener->fast_stats_capacity;
              thread_id++) {
             total_num_calls += peak_general_listener_num_calls_load(
                 peak_general_listener_num_calls_slot(listener, thread_id));
         }
+        g_mutex_unlock(&listener->retired_mutex);
 
         (void)peak_general_listener_request_detach_with_context_unlocked(
             hook_id,
@@ -4287,6 +4369,7 @@ static void*
 peak_general_controller_thread_main(void* arg)
 {
     (void)arg;
+    peak_general_listener_exclude_current_thread();
 
     pthread_t controller_tid = pthread_self();
     pthread_t* tid_keys = g_new0(pthread_t, peak_max_num_threads);
@@ -4362,6 +4445,7 @@ peak_general_listener_controller_start(void)
     pthread_mutex_lock(&general_controller_wake_mutex);
     if (!general_controller_thread_started) {
         general_controller_running = TRUE;
+        pthread_listener_mark_next_created_thread_helper();
         if (pthread_create(&general_controller_thread,
                            NULL,
                            peak_general_controller_thread_main,
@@ -4470,6 +4554,135 @@ peak_general_listener_num_calls_increment(gulong* slot)
     return next;
 }
 
+static gboolean
+peak_general_listener_retire_listener_slot(PeakGeneralListener* listener,
+                                           size_t slot)
+{
+    if (listener == NULL || slot >= listener->fast_stats_capacity) {
+        return TRUE;
+    }
+
+    gulong* calls_slot = peak_general_listener_num_calls_slot(listener, slot);
+    gulong calls = peak_general_listener_num_calls_load(calls_slot);
+    gdouble total = *peak_general_listener_total_time_slot(listener, slot);
+    gdouble exclusive =
+        *peak_general_listener_exclusive_time_slot(listener, slot);
+    gfloat maximum = *peak_general_listener_max_time_slot(listener, slot);
+    gfloat minimum = *peak_general_listener_min_time_slot(listener, slot);
+
+    /* The exiting thread is this slot's only callback writer.  Publish its
+     * completed contribution before clearing the slot for a future thread. */
+    /* This mutex is also held by report composition while it reads both the
+     * retired accumulator and every active slot.  Thus a report observes
+     * either the pre-retirement slot or the post-retirement accumulator, but
+     * never both and never neither. */
+    g_mutex_lock(&listener->retired_mutex);
+    if (calls != 0) {
+        listener->retired_num_calls += calls;
+        if (listener->retired_thread_count != G_MAXULONG) {
+            listener->retired_thread_count++;
+        }
+        listener->retired_total_time += total;
+        listener->retired_exclusive_time += exclusive;
+        if (total > listener->retired_max_total_time) {
+            listener->retired_max_total_time = total;
+        }
+        if (total < listener->retired_min_total_time ||
+            listener->retired_thread_count == 1) {
+            listener->retired_min_total_time = total;
+        }
+        if (maximum > listener->retired_max_time) {
+            listener->retired_max_time = maximum;
+        }
+        if (minimum < listener->retired_min_time ||
+            listener->retired_thread_count == 1) {
+            listener->retired_min_time = minimum;
+        }
+    }
+
+    __atomic_store_n(calls_slot, 0, __ATOMIC_RELAXED);
+    *peak_general_listener_total_time_slot(listener, slot) = 0.0;
+    *peak_general_listener_exclusive_time_slot(listener, slot) = 0.0;
+    *peak_general_listener_max_time_slot(listener, slot) = 0.0f;
+    *peak_general_listener_min_time_slot(listener, slot) = 0.0f;
+    if (listener->target_thread_called != NULL) {
+        listener->target_thread_called[slot] = FALSE;
+    }
+    gboolean checkpoint_reset_safe = TRUE;
+    if (listener->checkpoint_shadow != NULL) {
+        PeakGeneralListenerCheckpointShadow* shadow =
+            &listener->checkpoint_shadow[slot];
+        gulong sequence = atomic_load_explicit(&shadow->sequence,
+                                               memory_order_acquire);
+        /* Preserve a monotonically advancing seqlock generation.  Resetting
+         * to zero would let an exec-checkpoint reader accept an ABA copy. */
+        if ((sequence & 1UL) == 0 &&
+            atomic_compare_exchange_strong_explicit(&shadow->sequence,
+                                                    &sequence,
+                                                    sequence + 1UL,
+                                                    memory_order_acquire,
+                                                    memory_order_relaxed)) {
+            shadow->completed_calls = 0;
+            shadow->total_time = 0.0;
+            shadow->exclusive_time = 0.0;
+            shadow->max_time = 0.0f;
+            shadow->min_time = 0.0f;
+            atomic_store_explicit(&shadow->invalid, 0, memory_order_relaxed);
+            atomic_store_explicit(&shadow->sequence,
+                                  sequence + 2UL,
+                                  memory_order_release);
+        } else {
+            checkpoint_reset_safe = FALSE;
+        }
+    }
+    g_mutex_unlock(&listener->retired_mutex);
+    return checkpoint_reset_safe;
+}
+
+gboolean
+peak_general_listener_retire_current_thread_slot(size_t slot)
+{
+    gboolean reusable = TRUE;
+    /* array_listener ownership changes only under the controller lock. */
+    pthread_mutex_lock(&lock);
+    if (array_listener != NULL && hook_address != NULL) {
+        for (size_t i = 0; i < peak_hook_address_count; i++) {
+            if (hook_address[i] != NULL && array_listener[i] != NULL) {
+                if (!peak_general_listener_retire_listener_slot(
+                        PEAKGENERAL_LISTENER(array_listener[i]), slot)) {
+                    reusable = FALSE;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return reusable;
+}
+
+static gulong
+peak_general_listener_total_calls(PeakGeneralListener* listener)
+{
+    gulong calls = 0;
+    if (listener != NULL) {
+        g_mutex_lock(&listener->retired_mutex);
+        calls = listener->retired_num_calls;
+        for (size_t index = 0; index < listener->fast_stats_capacity; index++) {
+            calls += peak_general_listener_num_calls_load(
+                peak_general_listener_num_calls_slot(listener, index));
+        }
+        g_mutex_unlock(&listener->retired_mutex);
+    }
+    return calls;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API gulong
+peak_general_listener_test_total_calls(PeakGeneralListener* listener)
+{
+    return peak_general_listener_total_calls(listener);
+}
+#endif
+
 static double
 peak_general_listener_profile_seconds_for_calls_unlocked(size_t hook_id,
                                                          gulong calls)
@@ -4498,12 +4711,7 @@ peak_general_listener_profile_seconds_at_boundary(void)
 
         PeakGeneralListener* pg_listener =
             PEAKGENERAL_LISTENER(array_listener[i]);
-        gulong total_calls = 0;
-        for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
-            total_calls +=
-                peak_general_listener_num_calls_load(
-                    peak_general_listener_num_calls_slot(pg_listener, j));
-        }
+        gulong total_calls = peak_general_listener_total_calls(pg_listener);
         if (total_calls != 0 &&
             profile_seconds <=
                 DBL_MAX - ((double)total_calls * peak_general_overhead)) {
@@ -4632,11 +4840,7 @@ peak_general_listener_refresh_hook_sample_cache_unlocked(
 
     PeakGeneralListener* pg_listener =
         PEAKGENERAL_LISTENER(array_listener[hook_id]);
-    gulong total_num_calls = 0;
-    for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
-        total_num_calls += peak_general_listener_num_calls_load(
-            peak_general_listener_num_calls_slot(pg_listener, j));
-    }
+    gulong total_num_calls = peak_general_listener_total_calls(pg_listener);
 
     double profile_seconds =
         peak_general_listener_profile_seconds_for_calls_unlocked(
@@ -4703,6 +4907,7 @@ peak_heartbeat_wait_us(unsigned int sleep_us)
 
 void* peak_heartbeat_monitor(void* arg) {
     PeakHeartbeatArgs* heartbeat_args = (PeakHeartbeatArgs*)arg;
+    peak_general_listener_exclude_current_thread();
     unsigned int heartbeat_time = heartbeat_args->heartbeat_time;
     unsigned int check_interval = heartbeat_args->check_interval;
     unsigned int hb_min_us = heartbeat_args->hb_min_us;
@@ -5725,6 +5930,9 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     if (G_UNLIKELY(thread_data.in_callback)) {
         return;
     }
+    if (G_UNLIKELY(pthread_listener_current_thread_excluded())) {
+        return;
+    }
     thread_data.in_callback = TRUE;
     if (atomic_load_explicit(&peak_general_callbacks_suspended,
                              memory_order_acquire)) {
@@ -5734,6 +5942,7 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 
     peak_general_listener_thread_state_initialize();
     if (G_UNLIKELY(!thread_data.self_mapped_valid)) {
+        peak_general_listener_note_dropped_current_thread();
         thread_data.in_callback = FALSE;
         return;
     }
@@ -5748,9 +5957,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     entry->stack_address =
         peak_general_listener_invocation_stack_address(ic);
     entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
-    gulong current_num_calls =
-        peak_general_listener_num_calls_increment(
-            peak_general_listener_num_calls_slot(self, index));
+    gulong current_num_calls = peak_general_listener_num_calls_increment(
+        peak_general_listener_num_calls_slot(self, index));
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -5872,6 +6080,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     PeakGeneralListener* self = user_data;
 
     if (G_UNLIKELY(thread_data.in_callback) ||
+        G_UNLIKELY(pthread_listener_current_thread_excluded()) ||
         G_UNLIKELY(thread_data.fast_ignore_level != 0) ||
         G_UNLIKELY(atomic_load_explicit(&peak_general_callbacks_suspended,
                                         memory_order_acquire))) {
@@ -5882,6 +6091,7 @@ peak_general_listener_fast_on_enter(gpointer user_data,
         return GUM_PEAK_FAST_ENTER_FALLBACK;
     }
     if (G_UNLIKELY(!thread_data.self_mapped_valid)) {
+        peak_general_listener_note_dropped_current_thread();
         return GUM_PEAK_FAST_ENTER_SKIP;
     }
 
@@ -5903,9 +6113,8 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     entry->gum_stack_depth = gum_stack_depth;
     entry->fast_dispatch = TRUE;
 
-    gulong current_num_calls =
-        peak_general_listener_num_calls_increment(
-            peak_general_listener_num_calls_slot(self, index));
+    gulong current_num_calls = peak_general_listener_num_calls_increment(
+        peak_general_listener_num_calls_slot(self, index));
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -6444,6 +6653,8 @@ static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
     size_t total_count = peak_max_num_threads;
+    g_mutex_init(&self->retired_mutex);
+    self->retired_mutex_initialized = TRUE;
     atomic_init(&self->callback_hook_control, PEAK_HOOK_UNRESOLVED);
     atomic_init(&self->fast_lifetime_closing, 0);
     atomic_init(&self->fast_lifetime_abandoners, 0);
@@ -6552,6 +6763,10 @@ peak_general_listener_free(PeakGeneralListener* self)
     self->checkpoint_shadow_mapping_size = 0;
     g_free(self->target_thread_called);
     self->target_thread_called = NULL;
+    if (self->retired_mutex_initialized) {
+        g_mutex_clear(&self->retired_mutex);
+        self->retired_mutex_initialized = FALSE;
+    }
 }
 
 static volatile guint64 peak_general_overhead_dummy_sink;
@@ -7606,9 +7821,25 @@ peak_general_listener_checkpoint_for_exec(unsigned long long checkpoint_index)
                 peak_hook_strings[i] :
                 "";
         current_length = strlen(name) + 1;
+        PeakGeneralListener* checkpoint_listener =
+            PEAKGENERAL_LISTENER(array_listener[i]);
+        /* Join-retired threads no longer own an active shadow slot.  The
+         * global controller lock excludes retirement while this snapshot is
+         * assembled; the retired mutex preserves the same ordering for
+         * report/checkpoint readers. */
+        g_mutex_lock(&checkpoint_listener->retired_mutex);
+        records[i].num_calls = checkpoint_listener->retired_num_calls;
+        records[i].total_time = checkpoint_listener->retired_total_time;
+        records[i].exclusive_time = checkpoint_listener->retired_exclusive_time;
+        records[i].threads_seen = checkpoint_listener->retired_thread_count;
+        records[i].max_total_time = checkpoint_listener->retired_max_total_time;
+        records[i].min_total_time = checkpoint_listener->retired_min_total_time;
+        records[i].max_time = checkpoint_listener->retired_max_time;
+        records[i].min_time = checkpoint_listener->retired_min_time;
+        g_mutex_unlock(&checkpoint_listener->retired_mutex);
         if (current_length > name_lengths[i] ||
             !peak_exec_checkpoint_copy_listener(
-                PEAKGENERAL_LISTENER(array_listener[i]),
+                checkpoint_listener,
                 &threads,
                 thread_count)) {
             pthread_mutex_unlock(&lock);
@@ -7685,6 +7916,10 @@ peak_general_listener_build_report_snapshot(
     }
     get_argv0(&snapshot->program);
     snapshot->overhead_per_call = peak_general_overhead;
+    snapshot->dropped_calls = atomic_load_explicit(
+        &peak_general_listener_dropped_calls, memory_order_relaxed);
+    snapshot->dropped_threads = atomic_load_explicit(
+        &peak_general_listener_dropped_threads, memory_order_relaxed);
     snapshot->rank_count = rank_count;
     if (report_overhead != NULL) {
         snapshot->overhead = *report_overhead;
@@ -8090,7 +8325,8 @@ peak_general_listener_mpi_reducer_failed_closed(void)
 #endif
 }
 
-gboolean peak_general_listener_print_with_mpi_job_policy(
+gboolean
+peak_general_listener_print_with_mpi_job_policy(
     PeakOutputAggregationMode aggregation_mode,
     gboolean active_mpi_job,
     gboolean* report_write_succeeded)
@@ -8123,6 +8359,18 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
         if (hook_address[i]) {
             PeakGeneralListener* pg_listener =
                 PEAKGENERAL_LISTENER(array_listener[i]);
+            /* Retired logical threads are deliberately not represented by a
+             * reusable active slot.  Fold their exit-only snapshot in first
+             * so active-slot minima/maxima remain semantically distinct. */
+            g_mutex_lock(&pg_listener->retired_mutex);
+            sum_num_calls[i] = pg_listener->retired_num_calls;
+            sum_total_time[i] = pg_listener->retired_total_time;
+            sum_exclusive_time[i] = pg_listener->retired_exclusive_time;
+            max_total_time[i] = pg_listener->retired_max_total_time;
+            min_total_time[i] = pg_listener->retired_min_total_time;
+            sum_max_time[i] = pg_listener->retired_max_time;
+            sum_min_time[i] = pg_listener->retired_min_time;
+            thread_count[i] = pg_listener->retired_thread_count;
             for (size_t j = 0; j < pg_listener->fast_stats_capacity; j++) {
                 gulong calls = peak_general_listener_num_calls_load(
                     peak_general_listener_num_calls_slot(pg_listener, j));
@@ -8156,6 +8404,7 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
                     }
                 }
             }
+            g_mutex_unlock(&pg_listener->retired_mutex);
             if (thread_count[i] == 0) {
                 min_total_time[i] = DBL_MAX;
                 sum_min_time[i] = FLT_MAX;

@@ -168,6 +168,8 @@ create_fixture(const char* name)
     snapshot->max_total_time[0] = 0.75;
     snapshot->min_total_time[0] = 0.25;
     snapshot->overhead_per_call = 0.01;
+    snapshot->dropped_calls = 7;
+    snapshot->dropped_threads = 3;
     snapshot->rank_count = 2;
 
     snapshot->instrumented[1] = 0;
@@ -200,10 +202,11 @@ check_csv_golden(const char* csv_path)
 {
     static const char expected[] =
         "function,count,per_thread,per_rank,call_max_s,call_min_s,"
-        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s\n"
+        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,dropped_calls,dropped_threads\n"
         "\"alpha\",5,3,2.5,5.000000000e-01,1.250000000e-01,"
         "1.250000000e+00,1.250000000e+00,7.500000000e-01,"
-        "2.500000000e-01,5.000000000e-02\n";
+        "2.500000000e-01,5.000000000e-02,7,3\n"
+        "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,7,3\n";
     PeakReportSnapshot* snapshot = create_fixture("alpha");
     PeakReportSnapshot* prepared = peak_report_snapshot_clone(snapshot);
     char* actual;
@@ -384,6 +387,31 @@ check_no_output(const char* csv_path)
     assert(text[0] == '\0');
     assert(access(csv_path, F_OK) != 0);
     free(text);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_dropped_only_output(const char* csv_path)
+{
+    PeakReportSnapshot* snapshot = peak_report_snapshot_create(1);
+    const PeakReportFormatOptions options = {.print_text = true};
+    char* text;
+    char* csv;
+
+    assert(snapshot != NULL);
+    assert(peak_report_snapshot_set_program(snapshot, "dropped-only"));
+    assert(peak_report_snapshot_set_name(snapshot, 0, "untracked"));
+    snapshot->instrumented[0] = 1;
+    snapshot->dropped_calls = 9;
+    snapshot->dropped_threads = 2;
+    assert(peak_report_formatter_write_csv(snapshot));
+    csv = read_file(csv_path);
+    assert(strstr(csv, "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,9,2") != NULL);
+    free(csv);
+    text = capture_text_report(snapshot, &options);
+    assert(strstr(text, "dropped_calls=9 dropped_threads=2") != NULL);
+    free(text);
+    assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);
 }
 
@@ -580,6 +608,7 @@ main(void)
     check_rank_local_csv_names(stats_base, csv_path);
     check_csv_permissions(csv_path);
     check_no_output(csv_path);
+    check_dropped_only_output(csv_path);
     check_text_name_policy();
     check_text_flush_failure();
     check_long_stats_path(temp_directory);

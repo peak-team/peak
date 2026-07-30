@@ -818,6 +818,10 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
     uint64_t local_failed_stop_window_count;
     uint64_t mpi_failed_stop_window_count = 0;
     uint64_t mpi_max_failed_stop_window_count = 0;
+    uint64_t mpi_dropped_calls = 0;
+    uint64_t mpi_dropped_threads = 0;
+    uint64_t mpi_max_dropped_calls = 0;
+    uint64_t mpi_max_dropped_threads = 0;
     int local_elapsed_valid;
     int all_elapsed_valid = 0;
     int local_accounting_valid;
@@ -999,6 +1003,44 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
                                         "failed-stop-window-count")) {
         return peak_mpi_report_transport_collective_failure();
     }
+    if (!peak_mpi_allreduce_checked(&local->dropped_calls,
+                                    &mpi_max_dropped_calls,
+                                    1,
+                                    PEAK_MPI_UINT64_DATATYPE,
+                                    MPI_MAX,
+                                    "dropped-calls-max") ||
+        !peak_mpi_allreduce_checked(&local->dropped_threads,
+                                    &mpi_max_dropped_threads,
+                                    1,
+                                    PEAK_MPI_UINT64_DATATYPE,
+                                    MPI_MAX,
+                                    "dropped-threads-max")) {
+        return peak_mpi_report_transport_collective_failure();
+    }
+    if (mpi_max_dropped_calls > (UINT64_MAX - 1) / (uint64_t)size) {
+        mpi_dropped_calls = UINT64_MAX - 1;
+    } else if (!peak_mpi_reduce_checked(&local->dropped_calls,
+                                        &mpi_dropped_calls,
+                                        1,
+                                        PEAK_MPI_UINT64_DATATYPE,
+                                        MPI_SUM,
+                                        0,
+                                        rank == 0,
+                                        "dropped-calls")) {
+        return peak_mpi_report_transport_collective_failure();
+    }
+    if (mpi_max_dropped_threads > (UINT64_MAX - 1) / (uint64_t)size) {
+        mpi_dropped_threads = UINT64_MAX - 1;
+    } else if (!peak_mpi_reduce_checked(&local->dropped_threads,
+                                        &mpi_dropped_threads,
+                                        1,
+                                        PEAK_MPI_UINT64_DATATYPE,
+                                        MPI_SUM,
+                                        0,
+                                        rank == 0,
+                                        "dropped-threads")) {
+        return peak_mpi_report_transport_collective_failure();
+    }
     if (!peak_mpi_reduce_checked(&local_elapsed_seconds,
                                  &mpi_min_elapsed_seconds,
                                  1,
@@ -1124,6 +1166,8 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
             aggregate->instrumented[i] || aggregate->num_calls[i] != 0;
     }
     aggregate->rank_count = size;
+    aggregate->dropped_calls = mpi_dropped_calls;
+    aggregate->dropped_threads = mpi_dropped_threads;
     peak_mpi_report_transport_set_overhead(
         aggregate,
         all_accounting_valid != 0,

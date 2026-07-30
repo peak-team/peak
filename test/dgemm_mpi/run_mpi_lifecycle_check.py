@@ -82,7 +82,163 @@ STATS_FIELDS = [
     "thread_max_s",
     "thread_min_s",
     "overhead_s",
+    "dropped_calls",
+    "dropped_threads",
 ]
+ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
+
+
+def require_valid_accounting_diagnostics(name, rows):
+    diagnostics = [
+        row for row in rows
+        if row.get("function") == ACCOUNTING_DIAGNOSTICS_FUNCTION
+    ]
+
+    if len(diagnostics) > 1:
+        raise AssertionError(f"duplicate accounting diagnostics row: {name}")
+    diagnostics_values = None
+    if diagnostics:
+        row = diagnostics[0]
+        for field in STATS_FIELDS[1:11]:
+            try:
+                if float(row.get(field, "") or "") != 0.0:
+                    raise AssertionError(
+                        f"nonzero accounting diagnostics metric {field}: {name}"
+                    )
+            except ValueError as exc:
+                raise AssertionError(
+                    f"invalid accounting diagnostics metric {field}: {name}"
+                ) from exc
+        for field in STATS_FIELDS[11:]:
+            if not re.fullmatch(r"[0-9]+", row.get(field, "") or ""):
+                raise AssertionError(
+                    f"invalid accounting diagnostic {field}: {name}"
+                )
+        diagnostics_values = tuple(int(row[field]) for field in STATS_FIELDS[11:])
+
+    target_values = None
+    for row in rows:
+        if row.get("function") == ACCOUNTING_DIAGNOSTICS_FUNCTION:
+            continue
+        values = []
+        for field in STATS_FIELDS[11:]:
+            value = row.get(field, "") or ""
+            if not re.fullmatch(r"[0-9]+", value):
+                raise AssertionError(
+                    f"invalid target accounting diagnostic {field}: {name}"
+                )
+            values.append(int(value))
+        values = tuple(values)
+        if target_values is None:
+            target_values = values
+        elif target_values != values:
+            raise AssertionError(f"inconsistent target accounting diagnostics: {name}")
+
+    if target_values is None:
+        if diagnostics_values is None:
+            raise AssertionError(
+                f"missing target or accounting diagnostics row: {name}"
+            )
+        if diagnostics_values == (0, 0):
+            raise AssertionError(f"spurious zero accounting diagnostics row: {name}")
+    elif target_values == (0, 0):
+        if diagnostics_values is not None:
+            raise AssertionError(f"spurious accounting diagnostics row: {name}")
+    elif diagnostics_values is None:
+        raise AssertionError(f"missing accounting diagnostics row: {name}")
+    elif diagnostics_values != target_values:
+        raise AssertionError(f"accounting diagnostics mismatch: {name}")
+
+
+def run_synthetic_stats_diagnostics():
+    def row(function, dropped_calls="0", dropped_threads="0"):
+        return dict(zip(
+            STATS_FIELDS,
+            [function] + ["0"] * 10 + [dropped_calls, dropped_threads],
+        ))
+
+    def expect_assertion(label, callback):
+        try:
+            callback()
+        except AssertionError:
+            return
+        raise AssertionError(f"synthetic negative did not fail: {label}")
+
+    require_valid_accounting_diagnostics(
+        "zero-targets", [row("peak_mpi_exit_target")]
+    )
+    require_valid_accounting_diagnostics(
+        "nonzero-targets",
+        [
+            row("peak_mpi_exit_target", "7", "3"),
+            row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3"),
+        ],
+    )
+    require_valid_accounting_diagnostics(
+        "diagnostics-only",
+        [row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3")],
+    )
+    expect_assertion(
+        "missing diagnostics",
+        lambda: require_valid_accounting_diagnostics(
+            "missing", [row("peak_mpi_exit_target", "7", "3")]
+        ),
+    )
+    expect_assertion(
+        "mismatched diagnostics",
+        lambda: require_valid_accounting_diagnostics(
+            "mismatched",
+            [
+                row("peak_mpi_exit_target", "7", "3"),
+                row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "8", "3"),
+            ],
+        ),
+    )
+    expect_assertion(
+        "inconsistent targets",
+        lambda: require_valid_accounting_diagnostics(
+            "inconsistent",
+            [
+                row("peak_mpi_exit_target", "7", "3"),
+                row("another-target", "8", "3"),
+                row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3"),
+            ],
+        ),
+    )
+    expect_assertion(
+        "spurious zero diagnostics",
+        lambda: require_valid_accounting_diagnostics(
+            "spurious",
+            [
+                row("peak_mpi_exit_target"),
+                row(ACCOUNTING_DIAGNOSTICS_FUNCTION),
+            ],
+        ),
+    )
+    expect_assertion(
+        "empty stats rows",
+        lambda: require_valid_accounting_diagnostics("empty", []),
+    )
+    expect_assertion(
+        "duplicate diagnostics",
+        lambda: require_valid_accounting_diagnostics(
+            "duplicate",
+            [
+                row("peak_mpi_exit_target", "7", "3"),
+                row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3"),
+                row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3"),
+            ],
+        ),
+    )
+    bad_metric = row(ACCOUNTING_DIAGNOSTICS_FUNCTION, "7", "3")
+    bad_metric["count"] = "1"
+    expect_assertion(
+        "nonzero diagnostics metric",
+        lambda: require_valid_accounting_diagnostics(
+            "nonzero-metric", [row("peak_mpi_exit_target", "7", "3"), bad_metric]
+        ),
+    )
+    print("mpi_lifecycle_synthetic_stats_diagnostics_ok")
 REPORT_RELEASE_REAL_DIAGNOSTIC = (
     "All-rank report publication release completed: "
     "all_reports_succeeded=1 all_real_finalize_allowed=1"
@@ -230,6 +386,7 @@ def require_complete_stats_evidence(name, evidence):
     for row in evidence["rows"]:
         if None in row or any(value is None for value in row.values()):
             raise AssertionError(f"PEAK final CSV contained a partial row: {name}")
+    require_valid_accounting_diagnostics(name, evidence["rows"])
     target_rows = [
         row for row in evidence["rows"]
         if row.get("function") == "peak_mpi_exit_target"
@@ -390,6 +547,9 @@ def parse_args():
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--synthetic-stats-diagnostics":
+        run_synthetic_stats_diagnostics()
+        return
     args = parse_args()
     nprocs = int(args.nprocs)
     report_signal_requested = (
@@ -933,6 +1093,8 @@ def main():
                     "rows": rows,
                 }
                 stats_rows.extend(rows)
+        for name, evidence in stats_file_evidence.items():
+            require_valid_accounting_diagnostics(name, evidence["rows"])
         selected_stats_pattern = (
             "peak-stats-p*-r0.csv" if nprocs > 1 else "peak-stats-p*.csv"
         )

@@ -20,6 +20,7 @@ set(sources_peak
     jit_provider.c
     signal_policy.c
     pthread_listener.c
+    pthread_slot_registry.c
     syscall_interceptor.c
     unsafe_gum_prologue.c
     exec_memory.c

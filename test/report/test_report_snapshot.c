@@ -23,6 +23,8 @@ int main(void)
     snapshot->overhead.valid = true;
     snapshot->overhead.elapsed_seconds = 4.0;
     snapshot->overhead_per_call = 0.25;
+    snapshot->dropped_calls = 7;
+    snapshot->dropped_threads = 3;
 
     assert(!peak_report_snapshot_has_duplicate_names(snapshot));
     assert(peak_report_snapshot_slot_identity_hash(snapshot, 0) != 0);
@@ -40,6 +42,8 @@ int main(void)
     assert(copy->overhead.valid);
     assert(copy->overhead.elapsed_seconds == 4.0);
     assert(copy->overhead_per_call == 0.25);
+    assert(copy->dropped_calls == 7);
+    assert(copy->dropped_threads == 3);
 
     peak_report_snapshot_prepare_for_render(copy);
     assert(strcmp(copy->program, "milc -i input") == 0);

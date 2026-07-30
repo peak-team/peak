@@ -75,12 +75,28 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "header_guard_style_ok")
 
+    add_test(NAME test_cmake_portability
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_test_cmake_portability.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_cmake_portability
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "test_cmake_portability_ok")
+
     add_test(NAME test_mpi_lifecycle_checker_policy
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/test_mpi_lifecycle_checker_policy.py)
     set_tests_properties(test_mpi_lifecycle_checker_policy
         PROPERTIES
             PASS_REGULAR_EXPRESSION "mpi_lifecycle_checker_policy_ok")
+
+    add_test(NAME test_mpi_lifecycle_synthetic_stats_diagnostics
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/run_mpi_lifecycle_check.py
+                --synthetic-stats-diagnostics)
+    set_tests_properties(test_mpi_lifecycle_synthetic_stats_diagnostics
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "mpi_lifecycle_synthetic_stats_diagnostics_ok")
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
         add_test(NAME test_peak_shared_unwinder
@@ -196,7 +212,7 @@ if(BUILD_TESTING)
         PROPERTIES
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION
-                "mpi_report_request_lifetime_ok operations=54 labels=29 failures=108")
+                "mpi_report_request_lifetime_ok operations=58 labels=33 failures=116")
 
     add_executable(test_mpi_teardown_guard
         report/test_mpi_teardown_guard.c
@@ -228,7 +244,8 @@ if(BUILD_TESTING)
     target_include_directories(test_runtime_config PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_compile_definitions(test_runtime_config PRIVATE
-        PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV=1)
+        PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV=1
+        PEAK_ENABLE_TEST_HOOKS=1)
     add_test(NAME test_runtime_config COMMAND test_runtime_config)
     set_tests_properties(test_runtime_config
         PROPERTIES
@@ -528,14 +545,97 @@ if(BUILD_TESTING)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        PEAK_GUM_PEAK_PC_API_AVAILABLE AND
        TARGET peak_detach_helper)
+        add_test(NAME test_max_threads_parser
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_max_threads_parser)
+        set_tests_properties(test_max_threads_parser
+            PROPERTIES
+                ENVIRONMENT "${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "max_threads_parser_ok"
+                TIMEOUT 20)
+
         add_test(NAME test_fastpath_thread_exit_slot_reuse
             COMMAND
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
         set_tests_properties(test_fastpath_thread_exit_slot_reuse
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=4;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
                 FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_checkpoint_exact_once
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_checkpoint_exact_once
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_CHECKPOINT_EXACT=1;PEAK_EXEC_CHECKPOINT=1;PEAK_STATSLOG_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-checkpoint;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|checkpoint .* mismatch|capture failed|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_zero_capacity_clamped
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_zero_capacity_clamped
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=0;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_overflow_capacity_clamped
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_overflow_capacity_clamped
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=18446744073709551616;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_slot_publish_failure_drops
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_slot_publish_failure_drops
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_SLOT_PUBLISH_FAILURE=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_nonwrapper_drops
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_nonwrapper_drops
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_NONWRAPPER=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_detached_slot_quarantine
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_detached_slot_quarantine
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_DETACHED_QUARANTINE=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|detached thread slot was reused|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_helper_silent
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_helper_silent
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_HELPER_SILENT=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|helper contributed|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_generation_aba
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_generation_aba
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_GENERATION_ABA=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|stale generation removed|normal join cleanup|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
         add_test(NAME test_fastpath_thread_exit_detach_race
@@ -546,6 +646,26 @@ if(BUILD_TESTING)
                 ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=8;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_DETACH_COUNT=2;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
                 FAIL_REGULAR_EXPRESSION "fatal|tracked thread snapshot exceeded|thread id .* exceeds|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_retired_detach_threshold
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_retired_detach_threshold
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=3;PEAK_TEST_RETIRED_DETACH_THRESHOLD=1;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_DETACH_COUNT=10;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-retired-detach-threshold-trace.csv;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|retired detach-count request did not report|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
+        add_test(NAME test_fastpath_thread_exit_retired_active_detach_threshold
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_fastpath_thread_exit_retired_active_detach_threshold
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_RETIRED_ACTIVE_THRESHOLD=1;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_COST=0;PEAK_DETACH_COUNT=10;PEAK_HEARTBEAT_INTERVAL=0.001;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_DETACH_TRACE_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-retired-active-detach-threshold-trace.csv;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|retired-plus-active detach-count request did not fire|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
         add_test(NAME test_fastpath_second_listener_fanout

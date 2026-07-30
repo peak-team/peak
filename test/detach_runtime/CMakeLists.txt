@@ -53,10 +53,31 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 add_executable(test_fastpath_thread_exit test_fastpath_thread_exit.c)
-target_link_libraries(test_fastpath_thread_exit PRIVATE Threads::Threads)
+target_link_libraries(test_fastpath_thread_exit
+    PRIVATE Threads::Threads ${DL_LIBRARY})
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_fastpath_thread_exit PRIVATE -Wl,--export-dynamic)
 endif()
+
+add_executable(test_max_threads_parser test_max_threads_parser.c)
+target_link_libraries(test_max_threads_parser PRIVATE ${DL_LIBRARY})
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_options(test_max_threads_parser PRIVATE -Wl,--export-dynamic)
+endif()
+
+add_executable(test_pthread_slot_registry
+  test_pthread_slot_registry.c
+  ${PROJECT_SOURCE_DIR}/src/pthread_slot_registry.c)
+target_include_directories(test_pthread_slot_registry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(test_pthread_slot_registry PRIVATE Threads::Threads)
+if(PEAK_ENABLE_TSAN_TESTS)
+  target_compile_options(test_pthread_slot_registry PRIVATE
+    -fsanitize=thread -fno-omit-frame-pointer -O1 -g)
+  target_link_options(test_pthread_slot_registry PRIVATE -fsanitize=thread)
+endif()
+add_test(NAME test_pthread_slot_registry COMMAND test_pthread_slot_registry)
+set_tests_properties(test_pthread_slot_registry PROPERTIES
+  PASS_REGULAR_EXPRESSION "pthread_slot_registry_ok")
 
 add_executable(test_fastpath_second_listener test_fastpath_second_listener.c)
 target_include_directories(test_fastpath_second_listener

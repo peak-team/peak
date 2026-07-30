@@ -4,6 +4,7 @@
 #include "pthread_listener.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -835,6 +836,32 @@ run_detach_count_latch_state_gate(void)
 }
 
 static int
+run_call_count_modular_aggregation(void)
+{
+    GumInvocationListener* base;
+    PeakGeneralListener* listener;
+
+    gum_init_embedded();
+    peak_max_num_threads = 2;
+    base = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+    listener = PEAKGENERAL_LISTENER(base);
+    if (!peak_general_listener_is_ready(listener)) {
+        fprintf(stderr, "listener allocation failed\n");
+        g_object_unref(base);
+        return EXIT_FAILURE;
+    }
+    listener->retired_num_calls = ULONG_MAX - 2;
+    listener->num_calls[0] = 2;
+    listener->num_calls[64 / sizeof(gulong)] = 1;
+    check_true("call aggregation wraps modulo unsigned long",
+               peak_general_listener_test_total_calls(listener) == 0);
+    peak_general_listener_free(listener);
+    g_object_unref(base);
+    fprintf(stderr, "general-listener-call-count-modular-aggregation-ok\n");
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static int
 run_general_listener_mapping_lifecycle(void)
 {
     const size_t capacity = 112;
@@ -956,7 +983,7 @@ main(int argc, char** argv)
 {
     if (argc != 2) {
         fprintf(stderr,
-                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-rank-local-mpi-text-default|general-listener-slurm-host-parser|general-listener-uint64-saturation|general-listener-detach-count-latch-state-gate\n",
+                "usage: %s general-listener-shutdown-prepare-fail-closed|general-listener-idle-shutdown-io-fail-closed|general-listener-final-freeze-after-controller-stop|general-listener-invalid-accounting-baseline-report|general-listener-rank-local-mpi-text-default|general-listener-slurm-host-parser|general-listener-uint64-saturation|general-listener-detach-count-latch-state-gate|general-listener-call-count-modular-aggregation\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -988,6 +1015,10 @@ main(int argc, char** argv)
     if (strcmp(argv[1],
                "general-listener-detach-count-latch-state-gate") == 0) {
         return run_detach_count_latch_state_gate();
+    }
+    if (strcmp(argv[1],
+               "general-listener-call-count-modular-aggregation") == 0) {
+        return run_call_count_modular_aggregation();
     }
     if (strcmp(argv[1], "general-listener-mapping-lifecycle") == 0) {
         return run_general_listener_mapping_lifecycle();

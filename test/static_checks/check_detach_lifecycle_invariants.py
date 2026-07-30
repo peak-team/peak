@@ -1158,7 +1158,23 @@ def check_final_report_snapshot_order(repo_root):
     set_socket_overhead = extract_function(
         socket_transport, "peak_socket_report_set_aggregate_overhead"
     )
-    require("#define PEAK_SOCKET_REDUCE_VERSION 11U" in socket_transport and
+    dropped_calls_are_saturated = re.search(
+        r"\*aggregate->dropped_calls\s*=\s*"
+        r"peak_socket_add_uint64_saturated\s*\(\s*"
+        r"\*aggregate->dropped_calls\s*,\s*"
+        r"connection->header\.dropped_calls\s*\)",
+        socket_prepare_receipt,
+        re.DOTALL,
+    ) is not None
+    dropped_threads_are_saturated = re.search(
+        r"\*aggregate->dropped_threads\s*=\s*"
+        r"peak_socket_add_uint64_saturated\s*\(\s*"
+        r"\*aggregate->dropped_threads\s*,\s*"
+        r"connection->header\.dropped_threads\s*\)",
+        socket_prepare_receipt,
+        re.DOTALL,
+    ) is not None
+    require("#define PEAK_SOCKET_REDUCE_VERSION 12U" in socket_transport and
             "peak_socket_reduce_header_set_report_tuple" in socket_result and
             "peak_socket_reduce_header_report_tuple" in
                 socket_validate_header and
@@ -1171,7 +1187,8 @@ def check_final_report_snapshot_order(repo_root):
             "combined_maximum->elapsed_seconds" in set_socket_overhead and
             "report.accounting_valid = accounting_valid" in
                 set_socket_overhead and
-            "peak_socket_add_uint64_saturated" in socket_prepare_receipt,
+            dropped_calls_are_saturated and
+            dropped_threads_are_saturated,
             "socket reducer must carry complete owner tuples and accounting health")
     require("PEAK_SOCKET_GATHER_ACTIVE_MAX" in socket_transport and
             "peak_socket_reduce_gather_active_limit" in

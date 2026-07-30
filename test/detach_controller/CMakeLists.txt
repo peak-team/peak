@@ -23,13 +23,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/jit_provider.c
     ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
+    ${PROJECT_SOURCE_DIR}/src/pthread_slot_registry.c
     ${PROJECT_SOURCE_DIR}/src/detach_controller.c
     ${PROJECT_SOURCE_DIR}/src/signal_policy.c
     ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall.c
     $<TARGET_OBJECTS:utils_c>
     $<TARGET_OBJECTS:utils_cxx>
   )
-  if(MPI_FOUND)
+  if(PEAK_ENABLE_MPI AND MPI_FOUND)
     target_sources(test_detach_listener_shutdown PRIVATE
       ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c)
   endif()
@@ -109,7 +110,7 @@ if(TARGET test_detach_listener_shutdown)
       ${M_LIBRARY}
       ${LIBIBERTY_LIB}
   )
-  if(MPI_FOUND)
+  if(PEAK_ENABLE_MPI AND MPI_FOUND)
     target_link_libraries(test_detach_listener_shutdown
       PRIVATE
         MPI::MPI_C
@@ -570,6 +571,15 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       PASS_REGULAR_EXPRESSION
         "general-listener-detach-count-latch-state-gate-ok")
+
+  add_test(NAME test_detach_controller_general_listener_call_count_modular_aggregation
+    COMMAND test_detach_listener_shutdown
+            general-listener-call-count-modular-aggregation)
+  set_tests_properties(
+    test_detach_controller_general_listener_call_count_modular_aggregation
+    PROPERTIES
+      PASS_REGULAR_EXPRESSION
+        "general-listener-call-count-modular-aggregation-ok")
 
   add_test(NAME test_detach_controller_general_listener_mapping_lifecycle
     COMMAND test_detach_listener_shutdown general-listener-mapping-lifecycle)

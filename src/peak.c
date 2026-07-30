@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -60,6 +61,10 @@
 #define PEAK_HB_K_RATE_ENV                     "PEAK_HB_K_RATE"
 #define PEAK_HB_EMA_A_ENV                      "PEAK_HB_EMA_A"
 #define PEAK_MAX_NUM_THREADS_ENV               "PEAK_MAX_NUM_THREADS"
+/* Each target owns a 64-byte hot slot (plus optional checkpoint storage).
+ * Keep the process-wide knob bounded so large target groups cannot turn an
+ * accidental environment value into multi-gigabyte listener mappings. */
+#define PEAK_MAX_NUM_THREADS_LIMIT             4096UL
 #define PEAK_MEMORY_PROFILE                    "PEAK_MEMORY_PROFILE"
 #define PEAK_MEMORY_TRACK_ALL                  "PEAK_MEMORY_TRACK_ALL"
 #define PEAK_OUTPUT_AGGREGATION_ENV            "PEAK_OUTPUT_AGGREGATION"
@@ -633,6 +638,7 @@ peak_activate_runtime(void)
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
+        pthread_listener_mark_next_created_thread_helper();
         if (pthread_create(&heartbeat_thread,
                            NULL,
                            peak_heartbeat_monitor,
@@ -671,13 +677,75 @@ peak_mpi_init_completed(int result)
 }
 #endif
 
+static gulong
+peak_parse_max_num_threads(void)
+{
+    const char* value = getenv(PEAK_MAX_NUM_THREADS_ENV);
+    long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    gulong default_value = 2;
+
+    if (online_cpus > 0) {
+        if ((unsigned long)online_cpus > PEAK_MAX_NUM_THREADS_LIMIT / 2UL) {
+            default_value = PEAK_MAX_NUM_THREADS_LIMIT;
+        } else {
+            default_value = (gulong)online_cpus * 2UL;
+        }
+    }
+
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+    for (const unsigned char* cursor = (const unsigned char*)value;
+         *cursor != '\0';
+         cursor++) {
+        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
+            peak_log_warn("[peak] invalid %s=%s; using %lu\n",
+                          PEAK_MAX_NUM_THREADS_ENV,
+                          value,
+                          (unsigned long)default_value);
+            return default_value;
+        }
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed > (unsigned long long)G_MAXULONG) {
+        peak_log_warn("[peak] invalid %s=%s; using %lu\n",
+                      PEAK_MAX_NUM_THREADS_ENV,
+                      value,
+                      (unsigned long)default_value);
+        return default_value;
+    }
+    if (parsed == 0) {
+        peak_log_warn("[peak] %s=0 is unsafe; using 1\n",
+                      PEAK_MAX_NUM_THREADS_ENV);
+        return 1;
+    }
+    if (parsed > PEAK_MAX_NUM_THREADS_LIMIT) {
+        peak_log_warn("[peak] %s=%s exceeds supported capacity %lu; clamping\n",
+                      PEAK_MAX_NUM_THREADS_ENV,
+                      value,
+                      PEAK_MAX_NUM_THREADS_LIMIT);
+        return PEAK_MAX_NUM_THREADS_LIMIT;
+    }
+    return (gulong)parsed;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Deliberately re-read the environment so table-driven tests can exercise the
+ * parser without reinitializing the full preload runtime. */
+PEAK_API gulong
+peak_test_parse_max_num_threads(void)
+{
+    return peak_parse_max_num_threads();
+}
+#endif
+
 void peak_init()
 {
     peak_log_configure();
-    gulong default_max_threads = (gulong)sysconf(_SC_NPROCESSORS_ONLN) * 2;
-    peak_max_num_threads =
-        parse_env_to_uint_default(PEAK_MAX_NUM_THREADS_ENV,
-                                  (unsigned int)default_max_threads);
+    peak_max_num_threads = peak_parse_max_num_threads();
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
     peak_hook_address_count += load_symbols_from_array(PEAK_TARGET_GROUP_ENV, &peak_hook_strings, peak_hook_address_count);

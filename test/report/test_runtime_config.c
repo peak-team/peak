@@ -174,6 +174,33 @@ check_report_timeout_budget(void)
         return 1;
     }
 
+    /*
+     * Keep the small two-rank socket test's former timeout contract here,
+     * where the default and clamp arithmetic is deterministic.  The socket
+     * integration test covers the delayed peer-release protocol separately.
+     */
+    setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1500", 1);
+    setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS", "10", 1);
+    unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    budget = peak_general_listener_report_timeout_budget_for_rank_count(2U);
+    if (budget.socket_phase_timeout_ms != 1500U ||
+        budget.socket_gather_wave_budget_ms != 10U ||
+        budget.socket_gather_hard_timeout_ms != 1510U ||
+        budget.socket_release_timeout_ms != 4510U ||
+        budget.socket_combined_release_minimum_ms != 7510U ||
+        !budget.socket_gather_timeout_was_scaled ||
+        budget.socket_release_was_raised) {
+        return 1;
+    }
+    setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "100", 1);
+    budget = peak_general_listener_report_timeout_budget_for_rank_count(2U);
+    if (budget.socket_release_timeout_ms != 4510U ||
+        budget.socket_combined_release_minimum_ms != 7510U ||
+        !budget.socket_release_was_raised) {
+        return 1;
+    }
+    unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS");
+
     setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1000", 1);
     setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "1", 1);
     setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "2", 1);
