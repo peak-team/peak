@@ -22,6 +22,12 @@ typedef enum {
     PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED,
 } PeakSocketReportRankSource;
 
+/** Independent port domains for sequential report transports. */
+typedef enum {
+    PEAK_SOCKET_REPORT_CHANNEL_CPU = 0,
+    PEAK_SOCKET_REPORT_CHANNEL_CUDA = 1,
+} PeakSocketReportChannel;
+
 /** Outcome of the blocking first phase of socket report aggregation. */
 typedef enum {
     /** Aggregation failed; the caller may choose rank-local output. */
@@ -81,6 +87,18 @@ PeakSocketReportStatus peak_socket_report_transport_begin(
     PeakReportSnapshot** aggregate_out);
 
 /**
+ * Same protocol as `peak_socket_report_transport_begin`, in an explicit
+ * channel. CPU uses channel zero (base/base+1); CUDA uses channel one
+ * (base+2/base+3), preventing sequential TIME_WAIT and port collisions.
+ */
+PeakSocketReportStatus peak_socket_report_transport_begin_channel(
+    const PeakReportSnapshot* local,
+    PeakSocketReportRankSource rank_source,
+    PeakSocketReportChannel channel,
+    PeakSocketReportSession** session_out,
+    PeakReportSnapshot** aggregate_out);
+
+/**
  * Sends the final ACK decision to every registered peer, waits for each peer's
  * confirmation, and consumes @p session.
  *
@@ -132,6 +150,9 @@ void peak_socket_report_test_telemetry_get(
  * launcher identity.
  */
 int peak_socket_report_test_default_port(void);
+
+/** Returns the gather port selected for a test channel, or -1 when invalid. */
+int peak_socket_report_test_channel_port(PeakSocketReportChannel channel);
 
 /** Computes a test-only rolling deadline from an injected clock value. */
 int64_t peak_socket_report_test_progress_deadline_us(

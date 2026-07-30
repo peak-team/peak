@@ -76,6 +76,12 @@ uint64_t peak_report_snapshot_slot_identity_hash(
 bool peak_report_snapshot_has_duplicate_names(
     const PeakReportSnapshot* snapshot);
 
+/** Stores the latest real local transport context for optional report domains. */
+void peak_report_snapshot_set_transport_overhead(const PeakReportOverhead* overhead);
+
+/** Returns the stored context, or a deterministic invalid zero context. */
+PeakReportOverhead peak_report_snapshot_get_transport_overhead(void);
+
 /** Releases the snapshot and all memory it owns. */
 void peak_report_snapshot_destroy(PeakReportSnapshot* snapshot);
 

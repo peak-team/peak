@@ -98,6 +98,16 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "mpi_lifecycle_synthetic_stats_diagnostics_ok")
 
+    add_executable(test_cuda_profiler_state
+        cuda_profiler_state_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/cuda_profiler_state.cpp)
+    target_include_directories(test_cuda_profiler_state PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test_cuda_profiler_state PRIVATE Threads::Threads)
+    add_test(NAME test_cuda_profiler_state COMMAND test_cuda_profiler_state)
+    set_tests_properties(test_cuda_profiler_state
+        PROPERTIES PASS_REGULAR_EXPRESSION "cuda_profiler_state_test_ok")
+
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
         add_test(NAME test_peak_shared_unwinder
             COMMAND ${Python3_EXECUTABLE}

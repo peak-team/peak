@@ -25,6 +25,9 @@ int main(void)
     snapshot->overhead_per_call = 0.25;
     snapshot->dropped_calls = 7;
     snapshot->dropped_threads = 3;
+    peak_report_snapshot_set_transport_overhead(&snapshot->overhead);
+    PeakReportOverhead transport = peak_report_snapshot_get_transport_overhead();
+    assert(transport.valid && transport.elapsed_seconds == 4.0);
 
     assert(!peak_report_snapshot_has_duplicate_names(snapshot));
     assert(peak_report_snapshot_slot_identity_hash(snapshot, 0) != 0);

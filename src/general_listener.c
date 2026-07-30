@@ -8415,6 +8415,7 @@ peak_general_listener_print_with_mpi_job_policy(
 
     PeakReportOverhead local_report =
         peak_general_listener_local_report_overhead(sum_num_calls);
+    peak_report_snapshot_set_transport_overhead(&local_report);
     local_snapshot = peak_general_listener_build_report_snapshot(
         sum_num_calls,
         sum_total_time,

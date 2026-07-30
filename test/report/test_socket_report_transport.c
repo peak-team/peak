@@ -933,6 +933,252 @@ run_dropped_counter_saturation_case(int port)
     return result;
 }
 
+/*
+ * Exercises the production sequence used when both CPU and CUDA reporting are
+ * enabled.  The same two processes complete CPU first, then use CUDA's
+ * independent port pair.  Keeping the child alive across both phases catches
+ * accidental channel state leakage as well as TIME_WAIT port reuse bugs.
+ */
+static int
+run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
+{
+    PeakReportSnapshot* root_cpu = fixture_snapshot(0, false);
+    PeakReportSnapshot* root_cuda = fixture_snapshot(0, false);
+    PeakReportSnapshot* aggregate = NULL;
+    PeakSocketReportSession* session = NULL;
+    PeakSocketReportTestTelemetry telemetry;
+    PeakSocketReportStatus cpu_status = PEAK_SOCKET_REPORT_FAILED;
+    PeakSocketReportStatus cuda_status = PEAK_SOCKET_REPORT_FAILED;
+    char port_text[16];
+    char token_text[64];
+    pid_t child;
+    int child_status = -1;
+    int result = 0;
+
+    if (root_cpu == NULL || root_cuda == NULL) {
+        peak_report_snapshot_destroy(root_cpu);
+        peak_report_snapshot_destroy(root_cuda);
+        return 1;
+    }
+    snprintf(port_text, sizeof(port_text), "%d", port);
+    snprintf(token_text,
+             sizeof(token_text),
+             "socket-sequential-channels-%ld-%d",
+             (long)getpid(),
+             port);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", port_text, 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1500", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "3000", 1);
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS",
+                 "10000",
+                 1);
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS", "10", 1);
+
+    child = fork();
+    if (child < 0) {
+        peak_report_snapshot_destroy(root_cpu);
+        peak_report_snapshot_destroy(root_cuda);
+        return 1;
+    }
+    if (child == 0) {
+        PeakReportSnapshot* peer_cpu = fixture_snapshot(1, false);
+        PeakReportSnapshot* peer_cuda =
+            fixture_snapshot(1, cuda_schema_mismatch);
+        PeakReportSnapshot* peer_aggregate = NULL;
+        PeakSocketReportSession* peer_session = NULL;
+        PeakSocketReportStatus peer_cpu_status;
+        PeakSocketReportStatus peer_cuda_status;
+
+        set_test_rank(1, 2);
+        if (peer_cpu == NULL || peer_cuda == NULL) {
+            peak_report_snapshot_destroy(peer_cpu);
+            peak_report_snapshot_destroy(peer_cuda);
+            _exit(99);
+        }
+        peer_cpu_status = peak_socket_report_transport_begin_channel(
+            peer_cpu,
+            PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+            PEAK_SOCKET_REPORT_CHANNEL_CPU,
+            &peer_session,
+            &peer_aggregate);
+        memset(&telemetry, 0, sizeof(telemetry));
+        peak_socket_report_test_telemetry_get(&telemetry);
+        peak_socket_report_transport_abort(peer_session);
+        peak_report_snapshot_destroy(peer_aggregate);
+        if (peer_cpu_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
+            telemetry.wire_version != 12U ||
+            !telemetry.peer_receipt_received ||
+            !telemetry.peer_confirmation_sent ||
+            !telemetry.peer_release_started ||
+            !telemetry.peer_release_decision_received ||
+            !telemetry.peer_release_confirmation_sent ||
+            telemetry.peer_release_decision != TEST_RELEASE_ACK) {
+            peak_report_snapshot_destroy(peer_cpu);
+            peak_report_snapshot_destroy(peer_cuda);
+            _exit(99);
+        }
+        peak_report_snapshot_destroy(peer_cpu);
+
+        peer_aggregate = NULL;
+        peer_session = NULL;
+        peer_cuda_status = peak_socket_report_transport_begin_channel(
+            peer_cuda,
+            PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+            PEAK_SOCKET_REPORT_CHANNEL_CUDA,
+            &peer_session,
+            &peer_aggregate);
+        memset(&telemetry, 0, sizeof(telemetry));
+        peak_socket_report_test_telemetry_get(&telemetry);
+        peak_socket_report_transport_abort(peer_session);
+        peak_report_snapshot_destroy(peer_aggregate);
+        peak_report_snapshot_destroy(peer_cuda);
+        if ((!cuda_schema_mismatch &&
+             (peer_cuda_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
+              telemetry.wire_version != 12U ||
+              !telemetry.peer_receipt_received ||
+              !telemetry.peer_confirmation_sent ||
+              !telemetry.peer_release_started ||
+              !telemetry.peer_release_decision_received ||
+              !telemetry.peer_release_confirmation_sent ||
+              telemetry.peer_release_decision != TEST_RELEASE_ACK)) ||
+            (cuda_schema_mismatch &&
+             (peer_cuda_status != PEAK_SOCKET_REPORT_FAILED ||
+              telemetry.peer_release_decision == TEST_RELEASE_ACK))) {
+            _exit(99);
+        }
+        _exit(0);
+    }
+
+    set_test_rank(0, 2);
+    cpu_status = peak_socket_report_transport_begin_channel(
+        root_cpu,
+        PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+        PEAK_SOCKET_REPORT_CHANNEL_CPU,
+        &session,
+        &aggregate);
+    memset(&telemetry, 0, sizeof(telemetry));
+    peak_socket_report_test_telemetry_get(&telemetry);
+    if (cpu_status != PEAK_SOCKET_REPORT_ROOT_PREPARED || session == NULL ||
+        !aggregate_matches(aggregate) || telemetry.wire_version != 12U ||
+        telemetry.root_payload_count != 1U ||
+        telemetry.root_receipt_count != 1U ||
+        telemetry.root_confirmation_count != 1U ||
+        telemetry.root_release_target_count != 1U) {
+        result = 1;
+        peak_socket_report_transport_abort(session);
+        session = NULL;
+    } else if (!peak_socket_report_transport_commit(session)) {
+        result = 1;
+        session = NULL;
+    } else {
+        session = NULL;
+        memset(&telemetry, 0, sizeof(telemetry));
+        peak_socket_report_test_telemetry_get(&telemetry);
+        if (telemetry.root_release_decision != TEST_RELEASE_ACK ||
+            telemetry.root_release_confirmed_count != 1U) {
+            result = 1;
+        }
+    }
+    peak_report_snapshot_destroy(aggregate);
+    aggregate = NULL;
+    if (session == NULL) {
+        int gather_fd = bind_test_tcp_port(port, true);
+        int release_fd = bind_test_tcp_port(port + 1, true);
+
+        if (gather_fd < 0 || release_fd < 0) {
+            result = 1;
+        }
+        if (gather_fd >= 0) {
+            close(gather_fd);
+        }
+        if (release_fd >= 0) {
+            close(release_fd);
+        }
+    }
+
+    if (cpu_status == PEAK_SOCKET_REPORT_ROOT_PREPARED && result == 0) {
+        cuda_status = peak_socket_report_transport_begin_channel(
+            root_cuda,
+            PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+            PEAK_SOCKET_REPORT_CHANNEL_CUDA,
+            &session,
+            &aggregate);
+        memset(&telemetry, 0, sizeof(telemetry));
+        peak_socket_report_test_telemetry_get(&telemetry);
+        if (cuda_schema_mismatch) {
+            if (cuda_status != PEAK_SOCKET_REPORT_FAILED || session != NULL ||
+                aggregate != NULL || telemetry.root_release_decision ==
+                    TEST_RELEASE_ACK) {
+                result = 1;
+                peak_socket_report_transport_abort(session);
+                session = NULL;
+            }
+        } else if (cuda_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
+                   session == NULL || !aggregate_matches(aggregate) ||
+                   telemetry.wire_version != 12U ||
+                   telemetry.root_payload_count != 1U ||
+                   telemetry.root_receipt_count != 1U ||
+                   telemetry.root_confirmation_count != 1U ||
+                   telemetry.root_release_target_count != 1U) {
+            result = 1;
+            peak_socket_report_transport_abort(session);
+            session = NULL;
+        } else if (!peak_socket_report_transport_commit(session)) {
+            result = 1;
+            session = NULL;
+        } else {
+            session = NULL;
+            memset(&telemetry, 0, sizeof(telemetry));
+            peak_socket_report_test_telemetry_get(&telemetry);
+            if (telemetry.root_release_decision != TEST_RELEASE_ACK ||
+                telemetry.root_release_confirmed_count != 1U) {
+                result = 1;
+            }
+        }
+        peak_report_snapshot_destroy(aggregate);
+        aggregate = NULL;
+        if (session == NULL) {
+            int gather_fd = bind_test_tcp_port(port + 2, true);
+            int release_fd = bind_test_tcp_port(port + 3, true);
+
+            if (gather_fd < 0 || release_fd < 0) {
+                result = 1;
+            }
+            if (gather_fd >= 0) {
+                close(gather_fd);
+            }
+            if (release_fd >= 0) {
+                close(release_fd);
+            }
+        }
+    }
+
+    if (waitpid(child, &child_status, 0) != child ||
+        !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+        result = 1;
+    }
+    peak_socket_report_transport_abort(session);
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(root_cpu);
+    peak_report_snapshot_destroy(root_cuda);
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS");
+    return result;
+}
+
+static int
+run_two_rank_sequential_channels_repeatedly(int port)
+{
+    for (int iteration = 0; iteration < 20; iteration++) {
+        if (run_two_rank_sequential_channels(port, false) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int
 check_release_port_reservation_fails_before_gather(int port)
 {
@@ -1067,6 +1313,23 @@ check_default_port_derivation(void)
     clear_socket_identity_environment();
     clear_rank_environment();
     return failed;
+}
+
+static int
+check_sequential_channel_ports(void)
+{
+    int result;
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", "45100", 1);
+    result = peak_socket_report_test_channel_port(
+                 PEAK_SOCKET_REPORT_CHANNEL_CPU) != 45100 ||
+             peak_socket_report_test_channel_port(
+                 PEAK_SOCKET_REPORT_CHANNEL_CUDA) != 45102;
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_PORT", "65534", 1);
+    result |= peak_socket_report_test_channel_port(
+                  PEAK_SOCKET_REPORT_CHANNEL_CUDA) != -1;
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_PORT");
+    return result;
 }
 
 static int
@@ -1522,7 +1785,7 @@ main(void)
 {
     /*
      * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
-     * consumes base..base+45, and the kernel lock prevents parallel CTest
+     * consumes base..base+53, and the kernel lock prevents parallel CTest
      * processes, including different UIDs, from choosing the same range.
      */
     int port_lock_fd = -1;
@@ -1549,6 +1812,8 @@ main(void)
                       check_progress_deadline_hard_cap());
     CHECK_SOCKET_CASE("default-port-derivation",
                       check_default_port_derivation());
+    CHECK_SOCKET_CASE("sequential-channel-ports",
+                      check_sequential_channel_ports());
     CHECK_SOCKET_CASE("gather-admission-waves",
                       check_gather_admission_waves());
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
@@ -1559,6 +1824,12 @@ main(void)
         "release-port-pre-reservation",
         check_release_port_reservation_fails_before_gather(
             base_port + 38));
+    CHECK_SOCKET_CASE(
+        "sequential-cpu-cuda-20x",
+        run_two_rank_sequential_channels_repeatedly(base_port + 46));
+    CHECK_SOCKET_CASE(
+        "sequential-cpu-success-cuda-schema-fallback",
+        run_two_rank_sequential_channels(base_port + 50, true));
     CHECK_SOCKET_CASE(
         "commit",
         run_two_rank_case(base_port, TEST_ROOT_COMMIT, false));
