@@ -181,7 +181,10 @@ if(BUILD_TESTING)
         COMMAND test_socket_report_transport)
     set_tests_properties(test_socket_report_transport
         PROPERTIES
-            TIMEOUT 30
+            # A test-only startup grace isolates peer launch from protocol
+            # timing. This cap includes the deterministic two-second
+            # pre-connect regression delay and failed-child cleanup.
+            TIMEOUT 60
             PASS_REGULAR_EXPRESSION "socket_report_transport_test_ok")
 
     add_executable(test_mpi_report_request_lifetime

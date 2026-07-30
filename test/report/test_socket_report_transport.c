@@ -449,17 +449,18 @@ run_two_rank_case(int port,
     PeakReportSnapshot* root = fixture_snapshot(0, false);
     PeakReportSnapshot* aggregate = NULL;
     PeakSocketReportSession* session = NULL;
-    PeakSocketReportStatus root_status;
-    PeakSocketReportTestTelemetry root_telemetry;
-    PeakSocketReportStatus expected_peer =
+    PeakSocketReportStatus root_status = PEAK_SOCKET_REPORT_FAILED;
+    PeakSocketReportTestTelemetry root_telemetry = {0};
+    bool success_path =
+        !mismatched_peer_name &&
         (action == TEST_ROOT_COMMIT ||
          action == TEST_ROOT_COMMIT_AFTER_PEER_READY ||
          action == TEST_ROOT_COMMIT_DROP_ONCE ||
          action == TEST_ROOT_COMMIT_RESOLVE_AGAIN ||
          action == TEST_ROOT_COMMIT_CONFIRM_RETRY ||
          action == TEST_GATHER_PARTIAL_SUCCESS ||
-         action == TEST_GATHER_PROGRESS_SUCCESS) &&
-                !mismatched_peer_name
+         action == TEST_GATHER_PROGRESS_SUCCESS);
+    PeakSocketReportStatus expected_peer = success_path
             ? PEAK_SOCKET_REPORT_PEER_RELEASED
             : PEAK_SOCKET_REPORT_FAILED;
     bool gather_must_fail =
@@ -512,6 +513,16 @@ run_two_rank_case(int port,
          * on both sides of the refresh for a loaded hosted runner.
          */
         (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1000", 1);
+    }
+    if (action == TEST_GATHER_SLOW_FAILURE ||
+        action == TEST_GATHER_PROGRESS_SUCCESS) {
+        (void)unsetenv(
+            "PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS");
+    } else {
+        /* Test-only grace isolates launcher scheduling before transport I/O. */
+        (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS",
+                     "10000",
+                     1);
     }
     (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS",
                  action == TEST_GATHER_PROGRESS_SUCCESS
@@ -609,18 +620,22 @@ run_two_rank_case(int port,
         (void)unsetenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK");
     }
-    if (action == TEST_GATHER_PROGRESS_SUCCESS) {
+    if (action == TEST_GATHER_PROGRESS_SUCCESS ||
+        action == TEST_ROOT_COMMIT_CONFIRM_RETRY) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS",
-            "600",
+            action == TEST_GATHER_PROGRESS_SUCCESS ? "600" : "2000",
             1);
+    } else {
+        (void)unsetenv(
+            "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS");
+    }
+    if (action == TEST_GATHER_PROGRESS_SUCCESS) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER",
             "1",
             1);
     } else {
-        (void)unsetenv(
-            "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS");
         (void)unsetenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER");
     }
@@ -876,6 +891,8 @@ run_two_rank_case(int port,
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK");
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS");
+    (void)unsetenv(
+        "PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS");
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER");
     (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS",
