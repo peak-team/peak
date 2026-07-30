@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * Owned final-report data captured from the live listener.
  *
@@ -84,5 +88,9 @@ PeakReportOverhead peak_report_snapshot_get_transport_overhead(void);
 
 /** Releases the snapshot and all memory it owns. */
 void peak_report_snapshot_destroy(PeakReportSnapshot* snapshot);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PEAK_REPORT_SNAPSHOT_H */

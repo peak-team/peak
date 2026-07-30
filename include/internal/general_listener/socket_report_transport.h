@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Sources from which socket aggregation may obtain the process rank. */
 typedef enum {
     /** Use active MPI first, then fall back to launcher metadata. */
@@ -184,6 +188,10 @@ unsigned int peak_socket_report_test_latest_admission_ms(
 int peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                 char* out,
                                                 size_t out_size);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* PEAK_SOCKET_REPORT_TRANSPORT_H */

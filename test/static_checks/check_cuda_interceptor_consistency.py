@@ -112,6 +112,13 @@ def main():
     general = read_general_listener_source(repo_root)
     cuda_header = (repo_root / "include" / "cuda_interceptor.h").read_text(
         encoding="utf-8")
+    c_api_headers = [
+        "include/internal/general_listener/report_maxima.h",
+        "include/internal/general_listener/report_model.h",
+        "include/internal/general_listener/report_snapshot.h",
+        "include/internal/general_listener/socket_report_transport.h",
+        "include/internal/general_listener/mpi_report_transport.h",
+    ]
     support_sources = {
         "src/dlopen_interceptor.c": ["dlopen"],
         "src/mpi_interceptor.c": ["PMPI_Finalize"],
@@ -160,6 +167,18 @@ def main():
             'extern "C" gpointer peak_general_listener_find_function('
             'const char* symbol);' in cuda,
             "CUDA must avoid C-only general-listener declarations and keep its C lookup ABI")
+    for relpath in c_api_headers:
+        header = (repo_root / relpath).read_text(encoding="utf-8")
+        require(re.search(r'#ifdef __cplusplus\s+extern "C" \{\s+#endif',
+                          header) is not None and
+                re.search(r'#ifdef __cplusplus\s+}\s+#endif\s*\n\s*#endif',
+                          header) is not None,
+                f"{relpath} must preserve C linkage for CUDA C++ callers")
+    cxx_link_test = (repo_root / "test" / "CMakeLists.txt").read_text(
+        encoding="utf-8")
+    require("test_report_snapshot_cxx_link" in cxx_link_test and
+            "test_report_snapshot_cxx_link.cpp" in cxx_link_test,
+            "C++ report-snapshot linkage must remain a compiled regression test")
     require("PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL = 0" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_MPI = 1" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2" in cuda,

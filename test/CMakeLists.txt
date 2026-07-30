@@ -152,6 +152,19 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_snapshot_test_ok")
 
+    add_executable(test_report_snapshot_cxx_link
+        report/test_report_snapshot_cxx_link.cpp
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
+    target_include_directories(test_report_snapshot_cxx_link PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    add_test(NAME test_report_snapshot_cxx_link
+        COMMAND test_report_snapshot_cxx_link)
+    set_tests_properties(test_report_snapshot_cxx_link
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_snapshot_cxx_link_test_ok")
+
     add_executable(test_report_formatter
         report/test_report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
