@@ -110,6 +110,10 @@ def main():
     cuda = (repo_root / "src" / "cuda_interceptor.cpp").read_text(
         encoding="utf-8")
     general = read_general_listener_source(repo_root)
+    general_header = (repo_root / "include" / "general_listener.h").read_text(
+        encoding="utf-8")
+    cuda_header = (repo_root / "include" / "cuda_interceptor.h").read_text(
+        encoding="utf-8")
     support_sources = {
         "src/dlopen_interceptor.c": ["dlopen"],
         "src/mpi_interceptor.c": ["PMPI_Finalize"],
@@ -154,6 +158,12 @@ def main():
             "CUDA support hooks must use the Frida-native lookup helper")
     require('gum_find_function("' not in general,
             "general listener special cases must use the Frida-native lookup helper")
+    require("extern \"C\" gpointer peak_general_listener_find_function" not in cuda,
+            "CUDA must not redeclare the general-listener lookup with conflicting linkage")
+    require(re.search(r'#ifdef __cplusplus\s+extern "C" \{\s+#endif\s+'
+                      r'gpointer peak_general_listener_find_function',
+                      general_header) is not None,
+            "general-listener lookup must retain C linkage for CUDA C++ callers")
 
     for hook in CUDA_HOOKS:
         require(f'peak_general_listener_find_function("{hook}")' in cuda,
@@ -188,6 +198,14 @@ def main():
             "each wrapper must handle both start and end event-record failures")
     require("launches.reserve(" not in cuda,
             "per-key launch vectors must not reserve beyond the shared pool budget")
+    require(re.search(r'^\s*#\s*define\s+(?:min|max)\s*\(', cuda_header,
+                      re.MULTILINE) is None,
+            "CUDA public header must not poison C++ standard min/max names")
+    require(cuda.find("#include <algorithm>") != -1 and
+            cuda.find("#include <algorithm>") <
+            cuda.find("#include \"cuda_interceptor.h\"") and
+            cuda.count("std::max(") == 5 and cuda.count("std::min(") == 5,
+            "CUDA launch statistics must use standard min/max without macro pollution")
     require("cudaEventRecord(*event, stream) != cudaSuccess" in cuda and
             "cudaEventElapsedTime(&ms" in cuda and
             "!= cudaSuccess" in cuda,

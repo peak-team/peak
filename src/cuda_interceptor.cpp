@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "cuda_interceptor.h"
 #include "general_listener.h"
 #include "internal/cuda_profiler_state.h"
@@ -8,11 +10,7 @@
 #endif
 #include "logging.h"
 
-#include <algorithm>
-
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
-
-extern "C" gpointer peak_general_listener_find_function(const char* symbol);
 
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
@@ -266,14 +264,14 @@ static void update_kernel_map_info(const gchar* kernel_name, gulong total_thread
         dim_info->total_block_size += block_size;
         dim_info->total_grid_size += grid_size;
         dim_info->total_time += elapsed_sec;
-        dim_info->max_gpu_threads = max(dim_info->max_gpu_threads, total_threads);
-        dim_info->min_gpu_threads = min(dim_info->min_gpu_threads, total_threads);
-        dim_info->max_block_size = max(dim_info->max_block_size, block_size);
-        dim_info->min_block_size = min(dim_info->min_block_size, block_size);
-        dim_info->max_grid_size = max(dim_info->max_grid_size, grid_size);
-        dim_info->min_grid_size = min(dim_info->min_grid_size, grid_size);
-        dim_info->max_time = max(dim_info->max_time, elapsed_sec);
-        dim_info->min_time = min(dim_info->min_time, elapsed_sec);
+        dim_info->max_gpu_threads = std::max(dim_info->max_gpu_threads, total_threads);
+        dim_info->min_gpu_threads = std::min(dim_info->min_gpu_threads, total_threads);
+        dim_info->max_block_size = std::max(dim_info->max_block_size, block_size);
+        dim_info->min_block_size = std::min(dim_info->min_block_size, block_size);
+        dim_info->max_grid_size = std::max(dim_info->max_grid_size, grid_size);
+        dim_info->min_grid_size = std::min(dim_info->min_grid_size, grid_size);
+        dim_info->max_time = std::max(dim_info->max_time, elapsed_sec);
+        dim_info->min_time = std::min(dim_info->min_time, elapsed_sec);
     }
 }
 
@@ -299,8 +297,8 @@ void insert_cuda_graph_record(CUgraphExec_st* graph, gdouble elapsed_sec)
     } else {
         graph_info->total_graph_call_cnt++;
         graph_info->total_time += elapsed_sec;
-        graph_info->max_time = max(graph_info->max_time, elapsed_sec);
-        graph_info->min_time = min(graph_info->min_time, elapsed_sec);
+        graph_info->max_time = std::max(graph_info->max_time, elapsed_sec);
+        graph_info->min_time = std::min(graph_info->min_time, elapsed_sec);
     }
     g_mutex_unlock(&cuda_graph_local_mapping_mutex);
 }
