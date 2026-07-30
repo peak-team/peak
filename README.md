@@ -277,10 +277,10 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_GPU_TARGET` | Comma-separated demangled base kernel names. |
 | `PEAK_GPU_TARGET_FILE` | File containing one GPU kernel name per line. |
 | `PEAK_GPU_MONITOR_ALL` | Profile every observed GPU kernel. |
-| `PEAK_MEMORY_PROFILE` | Enable beta memory allocation profiling for selected CPU targets. |
+| `PEAK_MEMORY_PROFILE` | Enable experimental memory allocation profiling for selected CPU targets. |
 | `PEAK_MEMORY_TRACK_ALL` | Track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |
-| `PEAK_MEMLOG_CHUNK_EVENTS` | Virtual-memory event-buffer growth size. Values greater than `1000` are accepted. |
+| `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed event capacity. A positive decimal value allocates that many slots once; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |
 
 ### Legacy Controls

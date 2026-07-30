@@ -53,6 +53,14 @@ typedef struct {
     uint8_t  op;        /**< 1=add/allocation, 2=remove/free; realloc emits those operations. */
 } __attribute__((packed)) PeakMemEvent;
 
+/** Explicit lifecycle for the experimental memory-event log. */
+typedef enum {
+    PEAK_MEMLOG_UNINITIALIZED = 0,
+    PEAK_MEMLOG_ACTIVE,
+    PEAK_MEMLOG_DISABLED,
+    PEAK_MEMLOG_FINALIZED,
+} PeakMemLogState;
+
 /** Fixed metadata at the start of a PEAK binary memory log. */
 typedef struct {
     char     magic[8];       /**< The eight bytes `PEAKMEM\0`. */
@@ -68,14 +76,16 @@ typedef struct {
 typedef struct {
     int      fd;                  /**< Descriptor for the temporary binary log. */
     void    *map;                 /**< Mapping base containing header followed by events. */
-    size_t   map_bytes;           /**< Current mapping size, in bytes. */
+    size_t   map_bytes;           /**< Fixed mapping size, in bytes. */
     size_t   header_bytes;        /**< Page-aligned event-region offset. */
-    size_t   capacity_events;     /**< Number of event slots in the current mapping. */
-    size_t   chunk_events;        /**< Event-slot increment used when growing the mapping. */
-    _Atomic size_t index;         /**< Next event slot reserved by producers. */
-    pthread_mutex_t resize_mutex; /**< Protects `ftruncate()` plus `mremap()`. */
+    size_t   capacity_events;     /**< Number of event slots in the fixed mapping. */
+    size_t   ready_offset;        /**< Offset of one-byte atomic ready flags after events. */
+    _Atomic size_t reserved;      /**< Successfully reserved event slots. */
+    _Atomic size_t committed;     /**< Slots whose payload publication completed. */
+    _Atomic size_t dropped;       /**< Events rejected after capacity is exhausted. */
+    _Atomic size_t active_writers;/**< Writers admitted before DISABLED. */
+    _Atomic PeakMemLogState state;/**< UNINITIALIZED, ACTIVE, DISABLED, or FINALIZED. */
     uint64_t t0_ns;               /**< Log-open `CLOCK_MONOTONIC_RAW` time, in nanoseconds. */
-    int      initialized;         /**< Nonzero after the one-shot open attempt. */
     char     tmp_path[512];       /**< Temporary mapped-file path, unlinked after export. */
     char     csv_path[512];       /**< Final CSV output path. */
     char     otf2_prefix[512];    /**< Final OTF2 archive prefix for this rank and process. */
@@ -116,6 +126,62 @@ int malloc_interceptor_attach();
  * exports, and closes, unmaps, and unlinks the module-owned temporary log.
  */
 void malloc_interceptor_detach();
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+#define PEAK_MALLOC_TEST_API __attribute__((visibility("default")))
+
+typedef enum {
+    PEAK_MEMLOG_TEST_FAIL_NONE = 0,
+    PEAK_MEMLOG_TEST_FAIL_CREATE,
+    PEAK_MEMLOG_TEST_FAIL_SIZING,
+    PEAK_MEMLOG_TEST_FAIL_MAPPING,
+    PEAK_MEMLOG_TEST_FAIL_ALLOCATION,
+} PeakMemLogTestFailure;
+
+typedef struct {
+    PeakMemLogState state;
+    size_t capacity;
+    size_t reserved;
+    size_t committed;
+    size_t dropped;
+    size_t active_writers;
+    size_t exported;
+    int mapping_live;
+} PeakMemLogTestSnapshot;
+
+PEAK_MALLOC_TEST_API void
+peak_memlog_test_set_failure(PeakMemLogTestFailure failure);
+
+PEAK_MALLOC_TEST_API int
+peak_memlog_test_open(size_t capacity_events);
+
+PEAK_MALLOC_TEST_API void
+peak_memlog_test_log_event(uint64_t ts, int64_t delta, uint64_t current, uint8_t op);
+
+PEAK_MALLOC_TEST_API size_t
+peak_memlog_test_ready_records(void);
+
+PEAK_MALLOC_TEST_API int
+peak_memlog_test_read_event(size_t index, PeakMemEvent* out);
+
+PEAK_MALLOC_TEST_API void
+peak_memlog_test_snapshot(PeakMemLogTestSnapshot* out);
+
+PEAK_MALLOC_TEST_API void
+peak_memlog_test_pause_before_commit(int enabled);
+
+PEAK_MALLOC_TEST_API int
+peak_memlog_test_writer_is_paused(void);
+
+PEAK_MALLOC_TEST_API void
+peak_memlog_test_finalize(void);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_failed_realloc_preserves_accounting(void);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_tracking_allocation_failure(void);
+#endif
 
 /** @} */
 

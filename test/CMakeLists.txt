@@ -3060,6 +3060,16 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stress allocation realloc)
+        add_test(NAME test_memlog_${memlog_case}
+            COMMAND test_memlog_safety ${memlog_case})
+        set_tests_properties(test_memlog_${memlog_case}
+            PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                TIMEOUT 10)
+    endforeach()
+    set_tests_properties(test_memlog_sizing
+        PROPERTIES PASS_REGULAR_EXPRESSION "memlog: ftruncate init failed")
     add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
     set_tests_properties(test_memory
         PROPERTIES

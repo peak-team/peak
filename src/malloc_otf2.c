@@ -97,8 +97,9 @@ static void peak_otf2_log_err(const char* where, OTF2_ErrorCode ec) {
             desc ? desc : "");
 }
 
-/* base: pointer to first PeakMemEvent in mmap region (after header_bytes)
- * events: count from atomic_load_explicit(&g_memlog.index, ...)
+/* base: pointer to first compacted, fully committed PeakMemEvent in the mmap
+ * region (after header_bytes).  The caller filters per-slot publication flags
+ * after writer quiescence; events is never a raw reservation count.
  */
 void peak_memlog_export_otf2(char* filename, const PeakMemEvent* base, size_t events) {
     if (!base || events == 0) return;
