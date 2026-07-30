@@ -49,6 +49,10 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK"
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS"
+#ifdef PEAK_ENABLE_TEST_HOOKS
+#define PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS_ENV \
+    "PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS"
+#endif
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER"
 #define PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_AFTER_BYTES_ENV \
@@ -2416,6 +2420,7 @@ peak_socket_reduce_root_gather(
     int listener,
     int size,
     int progress_timeout_ms,
+    int gather_hard_timeout_ms,
     int64_t hard_deadline_us,
     PeakSocketGatherAggregate* aggregate,
     unsigned int* received_out)
@@ -2430,10 +2435,19 @@ peak_socket_reduce_root_gather(
     unsigned int completed = 0;
     int64_t progress_deadline_us;
     bool ok = true;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    bool startup_grace_active =
+        peak_socket_reduce_parse_positive_int_env(
+            PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS_ENV,
+            0) > 0;
+#endif
 
     if (received_out != NULL) {
         *received_out = 0;
     }
+#ifndef PEAK_ENABLE_TEST_HOOKS
+    (void)gather_hard_timeout_ms;
+#endif
     if (listener < 0 || size <= 1 || aggregate == NULL ||
         received_out == NULL) {
         return false;
@@ -2461,6 +2475,11 @@ peak_socket_reduce_root_gather(
     progress_deadline_us =
         peak_socket_reduce_refresh_progress_deadline_us(
             hard_deadline_us, progress_timeout_ms);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (startup_grace_active) {
+        progress_deadline_us = hard_deadline_us;
+    }
+#endif
 
     while (completed < peer_count &&
            peak_socket_reduce_remaining_ms(progress_deadline_us) > 0) {
@@ -2538,6 +2557,18 @@ peak_socket_reduce_root_gather(
                 connections[slot].fd = fd;
                 connections[slot].phase =
                     PEAK_SOCKET_GATHER_READING_HEADER;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+                if (startup_grace_active) {
+                    /* First transport progress restores the normal budget. */
+                    hard_deadline_us = peak_socket_reduce_deadline_us(
+                        gather_hard_timeout_ms);
+                    progress_deadline_us =
+                        peak_socket_reduce_refresh_progress_deadline_us(
+                            hard_deadline_us,
+                            progress_timeout_ms);
+                    startup_grace_active = false;
+                }
+#endif
                 accepted++;
                 active++;
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -2894,6 +2925,9 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     int gather_hard_timeout_ms;
     int release_wait_timeout_ms;
     int64_t deadline_us;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    int startup_grace_ms;
+#endif
     uint64_t session_token;
     PeakSocketReduceRecord* local_records = NULL;
     PeakSocketReduceHeader header;
@@ -2959,6 +2993,13 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
             timeout_budget.socket_gather_hard_timeout_ms);
     deadline_us =
         peak_socket_reduce_deadline_us(gather_hard_timeout_ms);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    startup_grace_ms = peak_socket_reduce_parse_positive_int_env(
+        PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS_ENV, 0);
+    if (startup_grace_ms > 0) {
+        deadline_us = peak_socket_reduce_deadline_us(startup_grace_ms);
+    }
+#endif
     if (rank == 0 && timeout_budget.socket_release_was_raised) {
         peak_log_info("[peak] Raised socket peer release timeout to %u ms to preserve the scaled gather/publication/release budget\n",
                       timeout_budget.socket_release_timeout_ms);
@@ -3107,6 +3148,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     failed = !peak_socket_reduce_root_gather(listener,
                                              size,
                                              timeout_ms,
+                                             gather_hard_timeout_ms,
                                              deadline_us,
                                              &gather_aggregate,
                                              &received);

@@ -181,7 +181,10 @@ if(BUILD_TESTING)
         COMMAND test_socket_report_transport)
     set_tests_properties(test_socket_report_transport
         PROPERTIES
-            TIMEOUT 30
+            # A test-only startup grace isolates peer launch from protocol
+            # timing. This cap includes the deterministic two-second
+            # pre-connect regression delay and failed-child cleanup.
+            TIMEOUT 60
             PASS_REGULAR_EXPRESSION "socket_report_transport_test_ok")
 
     add_executable(test_mpi_report_request_lifetime
@@ -3060,6 +3063,16 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stress allocation realloc)
+        add_test(NAME test_memlog_${memlog_case}
+            COMMAND test_memlog_safety ${memlog_case})
+        set_tests_properties(test_memlog_${memlog_case}
+            PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                TIMEOUT 10)
+    endforeach()
+    set_tests_properties(test_memlog_sizing
+        PROPERTIES PASS_REGULAR_EXPRESSION "memlog: ftruncate init failed")
     add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
     set_tests_properties(test_memory
         PROPERTIES
