@@ -179,6 +179,16 @@ def main():
     require("test_report_snapshot_cxx_link" in cxx_link_test and
             "test_report_snapshot_cxx_link.cpp" in cxx_link_test,
             "C++ report-snapshot linkage must remain a compiled regression test")
+    socket_test = (repo_root / "test" / "report" /
+                   "test_socket_report_transport.c").read_text(encoding="utf-8")
+    require("bool early_drop_may_skip_accept =" in socket_test and
+            "action == TEST_GATHER_DROP_FAILURE ||" in socket_test and
+            "action == TEST_GATHER_PAYLOAD_DROP_FAILURE;" in socket_test and
+            "(!early_drop_may_skip_accept &&" in socket_test and
+            "root_telemetry.root_max_active != 1U" in socket_test and
+            "(early_drop_may_skip_accept &&" in socket_test and
+            "root_telemetry.root_max_active > 1U" in socket_test,
+            "only immediate gather-drop injections may skip root accept telemetry")
     require("PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL = 0" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_MPI = 1" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2" in cuda,

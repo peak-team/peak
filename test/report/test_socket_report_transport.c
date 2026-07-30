@@ -471,6 +471,14 @@ run_two_rank_case(int port,
         action == TEST_GATHER_PAYLOAD_DROP_FAILURE ||
         action == TEST_GATHER_RECEIPT_FAILURE ||
         action == TEST_GATHER_CONFIRM_DROP_FAILURE;
+    /*
+     * These injected peers can connect, send their configured early bytes,
+     * and close from the TCP backlog before a delayed root reaches accept().
+     * That valid failure path has no userland active connection to observe.
+     */
+    bool early_drop_may_skip_accept =
+        action == TEST_GATHER_DROP_FAILURE ||
+        action == TEST_GATHER_PAYLOAD_DROP_FAILURE;
     bool peer_registration_expected =
         !gather_must_fail ||
         action == TEST_GATHER_CONFIRM_DROP_FAILURE;
@@ -747,7 +755,10 @@ run_two_rank_case(int port,
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
     if (root_telemetry.wire_version != 12U ||
-        root_telemetry.root_max_active != 1U ||
+        (!early_drop_may_skip_accept &&
+         root_telemetry.root_max_active != 1U) ||
+        (early_drop_may_skip_accept &&
+         root_telemetry.root_max_active > 1U) ||
         (gather_must_fail &&
          (root_telemetry.root_payload_count !=
               ((action == TEST_GATHER_RECEIPT_FAILURE ||
