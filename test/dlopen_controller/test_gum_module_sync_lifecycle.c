@@ -241,11 +241,16 @@ main(void)
             atomic_store_explicit(&failed, 1, memory_order_release);
         }
         atomic_store_explicit(&quiesce_gate_enabled, 0, memory_order_release);
-        gum_deinit_embedded();
+
+        /*
+         * Process-final Gum teardown may remove the RTLD interceptor.  No
+         * loader may still be executing its trampoline at that point.
+         */
         atomic_store_explicit(&stop, 1, memory_order_release);
         for (int i = 0; i < THREADS; i++) {
             pthread_join(threads[i], NULL);
         }
+        gum_deinit_embedded();
 
         if (atomic_load_explicit(&failed, memory_order_acquire) != 0) {
             fprintf(stderr, "loader failed in lifecycle cycle %d\n", cycle);
