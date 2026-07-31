@@ -484,8 +484,11 @@ run_two_rank_case(int port,
         action == TEST_GATHER_CONFIRM_DROP_FAILURE;
     bool session_allocation_must_fail =
         action == TEST_ROOT_SESSION_ALLOC_FAILURE;
+    bool receipt_failure_barrier =
+        action == TEST_GATHER_RECEIPT_FAILURE;
     char port_text[16];
     char token_text[64];
+    int receipt_barrier_fds[2] = {-1, -1};
     pid_t child;
     int64_t case_started_ms;
     int peer_wait_status = -1;
@@ -689,9 +692,22 @@ run_two_rank_case(int port,
             "PEAK_TEST_OUTPUT_AGGREGATION_CONFIRM_DROP_RANK");
     }
 
+    peak_socket_report_test_receipt_barrier_set(-1, -1);
+    if (receipt_failure_barrier &&
+        socketpair(AF_UNIX, SOCK_STREAM, 0, receipt_barrier_fds) != 0) {
+        peak_report_snapshot_destroy(root);
+        return 1;
+    }
+
     case_started_ms = test_monotonic_ms();
     child = fork();
     if (child < 0) {
+        if (receipt_barrier_fds[0] >= 0) {
+            close(receipt_barrier_fds[0]);
+        }
+        if (receipt_barrier_fds[1] >= 0) {
+            close(receipt_barrier_fds[1]);
+        }
         peak_report_snapshot_destroy(root);
         return 1;
     }
@@ -702,6 +718,13 @@ run_two_rank_case(int port,
         PeakSocketReportStatus peer_status;
         PeakSocketReportTestTelemetry telemetry;
 
+        if (receipt_failure_barrier) {
+            close(receipt_barrier_fds[1]);
+            receipt_barrier_fds[1] = -1;
+            peak_socket_report_test_receipt_barrier_set(
+                receipt_barrier_fds[0], -1);
+            receipt_barrier_fds[0] = -1;
+        }
         set_test_rank(1, 2);
         if (peer == NULL) {
             _exit(99);
@@ -746,6 +769,13 @@ run_two_rank_case(int port,
         _exit((int)peer_status);
     }
 
+    if (receipt_failure_barrier) {
+        close(receipt_barrier_fds[0]);
+        receipt_barrier_fds[0] = -1;
+        peak_socket_report_test_receipt_barrier_set(
+            -1, receipt_barrier_fds[1]);
+        receipt_barrier_fds[1] = -1;
+    }
     set_test_rank(0, 2);
     root_status = peak_socket_report_transport_begin(
         root,
@@ -754,6 +784,10 @@ run_two_rank_case(int port,
         &aggregate);
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
+    if (receipt_failure_barrier) {
+        /* Also releases the peer if root failed before receipt preparation. */
+        peak_socket_report_test_receipt_barrier_set(-1, -1);
+    }
     if (root_telemetry.wire_version != 12U ||
         (!early_drop_may_skip_accept &&
          root_telemetry.root_max_active != 1U) ||
@@ -774,6 +808,16 @@ run_two_rank_case(int port,
           root_telemetry.root_confirmation_count != 1U)) ||
         root_telemetry.root_release_target_count !=
             root_telemetry.root_receipt_count) {
+        result = 1;
+    }
+    if (action == TEST_GATHER_RECEIPT_FAILURE &&
+        (!root_telemetry.root_receipt_failure_injected ||
+         root_telemetry.root_max_active != 1U ||
+         root_telemetry.root_payload_count != 1U ||
+         root_telemetry.root_receipt_count != 0U ||
+         root_telemetry.root_confirmation_count != 0U ||
+         root_status != PEAK_SOCKET_REPORT_FAILED || session != NULL ||
+         aggregate != NULL)) {
         result = 1;
     }
     if (gather_must_fail || session_allocation_must_fail) {

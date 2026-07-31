@@ -189,6 +189,36 @@ def main():
             "(early_drop_may_skip_accept &&" in socket_test and
             "root_telemetry.root_max_active > 1U" in socket_test,
             "only immediate gather-drop injections may skip root accept telemetry")
+    require("socketpair(AF_UNIX, SOCK_STREAM, 0, receipt_barrier_fds)" in
+            socket_test and
+            "peak_socket_report_test_receipt_barrier_set(" in socket_test and
+            "root_telemetry.root_receipt_failure_injected" in socket_test,
+            "receipt-failure test must synchronize the precise injected phase")
+    socket_transport = (
+        repo_root / "src" / "general_listener" /
+        "socket_report_transport.c").read_text(encoding="utf-8")
+    socket_header = (
+        repo_root / "include" / "internal" / "general_listener" /
+        "socket_report_transport.h").read_text(encoding="utf-8")
+    socket_test_hook_section = socket_header.split(
+        "#ifdef PEAK_ENABLE_TEST_HOOKS", 1)[1].split("#endif", 1)[0]
+    require("root_receipt_failure_injected" in socket_test_hook_section and
+            "peak_socket_report_test_receipt_barrier_set" in
+            socket_test_hook_section,
+            "receipt barrier telemetry and API must remain test-hook-only")
+    receipt_prepare = function_body(socket_transport,
+                                    "peak_socket_gather_prepare_receipt")
+    receipt_write = function_body(socket_transport,
+                                  "peak_socket_gather_write_ready")
+    receipt_peer = function_body(socket_transport,
+                                 "peak_socket_report_peer_begin")
+    require_order(receipt_prepare,
+                  "connection->phase = PEAK_SOCKET_GATHER_SENDING_RECEIPT;",
+                  "peak_socket_test_receipt_barrier_signal_root()")
+    require("peak_socket_test_telemetry.root_receipt_failure_injected = true;"
+            in receipt_write and
+            "peak_socket_test_receipt_barrier_wait_for_root()" in receipt_peer,
+            "receipt failure must be injected only after the test barrier")
     require("PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL = 0" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_MPI = 1" in cuda and
             "PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2" in cuda,

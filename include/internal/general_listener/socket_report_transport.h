@@ -134,6 +134,7 @@ typedef struct {
     uint32_t root_release_target_count;
     uint32_t root_release_confirmed_count;
     uint8_t root_release_decision;
+    bool root_receipt_failure_injected;
     bool peer_receipt_received;
     bool peer_confirmation_sent;
     bool peer_release_started;
@@ -148,6 +149,10 @@ void peak_socket_report_test_telemetry_reset(void);
 /** Copies test-only socket gather observations to @p telemetry_out. */
 void peak_socket_report_test_telemetry_get(
     PeakSocketReportTestTelemetry* telemetry_out);
+
+/** Configures a one-shot test-only barrier around root receipt transmission. */
+void peak_socket_report_test_receipt_barrier_set(int peer_wait_fd,
+                                                 int root_signal_fd);
 
 /**
  * Returns the default socket aggregation port for the current shared
