@@ -1119,9 +1119,22 @@ peak_fini_impl(void)
         }
     }
     #ifdef HAVE_CUDA
-        cuda_interceptor_print(use_mpi_collective_output &&
-                               used_mpi_aggregation &&
-                               !mpi_reducer_failed_closed);
+        cuda_interceptor_print_with_mpi_job_policy(
+            (mpi_reducer_failed_closed ||
+             (output_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+              !used_mpi_aggregation)) ?
+                PEAK_OUTPUT_AGGREGATION_LOCAL : output_mode,
+            found_MPI ? TRUE : FALSE);
+        mpi_reducer_failed_closed = found_MPI &&
+            peak_general_listener_mpi_reducer_failed_closed();
+        if (mpi_reducer_failed_closed) {
+            peak_mpi_teardown_collectives_mark_failed_closed();
+            allow_real_mpi_finalize = 0;
+            use_mpi_collective_output = 0;
+            if (mpi_log_rank) {
+                g_printerr("[peak] CUDA MPI reducer failed or timed out; skipping real PMPI_Finalize\n");
+            }
+        }
         errno = 0;
         if (fflush(stderr) != 0 || ferror(stderr)) {
             report_write_succeeded = FALSE;
@@ -1248,7 +1261,8 @@ peak_fini_impl(void)
 #else
     (void)peak_general_listener_print(0, NULL);
     #ifdef HAVE_CUDA
-    cuda_interceptor_print(0);
+    cuda_interceptor_print_with_mpi_job_policy(
+        PEAK_OUTPUT_AGGREGATION_LOCAL, FALSE);
     cuda_interceptor_dettach();
     #endif
 #endif

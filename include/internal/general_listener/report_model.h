@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Final overhead data consumed by local and aggregated report renderers. */
 typedef struct {
     bool valid;
@@ -58,5 +62,9 @@ PeakReportRankTuple peak_report_overhead_rank_tuple(
 
 /** Validates a tuple received from an aggregation transport. */
 bool peak_report_rank_tuple_is_valid(const PeakReportRankTuple* tuple);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PEAK_REPORT_MODEL_H */

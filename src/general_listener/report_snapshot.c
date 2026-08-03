@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+static PeakReportOverhead peak_report_snapshot_transport_overhead;
+
 static char*
 peak_report_snapshot_duplicate_string(const char* source)
 {
@@ -218,6 +220,19 @@ peak_report_snapshot_has_duplicate_names(
         }
     }
     return false;
+}
+
+void
+peak_report_snapshot_set_transport_overhead(const PeakReportOverhead* overhead)
+{
+    peak_report_snapshot_transport_overhead =
+        overhead != NULL ? *overhead : (PeakReportOverhead){0};
+}
+
+PeakReportOverhead
+peak_report_snapshot_get_transport_overhead(void)
+{
+    return peak_report_snapshot_transport_overhead;
 }
 
 void

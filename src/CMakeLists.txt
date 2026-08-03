@@ -39,7 +39,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
 endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
-    add_library(cuda_interceptor_obj OBJECT cuda_interceptor.cpp)
+    add_library(cuda_interceptor_obj OBJECT
+        cuda_interceptor.cpp
+        cuda_profiler_state.cpp)
 endif()
 
 # Preserve the original source order while expressing optional modules once.

@@ -28,24 +28,6 @@
 #include <mutex>
 #endif
 
-#ifdef HAVE_MPI
-#include <mpi.h>
-#endif
-
-#define max(a,b)             \
-({                           \
-    __typeof__ (a) _a = (a); \
-    __typeof__ (b) _b = (b); \
-    _a > _b ? _a : _b;       \
-})
-
-#define min(a,b)             \
-({                           \
-    __typeof__ (a) _a = (a); \
-    __typeof__ (b) _b = (b); \
-    _a < _b ? _a : _b;       \
-})
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -56,8 +38,8 @@ extern "C" {
 /**
  * @brief Installs the available CUDA launch replacements.
  *
- * The implementation initializes the module-owned result maps and per-target
- * CUDA events, then attempts each supported Runtime and Driver replacement in
+ * The implementation initializes the module-owned result maps and bounded
+ * CUDA event pool, then attempts each supported Runtime and Driver replacement in
  * one Gum transaction.  Missing entry points are skipped.  If one replacement
  * fails, already successful replacements remain installed; the function does
  * not roll them back.
@@ -75,10 +57,12 @@ int cuda_interceptor_attach();
  * New event admission is stopped before the Gum replacements are reverted.
  * If Gum cannot flush, the function logs the failure and deliberately retains
  * the interceptor, CUDA events, and result maps so live trampoline users do
- * not observe freed state.  After a successful flush it drains pending CUDA
- * events and releases the module-owned maps and event arrays.  The Gum
- * interceptor reference itself remains pinned to cover wrappers that may
- * already have entered before in-flight accounting began.
+ * not observe freed state.  A successful flush still retains the bounded CUDA
+ * state when an in-flight wrapper is observed; a later detach retry drains
+ * pending events and releases the module-owned maps and event pool only once
+ * no wrappers remain.  The Gum interceptor reference itself remains pinned to
+ * cover wrappers that may already have entered before in-flight accounting
+ * began.
  *
  * The function is a no-op when no interceptor has been obtained.
  */
@@ -90,19 +74,33 @@ void cuda_interceptor_dettach();
  * @{ */
 
 /**
+ * @brief Compatibility CUDA report entry point.
+ *
+ * Retains the historical boolean interface: nonzero selects MPI aggregation;
+ * zero selects rank-local output. It never selects socket aggregation.
+ *
+ * @param[in] is_MPI Nonzero for MPI aggregation, zero for rank-local output.
+ */
+void cuda_interceptor_print(int is_MPI);
+
+/**
  * @brief Synchronizes pending CUDA work and reports collected launch data.
  *
  * Calling this function permanently stops admission of new events for the
  * current attachment, synchronizes the CUDA device, and drains kernel and
- * graph event records.  When PEAK is built with MPI and @p is_MPI is nonzero,
- * results are reduced through the MPI reporting path; otherwise they are
- * printed locally.  The function is a no-op if the result maps were not
+ * graph event records. Kernel rows use a separate, bounded report snapshot
+ * through the established aggregation transport; rank-local graph rows are
+ * printed here. The function is a no-op if the result maps were not
  * initialized.
  *
- * @param[in] is_MPI Nonzero to request MPI reduction in an MPI-enabled build;
- *                   zero to emit the local report.
+ * @param[in] aggregation_mode A `PeakOutputAggregationMode` numeric value.
+ * @param[in] active_mpi_job Nonzero when this process belongs to an active MPI
+ *            job.  CUDA socket aggregation then obtains rank metadata only
+ *            from launcher environment, so it never touches MPI while the
+ *            CPU reducer is failed-closed or MPI teardown is in progress.
  */
-void cuda_interceptor_print(int is_MPI);
+void cuda_interceptor_print_with_mpi_job_policy(int aggregation_mode,
+                                                int active_mpi_job);
 
 /** @} */
 

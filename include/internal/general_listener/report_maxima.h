@@ -9,6 +9,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Metrics for which the final report retains a per-rank maximum. */
 typedef enum {
     PEAK_REPORT_METRIC_COMBINED = 0,
@@ -97,5 +101,9 @@ bool peak_report_maxima_assign(
     const PeakReportMaxima* maxima,
     PeakReportRankTuple tuples[PEAK_REPORT_METRIC_COUNT],
     int owner_ranks[PEAK_REPORT_METRIC_COUNT]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PEAK_REPORT_MAXIMA_H */

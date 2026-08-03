@@ -11,6 +11,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Outcome of one MPI final-report aggregation attempt. */
 typedef enum {
     /** Rank zero owns the aggregate returned through the output parameter. */
@@ -58,6 +62,10 @@ void peak_mpi_report_transport_reset_failed_closed(void);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the number of active requests retained for process lifetime. */
 size_t peak_mpi_report_transport_quarantined_request_count(void);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* PEAK_MPI_REPORT_TRANSPORT_H */

@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** Sources from which socket aggregation may obtain the process rank. */
 typedef enum {
     /** Use active MPI first, then fall back to launcher metadata. */
@@ -21,6 +25,12 @@ typedef enum {
     /** Require launcher metadata and never assume an unlabelled singleton. */
     PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED,
 } PeakSocketReportRankSource;
+
+/** Independent port domains for sequential report transports. */
+typedef enum {
+    PEAK_SOCKET_REPORT_CHANNEL_CPU = 0,
+    PEAK_SOCKET_REPORT_CHANNEL_CUDA = 1,
+} PeakSocketReportChannel;
 
 /** Outcome of the blocking first phase of socket report aggregation. */
 typedef enum {
@@ -81,6 +91,18 @@ PeakSocketReportStatus peak_socket_report_transport_begin(
     PeakReportSnapshot** aggregate_out);
 
 /**
+ * Same protocol as `peak_socket_report_transport_begin`, in an explicit
+ * channel. CPU uses channel zero (base/base+1); CUDA uses channel one
+ * (base+2/base+3), preventing sequential TIME_WAIT and port collisions.
+ */
+PeakSocketReportStatus peak_socket_report_transport_begin_channel(
+    const PeakReportSnapshot* local,
+    PeakSocketReportRankSource rank_source,
+    PeakSocketReportChannel channel,
+    PeakSocketReportSession** session_out,
+    PeakReportSnapshot** aggregate_out);
+
+/**
  * Sends the final ACK decision to every registered peer, waits for each peer's
  * confirmation, and consumes @p session.
  *
@@ -112,6 +134,7 @@ typedef struct {
     uint32_t root_release_target_count;
     uint32_t root_release_confirmed_count;
     uint8_t root_release_decision;
+    bool root_receipt_failure_injected;
     bool peer_receipt_received;
     bool peer_confirmation_sent;
     bool peer_release_started;
@@ -127,11 +150,18 @@ void peak_socket_report_test_telemetry_reset(void);
 void peak_socket_report_test_telemetry_get(
     PeakSocketReportTestTelemetry* telemetry_out);
 
+/** Configures a one-shot test-only barrier around root receipt transmission. */
+void peak_socket_report_test_receipt_barrier_set(int peer_wait_fd,
+                                                 int root_signal_fd);
+
 /**
  * Returns the default socket aggregation port for the current shared
  * launcher identity.
  */
 int peak_socket_report_test_default_port(void);
+
+/** Returns the gather port selected for a test channel, or -1 when invalid. */
+int peak_socket_report_test_channel_port(PeakSocketReportChannel channel);
 
 /** Computes a test-only rolling deadline from an injected clock value. */
 int64_t peak_socket_report_test_progress_deadline_us(
@@ -163,6 +193,10 @@ unsigned int peak_socket_report_test_latest_admission_ms(
 int peak_general_listener_test_first_slurm_host(const char* nodelist,
                                                 char* out,
                                                 size_t out_size);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* PEAK_SOCKET_REPORT_TRANSPORT_H */

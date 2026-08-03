@@ -1016,7 +1016,8 @@ def check_final_report_snapshot_order(repo_root):
         early_report_position + 1,
     )
     report_position = early_report_position
-    cuda_position = fini.find("cuda_interceptor_print(", report_position)
+    cuda_position = fini.find(
+        "cuda_interceptor_print_with_mpi_job_policy(", report_position)
     finalize_permission_position = fini.find(
         "mpi_interceptor_set_real_finalize_allowed(", report_position
     )

@@ -175,10 +175,28 @@ typedef enum {
     PEAK_SOCKET_RELEASE_FALLBACK,
 } PeakSocketReleaseResult;
 
+static bool peak_socket_reduce_channel_ports(PeakSocketReportChannel channel,
+                                             int* gather_port,
+                                             int* release_port);
+static _Thread_local PeakSocketReportChannel peak_socket_report_channel =
+    PEAK_SOCKET_REPORT_CHANNEL_CPU;
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static PeakSocketReportTestTelemetry peak_socket_test_telemetry = {
     .wire_version = PEAK_SOCKET_REDUCE_VERSION,
 };
+static int peak_socket_test_receipt_barrier_peer_wait_fd = -1;
+static int peak_socket_test_receipt_barrier_root_signal_fd = -1;
+static bool peak_socket_test_receipt_failure_injected;
+
+static void
+peak_socket_test_receipt_barrier_close(int* fd)
+{
+    if (fd != NULL && *fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
 
 void
 peak_socket_report_test_telemetry_reset(void)
@@ -197,6 +215,55 @@ peak_socket_report_test_telemetry_get(
     if (telemetry_out != NULL) {
         *telemetry_out = peak_socket_test_telemetry;
     }
+}
+
+void
+peak_socket_report_test_receipt_barrier_set(int peer_wait_fd,
+                                            int root_signal_fd)
+{
+    peak_socket_test_receipt_barrier_close(
+        &peak_socket_test_receipt_barrier_peer_wait_fd);
+    peak_socket_test_receipt_barrier_close(
+        &peak_socket_test_receipt_barrier_root_signal_fd);
+    peak_socket_test_receipt_barrier_peer_wait_fd = peer_wait_fd;
+    peak_socket_test_receipt_barrier_root_signal_fd = root_signal_fd;
+    peak_socket_test_receipt_failure_injected = false;
+}
+
+static bool
+peak_socket_test_receipt_barrier_wait_for_root(void)
+{
+    unsigned char signal = 0;
+    int fd = peak_socket_test_receipt_barrier_peer_wait_fd;
+    ssize_t received;
+
+    if (fd < 0) {
+        return true;
+    }
+    peak_socket_test_receipt_barrier_peer_wait_fd = -1;
+    do {
+        received = recv(fd, &signal, sizeof(signal), 0);
+    } while (received < 0 && errno == EINTR);
+    close(fd);
+    return received == (ssize_t)sizeof(signal) && signal == 0x72U;
+}
+
+static bool
+peak_socket_test_receipt_barrier_signal_root(void)
+{
+    const unsigned char signal = 0x72U;
+    int fd = peak_socket_test_receipt_barrier_root_signal_fd;
+    ssize_t written;
+
+    if (fd < 0) {
+        return true;
+    }
+    peak_socket_test_receipt_barrier_root_signal_fd = -1;
+    do {
+        written = send(fd, &signal, sizeof(signal), MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    close(fd);
+    return written == (ssize_t)sizeof(signal);
 }
 #endif
 
@@ -450,6 +517,16 @@ int
 peak_socket_report_test_default_port(void)
 {
     return peak_socket_reduce_default_port();
+}
+
+int
+peak_socket_report_test_channel_port(PeakSocketReportChannel channel)
+{
+    int gather_port = -1;
+    int release_port = -1;
+
+    return peak_socket_reduce_channel_ports(channel, &gather_port,
+                                            &release_port) ? gather_port : -1;
 }
 #endif
 
@@ -1483,6 +1560,33 @@ peak_socket_reduce_release_port(int port)
     return port < 65535 ? port + 1 : port - 1;
 }
 
+static bool
+peak_socket_reduce_channel_ports(PeakSocketReportChannel channel,
+                                 int* gather_port,
+                                 int* release_port)
+{
+    int base = peak_socket_reduce_port();
+
+    if (gather_port == NULL || release_port == NULL ||
+        (channel != PEAK_SOCKET_REPORT_CHANNEL_CPU &&
+         channel != PEAK_SOCKET_REPORT_CHANNEL_CUDA)) {
+        return false;
+    }
+    if (channel == PEAK_SOCKET_REPORT_CHANNEL_CPU) {
+        *gather_port = base;
+        *release_port = peak_socket_reduce_release_port(base);
+        return true;
+    }
+    if (base > 65532) {
+        peak_log_warn("[peak] socket CUDA channel requires base port <= 65532; refusing %d\n",
+                      base);
+        return false;
+    }
+    *gather_port = base + 2;
+    *release_port = base + 3;
+    return true;
+}
+
 static PeakSocketReleaseResult
 peak_socket_reduce_wait_for_release(const struct addrinfo* addresses,
                                     int port,
@@ -2123,6 +2227,11 @@ peak_socket_gather_prepare_receipt(
         PEAK_SOCKET_REDUCE_GATHER_REGISTERED;
     connection->receipt_bytes = 0;
     connection->phase = PEAK_SOCKET_GATHER_SENDING_RECEIPT;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (!peak_socket_test_receipt_barrier_signal_root()) {
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -2342,16 +2451,12 @@ peak_socket_gather_write_ready(PeakSocketGatherConnection* connection,
     }
     *complete_out = false;
 #ifdef PEAK_ENABLE_TEST_HOOKS
-    {
-        static bool injected_receipt_failure = false;
-
-        if (!injected_receipt_failure &&
-            peak_general_listener_env_value_truthy(
-                getenv(
-                    PEAK_TEST_OUTPUT_AGGREGATION_RECEIPT_FAIL_ONCE_ENV))) {
-            injected_receipt_failure = true;
-            return false;
-        }
+    if (!peak_socket_test_receipt_failure_injected &&
+        peak_general_listener_env_value_truthy(
+            getenv(PEAK_TEST_OUTPUT_AGGREGATION_RECEIPT_FAIL_ONCE_ENV))) {
+        peak_socket_test_receipt_failure_injected = true;
+        peak_socket_test_telemetry.root_receipt_failure_injected = true;
+        return false;
     }
 #endif
 
@@ -2849,6 +2954,9 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
                                               &gather_written,
                                               header->rank,
                                               deadline_us);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    sent = sent && peak_socket_test_receipt_barrier_wait_for_root();
+#endif
     memset(&receipt, 0, sizeof(receipt));
     receipt_received =
         sent &&
@@ -2956,8 +3064,10 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         return PEAK_SOCKET_REPORT_FAILED;
     }
 
-    port = peak_socket_reduce_port();
-    release_port = peak_socket_reduce_release_port(port);
+    if (!peak_socket_reduce_channel_ports(peak_socket_report_channel,
+                                          &port, &release_port)) {
+        return PEAK_SOCKET_REPORT_FAILED;
+    }
     session_token = peak_socket_reduce_session_token();
 
     if (!peak_socket_reduce_rank_size(&rank, &size, rank_source)) {
@@ -3228,6 +3338,24 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     *session_out = session;
     *aggregate_out = aggregate;
     return PEAK_SOCKET_REPORT_ROOT_PREPARED;
+}
+
+PeakSocketReportStatus
+peak_socket_report_transport_begin_channel(
+    const PeakReportSnapshot* local,
+    PeakSocketReportRankSource rank_source,
+    PeakSocketReportChannel channel,
+    PeakSocketReportSession** session_out,
+    PeakReportSnapshot** aggregate_out)
+{
+    PeakSocketReportChannel previous = peak_socket_report_channel;
+    PeakSocketReportStatus result;
+
+    peak_socket_report_channel = channel;
+    result = peak_socket_report_transport_begin(local, rank_source,
+                                                session_out, aggregate_out);
+    peak_socket_report_channel = previous;
+    return result;
 }
 
 bool
