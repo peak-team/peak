@@ -45,8 +45,11 @@ typedef enum {
  * Peer-only instrumented slots with zero calls are not represented.
  */
 PeakMpiReportTransportResult peak_mpi_report_transport_reduce(
-    const PeakReportSnapshot* local,
+    PeakReportSnapshot* local,
     PeakReportSnapshot** root_aggregate);
+
+/** Coordinates report-capture readiness before entering reducer payloads. */
+bool peak_mpi_report_transport_preflight_report_ready(bool local_ready);
 
 /** Returns whether an MPI transport failure has poisoned this process. */
 bool peak_mpi_report_transport_failed_closed(void);

@@ -67,6 +67,14 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "gum_mutation_allowlist_ok")
 
+    add_test(NAME test_mpi_report_transport_nonblocking
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_mpi_report_transport_nonblocking.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_mpi_report_transport_nonblocking
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "mpi_report_transport_nonblocking_ok")
+
     add_test(NAME test_header_guard_style
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_header_guard_style.py
@@ -238,7 +246,7 @@ if(BUILD_TESTING)
         PROPERTIES
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION
-                "mpi_report_request_lifetime_ok operations=58 labels=33 failures=116")
+                "mpi_report_request_lifetime_ok operations=59 labels=34 failures=118")
 
     add_executable(test_mpi_teardown_guard
         report/test_mpi_teardown_guard.c
@@ -3098,11 +3106,14 @@ if(BUILD_TESTING)
             ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_TEST_FAIL_REPORT_ALLOCATION=1;${PRELOAD_VAR}"
             PASS_REGULAR_EXPRESSION "disabling non-critical profiler subsystem \\(final report snapshot allocation failed\\)")
     add_test(NAME test_memory_interceptor_unrecoverable_rollback_is_strict
-        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 128
+                --stderr-regex "fatal memory interceptor rollback was not proven safe"
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
     set_tests_properties(test_memory_interceptor_unrecoverable_rollback_is_strict
         PROPERTIES
-            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH=1;${PRELOAD_VAR}"
-            WILL_FAIL TRUE)
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH=1;${PRELOAD_VAR}")
     add_test(NAME test_memory_interceptor_recoverable_rollback_fail_open
         COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
     set_tests_properties(test_memory_interceptor_recoverable_rollback_fail_open

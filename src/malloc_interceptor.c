@@ -1101,10 +1101,17 @@ malloc_interceptor_detach(void)
     }
 
     pthread_mutex_lock(&track_mutex);
-    pthread_mutex_lock(&caller_mutex);
-    malloc_interceptor_release_tracking_tables();
-    pthread_mutex_unlock(&caller_mutex);
+    if (track_table != NULL) {
+        gum_metal_hash_table_unref(track_table);
+        track_table = NULL;
+    }
     pthread_mutex_unlock(&track_mutex);
+    pthread_mutex_lock(&caller_mutex);
+    if (memory_caller_target_table != NULL) {
+        gum_metal_hash_table_unref(memory_caller_target_table);
+        memory_caller_target_table = NULL;
+    }
+    pthread_mutex_unlock(&caller_mutex);
 
     g_object_unref(malloc_interceptor);
     malloc_interceptor = NULL;

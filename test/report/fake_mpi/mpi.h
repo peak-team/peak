@@ -63,12 +63,6 @@ int MPI_Iallreduce(const void* send_buffer,
                    MPI_Op operation,
                    MPI_Comm communicator,
                    MPI_Request* request);
-int MPI_Allreduce(const void* send_buffer,
-                  void* receive_buffer,
-                  int count,
-                  MPI_Datatype datatype,
-                  MPI_Op operation,
-                  MPI_Comm communicator);
 int MPI_Ireduce(const void* send_buffer,
                 void* receive_buffer,
                 int count,

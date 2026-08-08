@@ -8333,6 +8333,8 @@ peak_general_listener_print_with_mpi_job_policy(
 {
     gboolean used_mpi_aggregation = FALSE;
     gboolean write_succeeded = FALSE;
+    gboolean report_capture_ready;
+    gboolean skip_report_output = FALSE;
     PeakReportSnapshot* local_snapshot = NULL;
 
     if (report_write_succeeded != NULL) {
@@ -8356,17 +8358,17 @@ peak_general_listener_print_with_mpi_job_policy(
     gfloat* sum_min_time = g_try_new0(gfloat, peak_hook_address_count);
     gulong* thread_count = g_try_new0(gulong, peak_hook_address_count);
 
-    if (peak_hook_address_count != 0 &&
+    report_capture_ready = !(peak_hook_address_count != 0 &&
         (sum_num_calls == NULL || sum_total_time == NULL ||
          max_total_time == NULL || min_total_time == NULL ||
          sum_exclusive_time == NULL || sum_max_time == NULL ||
-         sum_min_time == NULL || thread_count == NULL)) {
+         sum_min_time == NULL || thread_count == NULL));
+    if (!report_capture_ready) {
         /* Nothing has been detached or otherwise mutated for report capture. */
         peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
                                            "final report allocation failed");
-        goto report_cleanup;
     }
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
+    for (size_t i = 0; report_capture_ready && i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
             PeakGeneralListener* pg_listener =
                 PEAKGENERAL_LISTENER(array_listener[i]);
@@ -8422,29 +8424,56 @@ peak_general_listener_print_with_mpi_job_policy(
             }
         }
     }
-    peak_general_listener_refresh_revisited_markers(sum_num_calls);
+    if (report_capture_ready) {
+        peak_general_listener_refresh_revisited_markers(sum_num_calls);
+    }
 
-    PeakReportOverhead local_report =
-        peak_general_listener_local_report_overhead(sum_num_calls);
-    peak_report_snapshot_set_transport_overhead(&local_report);
-    local_snapshot = peak_general_listener_build_report_snapshot(
-        sum_num_calls,
-        sum_total_time,
-        max_total_time,
-        min_total_time,
-        sum_exclusive_time,
-        sum_max_time,
-        sum_min_time,
-        thread_count,
-        1,
-        &local_report);
+    if (report_capture_ready) {
+        PeakReportOverhead local_report =
+            peak_general_listener_local_report_overhead(sum_num_calls);
+        peak_report_snapshot_set_transport_overhead(&local_report);
+        local_snapshot = peak_general_listener_build_report_snapshot(
+            sum_num_calls,
+            sum_total_time,
+            max_total_time,
+            min_total_time,
+            sum_exclusive_time,
+            sum_max_time,
+            sum_min_time,
+            thread_count,
+            1,
+            &local_report);
+        report_capture_ready = local_snapshot != NULL;
+    }
 
-    if (local_snapshot != NULL) {
+#ifdef HAVE_MPI
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+        !peak_mpi_report_transport_preflight_report_ready(
+            report_capture_ready)) {
+        if (local_snapshot != NULL) {
+            local_snapshot->degraded_mask |=
+                peak_report_snapshot_degraded_mask();
+            write_succeeded = peak_general_listener_write_report(
+                local_snapshot, TRUE, TRUE, active_mpi_job);
+        }
+        /* All ranks have completed the preflight agreement.  Do not enter a
+         * payload collective after an allocation failure or a poisoned MPI
+         * request, but retain any local report that was safely captured. */
+        skip_report_output = TRUE;
+    }
+#endif
+    if (local_snapshot != NULL && !skip_report_output) {
 #ifdef HAVE_MPI
         if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local_snapshot, &aggregate);
+
+            /* The reducer can discover an allocation/transport failure after
+             * this rank captured its snapshot.  Local fallback must carry the
+             * latest process-wide degradation metadata, not a stale copy. */
+            local_snapshot->degraded_mask |=
+                peak_report_snapshot_degraded_mask();
 
             if (result == PEAK_MPI_REPORT_TRANSPORT_ROOT_READY) {
                 PeakReportMarkerSwap marker_swap =
@@ -8501,13 +8530,12 @@ peak_general_listener_print_with_mpi_job_policy(
         write_succeeded = peak_general_listener_write_report(
             local_snapshot, TRUE, TRUE, active_mpi_job);
 #endif
-    } else {
+    } else if (local_snapshot == NULL) {
         /* Report capture owns no listener mutation and may be abandoned. */
         peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
                                            "final report snapshot allocation failed");
     }
 
-report_cleanup:
     peak_report_snapshot_destroy(local_snapshot);
     g_free(sum_num_calls);
     g_free(sum_total_time);
