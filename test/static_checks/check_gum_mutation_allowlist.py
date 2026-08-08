@@ -22,7 +22,7 @@ EXPECTED = {
         "revert": 1,
     },
     ("support-init", "src/malloc_interceptor.c"): {
-        "begin_transaction": 2,
+        "begin_transaction": 1,
         "end_transaction": 2,
         "flush": 1,
         "replace_fast": 2,
@@ -106,9 +106,11 @@ FUNCTION_ANCHORS = {
         "peak_general_listener_attach": "strict-controller",
     },
     "src/malloc_interceptor.c": {
+        "PEAK_MALLOC_REPLACE_FAST": "support-init",
         "DO_REPLACE_FAST": "support-init",
         "malloc_interceptor_attach": "support-init",
-        "malloc_interceptor_revert_all_and_flush": "support-shutdown-debt",
+        "malloc_interceptor_revert_all_in_transaction": "support-init",
+        "malloc_interceptor_flush_rollback": "support-init",
         "malloc_interceptor_detach": "support-shutdown-debt",
     },
     "src/pthread_listener.c": {
@@ -175,7 +177,9 @@ def count_mutations(repo_root):
         if anchors:
             for line_number, line in enumerate(source.splitlines(), 1):
                 for function_name in anchors:
-                    if function_name in line:
+                    if re.search(
+                            rf"\b{re.escape(function_name)}\s*\(",
+                            line):
                         function_starts[rel].append(
                             (line_number, function_name)
                         )
@@ -187,7 +191,9 @@ def count_mutations(repo_root):
         anchors = FUNCTION_ANCHORS[rel]
         for line_number, line in enumerate(source.splitlines(), 1):
             for function_name in anchors:
-                if function_name in line:
+                if re.search(
+                        rf"\b{re.escape(function_name)}\s*\(",
+                        line):
                     function_starts[rel].append(
                         (line_number, function_name)
                     )

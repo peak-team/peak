@@ -791,19 +791,24 @@ init_table(void)
   Custom alloc family (no logic changes)
 =========================*/
 
-static int malloc_hook_enter(void)
+typedef enum {
+    PEAK_MALLOC_HOOK_RECURSIVE = 0,
+    PEAK_MALLOC_HOOK_TRACKING,
+    PEAK_MALLOC_HOOK_FORWARDING,
+} PeakMallocHookEntry;
+
+static PeakMallocHookEntry
+malloc_hook_enter(void)
 {
-    if (in_peak_alloc_hook ||
-        atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
-        return 0;
+    if (in_peak_alloc_hook) {
+        return PEAK_MALLOC_HOOK_RECURSIVE;
     }
 
     atomic_fetch_add_explicit(&active_alloc_hooks, 1, memory_order_acquire);
     if (atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
-        atomic_fetch_sub_explicit(&active_alloc_hooks, 1, memory_order_release);
-        return 0;
+        return PEAK_MALLOC_HOOK_FORWARDING;
     }
-    return 1;
+    return PEAK_MALLOC_HOOK_TRACKING;
 }
 
 static void malloc_hook_leave(void)
@@ -823,8 +828,13 @@ static int malloc_interceptor_wait_for_quiescence(void)
 }
 
 static void* custom_malloc(size_t size) {
-    if (!malloc_hook_enter()) {
-        return original_malloc(size);
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
+        void* result = original_malloc(size);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
+        return result;
     }
 
     int hook_val = in_peak_alloc_hook;
@@ -843,8 +853,12 @@ static void* custom_malloc(size_t size) {
 static void custom_free(void* ptr) {
     if (!ptr) return;
 
-    if (!malloc_hook_enter()) {
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
         original_free(ptr);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
         return;
     }
 
@@ -858,8 +872,13 @@ static void custom_free(void* ptr) {
 }
 
 static void* custom_calloc(size_t nmemb, size_t size) {
-    if (!malloc_hook_enter()) {
-        return original_calloc(nmemb, size);
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
+        void* result = original_calloc(nmemb, size);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
+        return result;
     }
 
     if (size && nmemb > SIZE_MAX / size) {
@@ -883,8 +902,13 @@ static void* custom_calloc(size_t nmemb, size_t size) {
 }
 
 static void* custom_realloc(void* ptr, size_t size) {
-    if (!malloc_hook_enter()) {
-        return original_realloc(ptr, size);
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
+        void* result = original_realloc(ptr, size);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
+        return result;
     }
 
     if (!ptr) {
@@ -950,8 +974,13 @@ static void* custom_realloc(void* ptr, size_t size) {
 }
 
 static void* custom_aligned_alloc(size_t alignment, size_t size) {
-    if (!malloc_hook_enter()) {
-        return original_aligned_alloc(alignment, size);
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
+        void* result = original_aligned_alloc(alignment, size);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
+        return result;
     }
 
     int hook_val = in_peak_alloc_hook;
@@ -968,8 +997,13 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
 }
 
 static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
-    if (!malloc_hook_enter()) {
-        return original_posix_memalign(memptr, alignment, size);
+    PeakMallocHookEntry hook_entry = malloc_hook_enter();
+    if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
+        int result = original_posix_memalign(memptr, alignment, size);
+        if (hook_entry == PEAK_MALLOC_HOOK_FORWARDING) {
+            malloc_hook_leave();
+        }
+        return result;
     }
 
     int hook_val = in_peak_alloc_hook;
@@ -1006,17 +1040,23 @@ static void memory_usage_log_print(void) {
         }                                                                                 \
     } while (0)
 
-static gboolean
-malloc_interceptor_revert_all_and_flush(void)
+/* The caller owns an open Gum transaction.  Reverting a partially prepared
+ * replacement set before committing that transaction means no wrapper or
+ * trampoline can become visible to another thread. */
+static void
+malloc_interceptor_revert_all_in_transaction(void)
 {
-    gum_interceptor_begin_transaction(malloc_interceptor);
     if (malloc_replaced) gum_interceptor_revert(malloc_interceptor, malloc_addr);
     if (free_replaced) gum_interceptor_revert(malloc_interceptor, free_addr);
     if (calloc_replaced) gum_interceptor_revert(malloc_interceptor, calloc_addr);
     if (realloc_replaced) gum_interceptor_revert(malloc_interceptor, realloc_addr);
     if (aligned_alloc_replaced) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
     if (posix_memalign_replaced) gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
-    gum_interceptor_end_transaction(malloc_interceptor);
+}
+
+static gboolean
+malloc_interceptor_flush_rollback(void)
+{
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (getenv("PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH") != NULL) {
         return FALSE;
@@ -1058,15 +1098,10 @@ malloc_interceptor_attach(void)
     if (!malloc_replaced || !free_replaced || !calloc_replaced ||
         !realloc_replaced || !aligned_alloc_replaced ||
         !posix_memalign_replaced) {
-        /* Once this transaction becomes visible, wrappers must only forward
-         * through their recorded originals while rollback drains in-flight
-         * hooks. */
+        /* Do not make a partial replacement visible.  In particular, if the
+         * failed entry is free(), a visible malloc wrapper would otherwise
+         * have no recorded original_free to use on recursive paths. */
         atomic_store_explicit(&cleanup_in_progress, 1, memory_order_release);
-    }
-    gum_interceptor_end_transaction(malloc_interceptor);
-    if (!malloc_replaced || !free_replaced || !calloc_replaced ||
-        !realloc_replaced || !aligned_alloc_replaced ||
-        !posix_memalign_replaced) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         const char* rollback_delay = getenv("PEAK_TEST_MALLOC_ROLLBACK_DELAY_US");
         if (rollback_delay != NULL && rollback_delay[0] != '\0') {
@@ -1077,7 +1112,9 @@ malloc_interceptor_attach(void)
             }
         }
 #endif
-        if (!malloc_interceptor_revert_all_and_flush() ||
+        malloc_interceptor_revert_all_in_transaction();
+        gum_interceptor_end_transaction(malloc_interceptor);
+        if (!malloc_interceptor_flush_rollback() ||
             !malloc_interceptor_wait_for_quiescence()) {
             peak_log_warn("[peak] fatal memory interceptor rollback was not proven safe after mutation\n");
             _exit(128);
@@ -1088,6 +1125,8 @@ malloc_interceptor_attach(void)
         peak_memlog_finalize();
         return PEAK_MALLOC_ATTACH_ROLLED_BACK;
     }
+
+    gum_interceptor_end_transaction(malloc_interceptor);
 
     malloc_interceptor_attached = TRUE;
     peak_log_info("[peak] Memory allocation functions intercepted successfully\n");
