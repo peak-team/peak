@@ -628,8 +628,16 @@ peak_activate_runtime(void)
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL) {
+            heartbeat_overhead = NULL;
+            args = NULL;
+        } else
+#endif
+        {
         heartbeat_overhead = g_try_new0(gdouble, peak_hook_address_count);
         args = g_try_new0(PeakHeartbeatArgs, 1);
+        }
         if ((peak_hook_address_count != 0 && heartbeat_overhead == NULL) ||
             args == NULL) {
             peak_report_snapshot_note_degraded(

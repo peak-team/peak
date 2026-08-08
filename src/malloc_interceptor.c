@@ -1028,6 +1028,7 @@ malloc_interceptor_revert_all_and_flush(void)
 PeakMallocInterceptorAttachResult
 malloc_interceptor_attach(void)
 {
+    atomic_store_explicit(&cleanup_in_progress, 0, memory_order_release);
     if (!init_table()) {
         return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
     }
@@ -1054,11 +1055,30 @@ malloc_interceptor_attach(void)
     DO_REPLACE_FAST(aligned_alloc_addr, custom_aligned_alloc, original_aligned_alloc, "aligned_alloc", aligned_alloc_replaced);
     DO_REPLACE_FAST(posix_memalign_addr, custom_posix_memalign, original_posix_memalign, "posix_memalign", posix_memalign_replaced);
 
+    if (!malloc_replaced || !free_replaced || !calloc_replaced ||
+        !realloc_replaced || !aligned_alloc_replaced ||
+        !posix_memalign_replaced) {
+        /* Once this transaction becomes visible, wrappers must only forward
+         * through their recorded originals while rollback drains in-flight
+         * hooks. */
+        atomic_store_explicit(&cleanup_in_progress, 1, memory_order_release);
+    }
     gum_interceptor_end_transaction(malloc_interceptor);
     if (!malloc_replaced || !free_replaced || !calloc_replaced ||
         !realloc_replaced || !aligned_alloc_replaced ||
         !posix_memalign_replaced) {
-        if (!malloc_interceptor_revert_all_and_flush()) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        const char* rollback_delay = getenv("PEAK_TEST_MALLOC_ROLLBACK_DELAY_US");
+        if (rollback_delay != NULL && rollback_delay[0] != '\0') {
+            char* end = NULL;
+            unsigned long delay_us = strtoul(rollback_delay, &end, 10);
+            if (end != rollback_delay && *end == '\0' && delay_us <= UINT_MAX) {
+                usleep((useconds_t)delay_us);
+            }
+        }
+#endif
+        if (!malloc_interceptor_revert_all_and_flush() ||
+            !malloc_interceptor_wait_for_quiescence()) {
             peak_log_warn("[peak] fatal memory interceptor rollback was not proven safe after mutation\n");
             _exit(128);
         }

@@ -894,7 +894,7 @@ peak_mpi_report_transport_all_ranks_ready(int local_ready,
     if (mpi_result != MPI_SUCCESS) {
         peak_log_warn("[peak] MPI allocation agreement start failed for %s; abandoning MPI reducer without touching MPI again\n",
                       label);
-        peak_mpi_report_transport_mark_failed_closed();
+        peak_mpi_report_transport_mark_hard_failed_closed();
         atomic_store_explicit(&agreement->state,
                               PEAK_MPI_READINESS_ABANDONED,
                               memory_order_release);
@@ -1429,6 +1429,9 @@ peak_mpi_report_transport_preflight_report_ready(bool local_ready)
     PeakMpiReadinessResult result =
         PEAK_MPI_READINESS_FAILED_CLOSED;
 
+    if (peak_mpi_report_transport_failed_closed()) {
+        return false;
+    }
     if (peak_mpi_report_transport_initialize(&rank, &size)) {
         result = peak_mpi_report_transport_all_ranks_ready(
             local_ready ? 1 : 0, "local-report-snapshot-allocation");

@@ -23,6 +23,7 @@ typedef enum {
     TEST_REQUEST_COMPLETE = 0,
     TEST_REQUEST_ERROR,
     TEST_REQUEST_TIMEOUT,
+    TEST_REQUEST_START_ERROR,
 } TestRequestMode;
 
 typedef struct {
@@ -50,6 +51,9 @@ static TestRequestMode fake_request_mode;
 static TestRequestMode fake_readiness_mode;
 static int fake_readiness_observed;
 static MPI_Request* fake_readiness_request;
+static int fake_readiness_start_calls;
+static int fake_mpi_setup_calls;
+static int fake_readiness_force_unready;
 static void* fake_target_send;
 static void* fake_target_receive;
 static MPI_Request* fake_target_request;
@@ -94,6 +98,9 @@ fake_reset(int target_ordinal, TestRequestMode mode, int rank, int size)
     fake_readiness_mode = TEST_REQUEST_COMPLETE;
     fake_readiness_observed = 0;
     fake_readiness_request = NULL;
+    fake_readiness_start_calls = 0;
+    fake_mpi_setup_calls = 0;
+    fake_readiness_force_unready = 0;
     fake_target_send = NULL;
     fake_target_receive = NULL;
     fake_target_request = NULL;
@@ -155,6 +162,7 @@ MPI_Init(int* argc, char*** argv)
 int
 MPI_Initialized(int* initialized)
 {
+    fake_mpi_setup_calls++;
     *initialized = 1;
     return MPI_SUCCESS;
 }
@@ -162,6 +170,7 @@ MPI_Initialized(int* initialized)
 int
 MPI_Comm_rank(MPI_Comm communicator, int* rank)
 {
+    fake_mpi_setup_calls++;
     (void)communicator;
     *rank = fake_rank;
     return MPI_SUCCESS;
@@ -170,6 +179,7 @@ MPI_Comm_rank(MPI_Comm communicator, int* rank)
 int
 MPI_Comm_size(MPI_Comm communicator, int* size)
 {
+    fake_mpi_setup_calls++;
     (void)communicator;
     *size = fake_size;
     return MPI_SUCCESS;
@@ -240,8 +250,15 @@ MPI_Iallreduce(const void* send_buffer,
         size_t bytes = fake_datatype_extent(datatype) * (size_t)count;
 
         fake_readiness_observed = 0;
+        fake_readiness_start_calls++;
+        if (fake_readiness_mode == TEST_REQUEST_START_ERROR) {
+            return MPI_ERR_OTHER;
+        }
         if (bytes != 0) {
             memcpy(receive_buffer, send_buffer, bytes);
+        }
+        if (fake_readiness_force_unready) {
+            *(int*)receive_buffer = 0;
         }
         request->ordinal = 0;
         request->active = 1;
@@ -682,6 +699,8 @@ run_readiness_failure_case(TestRequestMode mode)
     PeakReportSnapshot* aggregate = NULL;
     PeakMpiReportTransportResult result;
     int failed;
+    int setup_calls_before_retry;
+    int readiness_starts_before_retry;
 
     fake_reset(0, TEST_REQUEST_COMPLETE, 0, 1);
     fake_readiness_mode = mode;
@@ -695,9 +714,32 @@ run_readiness_failure_case(TestRequestMode mode)
              aggregate != NULL || !peak_mpi_report_transport_failed_closed() ||
              peak_mpi_report_transport_quarantined_request_count() != 1 ||
              fake_operation_count != 0 || trace_count != 0 ||
-             fake_readiness_request == NULL ||
-             !fake_readiness_request->active;
+             fake_readiness_start_calls != 1 ||
+             (mode != TEST_REQUEST_START_ERROR &&
+              (fake_readiness_request == NULL ||
+               !fake_readiness_request->active));
+    setup_calls_before_retry = fake_mpi_setup_calls;
+    readiness_starts_before_retry = fake_readiness_start_calls;
+    if (peak_mpi_report_transport_preflight_report_ready(true) ||
+        fake_mpi_setup_calls != setup_calls_before_retry ||
+        fake_readiness_start_calls != readiness_starts_before_retry) {
+        failed = 1;
+    }
     peak_report_snapshot_destroy(local);
+    return failed;
+}
+
+static int
+run_peer_not_ready_case(void)
+{
+    int failed;
+
+    fake_reset(0, TEST_REQUEST_COMPLETE, 0, 2);
+    fake_readiness_force_unready = 1;
+    failed = peak_mpi_report_transport_preflight_report_ready(true) ||
+             peak_mpi_report_transport_failed_closed() ||
+             fake_operation_count != 0 || trace_count != 0 ||
+             fake_readiness_start_calls != 1;
     return failed;
 }
 
@@ -733,6 +775,8 @@ main(void)
      * payload collective and return the same local-fallback outcome. */
     failures += run_late_allocation_failure_case(15, 0);
     failures += run_late_allocation_failure_case(-1, 1);
+    failures += run_peer_not_ready_case();
+    failures += run_readiness_failure_child(TEST_REQUEST_START_ERROR);
     failures += run_readiness_failure_child(TEST_REQUEST_ERROR);
     failures += run_readiness_failure_child(TEST_REQUEST_TIMEOUT);
     for (int ordinal = 1; ordinal <= TEST_COLLECTIVE_COUNT; ordinal++) {
