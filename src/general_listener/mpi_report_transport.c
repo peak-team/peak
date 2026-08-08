@@ -844,10 +844,6 @@ peak_mpi_report_transport_allocate(size_t count, size_t element_size)
     }
 #endif
     void* allocation = calloc(count == 0 ? 1 : count, element_size);
-
-    if (allocation == NULL) {
-        peak_log_warn("[peak] MPI report aggregation allocation failed; preserving collective order and writing rank-local output\n");
-    }
     return allocation;
 }
 
@@ -937,8 +933,9 @@ peak_mpi_report_transport_all_ranks_ready(int local_ready,
     if (!agreement->receive_ready) {
         peak_report_snapshot_note_degraded(
             PEAK_PROFILER_DEGRADED_REPORT,
-            "MPI report staging allocation failed");
-        peak_log_warn("[peak] MPI report aggregation allocation failed on at least one rank; writing rank-local output\n");
+            strcmp(label, "local-report-snapshot-allocation") == 0
+                ? "final report snapshot allocation failed on at least one MPI rank"
+                : "MPI report staging allocation failed");
         return PEAK_MPI_READINESS_LOCAL_FALLBACK;
     }
     return PEAK_MPI_READINESS_ALL_READY;

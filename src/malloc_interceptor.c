@@ -770,7 +770,6 @@ init_table(void)
     new_track_table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
     new_caller_table = gum_metal_hash_table_new(g_str_hash, str_equal_function);
     if (!new_track_table || !new_caller_table) {
-        peak_log_warn("[peak] Failed to initialize tracking table\n");
         if (new_track_table) gum_metal_hash_table_unref(new_track_table);
         if (new_caller_table) gum_metal_hash_table_unref(new_caller_table);
         return 0;
@@ -1003,8 +1002,7 @@ static void memory_usage_log_print(void) {
         if (_addr) {                                                                      \
             GumReplaceReturn r = PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name);  \
             _replaced = r == GUM_REPLACE_OK;                                              \
-            if (!_replaced)                                                               \
-                peak_log_warn("[peak] Failed to replace " _name ": %d\n", r);             \
+            (void)r;                                                                      \
         }                                                                                 \
     } while (0)
 
@@ -1027,18 +1025,18 @@ malloc_interceptor_revert_all_and_flush(void)
     return gum_interceptor_flush(malloc_interceptor);
 }
 
-int
+PeakMallocInterceptorAttachResult
 malloc_interceptor_attach(void)
 {
     if (!init_table()) {
-        return -1;
+        return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
     }
     peak_memlog_open();
     malloc_interceptor = gum_interceptor_obtain();
     if (malloc_interceptor == NULL) {
         malloc_interceptor_release_tracking_tables();
         peak_memlog_finalize();
-        return -1;
+        return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
     }
     gum_interceptor_begin_transaction(malloc_interceptor);
 
@@ -1068,7 +1066,7 @@ malloc_interceptor_attach(void)
         malloc_interceptor = NULL;
         malloc_interceptor_release_tracking_tables();
         peak_memlog_finalize();
-        return -1;
+        return PEAK_MALLOC_ATTACH_ROLLED_BACK;
     }
 
     malloc_interceptor_attached = TRUE;

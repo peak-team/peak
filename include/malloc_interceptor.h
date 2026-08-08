@@ -103,16 +103,21 @@ extern "C" {
 /**
  * @brief Installs allocation replacements and opens the memory log.
  *
- * The implementation attempts `malloc`, `free`, `calloc`, `realloc`,
- * `aligned_alloc`, and `posix_memalign` independently in one Gum transaction,
- * then initializes the tracking tables and binary log.  Individual Gum
- * replacement failures are logged; successful replacements are not rolled
- * back and do not change this function's current return value.
+ * The implementation prepares tracking tables and the binary log before any
+ * replacement.  If replacement is only partially successful it reverts every
+ * changed entry and flushes before returning a recoverable degraded outcome.
  *
- * @return Always 0 after initialization completes.  This return value does
- *         not report individual `gum_interceptor_replace_fast()` failures.
+ * @return PEAK_MALLOC_ATTACH_OK, PEAK_MALLOC_ATTACH_PREPARE_FAILED, or
+ *         PEAK_MALLOC_ATTACH_ROLLED_BACK.  An unprovable post-mutation
+ *         rollback terminates instead of returning.
  */
-int malloc_interceptor_attach();
+typedef enum {
+    PEAK_MALLOC_ATTACH_OK = 0,
+    PEAK_MALLOC_ATTACH_PREPARE_FAILED = -1,
+    PEAK_MALLOC_ATTACH_ROLLED_BACK = -2,
+} PeakMallocInterceptorAttachResult;
+
+PeakMallocInterceptorAttachResult malloc_interceptor_attach(void);
 
 /**
  * @brief Reverts allocation replacements and finalizes collected output.

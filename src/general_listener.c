@@ -8365,6 +8365,9 @@ peak_general_listener_print_with_mpi_job_policy(
          sum_min_time == NULL || thread_count == NULL));
     if (!report_capture_ready) {
         /* Nothing has been detached or otherwise mutated for report capture. */
+#ifdef HAVE_MPI
+        if (aggregation_mode != PEAK_OUTPUT_AGGREGATION_MPI)
+#endif
         peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
                                            "final report allocation failed");
     }
@@ -8532,6 +8535,9 @@ peak_general_listener_print_with_mpi_job_policy(
 #endif
     } else if (local_snapshot == NULL) {
         /* Report capture owns no listener mutation and may be abandoned. */
+#ifdef HAVE_MPI
+        if (aggregation_mode != PEAK_OUTPUT_AGGREGATION_MPI)
+#endif
         peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
                                            "final report snapshot allocation failed");
     }

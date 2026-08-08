@@ -652,10 +652,14 @@ peak_activate_runtime(void)
         args->hb_ema_a = hb_ema_a;
     }
     if (peak_memory_profile) {
-        if (malloc_interceptor_attach() != 0) {
+        PeakMallocInterceptorAttachResult memory_attach_result =
+            malloc_interceptor_attach();
+        if (memory_attach_result != PEAK_MALLOC_ATTACH_OK) {
             peak_report_snapshot_note_degraded(
                 PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
-                "memory tracking setup failed before installation");
+                memory_attach_result == PEAK_MALLOC_ATTACH_ROLLED_BACK
+                    ? "memory interceptor installation rolled back safely"
+                    : "memory tracking setup failed before installation");
             peak_memory_profile = false;
         }
     }
@@ -685,8 +689,6 @@ peak_activate_runtime(void)
                                                       args);
         }
         if (heartbeat_create_result != 0) {
-            peak_log_warn("[peak] optional heartbeat thread creation failed: %s\n",
-                          strerror(heartbeat_create_result));
             peak_report_snapshot_note_degraded(
                 PEAK_PROFILER_DEGRADED_HEARTBEAT,
                 "heartbeat thread creation failed");
