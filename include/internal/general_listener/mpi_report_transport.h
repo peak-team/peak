@@ -62,6 +62,12 @@ void peak_mpi_report_transport_reset_failed_closed(void);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the number of active requests retained for process lifetime. */
 size_t peak_mpi_report_transport_quarantined_request_count(void);
+
+/** Fails one staged-report allocation after @p successful allocations. */
+void peak_mpi_report_transport_test_fail_allocation_after(int successful);
+
+/** Makes the next aggregate snapshot clone fail before payload reduction. */
+void peak_mpi_report_transport_test_fail_clone_once(void);
 #endif
 
 #ifdef __cplusplus

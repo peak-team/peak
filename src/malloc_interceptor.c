@@ -43,6 +43,13 @@ static gpointer            calloc_addr = NULL;
 static gpointer            realloc_addr = NULL;
 static gpointer            aligned_alloc_addr = NULL;
 static gpointer            posix_memalign_addr = NULL;
+static gboolean            malloc_replaced = FALSE;
+static gboolean            free_replaced = FALSE;
+static gboolean            calloc_replaced = FALSE;
+static gboolean            realloc_replaced = FALSE;
+static gboolean            aligned_alloc_replaced = FALSE;
+static gboolean            posix_memalign_replaced = FALSE;
+static gboolean            malloc_interceptor_attached = FALSE;
 static PeakMemLog          g_memlog = {
     .fd = -1,
     .state = ATOMIC_VAR_INIT(PEAK_MEMLOG_UNINITIALIZED),
@@ -63,6 +70,23 @@ static void* peak_memlog_test_realloc_failure(void* ptr, size_t size) {
     errno = ENOMEM;
     return NULL;
 }
+
+static gboolean
+peak_malloc_test_should_fail_replace(const char* name)
+{
+    const char* configured = getenv("PEAK_TEST_FAIL_MALLOC_REPLACE");
+
+    return configured != NULL && name != NULL &&
+           strcmp(configured, name) == 0;
+}
+#define PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name) \
+    (peak_malloc_test_should_fail_replace(_name) ? GUM_REPLACE_WRONG_TYPE : \
+     gum_interceptor_replace_fast(malloc_interceptor, _addr, _hook, \
+                                  (gpointer*)(&_orig), NULL))
+#else
+#define PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name) \
+    gum_interceptor_replace_fast(malloc_interceptor, _addr, _hook, \
+                                 (gpointer*)(&_orig), NULL)
 #endif
 
 /*=========================
@@ -717,23 +741,51 @@ static int update_tracking_entry_after_realloc(void* old_ptr,
     return 1;
 }
 
-static void init_table(void) {
-    track_table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
-    memory_caller_target_table = gum_metal_hash_table_new(g_str_hash, str_equal_function);
-    if (!track_table) {
-        peak_log_warn("[peak] Failed to initialize tracking table\n");
-        exit(1);
+static void
+malloc_interceptor_release_tracking_tables(void)
+{
+    if (track_table != NULL) {
+        gum_metal_hash_table_unref(track_table);
+        track_table = NULL;
     }
-    if (!memory_caller_target_table) {
-        peak_log_warn("[peak] Failed to initialize memory caller target table\n");
-        exit(1);
+    if (memory_caller_target_table != NULL) {
+        gum_metal_hash_table_unref(memory_caller_target_table);
+        memory_caller_target_table = NULL;
+    }
+}
+
+static int
+init_table(void)
+{
+    GumMetalHashTable* new_track_table;
+    GumMetalHashTable* new_caller_table;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (atomic_load_explicit(&g_memlog_test_failure, memory_order_acquire) ==
+            PEAK_MEMLOG_TEST_FAIL_TRACKING_SETUP ||
+        getenv("PEAK_TEST_FAIL_MEMORY_TRACKING_SETUP") != NULL) {
+        return 0;
+    }
+#endif
+    new_track_table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
+    new_caller_table = gum_metal_hash_table_new(g_str_hash, str_equal_function);
+    if (!new_track_table || !new_caller_table) {
+        peak_log_warn("[peak] Failed to initialize tracking table\n");
+        if (new_track_table) gum_metal_hash_table_unref(new_track_table);
+        if (new_caller_table) gum_metal_hash_table_unref(new_caller_table);
+        return 0;
     }
 
     pthread_mutex_lock(&caller_mutex);
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        gum_metal_hash_table_insert(memory_caller_target_table, peak_hook_strings[i], peak_hook_strings[i]);
+        gum_metal_hash_table_insert(new_caller_table,
+                                    peak_hook_strings[i],
+                                    peak_hook_strings[i]);
     }
     pthread_mutex_unlock(&caller_mutex);
+    track_table = new_track_table;
+    memory_caller_target_table = new_caller_table;
+    return 1;
 }
 
 /*=========================
@@ -946,20 +998,48 @@ static void memory_usage_log_print(void) {
   Attach / Detach
 =========================*/
 
-#define DO_REPLACE_FAST(_addr, _hook, _orig, _name)                                       \
+#define DO_REPLACE_FAST(_addr, _hook, _orig, _name, _replaced)                            \
     do {                                                                                  \
         if (_addr) {                                                                      \
-            GumReplaceReturn r = gum_interceptor_replace_fast(malloc_interceptor,         \
-                                                              _addr, _hook,               \
-                                                              (gpointer*)(&_orig),        \
-                                                              NULL);                      \
-            if (r != GUM_REPLACE_OK)                                                      \
+            GumReplaceReturn r = PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name);  \
+            _replaced = r == GUM_REPLACE_OK;                                              \
+            if (!_replaced)                                                               \
                 peak_log_warn("[peak] Failed to replace " _name ": %d\n", r);             \
         }                                                                                 \
     } while (0)
 
-int malloc_interceptor_attach(void) {
+static gboolean
+malloc_interceptor_revert_all_and_flush(void)
+{
+    gum_interceptor_begin_transaction(malloc_interceptor);
+    if (malloc_replaced) gum_interceptor_revert(malloc_interceptor, malloc_addr);
+    if (free_replaced) gum_interceptor_revert(malloc_interceptor, free_addr);
+    if (calloc_replaced) gum_interceptor_revert(malloc_interceptor, calloc_addr);
+    if (realloc_replaced) gum_interceptor_revert(malloc_interceptor, realloc_addr);
+    if (aligned_alloc_replaced) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
+    if (posix_memalign_replaced) gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
+    gum_interceptor_end_transaction(malloc_interceptor);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH") != NULL) {
+        return FALSE;
+    }
+#endif
+    return gum_interceptor_flush(malloc_interceptor);
+}
+
+int
+malloc_interceptor_attach(void)
+{
+    if (!init_table()) {
+        return -1;
+    }
+    peak_memlog_open();
     malloc_interceptor = gum_interceptor_obtain();
+    if (malloc_interceptor == NULL) {
+        malloc_interceptor_release_tracking_tables();
+        peak_memlog_finalize();
+        return -1;
+    }
     gum_interceptor_begin_transaction(malloc_interceptor);
 
     malloc_addr        = (void*) malloc;
@@ -969,23 +1049,39 @@ int malloc_interceptor_attach(void) {
     aligned_alloc_addr = (void*) aligned_alloc;
     posix_memalign_addr= (void*) posix_memalign;
 
-    DO_REPLACE_FAST(malloc_addr,        custom_malloc,        original_malloc,        "malloc");
-    DO_REPLACE_FAST(free_addr,          custom_free,          original_free,          "free");
-    DO_REPLACE_FAST(calloc_addr,        custom_calloc,        original_calloc,        "calloc");
-    DO_REPLACE_FAST(realloc_addr,       custom_realloc,       original_realloc,       "realloc");
-    DO_REPLACE_FAST(aligned_alloc_addr, custom_aligned_alloc, original_aligned_alloc, "aligned_alloc");
-    DO_REPLACE_FAST(posix_memalign_addr,custom_posix_memalign,original_posix_memalign,"posix_memalign");
+    DO_REPLACE_FAST(malloc_addr, custom_malloc, original_malloc, "malloc", malloc_replaced);
+    DO_REPLACE_FAST(free_addr, custom_free, original_free, "free", free_replaced);
+    DO_REPLACE_FAST(calloc_addr, custom_calloc, original_calloc, "calloc", calloc_replaced);
+    DO_REPLACE_FAST(realloc_addr, custom_realloc, original_realloc, "realloc", realloc_replaced);
+    DO_REPLACE_FAST(aligned_alloc_addr, custom_aligned_alloc, original_aligned_alloc, "aligned_alloc", aligned_alloc_replaced);
+    DO_REPLACE_FAST(posix_memalign_addr, custom_posix_memalign, original_posix_memalign, "posix_memalign", posix_memalign_replaced);
 
     gum_interceptor_end_transaction(malloc_interceptor);
+    if (!malloc_replaced || !free_replaced || !calloc_replaced ||
+        !realloc_replaced || !aligned_alloc_replaced ||
+        !posix_memalign_replaced) {
+        if (!malloc_interceptor_revert_all_and_flush()) {
+            peak_log_warn("[peak] fatal memory interceptor rollback was not proven safe after mutation\n");
+            _exit(128);
+        }
+        g_object_unref(malloc_interceptor);
+        malloc_interceptor = NULL;
+        malloc_interceptor_release_tracking_tables();
+        peak_memlog_finalize();
+        return -1;
+    }
 
-    init_table();
-    peak_memlog_open();
-
+    malloc_interceptor_attached = TRUE;
     peak_log_info("[peak] Memory allocation functions intercepted successfully\n");
     return 0;
 }
 
-void malloc_interceptor_detach(void) {
+void
+malloc_interceptor_detach(void)
+{
+    if (!malloc_interceptor_attached || malloc_interceptor == NULL) {
+        return;
+    }
     atomic_store_explicit(&cleanup_in_progress, 1, memory_order_release);
 
     gum_interceptor_begin_transaction(malloc_interceptor);
@@ -1005,16 +1101,14 @@ void malloc_interceptor_detach(void) {
     }
 
     pthread_mutex_lock(&track_mutex);
-    gum_metal_hash_table_unref(track_table);
-    track_table = NULL;
+    pthread_mutex_lock(&caller_mutex);
+    malloc_interceptor_release_tracking_tables();
+    pthread_mutex_unlock(&caller_mutex);
     pthread_mutex_unlock(&track_mutex);
 
-    pthread_mutex_lock(&caller_mutex);
-    gum_metal_hash_table_unref(memory_caller_target_table);
-    memory_caller_target_table = NULL;
-    pthread_mutex_unlock(&caller_mutex);
-
     g_object_unref(malloc_interceptor);
+    malloc_interceptor = NULL;
+    malloc_interceptor_attached = FALSE;
 
     memory_usage_log_print();
     peak_memlog_finalize();

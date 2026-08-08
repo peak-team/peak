@@ -22,9 +22,11 @@ EXPECTED = {
         "revert": 1,
     },
     ("support-init", "src/malloc_interceptor.c"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
-        "replace_fast": 1,
+        "begin_transaction": 2,
+        "end_transaction": 2,
+        "flush": 1,
+        "replace_fast": 2,
+        "revert": 6,
     },
     ("support-shutdown-debt", "src/malloc_interceptor.c"): {
         "begin_transaction": 1,
@@ -106,6 +108,7 @@ FUNCTION_ANCHORS = {
     "src/malloc_interceptor.c": {
         "DO_REPLACE_FAST": "support-init",
         "malloc_interceptor_attach": "support-init",
+        "malloc_interceptor_revert_all_and_flush": "support-shutdown-debt",
         "malloc_interceptor_detach": "support-shutdown-debt",
     },
     "src/pthread_listener.c": {

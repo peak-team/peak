@@ -770,6 +770,15 @@ peak_report_formatter_write_text(
     peak_log_report("Recorded calls: %s%llu\n",
                     summary.total_calls_saturated ? ">=" : "",
                     (unsigned long long)summary.total_calls);
+    if (snapshot->degraded_mask != PEAK_PROFILER_DEGRADED_NONE) {
+        char reasons[128];
+
+        peak_report_snapshot_format_degraded_mask(snapshot->degraded_mask,
+                                                  reasons,
+                                                  sizeof(reasons));
+        peak_log_report("Profiler degraded mode: enabled reasons=%s\n",
+                        reasons[0] != '\0' ? reasons : "unknown");
+    }
     if (snapshot->dropped_calls != 0 || snapshot->dropped_threads != 0) {
         peak_log_report("Accounting diagnostics: dropped_calls=%llu dropped_threads=%llu "
                         "(untracked, overflow, or unowned callers excluded)\n",

@@ -8347,14 +8347,25 @@ peak_general_listener_print_with_mpi_job_policy(
         gum_interceptor_ignore_current_thread(interceptor);
     }
 
-    gulong* sum_num_calls = g_new0(gulong, peak_hook_address_count);
-    gdouble* sum_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* max_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* min_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* sum_exclusive_time = g_new0(gdouble, peak_hook_address_count);
-    gfloat* sum_max_time = g_new0(gfloat, peak_hook_address_count);
-    gfloat* sum_min_time = g_new0(gfloat, peak_hook_address_count);
-    gulong* thread_count = g_new0(gulong, peak_hook_address_count);
+    gulong* sum_num_calls = g_try_new0(gulong, peak_hook_address_count);
+    gdouble* sum_total_time = g_try_new0(gdouble, peak_hook_address_count);
+    gdouble* max_total_time = g_try_new0(gdouble, peak_hook_address_count);
+    gdouble* min_total_time = g_try_new0(gdouble, peak_hook_address_count);
+    gdouble* sum_exclusive_time = g_try_new0(gdouble, peak_hook_address_count);
+    gfloat* sum_max_time = g_try_new0(gfloat, peak_hook_address_count);
+    gfloat* sum_min_time = g_try_new0(gfloat, peak_hook_address_count);
+    gulong* thread_count = g_try_new0(gulong, peak_hook_address_count);
+
+    if (peak_hook_address_count != 0 &&
+        (sum_num_calls == NULL || sum_total_time == NULL ||
+         max_total_time == NULL || min_total_time == NULL ||
+         sum_exclusive_time == NULL || sum_max_time == NULL ||
+         sum_min_time == NULL || thread_count == NULL)) {
+        /* Nothing has been detached or otherwise mutated for report capture. */
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
+                                           "final report allocation failed");
+        goto report_cleanup;
+    }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
             PeakGeneralListener* pg_listener =
@@ -8490,8 +8501,13 @@ peak_general_listener_print_with_mpi_job_policy(
         write_succeeded = peak_general_listener_write_report(
             local_snapshot, TRUE, TRUE, active_mpi_job);
 #endif
+    } else {
+        /* Report capture owns no listener mutation and may be abandoned. */
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
+                                           "final report snapshot allocation failed");
     }
 
+report_cleanup:
     peak_report_snapshot_destroy(local_snapshot);
     g_free(sum_num_calls);
     g_free(sum_total_time);

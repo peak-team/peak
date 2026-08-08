@@ -241,6 +241,24 @@ MPI_Iallreduce(const void* send_buffer,
 }
 
 int
+MPI_Allreduce(const void* send_buffer,
+              void* receive_buffer,
+              int count,
+              MPI_Datatype datatype,
+              MPI_Op operation,
+              MPI_Comm communicator)
+{
+    size_t bytes = fake_datatype_extent(datatype) * (size_t)count;
+
+    (void)operation;
+    (void)communicator;
+    if (bytes != 0) {
+        memcpy(receive_buffer, send_buffer, bytes);
+    }
+    return MPI_SUCCESS;
+}
+
+int
 MPI_Ireduce(const void* send_buffer,
             void* receive_buffer,
             int count,
@@ -586,6 +604,57 @@ run_failure_child(int ordinal, TestRequestMode mode)
     return 0;
 }
 
+static int
+run_staged_allocation_failure_case(int successful_allocations)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failed = 0;
+
+    fake_reset(0, TEST_REQUEST_ERROR, 0, 1);
+    peak_mpi_report_transport_test_fail_allocation_after(successful_allocations);
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    failed = result != PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK ||
+             aggregate != NULL ||
+             peak_mpi_report_transport_failed_closed() ||
+             fake_operation_count != 0 || trace_count != 0;
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    peak_mpi_report_transport_test_fail_allocation_after(-1);
+    return failed;
+}
+
+static int
+run_late_allocation_failure_case(int successful_allocations, int fail_clone)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failed;
+
+    fake_reset(0, TEST_REQUEST_ERROR, 0, 1);
+    peak_mpi_report_transport_test_fail_allocation_after(successful_allocations);
+    if (fail_clone) {
+        peak_mpi_report_transport_test_fail_clone_once();
+    }
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    failed = result != PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK ||
+             aggregate != NULL || peak_mpi_report_transport_failed_closed();
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    peak_mpi_report_transport_test_fail_allocation_after(-1);
+    return failed;
+}
+
 int
 main(void)
 {
@@ -594,6 +663,15 @@ main(void)
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     failures += run_success_case(0, 1);
     failures += run_success_case(1, 2);
+    /* pending struct, staged send buffer, and staged receive buffer each
+     * coordinate local fallback before any payload collective is issued. */
+    failures += run_staged_allocation_failure_case(0);
+    failures += run_staged_allocation_failure_case(1);
+    failures += run_staged_allocation_failure_case(2);
+    /* The three identity buffers and clone both stop before their next
+     * payload collective and return the same local-fallback outcome. */
+    failures += run_late_allocation_failure_case(15, 0);
+    failures += run_late_allocation_failure_case(-1, 1);
     for (int ordinal = 1; ordinal <= TEST_COLLECTIVE_COUNT; ordinal++) {
         failures += run_failure_child(ordinal, TEST_REQUEST_ERROR);
         failures += run_failure_child(ordinal, TEST_REQUEST_TIMEOUT);

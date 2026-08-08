@@ -44,6 +44,7 @@ typedef struct {
 #define MPI_MAX 2
 #define MPI_SUM 3
 #define MPI_MAXLOC 4
+#define MPI_BOR 5
 
 #define MPI_REQUEST_NULL ((MPI_Request){0, 0})
 
@@ -62,6 +63,12 @@ int MPI_Iallreduce(const void* send_buffer,
                    MPI_Op operation,
                    MPI_Comm communicator,
                    MPI_Request* request);
+int MPI_Allreduce(const void* send_buffer,
+                  void* receive_buffer,
+                  int count,
+                  MPI_Datatype datatype,
+                  MPI_Op operation,
+                  MPI_Comm communicator);
 int MPI_Ireduce(const void* send_buffer,
                 void* receive_buffer,
                 int count,

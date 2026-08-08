@@ -3073,6 +3073,42 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|"
     )
+    add_test(NAME test_heartbeat_create_failure_fail_open
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_heartbeat_create_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEST_FAIL_HEARTBEAT_CREATE=1;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "Profiler degraded mode: enabled reasons=heartbeat")
+    add_test(NAME test_exit_interposer_install_failure_fail_open
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_exit_interposer_install_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_TEST_FAIL_EXIT_INTERPOSER_INSTALL=1;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "Profiler degraded mode: enabled reasons=exit-interposer")
+    add_test(NAME test_memory_tracking_setup_failure_fail_open
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_tracking_setup_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MEMORY_TRACKING_SETUP=1;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "Profiler degraded mode: enabled reasons=memory-tracking")
+    add_test(NAME test_report_allocation_failure_fail_open
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_report_allocation_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_TEST_FAIL_REPORT_ALLOCATION=1;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "disabling non-critical profiler subsystem \\(final report snapshot allocation failed\\)")
+    add_test(NAME test_memory_interceptor_unrecoverable_rollback_is_strict
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_interceptor_unrecoverable_rollback_is_strict
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH=1;${PRELOAD_VAR}"
+            WILL_FAIL TRUE)
+    add_test(NAME test_memory_interceptor_recoverable_rollback_fail_open
+        COMMAND ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_interceptor_recoverable_rollback_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "Profiler degraded mode: enabled reasons=memory-tracking")
 
     # Add Cuda Test cases
     if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))
