@@ -197,6 +197,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
+    target_compile_definitions(test_report_formatter PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_link_libraries(test_report_formatter PRIVATE Threads::Threads ${RT_LIBRARY})
     add_test(NAME test_report_formatter COMMAND test_report_formatter)
     set_tests_properties(test_report_formatter

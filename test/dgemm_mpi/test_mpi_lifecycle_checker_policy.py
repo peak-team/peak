@@ -282,6 +282,41 @@ class StatsArtifactNameTest(unittest.TestCase):
             "peak-stats-j42-s7-hnode0-r0-p123.csv"
         ))
 
+    @staticmethod
+    def release_name(rank: int, fallback: bool = False) -> str:
+        suffix = "-ranklocal-hnode0" if fallback else ""
+        return (
+            f"peak-stats-j42-s7-hnode0-r{rank}-p{rank + 100}-"
+            f"q{rank:016x}{suffix}.csv"
+        )
+
+    def test_socket_release_layout_requires_one_aggregate_and_every_rank(self) -> None:
+        names = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in range(4)
+        ]
+
+        CHECKER.require_socket_release_fallback_layout(names, 4)
+
+    def test_socket_release_layout_rejects_extra_aggregate(self) -> None:
+        names = [self.release_name(0), self.release_name(1), self.release_name(2)]
+        names.extend(self.release_name(rank, fallback=True) for rank in range(4))
+
+        with self.assertRaisesRegex(AssertionError, "exactly one aggregate"):
+            CHECKER.require_socket_release_fallback_layout(names, 4)
+
+    def test_socket_release_layout_rejects_missing_or_duplicate_rank(self) -> None:
+        missing = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in (0, 1, 3)
+        ]
+        duplicate = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in (0, 1, 1, 3)
+        ]
+
+        with self.assertRaisesRegex(AssertionError, "exactly 4 rank-local"):
+            CHECKER.require_socket_release_fallback_layout(missing, 4)
+        with self.assertRaisesRegex(AssertionError, "each rank exactly once"):
+            CHECKER.require_socket_release_fallback_layout(duplicate, 4)
+
 
 if __name__ == "__main__":
     result = unittest.main(exit=False)

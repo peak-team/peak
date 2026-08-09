@@ -107,8 +107,45 @@ ALLOCATED_SOCKET_TEST_PORT_BASES = set()
 STATS_CSV_NAME_RE = re.compile(
     r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
     r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
-    r"q[0-9a-f]{16}(?:-ranklocal-h[A-Za-z0-9_.-]+)?\.csv$"
+    r"q[0-9a-f]{16}(?P<fallback>-ranklocal-h[A-Za-z0-9_.-]+)?\.csv$"
 )
+
+
+def require_socket_release_fallback_layout(stats_names, nprocs):
+    aggregates = []
+    fallback_ranks = []
+
+    for name in stats_names:
+        match = STATS_CSV_NAME_RE.fullmatch(name)
+        if match is None:
+            raise AssertionError(f"unexpected PEAK stats CSV artifact: {name}")
+        if match["fallback"] is None:
+            aggregates.append(name)
+            continue
+        try:
+            fallback_ranks.append(int(match["rank"]))
+        except ValueError as exc:
+            raise AssertionError(
+                f"rank-local fallback has a non-numeric rank: {name}"
+            ) from exc
+
+    if len(aggregates) != 1:
+        raise AssertionError(
+            f"socket release failure requires exactly one aggregate CSV, got "
+            f"{len(aggregates)}"
+        )
+    if len(fallback_ranks) != nprocs:
+        raise AssertionError(
+            f"socket release failure requires exactly {nprocs} rank-local "
+            f"fallback CSVs, got {len(fallback_ranks)}"
+        )
+    expected_ranks = set(range(nprocs))
+    if set(fallback_ranks) != expected_ranks or \
+            len(set(fallback_ranks)) != len(fallback_ranks):
+        raise AssertionError(
+            "socket release failure fallback ranks must contain each rank "
+            f"exactly once: got {sorted(fallback_ranks)}"
+        )
 
 
 def require_valid_accounting_diagnostics(name, rows):
@@ -1316,6 +1353,10 @@ def main():
         raise AssertionError(
             f"expected at most {expected_max_peak_tables} PEAK output table(s), "
             f"got {peak_table_count}"
+        )
+    if args.mode == "finalize-clean-output-socket-release-fail":
+        require_socket_release_fallback_layout(
+            [path.name for path in stats_files], nprocs
         )
     if expected_stats_files is not None and len(stats_files) != expected_stats_files:
         raise AssertionError(

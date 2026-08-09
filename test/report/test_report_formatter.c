@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
 
 enum { TEST_HOSTNAME_CAPACITY = 256 };
 
@@ -96,6 +101,28 @@ directory_has_prefix(const char* directory, const char* prefix)
     }
     assert(closedir(stream) == 0);
     return found;
+}
+
+static void
+remove_directory_files(const char* directory)
+{
+    DIR* stream = opendir(directory);
+    struct dirent* entry;
+
+    assert(stream != NULL);
+    while ((entry = readdir(stream)) != NULL) {
+        char path[PATH_MAX];
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        assert(snprintf(path, sizeof(path), "%s/%s", directory,
+                        entry->d_name) < (int)sizeof(path));
+        assert(unlink(path) == 0);
+    }
+    assert(closedir(stream) == 0);
+    assert(rmdir(directory) == 0);
 }
 
 static char*
@@ -363,6 +390,100 @@ check_rank_local_csv_names(const char* stats_base,
 
     clear_launcher_environment();
     peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_strict_rank_local_bounded_names(void)
+{
+    char directory[] = "/tmp/peak_report_formatter_strict_XXXXXX";
+    char aggregate_path[PATH_MAX];
+    char strict_path[PATH_MAX];
+    char long_component[NAME_MAX + 1];
+    char long_hostname[255];
+    char alternate_long_hostname[255];
+    PeakReportSnapshot* snapshot = create_fixture("strict-name-boundary");
+    DIR* stream;
+    struct dirent* entry;
+    size_t entries = 0;
+    bool saw_aggregate = false;
+    size_t strict_entries = 0;
+
+    assert(mkdtemp(directory) != NULL);
+    peak_report_snapshot_prepare_for_render(snapshot);
+
+    assert(snprintf(aggregate_path, sizeof(aggregate_path), "%s/ordinary.csv",
+                    directory) < (int)sizeof(aggregate_path));
+    assert(snprintf(strict_path, sizeof(strict_path),
+                    "%s/ordinary-ranklocal-hnode-1.csv", directory) <
+           (int)sizeof(strict_path));
+    assert(setenv("PEAK_TEST_REPORT_HOSTNAME", "node-1", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
+    assert(peak_report_formatter_write_csv(snapshot));
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
+    memcpy(alternate_long_hostname, long_hostname, sizeof(long_hostname));
+    alternate_long_hostname[sizeof(alternate_long_hostname) - 2] = 'i';
+    assert(setenv("PEAK_TEST_REPORT_HOSTNAME", alternate_long_hostname, 1) == 0);
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
+    assert(access(aggregate_path, F_OK) == 0);
+    assert(access(strict_path, F_OK) == 0);
+    assert(!directory_has_prefix(directory, "ordinary.csv.tmp."));
+    assert(unlink(aggregate_path) == 0);
+    assert(unlink(strict_path) == 0);
+
+    assert(snprintf(aggregate_path, sizeof(aggregate_path), "%s/bare",
+                    directory) < (int)sizeof(aggregate_path));
+    assert(snprintf(strict_path, sizeof(strict_path),
+                    "%s/bare-ranklocal-hhost_____", directory) <
+           (int)sizeof(strict_path));
+    assert(setenv("PEAK_TEST_REPORT_HOSTNAME", "host:/\\?*", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
+    assert(peak_report_formatter_write_csv(snapshot));
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
+    assert(access(aggregate_path, F_OK) == 0);
+    assert(access(strict_path, F_OK) == 0);
+    assert(!directory_has_prefix(directory, "bare.tmp."));
+    assert(unlink(aggregate_path) == 0);
+    assert(unlink(strict_path) == 0);
+
+    memset(long_component, 'a', NAME_MAX - 4);
+    memcpy(long_component + NAME_MAX - 4, ".csv", 5);
+    memset(long_hostname, 'h', sizeof(long_hostname) - 1);
+    long_hostname[sizeof(long_hostname) - 1] = '\0';
+    assert(snprintf(aggregate_path, sizeof(aggregate_path), "%s/%s",
+                    directory, long_component) < (int)sizeof(aggregate_path));
+    assert(setenv("PEAK_TEST_REPORT_HOSTNAME", long_hostname, 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
+    assert(peak_report_formatter_write_csv(snapshot));
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
+    stream = opendir(directory);
+    assert(stream != NULL);
+    while ((entry = readdir(stream)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        entries++;
+        assert(strlen(entry->d_name) <= NAME_MAX);
+        assert(strstr(entry->d_name, ".tmp.") == NULL);
+        if (strcmp(entry->d_name, long_component) == 0) {
+            saw_aggregate = true;
+        }
+        if (strstr(entry->d_name, "-ranklocal-h") != NULL) {
+            strict_entries++;
+        }
+    }
+    assert(closedir(stream) == 0);
+    assert(entries == 3);
+    assert(saw_aggregate);
+    assert(strict_entries == 2);
+    assert(unsetenv("PEAK_TEST_REPORT_HOSTNAME") == 0);
+    clear_launcher_environment();
+    peak_report_snapshot_destroy(snapshot);
+    remove_directory_files(directory);
 }
 
 static void
@@ -780,6 +901,7 @@ main(void)
     check_output_template_and_no_clobber(temp_directory);
     check_concurrent_no_clobber(temp_directory);
     check_template_parent_creation(temp_directory);
+    check_strict_rank_local_bounded_names();
 
     assert(unsetenv("PEAK_STATSLOG_PATH") == 0);
     assert(unsetenv("PEAK_STATSLOG_TEMPLATE") == 0);
