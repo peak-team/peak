@@ -62,8 +62,7 @@ and applies its PEAK patch. For controlled or offline builds, set
 
 ## Build and Install
 
-For a self-contained developer build, the pinned Frida Gum download is enabled
-by default:
+The default build downloads the pinned Frida Gum devkit:
 
 ```bash
 mkdir -p build
@@ -101,6 +100,9 @@ LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 The detach helper is installed at the configured
 `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` (by default, `bin`).  Set
 `PEAK_DETACH_HELPER` when a package layout requires a different helper path.
+
+Installed CMake consumers can use `find_package(PEAK CONFIG REQUIRED)` and link
+`PEAK::peak`.
 
 ## Essential Usage
 
@@ -303,7 +305,7 @@ that path.
 
 ## Testing
 
-Configure and run the local suite (with the packaged Frida Gum download) with:
+Configure and run the local suite with the default pinned Frida Gum download:
 
 ```bash
 mkdir -p build
@@ -315,14 +317,6 @@ ctest --output-on-failure
 
 MPI, CUDA, strict-backend, and real-runtime JIT coverage depends on the
 toolchains and host capabilities detected during configuration.
-
-### HPC package-manager builds
-
-Site package managers should provide Frida Gum and, when OTF2 export is needed,
-OTF2, then configure PEAK with `PEAK_FETCH_DEPS=OFF`.  Verified Spack and
-EasyBuild recipes are tracked in [#73](https://github.com/peak-team/peak/issues/73).
-Installed consumers can use
-`find_package(PEAK CONFIG REQUIRED)` and link `PEAK::peak`.
 
 ## Documentation
 

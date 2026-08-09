@@ -10,9 +10,10 @@ routes attach-time redirect resolution through PEAK's exact-entry API. Other
 platforms keep using the stock prebuilt devkit unless a patched devkit is
 selected explicitly.
 
-## Developer Download Provider
+## Default Provider
 
-A self-contained developer build downloads the pinned devkit by default:
+With no extra options, PEAK downloads the pinned Frida Gum devkit and applies
+the PEAK patch on supported Linux architectures:
 
 ```sh
 cmake -S . -B build
