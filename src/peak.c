@@ -34,6 +34,7 @@
 #include "malloc_interceptor.h"
 #include "utils/env_parser.h"
 #include "utils/mpi_utils.h"
+#include "utils/target_config.h"
 #include "utils/utils.h"
 
 #define PEAK_TARGET_ENV                        "PEAK_TARGET"
@@ -44,23 +45,9 @@
 #define PEAK_GPU_MONITOR_ALL                   "PEAK_GPU_MONITOR_ALL"
 #define PEAK_NAME_TRUNCATE                     "PEAK_NAME_TRUNCATE"
 #define PEAK_TARGET_DELIM                     ','
-#define PEAK_COST_ENV                          "PEAK_COST"
-#define PEAK_HEARTBEAT_INTERVAL_ENV            "PEAK_HEARTBEAT_INTERVAL"
-#define PEAK_HIBERNATION_CYCLE_ENV             "PEAK_HIBERNATION_CYCLE"
-#define PEAK_OVERHEAD_RATIO_ENV                "PEAK_OVERHEAD_RATIO"
-#define PEAK_GLOBAL_OVERHEAD_RATIO_ENV         "PEAK_GLOBAL_OVERHEAD_RATIO"
-#define PEAK_GLOBAL_DETACH_FACTOR_ENV          "PEAK_GLOBAL_DETACH_FACTOR"
-#define PEAK_GLOBAL_REATTACH_FACTOR_ENV        "PEAK_GLOBAL_REATTACH_FACTOR"
 #define PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV   "PEAK_ENABLE_PER_TARGET_HEARTBEAT"
 #define PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV       "PEAK_ENABLE_GLOBAL_HEARTBEAT"
 #define PEAK_ENABLE_REATTACH_ENV               "PEAK_ENABLE_REATTACH"
-#define PEAK_PAUSE_TIMEOUT_ENV                 "PEAK_PAUSE_TIMEOUT"
-#define PEAK_SIG_CONT_TIMEOUT_ENV              "PEAK_SIG_CONT_TIMEOUT"
-#define PEAK_HB_MIN_US_ENV                     "PEAK_HB_MIN_US"
-#define PEAK_HB_MAX_US_ENV                     "PEAK_HB_MAX_US"
-#define PEAK_HB_K_ERR_ENV                      "PEAK_HB_K_ERR"
-#define PEAK_HB_K_RATE_ENV                     "PEAK_HB_K_RATE"
-#define PEAK_HB_EMA_A_ENV                      "PEAK_HB_EMA_A"
 #define PEAK_MAX_NUM_THREADS_ENV               "PEAK_MAX_NUM_THREADS"
 /* Each target owns a 64-byte hot slot (plus optional checkpoint storage).
  * Keep the process-wide knob bounded so large target groups cannot turn an
@@ -123,6 +110,7 @@ static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
 static _Atomic int peak_runtime_active = 0;
 static _Atomic pid_t peak_runtime_owner_pid = 0;
+static PeakEnvWarningState peak_max_num_threads_warning_emitted;
 typedef enum {
     PEAK_RUNTIME_ACTIVATION_NOT_READY = 0,
     PEAK_RUNTIME_ACTIVATION_READY = 1,
@@ -746,6 +734,8 @@ peak_parse_max_num_threads(void)
     const char* value = getenv(PEAK_MAX_NUM_THREADS_ENV);
     long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     gulong default_value = 2;
+    PeakEnvUnsignedSchema schema;
+    unsigned long long parsed;
 
     if (online_cpus > 0) {
         if ((unsigned long)online_cpus > PEAK_MAX_NUM_THREADS_LIMIT / 2UL) {
@@ -755,41 +745,35 @@ peak_parse_max_num_threads(void)
         }
     }
 
-    if (value == NULL || value[0] == '\0') {
+    if (value == NULL) {
         return default_value;
     }
-    for (const unsigned char* cursor = (const unsigned char*)value;
-         *cursor != '\0';
-         cursor++) {
-        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
-            peak_log_warn("[peak] invalid %s=%s; using %lu\n",
-                          PEAK_MAX_NUM_THREADS_ENV,
-                          value,
-                          (unsigned long)default_value);
-            return default_value;
-        }
-    }
-    errno = 0;
-    char* end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > (unsigned long long)G_MAXULONG) {
-        peak_log_warn("[peak] invalid %s=%s; using %lu\n",
-                      PEAK_MAX_NUM_THREADS_ENV,
-                      value,
-                      (unsigned long)default_value);
-        return default_value;
+    schema = (PeakEnvUnsignedSchema){
+        PEAK_MAX_NUM_THREADS_ENV, "thread slots", default_value,
+        0, G_MAXULONG, true, &peak_max_num_threads_warning_emitted,
+        true,
+    };
+    if (!peak_parse_env_unsigned_checked(&schema, &parsed)) {
+        return (gulong)peak_parse_env_unsigned(&schema);
     }
     if (parsed == 0) {
-        peak_log_warn("[peak] %s=0 is unsafe; using 1\n",
-                      PEAK_MAX_NUM_THREADS_ENV);
+        if (__atomic_exchange_n(&peak_max_num_threads_warning_emitted.emitted,
+                                1,
+                                __ATOMIC_RELAXED) == 0) {
+            peak_log_warn("[peak] %s=0 is unsafe; using 1\n",
+                          PEAK_MAX_NUM_THREADS_ENV);
+        }
         return 1;
     }
     if (parsed > PEAK_MAX_NUM_THREADS_LIMIT) {
-        peak_log_warn("[peak] %s=%s exceeds supported capacity %lu; clamping\n",
-                      PEAK_MAX_NUM_THREADS_ENV,
-                      value,
-                      PEAK_MAX_NUM_THREADS_LIMIT);
+        if (__atomic_exchange_n(&peak_max_num_threads_warning_emitted.emitted,
+                                1,
+                                __ATOMIC_RELAXED) == 0) {
+            peak_log_warn("[peak] %s=%s exceeds supported capacity %lu; clamping\n",
+                          PEAK_MAX_NUM_THREADS_ENV,
+                          value,
+                          PEAK_MAX_NUM_THREADS_LIMIT);
+        }
         return PEAK_MAX_NUM_THREADS_LIMIT;
     }
     return (gulong)parsed;
@@ -807,6 +791,8 @@ peak_test_parse_max_num_threads(void)
 
 void peak_init()
 {
+    PeakRuntimeNumericConfig numeric_config;
+
     peak_log_configure();
     peak_max_num_threads = peak_parse_max_num_threads();
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
@@ -817,33 +803,28 @@ void peak_init()
         peak_hook_address_count);
     peak_gpu_hook_address_count = parse_env_w_delim(PEAK_GPU_TARGET_ENV, PEAK_TARGET_DELIM, &peak_gpu_hook_strings);
     peak_gpu_hook_address_count += load_profiling_symbols(PEAK_GPU_TARGET_FILE_ENV, &peak_gpu_hook_strings, peak_gpu_hook_address_count);
-    peak_detach_cost = parse_env_to_float(PEAK_COST_ENV);
+    numeric_config = peak_parse_runtime_numeric_config();
+    peak_detach_cost = numeric_config.detach_cost;
     peak_gpu_monitor_all = parse_env_to_bool(PEAK_GPU_MONITOR_ALL);
     peak_truncate_function_name = parse_env_to_bool(PEAK_NAME_TRUNCATE);
-    heartbeat_time = parse_env_to_time(PEAK_HEARTBEAT_INTERVAL_ENV);
-    check_interval = parse_env_to_interval(PEAK_HIBERNATION_CYCLE_ENV);
-    target_profile_ratio = parse_env_to_float_ratio(PEAK_OVERHEAD_RATIO_ENV);
-    global_target_ratio = parse_env_to_float_ratio(PEAK_GLOBAL_OVERHEAD_RATIO_ENV);
-    peak_global_detach_factor = parse_env_to_float_detach_factor(PEAK_GLOBAL_DETACH_FACTOR_ENV);
-    peak_global_reattach_factor = parse_env_to_float_reattach_factor(PEAK_GLOBAL_REATTACH_FACTOR_ENV);
+    heartbeat_time = numeric_config.heartbeat_interval_us;
+    check_interval = numeric_config.hibernation_cycle;
+    target_profile_ratio = numeric_config.target_overhead_ratio;
+    global_target_ratio = numeric_config.global_overhead_ratio;
+    peak_global_detach_factor = numeric_config.global_detach_factor;
+    peak_global_reattach_factor = numeric_config.global_reattach_factor;
     enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
     enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
     const char* enable_reattach_env = getenv(PEAK_ENABLE_REATTACH_ENV);
     enable_reattach =
         (enable_reattach_env == NULL) || parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
-    sig_stop_ack_wait_interval = parse_env_to_post_interval(PEAK_PAUSE_TIMEOUT_ENV);
-    sig_cont_wait_interval = parse_env_to_post_interval(PEAK_SIG_CONT_TIMEOUT_ENV);
-    hb_min_us = parse_env_to_uint_default(PEAK_HB_MIN_US_ENV, 10000);
-    hb_max_us = parse_env_to_uint_default(PEAK_HB_MAX_US_ENV, 500000);
-    hb_k_err = parse_env_to_double_default(PEAK_HB_K_ERR_ENV, 3.0);
-    hb_k_rate = parse_env_to_double_default(PEAK_HB_K_RATE_ENV, 0.8);
-    hb_ema_a = parse_env_to_double_default(PEAK_HB_EMA_A_ENV, 0.3);
-    if (hb_max_us < hb_min_us) {
-        hb_max_us = hb_min_us;
-    }
-    if (hb_ema_a <= 0.0 || hb_ema_a > 1.0) {
-        hb_ema_a = 0.3;
-    }
+    sig_stop_ack_wait_interval = numeric_config.pause_timeout_ns;
+    sig_cont_wait_interval = numeric_config.sig_cont_timeout_ns;
+    hb_min_us = numeric_config.heartbeat_min_us;
+    hb_max_us = numeric_config.heartbeat_max_us;
+    hb_k_err = numeric_config.heartbeat_error_gain;
+    hb_k_rate = numeric_config.heartbeat_rate_gain;
+    hb_ema_a = numeric_config.heartbeat_ema_alpha;
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
 

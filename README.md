@@ -162,7 +162,7 @@ in detail.
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
 | `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
-| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count. |
+| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. |
 
 ### MPI Output
 
@@ -221,6 +221,17 @@ full output and teardown behavior.
 | `PEAK_HB_MIN_US`, `PEAK_HB_MAX_US` | Adaptive heartbeat sleep bounds. Defaults: `10000` and `500000` microseconds. |
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
+
+Numeric overhead-control values must consume the complete value and be finite.
+Invalid present values emit one warning and use their documented default.
+`PEAK_COST` and the overhead ratios are nonnegative; a zero ratio remains an
+immediate threshold for the existing `ratio > threshold` comparison. Heartbeat
+sleep bounds are positive, and a maximum below an
+accepted minimum is raised to that minimum. Global hysteresis requires a
+detach factor of at least `1`, a reattach factor in `(0, 1]`, and the reattach
+factor strictly below the detach factor; a conflicting reattach value uses its
+default. `PEAK_REATTACH_COOLDOWN_MS=60000` remains a policy default, not a
+safety requirement.
 
 For runtime behavior, accounting, and tuning, see
 [Heartbeat mechanism and runtime policy](docs/heartbeat.md).
@@ -298,6 +309,7 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_GPU_TARGET` | Comma-separated demangled base kernel names. |
 | `PEAK_GPU_TARGET_FILE` | File containing one GPU kernel name per line. |
 | `PEAK_GPU_MONITOR_ALL` | Profile every observed GPU kernel. |
+| `PEAK_CUDA_EVENT_POOL_CAPACITY` | CUDA event-pool capacity. Default: `256` events; accepts `1` through `65536`. |
 | `PEAK_MEMORY_PROFILE` | Enable experimental memory allocation profiling for selected CPU targets. |
 | `PEAK_MEMORY_TRACK_ALL` | Track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |

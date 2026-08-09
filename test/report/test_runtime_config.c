@@ -5,10 +5,10 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static const char* const peak_test_environment_names[] = {
     "PEAK_DETACH_COUNT",
-    "PEAK_TEST_UINT",
     "MPI_LOCALNRANKS",
     "OMPI_COMM_WORLD_LOCAL_SIZE",
     "MV2_COMM_WORLD_LOCAL_SIZE",
@@ -54,72 +54,6 @@ check_truthy_values(void)
            !peak_general_listener_env_value_truthy("on") ||
            peak_general_listener_env_value_truthy("0") ||
            peak_general_listener_env_value_truthy("true ");
-}
-
-static int
-check_unsigned_parser(void)
-{
-    char negative[64];
-    char spaced_negative[66];
-
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "0", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 0U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "42", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 42U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "42junk", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U ||
-        snprintf(negative, sizeof(negative), "-%lu", ULONG_MAX) >=
-            (int)sizeof(negative) ||
-        snprintf(spaced_negative,
-                 sizeof(spaced_negative),
-                 "  -%lu",
-                 ULONG_MAX) >= (int)sizeof(spaced_negative)) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", negative, 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", spaced_negative, 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "-0", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "-1", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "+42", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 42U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", " 42", 1);
-    return peak_general_listener_parse_uint_env_default(
-               "PEAK_TEST_UINT", 7U) != 42U;
 }
 
 static int
@@ -345,6 +279,11 @@ check_detach_override(void)
     char spaced_negative[66];
     unsigned long count = 99U;
 
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
+    setenv("PEAK_DETACH_COUNT", "", 1);
     if (peak_general_listener_parse_detach_count_override(&count) ||
         count != 99U) {
         return 1;
@@ -628,10 +567,55 @@ check_output_policies(void)
 }
 
 int
-main(void)
+main(int argc, char** argv)
 {
+    if (argc == 2 && strcmp(argv[1], "detach-empty-warning") == 0) {
+        unsigned long count = 1U;
+
+        clear_test_environment();
+        setenv("PEAK_DETACH_COUNT", "", 1);
+        return peak_general_listener_parse_detach_count_override(&count) ||
+                       count != 1U
+                   ? 1
+                   : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "timeout-warning") == 0) {
+        PeakReportTimeoutBudget budget;
+
+        clear_test_environment();
+        setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "junk", 1);
+        setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "junk", 1);
+        setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "junk", 1);
+        budget = peak_general_listener_report_timeout_budget_for_rank_count(
+            4096U);
+        return budget.socket_phase_timeout_ms != 60000U ||
+                       budget.socket_release_timeout_ms != 340000U ||
+                       budget.mpi_report_release_timeout_ms != 180000U
+                   ? 1
+                   : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "timeout-raise-warning") == 0) {
+        PeakReportTimeoutBudget budget;
+
+        clear_test_environment();
+        setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "1500", 1);
+        setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS", "10", 1);
+        setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "100", 1);
+        budget = peak_general_listener_report_timeout_budget_for_rank_count(
+            2U);
+        if (budget.socket_release_timeout_ms != 4510U ||
+            !budget.socket_release_was_raised) {
+            return 1;
+        }
+        budget = peak_general_listener_report_timeout_budget_for_rank_count(
+            2U);
+        return budget.socket_release_timeout_ms != 4510U ||
+                       !budget.socket_release_was_raised
+                   ? 1
+                   : 0;
+    }
     clear_test_environment();
-    if (check_truthy_values() || check_unsigned_parser() ||
+    if (check_truthy_values() ||
         check_detach_override()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;

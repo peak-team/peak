@@ -29,6 +29,7 @@ static _Atomic int peak_mpi_teardown_failed_closed;
 static _Atomic(PeakMpiTeardownRequest*)
     peak_mpi_teardown_quarantine = NULL;
 static _Atomic size_t peak_mpi_teardown_quarantine_count;
+static PeakEnvWarningState peak_mpi_finalize_timeout_warning_emitted;
 
 #if defined(PEAK_ENABLE_TEST_HOOKS) && \
     (defined(__GNUC__) || defined(__clang__))
@@ -158,13 +159,13 @@ peak_mpi_teardown_observe_request(PeakMpiTeardownRequest* pending)
 static unsigned int
 peak_mpi_teardown_finalize_timeout_ms(void)
 {
-    unsigned int timeout_ms = parse_env_to_uint_default(
-        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS,
-        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT);
+    PeakEnvUnsignedSchema schema = {
+        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS, "milliseconds",
+        PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT, 1, UINT_MAX, false,
+        &peak_mpi_finalize_timeout_warning_emitted, false,
+    };
 
-    return timeout_ms == 0
-               ? PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT
-               : timeout_ms;
+    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static bool

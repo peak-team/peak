@@ -1,6 +1,7 @@
 #include "internal/general_listener/runtime_config.h"
 
 #include "logging.h"
+#include "utils/env_parser.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -25,38 +26,30 @@
 #define PEAK_MPI_RELEASE_MARGIN_PHASE_COUNT 2U
 
 static unsigned int configured_local_mpi_ranks = 1U;
-
-static bool
-peak_general_listener_unsigned_text_is_negative(const char* value)
-{
-    const unsigned char* cursor = (const unsigned char*)value;
-
-    if (cursor == NULL) {
-        return false;
-    }
-    while (*cursor != '\0' && isspace(*cursor)) {
-        cursor++;
-    }
-    return *cursor == '-';
-}
+static PeakEnvWarningState peak_output_timeout_warning_emitted;
+static PeakEnvWarningState peak_output_release_timeout_warning_emitted;
+static PeakEnvWarningState peak_mpi_release_timeout_warning_emitted;
+static PeakEnvWarningState peak_detach_count_warning_emitted;
 
 static bool
 peak_general_listener_parse_positive_uint_bounded(const char* name,
                                                   unsigned int maximum,
-                                                  unsigned int* value_out)
+                                                  unsigned int* value_out,
+                                                  PeakEnvWarningState* warning_emitted,
+                                                  unsigned int fallback)
 {
     const char* value = getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
+    PeakEnvUnsignedSchema schema = {
+        name, "milliseconds", fallback, 1, maximum, false, warning_emitted,
+        false,
+    };
+    unsigned long long parsed;
 
-    if (value == NULL || value[0] == '\0' ||
-        peak_general_listener_unsigned_text_is_negative(value)) {
+    if (value == NULL) {
         return false;
     }
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
-        parsed > maximum) {
+    if (!peak_parse_env_unsigned_checked(&schema, &parsed)) {
+        (void)peak_parse_env_unsigned(&schema);
         return false;
     }
     if (value_out != NULL) {
@@ -121,7 +114,9 @@ peak_general_listener_report_timeout_budget_for_rank_count(
         peak_general_listener_parse_positive_uint_bounded(
             PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
             (unsigned int)INT_MAX,
-            &configured);
+            &configured,
+            &peak_output_timeout_warning_emitted,
+            PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT);
     if (phase_was_configured) {
         budget.socket_phase_timeout_ms = configured;
     }
@@ -129,7 +124,9 @@ peak_general_listener_report_timeout_budget_for_rank_count(
     if (peak_general_listener_parse_positive_uint_bounded(
             PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS_ENV,
             PEAK_SOCKET_GATHER_ADAPTIVE_MARGIN_MAX_MS,
-            &configured)) {
+            &configured,
+            NULL,
+            0)) {
         wave_budget_ms = configured;
     }
 #endif
@@ -161,18 +158,34 @@ peak_general_listener_report_timeout_budget_for_rank_count(
     if (peak_general_listener_parse_positive_uint_bounded(
             PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
             (unsigned int)INT_MAX,
-            &configured)) {
+            &configured,
+            &peak_output_release_timeout_warning_emitted,
+            minimum_socket_release)) {
         budget.socket_release_timeout_ms = configured;
         if (configured < minimum_socket_release) {
             budget.socket_release_timeout_ms = minimum_socket_release;
             budget.socket_release_was_raised = true;
+            if (__atomic_exchange_n(
+                    &peak_output_release_timeout_warning_emitted.emitted,
+                    1,
+                    __ATOMIC_RELAXED) == 0) {
+                peak_log_warn(
+                    "[peak] %s=%u is below required minimum %u milliseconds; "
+                    "using %u milliseconds\n",
+                    PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
+                    configured,
+                    minimum_socket_release,
+                    minimum_socket_release);
+            }
         }
     }
 
     if (peak_general_listener_parse_positive_uint_bounded(
             PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_ENV,
             UINT_MAX,
-            &configured)) {
+            &configured,
+            &peak_mpi_release_timeout_warning_emitted,
+            PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT)) {
         budget.mpi_report_release_timeout_ms = configured;
     }
     mpi_margin = peak_general_listener_multiply_saturated(
@@ -203,52 +216,23 @@ peak_general_listener_parse_detach_count_override(unsigned long* count_out)
 {
     const char* value = getenv("PEAK_DETACH_COUNT");
 
-    if (value == NULL || value[0] == '\0') {
+    if (value == NULL) {
         return false;
     }
-    if (peak_general_listener_unsigned_text_is_negative(value)) {
-        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
-        return false;
-    }
+    PeakEnvUnsignedSchema schema = {
+        "PEAK_DETACH_COUNT", "calls", 0, 1, ULONG_MAX, false,
+        &peak_detach_count_warning_emitted, false,
+    };
+    unsigned long long parsed = peak_parse_env_unsigned(&schema);
 
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0) {
-        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
+    if (parsed == 0) {
         return false;
     }
 
     if (count_out != NULL) {
-        *count_out = parsed;
+        *count_out = (unsigned long)parsed;
     }
     return true;
-}
-
-unsigned int
-peak_general_listener_parse_uint_env_default(const char* name,
-                                             unsigned int default_value)
-{
-    const char* value = getenv(name);
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-    if (peak_general_listener_unsigned_text_is_negative(value)) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > UINT_MAX) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
 }
 
 static bool

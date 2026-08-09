@@ -19,6 +19,7 @@
 #include "internal/unsafe_gum_prologue.h"
 #include "detach_controller.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 #include "pthread_listener.h"
 #include <errno.h>
 #include <float.h>
@@ -212,6 +213,9 @@ static gsize peak_controller_shutdown_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static PeakEnvWarningState peak_reattach_cooldown_warning_emitted;
+static PeakEnvWarningState peak_controller_pending_age_warning_emitted;
+static PeakEnvWarningState peak_controller_retry_count_warning_emitted;
 static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
@@ -230,10 +234,13 @@ static gboolean peak_dynamic_attach_needed = FALSE;
 static void
 peak_general_listener_init_reattach_policy_once(void)
 {
+    PeakEnvUnsignedSchema schema = {
+        PEAK_REATTACH_COOLDOWN_MS_ENV, "milliseconds",
+        peak_reattach_default_cooldown_ms, 0, UINT_MAX, true,
+        &peak_reattach_cooldown_warning_emitted, false,
+    };
     unsigned int cooldown_ms =
-        peak_general_listener_parse_uint_env_default(
-            PEAK_REATTACH_COOLDOWN_MS_ENV,
-            peak_reattach_default_cooldown_ms);
+        (unsigned int)peak_parse_env_unsigned(&schema);
     peak_reattach_cooldown_s = (double)cooldown_ms / 1000.0;
 }
 
@@ -492,24 +499,15 @@ peak_env_truthy_general(const char* value)
 
 static unsigned int
 peak_general_controller_parse_uint_env(const char* name,
-                                       unsigned int default_value)
+                                       const char* unit,
+                                       unsigned int default_value,
+                                       PeakEnvWarningState* warning_emitted)
 {
-    const char* value = g_getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
+    PeakEnvUnsignedSchema schema = {
+        name, unit, default_value, 0, G_MAXUINT, true, warning_emitted, false,
+    };
 
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
+    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static void
@@ -518,14 +516,18 @@ peak_general_controller_init_retry_limits_once(void)
     unsigned int max_pending_age_ms =
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV,
-            (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0));
+            "milliseconds",
+            (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0),
+            &peak_controller_pending_age_warning_emitted);
 
     peak_controller_max_pending_age_s =
         max_pending_age_ms == 0 ? 0.0 : (double)max_pending_age_ms / 1000.0;
     peak_controller_max_retry_count =
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV,
-            peak_controller_default_max_retry_count);
+            "retries",
+            peak_controller_default_max_retry_count,
+            &peak_controller_retry_count_warning_emitted);
 }
 
 static void

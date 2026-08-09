@@ -6,6 +6,7 @@
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/runtime_config.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 #include "utils/timing.h"
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -45,6 +46,8 @@ _Static_assert(SIZE_MAX <= ULONG_MAX,
 #else
 #error No exact MPI datatype fallback is available for uint64_t
 #endif
+
+static PeakEnvWarningState peak_mpi_output_timeout_warning_emitted;
 
 typedef enum {
     PEAK_MPI_COLLECTIVE_ALLREDUCE = 0,
@@ -202,12 +205,13 @@ peak_mpi_report_transport_test_fail_clone_once(void)
 static unsigned int
 peak_mpi_output_collective_timeout_ms(void)
 {
-    unsigned int timeout_ms = peak_general_listener_parse_uint_env_default(
-        PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
-        PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_DEFAULT);
+    PeakEnvUnsignedSchema schema = {
+        PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV, "milliseconds",
+        PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_DEFAULT, 1, UINT_MAX, false,
+        &peak_mpi_output_timeout_warning_emitted, false,
+    };
 
-    return timeout_ms == 0 ? PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_DEFAULT
-                           : timeout_ms;
+    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static bool
