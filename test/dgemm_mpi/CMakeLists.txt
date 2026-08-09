@@ -64,6 +64,7 @@ target_compile_definitions(test_mpi_report_transport
     PRIVATE PEAK_ENABLE_TEST_HOOKS=1 HAVE_MPI=1)
 target_link_libraries(test_mpi_report_transport PRIVATE
     MPI::MPI_C
+    Threads::Threads
     ${RT_LIBRARY}
     m)
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")

@@ -196,6 +196,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
+    target_link_libraries(test_report_formatter PRIVATE Threads::Threads)
     add_test(NAME test_report_formatter COMMAND test_report_formatter)
     set_tests_properties(test_report_formatter
         PROPERTIES
@@ -254,6 +255,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include/utils
         ${FRIDA_GUM_INCLUDE_DIRS})
     target_link_libraries(test_mpi_report_request_lifetime PRIVATE
+        Threads::Threads
         ${RT_LIBRARY}
         ${M_LIBRARY})
     add_test(NAME test_mpi_report_request_lifetime
@@ -283,6 +285,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
     target_link_libraries(test_mpi_teardown_guard PRIVATE
+        Threads::Threads
         ${RT_LIBRARY})
     add_test(NAME test_mpi_teardown_guard COMMAND test_mpi_teardown_guard)
     set_tests_properties(test_mpi_teardown_guard
@@ -302,6 +305,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_runtime_config PRIVATE
         PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV=1
         PEAK_ENABLE_TEST_HOOKS=1)
+    target_link_libraries(test_runtime_config PRIVATE Threads::Threads)
     add_test(NAME test_runtime_config COMMAND test_runtime_config)
     set_tests_properties(test_runtime_config
         PROPERTIES
@@ -338,6 +342,7 @@ if(BUILD_TESTING)
     target_include_directories(test_numeric_env_parser PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
+    target_link_libraries(test_numeric_env_parser PRIVATE Threads::Threads)
     add_test(NAME test_numeric_env_parser COMMAND test_numeric_env_parser)
     set_tests_properties(test_numeric_env_parser
         PROPERTIES PASS_REGULAR_EXPRESSION "numeric_env_parser_test_ok")
@@ -357,6 +362,8 @@ if(BUILD_TESTING)
         target_link_options(test_numeric_env_parser_long_double_64 PRIVATE
             -fsanitize=undefined,float-cast-overflow
             -fno-sanitize-recover=all)
+        target_link_libraries(test_numeric_env_parser_long_double_64
+            PRIVATE Threads::Threads)
         add_test(NAME test_numeric_env_parser_long_double_64
             COMMAND test_numeric_env_parser_long_double_64)
     endif()
