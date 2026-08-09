@@ -472,7 +472,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_output_identity PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_options(test_output_identity PRIVATE -UNDEBUG)
     target_link_libraries(test_output_identity PRIVATE Threads::Threads ${RT_LIBRARY})
-    foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid template-overlong template-expanded-overlong concurrent snapshot entropy-fallback)
+    foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid template-overlong template-expanded-overlong template-raw-overlong-renderable concurrent snapshot entropy-fallback)
         add_test(NAME test_output_identity_${_output_identity_case}
             COMMAND test_output_identity ${_output_identity_case})
         set_tests_properties(test_output_identity_${_output_identity_case}

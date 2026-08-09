@@ -170,6 +170,43 @@ run_template_overlong(const char *directory, int expanded)
 }
 
 static int
+run_template_raw_overlong_but_renderable(const char *directory)
+{
+    char base[PATH_MAX];
+    char template_path[PATH_MAX + 128];
+    char final_path[PATH_MAX];
+    char checkpoint_path[PATH_MAX];
+    char expected_checkpoint[PATH_MAX];
+    size_t used;
+
+    assert(snprintf(base, sizeof(base), "%s/stats", directory) < (int)sizeof(base));
+    assert(snprintf(template_path, sizeof(template_path), "%s/", directory) <
+           (int)sizeof(template_path));
+    used = strlen(template_path);
+    while (used + sizeof("{jobid}/") < sizeof(template_path)) {
+        memcpy(template_path + used, "{jobid}/", sizeof("{jobid}/") - 1);
+        used += sizeof("{jobid}/") - 1;
+    }
+    memcpy(template_path + used, "report", sizeof("report"));
+    assert(used > PATH_MAX);
+    set_common(base);
+    assert(setenv("SLURM_JOB_ID", "x", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", template_path, 1) == 0);
+    peak_output_identity_initialize();
+    if (!peak_output_identity_path(final_path, sizeof(final_path), base,
+                                   template_path, ".csv", -1)) {
+        return 1;
+    }
+    if (checkpoint(checkpoint_path) != PEAK_OUTPUT_CHECKPOINT_READY ||
+        snprintf(expected_checkpoint, sizeof(expected_checkpoint), "%s-exec7.csv",
+                 final_path) >= (int)sizeof(expected_checkpoint) ||
+        strcmp(checkpoint_path, expected_checkpoint) != 0) {
+        return 1;
+    }
+    return write_cached_checkpoint();
+}
+
+static int
 run_concurrent(const char *directory)
 {
     char base[PATH_MAX];
@@ -259,6 +296,8 @@ main(int argc, char **argv)
             rc = run_template_overlong(directory, 0);
         else if (strcmp(argv[1], "template-expanded-overlong") == 0)
             rc = run_template_overlong(directory, 1);
+        else if (strcmp(argv[1], "template-raw-overlong-renderable") == 0)
+            rc = run_template_raw_overlong_but_renderable(directory);
         else if (strcmp(argv[1], "concurrent") == 0) rc = run_concurrent(directory);
         else if (strcmp(argv[1], "snapshot") == 0) rc = run_snapshot(directory);
         else if (strcmp(argv[1], "entropy-fallback") == 0) rc = run_entropy_fallback(directory);
