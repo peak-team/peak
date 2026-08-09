@@ -252,11 +252,9 @@ peak_socket_test_listener_ready_signal_root(void)
     if (fd < 0) {
         return 0;
     }
-    peak_socket_test_listener_ready_root_signal_fd = -1;
     do {
         written = send(fd, &signal, sizeof(signal), MSG_NOSIGNAL);
     } while (written < 0 && errno == EINTR);
-    close(fd);
     return written == (ssize_t)sizeof(signal) ? 1 : -1;
 }
 
@@ -2563,6 +2561,9 @@ peak_socket_reduce_root_gather(
     size_t peer_count;
     size_t active_limit;
     size_t poll_count;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    size_t test_control_index;
+#endif
     PeakSocketGatherConnection* connections = NULL;
     struct pollfd* descriptors = NULL;
     size_t accepted = 0;
@@ -2596,7 +2597,21 @@ peak_socket_reduce_root_gather(
         active_limit + 1 > SIZE_MAX / sizeof(*descriptors)) {
         return false;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (test_wait_for_first_peer &&
+        (active_limit > SIZE_MAX - 2 ||
+         active_limit + 2 > (size_t)((nfds_t)-1) ||
+         active_limit + 2 > SIZE_MAX / sizeof(*descriptors))) {
+        return false;
+    }
+#endif
     poll_count = active_limit + 1;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    test_control_index = poll_count;
+    if (test_wait_for_first_peer) {
+        poll_count++;
+    }
+#endif
     connections = calloc(active_limit, sizeof(*connections));
     descriptors = calloc(poll_count, sizeof(*descriptors));
     if (connections == NULL || descriptors == NULL) {
@@ -2626,8 +2641,6 @@ peak_socket_reduce_root_gather(
 #endif
            ) {
         int poll_result;
-        int poll_timeout_ms = peak_socket_reduce_remaining_ms(
-            progress_deadline_us);
 
         descriptors[0].fd =
             accepted < peer_count && active < active_limit
@@ -2644,13 +2657,30 @@ peak_socket_reduce_root_gather(
                     : POLLIN;
             descriptors[i + 1].revents = 0;
         }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (test_wait_for_first_peer) {
+            descriptors[test_control_index].fd =
+                peak_socket_test_listener_ready_root_signal_fd;
+            descriptors[test_control_index].events = POLLIN;
+            descriptors[test_control_index].revents = 0;
+        } else if (test_control_index < poll_count) {
+            descriptors[test_control_index].fd = -1;
+            descriptors[test_control_index].events = 0;
+            descriptors[test_control_index].revents = 0;
+        }
+#endif
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
         if (test_wait_for_first_peer) {
-            poll_timeout_ms = -1;
-        }
+            poll_result = poll(descriptors, (nfds_t)poll_count, -1);
+        } else
 #endif
-        poll_result = poll(descriptors, (nfds_t)poll_count, poll_timeout_ms);
+        {
+            poll_result = poll(
+                descriptors,
+                (nfds_t)poll_count,
+                peak_socket_reduce_remaining_ms(progress_deadline_us));
+        }
         if (poll_result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -2720,6 +2750,8 @@ peak_socket_reduce_root_gather(
                             hard_deadline_us,
                             progress_timeout_ms);
                     startup_grace_active = false;
+                    peak_socket_test_receipt_barrier_close(
+                        &peak_socket_test_listener_ready_root_signal_fd);
                     test_wait_for_first_peer = false;
                 }
 #endif
@@ -2739,6 +2771,13 @@ peak_socket_reduce_root_gather(
                 break;
             }
         }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (test_wait_for_first_peer &&
+            descriptors[test_control_index].revents != 0) {
+            ok = false;
+            break;
+        }
+#endif
 
         for (size_t i = 0; i < active_limit && ok; i++) {
             PeakSocketGatherConnection* connection =
@@ -3314,6 +3353,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         if (listener_ready < 0) {
             close(listener);
             close(release_listener);
+            peak_socket_test_receipt_barrier_close(
+                &peak_socket_test_listener_ready_root_signal_fd);
             free(local_records);
             free(release_targets);
             free(claimed_ranks);
@@ -3336,6 +3377,11 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
 #endif
                                              &gather_aggregate,
                                              &received);
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_socket_test_receipt_barrier_close(
+        &peak_socket_test_listener_ready_root_signal_fd);
+#endif
 
     close(listener);
     free(local_records);

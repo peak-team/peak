@@ -475,7 +475,8 @@ static int
 run_two_rank_case_with_peer_start_delay(int port,
                                         TestRootAction action,
                                         bool mismatched_peer_name,
-                                        bool delay_peer_start)
+                                        bool delay_peer_start,
+                                        bool exit_after_listener_ready)
 {
     PeakReportSnapshot* root = fixture_snapshot(0, false);
     PeakReportSnapshot* aggregate = NULL;
@@ -517,12 +518,14 @@ run_two_rank_case_with_peer_start_delay(int port,
         action == TEST_ROOT_SESSION_ALLOC_FAILURE;
     bool receipt_failure_barrier =
         action == TEST_GATHER_RECEIPT_FAILURE;
+    bool peer_exits_before_connect = exit_after_listener_ready;
     char port_text[16];
     char token_text[64];
     int peer_ready_fds[2] = {-1, -1};
     int receipt_barrier_fds[2] = {-1, -1};
     pid_t child;
     int64_t case_started_ms;
+    int64_t root_started_ms = -1;
     int peer_wait_status = -1;
     bool peer_wait_complete = false;
     bool commit_attempted = false;
@@ -791,8 +794,9 @@ run_two_rank_case_with_peer_start_delay(int port,
             close(peer_ready_fds[0]);
             _exit(99);
         }
-        close(peer_ready_fds[0]);
-        peer_ready_fds[0] = -1;
+        if (exit_after_listener_ready) {
+            _exit(0);
+        }
         if (delay_peer_start) {
             /* Old one-way startup expired its 100 ms grace here. */
             usleep(250000);
@@ -802,6 +806,8 @@ run_two_rank_case_with_peer_start_delay(int port,
             PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
             &peer_session,
             &peer_aggregate);
+        close(peer_ready_fds[0]);
+        peer_ready_fds[0] = -1;
         memset(&telemetry, 0, sizeof(telemetry));
         peak_socket_report_test_telemetry_get(&telemetry);
         if (telemetry.wire_version != 12U ||
@@ -856,6 +862,7 @@ run_two_rank_case_with_peer_start_delay(int port,
     }
     if (result == 0) {
         set_test_rank(0, 2);
+        root_started_ms = test_monotonic_ms();
         root_status = peak_socket_report_transport_begin(
             root,
             PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -871,7 +878,8 @@ run_two_rank_case_with_peer_start_delay(int port,
         /* Also releases the peer if root failed before receipt preparation. */
         peak_socket_report_test_receipt_barrier_set(-1, -1);
     }
-    if (root_telemetry.wire_version != 12U ||
+    if (!peer_exits_before_connect &&
+        (root_telemetry.wire_version != 12U ||
         (!early_drop_may_skip_accept &&
          root_telemetry.root_max_active != 1U) ||
         (early_drop_may_skip_accept &&
@@ -890,7 +898,7 @@ run_two_rank_case_with_peer_start_delay(int port,
           root_telemetry.root_receipt_count != 1U ||
           root_telemetry.root_confirmation_count != 1U)) ||
         root_telemetry.root_release_target_count !=
-            root_telemetry.root_receipt_count) {
+            root_telemetry.root_receipt_count)) {
         result = 1;
     }
     if (action == TEST_GATHER_RECEIPT_FAILURE &&
@@ -962,7 +970,8 @@ run_two_rank_case_with_peer_start_delay(int port,
 
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
-    if ((expected_peer == PEAK_SOCKET_REPORT_PEER_RELEASED &&
+    if (!peer_exits_before_connect &&
+        ((expected_peer == PEAK_SOCKET_REPORT_PEER_RELEASED &&
          (root_telemetry.root_release_decision != TEST_RELEASE_ACK ||
           root_telemetry.root_release_confirmed_count != 1U)) ||
         ((action == TEST_ROOT_ABORT ||
@@ -973,10 +982,26 @@ run_two_rank_case_with_peer_start_delay(int port,
           root_telemetry.root_release_confirmed_count != 1U)) ||
         (action == TEST_ROOT_COMMIT_FAILURE &&
          (root_telemetry.root_release_decision != TEST_RELEASE_ACK ||
-          root_telemetry.root_release_confirmed_count != 0U))) {
+          root_telemetry.root_release_confirmed_count != 0U)))) {
         result = 1;
     }
-    if (!peer_wait_complete &&
+    if (peer_exits_before_connect) {
+        int64_t elapsed_ms = test_monotonic_ms() - root_started_ms;
+
+        if ((!peer_wait_complete &&
+             (waitpid(child, &peer_wait_status, 0) != child)) ||
+            !WIFEXITED(peer_wait_status) ||
+            WEXITSTATUS(peer_wait_status) != 0 ||
+            root_status != PEAK_SOCKET_REPORT_FAILED || session != NULL ||
+            aggregate != NULL || root_telemetry.root_payload_count != 0U ||
+            root_telemetry.root_receipt_count != 0U ||
+            root_telemetry.root_confirmation_count != 0U ||
+            root_telemetry.root_max_active != 0U || root_started_ms < 0 ||
+            elapsed_ms > 5000) {
+            result = 1;
+        }
+        peer_wait_complete = true;
+    } else if (!peer_wait_complete &&
         wait_for_expected_child(child, expected_peer, &peer_wait_status) !=
             0) {
         result = 1;
@@ -1068,6 +1093,7 @@ run_two_rank_case(int port,
     return run_two_rank_case_with_peer_start_delay(port,
                                                     action,
                                                     mismatched_peer_name,
+                                                    false,
                                                     false);
 }
 
@@ -1967,7 +1993,7 @@ main(void)
 {
     /*
      * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
-     * consumes base..base+53, and the kernel lock prevents parallel CTest
+     * consumes base..base+55, and the kernel lock prevents parallel CTest
      * processes, including different UIDs, from choosing the same range.
      */
     int port_lock_fd = -1;
@@ -2058,6 +2084,15 @@ main(void)
         run_two_rank_case_with_peer_start_delay(
             base_port + 52,
             TEST_ROOT_SESSION_ALLOC_FAILURE,
+            false,
+            true,
+            false));
+    CHECK_SOCKET_CASE(
+        "listener-ready-peer-exit",
+        run_two_rank_case_with_peer_start_delay(
+            base_port + 54,
+            TEST_ROOT_SESSION_ALLOC_FAILURE,
+            false,
             false,
             true));
     CHECK_SOCKET_CASE(
