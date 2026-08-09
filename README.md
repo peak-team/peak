@@ -55,14 +55,18 @@ PEAK writes a report to stderr and a CSV profile log using the default prefix
 - POSIX threads and standard Linux runtime libraries
 
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
-CUDA Toolkit 11.2 or newer. By default PEAK downloads a pinned Frida Gum devkit
-and applies its PEAK patch. For controlled or offline builds, set
+CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
+provider downloads a pinned Frida Gum devkit and applies the PEAK patch. Other
+platforms use the stock prebuilt devkit unless a patched devkit is selected.
+For controlled or offline builds, set
 `PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
 `FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
 
 ## Build and Install
 
-The default build downloads the pinned Frida Gum devkit:
+On Linux x86_64 and Arm64, the default build downloads the pinned Frida Gum
+devkit and applies the PEAK patch. Other platforms use the stock prebuilt
+devkit unless a patched devkit is selected:
 
 ```bash
 mkdir -p build
@@ -97,9 +101,10 @@ LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 ./target_application
 ```
 
-The detach helper is installed at the configured
-`${CMAKE_INSTALL_BINDIR}/peak_detach_helper` (by default, `bin`).  Set
-`PEAK_DETACH_HELPER` when a package layout requires a different helper path.
+On Linux x86_64 and Arm64, the detach helper is built and installed at the
+configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
+`bin/peak_detach_helper`). Set `PEAK_DETACH_HELPER` when a package layout
+requires a different helper path.
 
 Installed CMake consumers can use `find_package(PEAK CONFIG REQUIRED)` and link
 `PEAK::peak`.
