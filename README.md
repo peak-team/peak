@@ -315,9 +315,9 @@ toolchains and host capabilities detected during configuration.
 ### HPC package-manager builds
 
 Site package managers should provide Frida Gum and, when OTF2 export is needed,
-OTF2, then configure PEAK with `PEAK_FETCH_DEPS=OFF`.  The tracked recipe
-templates in `packaging/spack/` and `packaging/easybuild/` document the same
-controlled-dependency path.  Installed consumers can use
+OTF2, then configure PEAK with `PEAK_FETCH_DEPS=OFF`.  Verified Spack and
+EasyBuild recipes are tracked in [#73](https://github.com/peak-team/peak/issues/73).
+Installed consumers can use
 `find_package(PEAK CONFIG REQUIRED)` and link `PEAK::peak`.
 
 ## Documentation

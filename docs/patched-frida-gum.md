@@ -10,9 +10,9 @@ routes attach-time redirect resolution through PEAK's exact-entry API. Other
 platforms keep using the stock prebuilt devkit unless a patched devkit is
 selected explicitly.
 
-## Default Provider
+## Developer Download Provider
 
-No extra configuration is required for the default build:
+A self-contained developer build explicitly opts in to the pinned download:
 
 ```sh
 cmake -S . -B build -DPEAK_FETCH_DEPS=ON

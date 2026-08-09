@@ -12,10 +12,19 @@ jobs:
           cmake -S . -B bootstrap
           -DPEAK_FETCH_DEPS=ON
           -DPEAK_ENABLE_OTF2=ON
+          -DPEAK_USE_SYSTEM_OTF2=OFF
           -DPEAK_ENABLE_MPI=OFF
           -DBUILD_CUDA_PROFILE=OFF
       - run: cmake --build bootstrap
       - name: Build with optional components disabled and no downloads
+        env:
+          ALL_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          all_proxy: http://127.0.0.1:9
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+          FC: /nonexistent/fortran
         run: >
           cmake -S . -B offline
           -DPEAK_FETCH_DEPS=OFF
@@ -29,7 +38,7 @@ jobs:
       - name: Install and consume the CMake package
         run: |
           cmake --install offline --prefix ${{ github.workspace }}/installed
-          cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed
+          cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed -DPEAK_SOURCE_DIR=${{ github.workspace }}
           cmake --build package-consumer
       - name: Build with the controlled system OTF2 prefix
         run: >
@@ -44,3 +53,7 @@ jobs:
           -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
           -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
       - run: cmake --build system-otf2
+      - name: Assert system OTF2 came from the controlled prefix
+        run: |
+          grep -F "OTF2_LIBRARY:FILEPATH=${{ github.workspace }}/bootstrap/otf2/lib/libotf2.a" system-otf2/CMakeCache.txt
+          grep -F "OTF2_INCLUDE_DIR:PATH=${{ github.workspace }}/bootstrap/otf2/include" system-otf2/CMakeCache.txt

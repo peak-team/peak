@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(peak VERSION 0.1.0 LANGUAGES C CXX)
+project(peak LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -215,20 +215,15 @@ if(PEAK_BUILD_BENCHMARKS)
 endif()
 
 include(CMakePackageConfigHelpers)
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+set(PEAK_CMAKE_INSTALL_DIR "lib/cmake/PEAK")
 install(EXPORT PEAKTargets
     FILE PEAKTargets.cmake
     NAMESPACE PEAK::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)
+    DESTINATION ${PEAK_CMAKE_INSTALL_DIR})
 configure_package_config_file(
     ${PROJECT_SOURCE_DIR}/cmake/PEAKConfig.cmake.in
     ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)
-write_basic_package_version_file(
-    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion)
+    INSTALL_DESTINATION ${PEAK_CMAKE_INSTALL_DIR})
 install(FILES
     ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
-    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)
+    DESTINATION ${PEAK_CMAKE_INSTALL_DIR})
