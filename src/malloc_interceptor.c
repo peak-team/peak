@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
+#include "internal/general_listener/output_identity.h"
 #include "logging.h"
 #include "utils/env_parser.h"
 #include <sched.h>
@@ -264,29 +265,21 @@ static int peak_log_backtrace_malloc() {
 =========================*/
 
 static void build_paths(char out_tmp[512], char out_csv[512], char out_otf2[512]) {
-    char base[256] = {0};
     const char *env_path = getenv("PEAK_MEMLOG_PATH");
-    if (env_path && *env_path) {
-        size_t n = strlen(env_path);
-        if (n >= sizeof(base)) n = sizeof(base) - 1;
-        memcpy(base, env_path, n);
-        base[n] = '\0';
-    } else {
-        snprintf(base, sizeof(base), "./peak_memlog");
-    }
-
     int rank = -1;
-    get_mpi_rank(&rank);
+    const char* base = env_path != NULL && env_path[0] != '\0' ?
+                           env_path : "./peak_memlog";
+    const char* template_value = getenv("PEAK_MEMLOG_TEMPLATE");
 
-    int pid = (int) getpid();
-    if (rank == -1) {
-        snprintf(out_tmp, 512, "%s-p%d.tmp", base, pid);
-        snprintf(out_csv, 512, "%s-p%d.csv", base, pid);
-        snprintf(out_otf2, 512, "p%d", pid);
-    } else {
-        snprintf(out_tmp, 512, "%s-r%d-p%d.tmp", base, rank, pid);
-        snprintf(out_csv, 512, "%s-r%d-p%d.csv", base, rank, pid);
-        snprintf(out_otf2, 512, "r%d-p%d", rank, pid);
+    get_mpi_rank(&rank);
+    if (!peak_output_identity_path(out_csv, 512, base, template_value,
+                                   ".csv", rank) ||
+        snprintf(out_tmp, 512, "%s.tmp", out_csv) >= 512 ||
+        !peak_output_identity_path(out_otf2, 512, "peak_memlog",
+                                   NULL, "", rank)) {
+        out_tmp[0] = '\0';
+        out_csv[0] = '\0';
+        out_otf2[0] = '\0';
     }
 }
 
@@ -442,6 +435,7 @@ static void peak_memlog_open(void) {
     int fd = -1;
     void* base = MAP_FAILED;
     const char* env_capacity;
+    const char* output_template;
 
     if (atomic_load_explicit(&g_memlog.state, memory_order_acquire) !=
         PEAK_MEMLOG_UNINITIALIZED) return;
@@ -477,6 +471,18 @@ static void peak_memlog_open(void) {
     }
 
     build_paths(g_memlog.tmp_path, g_memlog.csv_path, g_memlog.otf2_prefix);
+    if (g_memlog.tmp_path[0] == '\0') {
+        peak_log_warn("[peak] memlog: output path is invalid; disabling log\n");
+        atomic_store_explicit(&g_memlog.state, PEAK_MEMLOG_DISABLED, memory_order_release);
+        return;
+    }
+    output_template = getenv("PEAK_MEMLOG_TEMPLATE");
+    if (output_template != NULL && output_template[0] != '\0' &&
+        !peak_output_identity_make_parent(g_memlog.csv_path)) {
+        peak_log_warn("[peak] memlog: output directory is invalid; disabling log\n");
+        atomic_store_explicit(&g_memlog.state, PEAK_MEMLOG_DISABLED, memory_order_release);
+        return;
+    }
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (atomic_load_explicit(&g_memlog_test_failure, memory_order_acquire) ==
         PEAK_MEMLOG_TEST_FAIL_CREATE) {
@@ -484,7 +490,7 @@ static void peak_memlog_open(void) {
     } else
 #endif
     {
-        fd = open(g_memlog.tmp_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+        fd = open(g_memlog.tmp_path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
     }
     if (fd < 0) {
         peak_log_warn("[peak] memlog: open(%s) failed: %s\n", g_memlog.tmp_path, strerror(errno));
@@ -551,13 +557,13 @@ static void peak_memlog_open(void) {
 }
 
 /* small helper to keep CSV emit identical but clearer */
-static inline void peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
-    dprintf(fd_csv, "%llu,%lld,%llu,%u,%u\n",
-            (unsigned long long) e->ts_ns,
-            (long long)          e->delta,
-            (unsigned long long) e->current,
-            (unsigned)           e->tid,
-            (unsigned)           e->op);
+static inline int peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
+    return dprintf(fd_csv, "%llu,%lld,%llu,%u,%u\n",
+                   (unsigned long long) e->ts_ns,
+                   (long long)          e->delta,
+                   (unsigned long long) e->current,
+                   (unsigned)           e->tid,
+                   (unsigned)           e->op) >= 0;
 }
 
 /* Convert the mmapped binary buffer to a CSV file (and remove the temp backing file). */
@@ -608,24 +614,55 @@ static void peak_memlog_finalize(void) {
     /* 1) OTF2 export */
     peak_memlog_export_otf2(g_memlog.otf2_prefix, base_chunk, events);
 
-    /* 2) CSV export (exactly as before) */
-    int fd_csv = open(g_memlog.csv_path, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+    /* 2) CSV export: publish the complete file without replacing a prior run. */
+    char csv_temp[sizeof(g_memlog.csv_path) + 16];
+    int fd_csv;
+
+    if (snprintf(csv_temp, sizeof(csv_temp), "%s.export", g_memlog.csv_path) >=
+        (int)sizeof(csv_temp)) {
+        csv_temp[0] = '\0';
+    }
+    fd_csv = csv_temp[0] == '\0' ? -1 :
+        open(csv_temp, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+    bool csv_written = false;
     if (fd_csv < 0) {
         peak_log_warn("[peak] memlog: open CSV %s failed: %s\n", g_memlog.csv_path, strerror(errno));
     } else {
-        dprintf(fd_csv, "ts_ns,delta,current,tid,op\n");
+        int write_failed = dprintf(fd_csv, "ts_ns,delta,current,tid,op\n") < 0;
+        int failure_errno = write_failed ? errno : 0;
 
         uint8_t *base = (uint8_t *) g_memlog.map + g_memlog.header_bytes;
         for (size_t i = 0; i < events; i++) {
             PeakMemEvent *e = (PeakMemEvent *) (base + i * sizeof(PeakMemEvent));
-            peak_csv_emit_line(fd_csv, e);
+            if (!write_failed && !peak_csv_emit_line(fd_csv, e)) {
+                write_failed = 1;
+                failure_errno = errno;
+            }
         }
-        close(fd_csv);
+        if (close(fd_csv) != 0) {
+            write_failed = 1;
+            failure_errno = errno;
+        }
+        if (!write_failed && link(csv_temp, g_memlog.csv_path) != 0) {
+            write_failed = 1;
+            failure_errno = errno;
+        }
+        if (write_failed) {
+            peak_log_warn("[peak] memlog: publish CSV %s failed: %s\n",
+                          g_memlog.csv_path,
+                          strerror(failure_errno != 0 ? failure_errno : EIO));
+        }
+        else {
+            csv_written = true;
+        }
+        (void)unlink(csv_temp);
     }
-    peak_log_report("[peak] memlog CSV written: %s (events=%zu dropped=%zu)\n",
-                    g_memlog.csv_path,
-                    events,
-                    atomic_load_explicit(&g_memlog.dropped, memory_order_acquire));
+    if (csv_written) {
+        peak_log_report("[peak] memlog CSV written: %s (events=%zu dropped=%zu)\n",
+                        g_memlog.csv_path,
+                        events,
+                        atomic_load_explicit(&g_memlog.dropped, memory_order_acquire));
+    }
 
     munmap(g_memlog.map, g_memlog.map_bytes);
     close(g_memlog.fd);

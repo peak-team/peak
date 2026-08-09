@@ -159,6 +159,46 @@ bind_test_tcp_port(int port, bool reuse_address)
 }
 
 static void
+check_listener_bind_scope(int port)
+{
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    int fd;
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS");
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND");
+    fd = peak_socket_report_test_bind_listener(port);
+    if (fd < 0 || getsockname(fd, (struct sockaddr*)&address, &length) != 0 ||
+        address.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        fprintf(stderr, "default listener did not bind root-local address\n");
+        if (fd >= 0) close(fd);
+        exit(1);
+    }
+    close(fd);
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS", "0.0.0.0", 1);
+    fd = peak_socket_report_test_bind_listener(port + 1);
+    if (fd >= 0) {
+        fprintf(stderr, "wildcard bind bypassed explicit broad opt-in\n");
+        close(fd);
+        exit(1);
+    }
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS");
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND", "1", 1);
+    fd = peak_socket_report_test_bind_listener(port + 2);
+    if (fd < 0 || getsockname(fd, (struct sockaddr*)&address, &length) != 0 ||
+        address.sin_addr.s_addr != htonl(INADDR_ANY)) {
+        fprintf(stderr, "explicit broad listener bind was not honored\n");
+        if (fd >= 0) close(fd);
+        exit(1);
+    }
+    close(fd);
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND");
+}
+
+static void
 clear_rank_environment(void)
 {
     static const char* names[] = {
@@ -689,7 +729,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         action == TEST_GATHER_PAYLOAD_DROP_FAILURE) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_AFTER_BYTES",
-            /* wire-v12 header (168 bytes) plus 17 payload bytes. */
+            /* wire-v13 header (168 bytes) plus 17 payload bytes. */
             action == TEST_GATHER_DROP_FAILURE ? "1" : "185",
             1);
         (void)setenv(
@@ -810,7 +850,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         peer_ready_fds[0] = -1;
         memset(&telemetry, 0, sizeof(telemetry));
         peak_socket_report_test_telemetry_get(&telemetry);
-        if (telemetry.wire_version != 12U ||
+        if (telemetry.wire_version != 13U ||
             telemetry.peer_receipt_received !=
                 peer_registration_expected ||
             telemetry.peer_confirmation_sent !=
@@ -879,7 +919,9 @@ run_two_rank_case_with_peer_start_delay(int port,
         peak_socket_report_test_receipt_barrier_set(-1, -1);
     }
     if (!peer_exits_before_connect &&
-        (root_telemetry.wire_version != 12U ||
+        (root_telemetry.wire_version != 13U ||
+         (!gather_must_fail &&
+          root_telemetry.root_receipt_session_nonce == 0) ||
         (!early_drop_may_skip_accept &&
          root_telemetry.root_max_active != 1U) ||
         (early_drop_may_skip_accept &&
@@ -1183,7 +1225,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_socket_report_transport_abort(peer_session);
         peak_report_snapshot_destroy(peer_aggregate);
         if (peer_cpu_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-            telemetry.wire_version != 12U ||
+            telemetry.wire_version != 13U ||
             !telemetry.peer_receipt_received ||
             !telemetry.peer_confirmation_sent ||
             !telemetry.peer_release_started ||
@@ -1211,7 +1253,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_report_snapshot_destroy(peer_cuda);
         if ((!cuda_schema_mismatch &&
              (peer_cuda_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-              telemetry.wire_version != 12U ||
+              telemetry.wire_version != 13U ||
               !telemetry.peer_receipt_received ||
               !telemetry.peer_confirmation_sent ||
               !telemetry.peer_release_started ||
@@ -1236,7 +1278,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
     memset(&telemetry, 0, sizeof(telemetry));
     peak_socket_report_test_telemetry_get(&telemetry);
     if (cpu_status != PEAK_SOCKET_REPORT_ROOT_PREPARED || session == NULL ||
-        !aggregate_matches(aggregate) || telemetry.wire_version != 12U ||
+        !aggregate_matches(aggregate) || telemetry.wire_version != 13U ||
         telemetry.root_payload_count != 1U ||
         telemetry.root_receipt_count != 1U ||
         telemetry.root_confirmation_count != 1U ||
@@ -1292,7 +1334,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
             }
         } else if (cuda_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
                    session == NULL || !aggregate_matches(aggregate) ||
-                   telemetry.wire_version != 12U ||
+                   telemetry.wire_version != 13U ||
                    telemetry.root_payload_count != 1U ||
                    telemetry.root_receipt_count != 1U ||
                    telemetry.root_confirmation_count != 1U ||
@@ -1653,7 +1695,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
                 &peer_aggregate);
             memset(&telemetry, 0, sizeof(telemetry));
             peak_socket_report_test_telemetry_get(&telemetry);
-            if (telemetry.wire_version != 12U ||
+            if (telemetry.wire_version != 13U ||
                 !telemetry.peer_receipt_received ||
                 !telemetry.peer_confirmation_sent ||
                 !telemetry.peer_release_started ||
@@ -1683,7 +1725,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
         peak_socket_report_test_telemetry_get(&root_telemetry);
         if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
             session == NULL || aggregate == NULL ||
-            root_telemetry.wire_version != 12U ||
+            root_telemetry.wire_version != 13U ||
             root_telemetry.root_payload_count != (uint32_t)(size - 1) ||
             root_telemetry.root_receipt_count != (uint32_t)(size - 1) ||
             root_telemetry.root_confirmation_count !=
@@ -1842,7 +1884,7 @@ run_duplicate_rank_case(int port)
         peak_socket_report_test_telemetry_get(&telemetry);
         if (status != PEAK_SOCKET_REPORT_FAILED ||
             session != NULL || aggregate != NULL ||
-            telemetry.wire_version != 12U ||
+            telemetry.wire_version != 13U ||
             telemetry.root_payload_count > 1U ||
             telemetry.root_receipt_count >
                 telemetry.root_payload_count ||
@@ -2024,6 +2066,7 @@ main(void)
                       check_sequential_channel_ports());
     CHECK_SOCKET_CASE("gather-admission-waves",
                       check_gather_admission_waves());
+    check_listener_bind_scope(base_port + 56);
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
     CHECK_SOCKET_CASE("required-rank", check_required_rank_metadata());
     CHECK_SOCKET_CASE("invalid-output-pointers",

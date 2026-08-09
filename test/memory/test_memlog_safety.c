@@ -168,6 +168,37 @@ static int run_multithread_stress(void)
                    "export did not use only the fully committed records");
 }
 
+static int run_output_no_clobber(void)
+{
+    char path[256];
+    FILE* file;
+    char contents[32] = {0};
+
+    if (snprintf(path, sizeof(path), "/tmp/peak-memlog-no-clobber-%ld.csv",
+                 (long)getpid()) >= (int)sizeof(path)) return 1;
+    file = fopen(path, "w");
+    if (!expect(file != NULL, "could not create preserved CSV")) return 1;
+    if (!expect(fputs("preserved\n", file) >= 0, "could not seed preserved CSV") ||
+        !expect(fclose(file) == 0, "could not close preserved CSV")) return 1;
+    if (!expect(setenv("PEAK_MEMLOG_TEMPLATE", path, 1) == 0,
+                "could not set memlog template")) return 1;
+    if (!expect(peak_memlog_test_open(4), "memlog did not open")) return 1;
+    peak_memlog_test_log_event(2, 1, 1, 1);
+    peak_memlog_test_finalize();
+    file = fopen(path, "r");
+    if (!expect(file != NULL, "preserved CSV disappeared")) return 1;
+    if (!expect(fgets(contents, sizeof(contents), file) != NULL &&
+                strcmp(contents, "preserved\n") == 0,
+                "memlog replaced an existing CSV")) {
+        fclose(file);
+        return 1;
+    }
+    fclose(file);
+    unlink(path);
+    unsetenv("PEAK_MEMLOG_TEMPLATE");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2) return 2;
@@ -178,6 +209,7 @@ int main(int argc, char** argv)
     if (strcmp(argv[1], "capacity") == 0) return run_capacity();
     if (strcmp(argv[1], "stalled") == 0) return run_stalled_writer();
     if (strcmp(argv[1], "stress") == 0) return run_multithread_stress();
+    if (strcmp(argv[1], "no-clobber") == 0) return run_output_no_clobber();
     if (strcmp(argv[1], "realloc") == 0) {
         gum_init_embedded();
         int result = !peak_malloc_test_failed_realloc_preserves_accounting();

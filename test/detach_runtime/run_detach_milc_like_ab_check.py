@@ -30,6 +30,10 @@ STATS_CSV_FIELDS = (
     "dropped_calls",
     "dropped_threads",
 )
+PEAK_STATS_NAME_RE = re.compile(
+    r"^milc-like-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+    r"h[A-Za-z0-9_.-]+-r[A-Za-z0-9_-]+-p\d+-q[0-9a-f]{16}\.csv$"
+)
 STATS_CSV_METRIC_FIELDS = STATS_CSV_FIELDS[4:11]
 STATS_CSV_DIAGNOSTIC_FIELDS = STATS_CSV_FIELDS[11:]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
@@ -330,7 +334,7 @@ def progress_gate_required(args):
 
 
 def reset_peak_artifacts(args):
-    for path in args.work_dir.glob("milc-like-stats-p*.csv"):
+    for path in args.work_dir.glob("milc-like-stats-*.csv"):
         path.unlink()
 
 
@@ -1006,7 +1010,11 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
 
 
 def read_profiled_stats(args):
-    paths = sorted(args.work_dir.glob("milc-like-stats-p*.csv"))
+    candidates = sorted(args.work_dir.glob("milc-like-stats-*.csv"))
+    paths = [path for path in candidates if PEAK_STATS_NAME_RE.fullmatch(path.name)]
+    unexpected = [path for path in candidates if path not in paths]
+    if unexpected:
+        raise AssertionError(f"unexpected PEAK stats CSV artifacts: {unexpected}")
     if not paths:
         raise AssertionError("missing PEAK stats CSV for profiled call coverage")
     if len(paths) != 1:

@@ -1126,9 +1126,24 @@ def main():
             env=env,
             timeout=args.timeout,
         )
-        stats_files = sorted(Path(stats_dir).glob("peak-stats-p*.csv"))
+        stats_name = re.compile(
+            r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+            r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
+            r"q[0-9a-f]{16}\.csv$"
+        )
+        stats_files = sorted(
+            path for path in Path(stats_dir).glob("peak-stats-*.csv")
+            if stats_name.fullmatch(path.name)
+        )
+        unexpected_stats_files = [
+            path for path in Path(stats_dir).glob("peak-stats-*.csv")
+            if not stats_name.fullmatch(path.name)
+        ]
+        if unexpected_stats_files:
+            raise AssertionError(
+                f"unexpected PEAK stats CSV artifacts: {unexpected_stats_files}")
         temporary_stats_files = sorted(
-            Path(stats_dir).glob("peak-stats-p*.csv.tmp.*")
+            Path(stats_dir).glob("peak-stats-*.csv.tmp.*")
         )
         finalize_enter_markers = sorted(
             Path(stats_dir).glob("finalize-enter-r*.txt")
@@ -1162,19 +1177,14 @@ def main():
                 stats_rows.extend(rows)
         for name, evidence in stats_file_evidence.items():
             require_valid_accounting_diagnostics(name, evidence["rows"])
-        selected_stats_pattern = (
-            "peak-stats-p*-r0.csv" if nprocs > 1 else "peak-stats-p*.csv"
-        )
-        selected_temporary_stats_pattern = (
-            "peak-stats-p*-r0.csv.tmp.*" if nprocs > 1 else
-            "peak-stats-p*.csv.tmp.*"
-        )
-        selected_stats_files = sorted(
-            Path(stats_dir).glob(selected_stats_pattern)
-        )
-        selected_temporary_stats_files = sorted(
-            Path(stats_dir).glob(selected_temporary_stats_pattern)
-        )
+        selected_stats_files = [
+            path for path in stats_files
+            if nprocs == 1 or stats_name.fullmatch(path.name)["rank"] == "0"
+        ]
+        selected_temporary_stats_files = [
+            path for path in temporary_stats_files
+            if nprocs == 1 or "-r0-" in path.name
+        ]
         selected_stats_rows = []
         selected_stats_fields = None
         if len(selected_stats_files) == 1:

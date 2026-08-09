@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "internal/general_listener/report_formatter.h"
+#include "internal/general_listener/output_identity.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 enum { TEST_HOSTNAME_CAPACITY = 256 };
@@ -308,6 +310,7 @@ check_rank_local_csv_names(const char* stats_base,
     peak_report_snapshot_prepare_for_render(snapshot);
 
     /* Aggregate naming remains unchanged even inside a multi-rank job. */
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
     assert(peak_report_formatter_write_csv(snapshot));
     assert(access(aggregate_path, F_OK) == 0);
     assert(unlink(aggregate_path) == 0);
@@ -317,6 +320,7 @@ check_rank_local_csv_names(const char* stats_base,
                     "%s-p%d-r3.csv",
                     stats_base,
                     (int)getpid()) > 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", rank_path, 1) == 0);
     assert(peak_report_formatter_write_rank_local_csv(snapshot));
     assert(access(rank_path, F_OK) == 0);
     assert(access(aggregate_path, F_OK) != 0);
@@ -331,6 +335,7 @@ check_rank_local_csv_names(const char* stats_base,
                     stats_base,
                     (int)getpid(),
                     hostname) > 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", hostname_path, 1) == 0);
     assert(peak_report_formatter_write_rank_local_csv(snapshot));
     assert(access(hostname_path, F_OK) == 0);
     assert(unlink(hostname_path) == 0);
@@ -361,6 +366,7 @@ check_csv_permissions(const char* csv_path)
     struct stat attributes;
     mode_t previous_umask;
 
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
     peak_report_snapshot_prepare_for_render(snapshot);
     previous_umask = umask(0027);
     assert(peak_report_formatter_write_csv(snapshot));
@@ -379,6 +385,7 @@ check_no_output(const char* csv_path)
     char* text;
 
     assert(snapshot != NULL);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
     assert(peak_report_snapshot_set_program(snapshot, "idle"));
     assert(peak_report_snapshot_set_name(snapshot, 0, "idle_hook"));
     snapshot->instrumented[0] = 1;
@@ -399,6 +406,7 @@ check_dropped_only_output(const char* csv_path)
     char* csv;
 
     assert(snapshot != NULL);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
     assert(peak_report_snapshot_set_program(snapshot, "dropped-only"));
     assert(peak_report_snapshot_set_name(snapshot, 0, "untracked"));
     snapshot->instrumented[0] = 1;
@@ -507,6 +515,7 @@ check_long_stats_path(const char* temp_directory)
     assert(snprintf(csv_path, sizeof(csv_path), "%s-p%d.csv",
                     stats_base, (int)getpid()) > 0);
     assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
 
     peak_report_snapshot_prepare_for_render(snapshot);
     assert(peak_report_formatter_write_csv(snapshot));
@@ -540,6 +549,7 @@ check_failed_csv_never_replaces_final(const char* temp_directory)
     assert(snprintf(csv_path, sizeof(csv_path), "%s-p%d.csv",
                     stats_base, (int)getpid()) > 0);
     assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
     existing = fopen(csv_path, "w");
     assert(existing != NULL);
     assert(fputs(preserved, existing) >= 0);
@@ -582,6 +592,144 @@ check_failed_csv_never_replaces_final(const char* temp_directory)
     peak_report_snapshot_destroy(snapshot);
 }
 
+static void
+check_output_template_and_no_clobber(const char* temp_directory)
+{
+    char stats_base[512];
+    char template_path[768];
+    char written_path[1024] = {0};
+    DIR* directory;
+    struct dirent* entry;
+    PeakReportSnapshot* first = create_fixture("template-first");
+    PeakReportSnapshot* second = create_fixture("template-second");
+    char* contents;
+
+    assert(snprintf(stats_base, sizeof(stats_base), "%s/template", temp_directory) > 0);
+    assert(snprintf(template_path, sizeof(template_path),
+                    "%s/{jobid}-{stepid}-{host}-{rank}-{pid}-{session}.csv",
+                    temp_directory) > 0);
+    assert(setenv("SLURM_JOB_ID", "job-77", 1) == 0);
+    assert(setenv("SLURM_STEP_ID", "step-9", 1) == 0);
+    assert(setenv("SLURM_PROCID", "6", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", template_path, 1) == 0);
+    peak_report_snapshot_prepare_for_render(first);
+    assert(peak_report_formatter_write_csv(first));
+
+    directory = opendir(temp_directory);
+    assert(directory != NULL);
+    while ((entry = readdir(directory)) != NULL) {
+        if (strstr(entry->d_name, "job-77-step-9-") == entry->d_name) {
+            assert(snprintf(written_path, sizeof(written_path), "%s/%s",
+                            temp_directory, entry->d_name) > 0);
+            break;
+        }
+    }
+    assert(closedir(directory) == 0);
+    assert(written_path[0] != '\0');
+    assert(strstr(written_path, "-5-") != NULL);
+    assert(strstr(written_path, "{session}") == NULL);
+    contents = read_file(written_path);
+    assert(strstr(contents, "template-first") != NULL);
+    free(contents);
+
+    peak_report_snapshot_prepare_for_render(second);
+    assert(!peak_report_formatter_write_csv(second));
+    contents = read_file(written_path);
+    assert(strstr(contents, "template-first") != NULL);
+    assert(strstr(contents, "template-second") == NULL);
+    free(contents);
+    assert(unlink(written_path) == 0);
+
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", "{unknown}", 1) == 0);
+    assert(!peak_report_formatter_write_csv(second));
+    assert(unsetenv("SLURM_JOB_ID") == 0);
+    assert(unsetenv("SLURM_STEP_ID") == 0);
+    assert(unsetenv("SLURM_PROCID") == 0);
+    peak_report_snapshot_destroy(second);
+    peak_report_snapshot_destroy(first);
+}
+
+static void
+check_concurrent_no_clobber(const char* temp_directory)
+{
+    char path[768];
+    int start[2];
+    pid_t child;
+    int child_status;
+    bool parent_success;
+    PeakReportSnapshot* snapshot = create_fixture("concurrent");
+
+    assert(snprintf(path, sizeof(path), "%s/concurrent.csv", temp_directory) > 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", path, 1) == 0);
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(pipe(start) == 0);
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        char signal;
+        (void)close(start[1]);
+        if (read(start[0], &signal, 1) != 1) _exit(2);
+        _exit(peak_report_formatter_write_csv(snapshot) ? 0 : 1);
+    }
+    assert(close(start[0]) == 0);
+    assert(write(start[1], "x", 1) == 1);
+    assert(close(start[1]) == 0);
+    parent_success = peak_report_formatter_write_csv(snapshot);
+    assert(waitpid(child, &child_status, 0) == child);
+    assert(WIFEXITED(child_status));
+    assert((parent_success ? 1 : 0) + (WEXITSTATUS(child_status) == 0 ? 1 : 0) == 1);
+    assert(access(path, F_OK) == 0);
+    assert(unlink(path) == 0);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_template_parent_creation(const char* temp_directory)
+{
+    char template_path[768];
+    char final_path[768];
+    char directory_b[640];
+    char directory_a[640];
+    PeakReportSnapshot* snapshot = create_fixture("nested-template");
+
+    assert(snprintf(directory_a, sizeof(directory_a), "%s/./nested", temp_directory) > 0);
+    assert(snprintf(directory_b, sizeof(directory_b), "%s/job", directory_a) > 0);
+    assert(snprintf(template_path, sizeof(template_path), "%s/report.csv", directory_b) > 0);
+    assert(snprintf(final_path, sizeof(final_path), "%s", template_path) > 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", template_path, 1) == 0);
+    peak_report_snapshot_prepare_for_render(snapshot);
+    assert(peak_report_formatter_write_csv(snapshot));
+    assert(access(final_path, F_OK) == 0);
+    assert(unlink(final_path) == 0);
+    assert(rmdir(directory_b) == 0);
+    assert(rmdir(directory_a) == 0);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_output_identity_metadata(void)
+{
+    char path[512];
+
+    assert(setenv("SLURM_JOB_ID", "job-77", 1) == 0);
+    assert(setenv("SLURM_STEP_ID", "step-9", 1) == 0);
+    assert(setenv("PMIX_RANK", "5", 1) == 0);
+    peak_output_identity_initialize();
+    assert(setenv("SLURM_JOB_ID", "../outside", 1) == 0);
+    assert(unsetenv("SLURM_STEP_ID") == 0);
+    assert(setenv("PMIX_RANK", "6", 1) == 0);
+    assert(peak_output_identity_path(path, sizeof(path), "ignored",
+                                     "/tmp/{jobid}/{stepid}/{rank}-{pid}-{session}.csv",
+                                     ".csv", -1));
+    assert(strstr(path, "/job-77/step-9/5-") != NULL);
+    assert(peak_output_identity_path(path, sizeof(path), "ignored",
+                                     "/tmp/{jobid}.csv", ".csv", -1));
+    assert(strcmp(path, "/tmp/job-77.csv") == 0);
+    assert(unsetenv("SLURM_JOB_ID") == 0);
+    assert(unsetenv("PMIX_RANK") == 0);
+}
+
 int
 main(void)
 {
@@ -590,6 +738,7 @@ main(void)
     char csv_path[768];
 
     assert(mkdtemp(temp_directory) != NULL);
+    check_output_identity_metadata();
     clear_launcher_environment();
     assert(snprintf(stats_base,
                     sizeof(stats_base),
@@ -601,6 +750,7 @@ main(void)
                     stats_base,
                     (int)getpid()) > 0);
     assert(setenv("PEAK_STATSLOG_PATH", stats_base, 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
 
     check_csv_golden(csv_path);
     check_csv_quoted_name(csv_path);
@@ -613,8 +763,12 @@ main(void)
     check_text_flush_failure();
     check_long_stats_path(temp_directory);
     check_failed_csv_never_replaces_final(temp_directory);
+    check_output_template_and_no_clobber(temp_directory);
+    check_concurrent_no_clobber(temp_directory);
+    check_template_parent_creation(temp_directory);
 
     assert(unsetenv("PEAK_STATSLOG_PATH") == 0);
+    assert(unsetenv("PEAK_STATSLOG_TEMPLATE") == 0);
     assert(rmdir(temp_directory) == 0);
     puts("report_formatter_test_ok");
     return 0;

@@ -157,11 +157,7 @@ def expected_attached_records(mode):
 
 
 def find_stats_csv(stats_prefix, pid):
-    expected = f"{stats_prefix}-p{pid}.csv"
-    if os.path.exists(expected):
-        return expected
-
-    candidates = sorted(glob.glob(f"{stats_prefix}-p*.csv"))
+    candidates = sorted(glob.glob(f"{stats_prefix}-j*-s*-h*-r*-p{pid}-q????????????????.csv"))
     if len(candidates) == 1:
         return candidates[0]
     return None

@@ -186,6 +186,7 @@ if(BUILD_TESTING)
 
     add_executable(test_report_formatter
         report/test_report_formatter.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
@@ -237,6 +238,7 @@ if(BUILD_TESTING)
     add_executable(test_mpi_report_request_lifetime
         report/test_mpi_report_request_lifetime.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
@@ -439,6 +441,7 @@ if(BUILD_TESTING)
 
     add_executable(test_exec_checkpoint_writer
         report/test_exec_checkpoint_writer.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
@@ -3372,7 +3375,7 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
-    foreach(memlog_case create sizing mapping overflow capacity stalled stress allocation realloc)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stress no-clobber allocation realloc)
         add_test(NAME test_memlog_${memlog_case}
             COMMAND test_memlog_safety ${memlog_case})
         set_tests_properties(test_memlog_${memlog_case}

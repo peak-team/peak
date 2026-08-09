@@ -7,6 +7,7 @@ set(sources_peak
     general_listener.c
     general_listener/attach_policy.c
     general_listener/exec_checkpoint_writer.c
+    general_listener/output_identity.c
     general_listener/report_formatter.c
     general_listener/report_maxima.c
     general_listener/report_model.c

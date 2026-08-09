@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -19,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -32,6 +36,10 @@
 #define PEAK_OUTPUT_AGGREGATION_HOST_ENV "PEAK_OUTPUT_AGGREGATION_HOST"
 #define PEAK_OUTPUT_AGGREGATION_PORT_ENV "PEAK_OUTPUT_AGGREGATION_PORT"
 #define PEAK_OUTPUT_AGGREGATION_TOKEN_ENV "PEAK_OUTPUT_AGGREGATION_TOKEN"
+#define PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS_ENV \
+    "PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS"
+#define PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND_ENV \
+    "PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND"
 #define PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL_ENV \
     "PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL"
 #define PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_DROP_ONCE_ENV \
@@ -70,7 +78,7 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL"
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 12U
+#define PEAK_SOCKET_REDUCE_VERSION 13U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT 0x41U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM 0x42U
 #define PEAK_SOCKET_REDUCE_GATHER_REGISTERED 0x01U
@@ -147,19 +155,19 @@ typedef struct {
 } PeakSocketReduceRecord;
 
 /*
- * Wire-v12 intentionally targets a homogeneous job: every rank must use the
+ * Wire-v13 intentionally targets a homogeneous job: every rank must use the
  * same byte order, floating-point representation, and 64-bit Linux C ABI.
  * Lock the layouts so an accidental field or packing change cannot silently
  * corrupt a report without another wire-version bump.
  */
 _Static_assert(sizeof(PeakSocketReduceHeader) == 168,
-               "wire-v12 header layout changed");
+               "wire-v13 header layout changed");
 _Static_assert(sizeof(PeakSocketReduceReleaseFrame) == 40,
-               "wire-v12 control-frame layout changed");
+               "wire-v13 control-frame layout changed");
 _Static_assert(sizeof(PeakSocketReduceRecord) == 80,
-               "wire-v12 record layout changed");
+               "wire-v13 record layout changed");
 _Static_assert(sizeof(unsigned long) == sizeof(uint64_t),
-               "wire-v12 requires a 64-bit unsigned long");
+               "wire-v13 requires a 64-bit unsigned long");
 
 struct PeakSocketReportSession {
     bool* release_targets;
@@ -388,6 +396,50 @@ peak_socket_reduce_session_token(void)
         return hash;
     }
     return peak_socket_reduce_launcher_token();
+}
+
+static bool
+peak_socket_reduce_session_nonce(uint64_t* nonce_out)
+{
+    unsigned char* cursor = (unsigned char*)nonce_out;
+    size_t remaining = sizeof(*nonce_out);
+
+    if (nonce_out == NULL) {
+        return false;
+    }
+#ifdef __linux__
+    while (remaining != 0) {
+        ssize_t read_bytes;
+        do {
+            read_bytes = getrandom(cursor, remaining, GRND_NONBLOCK);
+        } while (read_bytes < 0 && errno == EINTR);
+        if (read_bytes <= 0) {
+            break;
+        }
+        cursor += read_bytes;
+        remaining -= (size_t)read_bytes;
+    }
+#endif
+    if (remaining != 0) {
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0) {
+            return false;
+        }
+        while (remaining != 0) {
+            ssize_t read_bytes;
+            do {
+                read_bytes = read(fd, cursor, remaining);
+            } while (read_bytes < 0 && errno == EINTR);
+            if (read_bytes <= 0) {
+                close(fd);
+                return false;
+            }
+            cursor += read_bytes;
+            remaining -= (size_t)read_bytes;
+        }
+        close(fd);
+    }
+    return true;
 }
 
 static void
@@ -1282,6 +1334,8 @@ peak_socket_reduce_bind_listener(int port)
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     struct sockaddr_in address;
+    const char* bind_override;
+    char root_host[256];
 
     if (fd < 0) {
         return -1;
@@ -1290,7 +1344,69 @@ peak_socket_reduce_bind_listener(int port)
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_override = getenv(PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS_ENV);
+    if (peak_general_listener_env_value_truthy(
+            getenv(PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND_ENV))) {
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (bind_override != NULL && bind_override[0] != '\0') {
+        if (inet_pton(AF_INET, bind_override, &address.sin_addr) != 1 ||
+            address.sin_addr.s_addr == htonl(INADDR_ANY)) {
+            close(fd);
+            errno = EINVAL;
+            return -1;
+        }
+    } else {
+        struct addrinfo hints = {0};
+        struct addrinfo* result = NULL;
+        struct addrinfo* candidate;
+        int status;
+        int bind_errno = EADDRNOTAVAIL;
+        bool bound = false;
+
+        if (!peak_socket_reduce_root_host(root_host, sizeof(root_host))) {
+            close(fd);
+            errno = EADDRNOTAVAIL;
+            return -1;
+        }
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        status = getaddrinfo(root_host, NULL, &hints, &result);
+        if (status != 0 || result == NULL) {
+            if (result != NULL) {
+                freeaddrinfo(result);
+            }
+            close(fd);
+            errno = EADDRNOTAVAIL;
+            return -1;
+        }
+        for (candidate = result; candidate != NULL;
+             candidate = candidate->ai_next) {
+            const struct sockaddr_in* candidate_address;
+
+            if (candidate->ai_family != AF_INET ||
+                candidate->ai_addrlen != sizeof(*candidate_address)) {
+                continue;
+            }
+            candidate_address = (const struct sockaddr_in*)candidate->ai_addr;
+            if (candidate_address->sin_addr.s_addr == htonl(INADDR_ANY)) {
+                continue;
+            }
+            address.sin_addr = candidate_address->sin_addr;
+            address.sin_port = htons((uint16_t)port);
+            if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == 0) {
+                bound = true;
+                break;
+            }
+            bind_errno = errno;
+        }
+        freeaddrinfo(result);
+        if (!bound) {
+            close(fd);
+            errno = bind_errno;
+            return -1;
+        }
+        return fd;
+    }
     address.sin_port = htons((uint16_t)port);
 
     if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
@@ -1302,6 +1418,14 @@ peak_socket_reduce_bind_listener(int port)
     }
     return fd;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+int
+peak_socket_report_test_bind_listener(int port)
+{
+    return peak_socket_reduce_bind_listener(port);
+}
+#endif
 
 static bool
 peak_socket_reduce_activate_listener(int fd, int expected_connections)
@@ -2163,6 +2287,7 @@ typedef struct {
     size_t record_bytes;
     int size;
     uint64_t session_token;
+    uint64_t receipt_session_token;
     bool* claimed_ranks;
     bool* release_targets;
     double* profile_seconds;
@@ -2245,8 +2370,11 @@ peak_socket_gather_prepare_receipt(
     connection->receipt.version = PEAK_SOCKET_REDUCE_VERSION;
     connection->receipt.rank = connection->header.rank;
     connection->receipt.hook_count = connection->header.hook_count;
-    connection->receipt.session_token =
-        connection->header.session_token;
+    connection->receipt.session_token = aggregate->receipt_session_token;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_socket_test_telemetry.root_receipt_session_nonce =
+        connection->receipt.session_token;
+#endif
     connection->receipt.type = PEAK_SOCKET_REDUCE_GATHER_RECEIPT;
     connection->receipt.decision =
         PEAK_SOCKET_REDUCE_GATHER_REGISTERED;
@@ -2445,7 +2573,7 @@ peak_socket_gather_read_ready(PeakSocketGatherConnection* connection,
                     confirmation->hook_count !=
                         connection->header.hook_count ||
                     confirmation->session_token !=
-                        connection->header.session_token ||
+                        connection->receipt.session_token ||
                     confirmation->type !=
                         PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM ||
                     confirmation->decision !=
@@ -3056,7 +3184,6 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
         receipt.version == header->version &&
         receipt.rank == header->rank &&
         receipt.hook_count == header->hook_count &&
-        receipt.session_token == header->session_token &&
         receipt.type == PEAK_SOCKET_REDUCE_GATHER_RECEIPT &&
         receipt.decision ==
             PEAK_SOCKET_REDUCE_GATHER_REGISTERED;
@@ -3087,10 +3214,14 @@ peak_socket_report_peer_begin(const PeakReportSnapshot* local,
                       rank);
     }
 
+    {
+    PeakSocketReduceHeader release_header = *header;
+    release_header.session_token = receipt.session_token;
     release = peak_socket_reduce_wait_for_release(root_addresses,
                                                   release_port,
-                                                  header,
+                                                  &release_header,
                                                   release_wait_timeout_ms);
+    }
     freeaddrinfo(root_addresses);
     if (release == PEAK_SOCKET_RELEASE_FALLBACK) {
         peak_log_info("[peak] Socket aggregation root requested rank-local fallback for rank %d\n",
@@ -3125,6 +3256,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     int startup_grace_ms;
 #endif
     uint64_t session_token;
+    uint64_t session_nonce = 0;
     PeakSocketReduceRecord* local_records = NULL;
     PeakSocketReduceHeader header;
     PeakReportRankTuple local_report_tuple;
@@ -3170,6 +3302,20 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                       rank,
                       size);
         return PEAK_SOCKET_REPORT_FAILED;
+    }
+    if (rank == 0) {
+        unsigned int attempts = 0;
+
+        do {
+            if (!peak_socket_reduce_session_nonce(&session_nonce)) {
+                peak_log_warn("[peak] Socket aggregation could not create a session nonce; skipping aggregate output\n");
+                return PEAK_SOCKET_REPORT_FAILED;
+            }
+        } while (session_nonce == 0 && ++attempts < 3);
+        if (session_nonce == 0) {
+            peak_log_warn("[peak] Socket aggregation received an invalid session nonce; skipping aggregate output\n");
+            return PEAK_SOCKET_REPORT_FAILED;
+        }
     }
     timeout_budget =
         peak_general_listener_report_timeout_budget_for_rank_count(
@@ -3334,6 +3480,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     gather_aggregate.record_bytes = record_bytes;
     gather_aggregate.size = size;
     gather_aggregate.session_token = session_token;
+    gather_aggregate.receipt_session_token = session_nonce;
     gather_aggregate.claimed_ranks = claimed_ranks;
     gather_aggregate.release_targets = release_targets;
     gather_aggregate.profile_seconds = &socket_profile_seconds;
@@ -3396,7 +3543,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
             release_targets,
             size,
             (uint64_t)local->hook_count,
-            session_token,
+            session_nonce,
             timeout_ms,
             PEAK_SOCKET_REDUCE_RELEASE_FALLBACK);
         free(release_targets);
@@ -3413,7 +3560,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
             release_targets,
             size,
             (uint64_t)local->hook_count,
-            session_token,
+            session_nonce,
             timeout_ms,
             PEAK_SOCKET_REDUCE_RELEASE_FALLBACK);
         free(release_targets);
@@ -3440,7 +3587,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         release_listener,
         timeout_ms,
         (uint64_t)local->hook_count,
-        session_token);
+        session_nonce);
     if (session == NULL) {
         peak_report_snapshot_destroy(aggregate);
         (void)peak_socket_reduce_release_peers(
@@ -3448,7 +3595,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
             release_targets,
             size,
             (uint64_t)local->hook_count,
-            session_token,
+            session_nonce,
             timeout_ms,
             PEAK_SOCKET_REDUCE_RELEASE_FALLBACK);
         free(release_targets);

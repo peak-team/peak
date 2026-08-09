@@ -1102,7 +1102,10 @@ def run_fixture(args, tmpdir: Path, preload=True):
 
 def csv_files(tmpdir: Path):
     stats_name = re.compile(
-        r"^(?:peak_stats|peak_statslog)-p\d+(?P<checkpoint>-exec\d+)?\.csv$"
+        r"^(?:(?:peak_stats|peak_statslog)-p\d+|"
+        r"(?:peak_stats|peak_statslog)-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+        r"h[A-Za-z0-9_.-]+-r[A-Za-z0-9_-]+-p\d+-q[0-9a-f]{16})"
+        r"(?P<checkpoint>-exec\d+)?\.csv$"
     )
     all_csv = sorted(tmpdir.glob("*.csv"))
     matched_csv = [(path, stats_name.fullmatch(path.name)) for path in all_csv]

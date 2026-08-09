@@ -91,7 +91,9 @@ peak_mpi_exit_aggregate_csv_is_published(void)
     if (stats_prefix == NULL || stats_prefix[0] == '\0') {
         return 0;
     }
-    length = snprintf(NULL, 0, "%s-p*.csv", stats_prefix);
+    length = snprintf(NULL, 0,
+                      "%s-j*-s*-h*-r*-p*-q????????????????.csv",
+                      stats_prefix);
     if (length < 0) {
         return 0;
     }
@@ -100,7 +102,8 @@ peak_mpi_exit_aggregate_csv_is_published(void)
         return 0;
     }
     (void)snprintf(pattern, (size_t)length + 1,
-                   "%s-p*.csv", stats_prefix);
+                   "%s-j*-s*-h*-r*-p*-q????????????????.csv",
+                   stats_prefix);
 
     if (glob(pattern, 0, NULL, &matches) == 0) {
         for (size_t i = 0; i < matches.gl_pathc; i++) {

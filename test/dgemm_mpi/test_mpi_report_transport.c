@@ -56,14 +56,13 @@ validate_root_formatting(PeakReportSnapshot* aggregate)
                                  (long)getpid());
     stats_path_length = snprintf(stats_path,
                                  sizeof(stats_path),
-                                 "%s-p%ld.csv",
-                                 stats_base,
-                                 (long)getpid());
+                                 "%s.csv", stats_base);
     if (stats_base_length < 0 ||
         (size_t)stats_base_length >= sizeof(stats_base) ||
         stats_path_length < 0 ||
         (size_t)stats_path_length >= sizeof(stats_path) ||
-        setenv("PEAK_STATSLOG_PATH", stats_base, 1) != 0) {
+        setenv("PEAK_STATSLOG_PATH", stats_base, 1) != 0 ||
+        setenv("PEAK_STATSLOG_TEMPLATE", stats_path, 1) != 0) {
         return 1;
     }
 
@@ -82,6 +81,9 @@ validate_root_formatting(PeakReportSnapshot* aggregate)
         failures++;
     }
     if (unlink(stats_path) != 0) {
+        failures++;
+    }
+    if (unsetenv("PEAK_STATSLOG_TEMPLATE") != 0) {
         failures++;
     }
 
