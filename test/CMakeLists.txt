@@ -1288,6 +1288,9 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "hotloop_trace_check_ok")
         # Hosted runners can perturb these short baselines substantially. Keep
         # this smoke test structural; Frontera same-node B-A-B owns performance.
+        add_test(NAME test_detach_milc_like_timed_window_scheduler
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_milc_like
+                    --timed-window-scheduler-self-test)
         add_test(NAME test_detach_milc_like_ab_strict
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_milc_like_ab_check.py

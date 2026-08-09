@@ -142,6 +142,20 @@ typedef struct {
     uint64_t true_calls;
 } CallCheckpoint;
 
+typedef struct {
+    double duration;
+    double window_seconds;
+    double previous_elapsed;
+    uint64_t previous_calls;
+    unsigned int next_index;
+} TimedWindowScheduler;
+
+typedef struct {
+    unsigned int index;
+    double elapsed;
+    uint64_t true_calls;
+} TimedWindow;
+
 static double
 monotonic_seconds(void)
 {
@@ -462,6 +476,110 @@ print_window(unsigned int index, double elapsed, uint64_t true_calls)
     fflush(stdout);
 }
 
+static uint64_t
+interpolate_window_calls(double previous_elapsed,
+                         uint64_t previous_calls,
+                         double observed_elapsed,
+                         uint64_t observed_calls,
+                         double window_elapsed)
+{
+    long double fraction;
+    long double increment;
+    uint64_t delta;
+
+    if (observed_calls <= previous_calls ||
+        observed_elapsed <= previous_elapsed ||
+        window_elapsed <= previous_elapsed) {
+        return previous_calls;
+    }
+    if (window_elapsed >= observed_elapsed) {
+        return observed_calls;
+    }
+
+    delta = observed_calls - previous_calls;
+    fraction = ((long double)window_elapsed - previous_elapsed) /
+               ((long double)observed_elapsed - previous_elapsed);
+    increment = fraction * delta;
+    if (increment <= 0.0L) {
+        return previous_calls;
+    }
+    if (increment >= delta) {
+        return observed_calls;
+    }
+    return previous_calls + (uint64_t)increment;
+}
+
+static int
+timed_window_scheduler_next(TimedWindowScheduler* scheduler,
+                            double observed_elapsed,
+                            uint64_t observed_calls,
+                            TimedWindow* window)
+{
+    double window_elapsed =
+        (double)scheduler->next_index * scheduler->window_seconds;
+
+    /* A periodic boundary at the deadline belongs to the final sample. */
+    if (window_elapsed >= scheduler->duration ||
+        window_elapsed > observed_elapsed) {
+        return 0;
+    }
+
+    window->index = scheduler->next_index;
+    window->elapsed = window_elapsed;
+    window->true_calls = interpolate_window_calls(scheduler->previous_elapsed,
+                                                   scheduler->previous_calls,
+                                                   observed_elapsed,
+                                                   observed_calls,
+                                                   window_elapsed);
+    scheduler->next_index++;
+    return 1;
+}
+
+static void
+timed_window_scheduler_observe(TimedWindowScheduler* scheduler,
+                               double observed_elapsed,
+                               uint64_t observed_calls)
+{
+    if (observed_elapsed >= scheduler->previous_elapsed &&
+        observed_calls >= scheduler->previous_calls) {
+        scheduler->previous_elapsed = observed_elapsed;
+        scheduler->previous_calls = observed_calls;
+    }
+}
+
+static int
+run_timed_window_scheduler_self_test(void)
+{
+    TimedWindowScheduler scheduler = {
+        .duration = 6.0,
+        .window_seconds = 1.0,
+        .previous_elapsed = 0.0,
+        .previous_calls = 100,
+        .next_index = 1,
+    };
+    TimedWindow window;
+    unsigned int expected_index = 1;
+
+    while (timed_window_scheduler_next(&scheduler, 6.0, 700, &window)) {
+        uint64_t expected_calls = 100 + (uint64_t)expected_index * 100;
+
+        if (window.index != expected_index ||
+            window.elapsed != (double)expected_index ||
+            window.true_calls != expected_calls) {
+            fprintf(stderr, "timed window scheduler interpolation failed\n");
+            return 1;
+        }
+        expected_index++;
+    }
+    if (expected_index != 6 || scheduler.next_index != 6) {
+        fprintf(stderr, "timed window scheduler included deadline boundary\n");
+        return 1;
+    }
+    timed_window_scheduler_observe(&scheduler, 6.0, 700);
+    printf("timed_window_scheduler_ok\n");
+    return 0;
+}
+
 static void
 print_checkpoint(unsigned int index, double elapsed, uint64_t true_calls)
 {
@@ -591,6 +709,10 @@ main(int argc, char** argv)
     unsigned int allowed_cpu_count = 0;
     unsigned int pinned_worker_count = 0;
 
+    if (has_flag(argc, argv, "--timed-window-scheduler-self-test")) {
+        return run_timed_window_scheduler_self_test();
+    }
+
     target_inner_work = (unsigned int)inner_work;
     if (thread_count > 256) {
         thread_count = 256;
@@ -675,32 +797,56 @@ main(int argc, char** argv)
     }
     if (iterations == 0) {
         double window_seconds = (double)window_ms / 1000.0;
-        double next_window = start + window_seconds;
-        unsigned int window_index = 0;
+        TimedWindowScheduler window_scheduler = {
+            .duration = (double)seconds,
+            .window_seconds = window_seconds,
+            .previous_elapsed = 0.0,
+            .previous_calls = initial_calls,
+            .next_index = 1,
+        };
+        TimedWindow window;
 
-        print_window(window_index, 0.0, initial_calls);
+        print_window(0, 0.0, initial_calls);
         while (monotonic_seconds() < deadline) {
             double now = monotonic_seconds();
+            double elapsed_window = now - start;
             uint64_t true_calls = load_total_target_count();
 
-            if (now >= next_window) {
-                window_index++;
-                print_window(window_index, now - start, true_calls);
-                next_window += window_seconds;
+            while (timed_window_scheduler_next(&window_scheduler,
+                                               elapsed_window,
+                                               true_calls,
+                                               &window)) {
+                print_window(window.index, window.elapsed, window.true_calls);
             }
+            timed_window_scheduler_observe(&window_scheduler,
+                                           elapsed_window,
+                                           true_calls);
             record_timed_checkpoint_sample(checkpoints,
                                            &checkpoint_count,
                                            (unsigned int)checkpoint_limit,
                                            checkpoint_calls,
                                            &next_checkpoint_calls,
-                                           now - start,
+                                           elapsed_window,
                                            true_calls);
             sleep_until(now + 0.001);
         }
-        window_index++;
-        print_window(window_index,
-                     monotonic_seconds() - start,
-                     load_total_target_count());
+        {
+            double final_elapsed = monotonic_seconds() - start;
+            uint64_t final_calls = load_total_target_count();
+
+            if (final_elapsed < window_scheduler.duration) {
+                final_elapsed = window_scheduler.duration;
+            }
+            while (timed_window_scheduler_next(&window_scheduler,
+                                               final_elapsed,
+                                               final_calls,
+                                               &window)) {
+                print_window(window.index, window.elapsed, window.true_calls);
+            }
+            print_window(window_scheduler.next_index,
+                         final_elapsed,
+                         final_calls);
+        }
     } else {
         while (atomic_load_explicit(&completed_worker_count,
                                     memory_order_acquire) <
