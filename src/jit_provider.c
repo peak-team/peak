@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "internal/jit_provider.h"
 #include "internal/general_listener_internal.h"
+#include "utils/env_parser.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -101,22 +102,17 @@ peak_jit_default_perfmap_path(void)
 }
 
 static unsigned long
-peak_jit_parse_ulong_env(const char* name, unsigned long fallback)
+peak_jit_parse_ulong_env(const char* name,
+                         const char* unit,
+                         unsigned long fallback,
+                         bool zero_allowed)
 {
-    const char* value = g_getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
+    PeakEnvUnsignedSchema schema = {
+        name, unit, fallback, zero_allowed ? 0UL : 1UL, ULONG_MAX,
+        zero_allowed,
+    };
 
-    if (value == NULL || value[0] == '\0') {
-        return fallback;
-    }
-
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0') {
-        return fallback;
-    }
-    return parsed;
+    return (unsigned long)peak_parse_env_unsigned(&schema);
 }
 
 static const char*
@@ -526,12 +522,15 @@ peak_jit_init_runtime_config_once(void)
     }
     configured_jit_not_exec_retry_timeout_ms =
         peak_jit_parse_ulong_env(PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV,
-                                 PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS);
+                                 "milliseconds",
+                                 PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS,
+                                 true);
     budget =
         peak_jit_parse_ulong_env(PEAK_JIT_DRAIN_RECORD_BUDGET_ENV,
-                                 PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET);
-    configured_jit_drain_record_budget =
-        budget == 0 ? PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET : budget;
+                                 "records",
+                                 PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET,
+                                 false);
+    configured_jit_drain_record_budget = budget;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     const char* attach_sequence =
         g_getenv(PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV);

@@ -189,9 +189,11 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_report_formatter PRIVATE
-        ${PROJECT_SOURCE_DIR}/include)
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
     add_test(NAME test_report_formatter COMMAND test_report_formatter)
     set_tests_properties(test_report_formatter
@@ -205,11 +207,13 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_compile_definitions(test_socket_report_transport PRIVATE
         PEAK_ENABLE_TEST_HOOKS=1)
     target_include_directories(test_socket_report_transport PRIVATE
         ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils
         ${FRIDA_GUM_INCLUDE_DIRS})
     target_link_libraries(test_socket_report_transport PRIVATE
         Threads::Threads
@@ -236,6 +240,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/utils/timing.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_compile_definitions(test_mpi_report_request_lifetime PRIVATE
@@ -288,9 +293,11 @@ if(BUILD_TESTING)
     add_executable(test_runtime_config
         report/test_runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_runtime_config PRIVATE
-        ${PROJECT_SOURCE_DIR}/include)
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_definitions(test_runtime_config PRIVATE
         PEAK_RUNTIME_CONFIG_TEST_MUTABLE_ENV=1
         PEAK_ENABLE_TEST_HOOKS=1)
@@ -299,14 +306,51 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "runtime_config_test_ok")
 
+    add_executable(test_numeric_env_parser
+        utils/test_numeric_env_parser.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
+    target_include_directories(test_numeric_env_parser PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils)
+    add_test(NAME test_numeric_env_parser COMMAND test_numeric_env_parser)
+    set_tests_properties(test_numeric_env_parser
+        PROPERTIES PASS_REGULAR_EXPRESSION "numeric_env_parser_test_ok")
+    add_test(NAME test_numeric_env_parser_single_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_HB_MAX_US=junk; using 600000 microseconds"
+                --stderr-count-regex "invalid PEAK_HB_MAX_US=junk"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_numeric_env_parser> warning)
+    add_test(NAME test_numeric_env_parser_unset_maximum_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "PEAK_HB_MIN_US=600000 requires PEAK_HB_MAX_US >= 600000"
+                --stderr-count-regex "PEAK_HB_MIN_US=600000 requires PEAK_HB_MAX_US >= 600000"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_numeric_env_parser> unset-warning)
+    add_test(NAME test_numeric_env_parser_repeated_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_COST=nan"
+                --stderr-count-regex "invalid PEAK_COST=nan"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_numeric_env_parser> repeated-warning)
+
     add_executable(test_attach_policy
         report/test_attach_policy.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/attach_policy.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
+        ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
         ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_attach_policy PRIVATE
         ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils
         ${FRIDA_GUM_INCLUDE_DIRS})
     target_compile_options(test_attach_policy PRIVATE -UNDEBUG)
     target_link_libraries(test_attach_policy PRIVATE

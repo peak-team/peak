@@ -522,6 +522,15 @@ The defaults below describe the current implementation.
 | `PEAK_HB_K_ERR` | `3.0` | Adaptive-sleep error gain. |
 | `PEAK_HB_K_RATE` | `0.8` | Gain on the EMA of global profile-pressure growth. |
 | `PEAK_HB_EMA_A` | `0.3` | Adaptive-sleep EMA weight. Invalid values outside `(0, 1]` reset to `0.3`. |
+
+All numeric values above require complete, finite input. A present invalid value
+emits one warning and uses its documented default. Sleep bounds must be
+positive; when the resolved maximum is below the accepted minimum, the maximum
+falls back to the minimum. The global detach multiplier is at least `1`, the
+reattach multiplier is in `(0, 1]`, and the reattach multiplier must remain
+below the detach multiplier; a conflict falls back to the reattach default.
+The cooldown default is policy only: `PEAK_REATTACH_COOLDOWN_MS=60000` is not a
+new safety precondition.
 | `PEAK_MAX_NUM_THREADS` | `2 * online CPUs` | Size of per-listener thread slots used for callback counters. |
 | `PEAK_COST` | `0` | Enables count-based detach using calibrated callback cost when positive. |
 | `PEAK_DETACH_COUNT` | unset | Overrides count-based detach threshold when set to a positive integer. |

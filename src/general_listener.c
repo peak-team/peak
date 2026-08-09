@@ -19,6 +19,7 @@
 #include "internal/unsafe_gum_prologue.h"
 #include "detach_controller.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 #include "pthread_listener.h"
 #include <errno.h>
 #include <float.h>
@@ -492,24 +493,14 @@ peak_env_truthy_general(const char* value)
 
 static unsigned int
 peak_general_controller_parse_uint_env(const char* name,
+                                       const char* unit,
                                        unsigned int default_value)
 {
-    const char* value = g_getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
+    PeakEnvUnsignedSchema schema = {
+        name, unit, default_value, 0, G_MAXUINT, true,
+    };
 
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXUINT) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
+    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static void
@@ -518,6 +509,7 @@ peak_general_controller_init_retry_limits_once(void)
     unsigned int max_pending_age_ms =
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV,
+            "milliseconds",
             (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0));
 
     peak_controller_max_pending_age_s =
@@ -525,6 +517,7 @@ peak_general_controller_init_retry_limits_once(void)
     peak_controller_max_retry_count =
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV,
+            "retries",
             peak_controller_default_max_retry_count);
 }
 

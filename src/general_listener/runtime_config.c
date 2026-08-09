@@ -1,6 +1,7 @@
 #include "internal/general_listener/runtime_config.h"
 
 #include "logging.h"
+#include "utils/env_parser.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -27,36 +28,21 @@
 static unsigned int configured_local_mpi_ranks = 1U;
 
 static bool
-peak_general_listener_unsigned_text_is_negative(const char* value)
-{
-    const unsigned char* cursor = (const unsigned char*)value;
-
-    if (cursor == NULL) {
-        return false;
-    }
-    while (*cursor != '\0' && isspace(*cursor)) {
-        cursor++;
-    }
-    return *cursor == '-';
-}
-
-static bool
 peak_general_listener_parse_positive_uint_bounded(const char* name,
                                                   unsigned int maximum,
                                                   unsigned int* value_out)
 {
     const char* value = getenv(name);
-    char* end = NULL;
-    unsigned long parsed;
+    PeakEnvUnsignedSchema schema = {
+        name, "milliseconds", 0, 1, maximum, false,
+    };
+    unsigned long long parsed;
 
-    if (value == NULL || value[0] == '\0' ||
-        peak_general_listener_unsigned_text_is_negative(value)) {
+    if (value == NULL) {
         return false;
     }
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0 ||
-        parsed > maximum) {
+    parsed = peak_parse_env_unsigned(&schema);
+    if (parsed == 0) {
         return false;
     }
     if (value_out != NULL) {
@@ -206,22 +192,17 @@ peak_general_listener_parse_detach_count_override(unsigned long* count_out)
     if (value == NULL || value[0] == '\0') {
         return false;
     }
-    if (peak_general_listener_unsigned_text_is_negative(value)) {
-        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
-        return false;
-    }
+    PeakEnvUnsignedSchema schema = {
+        "PEAK_DETACH_COUNT", "calls", 0, 1, ULONG_MAX, false,
+    };
+    unsigned long long parsed = peak_parse_env_unsigned(&schema);
 
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-
-    if (errno == ERANGE || end == value || *end != '\0' || parsed == 0) {
-        peak_log_info("[peak] ignoring invalid PEAK_DETACH_COUNT=%s\n", value);
+    if (parsed == 0) {
         return false;
     }
 
     if (count_out != NULL) {
-        *count_out = parsed;
+        *count_out = (unsigned long)parsed;
     }
     return true;
 }
@@ -230,25 +211,11 @@ unsigned int
 peak_general_listener_parse_uint_env_default(const char* name,
                                              unsigned int default_value)
 {
-    const char* value = getenv(name);
-    if (value == NULL || value[0] == '\0') {
-        return default_value;
-    }
-    if (peak_general_listener_unsigned_text_is_negative(value)) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
+    PeakEnvUnsignedSchema schema = {
+        name, "milliseconds", default_value, 0, UINT_MAX, true,
+    };
 
-    errno = 0;
-    char* end = NULL;
-    unsigned long parsed = strtoul(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > UINT_MAX) {
-        peak_log_info("[peak] ignoring invalid %s=%s\n", name, value);
-        return default_value;
-    }
-
-    return (unsigned int)parsed;
+    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static bool

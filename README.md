@@ -222,6 +222,16 @@ full output and teardown behavior.
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
 
+Numeric overhead-control values must consume the complete value and be finite.
+Invalid present values emit one warning and use their documented default.
+`PEAK_COST` and the overhead ratios are nonnegative (zero keeps their existing
+disable behavior); heartbeat sleep bounds are positive, and a maximum below an
+accepted minimum is raised to that minimum. Global hysteresis requires a
+detach factor of at least `1`, a reattach factor in `(0, 1]`, and the reattach
+factor strictly below the detach factor; a conflicting reattach value uses its
+default. `PEAK_REATTACH_COOLDOWN_MS=60000` remains a policy default, not a
+safety requirement.
+
 For runtime behavior, accounting, and tuning, see
 [Heartbeat mechanism and runtime policy](docs/heartbeat.md).
 

@@ -5,6 +5,7 @@
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/runtime_config.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 
 #include <errno.h>
 #include <float.h>
@@ -422,6 +423,7 @@ peak_socket_reduce_header_report_tuple(
     return tuple;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
 static int
 peak_socket_reduce_parse_positive_int_env(const char* name,
                                           int default_value)
@@ -444,6 +446,7 @@ peak_socket_reduce_parse_positive_int_env(const char* name,
 
     return (int)parsed;
 }
+#endif
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static bool
@@ -533,18 +536,13 @@ peak_socket_report_test_channel_port(PeakSocketReportChannel channel)
 static int
 peak_socket_reduce_port(void)
 {
-    int port = peak_socket_reduce_parse_positive_int_env(
-        PEAK_OUTPUT_AGGREGATION_PORT_ENV,
-        peak_socket_reduce_default_port());
+    PeakEnvUnsignedSchema schema = {
+        PEAK_OUTPUT_AGGREGATION_PORT_ENV, "TCP port",
+        (unsigned long long)peak_socket_reduce_default_port(), 1, 65535,
+        false,
+    };
 
-    if (port <= 0 || port > 65535) {
-        peak_log_info("[peak] Ignoring out-of-range %s=%d\n",
-                      PEAK_OUTPUT_AGGREGATION_PORT_ENV,
-                      port);
-        return peak_socket_reduce_default_port();
-    }
-
-    return port;
+    return (int)peak_parse_env_unsigned(&schema);
 }
 
 static int64_t
