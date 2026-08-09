@@ -472,9 +472,10 @@ report_many_rank_case_diagnostic(
 }
 
 static int
-run_two_rank_case(int port,
-                  TestRootAction action,
-                  bool mismatched_peer_name)
+run_two_rank_case_with_peer_start_delay(int port,
+                                        TestRootAction action,
+                                        bool mismatched_peer_name,
+                                        bool delay_peer_start)
 {
     PeakReportSnapshot* root = fixture_snapshot(0, false);
     PeakReportSnapshot* aggregate = NULL;
@@ -518,6 +519,7 @@ run_two_rank_case(int port,
         action == TEST_GATHER_RECEIPT_FAILURE;
     char port_text[16];
     char token_text[64];
+    int peer_ready_fds[2] = {-1, -1};
     int receipt_barrier_fds[2] = {-1, -1};
     pid_t child;
     int64_t case_started_ms;
@@ -562,7 +564,7 @@ run_two_rank_case(int port,
     } else {
         /* Test-only grace isolates launcher scheduling before transport I/O. */
         (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS",
-                     "10000",
+                     delay_peer_start ? "100" : "10000",
                      1);
     }
     (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS",
@@ -723,8 +725,20 @@ run_two_rank_case(int port,
     }
 
     peak_socket_report_test_receipt_barrier_set(-1, -1);
+    /*
+     * Keep fork/fixture launch out of root transport timing.  The child
+     * announces readiness immediately before it enters the peer transport;
+     * the root still has its normal startup and protocol deadlines after
+     * that point.
+     */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, peer_ready_fds) != 0) {
+        peak_report_snapshot_destroy(root);
+        return 1;
+    }
     if (receipt_failure_barrier &&
         socketpair(AF_UNIX, SOCK_STREAM, 0, receipt_barrier_fds) != 0) {
+        close(peer_ready_fds[0]);
+        close(peer_ready_fds[1]);
         peak_report_snapshot_destroy(root);
         return 1;
     }
@@ -732,6 +746,8 @@ run_two_rank_case(int port,
     case_started_ms = test_monotonic_ms();
     child = fork();
     if (child < 0) {
+        close(peer_ready_fds[0]);
+        close(peer_ready_fds[1]);
         if (receipt_barrier_fds[0] >= 0) {
             close(receipt_barrier_fds[0]);
         }
@@ -747,6 +763,10 @@ run_two_rank_case(int port,
         PeakSocketReportSession* peer_session = NULL;
         PeakSocketReportStatus peer_status;
         PeakSocketReportTestTelemetry telemetry;
+        const unsigned char ready = 0x71U;
+
+        close(peer_ready_fds[1]);
+        peer_ready_fds[1] = -1;
 
         if (receipt_failure_barrier) {
             close(receipt_barrier_fds[1]);
@@ -756,9 +776,20 @@ run_two_rank_case(int port,
             receipt_barrier_fds[0] = -1;
         }
         set_test_rank(1, 2);
-        if (peer == NULL) {
+        if (delay_peer_start) {
+            /* Without the rendezvous, root exhausts its 100 ms grace. */
+            usleep(250000);
+        }
+        if (peer == NULL ||
+            send(peer_ready_fds[0],
+                 &ready,
+                 sizeof(ready),
+                 MSG_NOSIGNAL) != (ssize_t)sizeof(ready)) {
+            close(peer_ready_fds[0]);
             _exit(99);
         }
+        close(peer_ready_fds[0]);
+        peer_ready_fds[0] = -1;
         peer_status = peak_socket_report_transport_begin(
             peer,
             PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -806,12 +837,26 @@ run_two_rank_case(int port,
             -1, receipt_barrier_fds[1]);
         receipt_barrier_fds[1] = -1;
     }
-    set_test_rank(0, 2);
-    root_status = peak_socket_report_transport_begin(
-        root,
-        PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
-        &session,
-        &aggregate);
+    {
+        unsigned char ready = 0;
+
+        close(peer_ready_fds[0]);
+        peer_ready_fds[0] = -1;
+        if (recv(peer_ready_fds[1], &ready, sizeof(ready), 0) !=
+            (ssize_t)sizeof(ready) || ready != 0x71U) {
+            result = 1;
+        }
+        close(peer_ready_fds[1]);
+        peer_ready_fds[1] = -1;
+    }
+    if (result == 0) {
+        set_test_rank(0, 2);
+        root_status = peak_socket_report_transport_begin(
+            root,
+            PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
+            &session,
+            &aggregate);
+    }
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
     if (receipt_failure_barrier) {
@@ -1005,6 +1050,17 @@ run_two_rank_case(int port,
                                         &root_telemetry);
     }
     return result;
+}
+
+static int
+run_two_rank_case(int port,
+                  TestRootAction action,
+                  bool mismatched_peer_name)
+{
+    return run_two_rank_case_with_peer_start_delay(port,
+                                                    action,
+                                                    mismatched_peer_name,
+                                                    false);
 }
 
 static int
@@ -1989,6 +2045,13 @@ main(void)
         run_two_rank_case(base_port + 40,
                           TEST_ROOT_SESSION_ALLOC_FAILURE,
                           false));
+    CHECK_SOCKET_CASE(
+        "session-allocation-fallback-delayed-peer",
+        run_two_rank_case_with_peer_start_delay(
+            base_port + 52,
+            TEST_ROOT_SESSION_ALLOC_FAILURE,
+            false,
+            true));
     CHECK_SOCKET_CASE(
         "gather-partial-success",
         run_two_rank_case(base_port + 18,
