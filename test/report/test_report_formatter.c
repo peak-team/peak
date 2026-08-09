@@ -455,6 +455,14 @@ check_strict_rank_local_bounded_names(void)
     assert(unlink(aggregate_path) == 0);
     assert(unlink(strict_path) == 0);
 
+    /* A runtime component limit below the shortest safe strict name fails. */
+    assert(setenv("PEAK_TEST_REPORT_NAME_MAX", "33", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
+    assert(!peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        snapshot));
+    assert(access(aggregate_path, F_OK) != 0);
+    assert(unsetenv("PEAK_TEST_REPORT_NAME_MAX") == 0);
+
     assert(snprintf(aggregate_path, sizeof(aggregate_path), "%s/bare",
                     ordinary_directory) < (int)sizeof(aggregate_path));
     assert(snprintf(strict_path, sizeof(strict_path),
