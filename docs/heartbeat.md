@@ -538,14 +538,18 @@ The defaults below describe the current implementation.
 | `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | `180000` | Baseline post-publication gate timeout. A path that attempted socket publication automatically raises the effective timeout to at least the peer release budget plus two socket-phase margins; MPI and rank-local paths retain this baseline. |
 | `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`, `MV2_COMM_WORLD_LOCAL_SIZE`, `PMI_LOCAL_SIZE` | `1` fallback | Local rank count for reattach admission and diagnostic risk reporting. |
 
-All numeric values above require complete, finite input. A present invalid value
-emits one warning and uses its documented fallback. `PEAK_MAX_NUM_THREADS=0`
-uses one slot and values above `4096` clamp to `4096`; an invalid
-`PEAK_MEMLOG_CHUNK_EVENTS` disables memory logging. Sleep bounds must be
-positive; when the resolved maximum is below the accepted minimum, the maximum
-falls back to the minimum. The global detach multiplier is at least `1`, the
-reattach multiplier is in `(0, 1]`, and the reattach multiplier must remain
-below the detach multiplier; a conflict falls back to the reattach default.
+PEAK numeric controls above require complete, finite input. A present invalid
+PEAK value emits one warning and uses its documented fallback.
+`PEAK_MAX_NUM_THREADS=0` uses one slot and values above `4096` clamp to
+`4096`; an invalid `PEAK_MEMLOG_CHUNK_EVENTS` disables memory logging. The
+launcher-provided `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`,
+`MV2_COMM_WORLD_LOCAL_SIZE`, and `PMI_LOCAL_SIZE` values are metadata rather
+than PEAK controls; missing or invalid values use the rank-count fallback
+without a configuration warning. Sleep bounds must be positive; when the
+resolved maximum is below the accepted minimum, the maximum falls back to the
+minimum. The global detach multiplier is at least `1`, the reattach multiplier
+is in `(0, 1]`, and the reattach multiplier must remain below the detach
+multiplier; a conflict falls back to the reattach default.
 The cooldown default is policy only: `PEAK_REATTACH_COOLDOWN_MS=60000` is not a
 new safety precondition.
 

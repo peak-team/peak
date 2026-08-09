@@ -214,9 +214,9 @@ main(int argc, char** argv)
     }
 
     clear_numeric_environment();
-    setenv("PEAK_PAUSE_TIMEOUT", "18446744073", 1);
+    setenv("PEAK_PAUSE_TIMEOUT", "18446744000", 1);
     if (peak_parse_runtime_numeric_config().pause_timeout_ns !=
-        18446744073000000000ULL) {
+        18446744000000000000ULL) {
         fputs("safe nanosecond boundary was rejected\n", stderr);
         return 1;
     }

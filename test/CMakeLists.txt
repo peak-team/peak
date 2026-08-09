@@ -1,5 +1,6 @@
 include(CTest)
 if(BUILD_TESTING)
+    include(CheckCCompilerFlag)
     option(PEAK_BUILD_DYNAMIC_LIB_TESTS "Build dynamic dlopen/Python extension tests" ON)
 
     # Find or download blas only for tests
@@ -321,6 +322,14 @@ if(BUILD_TESTING)
                 --stderr-count-regex "invalid PEAK_(OUTPUT_AGGREGATION_TIMEOUT_MS|OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS|MPI_REPORT_RELEASE_TIMEOUT_MS)=junk"
                 --stderr-count 3
                 -- $<TARGET_FILE:test_runtime_config> timeout-warning)
+    add_test(NAME test_runtime_config_timeout_raise_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS=100 is below required minimum 4510 milliseconds; using 4510 milliseconds"
+                --stderr-count-regex "PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS=100 is below required minimum 4510 milliseconds"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_runtime_config> timeout-raise-warning)
 
     add_executable(test_numeric_env_parser
         utils/test_numeric_env_parser.c
@@ -332,6 +341,25 @@ if(BUILD_TESTING)
     add_test(NAME test_numeric_env_parser COMMAND test_numeric_env_parser)
     set_tests_properties(test_numeric_env_parser
         PROPERTIES PASS_REGULAR_EXPRESSION "numeric_env_parser_test_ok")
+    check_c_compiler_flag("-mlong-double-64" PEAK_HAVE_LONG_DOUBLE_64_FLAG)
+    if(PEAK_HAVE_LONG_DOUBLE_64_FLAG)
+        add_executable(test_numeric_env_parser_long_double_64
+            utils/test_numeric_env_parser.c
+            ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
+            ${PROJECT_SOURCE_DIR}/src/logging.c)
+        target_include_directories(test_numeric_env_parser_long_double_64 PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/include/utils)
+        target_compile_options(test_numeric_env_parser_long_double_64 PRIVATE
+            -mlong-double-64
+            -fsanitize=undefined,float-cast-overflow
+            -fno-sanitize-recover=all)
+        target_link_options(test_numeric_env_parser_long_double_64 PRIVATE
+            -fsanitize=undefined,float-cast-overflow
+            -fno-sanitize-recover=all)
+        add_test(NAME test_numeric_env_parser_long_double_64
+            COMMAND test_numeric_env_parser_long_double_64)
+    endif()
     add_executable(test_env_parser_header_cxx
         utils/test_env_parser_header_cxx.cpp)
     target_include_directories(test_env_parser_header_cxx PRIVATE

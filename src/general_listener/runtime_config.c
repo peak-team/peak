@@ -165,6 +165,18 @@ peak_general_listener_report_timeout_budget_for_rank_count(
         if (configured < minimum_socket_release) {
             budget.socket_release_timeout_ms = minimum_socket_release;
             budget.socket_release_was_raised = true;
+            if (__atomic_exchange_n(
+                    &peak_output_release_timeout_warning_emitted.emitted,
+                    1,
+                    __ATOMIC_RELAXED) == 0) {
+                peak_log_warn(
+                    "[peak] %s=%u is below required minimum %u milliseconds; "
+                    "using %u milliseconds\n",
+                    PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
+                    configured,
+                    minimum_socket_release,
+                    minimum_socket_release);
+            }
         }
     }
 
