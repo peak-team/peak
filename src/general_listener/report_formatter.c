@@ -58,32 +58,11 @@ peak_report_formatter_name_max(int dirfd)
 #endif
     errno = 0;
     limit = fpathconf(dirfd, _PC_NAME_MAX);
+    if (limit < 0 && errno == 0) {
+        /* An indeterminate limit cannot safely bound a generated name. */
+        errno = ENAMETOOLONG;
+    }
     return limit;
-}
-
-static size_t
-peak_report_formatter_path_name_max(const char* path)
-{
-    const char* basename = strrchr(path, '/');
-    char* directory = basename == NULL ? strdup(".") :
-        strndup(path, (size_t)(basename - path) + 1);
-    long limit;
-    int dirfd;
-
-    if (directory == NULL) {
-        return 0;
-    }
-    dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    free(directory);
-    if (dirfd < 0) {
-        return 0;
-    }
-    limit = peak_report_formatter_name_max(dirfd);
-    (void)close(dirfd);
-    if (limit < 0) {
-        return 0;
-    }
-    return (size_t)limit;
 }
 
 static void
@@ -134,18 +113,17 @@ peak_report_formatter_summary_update(uint64_t summary, const char* text)
     return summary * UINT64_C(1099511628211);
 }
 
-static bool
-peak_report_formatter_strict_rank_local_path(char out[PATH_MAX],
-                                             const char* path,
-                                             long world_rank)
+static char*
+peak_report_formatter_strict_rank_local_name(const char* rendered_path,
+                                             long world_rank,
+                                             long name_max)
 {
     static const char marker[] = "-ranklocal-h";
-    const char* basename = strrchr(path, '/');
+    const char* basename;
     const char* extension;
     char hostname[PEAK_REPORT_HOST_CAPACITY] = {0};
     char rank_text[32];
     char summary[PEAK_REPORT_SUMMARY_HEX_LENGTH + 1];
-    size_t directory_length;
     size_t basename_length;
     size_t stem_length;
     size_t extension_length;
@@ -155,63 +133,53 @@ peak_report_formatter_strict_rank_local_path(char out[PATH_MAX],
     size_t final_component_length;
     uint64_t hash = UINT64_C(1469598103934665603);
 
-    if (basename == NULL) {
-        basename = path;
-        directory_length = 0;
-    } else {
-        directory_length = (size_t)(basename - path) + 1;
-        basename++;
-    }
+    char* result;
+
+    basename = strrchr(rendered_path, '/');
+    basename = basename == NULL ? rendered_path : basename + 1;
     basename_length = strlen(basename);
-    if (basename_length == 0 || directory_length >= PATH_MAX) {
-        return false;
+    if (basename_length == 0 || name_max <= 0) {
+        errno = ENAMETOOLONG;
+        return NULL;
     }
     extension = basename_length >= 4 &&
                         strcmp(basename + basename_length - 4, ".csv") == 0 ?
                     ".csv" : "";
     extension_length = strlen(extension);
     stem_length = basename_length - extension_length;
-    component_limit = peak_report_formatter_path_name_max(path);
-    if (component_limit == 0) {
-        return false;
-    }
-    if (component_limit > PATH_MAX - directory_length - 1) {
-        component_limit = PATH_MAX - directory_length - 1;
-    }
+    component_limit = (size_t)name_max;
     peak_report_formatter_sanitized_hostname(hostname);
     hostname_length = strlen(hostname);
     if (snprintf(rank_text, sizeof(rank_text), "%ld", world_rank) < 0) {
-        return false;
+        return NULL;
     }
-    hash = peak_report_formatter_summary_update(hash, path);
+    hash = peak_report_formatter_summary_update(hash, rendered_path);
     hash = peak_report_formatter_summary_update(hash, hostname);
     hash = peak_report_formatter_summary_update(hash, rank_text);
     if (snprintf(summary, sizeof(summary), "%016llx",
                  (unsigned long long)hash) !=
         PEAK_REPORT_SUMMARY_HEX_LENGTH) {
-        return false;
+        return NULL;
     }
     final_component_length = stem_length + marker_length + hostname_length +
                              extension_length;
     if (final_component_length <= component_limit) {
-        memcpy(out, path, directory_length);
-        memcpy(out + directory_length, basename, stem_length);
-        memcpy(out + directory_length + stem_length, marker, marker_length);
-        memcpy(out + directory_length + stem_length + marker_length,
-               hostname,
-               hostname_length);
-        memcpy(out + directory_length + stem_length + marker_length +
-                   hostname_length,
-               extension,
-               extension_length + 1);
-        return true;
+        result = malloc(final_component_length + 1);
+        if (result == NULL) return NULL;
+        memcpy(result, basename, stem_length);
+        memcpy(result + stem_length, marker, marker_length);
+        memcpy(result + stem_length + marker_length, hostname, hostname_length);
+        memcpy(result + stem_length + marker_length + hostname_length,
+               extension, extension_length + 1);
+        return result;
     }
 
     /* Preserve a bounded preview, but digest all omitted path/host/rank bytes. */
     final_component_length = marker_length + 2 +
                              PEAK_REPORT_SUMMARY_HEX_LENGTH + extension_length;
     if (final_component_length > component_limit) {
-        return false;
+        errno = ENAMETOOLONG;
+        return NULL;
     }
     hostname_length = hostname_length > PEAK_REPORT_HOST_PREVIEW_LENGTH ?
                           PEAK_REPORT_HOST_PREVIEW_LENGTH : hostname_length;
@@ -221,25 +189,18 @@ peak_report_formatter_strict_rank_local_path(char out[PATH_MAX],
     final_component_length += hostname_length;
     stem_length = stem_length > component_limit - final_component_length ?
                       component_limit - final_component_length : stem_length;
-    memcpy(out, path, directory_length);
-    memcpy(out + directory_length, basename, stem_length);
-    memcpy(out + directory_length + stem_length, marker, marker_length);
-    memcpy(out + directory_length + stem_length + marker_length,
-           hostname,
-           hostname_length);
-    memcpy(out + directory_length + stem_length + marker_length +
-               hostname_length,
-           "-q",
-           2);
-    memcpy(out + directory_length + stem_length + marker_length +
-               hostname_length + 2,
-           summary,
-           PEAK_REPORT_SUMMARY_HEX_LENGTH);
-    memcpy(out + directory_length + stem_length + marker_length +
-               hostname_length + 2 + PEAK_REPORT_SUMMARY_HEX_LENGTH,
-           extension,
-           extension_length + 1);
-    return true;
+    result = malloc(stem_length + marker_length + hostname_length + 2 +
+                    PEAK_REPORT_SUMMARY_HEX_LENGTH + extension_length + 1);
+    if (result == NULL) return NULL;
+    memcpy(result, basename, stem_length);
+    memcpy(result + stem_length, marker, marker_length);
+    memcpy(result + stem_length + marker_length, hostname, hostname_length);
+    memcpy(result + stem_length + marker_length + hostname_length, "-q", 2);
+    memcpy(result + stem_length + marker_length + hostname_length + 2,
+           summary, PEAK_REPORT_SUMMARY_HEX_LENGTH);
+    memcpy(result + stem_length + marker_length + hostname_length + 2 +
+               PEAK_REPORT_SUMMARY_HEX_LENGTH, extension, extension_length + 1);
+    return result;
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -385,9 +346,28 @@ peak_report_formatter_calls_per_rank(unsigned long calls, int rank_count)
     return (long double)calls / (long double)effective_rank_count;
 }
 
-static char*
-peak_report_formatter_csv_path(bool rank_local,
-                               bool require_host_suffix)
+typedef struct {
+    int dirfd;
+    long name_max;
+    char* final_name;
+    char* rendered_path;
+} PeakReportCsvDestination;
+
+static void
+peak_report_formatter_csv_destination_destroy(PeakReportCsvDestination* destination)
+{
+    if (destination->dirfd >= 0) {
+        (void)close(destination->dirfd);
+    }
+    free(destination->final_name);
+    free(destination->rendered_path);
+    *destination = (PeakReportCsvDestination){.dirfd = -1};
+}
+
+static bool
+peak_report_formatter_csv_destination(bool rank_local,
+                                      bool require_host_suffix,
+                                      PeakReportCsvDestination* destination)
 {
     const char* env_path = getenv("PEAK_STATSLOG_PATH");
     const char* template_value = getenv("PEAK_STATSLOG_TEMPLATE");
@@ -396,7 +376,14 @@ peak_report_formatter_csv_path(bool rank_local,
     long world_size = -1;
     long world_rank = -1;
     char path[PATH_MAX];
+    const char* basename;
+    char* directory;
 
+    if (destination == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+    *destination = (PeakReportCsvDestination){.dirfd = -1};
     if (rank_local) {
         bool have_pair = peak_general_listener_mpi_env_rank_size(
             &world_rank,
@@ -411,32 +398,64 @@ peak_report_formatter_csv_path(bool rank_local,
                                    template_value,
                                    ".csv",
                                    world_rank)) {
-        return NULL;
-    }
-    if (require_host_suffix) {
-        char suffixed[PATH_MAX];
-        if (!peak_report_formatter_strict_rank_local_path(
-                suffixed, path, world_rank)) {
-            return NULL;
-        }
-        (void)snprintf(path, sizeof(path), "%s", suffixed);
+        errno = EINVAL;
+        return false;
     }
     if (template_value != NULL && template_value[0] != '\0' &&
         !peak_output_identity_make_parent(path)) {
-        return NULL;
+        if (errno == 0) errno = EINVAL;
+        return false;
     }
-    return strdup(path);
+    basename = strrchr(path, '/');
+    directory = basename == NULL ? strdup(".") :
+        strndup(path, (size_t)(basename - path) + 1);
+    if (directory == NULL) {
+        return false;
+    }
+    destination->dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(directory);
+    if (destination->dirfd < 0) {
+        return false;
+    }
+    destination->name_max = peak_report_formatter_name_max(destination->dirfd);
+    if (destination->name_max <= 0) {
+        int saved_errno = errno != 0 ? errno : ENAMETOOLONG;
+        peak_report_formatter_csv_destination_destroy(destination);
+        errno = saved_errno;
+        return false;
+    }
+    basename = basename == NULL ? path : basename + 1;
+    if (strlen(basename) == 0 || strlen(basename) > (size_t)destination->name_max) {
+        errno = ENAMETOOLONG;
+        peak_report_formatter_csv_destination_destroy(destination);
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    destination->final_name = require_host_suffix ?
+        peak_report_formatter_strict_rank_local_name(path,
+                                                     world_rank,
+                                                     destination->name_max) :
+        strdup(basename);
+    if (destination->final_name == NULL) {
+        int saved_errno = errno;
+        peak_report_formatter_csv_destination_destroy(destination);
+        errno = saved_errno;
+        return false;
+    }
+    destination->rendered_path = strdup(path);
+    if (destination->rendered_path == NULL) {
+        int saved_errno = errno;
+        peak_report_formatter_csv_destination_destroy(destination);
+        errno = saved_errno;
+        return false;
+    }
+    return true;
 }
 
 static int
-peak_report_formatter_create_csv_temp(const char* out_csv,
-                                      int* dirfd_out,
-                                      char** final_name_out,
+peak_report_formatter_create_csv_temp(const PeakReportCsvDestination* destination,
                                       char** temp_name_out)
 {
-    const char* basename;
-    char* directory;
-    char* final_name;
     char* temp_name;
     size_t basename_length;
     long name_max;
@@ -444,42 +463,17 @@ peak_report_formatter_create_csv_temp(const char* out_csv,
     int length;
     int normal_suffix_length;
 
-    if (out_csv == NULL || dirfd_out == NULL || final_name_out == NULL ||
-        temp_name_out == NULL) {
+    if (destination == NULL || destination->dirfd < 0 ||
+        destination->final_name == NULL || temp_name_out == NULL) {
         errno = EINVAL;
         return -1;
     }
-    *dirfd_out = -1;
-    *final_name_out = NULL;
     *temp_name_out = NULL;
-    basename = strrchr(out_csv, '/');
-    if (basename == NULL) {
-        basename = out_csv;
-        directory = strdup(".");
-    } else {
-        directory = strndup(out_csv, (size_t)(basename - out_csv) + 1);
-        basename++;
-    }
-    if (directory == NULL) {
-        return -1;
-    }
-    int dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    free(directory);
-    if (dirfd < 0) {
-        return -1;
-    }
-    name_max = peak_report_formatter_name_max(dirfd);
-    if (name_max < 0) {
-        int saved_errno = errno;
-        (void)close(dirfd);
-        errno = saved_errno != 0 ? saved_errno : ENAMETOOLONG;
-        return -1;
-    }
-    basename_length = strlen(basename);
+    name_max = destination->name_max;
+    basename_length = strlen(destination->final_name);
     normal_suffix_length =
         snprintf(NULL, 0, ".tmp.p%d.%lu", (int)getpid(), ULONG_MAX);
     if (normal_suffix_length < 0) {
-        (void)close(dirfd);
         errno = EINVAL;
         return -1;
     }
@@ -494,20 +488,15 @@ peak_report_formatter_create_csv_temp(const char* out_csv,
                  snprintf(NULL,
                           0,
                           "%s.tmp.p%d.%lu",
-                          basename,
+                          destination->final_name,
                           (int)getpid(),
                           ULONG_MAX);
     if (length < 0 || length > name_max) {
-        (void)close(dirfd);
         errno = EINVAL;
         return -1;
     }
-    final_name = strdup(basename);
     temp_name = malloc((size_t)length + 1);
-    if (final_name == NULL || temp_name == NULL) {
-        free(final_name);
-        free(temp_name);
-        (void)close(dirfd);
+    if (temp_name == NULL) {
         return -1;
     }
 
@@ -528,29 +517,24 @@ peak_report_formatter_create_csv_temp(const char* out_csv,
             (void)snprintf(temp_name,
                            (size_t)length + 1,
                            "%s.tmp.p%d.%lu",
-                           basename,
+                           destination->final_name,
                            (int)getpid(),
                            ticket);
         }
-        fd = openat(dirfd, temp_name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+        fd = openat(destination->dirfd, temp_name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
                     0666);
         if (fd >= 0) {
-            *dirfd_out = dirfd;
-            *final_name_out = final_name;
             *temp_name_out = temp_name;
             return fd;
         }
         if (errno != EEXIST) {
-            free(final_name);
             free(temp_name);
-            (void)close(dirfd);
             return -1;
         }
     }
 
-    free(final_name);
     free(temp_name);
-    (void)close(dirfd);
     errno = EEXIST;
     return -1;
 }
@@ -755,13 +739,11 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         "count,per_thread,per_rank,call_max_s,call_min_s,"
         "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,"
         "dropped_calls,dropped_threads\n";
-    char* out_csv;
     char* temp_csv;
-    char* final_name;
+    PeakReportCsvDestination destination = {.dirfd = -1};
     FILE* csv;
     bool success;
     int csv_fd;
-    int dirfd;
     int failure_errno = 0;
     int rank_count;
 
@@ -784,36 +766,31 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     }
 #endif
 
-    out_csv = peak_report_formatter_csv_path(
-        rank_local,
-        require_host_suffix);
-    if (out_csv == NULL) {
-        peak_log_warn("[peak] failed to allocate stats csv path\n");
+    if (!peak_report_formatter_csv_destination(rank_local,
+                                               require_host_suffix,
+                                               &destination)) {
+        peak_log_warn("[peak] failed to prepare stats csv destination: %s\n",
+                      strerror(errno));
         return false;
     }
-    csv_fd = peak_report_formatter_create_csv_temp(out_csv,
-                                                    &dirfd,
-                                                    &final_name,
-                                                    &temp_csv);
+    csv_fd = peak_report_formatter_create_csv_temp(&destination, &temp_csv);
     if (csv_fd < 0) {
         peak_log_warn("[peak] failed to create temporary stats csv for '%s': %s\n",
-                      out_csv,
+                      destination.rendered_path,
                       strerror(errno));
-        free(out_csv);
+        peak_report_formatter_csv_destination_destroy(&destination);
         return false;
     }
     csv = fdopen(csv_fd, "w");
     if (csv == NULL) {
         failure_errno = errno;
         (void)close(csv_fd);
-        (void)unlinkat(dirfd, temp_csv, 0);
-        (void)close(dirfd);
+        (void)unlinkat(destination.dirfd, temp_csv, 0);
         peak_log_warn("[peak] failed to open temporary stats csv for '%s': %s\n",
-                      out_csv,
+                      destination.rendered_path,
                       strerror(failure_errno));
         free(temp_csv);
-        free(final_name);
-        free(out_csv);
+        peak_report_formatter_csv_destination_destroy(&destination);
         return false;
     }
 
@@ -876,12 +853,15 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         bool allow_overwrite = peak_general_listener_env_value_truthy(
             getenv("PEAK_OUTPUT_ALLOW_OVERWRITE"));
 
-        if ((allow_overwrite ? renameat(dirfd, temp_csv, dirfd, final_name) :
-                               linkat(dirfd, temp_csv, dirfd, final_name, 0)) != 0) {
+        if ((allow_overwrite ?
+                 renameat(destination.dirfd, temp_csv,
+                          destination.dirfd, destination.final_name) :
+                 linkat(destination.dirfd, temp_csv,
+                        destination.dirfd, destination.final_name, 0)) != 0) {
             success = false;
             failure_errno = errno;
         } else if (!allow_overwrite) {
-            (void)unlinkat(dirfd, temp_csv, 0);
+            (void)unlinkat(destination.dirfd, temp_csv, 0);
         }
     }
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -891,16 +871,14 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     }
 #endif
     if (!success) {
-        (void)unlinkat(dirfd, temp_csv, 0);
+        (void)unlinkat(destination.dirfd, temp_csv, 0);
         peak_log_warn("[peak] failed to publish complete stats csv '%s': %s; "
                       "any existing completed csv was left unchanged\n",
-                      out_csv,
+                      destination.rendered_path,
                       strerror(failure_errno != 0 ? failure_errno : EIO));
     }
     free(temp_csv);
-    free(final_name);
-    (void)close(dirfd);
-    free(out_csv);
+    peak_report_formatter_csv_destination_destroy(&destination);
     return success;
 }
 

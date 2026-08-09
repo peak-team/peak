@@ -456,7 +456,7 @@ check_strict_rank_local_bounded_names(void)
     assert(unlink(strict_path) == 0);
 
     /* A runtime component limit below the shortest safe strict name fails. */
-    assert(setenv("PEAK_TEST_REPORT_NAME_MAX", "33", 1) == 0);
+    assert(setenv("PEAK_TEST_REPORT_NAME_MAX", "20", 1) == 0);
     assert(setenv("PEAK_STATSLOG_TEMPLATE", aggregate_path, 1) == 0);
     assert(!peak_report_formatter_write_rank_local_csv_host_disambiguated(
         snapshot));
@@ -884,6 +884,117 @@ check_template_parent_creation(const char* temp_directory)
 }
 
 static void
+check_near_path_max_destination(const char* temp_directory)
+{
+    enum { FINAL_LENGTH = PATH_MAX - 7, COMPONENT_LENGTH = 240 };
+    static const char final_name[] = "final.csv";
+    char directories[32][PATH_MAX];
+    char current_directory[PATH_MAX];
+    char final_path[PATH_MAX];
+    char component[COMPONENT_LENGTH + 1];
+    char* strict_name = NULL;
+    FILE* direct;
+    DIR* stream;
+    struct dirent* entry;
+    int directory_fd;
+    size_t depth = 0;
+    PeakReportSnapshot* first = create_fixture("near-path-first");
+    PeakReportSnapshot* second = create_fixture("near-path-second");
+    char* contents;
+
+    assert(strlen(temp_directory) + 1 + strlen(final_name) < FINAL_LENGTH);
+    assert(snprintf(directories[depth], sizeof(directories[depth]), "%s",
+                    temp_directory) > 0);
+    while (strlen(directories[depth]) + 1 + strlen(final_name) <
+           FINAL_LENGTH) {
+        size_t remaining = FINAL_LENGTH - strlen(directories[depth]) - 1 -
+                           strlen(final_name);
+        size_t component_length = remaining > COMPONENT_LENGTH + 1 ?
+                                      COMPONENT_LENGTH : remaining - 1;
+
+        assert(component_length != 0);
+        assert(depth + 1 < sizeof(directories) / sizeof(directories[0]));
+        memset(component, 'n', component_length);
+        component[component_length] = '\0';
+        assert(snprintf(current_directory, sizeof(current_directory), "%s",
+                        directories[depth]) > 0);
+        assert(snprintf(directories[depth + 1], PATH_MAX, "%s/%s",
+                        current_directory, component) < PATH_MAX);
+        assert(mkdir(directories[depth + 1], 0700) == 0);
+        depth++;
+    }
+    assert(snprintf(final_path, sizeof(final_path), "%s/%s", directories[depth],
+                    final_name) == FINAL_LENGTH);
+
+    /* A legal final pathname at this length must work before PEAK uses it. */
+    direct = fopen(final_path, "wx");
+    assert(direct != NULL);
+    assert(fputs("direct-final-path-ok\n", direct) >= 0);
+    assert(fclose(direct) == 0);
+    assert(unlink(final_path) == 0);
+
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", final_path, 1) == 0);
+    assert(setenv("PEAK_TEST_REPORT_HOSTNAME", "near-path-host", 1) == 0);
+    peak_report_snapshot_prepare_for_render(first);
+    assert(peak_report_formatter_write_csv(first));
+    contents = read_file(final_path);
+    assert(strstr(contents, "near-path-first") != NULL);
+    free(contents);
+
+    assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
+        first));
+    directory_fd = open(directories[depth], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    assert(directory_fd >= 0);
+    stream = fdopendir(dup(directory_fd));
+    assert(stream != NULL);
+    while ((entry = readdir(stream)) != NULL) {
+        if (strstr(entry->d_name, "-ranklocal-h") != NULL) {
+            assert(strict_name == NULL);
+            assert(strlen(entry->d_name) <= (size_t)fpathconf(directory_fd,
+                                                               _PC_NAME_MAX));
+            strict_name = strdup(entry->d_name);
+            assert(strict_name != NULL);
+        }
+        assert(strstr(entry->d_name, ".tmp.") == NULL);
+        assert(strstr(entry->d_name, ".peak-tmp.") == NULL);
+    }
+    assert(closedir(stream) == 0);
+    assert(strict_name != NULL);
+    direct = fdopen(openat(directory_fd, strict_name, O_RDONLY | O_CLOEXEC), "r");
+    assert(direct != NULL);
+    contents = read_stream(direct);
+    assert(fclose(direct) == 0);
+    assert(strstr(contents, "near-path-first") != NULL);
+    free(contents);
+
+    peak_report_snapshot_prepare_for_render(second);
+    assert(!peak_report_formatter_write_csv(second));
+    contents = read_file(final_path);
+    assert(strstr(contents, "near-path-first") != NULL);
+    assert(strstr(contents, "near-path-second") == NULL);
+    free(contents);
+    assert(setenv("PEAK_OUTPUT_ALLOW_OVERWRITE", "1", 1) == 0);
+    assert(peak_report_formatter_write_csv(second));
+    assert(unsetenv("PEAK_OUTPUT_ALLOW_OVERWRITE") == 0);
+    contents = read_file(final_path);
+    assert(strstr(contents, "near-path-first") == NULL);
+    assert(strstr(contents, "near-path-second") != NULL);
+    free(contents);
+
+    assert(unlinkat(directory_fd, strict_name, 0) == 0);
+    assert(unlink(final_path) == 0);
+    free(strict_name);
+    assert(close(directory_fd) == 0);
+    assert(unsetenv("PEAK_TEST_REPORT_HOSTNAME") == 0);
+    peak_report_snapshot_destroy(second);
+    peak_report_snapshot_destroy(first);
+    while (depth != 0) {
+        assert(rmdir(directories[depth]) == 0);
+        depth--;
+    }
+}
+
+static void
 check_output_identity_metadata(void)
 {
     char path[512];
@@ -943,6 +1054,7 @@ main(void)
     check_concurrent_no_clobber(temp_directory);
     check_template_parent_creation(temp_directory);
     check_strict_rank_local_bounded_names();
+    check_near_path_max_destination(temp_directory);
 
     assert(unsetenv("PEAK_STATSLOG_PATH") == 0);
     assert(unsetenv("PEAK_STATSLOG_TEMPLATE") == 0);
