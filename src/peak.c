@@ -1490,29 +1490,33 @@ static _Atomic int peak_exit_interposer_unavailable = 0;
 static void
 peak_resolve_real_exit(void)
 {
-    if (original_exit == NULL) {
-        original_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
-        /* RTLD_NEXT normally finds libc.  Resolve libc explicitly as a
-         * fail-open fallback when a loader namespace prevents that lookup. */
-        if (original_exit == NULL) {
-            void* libc = dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
-
-            if (libc != NULL) {
-                /* Keep this handle open: original_exit must remain valid. */
-                original_exit = (void (*)(int))dlsym(libc, "exit");
-            }
-        }
-    }
 #ifdef PEAK_ENABLE_TEST_HOOKS
     const char* forced_failure = getenv("PEAK_TEST_FAIL_EXIT_INTERPOSER_INSTALL");
+    gboolean force_libc_fallback =
+        forced_failure != NULL && forced_failure[0] != '\0';
+#else
+    gboolean force_libc_fallback = FALSE;
+#endif
 
-    if (forced_failure != NULL && forced_failure[0] != '\0') {
+    if (original_exit == NULL && !force_libc_fallback) {
+        original_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
+    }
+    if (original_exit == NULL) {
+        /* RTLD_NEXT normally finds libc.  Resolve libc explicitly as a
+         * fail-open fallback when a loader namespace prevents that lookup. */
+        void* libc = dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
+
+        if (libc != NULL) {
+            /* Keep this handle open: original_exit must remain valid. */
+            original_exit = (void (*)(int))dlsym(libc, "exit");
+        }
+    }
+    if (force_libc_fallback) {
         atomic_store_explicit(&peak_exit_interposer_unavailable,
                               1,
                               memory_order_release);
         return;
     }
-#endif
     if (original_exit == NULL) {
         atomic_store_explicit(&peak_exit_interposer_unavailable,
                               1,

@@ -723,6 +723,16 @@ def check_peak_init_heartbeat_order(repo_root):
             "original_exit(status);" in exit_handler[unavailable_position:activation_position],
             "an unavailable explicit-exit interposer must delegate to libc "
             "exit before PEAK teardown")
+    exit_resolver = extract_function(source, "peak_resolve_real_exit")
+    primary_exit_lookup = exit_resolver.find('dlsym(RTLD_NEXT, "exit")')
+    libc_exit_lookup = exit_resolver.find('dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL)')
+    forced_disable = exit_resolver.find("if (force_libc_fallback)")
+    require("force_libc_fallback" in exit_resolver and
+            "original_exit == NULL && !force_libc_fallback" in exit_resolver and
+            primary_exit_lookup != -1 and libc_exit_lookup > primary_exit_lookup and
+            forced_disable > libc_exit_lookup,
+            "the exit-interposer failure hook must exercise the libc exit "
+            "fallback before disabling PEAK teardown")
     activation_close = extract_function(
         source, "peak_runtime_close_activation_for_teardown"
     )
