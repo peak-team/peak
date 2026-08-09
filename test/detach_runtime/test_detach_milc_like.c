@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -143,15 +144,15 @@ typedef struct {
 } CallCheckpoint;
 
 typedef struct {
-    double duration;
-    double window_seconds;
+    uint64_t duration_seconds;
+    uint64_t window_ms;
     double previous_elapsed;
     uint64_t previous_calls;
-    unsigned int next_index;
+    uint64_t next_index;
 } TimedWindowScheduler;
 
 typedef struct {
-    unsigned int index;
+    uint64_t index;
     double elapsed;
     uint64_t true_calls;
 } TimedWindow;
@@ -467,9 +468,9 @@ sleep_until(double deadline)
 }
 
 static void
-print_window(unsigned int index, double elapsed, uint64_t true_calls)
+print_window(uint64_t index, double elapsed, uint64_t true_calls)
 {
-    printf("milc_like_window index=%u elapsed=%.9f true_calls=%llu\n",
+    printf("milc_like_window index=%" PRIu64 " elapsed=%.9f true_calls=%llu\n",
            index,
            elapsed,
            (unsigned long long)true_calls);
@@ -510,16 +511,43 @@ interpolate_window_calls(double previous_elapsed,
 }
 
 static int
+timed_window_is_before_duration(uint64_t index,
+                                uint64_t window_ms,
+                                uint64_t duration_seconds)
+{
+    uint64_t whole_seconds = window_ms / 1000;
+    uint64_t remainder_ms = window_ms % 1000;
+    uint64_t elapsed_seconds = 0;
+    uint64_t remainder_seconds;
+
+    /* Split milliseconds so neither side of the boundary comparison wraps. */
+    if (whole_seconds > 0) {
+        if (index > duration_seconds / whole_seconds) {
+            return 0;
+        }
+        elapsed_seconds = index * whole_seconds;
+    }
+    remainder_seconds =
+        (index / 1000) * remainder_ms +
+        ((index % 1000) * remainder_ms) / 1000;
+    return elapsed_seconds < duration_seconds &&
+           remainder_seconds < duration_seconds - elapsed_seconds;
+}
+
+static int
 timed_window_scheduler_next(TimedWindowScheduler* scheduler,
                             double observed_elapsed,
                             uint64_t observed_calls,
                             TimedWindow* window)
 {
     double window_elapsed =
-        (double)scheduler->next_index * scheduler->window_seconds;
+        (double)scheduler->next_index * (double)scheduler->window_ms / 1000.0;
 
     /* A periodic boundary at the deadline belongs to the final sample. */
-    if (window_elapsed >= scheduler->duration ||
+    if (scheduler->next_index == UINT64_MAX ||
+        !timed_window_is_before_duration(scheduler->next_index,
+                                         scheduler->window_ms,
+                                         scheduler->duration_seconds) ||
         window_elapsed > observed_elapsed) {
         return 0;
     }
@@ -551,14 +579,14 @@ static int
 run_timed_window_scheduler_self_test(void)
 {
     TimedWindowScheduler scheduler = {
-        .duration = 6.0,
-        .window_seconds = 1.0,
+        .duration_seconds = 6,
+        .window_ms = 1000,
         .previous_elapsed = 0.0,
         .previous_calls = 100,
         .next_index = 1,
     };
     TimedWindow window;
-    unsigned int expected_index = 1;
+    uint64_t expected_index = 1;
 
     while (timed_window_scheduler_next(&scheduler, 6.0, 700, &window)) {
         uint64_t expected_calls = 100 + (uint64_t)expected_index * 100;
@@ -576,6 +604,46 @@ run_timed_window_scheduler_self_test(void)
         return 1;
     }
     timed_window_scheduler_observe(&scheduler, 6.0, 700);
+
+    scheduler = (TimedWindowScheduler){
+        .duration_seconds = 27,
+        .window_ms = 9,
+        .previous_elapsed = 0.0,
+        .previous_calls = 0,
+        .next_index = 1,
+    };
+    expected_index = 1;
+    {
+        uint64_t previous_calls = 0;
+
+        while (timed_window_scheduler_next(&scheduler,
+                                           27.0,
+                                           UINT64_C(3000000),
+                                           &window)) {
+            if (window.index != expected_index ||
+                window.elapsed >= 27.0 ||
+                window.true_calls <= previous_calls) {
+                fprintf(stderr,
+                        "timed window scheduler missed-boundary failed\n");
+                return 1;
+            }
+            previous_calls = window.true_calls;
+            expected_index++;
+        }
+    }
+    if (expected_index != 3000 || scheduler.next_index != 3000 ||
+        !timed_window_is_before_duration(2999, 9, 27) ||
+        timed_window_is_before_duration(3000, 9, 27)) {
+        fprintf(stderr, "timed window scheduler boundary classification failed\n");
+        return 1;
+    }
+    if (!timed_window_is_before_duration(UINT64_MAX, 1, UINT64_MAX) ||
+        timed_window_is_before_duration(UINT64_MAX, 1000, UINT64_MAX) ||
+        !timed_window_is_before_duration(UINT64_MAX, 999, UINT64_MAX) ||
+        timed_window_is_before_duration(UINT64_MAX, 1001, UINT64_MAX)) {
+        fprintf(stderr, "timed window scheduler overflow check failed\n");
+        return 1;
+    }
     printf("timed_window_scheduler_ok\n");
     return 0;
 }
@@ -796,10 +864,9 @@ main(int argc, char** argv)
         next_checkpoint_calls = initial_calls + (uint64_t)checkpoint_calls;
     }
     if (iterations == 0) {
-        double window_seconds = (double)window_ms / 1000.0;
         TimedWindowScheduler window_scheduler = {
-            .duration = (double)seconds,
-            .window_seconds = window_seconds,
+            .duration_seconds = (uint64_t)seconds,
+            .window_ms = (uint64_t)window_ms,
             .previous_elapsed = 0.0,
             .previous_calls = initial_calls,
             .next_index = 1,
@@ -834,8 +901,8 @@ main(int argc, char** argv)
             double final_elapsed = monotonic_seconds() - start;
             uint64_t final_calls = load_total_target_count();
 
-            if (final_elapsed < window_scheduler.duration) {
-                final_elapsed = window_scheduler.duration;
+            if (final_elapsed < (double)window_scheduler.duration_seconds) {
+                final_elapsed = (double)window_scheduler.duration_seconds;
             }
             while (timed_window_scheduler_next(&window_scheduler,
                                                final_elapsed,
