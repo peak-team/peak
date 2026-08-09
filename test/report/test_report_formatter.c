@@ -639,6 +639,14 @@ check_output_template_and_no_clobber(const char* temp_directory)
     assert(strstr(contents, "template-first") != NULL);
     assert(strstr(contents, "template-second") == NULL);
     free(contents);
+
+    assert(setenv("PEAK_OUTPUT_ALLOW_OVERWRITE", "1", 1) == 0);
+    assert(peak_report_formatter_write_csv(second));
+    contents = read_file(written_path);
+    assert(strstr(contents, "template-first") == NULL);
+    assert(strstr(contents, "template-second") != NULL);
+    free(contents);
+    assert(unsetenv("PEAK_OUTPUT_ALLOW_OVERWRITE") == 0);
     assert(unlink(written_path) == 0);
 
     assert(setenv("PEAK_STATSLOG_TEMPLATE", "{unknown}", 1) == 0);

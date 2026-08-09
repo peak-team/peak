@@ -125,7 +125,7 @@ run_template(const char *directory, int with_extension)
 }
 
 static int
-run_invalid(const char *directory)
+run_invalid_template(const char *directory, const char *template_path)
 {
     char base[PATH_MAX];
     char path[PATH_MAX];
@@ -134,7 +134,7 @@ run_invalid(const char *directory)
 
     assert(snprintf(base, sizeof(base), "%s/stats", directory) < (int)sizeof(base));
     set_common(base);
-    assert(setenv("PEAK_STATSLOG_TEMPLATE", "/dev/null/no-cwd-leak.csv", 1) == 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", template_path, 1) == 0);
     peak_output_identity_initialize();
     if (checkpoint(path) != PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE) return 1;
     errno = 0;
@@ -142,6 +142,31 @@ run_invalid(const char *directory)
     assert(snprintf(legacy, sizeof(legacy), "%s-p%ld-exec0.csv", base,
                     (long)getpid()) < (int)sizeof(legacy));
     return access(legacy, F_OK) != 0 ? 0 : 1;
+}
+
+static int
+run_invalid(const char *directory)
+{
+    return run_invalid_template(directory, "/dev/null/no-cwd-leak.csv");
+}
+
+static int
+run_template_overlong(const char *directory, int expanded)
+{
+    char template_path[PATH_MAX + 32];
+    size_t used = 0;
+
+    if (!expanded) {
+        memset(template_path, 'x', sizeof(template_path) - 1);
+        template_path[sizeof(template_path) - 1] = '\0';
+    } else {
+        while (used + sizeof("{session}") < sizeof(template_path) - 1) {
+            memcpy(template_path + used, "{session}", sizeof("{session}") - 1);
+            used += sizeof("{session}") - 1;
+        }
+        template_path[used] = '\0';
+    }
+    return run_invalid_template(directory, template_path);
 }
 
 static int
@@ -230,6 +255,10 @@ main(int argc, char **argv)
         else if (strcmp(argv[1], "template-csv") == 0) rc = run_template(directory, 1);
         else if (strcmp(argv[1], "template-bare") == 0) rc = run_template(directory, 0);
         else if (strcmp(argv[1], "invalid") == 0) rc = run_invalid(directory);
+        else if (strcmp(argv[1], "template-overlong") == 0)
+            rc = run_template_overlong(directory, 0);
+        else if (strcmp(argv[1], "template-expanded-overlong") == 0)
+            rc = run_template_overlong(directory, 1);
         else if (strcmp(argv[1], "concurrent") == 0) rc = run_concurrent(directory);
         else if (strcmp(argv[1], "snapshot") == 0) rc = run_snapshot(directory);
         else if (strcmp(argv[1], "entropy-fallback") == 0) rc = run_entropy_fallback(directory);

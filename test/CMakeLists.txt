@@ -197,7 +197,7 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
-    target_link_libraries(test_report_formatter PRIVATE Threads::Threads)
+    target_link_libraries(test_report_formatter PRIVATE Threads::Threads ${RT_LIBRARY})
     add_test(NAME test_report_formatter COMMAND test_report_formatter)
     set_tests_properties(test_report_formatter
         PROPERTIES
@@ -450,6 +450,8 @@ if(BUILD_TESTING)
     endif()
     target_include_directories(test_exec_checkpoint_writer PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test_exec_checkpoint_writer PRIVATE
+        Threads::Threads ${RT_LIBRARY})
     add_test(NAME test_exec_checkpoint_writer
         COMMAND test_exec_checkpoint_writer)
     set_tests_properties(test_exec_checkpoint_writer
@@ -470,7 +472,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_output_identity PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_options(test_output_identity PRIVATE -UNDEBUG)
     target_link_libraries(test_output_identity PRIVATE Threads::Threads ${RT_LIBRARY})
-    foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid concurrent snapshot entropy-fallback)
+    foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid template-overlong template-expanded-overlong concurrent snapshot entropy-fallback)
         add_test(NAME test_output_identity_${_output_identity_case}
             COMMAND test_output_identity ${_output_identity_case})
         set_tests_properties(test_output_identity_${_output_identity_case}

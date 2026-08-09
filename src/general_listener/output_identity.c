@@ -35,8 +35,6 @@ static char peak_output_jobid[128];
 static char peak_output_stepid[128];
 static char peak_output_rank[32];
 static char peak_output_host[PEAK_OUTPUT_HOST_CAPACITY];
-static char peak_output_stats_base[PATH_MAX];
-static char peak_output_stats_template[PATH_MAX];
 static char peak_output_checkpoint_prefix[PATH_MAX];
 static _Atomic unsigned int peak_output_checkpoint_prefix_length;
 static _Atomic int peak_output_checkpoint_state;
@@ -147,14 +145,6 @@ peak_output_identity_session_once(void)
         peak_output_identity_metadata(peak_output_rank,
                                       sizeof(peak_output_rank), value);
     }
-    (void)snprintf(peak_output_stats_base, sizeof(peak_output_stats_base), "%s",
-                   getenv("PEAK_STATSLOG_PATH") != NULL &&
-                           getenv("PEAK_STATSLOG_PATH")[0] != '\0'
-                       ? getenv("PEAK_STATSLOG_PATH") : "./peak_statslog");
-    (void)snprintf(peak_output_stats_template,
-                   sizeof(peak_output_stats_template), "%s",
-                   getenv("PEAK_STATSLOG_TEMPLATE") != NULL ?
-                       getenv("PEAK_STATSLOG_TEMPLATE") : "");
     atomic_store_explicit(&peak_output_session_ready, 1,
                           memory_order_release);
 }
@@ -164,8 +154,7 @@ peak_output_identity_checkpoint_path(char* out,
                                      size_t out_size,
                                      unsigned long long checkpoint_index)
 {
-    unsigned int length = atomic_load_explicit(&peak_output_checkpoint_prefix_length,
-                                         memory_order_acquire);
+    unsigned int length;
     size_t output = 0;
     char digits[32];
     size_t count = 0;
@@ -177,6 +166,8 @@ peak_output_identity_checkpoint_path(char* out,
                    ? PEAK_OUTPUT_CHECKPOINT_PREINIT
                    : PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE;
     }
+    length = atomic_load_explicit(&peak_output_checkpoint_prefix_length,
+                                  memory_order_acquire);
     if (length == 0 || out == NULL || out_size == 0 || length >= out_size) {
         return PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE;
     }
@@ -201,6 +192,8 @@ static void
 peak_output_identity_checkpoint_once(void)
 {
     char final_path[PATH_MAX];
+    const char* base = getenv("PEAK_STATSLOG_PATH");
+    const char* template_value = getenv("PEAK_STATSLOG_TEMPLATE");
     size_t length;
 
     atomic_store_explicit(&peak_output_checkpoint_state,
@@ -212,9 +205,14 @@ peak_output_identity_checkpoint_once(void)
                               memory_order_release);
         return;
     }
-    if (!peak_output_identity_path(final_path, sizeof(final_path),
-                                   peak_output_stats_base,
-                                   peak_output_stats_template,
+    if (base == NULL || base[0] == '\0') {
+        base = "./peak_statslog";
+    }
+    if (template_value == NULL) {
+        template_value = "";
+    }
+    if (!peak_output_identity_path(final_path, sizeof(final_path), base,
+                                   template_value,
                                    ".csv", -1)) {
         atomic_store_explicit(&peak_output_checkpoint_state,
                               PEAK_OUTPUT_CHECKPOINT_INVALID, memory_order_release);

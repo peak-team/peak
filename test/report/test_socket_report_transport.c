@@ -1919,6 +1919,7 @@ check_single_process_clone(void)
     if (local == NULL) {
         return 1;
     }
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL", "1", 1);
     status = peak_socket_report_transport_begin(
         local,
         PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -1936,7 +1937,32 @@ check_single_process_clone(void)
     }
     peak_report_snapshot_destroy(aggregate);
     peak_report_snapshot_destroy(local);
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL");
     return result;
+}
+
+static int
+check_multi_rank_nonce_failure(void)
+{
+    PeakReportSnapshot* local = fixture_snapshot(0, false);
+    PeakReportSnapshot* aggregate = NULL;
+    PeakSocketReportSession* session = NULL;
+    PeakSocketReportStatus status;
+
+    if (local == NULL) return 1;
+    clear_rank_environment();
+    set_test_rank(0, 2);
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL", "1", 1);
+    status = peak_socket_report_transport_begin(
+        local, PEAK_SOCKET_REPORT_RANK_ENV_ONLY, &session, &aggregate);
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL");
+    clear_rank_environment();
+    peak_socket_report_transport_abort(session);
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    return status == PEAK_SOCKET_REPORT_FAILED && session == NULL &&
+                   aggregate == NULL
+               ? 0 : 1;
 }
 
 static int
@@ -2068,6 +2094,7 @@ main(void)
                       check_gather_admission_waves());
     check_listener_bind_scope(base_port + 56);
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
+    CHECK_SOCKET_CASE("multi-rank-nonce-failure", check_multi_rank_nonce_failure());
     CHECK_SOCKET_CASE("required-rank", check_required_rank_metadata());
     CHECK_SOCKET_CASE("invalid-output-pointers",
                       check_invalid_output_pointers_are_cleared());

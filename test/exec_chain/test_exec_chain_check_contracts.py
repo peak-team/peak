@@ -74,6 +74,20 @@ class ExecChainCheckContractsTest(unittest.TestCase):
             self.assertEqual(finals, [final])
             self.assertEqual(checkpoints, [checkpoint])
 
+    def test_legacy_pid_only_final_is_rejected_but_checkpoint_is_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            checkpoint = workdir / "peak_stats-p1-exec1.csv"
+            checkpoint.write_text("function,count\n", encoding="utf-8")
+            checkpoints, finals = checker.csv_files(workdir)
+            self.assertEqual(checkpoints, [checkpoint])
+            self.assertEqual(finals, [])
+            (workdir / "peak_stats-p1.csv").write_text(
+                "function,count\n", encoding="utf-8"
+            )
+            with self.assertRaises(AssertionError):
+                checker.csv_files(workdir)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,27 @@ static atomic_int aba_worker_ready;
 static atomic_int aba_worker_release;
 typedef unsigned long (*CountFunction)(size_t);
 typedef uint64_t (*DroppedFunction)(void);
+
+static int
+checkpoint_name_matches(const char* name, long pid)
+{
+    char prefix[64];
+    const char* session;
+
+    if (snprintf(prefix, sizeof(prefix), "fastpath-checkpoint-%ld-", pid) >=
+            (int)sizeof(prefix) ||
+        strncmp(name, prefix, strlen(prefix)) != 0) {
+        return 0;
+    }
+    session = name + strlen(prefix);
+    for (size_t index = 0; index < 16; index++) {
+        if (!((session[index] >= '0' && session[index] <= '9') ||
+              (session[index] >= 'a' && session[index] <= 'f'))) {
+            return 0;
+        }
+    }
+    return strcmp(session + 16, "-exec1.csv") == 0;
+}
 typedef void (*MarkNextHelperFunction)(void);
 typedef int (*StaleGenerationRemoveFunction)(pthread_t);
 typedef int (*RemoveAmbiguousMappingFunction)(pthread_t);
@@ -639,14 +660,14 @@ main(void)
             fputs("checkpoint directory unavailable\n", stderr);
             return 1;
         }
+        if (!checkpoint_name_matches(
+                "fastpath-checkpoint-1-0123456789abcdef-exec1.csv", 1) ||
+            checkpoint_name_matches("fastpath-checkpoint-p1-exec1.csv", 1)) {
+            fputs("checkpoint name contract mismatch\n", stderr);
+            return 1;
+        }
         while ((entry = readdir(stream)) != NULL) {
-            size_t name_length = strlen(entry->d_name);
-            static const char checkpoint_suffix[] = "-exec1.csv";
-
-            if (strncmp(entry->d_name, "fastpath-checkpoint-", 20) == 0 &&
-                name_length >= sizeof(checkpoint_suffix) - 1 &&
-                strcmp(entry->d_name + name_length - (sizeof(checkpoint_suffix) - 1),
-                       checkpoint_suffix) == 0) {
+            if (checkpoint_name_matches(entry->d_name, (long)getpid())) {
                 if (snprintf(path, sizeof(path), "%s/%s", directory,
                              entry->d_name) >= (int)sizeof(path)) {
                     (void)closedir(stream);

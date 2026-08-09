@@ -22,6 +22,7 @@ def body(source, name):
 def main(root):
     identity = (root / "src/general_listener/output_identity.c").read_text()
     writer = (root / "src/general_listener/exec_checkpoint_writer.c").read_text()
+    cmake = (root / "test/CMakeLists.txt").read_text()
     ready = body(identity, "peak_output_identity_checkpoint_path")
     writer_path = body(writer, "peak_exec_checkpoint_path")
     forbidden = ("getenv", "pthread_once", "malloc", "free", "snprintf", "strlen",
@@ -30,6 +31,9 @@ def main(root):
         assert token not in ready, f"ready checkpoint path calls {token}"
     assert "_Atomic unsigned int peak_output_checkpoint_prefix_length" in identity
     assert "ATOMIC_INT_LOCK_FREE == 2" in identity
+    assert ready.index("peak_output_checkpoint_state") < ready.index(
+        "peak_output_checkpoint_prefix_length"
+    ), "checkpoint length must be acquired only after READY state"
     ready = "if (identity_path == PEAK_OUTPUT_CHECKPOINT_READY) {\n        return 0;\n    }"
     unavailable = (
         "if (identity_path == PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE) {\n"
@@ -39,6 +43,11 @@ def main(root):
     assert ready in writer_path and unavailable in writer_path
     assert writer_path.index(ready) < legacy
     assert writer_path.index(unavailable) < legacy
+    for target in ("test_report_formatter", "test_exec_checkpoint_writer",
+                   "test_output_identity"):
+        block = cmake[cmake.index(f"target_link_libraries({target}"):]
+        block = block[:block.index(")")]
+        assert "Threads::Threads" in block and "${RT_LIBRARY}" in block, target
     print("exec_checkpoint_output_contract_ok")
 
 

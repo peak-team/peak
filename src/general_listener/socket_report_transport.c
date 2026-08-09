@@ -407,6 +407,11 @@ peak_socket_reduce_session_nonce(uint64_t* nonce_out)
     if (nonce_out == NULL) {
         return false;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL") != NULL) {
+        return false;
+    }
+#endif
 #ifdef __linux__
     while (remaining != 0) {
         ssize_t read_bytes;
@@ -3303,20 +3308,6 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
                       size);
         return PEAK_SOCKET_REPORT_FAILED;
     }
-    if (rank == 0) {
-        unsigned int attempts = 0;
-
-        do {
-            if (!peak_socket_reduce_session_nonce(&session_nonce)) {
-                peak_log_warn("[peak] Socket aggregation could not create a session nonce; skipping aggregate output\n");
-                return PEAK_SOCKET_REPORT_FAILED;
-            }
-        } while (session_nonce == 0 && ++attempts < 3);
-        if (session_nonce == 0) {
-            peak_log_warn("[peak] Socket aggregation received an invalid session nonce; skipping aggregate output\n");
-            return PEAK_SOCKET_REPORT_FAILED;
-        }
-    }
     timeout_budget =
         peak_general_listener_report_timeout_budget_for_rank_count(
             (unsigned int)size);
@@ -3375,6 +3366,20 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
         single->rank_count = 1;
         *aggregate_out = single;
         return PEAK_SOCKET_REPORT_SINGLE_READY;
+    }
+    if (rank == 0) {
+        unsigned int attempts = 0;
+
+        do {
+            if (!peak_socket_reduce_session_nonce(&session_nonce)) {
+                peak_log_warn("[peak] Socket aggregation could not create a session nonce; skipping aggregate output\n");
+                return PEAK_SOCKET_REPORT_FAILED;
+            }
+        } while (session_nonce == 0 && ++attempts < 3);
+        if (session_nonce == 0) {
+            peak_log_warn("[peak] Socket aggregation received an invalid session nonce; skipping aggregate output\n");
+            return PEAK_SOCKET_REPORT_FAILED;
+        }
     }
     if (!peak_socket_positive_finite(local->overhead.elapsed_seconds)) {
         peak_log_warn("[peak] Socket aggregation observed an invalid local elapsed time; skipping aggregate output\n");
