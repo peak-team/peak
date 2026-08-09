@@ -215,7 +215,7 @@ if(PEAK_BUILD_BENCHMARKS)
 endif()
 
 include(CMakePackageConfigHelpers)
-set(PEAK_CMAKE_INSTALL_DIR "lib/cmake/PEAK")
+set(PEAK_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/PEAK")
 install(EXPORT PEAKTargets
     FILE PEAKTargets.cmake
     NAMESPACE PEAK::

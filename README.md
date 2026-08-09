@@ -35,7 +35,7 @@ safe attach and detach behavior, and reliable final reports matter.
 ```bash
 mkdir -p build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake -DCMAKE_BUILD_TYPE=Release -DPEAK_FETCH_DEPS=ON ..
 cmake --build .
 
 PEAK_TARGET=my_function \

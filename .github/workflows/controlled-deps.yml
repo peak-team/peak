@@ -25,16 +25,16 @@ jobs:
           http_proxy: http://127.0.0.1:9
           https_proxy: http://127.0.0.1:9
           FC: /nonexistent/fortran
-        run: >
-          cmake -S . -B offline
-          -DPEAK_FETCH_DEPS=OFF
-          -DPEAK_ENABLE_OTF2=OFF
-          -DPEAK_ENABLE_MPI=OFF
-          -DBUILD_CUDA_PROFILE=OFF
-          -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit
-          -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
-          -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
-      - run: cmake --build offline
+        run: |
+          cmake -S . -B offline \
+            -DPEAK_FETCH_DEPS=OFF \
+            -DPEAK_ENABLE_OTF2=OFF \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DBUILD_CUDA_PROFILE=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+          cmake --build offline
       - name: Install and consume the CMake package
         run: |
           cmake --install offline --prefix ${{ github.workspace }}/installed
