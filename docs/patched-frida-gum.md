@@ -198,13 +198,15 @@ truly blocked reserved signal, missing arrival, unknown PC, failed rewrite,
 missing pthread gate, or failed release is fail-closed; after a physical
 byte/register mutation starts, failed release is fatal.
 
-The helper is currently built on Linux x86_64 and Linux Arm64 and installed as
-`bin/peak_detach_helper`. At runtime, `PEAK_DETACH_HELPER` has priority when
-set. Otherwise the library tries a relocation-safe path derived from the loaded
-`libpeak.so` location
-(`../bin/peak_detach_helper`), a same-directory helper for local packaging, the
-configured install-prefix path, and finally the configured build-tree helper
-path. The build-tree fallback is last so installed libraries do not prefer stale
+The helper is currently built on Linux x86_64 and Linux Arm64 and installed at
+the configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
+`bin/peak_detach_helper`). At runtime, `PEAK_DETACH_HELPER` has priority when
+set. Otherwise the library first tries the conventional relative
+`../bin/peak_detach_helper` probe derived from the loaded `libpeak.so` location,
+then a same-directory helper for local packaging, the configured install-prefix
+path, and finally the configured build-tree helper path. The relative probe is a
+convenience fallback, not a promise that an installation remains relocatable.
+The build-tree fallback is last so installed libraries do not prefer stale
 helpers left behind by an old build directory.
 
 The controller launches the helper with a duplicated sanitized environment,

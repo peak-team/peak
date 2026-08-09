@@ -28,6 +28,7 @@ jobs:
         run: |
           cmake -S . -B offline \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed \
+            -DCMAKE_INSTALL_BINDIR=libexec \
             -DPEAK_FETCH_DEPS=OFF \
             -DPEAK_ENABLE_OTF2=OFF \
             -DPEAK_ENABLE_MPI=OFF \
@@ -39,7 +40,9 @@ jobs:
       - name: Install and consume the CMake package
         run: |
           cmake --install offline
-          strings installed/lib*/libpeak.so | grep -F "${{ github.workspace }}/installed/bin/peak_detach_helper"
+          test -x installed/libexec/peak_detach_helper
+          installed/libexec/peak_detach_helper --self-test
+          strings installed/lib*/libpeak.so | grep -F "${{ github.workspace }}/installed/libexec/peak_detach_helper"
           cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed -DPEAK_SOURCE_DIR=${{ github.workspace }}
           cmake --build package-consumer
       - name: Build with the controlled system OTF2 prefix

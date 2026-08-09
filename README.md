@@ -98,6 +98,10 @@ LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 ./target_application
 ```
 
+The detach helper is installed at the configured
+`${CMAKE_INSTALL_BINDIR}/peak_detach_helper` (by default, `bin`).  Set
+`PEAK_DETACH_HELPER` when a package layout requires a different helper path.
+
 ## Essential Usage
 
 Select one or more CPU functions:

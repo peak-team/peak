@@ -384,6 +384,14 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "detach_helper_ptrace_stop_wait_ok")
 
+    add_test(NAME test_detach_helper_install_layout
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_detach_helper_install_layout.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_detach_helper_install_layout
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "detach_helper_install_layout_ok")
+
     if(TARGET peak_detach_helper)
         add_test(NAME test_detach_helper_self_test
             COMMAND $<TARGET_FILE:peak_detach_helper> --self-test)

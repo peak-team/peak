@@ -75,7 +75,7 @@ if(PEAK_DETACH_HELPER_SUPPORTED)
     target_compile_definitions(peak
         PRIVATE
             "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
-            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_PREFIX}/bin/peak_detach_helper\""
+            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\""
     )
     add_dependencies(peak peak_detach_helper)
 endif()
