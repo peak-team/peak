@@ -37,6 +37,8 @@ static unsigned long configured_jit_not_exec_retry_timeout_ms =
     PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS;
 static unsigned long configured_jit_drain_record_budget =
     PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET;
+static PeakEnvWarningState peak_jit_retry_timeout_warning_emitted;
+static PeakEnvWarningState peak_jit_drain_budget_warning_emitted;
 static char* peak_jit_perfmap_path = NULL;
 static off_t peak_jit_perfmap_offset = 0;
 static gboolean peak_jit_perfmap_identity_known = FALSE;
@@ -105,11 +107,12 @@ static unsigned long
 peak_jit_parse_ulong_env(const char* name,
                          const char* unit,
                          unsigned long fallback,
-                         bool zero_allowed)
+                         bool zero_allowed,
+                         PeakEnvWarningState* warning_emitted)
 {
     PeakEnvUnsignedSchema schema = {
         name, unit, fallback, zero_allowed ? 0UL : 1UL, ULONG_MAX,
-        zero_allowed,
+        zero_allowed, warning_emitted,
     };
 
     return (unsigned long)peak_parse_env_unsigned(&schema);
@@ -524,12 +527,14 @@ peak_jit_init_runtime_config_once(void)
         peak_jit_parse_ulong_env(PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV,
                                  "milliseconds",
                                  PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS,
-                                 true);
+                                 true,
+                                 &peak_jit_retry_timeout_warning_emitted);
     budget =
         peak_jit_parse_ulong_env(PEAK_JIT_DRAIN_RECORD_BUDGET_ENV,
                                  "records",
                                  PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET,
-                                 false);
+                                 false,
+                                 &peak_jit_drain_budget_warning_emitted);
     configured_jit_drain_record_budget = budget;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     const char* attach_sequence =

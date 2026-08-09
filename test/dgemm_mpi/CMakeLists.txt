@@ -36,6 +36,7 @@ add_executable(test_mpi_report_transport
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
+    ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
     ${PROJECT_SOURCE_DIR}/src/utils/timing.c
     ${PROJECT_SOURCE_DIR}/src/logging.c)

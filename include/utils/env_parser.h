@@ -14,6 +14,10 @@ extern "C" {
 #endif
 
 typedef struct {
+    unsigned char emitted;
+} PeakEnvWarningState;
+
+typedef struct {
     float detach_cost;
     unsigned int heartbeat_interval_us;
     unsigned int hibernation_cycle;
@@ -37,6 +41,7 @@ typedef struct {
     unsigned long long minimum;
     unsigned long long maximum;
     bool zero_allowed;
+    PeakEnvWarningState* warning_emitted;
 } PeakEnvUnsignedSchema;
 
 typedef struct {
@@ -46,6 +51,7 @@ typedef struct {
     double minimum;
     double maximum;
     bool zero_allowed;
+    PeakEnvWarningState* warning_emitted;
 } PeakEnvRealSchema;
 
 /** Parses a decimal unsigned value according to @p schema. */

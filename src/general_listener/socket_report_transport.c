@@ -181,6 +181,7 @@ static bool peak_socket_reduce_channel_ports(PeakSocketReportChannel channel,
                                              int* release_port);
 static _Thread_local PeakSocketReportChannel peak_socket_report_channel =
     PEAK_SOCKET_REPORT_CHANNEL_CPU;
+static PeakEnvWarningState peak_socket_port_warning_emitted;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static PeakSocketReportTestTelemetry peak_socket_test_telemetry = {
@@ -539,7 +540,7 @@ peak_socket_reduce_port(void)
     PeakEnvUnsignedSchema schema = {
         PEAK_OUTPUT_AGGREGATION_PORT_ENV, "TCP port",
         (unsigned long long)peak_socket_reduce_default_port(), 1, 65535,
-        false,
+        false, &peak_socket_port_warning_emitted,
     };
 
     return (int)peak_parse_env_unsigned(&schema);

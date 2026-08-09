@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static const char* const peak_test_environment_names[] = {
     "PEAK_DETACH_COUNT",
@@ -349,6 +350,11 @@ check_detach_override(void)
         count != 99U) {
         return 1;
     }
+    setenv("PEAK_DETACH_COUNT", "", 1);
+    if (peak_general_listener_parse_detach_count_override(&count) ||
+        count != 99U) {
+        return 1;
+    }
     setenv("PEAK_DETACH_COUNT", "12", 1);
     if (!peak_general_listener_parse_detach_count_override(&count) ||
         count != 12U) {
@@ -628,8 +634,18 @@ check_output_policies(void)
 }
 
 int
-main(void)
+main(int argc, char** argv)
 {
+    if (argc == 2 && strcmp(argv[1], "detach-empty-warning") == 0) {
+        unsigned long count = 1U;
+
+        clear_test_environment();
+        setenv("PEAK_DETACH_COUNT", "", 1);
+        return peak_general_listener_parse_detach_count_override(&count) ||
+                       count != 1U
+                   ? 1
+                   : 0;
+    }
     clear_test_environment();
     if (check_truthy_values() || check_unsigned_parser() ||
         check_detach_override()) {

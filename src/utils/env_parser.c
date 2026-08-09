@@ -8,7 +8,6 @@
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
-#include <stdatomic.h>
 #include <string.h>
 #include <strings.h>
 
@@ -25,97 +24,85 @@ typedef struct {
     double minimum;
     double maximum;
     bool zero_allowed;
+    PeakEnvWarningState* warning_emitted;
 } PeakEnvNumberSchema;
 
 #define PEAK_SECONDS_PER_MICROSECOND 1000000.0
 #define PEAK_SECONDS_PER_NANOSECOND 1000000000.0
-/* The current production numeric schemas use fewer than 32 variable names. */
-#define PEAK_ENV_WARNING_LIMIT 64U
 
-static atomic_flag peak_env_warning_lock = ATOMIC_FLAG_INIT;
-static const char* peak_env_warned_names[PEAK_ENV_WARNING_LIMIT];
-
-static bool
-peak_env_warning_first_for(const char* name)
-{
-    bool first = false;
-
-    while (atomic_flag_test_and_set_explicit(&peak_env_warning_lock,
-                                             memory_order_acquire)) {
-    }
-    for (size_t index = 0; index < PEAK_ENV_WARNING_LIMIT; index++) {
-        if (peak_env_warned_names[index] == NULL) {
-            peak_env_warned_names[index] = name;
-            first = true;
-            break;
-        }
-        if (strcmp(peak_env_warned_names[index], name) == 0) {
-            break;
-        }
-    }
-    if (!first && peak_env_warned_names[PEAK_ENV_WARNING_LIMIT - 1] != NULL) {
-        /* Preserve visibility if a future schema set outgrows this small cache. */
-        first = true;
-    }
-    atomic_flag_clear_explicit(&peak_env_warning_lock, memory_order_release);
-    return first;
-}
+static PeakEnvWarningState peak_detach_cost_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_interval_warning_emitted;
+static PeakEnvWarningState peak_hibernation_cycle_warning_emitted;
+static PeakEnvWarningState peak_target_ratio_warning_emitted;
+static PeakEnvWarningState peak_global_ratio_warning_emitted;
+static PeakEnvWarningState peak_detach_factor_warning_emitted;
+static PeakEnvWarningState peak_reattach_factor_warning_emitted;
+static PeakEnvWarningState peak_pause_timeout_warning_emitted;
+static PeakEnvWarningState peak_sig_cont_timeout_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_min_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_max_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_error_gain_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_rate_gain_warning_emitted;
+static PeakEnvWarningState peak_heartbeat_ema_alpha_warning_emitted;
 
 static const PeakEnvNumberSchema peak_detach_cost_schema = {
     "PEAK_COST", PEAK_ENV_NUMBER_REAL, "seconds", 0.0,
-    0.0, FLT_MAX, true,
+    0.0, FLT_MAX, true, &peak_detach_cost_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_interval_schema = {
     "PEAK_HEARTBEAT_INTERVAL", PEAK_ENV_NUMBER_REAL, "seconds", 0.1,
     0.0, (double)UINT_MAX / PEAK_SECONDS_PER_MICROSECOND, true,
+    &peak_heartbeat_interval_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_hibernation_cycle_schema = {
     "PEAK_HIBERNATION_CYCLE", PEAK_ENV_NUMBER_UNSIGNED, "cycles", 50.0,
-    0.0, UINT_MAX, true,
+    0.0, UINT_MAX, true, &peak_hibernation_cycle_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_target_ratio_schema = {
     "PEAK_OVERHEAD_RATIO", PEAK_ENV_NUMBER_REAL, "ratio", 0.1,
-    0.0, FLT_MAX, true,
+    0.0, FLT_MAX, true, &peak_target_ratio_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_global_ratio_schema = {
     "PEAK_GLOBAL_OVERHEAD_RATIO", PEAK_ENV_NUMBER_REAL, "ratio", 0.1,
-    0.0, FLT_MAX, true,
+    0.0, FLT_MAX, true, &peak_global_ratio_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_detach_factor_schema = {
     "PEAK_GLOBAL_DETACH_FACTOR", PEAK_ENV_NUMBER_REAL, "multiplier", 1.2,
-    1.0, FLT_MAX, false,
+    1.0, FLT_MAX, false, &peak_detach_factor_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_reattach_factor_schema = {
     "PEAK_GLOBAL_REATTACH_FACTOR", PEAK_ENV_NUMBER_REAL, "multiplier", 0.85,
-    0.0, 1.0, false,
+    0.0, 1.0, false, &peak_reattach_factor_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_pause_timeout_schema = {
     "PEAK_PAUSE_TIMEOUT", PEAK_ENV_NUMBER_REAL, "seconds", 0.01,
     0.0, (double)ULLONG_MAX / PEAK_SECONDS_PER_NANOSECOND, true,
+    &peak_pause_timeout_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_sig_cont_timeout_schema = {
     "PEAK_SIG_CONT_TIMEOUT", PEAK_ENV_NUMBER_REAL, "seconds", 0.01,
     0.0, (double)ULLONG_MAX / PEAK_SECONDS_PER_NANOSECOND, true,
+    &peak_sig_cont_timeout_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_min_schema = {
     "PEAK_HB_MIN_US", PEAK_ENV_NUMBER_UNSIGNED, "microseconds", 10000.0,
-    1.0, UINT_MAX, false,
+    1.0, UINT_MAX, false, &peak_heartbeat_min_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_max_schema = {
     "PEAK_HB_MAX_US", PEAK_ENV_NUMBER_UNSIGNED, "microseconds", 500000.0,
-    1.0, UINT_MAX, false,
+    1.0, UINT_MAX, false, &peak_heartbeat_max_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_error_gain_schema = {
     "PEAK_HB_K_ERR", PEAK_ENV_NUMBER_REAL, "gain", 3.0,
-    0.0, DBL_MAX, true,
+    0.0, DBL_MAX, true, &peak_heartbeat_error_gain_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_rate_gain_schema = {
     "PEAK_HB_K_RATE", PEAK_ENV_NUMBER_REAL, "gain", 0.8,
-    0.0, DBL_MAX, true,
+    0.0, DBL_MAX, true, &peak_heartbeat_rate_gain_warning_emitted,
 };
 static const PeakEnvNumberSchema peak_heartbeat_ema_alpha_schema = {
     "PEAK_HB_EMA_A", PEAK_ENV_NUMBER_REAL, "ratio", 0.3,
-    0.0, 1.0, false,
+    0.0, 1.0, false, &peak_heartbeat_ema_alpha_warning_emitted,
 };
 
 static void
@@ -123,7 +110,10 @@ peak_env_warn_fallback(const PeakEnvNumberSchema* schema,
                        const char* value,
                        double fallback)
 {
-    if (!peak_env_warning_first_for(schema->name)) {
+    if (schema->warning_emitted != NULL &&
+        __atomic_exchange_n(&schema->warning_emitted->emitted,
+                            1,
+                            __ATOMIC_RELAXED) != 0) {
         return;
     }
     peak_log_warn("[peak] invalid %s=%s; using %.17g %s\n",
@@ -137,7 +127,10 @@ static void
 peak_env_warn_unsigned_fallback(const PeakEnvUnsignedSchema* schema,
                                 const char* value)
 {
-    if (!peak_env_warning_first_for(schema->name)) {
+    if (schema->warning_emitted != NULL &&
+        __atomic_exchange_n(&schema->warning_emitted->emitted,
+                            1,
+                            __ATOMIC_RELAXED) != 0) {
         return;
     }
     peak_log_warn("[peak] invalid %s=%s; using %llu %s\n",
@@ -264,6 +257,7 @@ peak_parse_env_real(const PeakEnvRealSchema* schema)
     PeakEnvNumberSchema number_schema = {
         schema->name, PEAK_ENV_NUMBER_REAL, schema->unit, schema->fallback,
         schema->minimum, schema->maximum, schema->zero_allowed,
+        schema->warning_emitted,
     };
 
     return peak_env_parse_number(&number_schema, NULL, true);
@@ -348,7 +342,10 @@ peak_parse_runtime_numeric_config(void)
                                    value,
                                    (double)config.heartbeat_min_us);
         } else {
-            if (peak_env_warning_first_for(peak_heartbeat_min_schema.name)) {
+            if (__atomic_exchange_n(
+                    &peak_heartbeat_min_schema.warning_emitted->emitted,
+                    1,
+                    __ATOMIC_RELAXED) == 0) {
                 peak_log_warn("[peak] %s=%u requires %s >= %u; using %u microseconds\n",
                               peak_heartbeat_min_schema.name,
                               config.heartbeat_min_us,

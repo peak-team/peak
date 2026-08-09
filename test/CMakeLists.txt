@@ -305,6 +305,14 @@ if(BUILD_TESTING)
     set_tests_properties(test_runtime_config
         PROPERTIES
             PASS_REGULAR_EXPRESSION "runtime_config_test_ok")
+    add_test(NAME test_runtime_config_detach_empty_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_DETACH_COUNT=; using 0 calls"
+                --stderr-count-regex "invalid PEAK_DETACH_COUNT=; using 0 calls"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_runtime_config> detach-empty-warning)
 
     add_executable(test_numeric_env_parser
         utils/test_numeric_env_parser.c
@@ -316,6 +324,12 @@ if(BUILD_TESTING)
     add_test(NAME test_numeric_env_parser COMMAND test_numeric_env_parser)
     set_tests_properties(test_numeric_env_parser
         PROPERTIES PASS_REGULAR_EXPRESSION "numeric_env_parser_test_ok")
+    add_executable(test_env_parser_header_cxx
+        utils/test_env_parser_header_cxx.cpp)
+    target_include_directories(test_env_parser_header_cxx PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include/utils)
+    add_test(NAME test_env_parser_header_cxx COMMAND test_env_parser_header_cxx)
     add_test(NAME test_numeric_env_parser_single_warning
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py

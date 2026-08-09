@@ -224,8 +224,9 @@ full output and teardown behavior.
 
 Numeric overhead-control values must consume the complete value and be finite.
 Invalid present values emit one warning and use their documented default.
-`PEAK_COST` and the overhead ratios are nonnegative (zero keeps their existing
-disable behavior); heartbeat sleep bounds are positive, and a maximum below an
+`PEAK_COST` and the overhead ratios are nonnegative; a zero ratio remains an
+immediate threshold for the existing `ratio > threshold` comparison. Heartbeat
+sleep bounds are positive, and a maximum below an
 accepted minimum is raised to that minimum. Global hysteresis requires a
 detach factor of at least `1`, a reattach factor in `(0, 1]`, and the reattach
 factor strictly below the detach factor; a conflicting reattach value uses its

@@ -213,6 +213,9 @@ static gsize peak_controller_shutdown_policy_initialized = 0;
 static unsigned int peak_controller_max_retry_count = 300;
 static double peak_controller_max_pending_age_s = 30.0;
 static double peak_reattach_cooldown_s = 60.0;
+static PeakEnvWarningState peak_reattach_cooldown_warning_emitted;
+static PeakEnvWarningState peak_controller_pending_age_warning_emitted;
+static PeakEnvWarningState peak_controller_retry_count_warning_emitted;
 static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
@@ -231,10 +234,13 @@ static gboolean peak_dynamic_attach_needed = FALSE;
 static void
 peak_general_listener_init_reattach_policy_once(void)
 {
+    PeakEnvUnsignedSchema schema = {
+        PEAK_REATTACH_COOLDOWN_MS_ENV, "milliseconds",
+        peak_reattach_default_cooldown_ms, 0, UINT_MAX, true,
+        &peak_reattach_cooldown_warning_emitted,
+    };
     unsigned int cooldown_ms =
-        peak_general_listener_parse_uint_env_default(
-            PEAK_REATTACH_COOLDOWN_MS_ENV,
-            peak_reattach_default_cooldown_ms);
+        (unsigned int)peak_parse_env_unsigned(&schema);
     peak_reattach_cooldown_s = (double)cooldown_ms / 1000.0;
 }
 
@@ -494,10 +500,11 @@ peak_env_truthy_general(const char* value)
 static unsigned int
 peak_general_controller_parse_uint_env(const char* name,
                                        const char* unit,
-                                       unsigned int default_value)
+                                       unsigned int default_value,
+                                       PeakEnvWarningState* warning_emitted)
 {
     PeakEnvUnsignedSchema schema = {
-        name, unit, default_value, 0, G_MAXUINT, true,
+        name, unit, default_value, 0, G_MAXUINT, true, warning_emitted,
     };
 
     return (unsigned int)peak_parse_env_unsigned(&schema);
@@ -510,7 +517,8 @@ peak_general_controller_init_retry_limits_once(void)
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_PENDING_AGE_MS_ENV,
             "milliseconds",
-            (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0));
+            (unsigned int)(peak_controller_default_max_pending_age_s * 1000.0),
+            &peak_controller_pending_age_warning_emitted);
 
     peak_controller_max_pending_age_s =
         max_pending_age_ms == 0 ? 0.0 : (double)max_pending_age_ms / 1000.0;
@@ -518,7 +526,8 @@ peak_general_controller_init_retry_limits_once(void)
         peak_general_controller_parse_uint_env(
             PEAK_CONTROLLER_MAX_RETRY_COUNT_ENV,
             "retries",
-            peak_controller_default_max_retry_count);
+            peak_controller_default_max_retry_count,
+            &peak_controller_retry_count_warning_emitted);
 }
 
 static void
