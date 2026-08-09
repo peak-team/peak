@@ -3,17 +3,19 @@
 PEAK can build with either the stock prebuilt Frida Gum devkit or a PEAK-patched
 devkit exposing the PC classification and safe-point hooks described in
 `docs/physical-detach-controller.md`. On Linux x86_64 and Linux Arm64 the
-default `auto` provider now downloads the Frida Gum devkit, copies it to a
+default `auto` provider downloads the Frida Gum devkit, copies it to a
 PEAK-patched devkit directory, guards Gum's online in-memory ELF fallback, and
 appends PEAK's Gum PC API implementation to the archive. On x86_64 it also
-routes attach-time redirect resolution through PEAK's exact-entry API. Other
-platforms keep using the stock prebuilt devkit unless a patched devkit is
-selected explicitly.
+routes attach-time redirect resolution through PEAK's exact-entry API. On macOS
+x86_64 and Arm64, the default provider downloads a pinned stock devkit. Other
+platforms/architectures require a caller-provided Frida Gum provider.
 
 ## Default Provider
 
 With no extra options, PEAK downloads the pinned Frida Gum devkit and applies
-the PEAK patch on supported Linux architectures:
+the PEAK patch on Linux x86_64 and Arm64. On macOS x86_64 and Arm64 it downloads
+a pinned stock devkit; other platforms/architectures require a caller-provided
+Frida Gum provider:
 
 ```sh
 cmake -S . -B build
@@ -27,7 +29,7 @@ caller-provided patched-devkit root.
 On Linux x86_64 and Linux Arm64 this produces
 `frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the
 linked headers and archive expose the architecture-specific PEAK ABI.
-The downloaded Frida Gum 17.15.3 archives are pinned with SHA-256 hashes in
+The four downloadable Frida Gum 17.15.3 archives are pinned with SHA-256 hashes in
 `cmake/frida-gum-download.cmake`.
 
 The Linux patched devkit also edits Frida's `gumelfmodule.c.o` archive member.

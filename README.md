@@ -56,17 +56,19 @@ PEAK writes a report to stderr and a CSV profile log using the default prefix
 
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
 CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
-provider downloads a pinned Frida Gum devkit and applies the PEAK patch. Other
-platforms use the stock prebuilt devkit unless a patched devkit is selected.
-For controlled or offline builds, set
+provider downloads a pinned Frida Gum devkit and applies the PEAK patch; on
+macOS x86_64 and Arm64, it downloads a pinned stock devkit. Other
+platforms/architectures require a caller-provided Frida Gum provider. For
+controlled or offline builds, set
 `PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
 `FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
 
 ## Build and Install
 
 On Linux x86_64 and Arm64, the default build downloads the pinned Frida Gum
-devkit and applies the PEAK patch. Other platforms use the stock prebuilt
-devkit unless a patched devkit is selected:
+devkit and applies the PEAK patch; on macOS x86_64 and Arm64, it downloads a
+pinned stock devkit. Other platforms/architectures require a caller-provided
+Frida Gum provider:
 
 ```bash
 mkdir -p build
@@ -310,7 +312,9 @@ that path.
 
 ## Testing
 
-Configure and run the local suite with the default pinned Frida Gum download:
+Configure and run the local suite with the default Frida Gum provider. On
+Linux/macOS x86_64 and Arm64, it uses a pinned download; other
+platforms/architectures need a caller-provided provider:
 
 ```bash
 mkdir -p build
