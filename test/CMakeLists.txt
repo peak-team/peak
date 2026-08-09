@@ -3163,6 +3163,7 @@ if(BUILD_TESTING)
                 --stderr-regex "disabling non-critical profiler subsystem \\(exit interposer installation unavailable\\)"
                 --stderr-count-regex "disabling non-critical profiler subsystem"
                 --stderr-count 1
+                --stdout-regex "(?s)^explicit exit requested\\nexplicit exit atexit marker\\n$"
                 -- $<TARGET_FILE:test_explicit_exit>)
     set_tests_properties(test_exit_interposer_explicit_exit_fails_open
         PROPERTIES

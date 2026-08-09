@@ -712,6 +712,17 @@ def check_peak_init_heartbeat_order(repo_root):
             "original_exit(status);" in exit_handler,
             "the ordinary ELF exit interposer must remain inert before "
             "activation and finalize PEAK afterward")
+    unavailable_position = exit_handler.find(
+        "if (atomic_load_explicit(&peak_exit_interposer_unavailable,"
+    )
+    activation_position = exit_handler.find(
+        "peak_runtime_close_activation_for_teardown();"
+    )
+    require(unavailable_position != -1 and
+            unavailable_position < activation_position and
+            "original_exit(status);" in exit_handler[unavailable_position:activation_position],
+            "an unavailable explicit-exit interposer must delegate to libc "
+            "exit before PEAK teardown")
     activation_close = extract_function(
         source, "peak_runtime_close_activation_for_teardown"
     )
