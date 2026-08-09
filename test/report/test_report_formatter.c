@@ -817,33 +817,45 @@ check_output_template_and_no_clobber(const char* temp_directory)
 static void
 check_concurrent_no_clobber(const char* temp_directory)
 {
-    char path[768];
+    char path[PATH_MAX];
+    char component[NAME_MAX + 1];
     int start[2];
-    pid_t child;
-    int child_status;
-    bool parent_success;
+    pid_t children[32];
+    unsigned int winners = 0;
     PeakReportSnapshot* snapshot = create_fixture("concurrent");
 
-    assert(snprintf(path, sizeof(path), "%s/concurrent.csv", temp_directory) > 0);
+    memset(component, 'c', NAME_MAX - 4);
+    memcpy(component + NAME_MAX - 4, ".csv", 5);
+    assert(snprintf(path, sizeof(path), "%s/%s", temp_directory, component) <
+           (int)sizeof(path));
     assert(setenv("PEAK_STATSLOG_TEMPLATE", path, 1) == 0);
     peak_report_snapshot_prepare_for_render(snapshot);
     assert(pipe(start) == 0);
-    child = fork();
-    assert(child >= 0);
-    if (child == 0) {
-        char signal;
-        (void)close(start[1]);
-        if (read(start[0], &signal, 1) != 1) _exit(2);
-        _exit(peak_report_formatter_write_csv(snapshot) ? 0 : 1);
+    for (size_t index = 0; index < 32; index++) {
+        children[index] = fork();
+        assert(children[index] >= 0);
+        if (children[index] == 0) {
+            char signal;
+            (void)close(start[1]);
+            if (read(start[0], &signal, 1) != 1) _exit(2);
+            _exit(peak_report_formatter_write_csv(snapshot) ? 0 : 1);
+        }
     }
     assert(close(start[0]) == 0);
-    assert(write(start[1], "x", 1) == 1);
+    for (size_t index = 0; index < 32; index++) {
+        assert(write(start[1], "x", 1) == 1);
+    }
     assert(close(start[1]) == 0);
-    parent_success = peak_report_formatter_write_csv(snapshot);
-    assert(waitpid(child, &child_status, 0) == child);
-    assert(WIFEXITED(child_status));
-    assert((parent_success ? 1 : 0) + (WEXITSTATUS(child_status) == 0 ? 1 : 0) == 1);
+    for (size_t index = 0; index < 32; index++) {
+        int child_status;
+
+        assert(waitpid(children[index], &child_status, 0) == children[index]);
+        assert(WIFEXITED(child_status));
+        winners += WEXITSTATUS(child_status) == 0;
+    }
+    assert(winners == 1);
     assert(access(path, F_OK) == 0);
+    assert(!directory_has_prefix(temp_directory, ".peak-tmp."));
     assert(unlink(path) == 0);
     peak_report_snapshot_destroy(snapshot);
 }
