@@ -646,6 +646,21 @@ main(int argc, char** argv)
                    ? 1
                    : 0;
     }
+    if (argc == 2 && strcmp(argv[1], "timeout-warning") == 0) {
+        PeakReportTimeoutBudget budget;
+
+        clear_test_environment();
+        setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "junk", 1);
+        setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS", "junk", 1);
+        setenv("PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS", "junk", 1);
+        budget = peak_general_listener_report_timeout_budget_for_rank_count(
+            4096U);
+        return budget.socket_phase_timeout_ms != 60000U ||
+                       budget.socket_release_timeout_ms != 340000U ||
+                       budget.mpi_report_release_timeout_ms != 180000U
+                   ? 1
+                   : 0;
+    }
     clear_test_environment();
     if (check_truthy_values() || check_unsigned_parser() ||
         check_detach_override()) {

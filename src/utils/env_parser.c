@@ -221,8 +221,9 @@ peak_env_parse_number(const PeakEnvNumberSchema* schema,
     return parsed;
 }
 
-unsigned long long
-peak_parse_env_unsigned(const PeakEnvUnsignedSchema* schema)
+bool
+peak_parse_env_unsigned_checked(const PeakEnvUnsignedSchema* schema,
+                                unsigned long long* value_out)
 {
     const char* value = getenv(schema->name);
     const unsigned char* cursor;
@@ -230,22 +231,35 @@ peak_parse_env_unsigned(const PeakEnvUnsignedSchema* schema)
     unsigned long long parsed;
 
     if (value == NULL) {
-        return schema->fallback;
+        return false;
     }
     cursor = (const unsigned char*)value;
     while (isspace(*cursor)) {
         cursor++;
     }
     if (value[0] == '\0' || *cursor == '-') {
-        peak_env_warn_unsigned_fallback(schema, value);
-        return schema->fallback;
+        return false;
     }
     errno = 0;
     parsed = strtoull(value, &end, 10);
     if (errno == ERANGE || end == value || *end != '\0' ||
         parsed < schema->minimum || parsed > schema->maximum ||
         (!schema->zero_allowed && parsed == 0)) {
-        peak_env_warn_unsigned_fallback(schema, value);
+        return false;
+    }
+    if (value_out != NULL) {
+        *value_out = parsed;
+    }
+    return true;
+}
+
+unsigned long long
+peak_parse_env_unsigned(const PeakEnvUnsignedSchema* schema)
+{
+    unsigned long long parsed;
+
+    if (!peak_parse_env_unsigned_checked(schema, &parsed)) {
+        peak_env_warn_unsigned_fallback(schema, getenv(schema->name));
         return schema->fallback;
     }
     return parsed;

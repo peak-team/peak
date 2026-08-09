@@ -57,6 +57,10 @@ typedef struct {
 /** Parses a decimal unsigned value according to @p schema. */
 unsigned long long peak_parse_env_unsigned(const PeakEnvUnsignedSchema* schema);
 
+/** Validates a decimal unsigned value without emitting a warning. */
+bool peak_parse_env_unsigned_checked(const PeakEnvUnsignedSchema* schema,
+                                     unsigned long long* value_out);
+
 /** Parses a finite real value according to @p schema. */
 double peak_parse_env_real(const PeakEnvRealSchema* schema);
 

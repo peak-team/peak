@@ -36,19 +36,20 @@ static bool
 peak_general_listener_parse_positive_uint_bounded(const char* name,
                                                   unsigned int maximum,
                                                   unsigned int* value_out,
-                                                  PeakEnvWarningState* warning_emitted)
+                                                  PeakEnvWarningState* warning_emitted,
+                                                  unsigned int fallback)
 {
     const char* value = getenv(name);
     PeakEnvUnsignedSchema schema = {
-        name, "milliseconds", 0, 1, maximum, false, warning_emitted,
+        name, "milliseconds", fallback, 1, maximum, false, warning_emitted,
     };
     unsigned long long parsed;
 
     if (value == NULL) {
         return false;
     }
-    parsed = peak_parse_env_unsigned(&schema);
-    if (parsed == 0) {
+    if (!peak_parse_env_unsigned_checked(&schema, &parsed)) {
+        (void)peak_parse_env_unsigned(&schema);
         return false;
     }
     if (value_out != NULL) {
@@ -114,7 +115,8 @@ peak_general_listener_report_timeout_budget_for_rank_count(
             PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV,
             (unsigned int)INT_MAX,
             &configured,
-            &peak_output_timeout_warning_emitted);
+            &peak_output_timeout_warning_emitted,
+            PEAK_SOCKET_PHASE_TIMEOUT_MS_DEFAULT);
     if (phase_was_configured) {
         budget.socket_phase_timeout_ms = configured;
     }
@@ -123,7 +125,8 @@ peak_general_listener_report_timeout_budget_for_rank_count(
             PEAK_TEST_OUTPUT_AGGREGATION_WAVE_BUDGET_MS_ENV,
             PEAK_SOCKET_GATHER_ADAPTIVE_MARGIN_MAX_MS,
             &configured,
-            NULL)) {
+            NULL,
+            0)) {
         wave_budget_ms = configured;
     }
 #endif
@@ -156,7 +159,8 @@ peak_general_listener_report_timeout_budget_for_rank_count(
             PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS_ENV,
             (unsigned int)INT_MAX,
             &configured,
-            &peak_output_release_timeout_warning_emitted)) {
+            &peak_output_release_timeout_warning_emitted,
+            minimum_socket_release)) {
         budget.socket_release_timeout_ms = configured;
         if (configured < minimum_socket_release) {
             budget.socket_release_timeout_ms = minimum_socket_release;
@@ -168,7 +172,8 @@ peak_general_listener_report_timeout_budget_for_rank_count(
             PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_ENV,
             UINT_MAX,
             &configured,
-            &peak_mpi_release_timeout_warning_emitted)) {
+            &peak_mpi_release_timeout_warning_emitted,
+            PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS_DEFAULT)) {
         budget.mpi_report_release_timeout_ms = configured;
     }
     mpi_margin = peak_general_listener_multiply_saturated(

@@ -313,6 +313,14 @@ if(BUILD_TESTING)
                 --stderr-count-regex "invalid PEAK_DETACH_COUNT=; using 0 calls"
                 --stderr-count 1
                 -- $<TARGET_FILE:test_runtime_config> detach-empty-warning)
+    add_test(NAME test_runtime_config_timeout_fallback_warnings
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "(?s)invalid PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS=junk; using 60000 milliseconds.*invalid PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS=junk; using 340000 milliseconds.*invalid PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS=junk; using 180000 milliseconds"
+                --stderr-count-regex "invalid PEAK_(OUTPUT_AGGREGATION_TIMEOUT_MS|OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS|MPI_REPORT_RELEASE_TIMEOUT_MS)=junk"
+                --stderr-count 3
+                -- $<TARGET_FILE:test_runtime_config> timeout-warning)
 
     add_executable(test_numeric_env_parser
         utils/test_numeric_env_parser.c
