@@ -194,7 +194,6 @@ peak_report_formatter_csv_path(bool rank_local,
             world_rank = -1;
         }
     }
-    (void)require_host_suffix;
     if (!peak_output_identity_path(path,
                                    sizeof(path),
                                    base,
@@ -202,6 +201,46 @@ peak_report_formatter_csv_path(bool rank_local,
                                    ".csv",
                                    world_rank)) {
         return NULL;
+    }
+    if (require_host_suffix) {
+        char hostname[256] = {0};
+        char suffixed[PATH_MAX];
+        int suffix_length;
+        size_t host_length = 0;
+        size_t path_length = strlen(path);
+        size_t stem_length = path_length;
+
+        if (gethostname(hostname, sizeof(hostname) - 1) != 0 ||
+            hostname[0] == '\0') {
+            (void)snprintf(hostname, sizeof(hostname), "unknown");
+        }
+        for (size_t index = 0; hostname[index] != '\0'; index++) {
+            unsigned char byte = (unsigned char)hostname[index];
+
+            hostname[host_length++] =
+                (byte >= 'a' && byte <= 'z') ||
+                (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '-' ||
+                byte == '_' || byte == '.' ? (char)byte : '_';
+        }
+        hostname[host_length] = '\0';
+        if (host_length == 0) {
+            (void)snprintf(hostname, sizeof(hostname), "unknown");
+        }
+        if (path_length >= 4 && strcmp(path + path_length - 4, ".csv") == 0) {
+            stem_length -= 4;
+        }
+        suffix_length = snprintf(suffixed,
+                                 sizeof(suffixed),
+                                 "%.*s-ranklocal-h%s%s",
+                                 (int)stem_length,
+                                 path,
+                                 hostname,
+                                 path_length == stem_length ? "" : ".csv");
+        if (suffix_length < 0 || suffix_length >= (int)sizeof(suffixed)) {
+            return NULL;
+        }
+        (void)snprintf(path, sizeof(path), "%s", suffixed);
     }
     if (template_value != NULL && template_value[0] != '\0' &&
         !peak_output_identity_make_parent(path)) {

@@ -262,6 +262,27 @@ class SocketPortIsolationTest(unittest.TestCase):
         ))
 
 
+class StatsArtifactNameTest(unittest.TestCase):
+    def test_strict_rank_local_fallback_is_a_valid_identity_artifact(self) -> None:
+        aggregate = (
+            "peak-stats-j42-s7-hnode0-r0-p123-q0123456789abcdef.csv"
+        )
+        fallback = (
+            "peak-stats-j42-s7-hnode0-r0-p123-q0123456789abcdef-"
+            "ranklocal-hnode0.csv"
+        )
+
+        self.assertEqual(
+            CHECKER.STATS_CSV_NAME_RE.fullmatch(aggregate)["rank"], "0"
+        )
+        self.assertEqual(
+            CHECKER.STATS_CSV_NAME_RE.fullmatch(fallback)["rank"], "0"
+        )
+        self.assertIsNone(CHECKER.STATS_CSV_NAME_RE.fullmatch(
+            "peak-stats-j42-s7-hnode0-r0-p123.csv"
+        ))
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False)
     if result.result.wasSuccessful():

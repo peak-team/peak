@@ -104,6 +104,11 @@ SOCKET_TRANSPORT_FALLBACK_MODES = {
     "finalize-clean-output-mpi-reducer-fail",
 }
 ALLOCATED_SOCKET_TEST_PORT_BASES = set()
+STATS_CSV_NAME_RE = re.compile(
+    r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+    r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
+    r"q[0-9a-f]{16}(?:-ranklocal-h[A-Za-z0-9_.-]+)?\.csv$"
+)
 
 
 def require_valid_accounting_diagnostics(name, rows):
@@ -1126,11 +1131,7 @@ def main():
             env=env,
             timeout=args.timeout,
         )
-        stats_name = re.compile(
-            r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
-            r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
-            r"q[0-9a-f]{16}\.csv$"
-        )
+        stats_name = STATS_CSV_NAME_RE
         stats_files = sorted(
             path for path in Path(stats_dir).glob("peak-stats-*.csv")
             if stats_name.fullmatch(path.name)

@@ -301,6 +301,7 @@ check_rank_local_csv_names(const char* stats_base,
     char rank_path[768];
     char hostname[TEST_HOSTNAME_CAPACITY] = {0};
     char hostname_path[1024];
+    char strict_hostname_path[1024];
     PeakReportSnapshot* snapshot = create_fixture("rank-local");
 
     clear_launcher_environment();
@@ -350,10 +351,15 @@ check_rank_local_csv_names(const char* stats_base,
 
     /* Strict MPI fallback naming reduces cross-node PID collision risk. */
     clear_launcher_environment();
+    assert(snprintf(strict_hostname_path, sizeof(strict_hostname_path),
+                    "%.*s-ranklocal-h%s.csv",
+                    (int)(strlen(hostname_path) - 4), hostname_path,
+                    hostname) > 0);
     assert(peak_report_formatter_write_rank_local_csv_host_disambiguated(
         snapshot));
-    assert(access(hostname_path, F_OK) == 0);
-    assert(unlink(hostname_path) == 0);
+    assert(access(hostname_path, F_OK) != 0);
+    assert(access(strict_hostname_path, F_OK) == 0);
+    assert(unlink(strict_hostname_path) == 0);
 
     clear_launcher_environment();
     peak_report_snapshot_destroy(snapshot);

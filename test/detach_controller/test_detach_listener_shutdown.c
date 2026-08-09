@@ -305,6 +305,57 @@ print_with_stderr_capture(char** output_out)
     return print_with_stderr_capture_for_mpi_policy(FALSE, output_out);
 }
 
+static gboolean
+print_rank_local_mpi_fixture_report(gboolean active_mpi_job,
+                                    char** output_out)
+{
+    char template_path[] = "/tmp/peak_rank_local_mpi_fixture_XXXXXX";
+    char hostname[256] = {0};
+    char strict_path[PATH_MAX];
+    size_t hostname_length = 0;
+    int strict_path_length;
+    int template_fd;
+    gboolean result;
+
+    template_fd = mkstemp(template_path);
+    if (template_fd < 0) {
+        return FALSE;
+    }
+    close(template_fd);
+    (void)unlink(template_path);
+    if (setenv("PEAK_STATSLOG_TEMPLATE", template_path, 1) != 0) {
+        return FALSE;
+    }
+    result = print_with_stderr_capture_for_mpi_policy(active_mpi_job,
+                                                      output_out);
+    (void)unlink(template_path);
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0 ||
+        hostname[0] == '\0') {
+        (void)snprintf(hostname, sizeof(hostname), "unknown");
+    }
+    for (size_t index = 0; hostname[index] != '\0'; index++) {
+        unsigned char byte = (unsigned char)hostname[index];
+
+        hostname[hostname_length++] =
+            (byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' ||
+            byte == '_' || byte == '.' ? (char)byte : '_';
+    }
+    hostname[hostname_length] = '\0';
+    strict_path_length = snprintf(strict_path,
+                                  sizeof(strict_path),
+                                  "%s-ranklocal-h%s",
+                                  template_path,
+                                  hostname_length > 0 ? hostname : "unknown");
+    if (strict_path_length >= 0 &&
+        strict_path_length < (int)sizeof(strict_path)) {
+        (void)unlink(strict_path);
+    }
+    (void)unsetenv("PEAK_STATSLOG_TEMPLATE");
+    return result;
+}
+
 static void
 cleanup_public_listener_globals(void)
 {
@@ -685,7 +736,7 @@ run_rank_local_mpi_text_default(void)
     peak_general_listener_freeze_final_report_snapshot();
 
     check_true("rank-local MPI report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    TRUE, &report_log) == TRUE);
     check_not_contains("rank-local MPI default suppresses text",
                        report_log,
@@ -697,7 +748,7 @@ run_rank_local_mpi_text_default(void)
     (void)setenv("I_MPI_RANK", "0", 1);
     (void)setenv("I_MPI_SIZE", "1", 1);
     check_true("singleton MPI report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    TRUE, &report_log) == TRUE);
     check_contains("singleton MPI default keeps text",
                    report_log,
@@ -707,7 +758,7 @@ run_rank_local_mpi_text_default(void)
 
     clear_mpi_launcher_environment();
     check_true("missing metadata report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    TRUE, &report_log) == TRUE);
     check_contains("missing metadata fails open for text",
                    report_log,
@@ -719,7 +770,7 @@ run_rank_local_mpi_text_default(void)
     (void)setenv("I_MPI_RANK", "17", 1);
     (void)setenv("I_MPI_SIZE", "4096", 1);
     check_true("inactive MPI policy report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    FALSE, &report_log) == TRUE);
     check_contains("inactive policy ignores launcher metadata",
                    report_log,
@@ -729,7 +780,7 @@ run_rank_local_mpi_text_default(void)
 
     (void)setenv("PEAK_TEXT_OUTPUT", "1", 1);
     check_true("rank-local MPI text override report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    TRUE, &report_log) == TRUE);
     check_contains("rank-local MPI text override keeps text",
                    report_log,
@@ -739,7 +790,7 @@ run_rank_local_mpi_text_default(void)
 
     (void)setenv("PEAK_TEXT_OUTPUT", "0", 1);
     check_true("explicit text disable report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    FALSE, &report_log) == TRUE);
     check_not_contains("explicit text disable suppresses text",
                        report_log,
@@ -754,7 +805,7 @@ run_rank_local_mpi_text_default(void)
     (void)setenv("I_MPI_RANK", "1", 1);
     (void)setenv("I_MPI_SIZE", "4", 1);
     check_true("contradictory metadata report write succeeded",
-               print_with_stderr_capture_for_mpi_policy(
+               print_rank_local_mpi_fixture_report(
                    TRUE, &report_log) == TRUE);
     check_contains("contradictory metadata fails open for text",
                    report_log,
