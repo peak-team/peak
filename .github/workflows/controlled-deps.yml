@@ -21,11 +21,11 @@ jobs:
           ALL_PROXY: http://127.0.0.1:9
           HTTP_PROXY: http://127.0.0.1:9
           HTTPS_PROXY: http://127.0.0.1:9
-          all_proxy: http://127.0.0.1:9
-          http_proxy: http://127.0.0.1:9
-          https_proxy: http://127.0.0.1:9
           FC: /nonexistent/fortran
         run: |
+          export all_proxy="$ALL_PROXY"
+          export http_proxy="$HTTP_PROXY"
+          export https_proxy="$HTTPS_PROXY"
           cmake -S . -B offline \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed \
             -DCMAKE_INSTALL_BINDIR=libexec \
