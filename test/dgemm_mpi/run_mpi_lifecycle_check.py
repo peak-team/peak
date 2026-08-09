@@ -148,6 +148,18 @@ def require_socket_release_fallback_layout(stats_names, nprocs):
         )
 
 
+def compact_temporary_stats_files(stats_dir):
+    return sorted(Path(stats_dir).glob(".peak-tmp.p*.*"))
+
+
+def reject_compact_temporary_stats_files(paths):
+    if paths:
+        raise AssertionError(
+            "PEAK compact CSV temporary file remained after launcher return: "
+            + ", ".join(path.name for path in paths)
+        )
+
+
 def require_valid_accounting_diagnostics(name, rows):
     diagnostics = [
         row for row in rows
@@ -1183,6 +1195,8 @@ def main():
         temporary_stats_files = sorted(
             Path(stats_dir).glob("peak-stats-*.csv.tmp.*")
         )
+        compact_temporary_files = compact_temporary_stats_files(stats_dir)
+        reject_compact_temporary_stats_files(compact_temporary_files)
         finalize_enter_markers = sorted(
             Path(stats_dir).glob("finalize-enter-r*.txt")
         )

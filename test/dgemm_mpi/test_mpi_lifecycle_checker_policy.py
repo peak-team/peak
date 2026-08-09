@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -316,6 +317,17 @@ class StatsArtifactNameTest(unittest.TestCase):
             CHECKER.require_socket_release_fallback_layout(missing, 4)
         with self.assertRaisesRegex(AssertionError, "each rank exactly once"):
             CHECKER.require_socket_release_fallback_layout(duplicate, 4)
+
+    def test_compact_temporary_artifact_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(CHECKER.compact_temporary_stats_files(directory), [])
+            artifact = Path(directory) / ".peak-tmp.p123.4"
+            artifact.touch()
+            artifacts = CHECKER.compact_temporary_stats_files(directory)
+
+            self.assertEqual(artifacts, [artifact])
+            with self.assertRaisesRegex(AssertionError, "compact CSV temporary"):
+                CHECKER.reject_compact_temporary_stats_files(artifacts)
 
 
 if __name__ == "__main__":
