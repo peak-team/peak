@@ -3133,12 +3133,32 @@ typedef int (*PeakCheckpointFn)(const char*, char* const[]);
 typedef void (*PeakTestVoidFn)(void);
 typedef int (*PeakTestReadyFn)(void);
 
+typedef struct {
+    PeakFiniFn fini;
+    _Atomic int completed;
+    int set_cancellation_type;
+    int cancellation_type;
+    int cancellation_status;
+} FiniThreadArgs;
+
 static void*
 fini_thread_main(void* data)
 {
-    PeakFiniFn fini = data;
+    FiniThreadArgs* args = data;
 
-    fini();
+    if (args->set_cancellation_type) {
+        args->cancellation_status =
+            pthread_setcanceltype(args->cancellation_type, NULL);
+        if (args->cancellation_status != 0) {
+            return NULL;
+        }
+    }
+    args->fini();
+    if (args->set_cancellation_type &&
+        args->cancellation_type == PTHREAD_CANCEL_DEFERRED) {
+        pthread_testcancel();
+    }
+    atomic_store_explicit(&args->completed, 1, memory_order_release);
     return NULL;
 }
 
@@ -3146,6 +3166,9 @@ typedef struct {
     const char* self;
     PeakCheckpointFn checkpoint;
     int result;
+    int set_cancellation_type;
+    int cancellation_type;
+    int cancellation_status;
 } CheckpointThreadArgs;
 
 static void*
@@ -3154,6 +3177,13 @@ checkpoint_thread_main(void* data)
     CheckpointThreadArgs* args = data;
     char* const argv[] = {(char*)args->self, (char*)"child-basic", NULL};
 
+    if (args->set_cancellation_type) {
+        args->cancellation_status =
+            pthread_setcanceltype(args->cancellation_type, NULL);
+        if (args->cancellation_status != 0) {
+            return NULL;
+        }
+    }
     args->result = args->checkpoint(args->self, argv);
     return NULL;
 }
@@ -3233,6 +3263,7 @@ run_exec_checkpoint_concurrent_fini_callbacks(const char* self)
         RTLD_DEFAULT, "peak_test_fini_waiting_for_checkpoint_reader");
     PeakTestReadyFn wait_count = (PeakTestReadyFn)dlsym(
         RTLD_DEFAULT, "peak_test_fini_checkpoint_reader_wait_count");
+    FiniThreadArgs fini_args = {.fini = fini, .completed = 0};
     CheckpointThreadArgs checkpoint_args = {.self = self, .checkpoint = checkpoint};
 
     if (fini == NULL || checkpoint == NULL || pause_enable == NULL ||
@@ -3261,7 +3292,7 @@ run_exec_checkpoint_concurrent_fini_callbacks(const char* self)
                    182 :
                    185;
     }
-    rc = pthread_create(&fini_thread, NULL, fini_thread_main, (void*)fini);
+    rc = pthread_create(&fini_thread, NULL, fini_thread_main, &fini_args);
     if (rc != 0) {
         fprintf(stderr, "pthread_create fini failed: %s\n", strerror(rc));
         reader_release();
@@ -3355,9 +3386,103 @@ run_exec_checkpoint_reader_wake_before_wait(const char* self)
 }
 
 static int
+run_exec_checkpoint_fini_completion_wake(const char* self)
+{
+    pthread_t checkpoint_thread;
+    pthread_t owner_thread;
+    pthread_t follower_thread;
+    PeakFiniFn fini = (PeakFiniFn)dlsym(RTLD_DEFAULT, "peak_test_fini");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    PeakTestVoidFn pause_enable = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_pause_enable");
+    PeakTestReadyFn reader_is_held = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_is_held");
+    PeakTestVoidFn reader_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_release");
+    PeakTestReadyFn owner_waiting = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_waiting_for_checkpoint_reader");
+    PeakTestReadyFn completion_wait_count = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_completion_wait_count");
+    CheckpointThreadArgs checkpoint_args = {.self = self, .checkpoint = checkpoint};
+    FiniThreadArgs owner_args = {.fini = fini, .completed = 0};
+    FiniThreadArgs follower_args = {.fini = fini, .completed = 0};
+    int rc;
+
+    if (fini == NULL || checkpoint == NULL || pause_enable == NULL ||
+        reader_is_held == NULL || reader_release == NULL ||
+        owner_waiting == NULL || completion_wait_count == NULL) {
+        fprintf(stderr, "checkpoint/fini test hooks unavailable\n");
+        return 200;
+    }
+
+    call_hot_target(5);
+    pause_enable();
+    rc = pthread_create(&checkpoint_thread, NULL, checkpoint_thread_main,
+                        &checkpoint_args);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_create checkpoint reader failed: %s\n",
+                strerror(rc));
+        return 201;
+    }
+    if (wait_for_test_hook(reader_is_held, "checkpoint reader") != 0) {
+        reader_release();
+        return join_test_thread(checkpoint_thread, "checkpoint reader") == 0 ?
+                   202 :
+                   203;
+    }
+    rc = pthread_create(&owner_thread, NULL, fini_thread_main, &owner_args);
+    if (rc != 0) {
+        reader_release();
+        return join_test_thread(checkpoint_thread, "checkpoint reader") == 0 ?
+                   204 :
+                   205;
+    }
+    if (wait_for_test_hook(owner_waiting, "owner finalizer") != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        (void)join_test_thread(owner_thread, "owner finalizer");
+        return 206;
+    }
+    rc = pthread_create(&follower_thread, NULL, fini_thread_main,
+                        &follower_args);
+    if (rc != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        (void)join_test_thread(owner_thread, "owner finalizer");
+        return 207;
+    }
+    if (wait_for_test_hook(completion_wait_count, "follower completion wait") !=
+            0 ||
+        atomic_load_explicit(&follower_args.completed, memory_order_acquire) !=
+            0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        (void)join_test_thread(owner_thread, "owner finalizer");
+        (void)join_test_thread(follower_thread, "follower finalizer");
+        return 208;
+    }
+
+    reader_release();
+    if (join_test_thread(checkpoint_thread, "checkpoint reader") != 0 ||
+        join_test_thread(owner_thread, "owner finalizer") != 0 ||
+        join_test_thread(follower_thread, "follower finalizer") != 0) {
+        return 209;
+    }
+    printf("fini_completion_wake=1 completion_waits=%d owner_done=%d "
+           "follower_done=%d\n",
+           completion_wait_count(),
+           atomic_load_explicit(&owner_args.completed, memory_order_acquire),
+           atomic_load_explicit(&follower_args.completed, memory_order_acquire));
+    return checkpoint_args.result == -1 ? 0 : 210;
+}
+
+static int
 run_exec_checkpoint_reader_timeout(const char* self)
 {
     pthread_t checkpoint_thread;
+    pthread_t owner_thread;
+    pthread_t follower_thread;
     struct timespec start;
     struct timespec end;
     PeakFiniFn fini = (PeakFiniFn)dlsym(RTLD_DEFAULT, "peak_test_fini");
@@ -3373,12 +3498,19 @@ run_exec_checkpoint_reader_timeout(const char* self)
         RTLD_DEFAULT, "peak_test_fini_checkpoint_reader_wait_count");
     PeakTestReadyFn timeout_observed = (PeakTestReadyFn)dlsym(
         RTLD_DEFAULT, "peak_test_fini_checkpoint_reader_timeout_observed");
+    PeakTestReadyFn fini_waiting = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_waiting_for_checkpoint_reader");
+    PeakTestReadyFn completion_wait_count = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_completion_wait_count");
     CheckpointThreadArgs checkpoint_args = {.self = self, .checkpoint = checkpoint};
+    FiniThreadArgs owner_args = {.fini = fini, .completed = 0};
+    FiniThreadArgs follower_args = {.fini = fini, .completed = 0};
     int rc;
 
     if (fini == NULL || checkpoint == NULL || pause_enable == NULL ||
         reader_is_held == NULL || reader_release == NULL || wait_count == NULL ||
-        timeout_observed == NULL) {
+        timeout_observed == NULL || fini_waiting == NULL ||
+        completion_wait_count == NULL) {
         fprintf(stderr, "checkpoint/fini test hooks unavailable\n");
         return 191;
     }
@@ -3401,27 +3533,243 @@ run_exec_checkpoint_reader_timeout(const char* self)
                    194 :
                    195;
     }
-    fini();
+    rc = pthread_create(&owner_thread, NULL, fini_thread_main, &owner_args);
+    if (rc != 0 || wait_for_test_hook(fini_waiting, "owner finalizer") != 0) {
+        reader_release();
+        if (rc == 0) {
+            (void)join_test_thread(owner_thread, "owner finalizer");
+        }
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        return 196;
+    }
+    rc = pthread_create(&follower_thread, NULL, fini_thread_main,
+                        &follower_args);
+    if (rc != 0 ||
+        wait_for_test_hook(completion_wait_count,
+                           "follower completion wait") != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        (void)join_test_thread(owner_thread, "owner finalizer");
+        if (rc == 0) {
+            (void)join_test_thread(follower_thread, "follower finalizer");
+        }
+        return 197;
+    }
+    if (join_test_thread(owner_thread, "owner finalizer") != 0 ||
+        join_test_thread(follower_thread, "follower finalizer") != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        return 198;
+    }
     if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
         reader_release();
         return join_test_thread(checkpoint_thread, "checkpoint reader") == 0 ?
-                   196 :
-                   197;
+                   199 :
+                   200;
     }
     reader_release();
     if (join_test_thread(checkpoint_thread, "released checkpoint reader") != 0) {
-        return 198;
+        return 201;
     }
 
     long elapsed_ms = elapsed_milliseconds(&start, &end);
     printf("checkpoint_reader_timeout=1 reader_released_after_timeout=1 "
-           "timeout_observed=%d fini_waits=%d elapsed_ms=%ld\n",
-           timeout_observed(), wait_count(), elapsed_ms);
+           "timeout_observed=%d fini_waits=%d completion_waits=%d "
+           "owner_done=%d follower_done=%d elapsed_ms=%ld\n",
+           timeout_observed(), wait_count(), completion_wait_count(),
+           atomic_load_explicit(&owner_args.completed, memory_order_acquire),
+           atomic_load_explicit(&follower_args.completed, memory_order_acquire),
+           elapsed_ms);
     return timeout_observed() && wait_count() > 0 &&
+                   completion_wait_count() > 0 &&
+                   atomic_load_explicit(&owner_args.completed,
+                                        memory_order_acquire) != 0 &&
+                   atomic_load_explicit(&follower_args.completed,
+                                        memory_order_acquire) != 0 &&
                    checkpoint_args.result == -1 && elapsed_ms >= 4500L &&
                    elapsed_ms < 7000L ?
                0 :
-               199;
+               202;
+}
+
+static int
+run_exec_checkpoint_fini_cancellation(const char* self, int cancellation_type)
+{
+    pthread_t checkpoint_thread;
+    pthread_t owner_thread;
+    pthread_t follower_thread;
+    struct timespec start;
+    struct timespec end;
+    PeakFiniFn fini = (PeakFiniFn)dlsym(RTLD_DEFAULT, "peak_test_fini");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    PeakTestVoidFn pause_enable = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_pause_enable");
+    PeakTestReadyFn reader_is_held = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_is_held");
+    PeakTestVoidFn reader_release = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_release");
+    PeakTestReadyFn fini_waiting = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_waiting_for_checkpoint_reader");
+    PeakTestReadyFn timeout_observed = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_checkpoint_reader_timeout_observed");
+    CheckpointThreadArgs checkpoint_args = {.self = self, .checkpoint = checkpoint};
+    FiniThreadArgs owner_args = {
+        .fini = fini,
+        .completed = 0,
+        .set_cancellation_type = 1,
+        .cancellation_type = cancellation_type,
+        .cancellation_status = 0,
+    };
+    FiniThreadArgs follower_args = {.fini = fini, .completed = 0};
+    void* owner_result = NULL;
+    int rc;
+
+    if (fini == NULL || checkpoint == NULL || pause_enable == NULL ||
+        reader_is_held == NULL || reader_release == NULL ||
+        fini_waiting == NULL || timeout_observed == NULL) {
+        fprintf(stderr, "checkpoint/fini test hooks unavailable\n");
+        return 211;
+    }
+
+    call_hot_target(5);
+    pause_enable();
+    rc = pthread_create(&checkpoint_thread, NULL, checkpoint_thread_main,
+                        &checkpoint_args);
+    if (rc != 0 ||
+        wait_for_test_hook(reader_is_held, "checkpoint reader") != 0) {
+        if (rc == 0) {
+            reader_release();
+            (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        }
+        return 212;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0 ||
+        pthread_create(&owner_thread, NULL, fini_thread_main, &owner_args) != 0 ||
+        wait_for_test_hook(fini_waiting, "cancelable owner finalizer") != 0 ||
+        pthread_cancel(owner_thread) != 0 ||
+        pthread_join(owner_thread, &owner_result) != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        return 213;
+    }
+    rc = pthread_create(&follower_thread, NULL, fini_thread_main,
+                        &follower_args);
+    if (rc != 0 || join_test_thread(follower_thread, "second finalizer") != 0) {
+        reader_release();
+        (void)join_test_thread(checkpoint_thread, "checkpoint reader");
+        return 214;
+    }
+    reader_release();
+    if (join_test_thread(checkpoint_thread, "released checkpoint reader") != 0) {
+        return 215;
+    }
+
+    long elapsed_ms = elapsed_milliseconds(&start, &end);
+    printf("fini_cancellation=%s timeout_observed=%d owner_result=%s "
+           "owner_setup=%d follower_done=%d "
+           "reader_released_after_timeout=1 "
+           "elapsed_ms=%ld\n",
+           cancellation_type == PTHREAD_CANCEL_ASYNCHRONOUS ? "async" :
+                                                           "deferred",
+           timeout_observed(),
+           owner_result == PTHREAD_CANCELED ? "canceled" : "returned",
+           owner_args.cancellation_status,
+           atomic_load_explicit(&follower_args.completed, memory_order_acquire),
+           elapsed_ms);
+    return timeout_observed() && owner_args.cancellation_status == 0 &&
+                   atomic_load_explicit(&follower_args.completed,
+                                        memory_order_acquire) != 0 &&
+                   checkpoint_args.result == -1 && elapsed_ms >= 4500L &&
+                   elapsed_ms < 7000L ?
+               0 :
+               216;
+}
+
+static int
+run_exec_checkpoint_reader_cancellation(const char* self,
+                                        int cancellation_type)
+{
+    pthread_t checkpoint_thread;
+    pthread_t owner_thread;
+    pthread_t follower_thread;
+    struct timespec start;
+    struct timespec end;
+    PeakFiniFn fini = (PeakFiniFn)dlsym(RTLD_DEFAULT, "peak_test_fini");
+    PeakCheckpointFn checkpoint =
+        (PeakCheckpointFn)dlsym(RTLD_DEFAULT, "peak_checkpoint_for_exec");
+    PeakTestVoidFn pause_enable = (PeakTestVoidFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_pause_enable");
+    PeakTestReadyFn reader_is_held = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_checkpoint_reader_is_held");
+    PeakTestReadyFn fini_waiting = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_waiting_for_checkpoint_reader");
+    PeakTestReadyFn timeout_observed = (PeakTestReadyFn)dlsym(
+        RTLD_DEFAULT, "peak_test_fini_checkpoint_reader_timeout_observed");
+    CheckpointThreadArgs checkpoint_args = {
+        .self = self,
+        .checkpoint = checkpoint,
+        .result = 0,
+        .set_cancellation_type = 1,
+        .cancellation_type = cancellation_type,
+        .cancellation_status = 0,
+    };
+    FiniThreadArgs owner_args = {.fini = fini, .completed = 0};
+    FiniThreadArgs follower_args = {.fini = fini, .completed = 0};
+    void* reader_result = NULL;
+    int rc;
+
+    if (fini == NULL || checkpoint == NULL || pause_enable == NULL ||
+        reader_is_held == NULL || fini_waiting == NULL ||
+        timeout_observed == NULL) {
+        fprintf(stderr, "checkpoint/fini test hooks unavailable\n");
+        return 217;
+    }
+
+    call_hot_target(5);
+    pause_enable();
+    rc = pthread_create(&checkpoint_thread, NULL, checkpoint_thread_main,
+                        &checkpoint_args);
+    if (rc != 0 ||
+        wait_for_test_hook(reader_is_held, "cancelable checkpoint reader") !=
+            0 ||
+        pthread_cancel(checkpoint_thread) != 0 ||
+        pthread_join(checkpoint_thread, &reader_result) != 0 ||
+        checkpoint_args.cancellation_status != 0 ||
+        reader_result != PTHREAD_CANCELED ||
+        clock_gettime(CLOCK_MONOTONIC, &start) != 0 ||
+        pthread_create(&owner_thread, NULL, fini_thread_main, &owner_args) != 0 ||
+        wait_for_test_hook(fini_waiting, "owner after reader cancellation") !=
+            0 ||
+        join_test_thread(owner_thread, "owner finalizer") != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 218;
+    }
+    rc = pthread_create(&follower_thread, NULL, fini_thread_main,
+                        &follower_args);
+    if (rc != 0 || join_test_thread(follower_thread, "second finalizer") != 0) {
+        return 219;
+    }
+
+    long elapsed_ms = elapsed_milliseconds(&start, &end);
+    printf("checkpoint_reader_cancellation=%s reader_result=canceled "
+           "timeout_observed=%d owner_done=%d follower_done=%d "
+           "elapsed_ms=%ld\n",
+           cancellation_type == PTHREAD_CANCEL_ASYNCHRONOUS ? "async" :
+                                                           "deferred",
+           timeout_observed(),
+           atomic_load_explicit(&owner_args.completed, memory_order_acquire),
+           atomic_load_explicit(&follower_args.completed, memory_order_acquire),
+           elapsed_ms);
+    return timeout_observed() &&
+                   atomic_load_explicit(&owner_args.completed,
+                                        memory_order_acquire) != 0 &&
+                   atomic_load_explicit(&follower_args.completed,
+                                        memory_order_acquire) != 0 &&
+                   elapsed_ms >= 4500L && elapsed_ms < 7000L ?
+               0 :
+               220;
 }
 
 static int
@@ -4176,8 +4524,23 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "exec-checkpoint-reader-wake-before-wait") == 0) {
         return run_exec_checkpoint_reader_wake_before_wait(argv[0]);
     }
+    if (strcmp(argv[1], "exec-checkpoint-fini-completion-wake") == 0) {
+        return run_exec_checkpoint_fini_completion_wake(argv[0]);
+    }
     if (strcmp(argv[1], "exec-checkpoint-reader-timeout") == 0) {
         return run_exec_checkpoint_reader_timeout(argv[0]);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-fini-cancel-deferred") == 0) {
+        return run_exec_checkpoint_fini_cancellation(
+            argv[0], PTHREAD_CANCEL_DEFERRED);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-reader-cancel-deferred") == 0) {
+        return run_exec_checkpoint_reader_cancellation(
+            argv[0], PTHREAD_CANCEL_DEFERRED);
+    }
+    if (strcmp(argv[1], "exec-checkpoint-reader-cancel-async") == 0) {
+        return run_exec_checkpoint_reader_cancellation(
+            argv[0], PTHREAD_CANCEL_ASYNCHRONOUS);
     }
     if (strcmp(argv[1], "exec-checkpoint-snapshot-lock-contention") == 0) {
         return run_exec_checkpoint_snapshot_lock_contention(argv[0]);

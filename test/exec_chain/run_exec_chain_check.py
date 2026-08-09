@@ -180,7 +180,19 @@ MODE_TO_APP_ARG = {
     "exec_checkpoint_reader_wake_before_wait": (
         "exec-checkpoint-reader-wake-before-wait"
     ),
+    "exec_checkpoint_fini_completion_wake": (
+        "exec-checkpoint-fini-completion-wake"
+    ),
     "exec_checkpoint_reader_timeout": "exec-checkpoint-reader-timeout",
+    "exec_checkpoint_fini_cancel_deferred": (
+        "exec-checkpoint-fini-cancel-deferred"
+    ),
+    "exec_checkpoint_reader_cancel_deferred": (
+        "exec-checkpoint-reader-cancel-deferred"
+    ),
+    "exec_checkpoint_reader_cancel_async": (
+        "exec-checkpoint-reader-cancel-async"
+    ),
     "exec_checkpoint_snapshot_lock_contention": "exec-checkpoint-snapshot-lock-contention",
     "exec_checkpoint_statistics_snapshot_contention": (
         "exec-checkpoint-statistics-snapshot-contention"
@@ -228,7 +240,11 @@ NO_EXEC_CHECKPOINT_MODES = {
     "exec_checkpoint_disabled",
     "exec_checkpoint_direct_disabled",
     "exec_checkpoint_concurrent_fini_callbacks",
+    "exec_checkpoint_fini_completion_wake",
     "exec_checkpoint_reader_timeout",
+    "exec_checkpoint_fini_cancel_deferred",
+    "exec_checkpoint_reader_cancel_deferred",
+    "exec_checkpoint_reader_cancel_async",
     "exec_checkpoint_statistics_shadow_invalidation",
     "execve_child_checkpoint_disabled",
     "exec_bad_stats_path_nonfatal",
@@ -1280,22 +1296,83 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         require(len(exec_files) == 1,
                 f"wake-before-wait reader did not finish its checkpoint\n{output}")
 
+    if args.mode == "exec_checkpoint_fini_completion_wake":
+        match = re.search(
+            r"fini_completion_wake=1 completion_waits=(\d+) owner_done=(\d+) "
+            r"follower_done=(\d+)",
+            output,
+        )
+        require(match is not None and int(match.group(1)) > 0,
+                f"follower did not use the completion condition variable\n{output}")
+        require(match.group(2) == "1" and match.group(3) == "1",
+                f"finalizers did not both complete after the owner wake\n{output}")
+        require(len(final_files) == 1 and not exec_files,
+                f"normal completion produced unexpected artifacts: "
+                f"final={final_files} checkpoint={exec_files}\n{output}")
+
     if args.mode == "exec_checkpoint_reader_timeout":
         match = re.search(
             r"checkpoint_reader_timeout=1 reader_released_after_timeout=1 "
-            r"timeout_observed=1 fini_waits=(\d+) elapsed_ms=(\d+)",
+            r"timeout_observed=1 fini_waits=(\d+) completion_waits=(\d+) "
+            r"owner_done=(\d+) follower_done=(\d+) elapsed_ms=(\d+)",
             output,
         )
         require(match is not None,
                 f"checkpoint reader timeout/release was not proven\n{output}")
         require(int(match.group(1)) > 0,
                 f"finalizer did not block on the condition variable\n{output}")
-        require(4500 <= int(match.group(2)) < 7000,
+        require(int(match.group(2)) > 0,
+                f"follower did not block on finalization completion\n{output}")
+        require(match.group(3) == "1" and match.group(4) == "1",
+                f"finalizers did not finish after checkpoint timeout\n{output}")
+        require(4500 <= int(match.group(5)) < 7000,
                 f"checkpoint reader timeout was not bounded\n{output}")
         require("skipping PEAK final report and teardown" in output,
                 f"timeout warning did not identify the skipped PEAK work\n{output}")
         require(not final_files and not exec_files,
                 f"timed-out finalization emitted unsafe artifacts: "
+                f"final={final_files} checkpoint={exec_files}\n{output}")
+
+    if args.mode == "exec_checkpoint_fini_cancel_deferred":
+        match = re.search(
+            r"fini_cancellation=(\w+) timeout_observed=(\d+) "
+            r"owner_result=(\w+) owner_setup=(\d+) follower_done=(\d+) "
+            r"reader_released_after_timeout=1 elapsed_ms=(\d+)",
+            output,
+        )
+        require(match is not None and match.group(1) == "deferred",
+                f"missing cancellation finalizer evidence\n{output}")
+        require(match.group(2) == "1" and match.group(3) == "canceled" and
+                match.group(4) == "0" and match.group(5) == "1",
+                f"canceled owner did not publish safe finalization\n{output}")
+        require(4500 <= int(match.group(6)) < 7000,
+                f"canceled owner finalizer was not bounded\n{output}")
+        require("skipping PEAK final report and teardown" in output,
+                f"canceled owner did not take the fail-open timeout path\n{output}")
+        require(not final_files and not exec_files,
+                f"canceled finalization emitted unsafe artifacts: "
+                f"final={final_files} checkpoint={exec_files}\n{output}")
+
+    if args.mode in {"exec_checkpoint_reader_cancel_deferred",
+                     "exec_checkpoint_reader_cancel_async"}:
+        expected_type = "async" if args.mode.endswith("async") else "deferred"
+        match = re.search(
+            r"checkpoint_reader_cancellation=(\w+) reader_result=canceled "
+            r"timeout_observed=(\d+) owner_done=(\d+) follower_done=(\d+) "
+            r"elapsed_ms=(\d+)",
+            output,
+        )
+        require(match is not None and match.group(1) == expected_type,
+                f"missing canceled-reader finalizer evidence\n{output}")
+        require(match.group(2) == "1" and match.group(3) == "1" and
+                match.group(4) == "1",
+                f"canceled reader did not lead to bounded finalization\n{output}")
+        require(4500 <= int(match.group(5)) < 7000,
+                f"canceled-reader finalization was not bounded\n{output}")
+        require("skipping PEAK final report and teardown" in output,
+                f"canceled reader did not take the fail-open timeout path\n{output}")
+        require(not final_files and not exec_files,
+                f"canceled reader emitted unsafe artifacts: "
                 f"final={final_files} checkpoint={exec_files}\n{output}")
 
     if args.mode == "exec_checkpoint_fork_child_fini":
