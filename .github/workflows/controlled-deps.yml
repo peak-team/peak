@@ -1,0 +1,46 @@
+name: Controlled dependencies
+
+on: [push, pull_request]
+
+jobs:
+  offline-and-system-otf2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap pinned development dependencies
+        run: >
+          cmake -S . -B bootstrap
+          -DPEAK_FETCH_DEPS=ON
+          -DPEAK_ENABLE_OTF2=ON
+          -DPEAK_ENABLE_MPI=OFF
+          -DBUILD_CUDA_PROFILE=OFF
+      - run: cmake --build bootstrap
+      - name: Build with optional components disabled and no downloads
+        run: >
+          cmake -S . -B offline
+          -DPEAK_FETCH_DEPS=OFF
+          -DPEAK_ENABLE_OTF2=OFF
+          -DPEAK_ENABLE_MPI=OFF
+          -DBUILD_CUDA_PROFILE=OFF
+          -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit
+          -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
+          -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+      - run: cmake --build offline
+      - name: Install and consume the CMake package
+        run: |
+          cmake --install offline --prefix ${{ github.workspace }}/installed
+          cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed
+          cmake --build package-consumer
+      - name: Build with the controlled system OTF2 prefix
+        run: >
+          cmake -S . -B system-otf2
+          -DPEAK_FETCH_DEPS=OFF
+          -DPEAK_ENABLE_OTF2=ON
+          -DPEAK_USE_SYSTEM_OTF2=ON
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/bootstrap/otf2
+          -DPEAK_ENABLE_MPI=OFF
+          -DBUILD_CUDA_PROFILE=OFF
+          -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit
+          -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
+          -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+      - run: cmake --build system-otf2

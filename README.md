@@ -49,17 +49,20 @@ PEAK writes a report to stderr and a CSV profile log using the default prefix
 ## Requirements
 
 - Linux for the primary `LD_PRELOAD` runtime path
-- CMake 3.9 or newer
-- C, C++, and Fortran compilers
+- CMake 3.13 or newer
+- C and C++ compilers (a Fortran compiler is needed only for
+  `PEAK_ENABLE_FORTRAN_TESTS=ON`)
 - POSIX threads and standard Linux runtime libraries
 
-MPI and CUDA are optional. CUDA profiling requires CUDA Toolkit 11.2 or newer.
-CMake validates or obtains the required Frida Gum and OTF2 dependencies during
-configuration.
+MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
+CUDA Toolkit 11.2 or newer.  Cluster builds do not download dependencies by
+default: provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
+`FRIDA_GUM_INCLUDE_DIRS`, or opt in to pinned downloads with
+`PEAK_FETCH_DEPS=ON`.
 
 ## Build and Install
 
-The following commands intentionally remain compatible with CMake 3.9:
+For a self-contained developer build, opt in to the pinned dependency fetches:
 
 ```bash
 mkdir -p build
@@ -67,6 +70,7 @@ cd build
 cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DPEAK_FETCH_DEPS=ON \
   ..
 cmake --build .
 cmake --build . --target install
@@ -78,6 +82,10 @@ Common CMake options:
 | --- | --- |
 | `PEAK_ENABLE_MPI=OFF` | Build without MPI support. |
 | `BUILD_CUDA_PROFILE=OFF` | Build without CUDA profiling support. |
+| `PEAK_FETCH_DEPS=ON` | Permit pinned Frida Gum/OTF2 and test-only OpenBLAS downloads. Default: `OFF`. |
+| `PEAK_ENABLE_OTF2=ON` | Enable OTF2 memory-trace export. Default: `OFF`; CSV memory profiling remains available. |
+| `PEAK_USE_SYSTEM_OTF2=ON` | Search for a system OTF2 before fetching it. |
+| `PEAK_ENABLE_FORTRAN_TESTS=ON` | Build the optional Fortran dgemm tests and require a Fortran compiler. |
 | `BUILD_TESTING=ON` | Build the CTest suite. `BUILD_TESTS=ON` is also accepted. |
 | `PEAK_BUILD_BENCHMARKS=ON` | Build benchmark and stress targets. |
 | `PEAK_ENABLE_JIT_RUNTIME_PRELOAD_TESTS=ON` | Enable opt-in real-runtime JIT preload tests when testing is enabled. |
@@ -291,18 +299,26 @@ that path.
 
 ## Testing
 
-Configure and run the local suite with CMake 3.9-compatible commands:
+Configure and run the local suite (with the packaged Frida Gum download) with:
 
 ```bash
 mkdir -p build
 cd build
-cmake -DBUILD_TESTING=ON ..
+cmake -DBUILD_TESTING=ON -DPEAK_FETCH_DEPS=ON ..
 cmake --build .
 ctest --output-on-failure
 ```
 
 MPI, CUDA, strict-backend, and real-runtime JIT coverage depends on the
 toolchains and host capabilities detected during configuration.
+
+### HPC package-manager builds
+
+Site package managers should provide Frida Gum and, when OTF2 export is needed,
+OTF2, then configure PEAK with `PEAK_FETCH_DEPS=OFF`.  The tracked recipe
+templates in `packaging/spack/` and `packaging/easybuild/` document the same
+controlled-dependency path.  Installed consumers can use
+`find_package(PEAK CONFIG REQUIRED)` and link `PEAK::peak`.
 
 ## Documentation
 

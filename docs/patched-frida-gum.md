@@ -15,8 +15,12 @@ selected explicitly.
 No extra configuration is required for the default build:
 
 ```sh
-cmake -S . -B build
+cmake -S . -B build -DPEAK_FETCH_DEPS=ON
 ```
+
+PEAK defaults `PEAK_FETCH_DEPS=OFF` for controlled HPC installs.  With that
+default, provide `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` from the
+site devkit instead of allowing CMake to download it.
 
 On Linux x86_64 and Linux Arm64 this produces
 `frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the

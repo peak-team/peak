@@ -6,8 +6,6 @@
  * @brief OTF2 export for PEAK allocation-accounting events.
  */
 
-#include "otf2/otf2.h"
-
 #include <stddef.h>
 #include <stdint.h>
 #include <limits.h>

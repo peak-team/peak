@@ -13,11 +13,21 @@ macro(fetch_otf2 _download_module_path _download_root)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
         WORKING_DIRECTORY "${_download_root}"
+        RESULT_VARIABLE _otf2_configure_result
     )
+    if(NOT _otf2_configure_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to configure OTF2 download project in ${_download_root}")
+    endif()
     execute_process(
         COMMAND "${CMAKE_COMMAND}" --build .
         WORKING_DIRECTORY "${_download_root}"
+        RESULT_VARIABLE _otf2_build_result
     )
+    if(NOT _otf2_build_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to build OTF2 download project in ${_download_root}")
+    endif()
 
     # Where ExternalProject to install OTF2
     set(OTF2_ROOT "${_download_root}")

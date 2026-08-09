@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(peak C CXX Fortran)
+project(peak VERSION 0.1.0 LANGUAGES C CXX)
+
+include(GNUInstallDirs)
+
+option(PEAK_FETCH_DEPS
+    "Allow CMake to download dependencies that are not provided by the system"
+    OFF)
+option(PEAK_ENABLE_OTF2 "Enable OTF2 memory-trace export" OFF)
+option(PEAK_USE_SYSTEM_OTF2 "Find OTF2 in the system before fetching it" ON)
+option(PEAK_ENABLE_FORTRAN_TESTS "Build tests that require a Fortran compiler" OFF)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")
@@ -76,14 +85,37 @@ peak_exec_enable_raw_syscall_language()
 message(STATUS "PEAK_EXEC_RAW_SYSCALL_SUPPORTED = ${PEAK_EXEC_RAW_SYSCALL_SUPPORTED}")
 message(STATUS "PEAK_DETACH_HELPER_SUPPORTED = ${PEAK_DETACH_HELPER_SUPPORTED}")
 
-# Find or download otf2
-if (NOT OTF2_LIBRARIES AND NOT OTF2_LIBRARY_DIR)
-    message(STATUS "Fetching otf2")
-    include(cmake/otf2.cmake)
-    fetch_otf2(
-        ${PROJECT_SOURCE_DIR}/cmake
-        ${PROJECT_BINARY_DIR}/otf2
-    )
+# Find or download OTF2 only when memory-trace export is requested.
+if(PEAK_ENABLE_OTF2)
+    if(OTF2_LIBRARIES AND OTF2_INCLUDE_DIRS)
+        message(STATUS "Using caller-provided OTF2")
+    elseif(OTF2_LIBRARIES OR OTF2_INCLUDE_DIRS)
+        message(FATAL_ERROR
+            "Set both OTF2_LIBRARIES and OTF2_INCLUDE_DIRS, or neither.")
+    elseif(PEAK_USE_SYSTEM_OTF2)
+        find_path(OTF2_INCLUDE_DIR NAMES otf2/otf2.h)
+        find_library(OTF2_LIBRARY NAMES otf2)
+        if(OTF2_INCLUDE_DIR AND OTF2_LIBRARY)
+            set(OTF2_INCLUDE_DIRS "${OTF2_INCLUDE_DIR}")
+            set(OTF2_LIBRARIES "${OTF2_LIBRARY}")
+            get_filename_component(OTF2_LIBRARY_DIR "${OTF2_LIBRARY}" DIRECTORY)
+            message(STATUS "Using system OTF2: ${OTF2_LIBRARY}")
+        endif()
+    endif()
+
+    if(NOT OTF2_LIBRARIES)
+        if(NOT PEAK_FETCH_DEPS)
+            message(FATAL_ERROR
+                "PEAK_ENABLE_OTF2=ON requires system OTF2, caller-provided "
+                "OTF2_LIBRARIES/OTF2_INCLUDE_DIRS, or PEAK_FETCH_DEPS=ON.")
+        endif()
+        message(STATUS "Fetching OTF2")
+        include(cmake/otf2.cmake)
+        fetch_otf2(
+            ${PROJECT_SOURCE_DIR}/cmake
+            ${PROJECT_BINARY_DIR}/otf2
+        )
+    endif()
     message(STATUS "OTF2_LIBRARIES   = ${OTF2_LIBRARIES}")
     message(STATUS "OTF2_INCLUDE_DIRS = ${OTF2_INCLUDE_DIRS}")
     message(STATUS "OTF2_LIBRARY_DIR = ${OTF2_LIBRARY_DIR}")
@@ -160,6 +192,15 @@ else()
 endif()
 option(PEAK_BUILD_BENCHMARKS "Build PEAK benchmark/stress targets" OFF)
 option(PEAK_ENABLE_TSAN_TESTS "Enable ThreadSanitizer registry test flags" OFF)
+if(PEAK_ENABLE_FORTRAN_TESTS)
+    include(CheckLanguage)
+    check_language(Fortran)
+    if(NOT CMAKE_Fortran_COMPILER)
+        message(FATAL_ERROR
+            "PEAK_ENABLE_FORTRAN_TESTS=ON requires a Fortran compiler.")
+    endif()
+    enable_language(Fortran)
+endif()
 if(BUILD_TESTING OR PEAK_BUILD_BENCHMARKS)
     enable_testing()
 endif()
@@ -172,3 +213,22 @@ endif()
 if(PEAK_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
+
+include(CMakePackageConfigHelpers)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT PEAKTargets
+    FILE PEAKTargets.cmake
+    NAMESPACE PEAK::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)
+configure_package_config_file(
+    ${PROJECT_SOURCE_DIR}/cmake/PEAKConfig.cmake.in
+    ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)
+write_basic_package_version_file(
+    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(FILES
+    ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
+    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/PEAK)

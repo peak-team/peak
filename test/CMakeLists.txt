@@ -5,6 +5,11 @@ if(BUILD_TESTING)
     # Find or download blas only for tests
     find_package(BLAS)
     if(NOT BLAS_FOUND)
+        if(NOT PEAK_FETCH_DEPS)
+            message(FATAL_ERROR
+                "BLAS is required for this test suite. Install BLAS or set "
+                "PEAK_FETCH_DEPS=ON to fetch the test-only OpenBLAS copy.")
+        endif()
         message(STATUS "Building OpenBLAS")
         include(${PROJECT_SOURCE_DIR}/cmake/openblas.cmake)
         fetch_openblas(
@@ -20,6 +25,11 @@ if(BUILD_TESTING)
         set(BLAS_LIBRARIES ${PROJECT_BINARY_DIR}/openblas/lib/libopenblas.a)
         set(LAPACK_LIBRARIES ${PROJECT_BINARY_DIR}/openblas/lib/libopenblas.a)
     elseif(NOT LAPACK_FOUND)
+        if(NOT PEAK_FETCH_DEPS)
+            message(FATAL_ERROR
+                "LAPACK is required for this test suite. Install LAPACK or set "
+                "PEAK_FETCH_DEPS=ON to fetch the test-only OpenBLAS copy.")
+        endif()
         message(STATUS "Building OpenBLAS for LAPACK")
         include(${PROJECT_SOURCE_DIR}/cmake/openblas.cmake)
         fetch_openblas(
@@ -42,13 +52,6 @@ if(BUILD_TESTING)
             include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
         endif()
     endif()
-
-    include (FortranCInterface)
-    list (APPEND FORTRAN_FUNCTIONS sdot dgemm)
-    FortranCInterface_HEADER (include/FC.h
-        MACRO_NAMESPACE "FC_"
-        SYMBOLS ${FORTRAN_FUNCTIONS}
-    )
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         set(PRELOAD_VAR "LD_PRELOAD=${PROJECT_BINARY_DIR}/src/libpeak.so")
@@ -1657,6 +1660,7 @@ if(BUILD_TESTING)
                 TIMEOUT 100)
     endif()
 
+    if(PEAK_ENABLE_FORTRAN_TESTS)
     # Add test of dgemm
     add_subdirectory(dgemm)
     add_test(NAME test_dgemm COMMAND ${PROJECT_BINARY_DIR}/test/dgemm/test_dgemm)
@@ -1696,6 +1700,7 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "dgemm_\\|[ \t]+100000\\|"
     )
+    endif()
 
     # Add test of sdot
     add_subdirectory(sdot)

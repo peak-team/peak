@@ -50,6 +50,8 @@ jobs:
         -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         -DBUILD_TESTS=1
+        -DPEAK_FETCH_DEPS=ON
+        -DPEAK_ENABLE_FORTRAN_TESTS=ON
         -DPEAK_BUILD_BENCHMARKS=OFF
         -S ${{ github.workspace }}
 

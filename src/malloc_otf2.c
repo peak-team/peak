@@ -1,4 +1,5 @@
 #include "malloc_otf2.h"
+#include "otf2/otf2.h"
 #include "logging.h"
 
 typedef struct {

@@ -12,13 +12,23 @@ macro(fetch_openblas _download_module_path _download_root)
             "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
         WORKING_DIRECTORY
             ${_download_root}
+        RESULT_VARIABLE _openblas_configure_result
         )
+    if(NOT _openblas_configure_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to configure OpenBLAS download project in ${_download_root}")
+    endif()
     execute_process(
         COMMAND
             "${CMAKE_COMMAND}" --build .
         WORKING_DIRECTORY
             ${_download_root}
+        RESULT_VARIABLE _openblas_build_result
         )
+    if(NOT _openblas_build_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to build OpenBLAS download project in ${_download_root}")
+    endif()
 
 #    set (BLAS_LIBRARIES ${PROJECT_BINARY_DIR}/openblas/lib/libopenblas.so)
 endmacro()
