@@ -31,10 +31,18 @@ def merge_preload(libpeak):
 
 
 def find_stats_csv(stats_prefix, pid):
-    candidates = sorted(glob.glob(f"{stats_prefix}-j*-s*-h*-r*-p{pid}-q????????????????.csv"))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+    expression = re.compile(
+        rf"^{re.escape(stats_prefix)}-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+        rf"h[A-Za-z0-9_.-]+-r[A-Za-z0-9_-]+-p{pid}-q[0-9a-f]{{16}}\.csv$"
+    )
+    artifacts = sorted(glob.glob(f"{stats_prefix}-*.csv"))
+    unexpected = [path for path in artifacts if expression.fullmatch(path) is None]
+    if unexpected:
+        raise AssertionError(f"unexpected statistics CSV artifacts: {unexpected}")
+    candidates = [path for path in artifacts if expression.fullmatch(path)]
+    if len(candidates) != 1:
+        raise AssertionError(f"expected exactly one statistics CSV, got {candidates}")
+    return candidates[0]
 
 
 def symbol_count(rows, symbol):

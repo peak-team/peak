@@ -115,10 +115,10 @@ peak_exec_checkpoint_path(char* buffer,
     int identity_path = peak_output_identity_checkpoint_path(buffer,
                                                               buffer_size,
                                                               checkpoint_index);
-    if (identity_path > 0) {
+    if (identity_path == PEAK_OUTPUT_CHECKPOINT_READY) {
         return 0;
     }
-    if (identity_path < 0) {
+    if (identity_path == PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE) {
         errno = EINVAL;
         return -1;
     }

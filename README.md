@@ -159,7 +159,7 @@ in detail.
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
 | `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Force the C++ symbol-map lookup path for target matching. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
-| `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`. Missing parent directories are created for an explicit template; the template itself supplies `.csv`. The default adds all identity fields plus `.csv` to the prefix. |
+| `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |
 | `PEAK_OUTPUT_ALLOW_OVERWRITE` | Explicitly permit replacement of a completed statistics CSV. Default: disabled. |
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
@@ -198,9 +198,10 @@ default because its hwloc teardown can crash after PEAK instrumentation; this
 compatibility path is non-conforming and must be validated with the target
 launcher. A gate error or timeout permanently disables later teardown MPI
 calls, even when `PEAK_MPI_REAL_FINALIZE=1` was requested.
-Aggregate CSVs retain `base-pPID.csv`; multi-rank local fallback files use
-`base-pPID-rRANK.csv` (or a sanitized hostname suffix when rank metadata is
-unavailable) to avoid cross-node PID collisions.
+CSV publication uses the same job/step/host/rank/PID/session identity as the
+default report name, including rank-local fallback. Completed outputs are
+published no-clobber by default; replacement requires the explicit
+`PEAK_OUTPUT_ALLOW_OVERWRITE` opt-in.
 In both CSV and text reports, `count` is the exact total call count,
 `per_thread` is the ceiling over active threads, and `per_rank`/`avg/rank` is
 the non-truncated arithmetic mean over all ranks represented by the report.

@@ -1339,7 +1339,11 @@ def main():
         for name, evidence in stats_file_evidence.items():
             require_complete_stats_evidence(name, evidence)
         for path in temporary_stats_files:
-            rank_match = re.search(r"-r(\d+)\.csv\.tmp\.", path.name)
+            rank_match = re.fullmatch(
+                r"peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+                r"h[A-Za-z0-9_.-]+-r(\d+)-p\d+-q[0-9a-f]{16}\.csv\.tmp\..+",
+                path.name,
+            )
             if rank_match is None or int(rank_match.group(1)) == 0:
                 raise AssertionError(
                     "subset-finalize handoff left an unexpected temporary CSV: "

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -19,8 +20,15 @@
 #endif
 
 enum { PEAK_OUTPUT_HOST_CAPACITY = 256, PEAK_OUTPUT_SESSION_CAPACITY = 17 };
+enum peak_output_checkpoint_state {
+    PEAK_OUTPUT_CHECKPOINT_UNINITIALIZED,
+    PEAK_OUTPUT_CHECKPOINT_READY_STATE,
+    PEAK_OUTPUT_CHECKPOINT_INVALID,
+    PEAK_OUTPUT_CHECKPOINT_INITIALIZING,
+};
 
 static uint64_t peak_output_session;
+static _Atomic unsigned long peak_output_fallback_counter;
 static _Atomic int peak_output_session_ready;
 static pthread_once_t peak_output_session_once = PTHREAD_ONCE_INIT;
 static char peak_output_jobid[128];
@@ -32,6 +40,7 @@ static char peak_output_stats_template[PATH_MAX];
 static char peak_output_checkpoint_prefix[PATH_MAX];
 static _Atomic unsigned int peak_output_checkpoint_prefix_length;
 static _Atomic int peak_output_checkpoint_state;
+static pthread_once_t peak_output_checkpoint_once = PTHREAD_ONCE_INIT;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "exec checkpoint state requires lock-free atomics");
 
@@ -41,11 +50,31 @@ static void peak_output_identity_metadata(char* out,
                                           const char* value);
 
 static void
+peak_output_identity_fallback_session(void)
+{
+    struct timespec now = {0};
+    uint64_t mix;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    mix = ((uint64_t)(unsigned long)getpid() << 32) ^ (uint64_t)now.tv_nsec ^
+          ((uint64_t)now.tv_sec << 1) ^
+          (uint64_t)atomic_fetch_add_explicit(&peak_output_fallback_counter, 1UL,
+                                               memory_order_relaxed) ^
+          (uintptr_t)&peak_output_session;
+    peak_output_session = mix == 0 ? 1 : mix;
+}
+
+static void
 peak_output_identity_session_once(void)
 {
     unsigned char* cursor = (unsigned char*)&peak_output_session;
     size_t remaining = sizeof(peak_output_session);
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_OUTPUT_IDENTITY_ENTROPY_FAIL") != NULL) {
+        remaining = sizeof(peak_output_session);
+    } else {
+#endif
 #ifdef __linux__
     while (remaining != 0) {
         ssize_t read_bytes;
@@ -62,26 +91,37 @@ peak_output_identity_session_once(void)
 #else
     (void)cursor;
 #endif
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    }
+#endif
     if (remaining != 0) {
-        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        int fd = -1;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (getenv("PEAK_TEST_OUTPUT_IDENTITY_ENTROPY_FAIL") == NULL)
+#endif
+            fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 
         if (fd < 0) {
-            return;
-        }
-        while (remaining != 0) {
-            ssize_t read_bytes;
-
-            do {
-                read_bytes = read(fd, cursor, remaining);
-            } while (read_bytes < 0 && errno == EINTR);
-            if (read_bytes <= 0) {
-                (void)close(fd);
-                return;
+            peak_output_identity_fallback_session();
+            remaining = 0;
+        } else {
+            while (remaining != 0) {
+                ssize_t read_bytes;
+                do {
+                    read_bytes = read(fd, cursor, remaining);
+                } while (read_bytes < 0 && errno == EINTR);
+                if (read_bytes <= 0) {
+                    (void)close(fd);
+                    peak_output_identity_fallback_session();
+                    remaining = 0;
+                    break;
+                }
+                cursor += read_bytes;
+                remaining -= (size_t)read_bytes;
             }
-            cursor += read_bytes;
-            remaining -= (size_t)read_bytes;
+            (void)close(fd);
         }
-        (void)close(fd);
     }
     peak_output_identity_host(peak_output_host);
     peak_output_identity_metadata(peak_output_jobid,
@@ -132,11 +172,13 @@ peak_output_identity_checkpoint_path(char* out,
 
     int state = atomic_load_explicit(&peak_output_checkpoint_state,
                                      memory_order_acquire);
-    if (state != 1) {
-        return state == 0 ? 0 : -1;
+    if (state != PEAK_OUTPUT_CHECKPOINT_READY_STATE) {
+        return state == PEAK_OUTPUT_CHECKPOINT_UNINITIALIZED
+                   ? PEAK_OUTPUT_CHECKPOINT_PREINIT
+                   : PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE;
     }
     if (length == 0 || out == NULL || out_size == 0 || length >= out_size) {
-        return -1;
+        return PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE;
     }
     for (size_t i = 0; i < length; i++) out[i] = peak_output_checkpoint_prefix[i];
     output = length;
@@ -145,32 +187,28 @@ peak_output_identity_checkpoint_path(char* out,
         checkpoint_index /= 10U;
     } while (checkpoint_index != 0 && count < sizeof(digits));
     if (output + 5 + count + 4 >= out_size) {
-        return -1;
+        return PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE;
     }
     out[output++] = '-'; out[output++] = 'e'; out[output++] = 'x';
     out[output++] = 'e'; out[output++] = 'c';
     while (count != 0) out[output++] = digits[--count];
     out[output++] = '.'; out[output++] = 'c'; out[output++] = 's';
     out[output++] = 'v'; out[output] = '\0';
-    return 1;
+    return PEAK_OUTPUT_CHECKPOINT_READY;
 }
 
-void
-peak_output_identity_initialize(void)
+static void
+peak_output_identity_checkpoint_once(void)
 {
     char final_path[PATH_MAX];
     size_t length;
 
-    {
-        int expected = 0;
-        if (!atomic_compare_exchange_strong_explicit(
-                &peak_output_checkpoint_state, &expected, 3,
-                memory_order_acq_rel, memory_order_acquire)) return;
-    }
-    (void)pthread_once(&peak_output_session_once,
-                       peak_output_identity_session_once);
+    atomic_store_explicit(&peak_output_checkpoint_state,
+                          PEAK_OUTPUT_CHECKPOINT_INITIALIZING,
+                          memory_order_release);
     if (!atomic_load_explicit(&peak_output_session_ready, memory_order_acquire)) {
-        atomic_store_explicit(&peak_output_checkpoint_state, 2,
+        atomic_store_explicit(&peak_output_checkpoint_state,
+                              PEAK_OUTPUT_CHECKPOINT_INVALID,
                               memory_order_release);
         return;
     }
@@ -178,24 +216,43 @@ peak_output_identity_initialize(void)
                                    peak_output_stats_base,
                                    peak_output_stats_template,
                                    ".csv", -1)) {
-        atomic_store_explicit(&peak_output_checkpoint_state, 2, memory_order_release);
+        atomic_store_explicit(&peak_output_checkpoint_state,
+                              PEAK_OUTPUT_CHECKPOINT_INVALID, memory_order_release);
         return;
     }
     if (!peak_output_identity_make_parent(final_path)) {
-        atomic_store_explicit(&peak_output_checkpoint_state, 2, memory_order_release);
+        atomic_store_explicit(&peak_output_checkpoint_state,
+                              PEAK_OUTPUT_CHECKPOINT_INVALID, memory_order_release);
         return;
     }
     length = strlen(final_path);
     if (length >= 4 && strcmp(final_path + length - 4, ".csv") == 0) length -= 4;
     if (length == 0 || length >= sizeof(peak_output_checkpoint_prefix)) {
-        atomic_store_explicit(&peak_output_checkpoint_state, 2, memory_order_release);
+        atomic_store_explicit(&peak_output_checkpoint_state,
+                              PEAK_OUTPUT_CHECKPOINT_INVALID, memory_order_release);
         return;
     }
     memcpy(peak_output_checkpoint_prefix, final_path, length);
     peak_output_checkpoint_prefix[length] = '\0';
     atomic_store_explicit(&peak_output_checkpoint_prefix_length, (unsigned int)length,
                           memory_order_release);
-    atomic_store_explicit(&peak_output_checkpoint_state, 1, memory_order_release);
+    atomic_store_explicit(&peak_output_checkpoint_state,
+                          PEAK_OUTPUT_CHECKPOINT_READY_STATE, memory_order_release);
+}
+
+void
+peak_output_identity_initialize(void)
+{
+    int expected = PEAK_OUTPUT_CHECKPOINT_UNINITIALIZED;
+
+    (void)atomic_compare_exchange_strong_explicit(
+        &peak_output_checkpoint_state, &expected,
+        PEAK_OUTPUT_CHECKPOINT_INITIALIZING,
+        memory_order_release, memory_order_relaxed);
+    (void)pthread_once(&peak_output_session_once,
+                       peak_output_identity_session_once);
+    (void)pthread_once(&peak_output_checkpoint_once,
+                       peak_output_identity_checkpoint_once);
 }
 
 bool

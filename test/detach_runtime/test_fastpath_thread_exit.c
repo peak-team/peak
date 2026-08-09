@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <pthread.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -618,12 +619,45 @@ main(void)
             RTLD_DEFAULT, "peak_checkpoint_for_exec");
         const char* base = getenv("PEAK_STATSLOG_PATH");
         char path[1024];
+        char directory[1024];
+        char* slash;
+        DIR* stream;
+        struct dirent* entry;
+        int matches = 0;
         char* argv[] = { (char*)"checkpoint-test", NULL };
         if (checkpoint == NULL || base == NULL ||
             checkpoint("checkpoint-test", argv) != 0 ||
-            snprintf(path, sizeof(path), "%s-p%ld-exec1.csv", base,
-                     (long)getpid()) >= (int)sizeof(path)) {
+            snprintf(directory, sizeof(directory), "%s", base) >=
+                (int)sizeof(directory) ||
+            (slash = strrchr(directory, '/')) == NULL) {
             fputs("checkpoint capture failed\n", stderr);
+            return 1;
+        }
+        *slash = '\0';
+        stream = opendir(directory);
+        if (stream == NULL) {
+            fputs("checkpoint directory unavailable\n", stderr);
+            return 1;
+        }
+        while ((entry = readdir(stream)) != NULL) {
+            size_t name_length = strlen(entry->d_name);
+            static const char checkpoint_suffix[] = "-exec1.csv";
+
+            if (strncmp(entry->d_name, "fastpath-checkpoint-", 20) == 0 &&
+                name_length >= sizeof(checkpoint_suffix) - 1 &&
+                strcmp(entry->d_name + name_length - (sizeof(checkpoint_suffix) - 1),
+                       checkpoint_suffix) == 0) {
+                if (snprintf(path, sizeof(path), "%s/%s", directory,
+                             entry->d_name) >= (int)sizeof(path)) {
+                    (void)closedir(stream);
+                    return 1;
+                }
+                matches++;
+            }
+        }
+        (void)closedir(stream);
+        if (matches != 1) {
+            fputs("checkpoint output identity mismatch\n", stderr);
             return 1;
         }
         FILE* checkpoint_csv = fopen(path, "r");

@@ -57,6 +57,23 @@ class ExecChainCheckContractsTest(unittest.TestCase):
             )
             self.check_mode("execv_success_checkpoint", output, workdir)
 
+    def test_identity_exec_text_is_not_a_checkpoint_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            final = workdir / (
+                "peak_stats-jjob-exec-sstep-hhost-exec-r0-p1-"
+                "q0123456789abcdef.csv"
+            )
+            checkpoint = workdir / (
+                "peak_stats-jjob-exec-sstep-hhost-exec-r0-p1-"
+                "q0123456789abcdef-exec7.csv"
+            )
+            final.write_text("function,count\n", encoding="utf-8")
+            checkpoint.write_text("function,count\n", encoding="utf-8")
+            checkpoints, finals = checker.csv_files(workdir)
+            self.assertEqual(finals, [final])
+            self.assertEqual(checkpoints, [checkpoint])
+
 
 if __name__ == "__main__":
     unittest.main()

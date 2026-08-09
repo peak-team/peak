@@ -13,7 +13,13 @@ void peak_output_identity_initialize(void);
 bool peak_output_identity_make_parent(const char* path);
 
 /* Render a cached statistics checkpoint pathname without consulting getenv. */
-/* 1=ready, 0=pre-init fallback allowed, -1=initialized but invalid. */
+enum PeakOutputCheckpointPath {
+    PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE = -1,
+    PEAK_OUTPUT_CHECKPOINT_PREINIT = 0,
+    PEAK_OUTPUT_CHECKPOINT_READY = 1,
+};
+
+/* PREINIT permits the raw legacy fallback; UNAVAILABLE must be skipped. */
 int peak_output_identity_checkpoint_path(char* out,
                                          size_t out_size,
                                          unsigned long long checkpoint_index);

@@ -1169,6 +1169,14 @@ def run_checkpoint_contract_self_test():
         else:
             raise AssertionError(
                 "active-controller malformed checkpoint was accepted")
+        final_with_exec_metadata = (
+            workdir / "peak_stats-jjob-exec-sstep-hhost-exec-r0-p1-"
+            "q0123456789abcdef.csv"
+        )
+        final_with_exec_metadata.write_text("function,count\n", encoding="utf-8")
+        _, final_files = csv_files(workdir)
+        require(final_with_exec_metadata in final_files,
+                "identity metadata containing -exec was misclassified as checkpoint")
     print("exec_chain_checkpoint_contract_ok")
 
 
@@ -1595,11 +1603,13 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         parent_pid = match.group(5)
         parent_exec_files = [
             path for path in exec_files
-            if f"-p{parent_pid}-exec" in path.name
+            if re.search(rf"-p{re.escape(parent_pid)}-q[0-9a-f]{{16}}-exec\d+\.csv$",
+                         path.name)
         ]
         parent_final_files = [
             path for path in final_files
-            if f"-p{parent_pid}.csv" in path.name
+            if re.search(rf"-p{re.escape(parent_pid)}-q[0-9a-f]{{16}}\.csv$",
+                         path.name)
         ]
         require(parent_exec_files,
                 f"clone parent wrote no exec checkpoint: {exec_files}")
