@@ -474,6 +474,13 @@ macro(configure_frida_gum _download_module_path _download_root)
             "Set both FRIDA_GUM_LIBRARIES and FRIDA_GUM_INCLUDE_DIRS, "
             "or leave both unset to use the prebuilt devkit.")
     else()
+        if(NOT PEAK_FETCH_DEPS)
+            message(FATAL_ERROR
+                "Frida Gum is required and PEAK_FETCH_DEPS=OFF. Set "
+                "FRIDA_GUM_LIBRARIES and FRIDA_GUM_INCLUDE_DIRS for a "
+                "site-provided devkit, select patched-devkit with "
+                "PEAK_PATCHED_GUM_ROOT, or set PEAK_FETCH_DEPS=ON.")
+        endif()
         message(STATUS "Fetching prebuilt frida-gum")
         fetch_frida_gum(
             ${_download_module_path}

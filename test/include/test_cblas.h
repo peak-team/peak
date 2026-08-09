@@ -1,8 +1,6 @@
 #ifndef PEAK_TEST_CBLAS_H
 #define PEAK_TEST_CBLAS_H
 
-#include "FC.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build-tsan -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTS=ON -DBUILD_CUDA_PROFILE=OFF -DPEAK_ENABLE_MPI=OFF -DPEAK_ENABLE_TSAN_TESTS=ON
+      - run: cmake -S . -B build-tsan -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTS=ON -DPEAK_FETCH_DEPS=ON -DBUILD_CUDA_PROFILE=OFF -DPEAK_ENABLE_MPI=OFF -DPEAK_ENABLE_TSAN_TESTS=ON
       - run: cmake --build build-tsan --target test_pthread_slot_registry
       - run: ctest --test-dir build-tsan --output-on-failure -R '^test_pthread_slot_registry$'
         env:

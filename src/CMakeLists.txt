@@ -14,7 +14,6 @@ set(sources_peak
     general_listener/runtime_config.c
     general_listener/socket_report_transport.c
     malloc_interceptor.c
-    malloc_otf2.c
     peak.c
     detach_controller.c
     jit_provider.c
@@ -27,6 +26,12 @@ set(sources_peak
     exec_interceptor.c
     exec_raw_syscall.c
 )
+
+if(PEAK_ENABLE_OTF2)
+    list(APPEND sources_peak malloc_otf2.c)
+else()
+    list(APPEND sources_peak malloc_otf2_stub.c)
+endif()
 
 # The C dispatcher is portable. Its assembly syscall interposer is selected by
 # the shared platform contract used at the project root and in platform tests.
@@ -70,14 +75,16 @@ if(PEAK_DETACH_HELPER_SUPPORTED)
     target_compile_definitions(peak
         PRIVATE
             "PEAK_DEFAULT_DETACH_HELPER_PATH=\"${CMAKE_CURRENT_BINARY_DIR}/peak_detach_helper\""
-            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_PREFIX}/bin/peak_detach_helper\""
+            "PEAK_INSTALL_DETACH_HELPER_PATH=\"${CMAKE_INSTALL_FULL_BINDIR}/peak_detach_helper\""
     )
     add_dependencies(peak peak_detach_helper)
 endif()
 
 target_include_directories(peak
     PUBLIC
-        ${PROJECT_SOURCE_DIR}/include
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${FRIDA_GUM_INCLUDE_DIRS}>
+    PRIVATE
         ${FRIDA_GUM_INCLUDE_DIRS}
         ${OTF2_INCLUDE_DIRS}
 )
@@ -144,7 +151,11 @@ elseif(CUDAToolkit_FOUND)
     target_link_options(peak PRIVATE -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR})
 endif()
 
-install(TARGETS peak DESTINATION lib)
+install(TARGETS peak
+    EXPORT PEAKTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET peak_detach_helper)
-    install(TARGETS peak_detach_helper DESTINATION bin)
+    install(TARGETS peak_detach_helper DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

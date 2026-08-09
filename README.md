@@ -49,17 +49,26 @@ PEAK writes a report to stderr and a CSV profile log using the default prefix
 ## Requirements
 
 - Linux for the primary `LD_PRELOAD` runtime path
-- CMake 3.9 or newer
-- C, C++, and Fortran compilers
+- CMake 3.13 or newer
+- C and C++ compilers (a Fortran compiler is needed only for
+  `PEAK_ENABLE_FORTRAN_TESTS=ON`)
 - POSIX threads and standard Linux runtime libraries
 
-MPI and CUDA are optional. CUDA profiling requires CUDA Toolkit 11.2 or newer.
-CMake validates or obtains the required Frida Gum and OTF2 dependencies during
-configuration.
+MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
+CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
+provider downloads a pinned Frida Gum devkit and applies the PEAK patch; on
+macOS x86_64 and Arm64, it downloads a pinned stock devkit. Other
+platforms/architectures require a caller-provided Frida Gum provider. For
+controlled or offline builds, set
+`PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
+`FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
 
 ## Build and Install
 
-The following commands intentionally remain compatible with CMake 3.9:
+On Linux x86_64 and Arm64, the default build downloads the pinned Frida Gum
+devkit and applies the PEAK patch; on macOS x86_64 and Arm64, it downloads a
+pinned stock devkit. Other platforms/architectures require a caller-provided
+Frida Gum provider:
 
 ```bash
 mkdir -p build
@@ -78,6 +87,10 @@ Common CMake options:
 | --- | --- |
 | `PEAK_ENABLE_MPI=OFF` | Build without MPI support. |
 | `BUILD_CUDA_PROFILE=OFF` | Build without CUDA profiling support. |
+| `PEAK_FETCH_DEPS=OFF` | Disable dependency downloads. Provide Frida Gum explicitly for controlled/offline builds. Default: `ON`. |
+| `PEAK_ENABLE_OTF2=ON` | Enable OTF2 memory-trace export. Default: `OFF`; CSV memory profiling remains available. |
+| `PEAK_USE_SYSTEM_OTF2=ON` | Search for a system OTF2 before fetching it. |
+| `PEAK_ENABLE_FORTRAN_TESTS=ON` | Build the optional Fortran dgemm tests and require a Fortran compiler. |
 | `BUILD_TESTING=ON` | Build the CTest suite. `BUILD_TESTS=ON` is also accepted. |
 | `PEAK_BUILD_BENCHMARKS=ON` | Build benchmark and stress targets. |
 | `PEAK_ENABLE_JIT_RUNTIME_PRELOAD_TESTS=ON` | Enable opt-in real-runtime JIT preload tests when testing is enabled. |
@@ -89,6 +102,14 @@ PEAK_TARGET=my_function \
 LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 ./target_application
 ```
+
+On Linux x86_64 and Arm64, the detach helper is built and installed at the
+configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
+`bin/peak_detach_helper`). Set `PEAK_DETACH_HELPER` when a package layout
+requires a different helper path.
+
+Installed CMake consumers can use `find_package(PEAK CONFIG REQUIRED)` and link
+`PEAK::peak`.
 
 ## Essential Usage
 
@@ -291,7 +312,9 @@ that path.
 
 ## Testing
 
-Configure and run the local suite with CMake 3.9-compatible commands:
+Configure and run the local suite with the default Frida Gum provider. On
+Linux/macOS x86_64 and Arm64, it uses a pinned download; other
+platforms/architectures need a caller-provided provider:
 
 ```bash
 mkdir -p build

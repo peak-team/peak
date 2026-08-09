@@ -1,0 +1,86 @@
+name: Controlled dependencies
+
+on: [push, pull_request]
+
+jobs:
+  offline-and-system-otf2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap pinned development dependencies
+        run: >
+          cmake -S . -B bootstrap
+          -DPEAK_ENABLE_OTF2=ON
+          -DPEAK_USE_SYSTEM_OTF2=OFF
+          -DPEAK_ENABLE_MPI=OFF
+          -DBUILD_CUDA_PROFILE=OFF
+      - run: cmake --build bootstrap
+      - name: Verify caller-provided Frida Gum bypasses the default fetch
+        env:
+          ALL_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+        run: |
+          export all_proxy="$ALL_PROXY"
+          export http_proxy="$HTTP_PROXY"
+          export https_proxy="$HTTPS_PROXY"
+          cmake -S . -B caller-provider \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DBUILD_CUDA_PROFILE=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+          grep -F 'PEAK_FETCH_DEPS:BOOL=ON' caller-provider/CMakeCache.txt
+      - name: Verify disabled fetch requires a caller-provided devkit
+        run: |
+          if cmake -S . -B no-provider -DPEAK_FETCH_DEPS=OFF -DPEAK_ENABLE_MPI=OFF -DBUILD_CUDA_PROFILE=OFF > no-provider.log 2>&1; then
+            echo "PEAK_FETCH_DEPS=OFF unexpectedly configured without Frida Gum"
+            exit 1
+          fi
+          grep -F 'Frida Gum is required and PEAK_FETCH_DEPS=OFF' no-provider.log
+      - name: Build with optional components disabled and no downloads
+        env:
+          ALL_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          FC: /nonexistent/fortran
+        run: |
+          export all_proxy="$ALL_PROXY"
+          export http_proxy="$HTTP_PROXY"
+          export https_proxy="$HTTPS_PROXY"
+          cmake -S . -B offline \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed \
+            -DCMAKE_INSTALL_BINDIR=libexec \
+            -DPEAK_FETCH_DEPS=OFF \
+            -DPEAK_ENABLE_OTF2=OFF \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DBUILD_CUDA_PROFILE=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+          cmake --build offline
+      - name: Install and consume the CMake package
+        run: |
+          cmake --install offline
+          test -x installed/libexec/peak_detach_helper
+          installed/libexec/peak_detach_helper --self-test
+          strings installed/lib*/libpeak.so | grep -F "${{ github.workspace }}/installed/libexec/peak_detach_helper"
+          cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed -DPEAK_SOURCE_DIR=${{ github.workspace }}
+          cmake --build package-consumer
+      - name: Build with the controlled system OTF2 prefix
+        run: >
+          cmake -S . -B system-otf2
+          -DPEAK_FETCH_DEPS=OFF
+          -DPEAK_ENABLE_OTF2=ON
+          -DPEAK_USE_SYSTEM_OTF2=ON
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/bootstrap/otf2
+          -DPEAK_ENABLE_MPI=OFF
+          -DBUILD_CUDA_PROFILE=OFF
+          -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit
+          -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
+          -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+      - run: cmake --build system-otf2
+      - name: Assert system OTF2 came from the controlled prefix
+        run: |
+          grep -F "OTF2_LIBRARY:FILEPATH=${{ github.workspace }}/bootstrap/otf2/lib/libotf2.a" system-otf2/CMakeCache.txt
+          grep -F "OTF2_INCLUDE_DIR:PATH=${{ github.workspace }}/bootstrap/otf2/include" system-otf2/CMakeCache.txt
