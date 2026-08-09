@@ -539,7 +539,9 @@ The defaults below describe the current implementation.
 | `MPI_LOCALNRANKS`, `OMPI_COMM_WORLD_LOCAL_SIZE`, `MV2_COMM_WORLD_LOCAL_SIZE`, `PMI_LOCAL_SIZE` | `1` fallback | Local rank count for reattach admission and diagnostic risk reporting. |
 
 All numeric values above require complete, finite input. A present invalid value
-emits one warning and uses its documented default. Sleep bounds must be
+emits one warning and uses its documented fallback. `PEAK_MAX_NUM_THREADS=0`
+uses one slot and values above `4096` clamp to `4096`; an invalid
+`PEAK_MEMLOG_CHUNK_EVENTS` disables memory logging. Sleep bounds must be
 positive; when the resolved maximum is below the accepted minimum, the maximum
 falls back to the minimum. The global detach multiplier is at least `1`, the
 reattach multiplier is in `(0, 1]`, and the reattach multiplier must remain

@@ -2,6 +2,7 @@
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 #include <sched.h>
 
 /*=========================
@@ -56,6 +57,7 @@ static PeakMemLog          g_memlog = {
 };
 static __thread int        in_peak_alloc_hook = 0;
 static __thread int        in_backtrace = 0;
+static PeakEnvWarningState peak_memlog_capacity_warning_emitted;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic PeakMemLogTestFailure g_memlog_test_failure = PEAK_MEMLOG_TEST_FAIL_NONE;
@@ -174,15 +176,15 @@ static int size_fits_off_t(size_t size) {
     return (uintmax_t) size <= max_off;
 }
 
-static int parse_memlog_capacity(const char* value, size_t* out) {
-    char* end = NULL;
+static int parse_memlog_capacity(size_t* out) {
+    static const PeakEnvUnsignedSchema schema = {
+        "PEAK_MEMLOG_CHUNK_EVENTS", "events", PEAK_MEMLOG_CHUNK_EVENTS,
+        1, SIZE_MAX, false,
+        &peak_memlog_capacity_warning_emitted, false,
+    };
     unsigned long long parsed;
 
-    if (!value || !*value || value[0] == '-') return 0;
-    errno = 0;
-    parsed = strtoull(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed == 0 || parsed > SIZE_MAX) {
+    if (!peak_parse_env_unsigned_checked(&schema, &parsed)) {
         return 0;
     }
     *out = (size_t) parsed;
@@ -445,8 +447,12 @@ static void peak_memlog_open(void) {
         PEAK_MEMLOG_UNINITIALIZED) return;
 
     env_capacity = getenv("PEAK_MEMLOG_CHUNK_EVENTS");
-    if (env_capacity && !parse_memlog_capacity(env_capacity, &capacity_events)) {
-        peak_log_warn("[peak] memlog: invalid PEAK_MEMLOG_CHUNK_EVENTS; disabling log\n");
+    if (env_capacity && !parse_memlog_capacity(&capacity_events)) {
+        if (__atomic_exchange_n(&peak_memlog_capacity_warning_emitted.emitted,
+                                1,
+                                __ATOMIC_RELAXED) == 0) {
+            peak_log_warn("[peak] memlog: invalid PEAK_MEMLOG_CHUNK_EVENTS; disabling log\n");
+        }
         atomic_store_explicit(&g_memlog.state, PEAK_MEMLOG_DISABLED, memory_order_release);
         return;
     }

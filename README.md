@@ -162,7 +162,7 @@ in detail.
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
 | `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
-| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count. |
+| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. |
 
 ### MPI Output
 
@@ -309,6 +309,7 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_GPU_TARGET` | Comma-separated demangled base kernel names. |
 | `PEAK_GPU_TARGET_FILE` | File containing one GPU kernel name per line. |
 | `PEAK_GPU_MONITOR_ALL` | Profile every observed GPU kernel. |
+| `PEAK_CUDA_EVENT_POOL_CAPACITY` | CUDA event-pool capacity. Default: `256` events; accepts `1` through `65536`. |
 | `PEAK_MEMORY_PROFILE` | Enable experimental memory allocation profiling for selected CPU targets. |
 | `PEAK_MEMORY_TRACK_ALL` | Track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |

@@ -9,7 +9,6 @@
 
 static const char* const peak_test_environment_names[] = {
     "PEAK_DETACH_COUNT",
-    "PEAK_TEST_UINT",
     "MPI_LOCALNRANKS",
     "OMPI_COMM_WORLD_LOCAL_SIZE",
     "MV2_COMM_WORLD_LOCAL_SIZE",
@@ -55,72 +54,6 @@ check_truthy_values(void)
            !peak_general_listener_env_value_truthy("on") ||
            peak_general_listener_env_value_truthy("0") ||
            peak_general_listener_env_value_truthy("true ");
-}
-
-static int
-check_unsigned_parser(void)
-{
-    char negative[64];
-    char spaced_negative[66];
-
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "0", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 0U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "42", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 42U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "42junk", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U ||
-        snprintf(negative, sizeof(negative), "-%lu", ULONG_MAX) >=
-            (int)sizeof(negative) ||
-        snprintf(spaced_negative,
-                 sizeof(spaced_negative),
-                 "  -%lu",
-                 ULONG_MAX) >= (int)sizeof(spaced_negative)) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", negative, 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", spaced_negative, 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "-0", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "-1", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 7U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", "+42", 1);
-    if (peak_general_listener_parse_uint_env_default(
-            "PEAK_TEST_UINT", 7U) != 42U) {
-        return 1;
-    }
-    setenv("PEAK_TEST_UINT", " 42", 1);
-    return peak_general_listener_parse_uint_env_default(
-               "PEAK_TEST_UINT", 7U) != 42U;
 }
 
 static int
@@ -662,7 +595,7 @@ main(int argc, char** argv)
                    : 0;
     }
     clear_test_environment();
-    if (check_truthy_values() || check_unsigned_parser() ||
+    if (check_truthy_values() ||
         check_detach_override()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;

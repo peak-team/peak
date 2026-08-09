@@ -73,11 +73,6 @@ peak_general_listener_report_timeout_budget_for_rank_count(
 bool peak_general_listener_parse_detach_count_override(
     unsigned long* count_out);
 
-/** Reads an unsigned environment value or returns @p default_value. */
-unsigned int peak_general_listener_parse_uint_env_default(
-    const char* name,
-    unsigned int default_value);
-
 /**
  * Snapshots launcher-local rank metadata before controller threads start.
  *

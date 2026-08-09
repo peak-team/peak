@@ -110,6 +110,7 @@ static _Atomic int peak_exit_status_known = 0;
 static _Atomic int peak_exit_status_value = 0;
 static _Atomic int peak_runtime_active = 0;
 static _Atomic pid_t peak_runtime_owner_pid = 0;
+static PeakEnvWarningState peak_max_num_threads_warning_emitted;
 typedef enum {
     PEAK_RUNTIME_ACTIVATION_NOT_READY = 0,
     PEAK_RUNTIME_ACTIVATION_READY = 1,
@@ -733,6 +734,8 @@ peak_parse_max_num_threads(void)
     const char* value = getenv(PEAK_MAX_NUM_THREADS_ENV);
     long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     gulong default_value = 2;
+    PeakEnvUnsignedSchema schema;
+    unsigned long long parsed;
 
     if (online_cpus > 0) {
         if ((unsigned long)online_cpus > PEAK_MAX_NUM_THREADS_LIMIT / 2UL) {
@@ -742,41 +745,35 @@ peak_parse_max_num_threads(void)
         }
     }
 
-    if (value == NULL || value[0] == '\0') {
+    if (value == NULL) {
         return default_value;
     }
-    for (const unsigned char* cursor = (const unsigned char*)value;
-         *cursor != '\0';
-         cursor++) {
-        if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') {
-            peak_log_warn("[peak] invalid %s=%s; using %lu\n",
-                          PEAK_MAX_NUM_THREADS_ENV,
-                          value,
-                          (unsigned long)default_value);
-            return default_value;
-        }
-    }
-    errno = 0;
-    char* end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > (unsigned long long)G_MAXULONG) {
-        peak_log_warn("[peak] invalid %s=%s; using %lu\n",
-                      PEAK_MAX_NUM_THREADS_ENV,
-                      value,
-                      (unsigned long)default_value);
-        return default_value;
+    schema = (PeakEnvUnsignedSchema){
+        PEAK_MAX_NUM_THREADS_ENV, "thread slots", default_value,
+        0, G_MAXULONG, true, &peak_max_num_threads_warning_emitted,
+        true,
+    };
+    if (!peak_parse_env_unsigned_checked(&schema, &parsed)) {
+        return (gulong)peak_parse_env_unsigned(&schema);
     }
     if (parsed == 0) {
-        peak_log_warn("[peak] %s=0 is unsafe; using 1\n",
-                      PEAK_MAX_NUM_THREADS_ENV);
+        if (__atomic_exchange_n(&peak_max_num_threads_warning_emitted.emitted,
+                                1,
+                                __ATOMIC_RELAXED) == 0) {
+            peak_log_warn("[peak] %s=0 is unsafe; using 1\n",
+                          PEAK_MAX_NUM_THREADS_ENV);
+        }
         return 1;
     }
     if (parsed > PEAK_MAX_NUM_THREADS_LIMIT) {
-        peak_log_warn("[peak] %s=%s exceeds supported capacity %lu; clamping\n",
-                      PEAK_MAX_NUM_THREADS_ENV,
-                      value,
-                      PEAK_MAX_NUM_THREADS_LIMIT);
+        if (__atomic_exchange_n(&peak_max_num_threads_warning_emitted.emitted,
+                                1,
+                                __ATOMIC_RELAXED) == 0) {
+            peak_log_warn("[peak] %s=%s exceeds supported capacity %lu; clamping\n",
+                          PEAK_MAX_NUM_THREADS_ENV,
+                          value,
+                          PEAK_MAX_NUM_THREADS_LIMIT);
+        }
         return PEAK_MAX_NUM_THREADS_LIMIT;
     }
     return (gulong)parsed;

@@ -237,7 +237,7 @@ peak_general_listener_init_reattach_policy_once(void)
     PeakEnvUnsignedSchema schema = {
         PEAK_REATTACH_COOLDOWN_MS_ENV, "milliseconds",
         peak_reattach_default_cooldown_ms, 0, UINT_MAX, true,
-        &peak_reattach_cooldown_warning_emitted,
+        &peak_reattach_cooldown_warning_emitted, false,
     };
     unsigned int cooldown_ms =
         (unsigned int)peak_parse_env_unsigned(&schema);
@@ -504,7 +504,7 @@ peak_general_controller_parse_uint_env(const char* name,
                                        PeakEnvWarningState* warning_emitted)
 {
     PeakEnvUnsignedSchema schema = {
-        name, unit, default_value, 0, G_MAXUINT, true, warning_emitted,
+        name, unit, default_value, 0, G_MAXUINT, true, warning_emitted, false,
     };
 
     return (unsigned int)peak_parse_env_unsigned(&schema);

@@ -162,7 +162,7 @@ peak_mpi_teardown_finalize_timeout_ms(void)
     PeakEnvUnsignedSchema schema = {
         PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS, "milliseconds",
         PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS_DEFAULT, 1, UINT_MAX, false,
-        &peak_mpi_finalize_timeout_warning_emitted,
+        &peak_mpi_finalize_timeout_warning_emitted, false,
     };
 
     return (unsigned int)peak_parse_env_unsigned(&schema);

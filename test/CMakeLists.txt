@@ -362,6 +362,22 @@ if(BUILD_TESTING)
                 --stderr-count-regex "invalid PEAK_COST=nan"
                 --stderr-count 1
                 -- $<TARGET_FILE:test_numeric_env_parser> repeated-warning)
+    add_test(NAME test_numeric_env_parser_cuda_warning
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_CUDA_EVENT_POOL_CAPACITY=; using 256 events"
+                --stderr-count-regex "invalid PEAK_CUDA_EVENT_POOL_CAPACITY="
+                --stderr-count 1
+                -- $<TARGET_FILE:test_numeric_env_parser> cuda-warning)
+    add_test(NAME test_numeric_env_parser_unsigned_unset
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "^$"
+                --stderr-count-regex "invalid PEAK_CUDA_EVENT_POOL_CAPACITY="
+                --stderr-count 0
+                -- $<TARGET_FILE:test_numeric_env_parser> cuda-unset)
 
     add_executable(test_attach_policy
         report/test_attach_policy.c
@@ -673,6 +689,30 @@ if(BUILD_TESTING)
             PROPERTIES
                 ENVIRONMENT "${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "max_threads_parser_ok"
+                TIMEOUT 20)
+        add_test(NAME test_max_threads_parser_warning
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_MAX_NUM_THREADS=junk; using [0-9]+ thread slots"
+                --stderr-count-regex "PEAK_MAX_NUM_THREADS=junk"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/detach_runtime/test_max_threads_parser warning)
+        set_tests_properties(test_max_threads_parser_warning
+            PROPERTIES
+                ENVIRONMENT "${PRELOAD_VAR}"
+                TIMEOUT 20)
+        add_test(NAME test_max_threads_parser_empty_warning
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "invalid PEAK_MAX_NUM_THREADS=; using [0-9]+ thread slots"
+                --stderr-count-regex "PEAK_MAX_NUM_THREADS="
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/detach_runtime/test_max_threads_parser empty-warning)
+        set_tests_properties(test_max_threads_parser_empty_warning
+            PROPERTIES
+                ENVIRONMENT "${PRELOAD_VAR}"
                 TIMEOUT 20)
 
         add_test(NAME test_fastpath_thread_exit_slot_reuse

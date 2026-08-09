@@ -30,7 +30,6 @@ static PeakEnvWarningState peak_output_timeout_warning_emitted;
 static PeakEnvWarningState peak_output_release_timeout_warning_emitted;
 static PeakEnvWarningState peak_mpi_release_timeout_warning_emitted;
 static PeakEnvWarningState peak_detach_count_warning_emitted;
-static PeakEnvWarningState peak_uint_default_warning_emitted;
 
 static bool
 peak_general_listener_parse_positive_uint_bounded(const char* name,
@@ -42,6 +41,7 @@ peak_general_listener_parse_positive_uint_bounded(const char* name,
     const char* value = getenv(name);
     PeakEnvUnsignedSchema schema = {
         name, "milliseconds", fallback, 1, maximum, false, warning_emitted,
+        false,
     };
     unsigned long long parsed;
 
@@ -209,7 +209,7 @@ peak_general_listener_parse_detach_count_override(unsigned long* count_out)
     }
     PeakEnvUnsignedSchema schema = {
         "PEAK_DETACH_COUNT", "calls", 0, 1, ULONG_MAX, false,
-        &peak_detach_count_warning_emitted,
+        &peak_detach_count_warning_emitted, false,
     };
     unsigned long long parsed = peak_parse_env_unsigned(&schema);
 
@@ -221,18 +221,6 @@ peak_general_listener_parse_detach_count_override(unsigned long* count_out)
         *count_out = (unsigned long)parsed;
     }
     return true;
-}
-
-unsigned int
-peak_general_listener_parse_uint_env_default(const char* name,
-                                             unsigned int default_value)
-{
-    PeakEnvUnsignedSchema schema = {
-        name, "milliseconds", default_value, 0, UINT_MAX, true,
-        &peak_uint_default_warning_emitted,
-    };
-
-    return (unsigned int)peak_parse_env_unsigned(&schema);
 }
 
 static bool

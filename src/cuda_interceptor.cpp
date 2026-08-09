@@ -8,6 +8,7 @@
 #include "internal/general_listener/mpi_report_transport.h"
 #endif
 #include "logging.h"
+#include "utils/env_parser.h"
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -86,6 +87,7 @@ typedef CUresult (*PeakCudaFuncGetNameFn)(const char** name,
 static PeakCudaFuncGetNameFn peak_cuda_func_get_name;
 static std::once_flag peak_cuda_func_get_name_once;
 static PeakCudaProfilerState peak_cuda_profiler_state;
+static PeakEnvWarningState peak_cuda_event_pool_capacity_warning_emitted;
 
 struct PeakCudaEventSlot {
     cudaEvent_t start;
@@ -313,20 +315,12 @@ void insert_cuda_graph_record(CUgraphExec_st* graph, gdouble elapsed_sec)
 static size_t
 peak_cuda_parse_event_pool_capacity()
 {
-    const gchar* value = g_getenv("PEAK_CUDA_EVENT_POOL_CAPACITY");
-    gchar* end = NULL;
-    guint64 parsed;
+    static const PeakEnvUnsignedSchema schema = {
+        "PEAK_CUDA_EVENT_POOL_CAPACITY", "events", 256, 1, 65536, false,
+        &peak_cuda_event_pool_capacity_warning_emitted, false,
+    };
 
-    if (value == NULL || value[0] == '\0') {
-        return 256;
-    }
-    parsed = g_ascii_strtoull(value, &end, 10);
-    if (end == value || *end != '\0' || parsed == 0 || parsed > 65536) {
-        peak_log_warn("[peak] invalid PEAK_CUDA_EVENT_POOL_CAPACITY=%s; using 256\n",
-                      value);
-        return 256;
-    }
-    return (size_t)parsed;
+    return (size_t)peak_parse_env_unsigned(&schema);
 }
 
 static void

@@ -42,6 +42,7 @@ typedef struct {
     unsigned long long maximum;
     bool zero_allowed;
     PeakEnvWarningState* warning_emitted;
+    bool decimal_digits_only;
 } PeakEnvUnsignedSchema;
 
 typedef struct {

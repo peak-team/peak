@@ -112,7 +112,7 @@ peak_jit_parse_ulong_env(const char* name,
 {
     PeakEnvUnsignedSchema schema = {
         name, unit, fallback, zero_allowed ? 0UL : 1UL, ULONG_MAX,
-        zero_allowed, warning_emitted,
+        zero_allowed, warning_emitted, false,
     };
 
     return (unsigned long)peak_parse_env_unsigned(&schema);

@@ -540,7 +540,7 @@ peak_socket_reduce_port(void)
     PeakEnvUnsignedSchema schema = {
         PEAK_OUTPUT_AGGREGATION_PORT_ENV, "TCP port",
         (unsigned long long)peak_socket_reduce_default_port(), 1, 65535,
-        false, &peak_socket_port_warning_emitted,
+        false, &peak_socket_port_warning_emitted, false,
     };
 
     return (int)peak_parse_env_unsigned(&schema);

@@ -208,7 +208,7 @@ peak_mpi_output_collective_timeout_ms(void)
     PeakEnvUnsignedSchema schema = {
         PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_ENV, "milliseconds",
         PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS_DEFAULT, 1, UINT_MAX, false,
-        &peak_mpi_output_timeout_warning_emitted,
+        &peak_mpi_output_timeout_warning_emitted, false,
     };
 
     return (unsigned int)peak_parse_env_unsigned(&schema);

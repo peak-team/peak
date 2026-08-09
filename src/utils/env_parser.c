@@ -233,6 +233,18 @@ peak_parse_env_unsigned_checked(const PeakEnvUnsignedSchema* schema,
     if (value == NULL) {
         return false;
     }
+    if (schema->decimal_digits_only) {
+        if (value[0] == '\0') {
+            return false;
+        }
+        for (const unsigned char* digit = (const unsigned char*)value;
+             *digit != '\0';
+             digit++) {
+            if (*digit < (unsigned char)'0' || *digit > (unsigned char)'9') {
+                return false;
+            }
+        }
+    }
     cursor = (const unsigned char*)value;
     while (isspace(*cursor)) {
         cursor++;
@@ -257,9 +269,14 @@ unsigned long long
 peak_parse_env_unsigned(const PeakEnvUnsignedSchema* schema)
 {
     unsigned long long parsed;
+    const char* value = getenv(schema->name);
+
+    if (value == NULL) {
+        return schema->fallback;
+    }
 
     if (!peak_parse_env_unsigned_checked(schema, &parsed)) {
-        peak_env_warn_unsigned_fallback(schema, getenv(schema->name));
+        peak_env_warn_unsigned_fallback(schema, value);
         return schema->fallback;
     }
     return parsed;
@@ -284,7 +301,8 @@ peak_env_seconds_to_microseconds(const PeakEnvNumberSchema* schema)
     double seconds = peak_env_parse_number(schema, &valid, true);
     double microseconds = seconds * PEAK_SECONDS_PER_MICROSECOND;
 
-    if (valid && seconds != 0.0 && microseconds < 1.0) {
+    if (valid && seconds != 0.0 &&
+        (microseconds < 1.0 || microseconds >= 0x1p32)) {
         const char* value = getenv(schema->name);
         peak_env_warn_fallback(schema, value, schema->fallback);
         microseconds = schema->fallback * PEAK_SECONDS_PER_MICROSECOND;
@@ -301,7 +319,7 @@ peak_env_seconds_to_nanoseconds(const PeakEnvNumberSchema* schema)
         (long double)seconds * PEAK_SECONDS_PER_NANOSECOND;
 
     if (valid && seconds != 0.0 &&
-        (nanoseconds < 1.0L || nanoseconds > (long double)ULLONG_MAX)) {
+        (nanoseconds < 1.0L || nanoseconds >= 0x1p64L)) {
         const char* value = getenv(schema->name);
         peak_env_warn_fallback(schema, value, schema->fallback);
         nanoseconds = (long double)schema->fallback *

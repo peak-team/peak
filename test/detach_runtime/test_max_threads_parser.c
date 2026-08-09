@@ -3,11 +3,12 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef unsigned long (*PeakParseMaxThreads)(void);
 
 int
-main(void)
+main(int argc, char** argv)
 {
     static const struct {
         const char* value;
@@ -26,6 +27,21 @@ main(void)
     if (parse == NULL) {
         fputs("missing max-thread parser test hook\n", stderr);
         return 1;
+    }
+
+    if (argc == 2 &&
+        (strcmp(argv[1], "warning") == 0 ||
+         strcmp(argv[1], "empty-warning") == 0)) {
+        unsigned long fallback;
+
+        setenv("PEAK_MAX_NUM_THREADS",
+               strcmp(argv[1], "empty-warning") == 0 ? "" : "junk", 1);
+        fallback = parse();
+        if (fallback == 0 || parse() != fallback) {
+            fputs("invalid max-thread fallback mismatch\n", stderr);
+            return 1;
+        }
+        return 0;
     }
 
     unsetenv("PEAK_MAX_NUM_THREADS");
