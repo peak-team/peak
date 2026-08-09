@@ -441,6 +441,36 @@ report_two_rank_case_diagnostic(
             telemetry->root_release_decision);
 }
 
+static void
+report_many_rank_case_diagnostic(
+    int size,
+    bool exercise_concurrency,
+    PeakSocketReportStatus root_status,
+    bool commit_attempted,
+    bool committed,
+    const PeakSocketReportTestTelemetry* telemetry)
+{
+    fprintf(stderr,
+            "socket many-rank diagnostic: size=%d concurrency=%d "
+            "root_status=%d commit_attempted=%d commit_result=%d "
+            "root={wire=%u payload=%u receipt=%u confirmation=%u "
+            "max_active=%u release_targets=%u release_confirmed=%u "
+            "release_decision=%u}\n",
+            size,
+            exercise_concurrency,
+            root_status,
+            commit_attempted,
+            committed,
+            telemetry->wire_version,
+            telemetry->root_payload_count,
+            telemetry->root_receipt_count,
+            telemetry->root_confirmation_count,
+            telemetry->root_max_active,
+            telemetry->root_release_target_count,
+            telemetry->root_release_confirmed_count,
+            telemetry->root_release_decision);
+}
+
 static int
 run_two_rank_case(int port,
                   TestRootAction action,
@@ -1432,6 +1462,10 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
     char token_text[64];
     int started = 0;
     int result = 0;
+    PeakSocketReportStatus root_status = PEAK_SOCKET_REPORT_FAILED;
+    PeakSocketReportTestTelemetry root_telemetry = {0};
+    bool commit_attempted = false;
+    bool committed = false;
 
     if (root == NULL || size <= 2) {
         peak_report_snapshot_destroy(root);
@@ -1453,12 +1487,16 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
     /*
      * Launching 31 peers on a hosted runner can take longer than the normal
      * per-phase budget even when every connection makes progress. Keep this
-     * many-rank regression bounded but allow a scheduling margin beyond the
-     * default three-second budget.
+     * many-rank regression bounded but allow a scheduling margin before the
+     * normal five-second protocol budget begins.
      */
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS", "5000", 1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS",
                  "15000",
+                 1);
+    /* Allow fork/scheduler startup only; transport progress stays at 5 s. */
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS",
+                 "10000",
                  1);
     (void)setenv("PEAK_OUTPUT_AGGREGATION_TOKEN", token_text, 1);
     (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_RELEASE_FAIL");
@@ -1546,29 +1584,25 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
     }
 
     if (!result) {
-        PeakSocketReportStatus root_status;
-        PeakSocketReportTestTelemetry telemetry;
-
         set_test_rank(0, size);
         root_status = peak_socket_report_transport_begin(
             root,
             PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
             &session,
             &aggregate);
-        memset(&telemetry, 0, sizeof(telemetry));
-        peak_socket_report_test_telemetry_get(&telemetry);
+        peak_socket_report_test_telemetry_get(&root_telemetry);
         if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
             session == NULL || aggregate == NULL ||
-            telemetry.wire_version != 12U ||
-            telemetry.root_payload_count != (uint32_t)(size - 1) ||
-            telemetry.root_receipt_count != (uint32_t)(size - 1) ||
-            telemetry.root_confirmation_count !=
+            root_telemetry.wire_version != 12U ||
+            root_telemetry.root_payload_count != (uint32_t)(size - 1) ||
+            root_telemetry.root_receipt_count != (uint32_t)(size - 1) ||
+            root_telemetry.root_confirmation_count !=
                 (uint32_t)(size - 1) ||
-            telemetry.root_max_active == 0U ||
-            telemetry.root_max_active > (uint32_t)(size - 1) ||
+            root_telemetry.root_max_active == 0U ||
+            root_telemetry.root_max_active > (uint32_t)(size - 1) ||
             (exercise_concurrency &&
-             telemetry.root_max_active <= 1U) ||
-            telemetry.root_release_target_count !=
+             root_telemetry.root_max_active <= 1U) ||
+            root_telemetry.root_release_target_count !=
                 (uint32_t)(size - 1) ||
             aggregate->rank_count != size ||
             aggregate->num_calls[0] !=
@@ -1578,18 +1612,21 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
             result = 1;
             peak_socket_report_transport_abort(session);
             session = NULL;
-        } else if (!peak_socket_report_transport_commit(session)) {
-            result = 1;
-            session = NULL;
         } else {
-            session = NULL;
-            memset(&telemetry, 0, sizeof(telemetry));
-            peak_socket_report_test_telemetry_get(&telemetry);
-            if (telemetry.root_release_decision !=
-                    TEST_RELEASE_ACK ||
-                telemetry.root_release_confirmed_count !=
-                    (uint32_t)(size - 1)) {
+            commit_attempted = true;
+            committed = peak_socket_report_transport_commit(session);
+            if (!committed) {
                 result = 1;
+                session = NULL;
+            } else {
+                session = NULL;
+                peak_socket_report_test_telemetry_get(&root_telemetry);
+                if (root_telemetry.root_release_decision !=
+                        TEST_RELEASE_ACK ||
+                    root_telemetry.root_release_confirmed_count !=
+                        (uint32_t)(size - 1)) {
+                    result = 1;
+                }
             }
         }
     } else {
@@ -1598,10 +1635,35 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
     }
 
     for (int i = 0; i < started; i++) {
+        int child_status;
+
         if (wait_for_expected_child(
-                children[i], PEAK_SOCKET_REPORT_PEER_RELEASED, NULL) != 0) {
+                children[i],
+                PEAK_SOCKET_REPORT_PEER_RELEASED,
+                &child_status) != 0) {
+            fprintf(stderr,
+                    "socket many-rank child diagnostic: rank=%d pid=%ld "
+                    "wait_status=%d exited=%d exit=%d signal=%d\n",
+                    i + 1,
+                    (long)children[i],
+                    child_status,
+                    child_status >= 0 && WIFEXITED(child_status),
+                    child_status >= 0 && WIFEXITED(child_status)
+                        ? WEXITSTATUS(child_status)
+                        : -1,
+                    child_status >= 0 && WIFSIGNALED(child_status)
+                        ? WTERMSIG(child_status)
+                        : -1);
             result = 1;
         }
+    }
+    if (result != 0) {
+        report_many_rank_case_diagnostic(size,
+                                         exercise_concurrency,
+                                         root_status,
+                                         commit_attempted,
+                                         committed,
+                                         &root_telemetry);
     }
     peak_report_snapshot_destroy(aggregate);
     peak_report_snapshot_destroy(root);
@@ -1614,6 +1676,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DELAY_RANK");
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_PRECONNECT_DELAY_MS");
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_STARTUP_GRACE_MS");
     (void)unsetenv(
         "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DISABLE_JITTER");
     return result;
