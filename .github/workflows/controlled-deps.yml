@@ -10,12 +10,34 @@ jobs:
       - name: Bootstrap pinned development dependencies
         run: >
           cmake -S . -B bootstrap
-          -DPEAK_FETCH_DEPS=ON
           -DPEAK_ENABLE_OTF2=ON
           -DPEAK_USE_SYSTEM_OTF2=OFF
           -DPEAK_ENABLE_MPI=OFF
           -DBUILD_CUDA_PROFILE=OFF
       - run: cmake --build bootstrap
+      - name: Verify caller-provided Frida Gum bypasses the default fetch
+        env:
+          ALL_PROXY: http://127.0.0.1:9
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+        run: |
+          export all_proxy="$ALL_PROXY"
+          export http_proxy="$HTTP_PROXY"
+          export https_proxy="$HTTPS_PROXY"
+          cmake -S . -B caller-provider \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DBUILD_CUDA_PROFILE=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+          grep -F 'PEAK_FETCH_DEPS:BOOL=ON' caller-provider/CMakeCache.txt
+      - name: Verify disabled fetch requires a caller-provided devkit
+        run: |
+          if cmake -S . -B no-provider -DPEAK_FETCH_DEPS=OFF -DPEAK_ENABLE_MPI=OFF -DBUILD_CUDA_PROFILE=OFF > no-provider.log 2>&1; then
+            echo "PEAK_FETCH_DEPS=OFF unexpectedly configured without Frida Gum"
+            exit 1
+          fi
+          grep -F 'Frida Gum is required and PEAK_FETCH_DEPS=OFF' no-provider.log
       - name: Build with optional components disabled and no downloads
         env:
           ALL_PROXY: http://127.0.0.1:9

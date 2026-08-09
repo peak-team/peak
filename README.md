@@ -35,7 +35,7 @@ safe attach and detach behavior, and reliable final reports matter.
 ```bash
 mkdir -p build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DPEAK_FETCH_DEPS=ON ..
+cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build .
 
 PEAK_TARGET=my_function \
@@ -55,14 +55,15 @@ PEAK writes a report to stderr and a CSV profile log using the default prefix
 - POSIX threads and standard Linux runtime libraries
 
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
-CUDA Toolkit 11.2 or newer.  Cluster builds do not download dependencies by
-default: provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
-`FRIDA_GUM_INCLUDE_DIRS`, or opt in to pinned downloads with
-`PEAK_FETCH_DEPS=ON`.
+CUDA Toolkit 11.2 or newer. By default PEAK downloads a pinned Frida Gum devkit
+and applies its PEAK patch. For controlled or offline builds, set
+`PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
+`FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
 
 ## Build and Install
 
-For a self-contained developer build, opt in to the pinned dependency fetches:
+For a self-contained developer build, the pinned Frida Gum download is enabled
+by default:
 
 ```bash
 mkdir -p build
@@ -70,7 +71,6 @@ cd build
 cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
-  -DPEAK_FETCH_DEPS=ON \
   ..
 cmake --build .
 cmake --build . --target install
@@ -82,7 +82,7 @@ Common CMake options:
 | --- | --- |
 | `PEAK_ENABLE_MPI=OFF` | Build without MPI support. |
 | `BUILD_CUDA_PROFILE=OFF` | Build without CUDA profiling support. |
-| `PEAK_FETCH_DEPS=ON` | Permit pinned Frida Gum/OTF2 and test-only OpenBLAS downloads. Default: `OFF`. |
+| `PEAK_FETCH_DEPS=OFF` | Disable dependency downloads. Provide Frida Gum explicitly for controlled/offline builds. Default: `ON`. |
 | `PEAK_ENABLE_OTF2=ON` | Enable OTF2 memory-trace export. Default: `OFF`; CSV memory profiling remains available. |
 | `PEAK_USE_SYSTEM_OTF2=ON` | Search for a system OTF2 before fetching it. |
 | `PEAK_ENABLE_FORTRAN_TESTS=ON` | Build the optional Fortran dgemm tests and require a Fortran compiler. |
@@ -308,7 +308,7 @@ Configure and run the local suite (with the packaged Frida Gum download) with:
 ```bash
 mkdir -p build
 cd build
-cmake -DBUILD_TESTING=ON -DPEAK_FETCH_DEPS=ON ..
+cmake -DBUILD_TESTING=ON ..
 cmake --build .
 ctest --output-on-failure
 ```

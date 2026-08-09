@@ -5,8 +5,8 @@ project(peak LANGUAGES C CXX)
 include(GNUInstallDirs)
 
 option(PEAK_FETCH_DEPS
-    "Allow CMake to download dependencies that are not provided by the system"
-    OFF)
+    "Allow CMake to download pinned dependencies when callers do not provide them"
+    ON)
 option(PEAK_ENABLE_OTF2 "Enable OTF2 memory-trace export" OFF)
 option(PEAK_USE_SYSTEM_OTF2 "Find OTF2 in the system before fetching it" ON)
 option(PEAK_ENABLE_FORTRAN_TESTS "Build tests that require a Fortran compiler" OFF)

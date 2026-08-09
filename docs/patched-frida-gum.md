@@ -12,15 +12,16 @@ selected explicitly.
 
 ## Developer Download Provider
 
-A self-contained developer build explicitly opts in to the pinned download:
+A self-contained developer build downloads the pinned devkit by default:
 
 ```sh
-cmake -S . -B build -DPEAK_FETCH_DEPS=ON
+cmake -S . -B build
 ```
 
-PEAK defaults `PEAK_FETCH_DEPS=OFF` for controlled HPC installs.  With that
-default, provide `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` from the
-site devkit instead of allowing CMake to download it.
+For controlled HPC or offline installs, explicitly set `PEAK_FETCH_DEPS=OFF`
+and provide `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` from the site
+devkit, or select `PEAK_FRIDA_GUM_PROVIDER=patched-devkit` with a
+caller-provided patched-devkit root.
 
 On Linux x86_64 and Linux Arm64 this produces
 `frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the
