@@ -155,6 +155,13 @@ void peak_socket_report_test_receipt_barrier_set(int peer_wait_fd,
                                                  int root_signal_fd);
 
 /**
+ * Configures a test-only root-listener readiness signal.  The root closes the
+ * descriptor after writing one byte once both transport listeners and gather
+ * allocations are ready; passing -1 clears a pending signal.
+ */
+void peak_socket_report_test_listener_ready_set(int root_signal_fd);
+
+/**
  * Returns the default socket aggregation port for the current shared
  * launcher identity.
  */

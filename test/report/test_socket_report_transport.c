@@ -725,20 +725,21 @@ run_two_rank_case_with_peer_start_delay(int port,
     }
 
     peak_socket_report_test_receipt_barrier_set(-1, -1);
+    peak_socket_report_test_listener_ready_set(-1);
     /*
      * Keep fork/fixture launch out of root transport timing.  The child
-     * announces readiness immediately before it enters the peer transport;
-     * the root still has its normal startup and protocol deadlines after
-     * that point.
+     * announces fixture readiness, then waits for the root to finish binding
+     * both listeners and allocating gather state before peer timing starts.
      */
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, peer_ready_fds) != 0) {
         peak_report_snapshot_destroy(root);
         return 1;
     }
+    peak_socket_report_test_listener_ready_set(peer_ready_fds[1]);
     if (receipt_failure_barrier &&
         socketpair(AF_UNIX, SOCK_STREAM, 0, receipt_barrier_fds) != 0) {
         close(peer_ready_fds[0]);
-        close(peer_ready_fds[1]);
+        peak_socket_report_test_listener_ready_set(-1);
         peak_report_snapshot_destroy(root);
         return 1;
     }
@@ -747,7 +748,7 @@ run_two_rank_case_with_peer_start_delay(int port,
     child = fork();
     if (child < 0) {
         close(peer_ready_fds[0]);
-        close(peer_ready_fds[1]);
+        peak_socket_report_test_listener_ready_set(-1);
         if (receipt_barrier_fds[0] >= 0) {
             close(receipt_barrier_fds[0]);
         }
@@ -763,7 +764,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         PeakSocketReportSession* peer_session = NULL;
         PeakSocketReportStatus peer_status;
         PeakSocketReportTestTelemetry telemetry;
-        const unsigned char ready = 0x71U;
+        unsigned char ready = 0x71U;
 
         close(peer_ready_fds[1]);
         peer_ready_fds[1] = -1;
@@ -776,10 +777,6 @@ run_two_rank_case_with_peer_start_delay(int port,
             receipt_barrier_fds[0] = -1;
         }
         set_test_rank(1, 2);
-        if (delay_peer_start) {
-            /* Without the rendezvous, root exhausts its 100 ms grace. */
-            usleep(250000);
-        }
         if (peer == NULL ||
             send(peer_ready_fds[0],
                  &ready,
@@ -788,8 +785,18 @@ run_two_rank_case_with_peer_start_delay(int port,
             close(peer_ready_fds[0]);
             _exit(99);
         }
+        if (recv(peer_ready_fds[0], &ready, sizeof(ready), 0) !=
+                (ssize_t)sizeof(ready) ||
+            ready != 0x73U) {
+            close(peer_ready_fds[0]);
+            _exit(99);
+        }
         close(peer_ready_fds[0]);
         peer_ready_fds[0] = -1;
+        if (delay_peer_start) {
+            /* Old one-way startup expired its 100 ms grace here. */
+            usleep(250000);
+        }
         peer_status = peak_socket_report_transport_begin(
             peer,
             PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -846,8 +853,6 @@ run_two_rank_case_with_peer_start_delay(int port,
             (ssize_t)sizeof(ready) || ready != 0x71U) {
             result = 1;
         }
-        close(peer_ready_fds[1]);
-        peer_ready_fds[1] = -1;
     }
     if (result == 0) {
         set_test_rank(0, 2);
@@ -857,6 +862,9 @@ run_two_rank_case_with_peer_start_delay(int port,
             &session,
             &aggregate);
     }
+    /* Wakes a waiting child by EOF if root failed before listener readiness. */
+    peak_socket_report_test_listener_ready_set(-1);
+    peer_ready_fds[1] = -1;
     memset(&root_telemetry, 0, sizeof(root_telemetry));
     peak_socket_report_test_telemetry_get(&root_telemetry);
     if (receipt_failure_barrier) {
