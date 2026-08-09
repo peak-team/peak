@@ -44,6 +44,7 @@ typedef struct {
 #define MPI_MAX 2
 #define MPI_SUM 3
 #define MPI_MAXLOC 4
+#define MPI_BOR 5
 
 #define MPI_REQUEST_NULL ((MPI_Request){0, 0})
 

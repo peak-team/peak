@@ -24,6 +24,7 @@
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
+#include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
 #include "internal/jit_provider.h"
 #include "logging.h"
@@ -86,6 +87,7 @@ static size_t peak_target_thread_called_count;
 PeakHeartbeatArgs* args;
 extern _Atomic gboolean heartbeat_running;
 pthread_t heartbeat_thread;
+static _Atomic int peak_heartbeat_started = 0;
 PEAK_API size_t peak_hook_address_count;
 unsigned int heartbeat_time;
 unsigned int check_interval;
@@ -206,6 +208,15 @@ static _Atomic int peak_test_fini_waiting_for_reader = 0;
 static _Atomic int peak_test_activation_pause = 0;
 static _Atomic int peak_test_activation_held = 0;
 static _Atomic int peak_test_activation_released = 0;
+static _Atomic int peak_test_fail_heartbeat_create = 0;
+
+void
+peak_test_fail_heartbeat_create_once(void)
+{
+    atomic_store_explicit(&peak_test_fail_heartbeat_create,
+                          1,
+                          memory_order_release);
+}
 
 void peak_fini(void);
 
@@ -617,8 +628,29 @@ peak_activate_runtime(void)
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
-        heartbeat_overhead = g_new0(gdouble, peak_hook_address_count);
-        args = g_new0(PeakHeartbeatArgs, 1);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL) {
+            heartbeat_overhead = NULL;
+            args = NULL;
+        } else
+#endif
+        {
+        heartbeat_overhead = g_try_new0(gdouble, peak_hook_address_count);
+        args = g_try_new0(PeakHeartbeatArgs, 1);
+        }
+        if ((peak_hook_address_count != 0 && heartbeat_overhead == NULL) ||
+            args == NULL) {
+            peak_report_snapshot_note_degraded(
+                PEAK_PROFILER_DEGRADED_HEARTBEAT,
+                "heartbeat setup allocation failed");
+            g_free(args);
+            args = NULL;
+            g_free(heartbeat_overhead);
+            heartbeat_overhead = NULL;
+            heartbeat_time = 0;
+        }
+    }
+    if (heartbeat_time != 0) {
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
         args->hb_min_us = hb_min_us;
@@ -628,7 +660,16 @@ peak_activate_runtime(void)
         args->hb_ema_a = hb_ema_a;
     }
     if (peak_memory_profile) {
-        malloc_interceptor_attach();
+        PeakMallocInterceptorAttachResult memory_attach_result =
+            malloc_interceptor_attach();
+        if (memory_attach_result != PEAK_MALLOC_ATTACH_OK) {
+            peak_report_snapshot_note_degraded(
+                PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
+                memory_attach_result == PEAK_MALLOC_ATTACH_ROLLED_BACK
+                    ? "memory interceptor installation rolled back safely"
+                    : "memory tracking setup failed before installation");
+            peak_memory_profile = false;
+        }
     }
     peak_general_listener_controller_start();
     if (dynamic_attach_listener_ready) {
@@ -638,17 +679,39 @@ peak_activate_runtime(void)
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
-        pthread_listener_mark_next_created_thread_helper();
-        if (pthread_create(&heartbeat_thread,
-                           NULL,
-                           peak_heartbeat_monitor,
-                           args) != 0) {
-            perror("Failed to create heartbeat thread");
+        int heartbeat_create_result;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (atomic_exchange_explicit(&peak_test_fail_heartbeat_create,
+                                     0,
+                                     memory_order_acq_rel) != 0 ||
+            (getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE") != NULL &&
+             getenv("PEAK_TEST_FAIL_HEARTBEAT_CREATE")[0] != '\0')) {
+            heartbeat_create_result = EAGAIN;
+        } else
+#endif
+        {
+            pthread_listener_mark_next_created_thread_helper();
+            heartbeat_create_result = pthread_create(&heartbeat_thread,
+                                                      NULL,
+                                                      peak_heartbeat_monitor,
+                                                      args);
+        }
+        if (heartbeat_create_result != 0) {
+            peak_report_snapshot_note_degraded(
+                PEAK_PROFILER_DEGRADED_HEARTBEAT,
+                "heartbeat thread creation failed");
             g_free(args);
             args = NULL;
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
-            exit(EXIT_FAILURE);
+            heartbeat_time = 0;
+            pthread_mutex_lock(&heartbeat_mutex);
+            atomic_store(&heartbeat_running, false);
+            pthread_mutex_unlock(&heartbeat_mutex);
+        } else {
+            atomic_store_explicit(&peak_heartbeat_started,
+                                  1,
+                                  memory_order_release);
         }
     }
 
@@ -875,12 +938,13 @@ peak_fini_impl(void)
     }
 #endif
 
-    if (heartbeat_time != 0) {
+    if (atomic_load_explicit(&peak_heartbeat_started, memory_order_acquire)) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, false);
         pthread_cond_signal(&heartbeat_cond);
         pthread_mutex_unlock(&heartbeat_mutex);
         pthread_join(heartbeat_thread, NULL);
+        atomic_store_explicit(&peak_heartbeat_started, 0, memory_order_release);
         if (args) {
             g_free(args);
             args = NULL;
@@ -1421,12 +1485,42 @@ peak_should_wrap_main(int argc, char** argv)
 
 /* Original function pointer for exit(). */
 static void (*original_exit)(int) = NULL;
+static _Atomic int peak_exit_interposer_unavailable = 0;
 
 static void
 peak_resolve_real_exit(void)
 {
-    if (original_exit == NULL) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* forced_failure = getenv("PEAK_TEST_FAIL_EXIT_INTERPOSER_INSTALL");
+    gboolean force_libc_fallback =
+        forced_failure != NULL && forced_failure[0] != '\0';
+#else
+    gboolean force_libc_fallback = FALSE;
+#endif
+
+    if (original_exit == NULL && !force_libc_fallback) {
         original_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
+    }
+    if (original_exit == NULL) {
+        /* RTLD_NEXT normally finds libc.  Resolve libc explicitly as a
+         * fail-open fallback when a loader namespace prevents that lookup. */
+        void* libc = dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
+
+        if (libc != NULL) {
+            /* Keep this handle open: original_exit must remain valid. */
+            original_exit = (void (*)(int))dlsym(libc, "exit");
+        }
+    }
+    if (force_libc_fallback) {
+        atomic_store_explicit(&peak_exit_interposer_unavailable,
+                              1,
+                              memory_order_release);
+        return;
+    }
+    if (original_exit == NULL) {
+        atomic_store_explicit(&peak_exit_interposer_unavailable,
+                              1,
+                              memory_order_release);
     }
 }
 
@@ -1462,6 +1556,11 @@ peak_exit(int status)
     peak_resolve_real_exit();
     if (original_exit == NULL) {
         _exit(status);
+    }
+    if (atomic_load_explicit(&peak_exit_interposer_unavailable,
+                             memory_order_acquire) != 0) {
+        original_exit(status);
+        __builtin_unreachable();
     }
 
     if (peak_runtime_is_fork_child()) {
@@ -1529,6 +1628,14 @@ int __libc_start_main(main_fn main, int argc, char** argv,
 
     /* Install main_wrapper() only when the command requests PEAK work. */
     int requested_work = peak_process_requests_work();
+    if (atomic_load_explicit(&peak_exit_interposer_unavailable,
+                             memory_order_acquire) != 0) {
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_EXIT_INTERPOSER,
+            "exit interposer installation unavailable");
+    }
+    /* A missing explicit-exit resolver does not prevent normal main-return
+     * teardown, which remains safe and supplies the degraded report metadata. */
     gboolean should_wrap = peak_should_wrap_main(argc, argv) && requested_work;
     peak_set_process_profile_enabled(should_wrap);
     peak_set_process_requests_work(requested_work);

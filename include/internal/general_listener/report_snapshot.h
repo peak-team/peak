@@ -16,6 +16,35 @@
 extern "C" {
 #endif
 
+/*
+ * Optional profiler facilities must never make the application unavailable
+ * before they have changed application code.  Keep this compact, allocation-
+ * free diagnostic in the report model so a completed report records every
+ * facility that was deliberately disabled during startup.
+ */
+typedef enum {
+    PEAK_PROFILER_DEGRADED_NONE             = 0,
+    PEAK_PROFILER_DEGRADED_HEARTBEAT        = 1u << 0,
+    PEAK_PROFILER_DEGRADED_REPORT           = 1u << 1,
+    PEAK_PROFILER_DEGRADED_MEMORY_TRACKING  = 1u << 2,
+    PEAK_PROFILER_DEGRADED_EXIT_INTERPOSER  = 1u << 3,
+} PeakProfilerDegradedMask;
+
+/** Records one non-critical subsystem that was safely disabled. */
+void peak_report_snapshot_note_degraded(uint32_t mask, const char* reason);
+
+/** Returns the process-wide immutable-after-set degraded-mode bitset. */
+uint32_t peak_report_snapshot_degraded_mask(void);
+
+/** Writes a stable comma-separated reason list to @p buffer. */
+void peak_report_snapshot_format_degraded_reasons(char* buffer,
+                                                  size_t buffer_size);
+
+/** Formats the supplied captured bitset, rather than live process state. */
+void peak_report_snapshot_format_degraded_mask(uint32_t mask,
+                                               char* buffer,
+                                               size_t buffer_size);
+
 /**
  * Owned final-report data captured from the live listener.
  *
@@ -42,6 +71,8 @@ typedef struct {
     /* Global diagnostics for user callers that had no assignable PEAK slot. */
     uint64_t dropped_calls;
     uint64_t dropped_threads;
+    /** Non-critical profiler facilities disabled without mutating user code. */
+    uint32_t degraded_mask;
     double overhead_per_call;
     int rank_count;
     PeakReportOverhead overhead;

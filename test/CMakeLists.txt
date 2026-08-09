@@ -67,6 +67,21 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "gum_mutation_allowlist_ok")
 
+    add_test(NAME test_mpi_report_transport_nonblocking
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_mpi_report_transport_nonblocking.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_mpi_report_transport_nonblocking
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "mpi_report_transport_nonblocking_ok")
+
+    add_test(NAME test_run_expect_exit_self_test
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/test_run_expect_exit.py)
+    set_tests_properties(test_run_expect_exit_self_test
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "run_expect_exit_self_test_ok")
+
     add_test(NAME test_header_guard_style
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/static_checks/check_header_guard_style.py
@@ -233,12 +248,16 @@ if(BUILD_TESTING)
         ${RT_LIBRARY}
         ${M_LIBRARY})
     add_test(NAME test_mpi_report_request_lifetime
-        COMMAND test_mpi_report_request_lifetime)
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- $<TARGET_FILE:test_mpi_report_request_lifetime>)
     set_tests_properties(test_mpi_report_request_lifetime
         PROPERTIES
-            TIMEOUT 30
-            PASS_REGULAR_EXPRESSION
-                "mpi_report_request_lifetime_ok operations=58 labels=33 failures=116")
+            TIMEOUT 30)
 
     add_executable(test_mpi_teardown_guard
         report/test_mpi_teardown_guard.c
@@ -3073,6 +3092,116 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "my_sleep_func\\|"
     )
+    add_test(NAME test_heartbeat_create_failure_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(heartbeat thread creation failed\\)"
+                --stderr-extra-regex "my_sleep_func\\|[ ]+1001"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_heartbeat_create_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEST_FAIL_HEARTBEAT_CREATE=1;${PRELOAD_VAR}")
+    add_test(NAME test_heartbeat_setup_allocation_failure_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(heartbeat setup allocation failed\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_heartbeat_setup_allocation_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION=1;${PRELOAD_VAR}")
+    add_test(NAME test_exit_interposer_install_failure_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(exit interposer installation unavailable\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_exit_interposer_install_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_TEST_FAIL_EXIT_INTERPOSER_INSTALL=1;${PRELOAD_VAR}")
+    add_test(NAME test_memory_tracking_setup_failure_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(memory tracking setup failed before installation\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_tracking_setup_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MEMORY_TRACKING_SETUP=1;${PRELOAD_VAR}")
+    add_test(NAME test_report_allocation_failure_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(final report snapshot allocation failed\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_report_allocation_failure_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_TEST_FAIL_REPORT_ALLOCATION=1;${PRELOAD_VAR}")
+    add_test(NAME test_report_array_allocation_failures_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/test_report_array_failure_modes.py
+                --executable $<TARGET_FILE:test_heartbeat>
+                --preload ${PROJECT_BINARY_DIR}/src/libpeak.so)
+    set_tests_properties(test_report_array_allocation_failures_fail_open
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "report_array_failure_modes_ok modes=8")
+    add_test(NAME test_exit_interposer_explicit_exit_fails_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 37
+                --stderr-regex "disabling non-critical profiler subsystem \\(exit interposer installation unavailable\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                --stdout-regex "(?s)^explicit exit requested\\nexplicit exit atexit marker\\n$"
+                -- $<TARGET_FILE:test_explicit_exit>)
+    set_tests_properties(test_exit_interposer_explicit_exit_fails_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main;PEAK_TEST_FAIL_EXIT_INTERPOSER_INSTALL=1;${PRELOAD_VAR}")
+    add_test(NAME test_memory_interceptor_unrecoverable_rollback_is_strict
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 128
+                --stderr-regex "fatal memory interceptor rollback was not proven safe"
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_interceptor_unrecoverable_rollback_is_strict
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;PEAK_TEST_FAIL_MALLOC_ROLLBACK_FLUSH=1;${PRELOAD_VAR}")
+    add_test(NAME test_memory_interceptor_recoverable_rollback_fail_open
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "disabling non-critical profiler subsystem \\(memory interceptor installation rolled back safely\\)"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 1
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_interceptor_recoverable_rollback_fail_open
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;${PRELOAD_VAR}")
+    foreach(peak_rollback_failure_target malloc free)
+        add_test(NAME test_memory_interceptor_pre_main_worker_${peak_rollback_failure_target}
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                    --exit-code 0
+                    --stderr-regex "disabling non-critical profiler subsystem \\(memory interceptor installation rolled back safely\\)"
+                    --stderr-count-regex "disabling non-critical profiler subsystem"
+                    --stderr-count 1
+                    --stdout-regex "rollback worker done allocations=[1-9]"
+                    -- $<TARGET_FILE:test_malloc_rollback_worker>)
+        set_tests_properties(test_memory_interceptor_pre_main_worker_${peak_rollback_failure_target}
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=main;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=${peak_rollback_failure_target};PEAK_TEST_MALLOC_ROLLBACK_DELAY_US=50000;${PRELOAD_VAR}")
+    endforeach()
 
     # Add Cuda Test cases
     if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))

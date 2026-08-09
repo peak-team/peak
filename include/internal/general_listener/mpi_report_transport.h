@@ -45,8 +45,11 @@ typedef enum {
  * Peer-only instrumented slots with zero calls are not represented.
  */
 PeakMpiReportTransportResult peak_mpi_report_transport_reduce(
-    const PeakReportSnapshot* local,
+    PeakReportSnapshot* local,
     PeakReportSnapshot** root_aggregate);
+
+/** Coordinates report-capture readiness before entering reducer payloads. */
+bool peak_mpi_report_transport_preflight_report_ready(bool local_ready);
 
 /** Returns whether an MPI transport failure has poisoned this process. */
 bool peak_mpi_report_transport_failed_closed(void);
@@ -62,6 +65,12 @@ void peak_mpi_report_transport_reset_failed_closed(void);
 #ifdef PEAK_ENABLE_TEST_HOOKS
 /** Returns the number of active requests retained for process lifetime. */
 size_t peak_mpi_report_transport_quarantined_request_count(void);
+
+/** Fails one staged-report allocation after @p successful allocations. */
+void peak_mpi_report_transport_test_fail_allocation_after(int successful);
+
+/** Makes the next aggregate snapshot clone fail before payload reduction. */
+void peak_mpi_report_transport_test_fail_clone_once(void);
 #endif
 
 #ifdef __cplusplus

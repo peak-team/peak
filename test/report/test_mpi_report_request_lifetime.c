@@ -15,14 +15,15 @@ enum {
     TEST_COLLECTIVE_ALLREDUCE = 0,
     TEST_COLLECTIVE_REDUCE = 1,
     TEST_COLLECTIVE_BCAST = 2,
-    TEST_COLLECTIVE_COUNT = 58,
-    TEST_UNIQUE_LABEL_COUNT = 33,
+    TEST_COLLECTIVE_COUNT = 59,
+    TEST_UNIQUE_LABEL_COUNT = 34,
 };
 
 typedef enum {
     TEST_REQUEST_COMPLETE = 0,
     TEST_REQUEST_ERROR,
     TEST_REQUEST_TIMEOUT,
+    TEST_REQUEST_START_ERROR,
 } TestRequestMode;
 
 typedef struct {
@@ -47,6 +48,12 @@ static int fake_size = 1;
 static int fake_operation_count;
 static int fake_target_ordinal;
 static TestRequestMode fake_request_mode;
+static TestRequestMode fake_readiness_mode;
+static int fake_readiness_observed;
+static MPI_Request* fake_readiness_request;
+static int fake_readiness_start_calls;
+static int fake_mpi_setup_calls;
+static int fake_readiness_force_unready;
 static void* fake_target_send;
 static void* fake_target_receive;
 static MPI_Request* fake_target_request;
@@ -88,6 +95,12 @@ fake_reset(int target_ordinal, TestRequestMode mode, int rank, int size)
     fake_operation_count = 0;
     fake_target_ordinal = target_ordinal;
     fake_request_mode = mode;
+    fake_readiness_mode = TEST_REQUEST_COMPLETE;
+    fake_readiness_observed = 0;
+    fake_readiness_request = NULL;
+    fake_readiness_start_calls = 0;
+    fake_mpi_setup_calls = 0;
+    fake_readiness_force_unready = 0;
     fake_target_send = NULL;
     fake_target_receive = NULL;
     fake_target_request = NULL;
@@ -149,6 +162,7 @@ MPI_Init(int* argc, char*** argv)
 int
 MPI_Initialized(int* initialized)
 {
+    fake_mpi_setup_calls++;
     *initialized = 1;
     return MPI_SUCCESS;
 }
@@ -156,6 +170,7 @@ MPI_Initialized(int* initialized)
 int
 MPI_Comm_rank(MPI_Comm communicator, int* rank)
 {
+    fake_mpi_setup_calls++;
     (void)communicator;
     *rank = fake_rank;
     return MPI_SUCCESS;
@@ -164,6 +179,7 @@ MPI_Comm_rank(MPI_Comm communicator, int* rank)
 int
 MPI_Comm_size(MPI_Comm communicator, int* size)
 {
+    fake_mpi_setup_calls++;
     (void)communicator;
     *size = fake_size;
     return MPI_SUCCESS;
@@ -230,6 +246,25 @@ MPI_Iallreduce(const void* send_buffer,
                MPI_Comm communicator,
                MPI_Request* request)
 {
+    if (fake_readiness_observed) {
+        size_t bytes = fake_datatype_extent(datatype) * (size_t)count;
+
+        fake_readiness_observed = 0;
+        fake_readiness_start_calls++;
+        if (fake_readiness_mode == TEST_REQUEST_START_ERROR) {
+            return MPI_ERR_OTHER;
+        }
+        if (bytes != 0) {
+            memcpy(receive_buffer, send_buffer, bytes);
+        }
+        if (fake_readiness_force_unready) {
+            *(int*)receive_buffer = 0;
+        }
+        request->ordinal = 0;
+        request->active = 1;
+        fake_readiness_request = request;
+        return MPI_SUCCESS;
+    }
     (void)operation;
     (void)communicator;
     return fake_begin_collective(send_buffer,
@@ -238,6 +273,13 @@ MPI_Iallreduce(const void* send_buffer,
                                  datatype,
                                  request,
                                  true);
+}
+
+void
+peak_mpi_report_transport_test_observe_readiness(const char* label)
+{
+    (void)label;
+    fake_readiness_observed = 1;
 }
 
 int
@@ -283,6 +325,18 @@ int
 MPI_Test(MPI_Request* request, int* done, MPI_Status* status)
 {
     (void)status;
+    if (request == fake_readiness_request) {
+        if (fake_readiness_mode == TEST_REQUEST_ERROR) {
+            return MPI_ERR_OTHER;
+        }
+        if (fake_readiness_mode == TEST_REQUEST_TIMEOUT) {
+            *done = 0;
+            return MPI_SUCCESS;
+        }
+        request->active = 0;
+        *done = 1;
+        return MPI_SUCCESS;
+    }
     if (request->ordinal == fake_target_ordinal) {
         if (fake_request_mode == TEST_REQUEST_ERROR) {
             return MPI_ERR_OTHER;
@@ -406,16 +460,17 @@ validate_golden_trace(void)
     if (trace_count != TEST_COLLECTIVE_COUNT || trace_failures != 0) {
         failures++;
     }
-    EXPECT(1, "elapsed-valid", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MIN, -1);
-    EXPECT(2, "accounting-valid", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MIN, -1);
-    EXPECT(3, "hook-count-min", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MIN, -1);
-    EXPECT(4, "hook-count-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MAX, -1);
-    EXPECT(5, "duplicate-hook-name-check", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MAX, -1);
-    EXPECT(6, "hook-slot-min-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MIN, -1);
-    EXPECT(7, "hook-slot-max-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(8, "profile-control-ratio-maxloc", TEST_COLLECTIVE_REDUCE, 6, MPI_DOUBLE_INT, MPI_MAXLOC, 0);
-    for (int ordinal = 9; ordinal <= 38; ordinal++) {
-        int field = (ordinal - 9) % 5;
+    EXPECT(1, "degraded-mode-mask", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED, MPI_BOR, -1);
+    EXPECT(2, "elapsed-valid", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MIN, -1);
+    EXPECT(3, "accounting-valid", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MIN, -1);
+    EXPECT(4, "hook-count-min", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MIN, -1);
+    EXPECT(5, "hook-count-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MAX, -1);
+    EXPECT(6, "duplicate-hook-name-check", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MAX, -1);
+    EXPECT(7, "hook-slot-min-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MIN, -1);
+    EXPECT(8, "hook-slot-max-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(9, "profile-control-ratio-maxloc", TEST_COLLECTIVE_REDUCE, 6, MPI_DOUBLE_INT, MPI_MAXLOC, 0);
+    for (int ordinal = 10; ordinal <= 39; ordinal++) {
+        int field = (ordinal - 10) % 5;
         EXPECT(ordinal,
                bcast_labels[field],
                TEST_COLLECTIVE_BCAST,
@@ -424,26 +479,26 @@ validate_golden_trace(void)
                MPI_OP_NULL,
                0);
     }
-    EXPECT(39, "profile-seconds", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(40, "failed-stop-window-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(41, "failed-stop-window-count", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(42, "dropped-calls-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(43, "dropped-threads-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(44, "dropped-calls", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(45, "dropped-threads", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(46, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(47, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(48, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(49, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(50, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(51, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(52, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(53, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
-    EXPECT(54, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
-    EXPECT(55, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(56, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(57, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(58, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(40, "profile-seconds", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(41, "failed-stop-window-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(42, "failed-stop-window-count", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(43, "dropped-calls-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(44, "dropped-threads-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(45, "dropped-calls", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(46, "dropped-threads", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(47, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(48, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(49, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(50, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(51, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(52, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(53, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(54, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
+    EXPECT(55, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
+    EXPECT(56, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(57, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(58, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(59, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
 
 #undef EXPECT
 
@@ -586,6 +641,123 @@ run_failure_child(int ordinal, TestRequestMode mode)
     return 0;
 }
 
+static int
+run_staged_allocation_failure_case(int successful_allocations)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failed = 0;
+
+    fake_reset(0, TEST_REQUEST_ERROR, 0, 1);
+    peak_mpi_report_transport_test_fail_allocation_after(successful_allocations);
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    failed = result != PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK ||
+             aggregate != NULL ||
+             peak_mpi_report_transport_failed_closed() ||
+             fake_operation_count != 0 || trace_count != 0;
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    peak_mpi_report_transport_test_fail_allocation_after(-1);
+    return failed;
+}
+
+static int
+run_late_allocation_failure_case(int successful_allocations, int fail_clone)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failed;
+
+    fake_reset(0, TEST_REQUEST_ERROR, 0, 1);
+    peak_mpi_report_transport_test_fail_allocation_after(successful_allocations);
+    if (fail_clone) {
+        peak_mpi_report_transport_test_fail_clone_once();
+    }
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    failed = result != PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK ||
+             aggregate != NULL || peak_mpi_report_transport_failed_closed();
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    peak_mpi_report_transport_test_fail_allocation_after(-1);
+    return failed;
+}
+
+static int
+run_readiness_failure_case(TestRequestMode mode)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failed;
+    int setup_calls_before_retry;
+    int readiness_starts_before_retry;
+
+    fake_reset(0, TEST_REQUEST_COMPLETE, 0, 1);
+    fake_readiness_mode = mode;
+    (void)setenv("PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS", "1", 1);
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    failed = result != PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED ||
+             aggregate != NULL || !peak_mpi_report_transport_failed_closed() ||
+             peak_mpi_report_transport_quarantined_request_count() != 1 ||
+             fake_operation_count != 0 || trace_count != 0 ||
+             fake_readiness_start_calls != 1 ||
+             (mode != TEST_REQUEST_START_ERROR &&
+              (fake_readiness_request == NULL ||
+               !fake_readiness_request->active));
+    setup_calls_before_retry = fake_mpi_setup_calls;
+    readiness_starts_before_retry = fake_readiness_start_calls;
+    if (peak_mpi_report_transport_preflight_report_ready(true) ||
+        fake_mpi_setup_calls != setup_calls_before_retry ||
+        fake_readiness_start_calls != readiness_starts_before_retry) {
+        failed = 1;
+    }
+    peak_report_snapshot_destroy(local);
+    return failed;
+}
+
+static int
+run_peer_not_ready_case(void)
+{
+    int failed;
+
+    fake_reset(0, TEST_REQUEST_COMPLETE, 0, 2);
+    fake_readiness_force_unready = 1;
+    failed = peak_mpi_report_transport_preflight_report_ready(true) ||
+             peak_mpi_report_transport_failed_closed() ||
+             fake_operation_count != 0 || trace_count != 0 ||
+             fake_readiness_start_calls != 1;
+    return failed;
+}
+
+static int
+run_readiness_failure_child(TestRequestMode mode)
+{
+    pid_t child = fork();
+    int status;
+
+    if (child < 0) return 1;
+    if (child == 0) {
+        _exit(run_readiness_failure_case(mode) == 0 ? EXIT_SUCCESS
+                                                    : EXIT_FAILURE);
+    }
+    return waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+           WEXITSTATUS(status) != EXIT_SUCCESS;
+}
+
 int
 main(void)
 {
@@ -594,6 +766,19 @@ main(void)
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     failures += run_success_case(0, 1);
     failures += run_success_case(1, 2);
+    /* pending struct, staged send buffer, and staged receive buffer each
+     * coordinate local fallback before any payload collective is issued. */
+    failures += run_staged_allocation_failure_case(0);
+    failures += run_staged_allocation_failure_case(1);
+    failures += run_staged_allocation_failure_case(2);
+    /* The three identity buffers and clone both stop before their next
+     * payload collective and return the same local-fallback outcome. */
+    failures += run_late_allocation_failure_case(15, 0);
+    failures += run_late_allocation_failure_case(-1, 1);
+    failures += run_peer_not_ready_case();
+    failures += run_readiness_failure_child(TEST_REQUEST_START_ERROR);
+    failures += run_readiness_failure_child(TEST_REQUEST_ERROR);
+    failures += run_readiness_failure_child(TEST_REQUEST_TIMEOUT);
     for (int ordinal = 1; ordinal <= TEST_COLLECTIVE_COUNT; ordinal++) {
         failures += run_failure_child(ordinal, TEST_REQUEST_ERROR);
         failures += run_failure_child(ordinal, TEST_REQUEST_TIMEOUT);
@@ -604,6 +789,6 @@ main(void)
                 failures);
         return EXIT_FAILURE;
     }
-    puts("mpi_report_request_lifetime_ok operations=58 labels=33 failures=116");
+    puts("mpi_report_request_lifetime_ok operations=59 labels=34 failures=118");
     return EXIT_SUCCESS;
 }

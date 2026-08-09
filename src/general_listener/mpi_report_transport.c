@@ -67,14 +67,45 @@ typedef enum {
     PEAK_MPI_TRANSPORT_HARD_POISONED,
 } PeakMpiTransportState;
 
+typedef enum {
+    PEAK_MPI_READINESS_IDLE = 0,
+    PEAK_MPI_READINESS_ACTIVE,
+    PEAK_MPI_READINESS_ABANDONED,
+} PeakMpiReadinessState;
+
+typedef enum {
+    PEAK_MPI_READINESS_ALL_READY = 0,
+    PEAK_MPI_READINESS_LOCAL_FALLBACK,
+    PEAK_MPI_READINESS_FAILED_CLOSED,
+} PeakMpiReadinessResult;
+
+typedef struct {
+    MPI_Request request;
+    int send_ready;
+    int receive_ready;
+    _Atomic int state;
+} PeakMpiReadinessAgreement;
+
 static _Atomic int peak_mpi_report_transport_state =
     PEAK_MPI_TRANSPORT_HEALTHY;
 static _Atomic(PeakMpiPendingCollective*)
     peak_mpi_report_transport_quarantine = NULL;
 static _Atomic size_t peak_mpi_report_transport_quarantine_count = 0;
+/* No heap is available when this agreement reports an allocation failure. */
+static PeakMpiReadinessAgreement peak_mpi_report_transport_readiness = {
+    .request = MPI_REQUEST_NULL,
+    .state = ATOMIC_VAR_INIT(PEAK_MPI_READINESS_IDLE),
+};
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_mpi_report_transport_test_allocation_countdown = -1;
+static _Atomic int peak_mpi_report_transport_test_fail_clone = 0;
+#endif
 
 static void*
 peak_mpi_report_transport_allocate(size_t count, size_t element_size);
+static PeakMpiReadinessResult
+peak_mpi_report_transport_all_ranks_ready(int local_ready,
+                                          const char* label);
 
 #if defined(PEAK_ENABLE_TEST_HOOKS) && \
     (defined(__GNUC__) || defined(__clang__))
@@ -90,6 +121,8 @@ extern void peak_mpi_report_transport_test_observe_collective(
     const void* staged_send,
     void* staged_receive,
     size_t buffer_size) __attribute__((weak));
+extern void peak_mpi_report_transport_test_observe_readiness(
+    const char* label) __attribute__((weak));
 #endif
 
 static void
@@ -138,8 +171,31 @@ peak_mpi_report_transport_reset_failed_closed(void)
 size_t
 peak_mpi_report_transport_quarantined_request_count(void)
 {
-    return atomic_load_explicit(&peak_mpi_report_transport_quarantine_count,
-                                memory_order_acquire);
+    size_t count = atomic_load_explicit(
+        &peak_mpi_report_transport_quarantine_count, memory_order_acquire);
+
+    if (atomic_load_explicit(&peak_mpi_report_transport_readiness.state,
+                             memory_order_acquire) ==
+        PEAK_MPI_READINESS_ABANDONED) {
+        count++;
+    }
+    return count;
+}
+
+void
+peak_mpi_report_transport_test_fail_allocation_after(int successful)
+{
+    atomic_store_explicit(&peak_mpi_report_transport_test_allocation_countdown,
+                          successful,
+                          memory_order_release);
+}
+
+void
+peak_mpi_report_transport_test_fail_clone_once(void)
+{
+    atomic_store_explicit(&peak_mpi_report_transport_test_fail_clone,
+                          1,
+                          memory_order_release);
 }
 #endif
 
@@ -225,17 +281,29 @@ peak_mpi_pending_collective_create(size_t buffer_size,
     PeakMpiPendingCollective* pending =
         peak_mpi_report_transport_allocate(1, sizeof(*pending));
 
+    if (pending == NULL) {
+        return NULL;
+    }
     pending->request = MPI_REQUEST_NULL;
     pending->buffer_size = buffer_size;
     if (send_source != NULL) {
         pending->send_buffer =
             peak_mpi_report_transport_allocate(buffer_size, 1);
+        if (pending->send_buffer == NULL) {
+            free(pending);
+            return NULL;
+        }
         if (buffer_size != 0) {
             memcpy(pending->send_buffer, send_source, buffer_size);
         }
     }
     pending->receive_buffer =
         peak_mpi_report_transport_allocate(buffer_size, 1);
+    if (pending->receive_buffer == NULL) {
+        free(pending->send_buffer);
+        free(pending);
+        return NULL;
+    }
     if (receive_source != NULL && buffer_size != 0) {
         memcpy(pending->receive_buffer, receive_source, buffer_size);
     }
@@ -384,6 +452,12 @@ peak_mpi_allreduce_checked(const void* sendbuf,
         return false;
     }
     pending = peak_mpi_pending_collective_create(buffer_size, sendbuf, NULL);
+    if (peak_mpi_report_transport_all_ranks_ready(
+            pending != NULL, "allreduce-staging-allocation") !=
+        PEAK_MPI_READINESS_ALL_READY) {
+        peak_mpi_pending_collective_destroy(pending);
+        return false;
+    }
     peak_mpi_observe_collective(label,
                                 PEAK_MPI_COLLECTIVE_ALLREDUCE,
                                 count,
@@ -453,6 +527,12 @@ peak_mpi_reduce_checked(const void* sendbuf,
         return false;
     }
     pending = peak_mpi_pending_collective_create(buffer_size, sendbuf, NULL);
+    if (peak_mpi_report_transport_all_ranks_ready(
+            pending != NULL, "reduce-staging-allocation") !=
+        PEAK_MPI_READINESS_ALL_READY) {
+        peak_mpi_pending_collective_destroy(pending);
+        return false;
+    }
     peak_mpi_observe_collective(label,
                                 PEAK_MPI_COLLECTIVE_REDUCE,
                                 count,
@@ -520,6 +600,12 @@ peak_mpi_bcast_checked(void* buffer,
         return false;
     }
     pending = peak_mpi_pending_collective_create(buffer_size, NULL, buffer);
+    if (peak_mpi_report_transport_all_ranks_ready(
+            pending != NULL, "bcast-staging-allocation") !=
+        PEAK_MPI_READINESS_ALL_READY) {
+        peak_mpi_pending_collective_destroy(pending);
+        return false;
+    }
     peak_mpi_observe_collective(label,
                                 PEAK_MPI_COLLECTIVE_BCAST,
                                 count,
@@ -738,13 +824,121 @@ peak_mpi_report_transport_initialize(int* rank, int* size)
 static void*
 peak_mpi_report_transport_allocate(size_t count, size_t element_size)
 {
-    void* allocation = calloc(count == 0 ? 1 : count, element_size);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    int remaining = atomic_load_explicit(
+        &peak_mpi_report_transport_test_allocation_countdown,
+        memory_order_acquire);
 
-    if (allocation == NULL) {
-        peak_log_warn("[peak] MPI report aggregation ran out of memory\n");
-        abort();
+    while (remaining >= 0) {
+        if (remaining == 0) {
+            return NULL;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &peak_mpi_report_transport_test_allocation_countdown,
+                &remaining,
+                remaining - 1,
+                memory_order_acq_rel,
+                memory_order_acquire)) {
+            break;
+        }
     }
+#endif
+    void* allocation = calloc(count == 0 ? 1 : count, element_size);
     return allocation;
+}
+
+/*
+ * Every rank must agree on an allocation failure before any following payload
+ * collective.  A local early return here would leave peers entering a later
+ * allreduce/reduce and deadlock the job.  This is still pre-mutation: no
+ * report payload collective has consumed the temporary buffers.
+ */
+static PeakMpiReadinessResult
+peak_mpi_report_transport_all_ranks_ready(int local_ready,
+                                          const char* label)
+{
+    PeakMpiReadinessAgreement* agreement =
+        &peak_mpi_report_transport_readiness;
+    int expected = PEAK_MPI_READINESS_IDLE;
+    int done = 0;
+    int mpi_result;
+    MPI_Status status;
+    unsigned int timeout_ms = peak_mpi_output_collective_timeout_ms();
+    double deadline;
+
+    if (!atomic_compare_exchange_strong_explicit(&agreement->state,
+                                                  &expected,
+                                                  PEAK_MPI_READINESS_ACTIVE,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        peak_log_warn("[peak] overlapping or abandoned MPI allocation agreement for %s; abandoning MPI reducer without touching MPI again\n",
+                      label);
+        peak_mpi_report_transport_mark_hard_failed_closed();
+        return PEAK_MPI_READINESS_FAILED_CLOSED;
+    }
+    agreement->send_ready = local_ready;
+    agreement->receive_ready = 0;
+#if defined(PEAK_ENABLE_TEST_HOOKS) && \
+    (defined(__GNUC__) || defined(__clang__))
+    if (peak_mpi_report_transport_test_observe_readiness != NULL) {
+        peak_mpi_report_transport_test_observe_readiness(label);
+    }
+#endif
+    mpi_result = MPI_Iallreduce(&agreement->send_ready,
+                                &agreement->receive_ready,
+                                1,
+                                MPI_INT,
+                                MPI_MIN,
+                                MPI_COMM_WORLD,
+                                &agreement->request);
+    if (mpi_result != MPI_SUCCESS) {
+        peak_log_warn("[peak] MPI allocation agreement start failed for %s; abandoning MPI reducer without touching MPI again\n",
+                      label);
+        peak_mpi_report_transport_mark_hard_failed_closed();
+        atomic_store_explicit(&agreement->state,
+                              PEAK_MPI_READINESS_ABANDONED,
+                              memory_order_release);
+        return PEAK_MPI_READINESS_FAILED_CLOSED;
+    }
+    deadline = peak_second() + (double)timeout_ms / 1000.0;
+    while (!done) {
+        mpi_result = MPI_Test(&agreement->request, &done, &status);
+        if (mpi_result != MPI_SUCCESS) {
+            peak_log_warn("[peak] MPI allocation agreement failed for %s; abandoning MPI reducer without touching MPI again\n",
+                          label);
+            peak_mpi_report_transport_mark_hard_failed_closed();
+            atomic_store_explicit(&agreement->state,
+                                  PEAK_MPI_READINESS_ABANDONED,
+                                  memory_order_release);
+            return PEAK_MPI_READINESS_FAILED_CLOSED;
+        }
+        if (!done && peak_second() >= deadline) {
+            peak_log_warn("[peak] MPI allocation agreement timed out after %u ms for %s; abandoning MPI reducer without touching MPI again\n",
+                          timeout_ms,
+                          label);
+            peak_mpi_report_transport_mark_hard_failed_closed();
+            atomic_store_explicit(&agreement->state,
+                                  PEAK_MPI_READINESS_ABANDONED,
+                                  memory_order_release);
+            return PEAK_MPI_READINESS_FAILED_CLOSED;
+        }
+        if (!done) {
+            sched_yield();
+        }
+    }
+    agreement->request = MPI_REQUEST_NULL;
+    atomic_store_explicit(&agreement->state,
+                          PEAK_MPI_READINESS_IDLE,
+                          memory_order_release);
+    if (!agreement->receive_ready) {
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_REPORT,
+            strcmp(label, "local-report-snapshot-allocation") == 0
+                ? "final report snapshot allocation failed on at least one MPI rank"
+                : "MPI report staging allocation failed");
+        return PEAK_MPI_READINESS_LOCAL_FALLBACK;
+    }
+    return PEAK_MPI_READINESS_ALL_READY;
 }
 
 static PeakMpiReportTransportResult
@@ -753,6 +947,14 @@ peak_mpi_report_transport_collective_failure(void)
     return peak_mpi_report_transport_failed_closed()
                ? PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED
                : PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK;
+}
+
+static void
+peak_mpi_report_transport_refresh_degraded_metadata(PeakReportSnapshot* local)
+{
+    if (local != NULL) {
+        local->degraded_mask |= peak_report_snapshot_degraded_mask();
+    }
 }
 
 static void
@@ -802,7 +1004,7 @@ peak_mpi_report_transport_set_overhead(
 }
 
 PeakMpiReportTransportResult
-peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
+peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
                                  PeakReportSnapshot** root_aggregate)
 {
     int rank = 0;
@@ -831,6 +1033,8 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
     unsigned long max_hook_count = 0;
     int local_duplicate_names;
     int any_duplicate_names = 0;
+    unsigned int local_degraded_mask;
+    unsigned int aggregate_degraded_mask = 0;
     uint64_t* slot_hashes;
     uint64_t* min_slot_hashes;
     uint64_t* max_slot_hashes;
@@ -848,6 +1052,17 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
         return PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED;
     }
     if (!peak_mpi_report_transport_initialize(&rank, &size)) {
+        return peak_mpi_report_transport_collective_failure();
+    }
+
+    local_degraded_mask = local->degraded_mask;
+    if (!peak_mpi_allreduce_checked(&local_degraded_mask,
+                                    &aggregate_degraded_mask,
+                                    1,
+                                    MPI_UNSIGNED,
+                                    MPI_BOR,
+                                    "degraded-mode-mask")) {
+        peak_mpi_report_transport_refresh_degraded_metadata(local);
         return peak_mpi_report_transport_collective_failure();
     }
 
@@ -934,6 +1149,18 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
         local->hook_count, sizeof(*min_slot_hashes));
     max_slot_hashes = peak_mpi_report_transport_allocate(
         local->hook_count, sizeof(*max_slot_hashes));
+    if (peak_mpi_report_transport_all_ranks_ready(
+            slot_hashes != NULL && min_slot_hashes != NULL &&
+                max_slot_hashes != NULL,
+                                    "hook-slot-buffer-allocation") != PEAK_MPI_READINESS_ALL_READY) {
+        peak_mpi_report_transport_refresh_degraded_metadata(local);
+        free(max_slot_hashes);
+        free(min_slot_hashes);
+        free(slot_hashes);
+        return peak_mpi_report_transport_failed_closed()
+                   ? PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED
+                   : PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK;
+    }
     for (size_t i = 0; i < local->hook_count; i++) {
         slot_hashes[i] = peak_report_snapshot_slot_identity_hash(local, i);
     }
@@ -1060,10 +1287,22 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
         return peak_mpi_report_transport_collective_failure();
     }
 
-    aggregate = peak_report_snapshot_clone(local);
-    if (aggregate == NULL) {
-        peak_log_warn("[peak] MPI report aggregation ran out of memory\n");
-        abort();
+    aggregate =
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_exchange_explicit(&peak_mpi_report_transport_test_fail_clone,
+                                 0,
+                                 memory_order_acq_rel) != 0 ?
+            NULL :
+#endif
+        peak_report_snapshot_clone(local);
+    if (peak_mpi_report_transport_all_ranks_ready(
+            aggregate != NULL,
+                                    "aggregate-snapshot-allocation") != PEAK_MPI_READINESS_ALL_READY) {
+        peak_mpi_report_transport_refresh_degraded_metadata(local);
+        peak_report_snapshot_destroy(aggregate);
+        return peak_mpi_report_transport_failed_closed()
+                   ? PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED
+                   : PEAK_MPI_REPORT_TRANSPORT_LOCAL_FALLBACK;
     }
     if (!peak_mpi_reduce_checked(local->num_calls,
                                  aggregate->num_calls,
@@ -1168,6 +1407,7 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
     aggregate->rank_count = size;
     aggregate->dropped_calls = mpi_dropped_calls;
     aggregate->dropped_threads = mpi_dropped_threads;
+    aggregate->degraded_mask = aggregate_degraded_mask;
     peak_mpi_report_transport_set_overhead(
         aggregate,
         all_accounting_valid != 0,
@@ -1179,6 +1419,27 @@ peak_mpi_report_transport_reduce(const PeakReportSnapshot* local,
         mpi_profile_seconds);
     *root_aggregate = aggregate;
     return PEAK_MPI_REPORT_TRANSPORT_ROOT_READY;
+}
+
+bool
+peak_mpi_report_transport_preflight_report_ready(bool local_ready)
+{
+    int rank;
+    int size;
+    PeakMpiReadinessResult result =
+        PEAK_MPI_READINESS_FAILED_CLOSED;
+
+    if (peak_mpi_report_transport_failed_closed()) {
+        return false;
+    }
+    if (peak_mpi_report_transport_initialize(&rank, &size)) {
+        result = peak_mpi_report_transport_all_ranks_ready(
+            local_ready ? 1 : 0, "local-report-snapshot-allocation");
+    }
+    (void)rank;
+    (void)size;
+
+    return result == PEAK_MPI_READINESS_ALL_READY;
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS

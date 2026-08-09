@@ -428,6 +428,58 @@ static gboolean str_equal_function_general(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_test_report_array_allocation_remaining = INT_MIN;
+
+static gboolean
+peak_general_listener_test_fail_report_array_allocation(void)
+{
+    int remaining = atomic_load_explicit(
+        &peak_test_report_array_allocation_remaining, memory_order_acquire);
+
+    if (remaining == INT_MIN) {
+        const char* configured = g_getenv(
+            "PEAK_TEST_FAIL_REPORT_ARRAY_ALLOCATION_AFTER");
+        char* end = NULL;
+        long parsed = configured != NULL ? strtol(configured, &end, 10) : -1;
+
+        if (configured == NULL || end == configured || *end != '\0' ||
+            parsed < 0 || parsed > INT_MAX) {
+            parsed = -1;
+        }
+        atomic_store_explicit(&peak_test_report_array_allocation_remaining,
+                              (int)parsed,
+                              memory_order_release);
+        remaining = (int)parsed;
+    }
+    while (remaining >= 0) {
+        if (remaining == 0) {
+            return TRUE;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &peak_test_report_array_allocation_remaining,
+                &remaining,
+                remaining - 1,
+                memory_order_acq_rel,
+                memory_order_acquire)) {
+            return FALSE;
+        }
+    }
+    return FALSE;
+}
+#endif
+
+static void*
+peak_general_listener_try_report_array(size_t count, size_t element_size)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_general_listener_test_fail_report_array_allocation()) {
+        return NULL;
+    }
+#endif
+    return g_try_malloc0_n(count, element_size);
+}
+
 static gboolean
 peak_env_truthy_general(const char* value)
 {
@@ -8333,6 +8385,8 @@ peak_general_listener_print_with_mpi_job_policy(
 {
     gboolean used_mpi_aggregation = FALSE;
     gboolean write_succeeded = FALSE;
+    gboolean report_capture_ready;
+    gboolean skip_report_output = FALSE;
     PeakReportSnapshot* local_snapshot = NULL;
 
     if (report_write_succeeded != NULL) {
@@ -8347,15 +8401,37 @@ peak_general_listener_print_with_mpi_job_policy(
         gum_interceptor_ignore_current_thread(interceptor);
     }
 
-    gulong* sum_num_calls = g_new0(gulong, peak_hook_address_count);
-    gdouble* sum_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* max_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* min_total_time = g_new0(gdouble, peak_hook_address_count);
-    gdouble* sum_exclusive_time = g_new0(gdouble, peak_hook_address_count);
-    gfloat* sum_max_time = g_new0(gfloat, peak_hook_address_count);
-    gfloat* sum_min_time = g_new0(gfloat, peak_hook_address_count);
-    gulong* thread_count = g_new0(gulong, peak_hook_address_count);
-    for (size_t i = 0; i < peak_hook_address_count; i++) {
+    gulong* sum_num_calls = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*sum_num_calls));
+    gdouble* sum_total_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*sum_total_time));
+    gdouble* max_total_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*max_total_time));
+    gdouble* min_total_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*min_total_time));
+    gdouble* sum_exclusive_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*sum_exclusive_time));
+    gfloat* sum_max_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*sum_max_time));
+    gfloat* sum_min_time = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*sum_min_time));
+    gulong* thread_count = peak_general_listener_try_report_array(
+        peak_hook_address_count, sizeof(*thread_count));
+
+    report_capture_ready = !(peak_hook_address_count != 0 &&
+        (sum_num_calls == NULL || sum_total_time == NULL ||
+         max_total_time == NULL || min_total_time == NULL ||
+         sum_exclusive_time == NULL || sum_max_time == NULL ||
+         sum_min_time == NULL || thread_count == NULL));
+    if (!report_capture_ready) {
+        /* Nothing has been detached or otherwise mutated for report capture. */
+#ifdef HAVE_MPI
+        if (aggregation_mode != PEAK_OUTPUT_AGGREGATION_MPI)
+#endif
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
+                                           "final report allocation failed");
+    }
+    for (size_t i = 0; report_capture_ready && i < peak_hook_address_count; i++) {
         if (hook_address[i]) {
             PeakGeneralListener* pg_listener =
                 PEAKGENERAL_LISTENER(array_listener[i]);
@@ -8411,29 +8487,56 @@ peak_general_listener_print_with_mpi_job_policy(
             }
         }
     }
-    peak_general_listener_refresh_revisited_markers(sum_num_calls);
+    if (report_capture_ready) {
+        peak_general_listener_refresh_revisited_markers(sum_num_calls);
+    }
 
-    PeakReportOverhead local_report =
-        peak_general_listener_local_report_overhead(sum_num_calls);
-    peak_report_snapshot_set_transport_overhead(&local_report);
-    local_snapshot = peak_general_listener_build_report_snapshot(
-        sum_num_calls,
-        sum_total_time,
-        max_total_time,
-        min_total_time,
-        sum_exclusive_time,
-        sum_max_time,
-        sum_min_time,
-        thread_count,
-        1,
-        &local_report);
+    if (report_capture_ready) {
+        PeakReportOverhead local_report =
+            peak_general_listener_local_report_overhead(sum_num_calls);
+        peak_report_snapshot_set_transport_overhead(&local_report);
+        local_snapshot = peak_general_listener_build_report_snapshot(
+            sum_num_calls,
+            sum_total_time,
+            max_total_time,
+            min_total_time,
+            sum_exclusive_time,
+            sum_max_time,
+            sum_min_time,
+            thread_count,
+            1,
+            &local_report);
+        report_capture_ready = local_snapshot != NULL;
+    }
 
-    if (local_snapshot != NULL) {
+#ifdef HAVE_MPI
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
+        !peak_mpi_report_transport_preflight_report_ready(
+            report_capture_ready)) {
+        if (local_snapshot != NULL) {
+            local_snapshot->degraded_mask |=
+                peak_report_snapshot_degraded_mask();
+            write_succeeded = peak_general_listener_write_report(
+                local_snapshot, TRUE, TRUE, active_mpi_job);
+        }
+        /* All ranks have completed the preflight agreement.  Do not enter a
+         * payload collective after an allocation failure or a poisoned MPI
+         * request, but retain any local report that was safely captured. */
+        skip_report_output = TRUE;
+    }
+#endif
+    if (local_snapshot != NULL && !skip_report_output) {
 #ifdef HAVE_MPI
         if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local_snapshot, &aggregate);
+
+            /* The reducer can discover an allocation/transport failure after
+             * this rank captured its snapshot.  Local fallback must carry the
+             * latest process-wide degradation metadata, not a stale copy. */
+            local_snapshot->degraded_mask |=
+                peak_report_snapshot_degraded_mask();
 
             if (result == PEAK_MPI_REPORT_TRANSPORT_ROOT_READY) {
                 PeakReportMarkerSwap marker_swap =
@@ -8490,6 +8593,13 @@ peak_general_listener_print_with_mpi_job_policy(
         write_succeeded = peak_general_listener_write_report(
             local_snapshot, TRUE, TRUE, active_mpi_job);
 #endif
+    } else if (local_snapshot == NULL) {
+        /* Report capture owns no listener mutation and may be abandoned. */
+#ifdef HAVE_MPI
+        if (aggregation_mode != PEAK_OUTPUT_AGGREGATION_MPI)
+#endif
+        peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
+                                           "final report snapshot allocation failed");
     }
 
     peak_report_snapshot_destroy(local_snapshot);

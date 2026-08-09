@@ -1,9 +1,100 @@
 #include "internal/general_listener/report_snapshot.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static PeakReportOverhead peak_report_snapshot_transport_overhead;
+static _Atomic uint32_t peak_report_snapshot_degraded = 0;
+static _Atomic uint32_t peak_report_snapshot_warned = 0;
+
+typedef struct {
+    uint32_t mask;
+    const char* name;
+} PeakReportDegradedReason;
+
+static const PeakReportDegradedReason peak_report_degraded_reasons[] = {
+    { PEAK_PROFILER_DEGRADED_HEARTBEAT, "heartbeat" },
+    { PEAK_PROFILER_DEGRADED_REPORT, "report-allocation" },
+    { PEAK_PROFILER_DEGRADED_MEMORY_TRACKING, "memory-tracking" },
+    { PEAK_PROFILER_DEGRADED_EXIT_INTERPOSER, "exit-interposer" },
+};
+
+void
+peak_report_snapshot_note_degraded(uint32_t mask, const char* reason)
+{
+    uint32_t previous;
+
+    if (mask == PEAK_PROFILER_DEGRADED_NONE) {
+        return;
+    }
+    previous = atomic_fetch_or_explicit(&peak_report_snapshot_degraded,
+                                        mask,
+                                        memory_order_acq_rel);
+    if ((previous & mask) != mask &&
+        (atomic_fetch_or_explicit(&peak_report_snapshot_warned,
+                                  mask,
+                                  memory_order_acq_rel) & mask) != mask) {
+        fprintf(stderr, "[peak] disabling non-critical profiler subsystem (%s)\n",
+                reason != NULL ? reason : "unknown");
+    }
+}
+
+uint32_t
+peak_report_snapshot_degraded_mask(void)
+{
+    return atomic_load_explicit(&peak_report_snapshot_degraded,
+                                memory_order_acquire);
+}
+
+void
+peak_report_snapshot_format_degraded_reasons(char* buffer, size_t buffer_size)
+{
+    peak_report_snapshot_format_degraded_mask(
+        peak_report_snapshot_degraded_mask(), buffer, buffer_size);
+}
+
+void
+peak_report_snapshot_format_degraded_mask(uint32_t mask,
+                                          char* buffer,
+                                          size_t buffer_size)
+{
+    size_t used = 0;
+
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    for (size_t i = 0;
+         i < sizeof(peak_report_degraded_reasons) /
+                 sizeof(peak_report_degraded_reasons[0]);
+         i++) {
+        const char* name;
+        size_t length;
+
+        if ((mask & peak_report_degraded_reasons[i].mask) == 0) {
+            continue;
+        }
+        name = peak_report_degraded_reasons[i].name;
+        length = strlen(name);
+        if (used != 0) {
+            if (used + 1 >= buffer_size) {
+                break;
+            }
+            buffer[used++] = ',';
+        }
+        if (length >= buffer_size - used) {
+            length = buffer_size - used - 1;
+        }
+        memcpy(buffer + used, name, length);
+        used += length;
+        buffer[used] = '\0';
+        if (used + 1 >= buffer_size) {
+            break;
+        }
+    }
+}
 
 static char*
 peak_report_snapshot_duplicate_string(const char* source)
@@ -60,6 +151,11 @@ peak_report_snapshot_allocate_arrays(PeakReportSnapshot* snapshot)
 PeakReportSnapshot*
 peak_report_snapshot_create(size_t hook_count)
 {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_FAIL_REPORT_ALLOCATION") != NULL) {
+        return NULL;
+    }
+#endif
     PeakReportSnapshot* snapshot = calloc(1, sizeof(*snapshot));
 
     if (snapshot == NULL) {
@@ -67,6 +163,7 @@ peak_report_snapshot_create(size_t hook_count)
     }
     snapshot->hook_count = hook_count;
     snapshot->rank_count = 1;
+    snapshot->degraded_mask = peak_report_snapshot_degraded_mask();
     if (!peak_report_snapshot_allocate_arrays(snapshot)) {
         peak_report_snapshot_destroy(snapshot);
         return NULL;
@@ -162,6 +259,7 @@ peak_report_snapshot_clone(
     copy->overhead_per_call = source->overhead_per_call;
     copy->dropped_calls = source->dropped_calls;
     copy->dropped_threads = source->dropped_threads;
+    copy->degraded_mask = source->degraded_mask;
     copy->rank_count = source->rank_count;
     copy->overhead = source->overhead;
     return copy;
