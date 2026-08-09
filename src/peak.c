@@ -2,12 +2,14 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef HAVE_MPI
 #include <mpi.h>
@@ -128,6 +130,15 @@ static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
 #define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
 #define PEAK_EXEC_CHECKPOINT_GATE_READERS \
     (PEAK_EXEC_CHECKPOINT_GATE_CLOSING - 1U)
+/* Exec checkpoints are best-effort.  Do not let a canceled checkpoint reader
+ * delay the application's normal exit indefinitely. */
+#define PEAK_EXEC_CHECKPOINT_FINI_WAIT_TIMEOUT_MS 5000L
+static pthread_mutex_t peak_exec_checkpoint_gate_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t peak_exec_checkpoint_gate_cond;
+static pthread_once_t peak_exec_checkpoint_gate_cond_once = PTHREAD_ONCE_INIT;
+static _Atomic int peak_exec_checkpoint_gate_cond_ready = 0;
+static _Atomic int peak_exec_checkpoint_fini_skip_warning_emitted = 0;
 typedef enum {
     PEAK_FINI_NOT_STARTED = 0,
     PEAK_FINI_IN_PROGRESS = 1,
@@ -193,6 +204,8 @@ static _Atomic int peak_test_checkpoint_reader_pause = 0;
 static _Atomic int peak_test_checkpoint_reader_held = 0;
 static _Atomic int peak_test_checkpoint_reader_released = 0;
 static _Atomic int peak_test_fini_waiting_for_reader = 0;
+static _Atomic int peak_test_fini_checkpoint_wait_count = 0;
+static _Atomic int peak_test_fini_checkpoint_timeout_observed = 0;
 static _Atomic int peak_test_activation_pause = 0;
 static _Atomic int peak_test_activation_held = 0;
 static _Atomic int peak_test_activation_released = 0;
@@ -226,6 +239,12 @@ peak_test_checkpoint_reader_pause_enable(void)
     atomic_store_explicit(&peak_test_fini_waiting_for_reader,
                           0,
                           memory_order_release);
+    atomic_store_explicit(&peak_test_fini_checkpoint_wait_count,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_fini_checkpoint_timeout_observed,
+                          0,
+                          memory_order_release);
     atomic_store_explicit(&peak_test_checkpoint_reader_pause,
                           1,
                           memory_order_release);
@@ -250,6 +269,20 @@ PEAK_EXEC_API int
 peak_test_fini_waiting_for_checkpoint_reader(void)
 {
     return atomic_load_explicit(&peak_test_fini_waiting_for_reader,
+                                memory_order_acquire);
+}
+
+PEAK_EXEC_API int
+peak_test_fini_checkpoint_reader_wait_count(void)
+{
+    return atomic_load_explicit(&peak_test_fini_checkpoint_wait_count,
+                                memory_order_acquire);
+}
+
+PEAK_EXEC_API int
+peak_test_fini_checkpoint_reader_timeout_observed(void)
+{
+    return atomic_load_explicit(&peak_test_fini_checkpoint_timeout_observed,
                                 memory_order_acquire);
 }
 
@@ -320,6 +353,131 @@ peak_test_activation_pause_before_claim(void)
 }
 #endif
 
+static void
+peak_exec_checkpoint_gate_cond_initialize(void)
+{
+#if defined(__linux__)
+    pthread_condattr_t attr;
+#endif
+    int status;
+
+#if defined(__linux__)
+    if (pthread_condattr_init(&attr) != 0) {
+        return;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&peak_exec_checkpoint_gate_cond, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+#else
+    status = pthread_cond_init(&peak_exec_checkpoint_gate_cond, NULL);
+#endif
+    if (status == 0) {
+        atomic_store_explicit(&peak_exec_checkpoint_gate_cond_ready,
+                              1,
+                              memory_order_release);
+    }
+}
+
+static gboolean
+peak_exec_checkpoint_gate_cond_is_ready(void)
+{
+    (void)pthread_once(&peak_exec_checkpoint_gate_cond_once,
+                       peak_exec_checkpoint_gate_cond_initialize);
+    return atomic_load_explicit(&peak_exec_checkpoint_gate_cond_ready,
+                                memory_order_acquire) != 0;
+}
+
+static void
+peak_exec_checkpoint_warn_fini_skip(const char* reason)
+{
+    int expected = 0;
+
+    if (atomic_compare_exchange_strong_explicit(
+            &peak_exec_checkpoint_fini_skip_warning_emitted,
+            &expected,
+            1,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        peak_log_warn(
+            "[peak] Exec checkpoint readers did not drain (%s); skipping "
+            "PEAK final report and teardown "
+            "so application exit can continue\n",
+            reason);
+    }
+}
+
+static gboolean
+peak_exec_checkpoint_wait_for_readers(void)
+{
+    struct timespec deadline;
+    gboolean drained = TRUE;
+
+    int wait_status = 0;
+    const char* failure_reason = NULL;
+
+    if ((atomic_load_explicit(&peak_exec_checkpoint_gate,
+                              memory_order_acquire) &
+         PEAK_EXEC_CHECKPOINT_GATE_READERS) == 0) {
+        return TRUE;
+    }
+    if (!peak_exec_checkpoint_gate_cond_is_ready() ||
+        clock_gettime(
+#if defined(__linux__)
+            CLOCK_MONOTONIC,
+#else
+            CLOCK_REALTIME,
+#endif
+            &deadline) != 0) {
+        peak_exec_checkpoint_warn_fini_skip("checkpoint wait unavailable");
+        return FALSE;
+    }
+    deadline.tv_sec += PEAK_EXEC_CHECKPOINT_FINI_WAIT_TIMEOUT_MS / 1000L;
+    deadline.tv_nsec +=
+        (PEAK_EXEC_CHECKPOINT_FINI_WAIT_TIMEOUT_MS % 1000L) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&peak_exec_checkpoint_gate_mutex);
+    while ((atomic_load_explicit(&peak_exec_checkpoint_gate,
+                                 memory_order_acquire) &
+            PEAK_EXEC_CHECKPOINT_GATE_READERS) != 0) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_store_explicit(&peak_test_fini_waiting_for_reader,
+                              1,
+                              memory_order_release);
+        atomic_fetch_add_explicit(&peak_test_fini_checkpoint_wait_count,
+                                  1,
+                                  memory_order_release);
+#endif
+        wait_status = pthread_cond_timedwait(&peak_exec_checkpoint_gate_cond,
+                                             &peak_exec_checkpoint_gate_mutex,
+                                             &deadline);
+        if (wait_status != 0) {
+            drained = FALSE;
+            failure_reason = wait_status == ETIMEDOUT ?
+                "finalization deadline expired" : "checkpoint wait failed";
+            break;
+        }
+    }
+    pthread_mutex_unlock(&peak_exec_checkpoint_gate_mutex);
+
+    if (!drained) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (wait_status == ETIMEDOUT) {
+            atomic_store_explicit(&peak_test_fini_checkpoint_timeout_observed,
+                                  1,
+                                  memory_order_release);
+        }
+#endif
+        peak_exec_checkpoint_warn_fini_skip(failure_reason);
+    }
+    return drained;
+}
+
 static int
 peak_exec_checkpoint_reader_acquire(void)
 {
@@ -347,9 +505,19 @@ peak_exec_checkpoint_reader_acquire(void)
 static void
 peak_exec_checkpoint_reader_release(void)
 {
+    if (!peak_exec_checkpoint_gate_cond_is_ready()) {
+        atomic_fetch_sub_explicit(&peak_exec_checkpoint_gate,
+                                  1U,
+                                  memory_order_release);
+        return;
+    }
+
+    pthread_mutex_lock(&peak_exec_checkpoint_gate_mutex);
     atomic_fetch_sub_explicit(&peak_exec_checkpoint_gate,
                               1U,
                               memory_order_release);
+    pthread_cond_broadcast(&peak_exec_checkpoint_gate_cond);
+    pthread_mutex_unlock(&peak_exec_checkpoint_gate_mutex);
 }
 
 static gboolean
@@ -1374,15 +1542,11 @@ void peak_fini()
         atomic_fetch_or_explicit(&peak_exec_checkpoint_gate,
                                  PEAK_EXEC_CHECKPOINT_GATE_CLOSING,
                                  memory_order_acq_rel);
-        while ((atomic_load_explicit(&peak_exec_checkpoint_gate,
-                                     memory_order_acquire) &
-                PEAK_EXEC_CHECKPOINT_GATE_READERS) != 0) {
-#ifdef PEAK_ENABLE_TEST_HOOKS
-            atomic_store_explicit(&peak_test_fini_waiting_for_reader,
-                                  1,
+        if (!peak_exec_checkpoint_wait_for_readers()) {
+            atomic_store_explicit(&peak_fini_state,
+                                  PEAK_FINI_DONE,
                                   memory_order_release);
-#endif
-            sched_yield();
+            return;
         }
         peak_fini_impl();
         atomic_store_explicit(&peak_fini_state,

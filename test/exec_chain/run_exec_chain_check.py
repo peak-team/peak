@@ -177,6 +177,10 @@ MODE_TO_APP_ARG = {
     "posix_spawnp_bad_argv_failure_non_destructive": "posix-spawnp-bad-argv",
     "posix_spawn_explicit_peak_env_preserved": "posix-spawn-explicit-peak-env",
     "exec_checkpoint_concurrent_fini_callbacks": "exec-concurrent-fini-callbacks",
+    "exec_checkpoint_reader_wake_before_wait": (
+        "exec-checkpoint-reader-wake-before-wait"
+    ),
+    "exec_checkpoint_reader_timeout": "exec-checkpoint-reader-timeout",
     "exec_checkpoint_snapshot_lock_contention": "exec-checkpoint-snapshot-lock-contention",
     "exec_checkpoint_statistics_snapshot_contention": (
         "exec-checkpoint-statistics-snapshot-contention"
@@ -224,6 +228,7 @@ NO_EXEC_CHECKPOINT_MODES = {
     "exec_checkpoint_disabled",
     "exec_checkpoint_direct_disabled",
     "exec_checkpoint_concurrent_fini_callbacks",
+    "exec_checkpoint_reader_timeout",
     "exec_checkpoint_statistics_shadow_invalidation",
     "execve_child_checkpoint_disabled",
     "exec_bad_stats_path_nonfatal",
@@ -1258,10 +1263,40 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
     exec_files, final_files = csv_files(tmpdir)
 
     if args.mode == "exec_checkpoint_concurrent_fini_callbacks":
-        require("checkpoint_reader_gate_held=1 fini_waiting=1" in output,
+        match = re.search(
+            r"checkpoint_reader_gate_held=1 fini_waiting=1 fini_waits=(\d+)",
+            output,
+        )
+        require(match is not None and int(match.group(1)) > 0,
                 f"checkpoint/fini lifetime-gate ordering was not proven\n{output}")
         require(final_files,
                 f"fini did not complete after releasing checkpoint reader\n{output}")
+
+    if args.mode == "exec_checkpoint_reader_wake_before_wait":
+        require("checkpoint_reader_wake_before_wait=1 fini_waits=0" in output,
+                f"wake-before-wait did not avoid a checkpoint wait\n{output}")
+        require(len(final_files) == 1,
+                f"wake-before-wait did not complete final reporting\n{output}")
+        require(len(exec_files) == 1,
+                f"wake-before-wait reader did not finish its checkpoint\n{output}")
+
+    if args.mode == "exec_checkpoint_reader_timeout":
+        match = re.search(
+            r"checkpoint_reader_timeout=1 reader_released_after_timeout=1 "
+            r"timeout_observed=1 fini_waits=(\d+) elapsed_ms=(\d+)",
+            output,
+        )
+        require(match is not None,
+                f"checkpoint reader timeout/release was not proven\n{output}")
+        require(int(match.group(1)) > 0,
+                f"finalizer did not block on the condition variable\n{output}")
+        require(4500 <= int(match.group(2)) < 7000,
+                f"checkpoint reader timeout was not bounded\n{output}")
+        require("skipping PEAK final report and teardown" in output,
+                f"timeout warning did not identify the skipped PEAK work\n{output}")
+        require(not final_files and not exec_files,
+                f"timed-out finalization emitted unsafe artifacts: "
+                f"final={final_files} checkpoint={exec_files}\n{output}")
 
     if args.mode == "exec_checkpoint_fork_child_fini":
         match = re.search(

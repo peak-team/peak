@@ -86,6 +86,12 @@ PEAK_EXEC_API void peak_test_checkpoint_reader_release(void);
 /** @return Nonzero once finalization is waiting for the paused reader. */
 PEAK_EXEC_API int peak_test_fini_waiting_for_checkpoint_reader(void);
 
+/** @return Number of condition-variable waits used by finalization. */
+PEAK_EXEC_API int peak_test_fini_checkpoint_reader_wait_count(void);
+
+/** @return Nonzero after the bounded checkpoint-reader wait timed out. */
+PEAK_EXEC_API int peak_test_fini_checkpoint_reader_timeout_observed(void);
+
 /** Invokes the normal `peak_fini()` path for lifetime-gate testing. */
 PEAK_EXEC_API void peak_test_fini(void);
 

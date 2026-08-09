@@ -274,6 +274,8 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         posix_spawnp_bad_argv_failure_non_destructive
         posix_spawn_explicit_peak_env_preserved
         exec_checkpoint_concurrent_fini_callbacks
+        exec_checkpoint_reader_wake_before_wait
+        exec_checkpoint_reader_timeout
         exec_checkpoint_snapshot_lock_contention
         exec_checkpoint_statistics_snapshot_contention
         exec_checkpoint_statistics_shadow_invalidation
