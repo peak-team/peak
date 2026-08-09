@@ -7,6 +7,15 @@ set_tests_properties(test_exec_chain_platform_contract
         PASS_REGULAR_EXPRESSION "exec_chain_platform_contract_ok"
         TIMEOUT 10)
 
+add_test(NAME test_peak_fini_wait_platform_contract
+    COMMAND ${CMAKE_COMMAND}
+            -DPEAK_SOURCE_ROOT=${PROJECT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test_peak_fini_wait_platform_contract.cmake)
+set_tests_properties(test_peak_fini_wait_platform_contract
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION "peak_fini_wait_platform_contract_ok"
+        TIMEOUT 10)
+
 add_test(NAME test_exec_chain_platform_selection_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/run_exec_platform_selection_contract.py
@@ -274,6 +283,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         posix_spawnp_bad_argv_failure_non_destructive
         posix_spawn_explicit_peak_env_preserved
         exec_checkpoint_concurrent_fini_callbacks
+        exec_checkpoint_reader_wake_before_wait
+        exec_checkpoint_fini_completion_wake
+        exec_checkpoint_reader_timeout
+        exec_checkpoint_fini_cancel_deferred
+        exec_checkpoint_reader_cancel_deferred
+        exec_checkpoint_reader_cancel_async
         exec_checkpoint_snapshot_lock_contention
         exec_checkpoint_statistics_snapshot_contention
         exec_checkpoint_statistics_shadow_invalidation
