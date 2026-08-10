@@ -104,6 +104,9 @@ SOCKET_TRANSPORT_FALLBACK_MODES = {
     "finalize-clean-output-mpi-reducer-fail",
 }
 ALLOCATED_SOCKET_TEST_PORT_BASES = set()
+WRITER_DESTINATION_FAILURE_DIAGNOSTIC = (
+    "failed to prepare stats csv destination"
+)
 STATS_CSV_NAME_RE = re.compile(
     r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
     r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
@@ -146,6 +149,11 @@ def require_socket_release_fallback_layout(stats_names, nprocs):
             "socket release failure fallback ranks must contain each rank "
             f"exactly once: got {sorted(fallback_ranks)}"
         )
+
+
+def writer_destination_failure_observed(output):
+    """The dirfd writer rejects a non-directory parent before temp creation."""
+    return WRITER_DESTINATION_FAILURE_DIAGNOSTIC in output
 
 
 def compact_temporary_stats_files(stats_dir):
@@ -850,7 +858,7 @@ def main():
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
         app_args.append("finalize-then-exit0")
-        expected = "failed to create temporary stats csv"
+        expected = WRITER_DESTINATION_FAILURE_DIAGNOSTIC
         expected_extra.append(
             "All-rank report publication release completed: "
             "all_reports_succeeded=0"

@@ -135,6 +135,18 @@ class ReportInterruptionPolicyTest(unittest.TestCase):
         self.assertFalse(CHECKER.report_release_was_interrupted(output))
 
 
+class WriterFailureDiagnosticPolicyTest(unittest.TestCase):
+    def test_dirfd_parent_failure_is_the_writer_failure_diagnostic(self) -> None:
+        output = "[peak] failed to prepare stats csv destination: Not a directory\n"
+
+        self.assertTrue(CHECKER.writer_destination_failure_observed(output))
+
+    def test_temp_creation_diagnostic_is_not_the_dirfd_parent_failure(self) -> None:
+        output = "[peak] failed to create temporary stats csv: Not a directory\n"
+
+        self.assertFalse(CHECKER.writer_destination_failure_observed(output))
+
+
 class SocketPortIsolationTest(unittest.TestCase):
     def test_busy_port_in_either_contiguous_pair_slot_retries(self) -> None:
         first_base = 21000
