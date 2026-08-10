@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.13)
 project(peak LANGUAGES C CXX)
 
 include(GNUInstallDirs)
+include(CheckIncludeFile)
 
 option(PEAK_FETCH_DEPS
     "Allow CMake to download pinned dependencies when callers do not provide them"
@@ -10,6 +11,14 @@ option(PEAK_FETCH_DEPS
 option(PEAK_ENABLE_OTF2 "Enable OTF2 memory-trace export" OFF)
 option(PEAK_USE_SYSTEM_OTF2 "Find OTF2 in the system before fetching it" ON)
 option(PEAK_ENABLE_FORTRAN_TESTS "Build tests that require a Fortran compiler" OFF)
+
+check_include_file("sys/random.h" PEAK_HAVE_SYS_RANDOM_H)
+if(PEAK_HAVE_SYS_RANDOM_H)
+    add_compile_definitions(PEAK_HAVE_SYS_RANDOM_H=1)
+else()
+    add_compile_definitions(PEAK_HAVE_SYS_RANDOM_H=0)
+endif()
+message(STATUS "PEAK_HAVE_SYS_RANDOM_H = ${PEAK_HAVE_SYS_RANDOM_H}")
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Release")

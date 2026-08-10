@@ -15,7 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef __linux__
+#if PEAK_HAVE_SYS_RANDOM_H
 #include <sys/random.h>
 #endif
 
@@ -73,7 +73,7 @@ peak_output_identity_session_once(void)
         remaining = sizeof(peak_output_session);
     } else {
 #endif
-#ifdef __linux__
+#if PEAK_HAVE_SYS_RANDOM_H
     while (remaining != 0) {
         ssize_t read_bytes;
 

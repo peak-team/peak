@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#ifdef __linux__
+#if PEAK_HAVE_SYS_RANDOM_H
 #include <sys/random.h>
 #endif
 #include <sys/resource.h>
@@ -412,7 +412,7 @@ peak_socket_reduce_session_nonce(uint64_t* nonce_out)
         return false;
     }
 #endif
-#ifdef __linux__
+#if PEAK_HAVE_SYS_RANDOM_H
     while (remaining != 0) {
         ssize_t read_bytes;
         do {
