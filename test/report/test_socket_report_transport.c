@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -91,7 +92,9 @@ test_tcp_slot_is_available(int base_port)
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in address = {
             .sin_family = AF_INET,
-            .sin_port = htons((uint16_t)(base_port + offset)),
+            .sin_port = htons((uint16_t)(base_port == 0
+                                             ? 0
+                                             : base_port + offset)),
             .sin_addr.s_addr = htonl(INADDR_ANY),
         };
 
@@ -151,24 +154,21 @@ test_port_ranges_overlap(int first_a,
 }
 
 static int
-reserve_test_port_slot(int* lock_fd_out)
+reserve_test_port_slot_from(int* lock_fd_out,
+                            int port_base,
+                            int first_slot,
+                            bool avoid_linux_ephemeral_ports,
+                            int ephemeral_first,
+                            int ephemeral_last)
 {
-    int first_slot;
-    int ephemeral_first = 0;
-    int ephemeral_last = -1;
-    bool avoid_linux_ephemeral_ports;
-
-    if (lock_fd_out == NULL) {
+    if (lock_fd_out == NULL || first_slot < 0 ||
+        first_slot >= TEST_PORT_SLOT_COUNT) {
         return -1;
     }
     *lock_fd_out = -1;
-    avoid_linux_ephemeral_ports =
-        test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last);
-    first_slot = (int)(getpid() % TEST_PORT_SLOT_COUNT);
     for (int offset = 0; offset < TEST_PORT_SLOT_COUNT; offset++) {
         int slot = (first_slot + offset) % TEST_PORT_SLOT_COUNT;
-        int port = TEST_PORT_BASE + slot * TEST_PORT_SLOT_WIDTH;
-        int lock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int port = port_base + slot * TEST_PORT_SLOT_WIDTH;
         struct sockaddr_in address = {
             .sin_family = AF_INET,
             .sin_port = htons((uint16_t)port),
@@ -188,6 +188,7 @@ reserve_test_port_slot(int* lock_fd_out)
                                      ephemeral_last)) {
             continue;
         }
+        int lock_fd = socket(AF_INET, SOCK_DGRAM, 0);
         /*
          * UDP and TCP have separate port namespaces. Holding the UDP endpoint
          * gives this process a kernel-enforced, cross-UID slot lock while the
@@ -209,6 +210,23 @@ reserve_test_port_slot(int* lock_fd_out)
 }
 
 static int
+reserve_test_port_slot(int* lock_fd_out)
+{
+    int ephemeral_first = 0;
+    int ephemeral_last = -1;
+    bool avoid_linux_ephemeral_ports =
+        test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last);
+
+    return reserve_test_port_slot_from(
+        lock_fd_out,
+        TEST_PORT_BASE,
+        (int)(getpid() % TEST_PORT_SLOT_COUNT),
+        avoid_linux_ephemeral_ports,
+        ephemeral_first,
+        ephemeral_last);
+}
+
+static int
 check_port_slot_avoids_linux_ephemeral_range(int base_port)
 {
     int ephemeral_first;
@@ -223,6 +241,42 @@ check_port_slot_avoids_linux_ephemeral_range(int base_port)
                                     ephemeral_last)
                ? 1
                : 0;
+}
+
+static int
+check_skipped_ephemeral_slots_do_not_consume_fds(void)
+{
+    struct rlimit original_limit;
+    struct rlimit limited_limit;
+    int lock_fd = -1;
+    int result;
+    bool reserved;
+
+    if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0 ||
+        original_limit.rlim_cur <= 128) {
+        return 0;
+    }
+    limited_limit = original_limit;
+    limited_limit.rlim_cur = 128;
+    if (setrlimit(RLIMIT_NOFILE, &limited_limit) != 0) {
+        return 1;
+    }
+    /* Slots 1..349 are filtered; slot 0 uses kernel-selected port zero. */
+    result = reserve_test_port_slot_from(
+        &lock_fd,
+        0,
+        1,
+        true,
+        TEST_PORT_SLOT_WIDTH,
+        TEST_PORT_SLOT_COUNT * TEST_PORT_SLOT_WIDTH - 1);
+    reserved = result == 0 && lock_fd >= 0;
+    if (lock_fd >= 0) {
+        close(lock_fd);
+    }
+    if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) {
+        return 1;
+    }
+    return !reserved;
 }
 
 static int
@@ -2184,6 +2238,8 @@ main(void)
     CHECK_SOCKET_CASE("port-slot-outside-ephemeral-range",
                       check_port_slot_avoids_linux_ephemeral_range(
                           base_port));
+    CHECK_SOCKET_CASE("ephemeral-slot-skip-does-not-leak-fds",
+                      check_skipped_ephemeral_slots_do_not_consume_fds());
     CHECK_SOCKET_CASE("slurm-host-parser", check_slurm_host_parser());
     CHECK_SOCKET_CASE("progress-hard-cap",
                       check_progress_deadline_hard_cap());
