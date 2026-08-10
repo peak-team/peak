@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
+#include "internal/target_resolver.h"
 #include "internal/exec_raw_syscall.h"
 #include "internal/general_listener_internal.h"
 #include "internal/general_listener/attach_policy.h"
@@ -190,9 +191,6 @@ static gboolean general_controller_running = FALSE;
 static gboolean general_controller_thread_started = FALSE;
 static pthread_t general_controller_owner_thread;
 static _Atomic gboolean general_controller_owner_known = FALSE;
-static gboolean gum_find_functions_matching_initialize = false;
-static GHashTable* gum_symbol_demangled_mapping;
-static GHashTable* gum_symbol_short_mapping;
 static const double peak_general_overhead_floor = 1e-9;
 static pthread_mutex_t detach_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
 static const double peak_controller_retry_base_delay = 0.001;
@@ -431,10 +429,6 @@ peak_general_listener_controller_wait(int expected_wake_sequence)
 }
 
 /* Runtime and controller accounting. */
-static gboolean str_equal_function_general(gconstpointer a, gconstpointer b) {
-    return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
-}
-
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_test_report_array_allocation_remaining = INT_MIN;
 
@@ -1024,9 +1018,12 @@ peak_symbol_should_use_cpp_map(const char* symbol)
     }
 
     return symbol != NULL &&
-           (strstr(symbol, "::") != NULL ||
+           (g_str_has_prefix(symbol, "_Z") ||
+            strstr(symbol, "::") != NULL ||
             strchr(symbol, '(') != NULL ||
             strchr(symbol, '<') != NULL ||
+            strchr(symbol, '!') != NULL ||
+            strstr(symbol, "+0x") != NULL ||
             strstr(symbol, "operator") != NULL);
 }
 
@@ -7015,72 +7012,34 @@ peak_general_listener_configure_detach_threshold(void)
     peak_need_detach[0] = false;
 }
 
-static void
-peak_symbol_map_add_target(GHashTable* table, const char* symbol)
+static gpointer
+peak_general_listener_resolve_selector(const char* selector,
+                                       char** demangled_name,
+                                       gboolean* terminal)
 {
-    if (symbol == NULL || g_hash_table_contains(table, symbol)) {
-        return;
+    PeakTargetResolution resolution = {0};
+    PeakTargetResolveResult result =
+        peak_target_resolver_resolve(selector, NULL, TRUE, &resolution);
+    gpointer address = NULL;
+
+    *terminal = FALSE;
+
+    if (result == PEAK_TARGET_RESOLVE_UNIQUE) {
+        PeakTargetSymbolCandidate* candidate =
+            g_ptr_array_index(resolution.candidates, 0);
+        address = candidate->address;
+        *demangled_name = g_strdup(candidate->demangled);
+    } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
+        g_printerr("[peak] ambiguous target selector; refusing to attach\n");
+        peak_target_resolver_print(stderr, selector, &resolution);
+        *terminal = TRUE;
+    } else if (result == PEAK_TARGET_RESOLVE_INVALID) {
+        g_printerr("[peak] invalid target selector; refusing to attach: %s\n",
+                   selector != NULL ? selector : "<null>");
+        *terminal = TRUE;
     }
-
-    g_hash_table_insert(table, g_strdup(symbol), g_ptr_array_new());
-}
-
-static void peak_build_symbol_map_once(size_t first_target_index) {
-    gum_find_functions_matching_initialize = true;
-    gum_symbol_demangled_mapping = g_hash_table_new_full(g_str_hash,
-                                                         str_equal_function_general,
-                                                         g_free,
-                                                         (GDestroyNotify) g_ptr_array_unref);
-    gum_symbol_short_mapping = g_hash_table_new_full(g_str_hash,
-                                                     str_equal_function_general,
-                                                     g_free,
-                                                     (GDestroyNotify) g_ptr_array_unref);
-
-    for (size_t i = first_target_index; i < peak_hook_address_count; i++) {
-        const char* symbol = peak_hook_strings[i];
-        if (!peak_symbol_should_use_cpp_map(symbol) ||
-            cxa_demangle_status(symbol) == 0) {
-            continue;
-        }
-
-        peak_symbol_map_add_target(gum_symbol_demangled_mapping, symbol);
-        peak_symbol_map_add_target(gum_symbol_short_mapping, symbol);
-    }
-
-    if (g_hash_table_size(gum_symbol_demangled_mapping) == 0 &&
-        g_hash_table_size(gum_symbol_short_mapping) == 0) {
-        return;
-    }
-
-    GArray* addresses = gum_find_functions_matching("_Z*");
-    for (gsize j = 0; j < addresses->len; j++) {
-        gpointer addr = g_array_index(addresses, gpointer, j);
-        if (!addr) continue;
-        gchar* mangled = gum_symbol_name_from_address(addr);
-        if (!mangled) continue;
-
-        char* demangled = cxa_demangle(mangled);
-        g_free(mangled);
-        if (!demangled) continue;
-
-        GPtrArray* demangled_candidates =
-            g_hash_table_lookup(gum_symbol_demangled_mapping, demangled);
-        if (demangled_candidates) {
-            g_ptr_array_add(demangled_candidates, addr);
-        }
-
-        char* function_name = extract_function_name(demangled);
-        GPtrArray* short_candidates =
-            g_hash_table_lookup(gum_symbol_short_mapping, function_name);
-        if (short_candidates) {
-            g_ptr_array_add(short_candidates, addr);
-        }
-
-        free(function_name);
-        free(demangled);
-    }
-
-    g_array_free(addresses, TRUE);
+    peak_target_resolution_clear(&resolution);
+    return address;
 }
 
 void
@@ -7208,7 +7167,9 @@ peak_general_listener_attach()
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
-            gpointer ptr = peak_general_listener_find_function(peak_hook_strings[i]);
+            gpointer ptr = peak_symbol_should_use_cpp_map(peak_hook_strings[i])
+                ? NULL
+                : peak_general_listener_find_function(peak_hook_strings[i]);
             if (ptr) {
                 hook_address[i] = ptr;
                 char* demangled = cxa_demangle(peak_hook_strings[i]);
@@ -7216,46 +7177,19 @@ peak_general_listener_attach()
                 free(demangled);
             } else {
                 if (peak_symbol_should_use_cpp_map(peak_hook_strings[i])) {
-                    if (!gum_find_functions_matching_initialize) {
-                        peak_build_symbol_map_once(i);
-                    }
-
-                    if (cxa_demangle_status(peak_hook_strings[i]) != 0) {
-                        GPtrArray* candidates =
-                            g_hash_table_lookup(gum_symbol_demangled_mapping,
-                                                peak_hook_strings[i]);
-                        if (candidates && candidates->len > 0) {
-                            /* A full demangled name resolves to one candidate. */
-                            hook_address[i] = g_ptr_array_index(candidates, 0);
-                            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-                        } else {
-                            /* Fall back to the first short-name candidate. */
-                            candidates = g_hash_table_lookup(gum_symbol_short_mapping,
-                                                             peak_hook_strings[i]);
-                            if (candidates && candidates->len > 0) {
-                                hook_address[i] = g_ptr_array_index(candidates, 0);
-                                gchar* mangled = gum_symbol_name_from_address(hook_address[i]);
-
-                                if (mangled != NULL) {
-                                    char* demangled = cxa_demangle(mangled);
-                                    g_free(mangled);
-                                    if (demangled != NULL) {
-                                        peak_demangled_strings[i] = g_strdup(demangled);
-                                        free(demangled);
-                                    } else {
-                                        /* Failed to demangle; fall back to original hook string */
-                                        peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-                                    }
-                                } else {
-                                    /* Failed to get mangled name; fall back to original hook string */
-                                    peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-                                }
-                            }
-                        }
+                    gboolean terminal = FALSE;
+                    hook_address[i] = peak_general_listener_resolve_selector(
+                        peak_hook_strings[i], &peak_demangled_strings[i],
+                        &terminal);
+                    if (terminal) {
+                        peak_demangled_strings[i] =
+                            g_strdup(peak_hook_strings[i]);
                     }
                 }
                 if (hook_address[i] == NULL) {
-                    peak_dynamic_attach_needed = TRUE;
+                    if (peak_demangled_strings[i] == NULL) {
+                        peak_dynamic_attach_needed = TRUE;
+                    }
                 }
             }
         }
@@ -7368,13 +7302,6 @@ peak_general_listener_attach()
                 peak_demangled_strings[i] = NULL;
             }
         }
-    }
-    if (gum_find_functions_matching_initialize) {
-        g_hash_table_destroy(gum_symbol_demangled_mapping);
-        g_hash_table_destroy(gum_symbol_short_mapping);
-        gum_symbol_demangled_mapping = NULL;
-        gum_symbol_short_mapping = NULL;
-        gum_find_functions_matching_initialize = false;
     }
 }
 

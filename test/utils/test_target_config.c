@@ -62,6 +62,95 @@ test_environment_tokens(void)
     count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
     ok &= expect_names(names, count, (const char* const[]){"duplicate", "duplicate"}, 2);
     free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS",
+           "ns::func(int,double), ns::template_func<std::pair<int,double>>(int)",
+           1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){
+                           "ns::func(int,double)",
+                           "ns::template_func<std::pair<int,double>>(int)"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "ns::C::operator<<(int), next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"ns::C::operator<<(int)",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "ns::C::operator<(int), next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"ns::C::operator<(int)",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS",
+           "ns::C::operator,(Widget const&), next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"ns::C::operator,(Widget const&)",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "ns::C::operator <<(int), next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"ns::C::operator <<(int)",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS",
+           "ns::C::operator ,(Widget const&), next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"ns::C::operator ,(Widget const&)",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "myoperator, next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"myoperator", "next_target"}, 2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "myoperator<T,U>, next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"myoperator<T,U>",
+                                             "next_target"},
+                       2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "bad(int,next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"bad(int", "next_target"}, 2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "bad<T,next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"bad<T", "next_target"}, 2);
+    free_parsed_result(names, count);
     unsetenv("PEAK_TEST_TARGETS");
     return ok;
 }

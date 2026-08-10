@@ -310,12 +310,14 @@ unresolved symbol may remain uncovered. `partial_success` means at least one
 listener was installed while the same scan also produced retryable work. That
 retry may still be dropped if PEAK cannot preserve its request handle.
 
-Unresolved plain C symbols do not trigger Gum's expensive global C++ demangled
-scan. The asynchronous `dlopen` path uses exact-name `dlsym()` when their DSO
-appears. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` restores the legacy broad startup scan
-for a short C++ target name without obvious C++ spelling such as `::`, `(`,
-`<`, or `operator`; it does not turn the post-load queue into a demangled C++
-resolver.
+Unresolved plain C symbols do not trigger Gum's global C++ scan. The
+asynchronous `dlopen` path uses exact-name `dlsym()` when their DSO appears.
+C++ selectors (a mangled name, full demangled signature, or module-qualified
+selector) use the same candidate resolver as startup. It resolves globally to
+detect cross-DSO ambiguity, then looks up the chosen mangled symbol through the
+request's retained handle so it attaches that exact loader instance. The
+resolver never loads a module. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` also permits a
+plain short target name to use the legacy C++ candidate scan.
 
 ## Supported Boundary
 

@@ -18,7 +18,8 @@ extern "C" {
  * An unset or empty value stores NULL in @p result and returns zero. Otherwise
  * the environment string is duplicated before tokenization and is not
  * modified. Tokens are trimmed; leading, consecutive, trailing, and
- * whitespace-only fields are ignored.
+ * whitespace-only fields are ignored. A delimiter inside balanced C++
+ * parameter parentheses or template brackets remains part of its selector.
  *
  * Assuming all required allocations succeed, both the array and every token
  * are newly allocated. The caller owns them and must pass the returned count

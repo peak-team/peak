@@ -241,6 +241,60 @@ append_trimmed_token(TargetBuilder* builder, char* token, bool* warned_empty)
     return target_builder_append(builder, token);
 }
 
+static bool
+target_config_operator_token_ends_at(const char* token, const char* cursor)
+{
+    while (cursor > token && isspace((unsigned char)cursor[-1])) {
+        cursor--;
+    }
+    return cursor - token >= 8 &&
+           memcmp(cursor - 8, "operator", 8) == 0 &&
+           (cursor - 8 == token ||
+            (!isalnum((unsigned char)cursor[-9]) && cursor[-9] != '_'));
+}
+
+static char*
+target_config_next_delimiter(char* token, char delimiter)
+{
+    unsigned int parentheses = 0;
+    unsigned int templates = 0;
+    char* nested_delimiter = NULL;
+
+    for (char* cursor = token; *cursor != '\0'; cursor++) {
+        if (*cursor == '(') {
+            parentheses++;
+        } else if (*cursor == ')' && parentheses > 0) {
+            parentheses--;
+        } else if (*cursor == '<' &&
+                   !(target_config_operator_token_ends_at(token, cursor) ||
+                     (cursor > token && cursor[-1] == '<' &&
+                      target_config_operator_token_ends_at(token,
+                                                           cursor - 1)))) {
+            templates++;
+        } else if (*cursor == '>' && templates > 0) {
+            templates--;
+        } else if (*cursor == delimiter &&
+                   !(delimiter == ',' &&
+                     target_config_operator_token_ends_at(token, cursor))) {
+            if (parentheses == 0 && templates == 0) {
+                return cursor;
+            }
+            if (nested_delimiter == NULL) {
+                nested_delimiter = cursor;
+            }
+        }
+    }
+    /*
+     * The public parser cannot reject one malformed list member.  Do not let
+     * an unmatched opener consume every subsequent target: split at the first
+     * delimiter it hid and leave the remaining entries usable.
+     */
+    if ((parentheses != 0 || templates != 0) && nested_delimiter != NULL) {
+        return nested_delimiter;
+    }
+    return NULL;
+}
+
 size_t
 parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
 {
@@ -268,7 +322,7 @@ parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
     }
     token = copy;
     do {
-        next = strchr(token, a_delim);
+        next = target_config_next_delimiter(token, a_delim);
         if (next != NULL) {
             *next++ = '\0';
         }
