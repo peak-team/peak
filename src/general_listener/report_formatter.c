@@ -289,6 +289,19 @@ peak_report_formatter_test_signal_publication_phase(const char* phase)
     (void)fflush(stderr);
     (void)kill(getpid(), signal_number);
 }
+
+static int
+peak_report_formatter_unlink_published_temp(int dirfd, const char* name)
+{
+    const char* inject =
+        getenv("PEAK_TEST_REPORT_FAIL_POST_PUBLISH_TEMP_UNLINK");
+
+    if (inject != NULL && strcmp(inject, "1") == 0) {
+        errno = EIO;
+        return -1;
+    }
+    return unlinkat(dirfd, name, 0);
+}
 #endif
 
 typedef struct {
@@ -743,6 +756,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     PeakReportCsvDestination destination = {.dirfd = -1};
     FILE* csv;
     bool success;
+    bool final_published = false;
     int csv_fd;
     int failure_errno = 0;
     int rank_count;
@@ -860,8 +874,21 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                         destination.dirfd, destination.final_name, 0)) != 0) {
             success = false;
             failure_errno = errno;
-        } else if (!allow_overwrite) {
-            (void)unlinkat(destination.dirfd, temp_csv, 0);
+        } else {
+            final_published = true;
+            if (!allow_overwrite) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+                int unlink_result = peak_report_formatter_unlink_published_temp(
+                    destination.dirfd, temp_csv);
+#else
+                int unlink_result = unlinkat(destination.dirfd, temp_csv, 0);
+#endif
+
+                if (unlink_result != 0) {
+                    success = false;
+                    failure_errno = errno;
+                }
+            }
         }
     }
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -871,11 +898,40 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
     }
 #endif
     if (!success) {
-        (void)unlinkat(destination.dirfd, temp_csv, 0);
-        peak_log_warn("[peak] failed to publish complete stats csv '%s': %s; "
-                      "any existing completed csv was left unchanged\n",
-                      destination.rendered_path,
-                      strerror(failure_errno != 0 ? failure_errno : EIO));
+        int cleanup_errno = 0;
+
+        if (unlinkat(destination.dirfd, temp_csv, 0) != 0 && errno != ENOENT) {
+            cleanup_errno = errno;
+        }
+        if (final_published) {
+            if (cleanup_errno == 0) {
+                peak_log_warn("[peak] published complete stats csv '%s', but "
+                              "the initial temporary cleanup failed: %s; "
+                              "retry succeeded\n",
+                              destination.rendered_path,
+                              strerror(failure_errno != 0 ? failure_errno : EIO));
+            } else {
+                peak_log_warn("[peak] published complete stats csv '%s', but "
+                              "temporary cleanup failed: initial=%s retry=%s\n",
+                              destination.rendered_path,
+                              strerror(failure_errno != 0 ? failure_errno : EIO),
+                              strerror(cleanup_errno));
+            }
+        } else {
+            if (cleanup_errno == 0) {
+                peak_log_warn("[peak] failed to publish complete stats csv '%s': %s; "
+                              "any existing completed csv was left unchanged\n",
+                              destination.rendered_path,
+                              strerror(failure_errno != 0 ? failure_errno : EIO));
+            } else {
+                peak_log_warn("[peak] failed to publish complete stats csv '%s': %s; "
+                              "any existing completed csv was left unchanged; "
+                              "temporary cleanup also failed: %s\n",
+                              destination.rendered_path,
+                              strerror(failure_errno != 0 ? failure_errno : EIO),
+                              strerror(cleanup_errno));
+            }
+        }
     }
     free(temp_csv);
     peak_report_formatter_csv_destination_destroy(&destination);

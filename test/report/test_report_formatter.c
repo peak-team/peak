@@ -861,6 +861,55 @@ check_concurrent_no_clobber(const char* temp_directory)
 }
 
 static void
+check_post_publish_temp_cleanup(const char* directory,
+                                const char* filename,
+                                bool compact_temp)
+{
+    char path[PATH_MAX];
+    char temp_prefix[NAME_MAX + 32];
+    PeakReportSnapshot* first = create_fixture("cleanup-first");
+    PeakReportSnapshot* second = create_fixture("cleanup-second");
+    char* contents;
+
+    assert(snprintf(path, sizeof(path), "%s/%s", directory, filename) <
+           (int)sizeof(path));
+    assert(compact_temp ?
+               snprintf(temp_prefix, sizeof(temp_prefix), ".peak-tmp.") > 0 :
+               snprintf(temp_prefix, sizeof(temp_prefix), "%s.tmp.", filename) > 0);
+    assert(setenv("PEAK_STATSLOG_TEMPLATE", path, 1) == 0);
+    assert(setenv("PEAK_TEST_REPORT_FAIL_POST_PUBLISH_TEMP_UNLINK", "1", 1) == 0);
+    peak_report_snapshot_prepare_for_render(first);
+    assert(!peak_report_formatter_write_csv(first));
+    assert(unsetenv("PEAK_TEST_REPORT_FAIL_POST_PUBLISH_TEMP_UNLINK") == 0);
+    contents = read_file(path);
+    assert(strstr(contents, "cleanup-first") != NULL);
+    free(contents);
+    assert(!directory_has_prefix(directory, temp_prefix));
+
+    peak_report_snapshot_prepare_for_render(second);
+    assert(!peak_report_formatter_write_csv(second));
+    contents = read_file(path);
+    assert(strstr(contents, "cleanup-first") != NULL);
+    assert(strstr(contents, "cleanup-second") == NULL);
+    free(contents);
+    assert(!directory_has_prefix(directory, temp_prefix));
+    assert(unlink(path) == 0);
+    peak_report_snapshot_destroy(second);
+    peak_report_snapshot_destroy(first);
+}
+
+static void
+check_post_publish_temp_cleanup_failures(const char* temp_directory)
+{
+    char compact_name[NAME_MAX + 1];
+
+    check_post_publish_temp_cleanup(temp_directory, "cleanup-ordinary.csv", false);
+    memset(compact_name, 't', NAME_MAX - 4);
+    memcpy(compact_name + NAME_MAX - 4, ".csv", 5);
+    check_post_publish_temp_cleanup(temp_directory, compact_name, true);
+}
+
+static void
 check_template_parent_creation(const char* temp_directory)
 {
     char template_path[768];
@@ -1052,6 +1101,7 @@ main(void)
     check_failed_csv_never_replaces_final(temp_directory);
     check_output_template_and_no_clobber(temp_directory);
     check_concurrent_no_clobber(temp_directory);
+    check_post_publish_temp_cleanup_failures(temp_directory);
     check_template_parent_creation(temp_directory);
     check_strict_rank_local_bounded_names();
     check_near_path_max_destination(temp_directory);
