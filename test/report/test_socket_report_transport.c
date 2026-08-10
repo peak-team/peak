@@ -1,6 +1,7 @@
 #include "internal/general_listener/socket_report_transport.h"
 
 #include <float.h>
+#include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -14,7 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TEST_PORT_SLOT_COUNT 800
+#define TEST_PORT_SLOT_COUNT 350 /* 10000..32399: below Linux defaults. */
 #define TEST_PORT_SLOT_WIDTH 64
 #define TEST_PORT_BASE 10000
 #define TEST_DEFAULT_PORT_BASE 42000
@@ -42,6 +43,31 @@ typedef enum {
 } TestRootAction;
 
 static bool test_saturate_dropped_counters;
+
+static bool
+test_socket_send_byte(int fd, unsigned char value)
+{
+    ssize_t written;
+
+    do {
+        written = send(fd, &value, sizeof(value), MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    return written == (ssize_t)sizeof(value);
+}
+
+static bool
+test_socket_recv_byte(int fd, unsigned char* value_out)
+{
+    ssize_t received;
+
+    if (value_out == NULL) {
+        return false;
+    }
+    do {
+        received = recv(fd, value_out, sizeof(*value_out), 0);
+    } while (received < 0 && errno == EINTR);
+    return received == (ssize_t)sizeof(*value_out);
+}
 
 static int64_t
 test_monotonic_ms(void)
@@ -88,15 +114,56 @@ test_tcp_slot_is_available(int base_port)
     return available;
 }
 
+static bool
+test_linux_ephemeral_port_range(int* first_port_out, int* last_port_out)
+{
+    FILE* range_file;
+    int first_port;
+    int last_port;
+
+    if (first_port_out == NULL || last_port_out == NULL) {
+        return false;
+    }
+    range_file = fopen("/proc/sys/net/ipv4/ip_local_port_range", "r");
+    if (range_file == NULL) {
+        return false;
+    }
+    bool parsed =
+        fscanf(range_file, "%d %d", &first_port, &last_port) == 2 &&
+        first_port > 0 && last_port >= first_port;
+
+    fclose(range_file);
+    if (!parsed) {
+        return false;
+    }
+    *first_port_out = first_port;
+    *last_port_out = last_port;
+    return true;
+}
+
+static bool
+test_port_ranges_overlap(int first_a,
+                         int last_a,
+                         int first_b,
+                         int last_b)
+{
+    return first_a <= last_b && first_b <= last_a;
+}
+
 static int
 reserve_test_port_slot(int* lock_fd_out)
 {
     int first_slot;
+    int ephemeral_first = 0;
+    int ephemeral_last = -1;
+    bool avoid_linux_ephemeral_ports;
 
     if (lock_fd_out == NULL) {
         return -1;
     }
     *lock_fd_out = -1;
+    avoid_linux_ephemeral_ports =
+        test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last);
     first_slot = (int)(getpid() % TEST_PORT_SLOT_COUNT);
     for (int offset = 0; offset < TEST_PORT_SLOT_COUNT; offset++) {
         int slot = (first_slot + offset) % TEST_PORT_SLOT_COUNT;
@@ -108,6 +175,19 @@ reserve_test_port_slot(int* lock_fd_out)
             .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         };
 
+        /*
+         * A loopback peer uses an ephemeral local source port.  Keeping the
+         * entire test slot outside that kernel range prevents a completed
+         * earlier case from retaining a future gather/release port in
+         * TIME_WAIT after this availability check has finished.
+         */
+        if (avoid_linux_ephemeral_ports &&
+            test_port_ranges_overlap(port,
+                                     port + TEST_PORT_SLOT_WIDTH - 1,
+                                     ephemeral_first,
+                                     ephemeral_last)) {
+            continue;
+        }
         /*
          * UDP and TCP have separate port namespaces. Holding the UDP endpoint
          * gives this process a kernel-enforced, cross-UID slot lock while the
@@ -126,6 +206,23 @@ reserve_test_port_slot(int* lock_fd_out)
         }
     }
     return -1;
+}
+
+static int
+check_port_slot_avoids_linux_ephemeral_range(int base_port)
+{
+    int ephemeral_first;
+    int ephemeral_last;
+
+    if (!test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last)) {
+        return 0;
+    }
+    return test_port_ranges_overlap(base_port,
+                                    base_port + TEST_PORT_SLOT_WIDTH - 1,
+                                    ephemeral_first,
+                                    ephemeral_last)
+               ? 1
+               : 0;
 }
 
 static int
@@ -820,16 +917,15 @@ run_two_rank_case_with_peer_start_delay(int port,
             receipt_barrier_fds[0] = -1;
         }
         set_test_rank(1, 2);
-        if (peer == NULL ||
-            send(peer_ready_fds[0],
-                 &ready,
-                 sizeof(ready),
-                 MSG_NOSIGNAL) != (ssize_t)sizeof(ready)) {
+        if (peer == NULL) {
             close(peer_ready_fds[0]);
             _exit(99);
         }
-        if (recv(peer_ready_fds[0], &ready, sizeof(ready), 0) !=
-                (ssize_t)sizeof(ready) ||
+        if (!test_socket_send_byte(peer_ready_fds[0], ready)) {
+            close(peer_ready_fds[0]);
+            _exit(99);
+        }
+        if (!test_socket_recv_byte(peer_ready_fds[0], &ready) ||
             ready != 0x73U) {
             close(peer_ready_fds[0]);
             _exit(99);
@@ -895,8 +991,8 @@ run_two_rank_case_with_peer_start_delay(int port,
 
         close(peer_ready_fds[0]);
         peer_ready_fds[0] = -1;
-        if (recv(peer_ready_fds[1], &ready, sizeof(ready), 0) !=
-            (ssize_t)sizeof(ready) || ready != 0x71U) {
+        if (!test_socket_recv_byte(peer_ready_fds[1], &ready) ||
+            ready != 0x71U) {
             result = 1;
         }
     }
@@ -2062,7 +2158,9 @@ main(void)
     /*
      * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
      * consumes base..base+55, and the kernel lock prevents parallel CTest
-     * processes, including different UIDs, from choosing the same range.
+     * processes, including different UIDs, from choosing the same range. On
+     * Linux the selected slot also excludes the kernel ephemeral range, so a
+     * prior loopback peer cannot hold a future listener port in TIME_WAIT.
      */
     int port_lock_fd = -1;
     int base_port = reserve_test_port_slot(&port_lock_fd);
@@ -2083,6 +2181,9 @@ main(void)
             failed = 1;                                              \
         }                                                            \
     } while (0)
+    CHECK_SOCKET_CASE("port-slot-outside-ephemeral-range",
+                      check_port_slot_avoids_linux_ephemeral_range(
+                          base_port));
     CHECK_SOCKET_CASE("slurm-host-parser", check_slurm_host_parser());
     CHECK_SOCKET_CASE("progress-hard-cap",
                       check_progress_deadline_hard_cap());
