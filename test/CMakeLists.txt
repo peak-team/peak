@@ -186,6 +186,7 @@ if(BUILD_TESTING)
 
     add_executable(test_report_formatter
         report/test_report_formatter.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
@@ -196,7 +197,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
     target_compile_options(test_report_formatter PRIVATE -UNDEBUG)
-    target_link_libraries(test_report_formatter PRIVATE Threads::Threads)
+    target_compile_definitions(test_report_formatter PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+    target_link_libraries(test_report_formatter PRIVATE Threads::Threads ${RT_LIBRARY})
     add_test(NAME test_report_formatter COMMAND test_report_formatter)
     set_tests_properties(test_report_formatter
         PROPERTIES
@@ -237,6 +239,7 @@ if(BUILD_TESTING)
     add_executable(test_mpi_report_request_lifetime
         report/test_mpi_report_request_lifetime.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
@@ -439,6 +442,7 @@ if(BUILD_TESTING)
 
     add_executable(test_exec_checkpoint_writer
         report/test_exec_checkpoint_writer.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
@@ -447,11 +451,41 @@ if(BUILD_TESTING)
     endif()
     target_include_directories(test_exec_checkpoint_writer PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test_exec_checkpoint_writer PRIVATE
+        Threads::Threads ${RT_LIBRARY})
     add_test(NAME test_exec_checkpoint_writer
         COMMAND test_exec_checkpoint_writer)
     set_tests_properties(test_exec_checkpoint_writer
         PROPERTIES
             PASS_REGULAR_EXPRESSION "exec_checkpoint_writer_test_ok")
+
+    add_executable(test_output_identity
+        report/test_output_identity.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
+        ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        target_sources(test_output_identity PRIVATE
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+    endif()
+    target_include_directories(test_output_identity PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_compile_definitions(test_output_identity PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+    target_compile_options(test_output_identity PRIVATE -UNDEBUG)
+    target_link_libraries(test_output_identity PRIVATE Threads::Threads ${RT_LIBRARY})
+    foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid template-overlong template-expanded-overlong template-raw-overlong-renderable concurrent snapshot entropy-fallback)
+        add_test(NAME test_output_identity_${_output_identity_case}
+            COMMAND test_output_identity ${_output_identity_case})
+        set_tests_properties(test_output_identity_${_output_identity_case}
+            PROPERTIES PASS_REGULAR_EXPRESSION "output_identity_test_ok")
+    endforeach()
+
+    add_test(NAME test_exec_checkpoint_output_contract
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/static_checks/check_exec_checkpoint_output_contract.py
+                ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test_exec_checkpoint_output_contract
+        PROPERTIES PASS_REGULAR_EXPRESSION "exec_checkpoint_output_contract_ok")
 
     add_test(NAME test_general_listener_layout
         COMMAND ${Python3_EXECUTABLE}
@@ -764,7 +798,7 @@ if(BUILD_TESTING)
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
         set_tests_properties(test_fastpath_thread_exit_checkpoint_exact_once
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_CHECKPOINT_EXACT=1;PEAK_EXEC_CHECKPOINT=1;PEAK_STATSLOG_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-checkpoint;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_CHECKPOINT_EXACT=1;PEAK_EXEC_CHECKPOINT=1;PEAK_STATSLOG_PATH=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-checkpoint;PEAK_STATSLOG_TEMPLATE=${PROJECT_BINARY_DIR}/test/detach_runtime/fastpath-checkpoint-{pid}-{session}.csv;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
                 FAIL_REGULAR_EXPRESSION "fatal|checkpoint .* mismatch|capture failed|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
@@ -3372,7 +3406,7 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
-    foreach(memlog_case create sizing mapping overflow capacity stalled stress allocation realloc)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stress no-clobber allocation realloc)
         add_test(NAME test_memlog_${memlog_case}
             COMMAND test_memlog_safety ${memlog_case})
         set_tests_properties(test_memlog_${memlog_case}

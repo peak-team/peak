@@ -14,6 +14,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/general_listener.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/attach_policy.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c

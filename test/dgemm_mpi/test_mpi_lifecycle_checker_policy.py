@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -134,6 +135,18 @@ class ReportInterruptionPolicyTest(unittest.TestCase):
         self.assertFalse(CHECKER.report_release_was_interrupted(output))
 
 
+class WriterFailureDiagnosticPolicyTest(unittest.TestCase):
+    def test_dirfd_parent_failure_is_the_writer_failure_diagnostic(self) -> None:
+        output = "[peak] failed to prepare stats csv destination: Not a directory\n"
+
+        self.assertTrue(CHECKER.writer_destination_failure_observed(output))
+
+    def test_temp_creation_diagnostic_is_not_the_dirfd_parent_failure(self) -> None:
+        output = "[peak] failed to create temporary stats csv: Not a directory\n"
+
+        self.assertFalse(CHECKER.writer_destination_failure_observed(output))
+
+
 class SocketPortIsolationTest(unittest.TestCase):
     def test_busy_port_in_either_contiguous_pair_slot_retries(self) -> None:
         first_base = 21000
@@ -260,6 +273,73 @@ class SocketPortIsolationTest(unittest.TestCase):
             env.get("PEAK_OUTPUT_AGGREGATION_PORT") == "26000"
             for env in environments
         ))
+
+
+class StatsArtifactNameTest(unittest.TestCase):
+    def test_strict_rank_local_fallback_is_a_valid_identity_artifact(self) -> None:
+        aggregate = (
+            "peak-stats-j42-s7-hnode0-r0-p123-q0123456789abcdef.csv"
+        )
+        fallback = (
+            "peak-stats-j42-s7-hnode0-r0-p123-q0123456789abcdef-"
+            "ranklocal-hnode0.csv"
+        )
+
+        self.assertEqual(
+            CHECKER.STATS_CSV_NAME_RE.fullmatch(aggregate)["rank"], "0"
+        )
+        self.assertEqual(
+            CHECKER.STATS_CSV_NAME_RE.fullmatch(fallback)["rank"], "0"
+        )
+        self.assertIsNone(CHECKER.STATS_CSV_NAME_RE.fullmatch(
+            "peak-stats-j42-s7-hnode0-r0-p123.csv"
+        ))
+
+    @staticmethod
+    def release_name(rank: int, fallback: bool = False) -> str:
+        suffix = "-ranklocal-hnode0" if fallback else ""
+        return (
+            f"peak-stats-j42-s7-hnode0-r{rank}-p{rank + 100}-"
+            f"q{rank:016x}{suffix}.csv"
+        )
+
+    def test_socket_release_layout_requires_one_aggregate_and_every_rank(self) -> None:
+        names = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in range(4)
+        ]
+
+        CHECKER.require_socket_release_fallback_layout(names, 4)
+
+    def test_socket_release_layout_rejects_extra_aggregate(self) -> None:
+        names = [self.release_name(0), self.release_name(1), self.release_name(2)]
+        names.extend(self.release_name(rank, fallback=True) for rank in range(4))
+
+        with self.assertRaisesRegex(AssertionError, "exactly one aggregate"):
+            CHECKER.require_socket_release_fallback_layout(names, 4)
+
+    def test_socket_release_layout_rejects_missing_or_duplicate_rank(self) -> None:
+        missing = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in (0, 1, 3)
+        ]
+        duplicate = [self.release_name(0)] + [
+            self.release_name(rank, fallback=True) for rank in (0, 1, 1, 3)
+        ]
+
+        with self.assertRaisesRegex(AssertionError, "exactly 4 rank-local"):
+            CHECKER.require_socket_release_fallback_layout(missing, 4)
+        with self.assertRaisesRegex(AssertionError, "each rank exactly once"):
+            CHECKER.require_socket_release_fallback_layout(duplicate, 4)
+
+    def test_compact_temporary_artifact_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(CHECKER.compact_temporary_stats_files(directory), [])
+            artifact = Path(directory) / ".peak-tmp.p123.4"
+            artifact.touch()
+            artifacts = CHECKER.compact_temporary_stats_files(directory)
+
+            self.assertEqual(artifacts, [artifact])
+            with self.assertRaisesRegex(AssertionError, "compact CSV temporary"):
+                CHECKER.reject_compact_temporary_stats_files(artifacts)
 
 
 if __name__ == "__main__":

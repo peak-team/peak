@@ -3,7 +3,7 @@
 
 /**
  * @file socket_report_transport.h
- * @brief Aggregate immutable final-report snapshots through PEAK wire-v12.
+ * @brief Aggregate immutable final-report snapshots through PEAK wire-v13.
  */
 
 #include "internal/general_listener/report_snapshot.h"
@@ -48,7 +48,7 @@ typedef enum {
 typedef struct PeakSocketReportSession PeakSocketReportSession;
 
 /**
- * Gathers immutable report snapshots through the established wire-v12 socket
+ * Gathers immutable report snapshots through the established wire-v13 socket
  * protocol.
  *
  * Root advances a bounded set of nonblocking peer connections under both a
@@ -133,6 +133,7 @@ typedef struct {
     uint32_t root_max_active;
     uint32_t root_release_target_count;
     uint32_t root_release_confirmed_count;
+    uint64_t root_receipt_session_nonce;
     uint8_t root_release_decision;
     bool root_receipt_failure_injected;
     bool peer_receipt_received;
@@ -149,6 +150,9 @@ void peak_socket_report_test_telemetry_reset(void);
 /** Copies test-only socket gather observations to @p telemetry_out. */
 void peak_socket_report_test_telemetry_get(
     PeakSocketReportTestTelemetry* telemetry_out);
+
+/** Opens a reducer listener for binding-scope regression tests. */
+int peak_socket_report_test_bind_listener(int port);
 
 /** Configures a one-shot test-only barrier around root receipt transmission. */
 void peak_socket_report_test_receipt_barrier_set(int peer_wait_fd,

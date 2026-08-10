@@ -104,6 +104,68 @@ SOCKET_TRANSPORT_FALLBACK_MODES = {
     "finalize-clean-output-mpi-reducer-fail",
 }
 ALLOCATED_SOCKET_TEST_PORT_BASES = set()
+WRITER_DESTINATION_FAILURE_DIAGNOSTIC = (
+    "failed to prepare stats csv destination"
+)
+STATS_CSV_NAME_RE = re.compile(
+    r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+    r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
+    r"q[0-9a-f]{16}(?P<fallback>-ranklocal-h[A-Za-z0-9_.-]+)?\.csv$"
+)
+
+
+def require_socket_release_fallback_layout(stats_names, nprocs):
+    aggregates = []
+    fallback_ranks = []
+
+    for name in stats_names:
+        match = STATS_CSV_NAME_RE.fullmatch(name)
+        if match is None:
+            raise AssertionError(f"unexpected PEAK stats CSV artifact: {name}")
+        if match["fallback"] is None:
+            aggregates.append(name)
+            continue
+        try:
+            fallback_ranks.append(int(match["rank"]))
+        except ValueError as exc:
+            raise AssertionError(
+                f"rank-local fallback has a non-numeric rank: {name}"
+            ) from exc
+
+    if len(aggregates) != 1:
+        raise AssertionError(
+            f"socket release failure requires exactly one aggregate CSV, got "
+            f"{len(aggregates)}"
+        )
+    if len(fallback_ranks) != nprocs:
+        raise AssertionError(
+            f"socket release failure requires exactly {nprocs} rank-local "
+            f"fallback CSVs, got {len(fallback_ranks)}"
+        )
+    expected_ranks = set(range(nprocs))
+    if set(fallback_ranks) != expected_ranks or \
+            len(set(fallback_ranks)) != len(fallback_ranks):
+        raise AssertionError(
+            "socket release failure fallback ranks must contain each rank "
+            f"exactly once: got {sorted(fallback_ranks)}"
+        )
+
+
+def writer_destination_failure_observed(output):
+    """The dirfd writer rejects a non-directory parent before temp creation."""
+    return WRITER_DESTINATION_FAILURE_DIAGNOSTIC in output
+
+
+def compact_temporary_stats_files(stats_dir):
+    return sorted(Path(stats_dir).glob(".peak-tmp.p*.*"))
+
+
+def reject_compact_temporary_stats_files(paths):
+    if paths:
+        raise AssertionError(
+            "PEAK compact CSV temporary file remained after launcher return: "
+            + ", ".join(path.name for path in paths)
+        )
 
 
 def require_valid_accounting_diagnostics(name, rows):
@@ -796,7 +858,7 @@ def main():
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
         app_args.append("finalize-then-exit0")
-        expected = "failed to create temporary stats csv"
+        expected = WRITER_DESTINATION_FAILURE_DIAGNOSTIC
         expected_extra.append(
             "All-rank report publication release completed: "
             "all_reports_succeeded=0"
@@ -1126,10 +1188,23 @@ def main():
             env=env,
             timeout=args.timeout,
         )
-        stats_files = sorted(Path(stats_dir).glob("peak-stats-p*.csv"))
-        temporary_stats_files = sorted(
-            Path(stats_dir).glob("peak-stats-p*.csv.tmp.*")
+        stats_name = STATS_CSV_NAME_RE
+        stats_files = sorted(
+            path for path in Path(stats_dir).glob("peak-stats-*.csv")
+            if stats_name.fullmatch(path.name)
         )
+        unexpected_stats_files = [
+            path for path in Path(stats_dir).glob("peak-stats-*.csv")
+            if not stats_name.fullmatch(path.name)
+        ]
+        if unexpected_stats_files:
+            raise AssertionError(
+                f"unexpected PEAK stats CSV artifacts: {unexpected_stats_files}")
+        temporary_stats_files = sorted(
+            Path(stats_dir).glob("peak-stats-*.csv.tmp.*")
+        )
+        compact_temporary_files = compact_temporary_stats_files(stats_dir)
+        reject_compact_temporary_stats_files(compact_temporary_files)
         finalize_enter_markers = sorted(
             Path(stats_dir).glob("finalize-enter-r*.txt")
         )
@@ -1162,19 +1237,14 @@ def main():
                 stats_rows.extend(rows)
         for name, evidence in stats_file_evidence.items():
             require_valid_accounting_diagnostics(name, evidence["rows"])
-        selected_stats_pattern = (
-            "peak-stats-p*-r0.csv" if nprocs > 1 else "peak-stats-p*.csv"
-        )
-        selected_temporary_stats_pattern = (
-            "peak-stats-p*-r0.csv.tmp.*" if nprocs > 1 else
-            "peak-stats-p*.csv.tmp.*"
-        )
-        selected_stats_files = sorted(
-            Path(stats_dir).glob(selected_stats_pattern)
-        )
-        selected_temporary_stats_files = sorted(
-            Path(stats_dir).glob(selected_temporary_stats_pattern)
-        )
+        selected_stats_files = [
+            path for path in stats_files
+            if nprocs == 1 or stats_name.fullmatch(path.name)["rank"] == "0"
+        ]
+        selected_temporary_stats_files = [
+            path for path in temporary_stats_files
+            if nprocs == 1 or "-r0-" in path.name
+        ]
         selected_stats_rows = []
         selected_stats_fields = None
         if len(selected_stats_files) == 1:
@@ -1306,6 +1376,10 @@ def main():
             f"expected at most {expected_max_peak_tables} PEAK output table(s), "
             f"got {peak_table_count}"
         )
+    if args.mode == "finalize-clean-output-socket-release-fail":
+        require_socket_release_fallback_layout(
+            [path.name for path in stats_files], nprocs
+        )
     if expected_stats_files is not None and len(stats_files) != expected_stats_files:
         raise AssertionError(
             f"expected {expected_stats_files} PEAK stats file(s), got {len(stats_files)}"
@@ -1329,7 +1403,11 @@ def main():
         for name, evidence in stats_file_evidence.items():
             require_complete_stats_evidence(name, evidence)
         for path in temporary_stats_files:
-            rank_match = re.search(r"-r(\d+)\.csv\.tmp\.", path.name)
+            rank_match = re.fullmatch(
+                r"peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+                r"h[A-Za-z0-9_.-]+-r(\d+)-p\d+-q[0-9a-f]{16}\.csv\.tmp\..+",
+                path.name,
+            )
             if rank_match is None or int(rank_match.group(1)) == 0:
                 raise AssertionError(
                     "subset-finalize handoff left an unexpected temporary CSV: "

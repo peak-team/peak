@@ -1,12 +1,14 @@
 #include "internal/general_listener/socket_report_transport.h"
 
 #include <float.h>
+#include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -14,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TEST_PORT_SLOT_COUNT 800
+#define TEST_PORT_SLOT_COUNT 350 /* 10000..32399: below Linux defaults. */
 #define TEST_PORT_SLOT_WIDTH 64
 #define TEST_PORT_BASE 10000
 #define TEST_DEFAULT_PORT_BASE 42000
@@ -43,6 +45,31 @@ typedef enum {
 
 static bool test_saturate_dropped_counters;
 
+static bool
+test_socket_send_byte(int fd, unsigned char value)
+{
+    ssize_t written;
+
+    do {
+        written = send(fd, &value, sizeof(value), MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    return written == (ssize_t)sizeof(value);
+}
+
+static bool
+test_socket_recv_byte(int fd, unsigned char* value_out)
+{
+    ssize_t received;
+
+    if (value_out == NULL) {
+        return false;
+    }
+    do {
+        received = recv(fd, value_out, sizeof(*value_out), 0);
+    } while (received < 0 && errno == EINTR);
+    return received == (ssize_t)sizeof(*value_out);
+}
+
 static int64_t
 test_monotonic_ms(void)
 {
@@ -65,7 +92,9 @@ test_tcp_slot_is_available(int base_port)
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in address = {
             .sin_family = AF_INET,
-            .sin_port = htons((uint16_t)(base_port + offset)),
+            .sin_port = htons((uint16_t)(base_port == 0
+                                             ? 0
+                                             : base_port + offset)),
             .sin_addr.s_addr = htonl(INADDR_ANY),
         };
 
@@ -88,26 +117,78 @@ test_tcp_slot_is_available(int base_port)
     return available;
 }
 
-static int
-reserve_test_port_slot(int* lock_fd_out)
+static bool
+test_linux_ephemeral_port_range(int* first_port_out, int* last_port_out)
 {
-    int first_slot;
+    FILE* range_file;
+    int first_port;
+    int last_port;
 
-    if (lock_fd_out == NULL) {
+    if (first_port_out == NULL || last_port_out == NULL) {
+        return false;
+    }
+    range_file = fopen("/proc/sys/net/ipv4/ip_local_port_range", "r");
+    if (range_file == NULL) {
+        return false;
+    }
+    bool parsed =
+        fscanf(range_file, "%d %d", &first_port, &last_port) == 2 &&
+        first_port > 0 && last_port >= first_port;
+
+    fclose(range_file);
+    if (!parsed) {
+        return false;
+    }
+    *first_port_out = first_port;
+    *last_port_out = last_port;
+    return true;
+}
+
+static bool
+test_port_ranges_overlap(int first_a,
+                         int last_a,
+                         int first_b,
+                         int last_b)
+{
+    return first_a <= last_b && first_b <= last_a;
+}
+
+static int
+reserve_test_port_slot_from(int* lock_fd_out,
+                            int port_base,
+                            int first_slot,
+                            bool avoid_linux_ephemeral_ports,
+                            int ephemeral_first,
+                            int ephemeral_last)
+{
+    if (lock_fd_out == NULL || first_slot < 0 ||
+        first_slot >= TEST_PORT_SLOT_COUNT) {
         return -1;
     }
     *lock_fd_out = -1;
-    first_slot = (int)(getpid() % TEST_PORT_SLOT_COUNT);
     for (int offset = 0; offset < TEST_PORT_SLOT_COUNT; offset++) {
         int slot = (first_slot + offset) % TEST_PORT_SLOT_COUNT;
-        int port = TEST_PORT_BASE + slot * TEST_PORT_SLOT_WIDTH;
-        int lock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int port = port_base + slot * TEST_PORT_SLOT_WIDTH;
         struct sockaddr_in address = {
             .sin_family = AF_INET,
             .sin_port = htons((uint16_t)port),
             .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         };
 
+        /*
+         * A loopback peer uses an ephemeral local source port.  Keeping the
+         * entire test slot outside that kernel range prevents a completed
+         * earlier case from retaining a future gather/release port in
+         * TIME_WAIT after this availability check has finished.
+         */
+        if (avoid_linux_ephemeral_ports &&
+            test_port_ranges_overlap(port,
+                                     port + TEST_PORT_SLOT_WIDTH - 1,
+                                     ephemeral_first,
+                                     ephemeral_last)) {
+            continue;
+        }
+        int lock_fd = socket(AF_INET, SOCK_DGRAM, 0);
         /*
          * UDP and TCP have separate port namespaces. Holding the UDP endpoint
          * gives this process a kernel-enforced, cross-UID slot lock while the
@@ -126,6 +207,76 @@ reserve_test_port_slot(int* lock_fd_out)
         }
     }
     return -1;
+}
+
+static int
+reserve_test_port_slot(int* lock_fd_out)
+{
+    int ephemeral_first = 0;
+    int ephemeral_last = -1;
+    bool avoid_linux_ephemeral_ports =
+        test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last);
+
+    return reserve_test_port_slot_from(
+        lock_fd_out,
+        TEST_PORT_BASE,
+        (int)(getpid() % TEST_PORT_SLOT_COUNT),
+        avoid_linux_ephemeral_ports,
+        ephemeral_first,
+        ephemeral_last);
+}
+
+static int
+check_port_slot_avoids_linux_ephemeral_range(int base_port)
+{
+    int ephemeral_first;
+    int ephemeral_last;
+
+    if (!test_linux_ephemeral_port_range(&ephemeral_first, &ephemeral_last)) {
+        return 0;
+    }
+    return test_port_ranges_overlap(base_port,
+                                    base_port + TEST_PORT_SLOT_WIDTH - 1,
+                                    ephemeral_first,
+                                    ephemeral_last)
+               ? 1
+               : 0;
+}
+
+static int
+check_skipped_ephemeral_slots_do_not_consume_fds(void)
+{
+    struct rlimit original_limit;
+    struct rlimit limited_limit;
+    int lock_fd = -1;
+    int result;
+    bool reserved;
+
+    if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0 ||
+        original_limit.rlim_cur <= 128) {
+        return 0;
+    }
+    limited_limit = original_limit;
+    limited_limit.rlim_cur = 128;
+    if (setrlimit(RLIMIT_NOFILE, &limited_limit) != 0) {
+        return 1;
+    }
+    /* Slots 1..349 are filtered; slot 0 uses kernel-selected port zero. */
+    result = reserve_test_port_slot_from(
+        &lock_fd,
+        0,
+        1,
+        true,
+        TEST_PORT_SLOT_WIDTH,
+        TEST_PORT_SLOT_COUNT * TEST_PORT_SLOT_WIDTH - 1);
+    reserved = result == 0 && lock_fd >= 0;
+    if (lock_fd >= 0) {
+        close(lock_fd);
+    }
+    if (setrlimit(RLIMIT_NOFILE, &original_limit) != 0) {
+        return 1;
+    }
+    return !reserved;
 }
 
 static int
@@ -156,6 +307,46 @@ bind_test_tcp_port(int port, bool reuse_address)
         return -1;
     }
     return fd;
+}
+
+static void
+check_listener_bind_scope(int port)
+{
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    int fd;
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_HOST", "127.0.0.1", 1);
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS");
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND");
+    fd = peak_socket_report_test_bind_listener(port);
+    if (fd < 0 || getsockname(fd, (struct sockaddr*)&address, &length) != 0 ||
+        address.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        fprintf(stderr, "default listener did not bind root-local address\n");
+        if (fd >= 0) close(fd);
+        exit(1);
+    }
+    close(fd);
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS", "0.0.0.0", 1);
+    fd = peak_socket_report_test_bind_listener(port + 1);
+    if (fd >= 0) {
+        fprintf(stderr, "wildcard bind bypassed explicit broad opt-in\n");
+        close(fd);
+        exit(1);
+    }
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS");
+
+    (void)setenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND", "1", 1);
+    fd = peak_socket_report_test_bind_listener(port + 2);
+    if (fd < 0 || getsockname(fd, (struct sockaddr*)&address, &length) != 0 ||
+        address.sin_addr.s_addr != htonl(INADDR_ANY)) {
+        fprintf(stderr, "explicit broad listener bind was not honored\n");
+        if (fd >= 0) close(fd);
+        exit(1);
+    }
+    close(fd);
+    (void)unsetenv("PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND");
 }
 
 static void
@@ -689,7 +880,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         action == TEST_GATHER_PAYLOAD_DROP_FAILURE) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_AFTER_BYTES",
-            /* wire-v12 header (168 bytes) plus 17 payload bytes. */
+            /* wire-v13 header (168 bytes) plus 17 payload bytes. */
             action == TEST_GATHER_DROP_FAILURE ? "1" : "185",
             1);
         (void)setenv(
@@ -780,16 +971,15 @@ run_two_rank_case_with_peer_start_delay(int port,
             receipt_barrier_fds[0] = -1;
         }
         set_test_rank(1, 2);
-        if (peer == NULL ||
-            send(peer_ready_fds[0],
-                 &ready,
-                 sizeof(ready),
-                 MSG_NOSIGNAL) != (ssize_t)sizeof(ready)) {
+        if (peer == NULL) {
             close(peer_ready_fds[0]);
             _exit(99);
         }
-        if (recv(peer_ready_fds[0], &ready, sizeof(ready), 0) !=
-                (ssize_t)sizeof(ready) ||
+        if (!test_socket_send_byte(peer_ready_fds[0], ready)) {
+            close(peer_ready_fds[0]);
+            _exit(99);
+        }
+        if (!test_socket_recv_byte(peer_ready_fds[0], &ready) ||
             ready != 0x73U) {
             close(peer_ready_fds[0]);
             _exit(99);
@@ -810,7 +1000,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         peer_ready_fds[0] = -1;
         memset(&telemetry, 0, sizeof(telemetry));
         peak_socket_report_test_telemetry_get(&telemetry);
-        if (telemetry.wire_version != 12U ||
+        if (telemetry.wire_version != 13U ||
             telemetry.peer_receipt_received !=
                 peer_registration_expected ||
             telemetry.peer_confirmation_sent !=
@@ -855,8 +1045,8 @@ run_two_rank_case_with_peer_start_delay(int port,
 
         close(peer_ready_fds[0]);
         peer_ready_fds[0] = -1;
-        if (recv(peer_ready_fds[1], &ready, sizeof(ready), 0) !=
-            (ssize_t)sizeof(ready) || ready != 0x71U) {
+        if (!test_socket_recv_byte(peer_ready_fds[1], &ready) ||
+            ready != 0x71U) {
             result = 1;
         }
     }
@@ -879,7 +1069,9 @@ run_two_rank_case_with_peer_start_delay(int port,
         peak_socket_report_test_receipt_barrier_set(-1, -1);
     }
     if (!peer_exits_before_connect &&
-        (root_telemetry.wire_version != 12U ||
+        (root_telemetry.wire_version != 13U ||
+         (!gather_must_fail &&
+          root_telemetry.root_receipt_session_nonce == 0) ||
         (!early_drop_may_skip_accept &&
          root_telemetry.root_max_active != 1U) ||
         (early_drop_may_skip_accept &&
@@ -1183,7 +1375,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_socket_report_transport_abort(peer_session);
         peak_report_snapshot_destroy(peer_aggregate);
         if (peer_cpu_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-            telemetry.wire_version != 12U ||
+            telemetry.wire_version != 13U ||
             !telemetry.peer_receipt_received ||
             !telemetry.peer_confirmation_sent ||
             !telemetry.peer_release_started ||
@@ -1211,7 +1403,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_report_snapshot_destroy(peer_cuda);
         if ((!cuda_schema_mismatch &&
              (peer_cuda_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-              telemetry.wire_version != 12U ||
+              telemetry.wire_version != 13U ||
               !telemetry.peer_receipt_received ||
               !telemetry.peer_confirmation_sent ||
               !telemetry.peer_release_started ||
@@ -1236,7 +1428,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
     memset(&telemetry, 0, sizeof(telemetry));
     peak_socket_report_test_telemetry_get(&telemetry);
     if (cpu_status != PEAK_SOCKET_REPORT_ROOT_PREPARED || session == NULL ||
-        !aggregate_matches(aggregate) || telemetry.wire_version != 12U ||
+        !aggregate_matches(aggregate) || telemetry.wire_version != 13U ||
         telemetry.root_payload_count != 1U ||
         telemetry.root_receipt_count != 1U ||
         telemetry.root_confirmation_count != 1U ||
@@ -1292,7 +1484,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
             }
         } else if (cuda_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
                    session == NULL || !aggregate_matches(aggregate) ||
-                   telemetry.wire_version != 12U ||
+                   telemetry.wire_version != 13U ||
                    telemetry.root_payload_count != 1U ||
                    telemetry.root_receipt_count != 1U ||
                    telemetry.root_confirmation_count != 1U ||
@@ -1653,7 +1845,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
                 &peer_aggregate);
             memset(&telemetry, 0, sizeof(telemetry));
             peak_socket_report_test_telemetry_get(&telemetry);
-            if (telemetry.wire_version != 12U ||
+            if (telemetry.wire_version != 13U ||
                 !telemetry.peer_receipt_received ||
                 !telemetry.peer_confirmation_sent ||
                 !telemetry.peer_release_started ||
@@ -1683,7 +1875,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
         peak_socket_report_test_telemetry_get(&root_telemetry);
         if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
             session == NULL || aggregate == NULL ||
-            root_telemetry.wire_version != 12U ||
+            root_telemetry.wire_version != 13U ||
             root_telemetry.root_payload_count != (uint32_t)(size - 1) ||
             root_telemetry.root_receipt_count != (uint32_t)(size - 1) ||
             root_telemetry.root_confirmation_count !=
@@ -1842,7 +2034,7 @@ run_duplicate_rank_case(int port)
         peak_socket_report_test_telemetry_get(&telemetry);
         if (status != PEAK_SOCKET_REPORT_FAILED ||
             session != NULL || aggregate != NULL ||
-            telemetry.wire_version != 12U ||
+            telemetry.wire_version != 13U ||
             telemetry.root_payload_count > 1U ||
             telemetry.root_receipt_count >
                 telemetry.root_payload_count ||
@@ -1877,6 +2069,7 @@ check_single_process_clone(void)
     if (local == NULL) {
         return 1;
     }
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL", "1", 1);
     status = peak_socket_report_transport_begin(
         local,
         PEAK_SOCKET_REPORT_RANK_ENV_ONLY,
@@ -1894,7 +2087,32 @@ check_single_process_clone(void)
     }
     peak_report_snapshot_destroy(aggregate);
     peak_report_snapshot_destroy(local);
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL");
     return result;
+}
+
+static int
+check_multi_rank_nonce_failure(void)
+{
+    PeakReportSnapshot* local = fixture_snapshot(0, false);
+    PeakReportSnapshot* aggregate = NULL;
+    PeakSocketReportSession* session = NULL;
+    PeakSocketReportStatus status;
+
+    if (local == NULL) return 1;
+    clear_rank_environment();
+    set_test_rank(0, 2);
+    (void)setenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL", "1", 1);
+    status = peak_socket_report_transport_begin(
+        local, PEAK_SOCKET_REPORT_RANK_ENV_ONLY, &session, &aggregate);
+    (void)unsetenv("PEAK_TEST_OUTPUT_AGGREGATION_NONCE_FAIL");
+    clear_rank_environment();
+    peak_socket_report_transport_abort(session);
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    return status == PEAK_SOCKET_REPORT_FAILED && session == NULL &&
+                   aggregate == NULL
+               ? 0 : 1;
 }
 
 static int
@@ -1994,7 +2212,9 @@ main(void)
     /*
      * Hold the UDP endpoint paired with a 64-port TCP slot. The test currently
      * consumes base..base+55, and the kernel lock prevents parallel CTest
-     * processes, including different UIDs, from choosing the same range.
+     * processes, including different UIDs, from choosing the same range. On
+     * Linux the selected slot also excludes the kernel ephemeral range, so a
+     * prior loopback peer cannot hold a future listener port in TIME_WAIT.
      */
     int port_lock_fd = -1;
     int base_port = reserve_test_port_slot(&port_lock_fd);
@@ -2015,6 +2235,11 @@ main(void)
             failed = 1;                                              \
         }                                                            \
     } while (0)
+    CHECK_SOCKET_CASE("port-slot-outside-ephemeral-range",
+                      check_port_slot_avoids_linux_ephemeral_range(
+                          base_port));
+    CHECK_SOCKET_CASE("ephemeral-slot-skip-does-not-leak-fds",
+                      check_skipped_ephemeral_slots_do_not_consume_fds());
     CHECK_SOCKET_CASE("slurm-host-parser", check_slurm_host_parser());
     CHECK_SOCKET_CASE("progress-hard-cap",
                       check_progress_deadline_hard_cap());
@@ -2024,7 +2249,9 @@ main(void)
                       check_sequential_channel_ports());
     CHECK_SOCKET_CASE("gather-admission-waves",
                       check_gather_admission_waves());
+    check_listener_bind_scope(base_port + 56);
     CHECK_SOCKET_CASE("single-process", check_single_process_clone());
+    CHECK_SOCKET_CASE("multi-rank-nonce-failure", check_multi_rank_nonce_failure());
     CHECK_SOCKET_CASE("required-rank", check_required_rank_metadata());
     CHECK_SOCKET_CASE("invalid-output-pointers",
                       check_invalid_output_pointers_are_cleared());

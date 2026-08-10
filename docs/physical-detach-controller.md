@@ -829,8 +829,11 @@ emits a bounded diagnostic, releases the peers it did receive, and by default
 falls back to rank-local output CSV files. Set
 `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK=0` (or `false`) to keep this from
 falling back and retain aggregate-disabled behavior instead.
-`PEAK_OUTPUT_AGGREGATION_TOKEN` can override the reducer token for controlled
-tests.
+`PEAK_OUTPUT_AGGREGATION_TOKEN` can override the deterministic peer-enrollment
+identifier for controlled tests. The root distributes a fresh unpredictable
+session nonce after registration; neither value is authentication. By default the reducer binds
+only the selected root-host address; `PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND`
+is the explicit opt-in for an all-interface bind.
 
 `peak_fini()` is process-single-entry: the first caller owns teardown and later
 callers wait for that teardown to finish without touching Gum, MPI, or

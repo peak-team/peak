@@ -1101,16 +1101,29 @@ def run_fixture(args, tmpdir: Path, preload=True):
 
 
 def csv_files(tmpdir: Path):
-    stats_name = re.compile(
-        r"^(?:peak_stats|peak_statslog)-p\d+(?P<checkpoint>-exec\d+)?\.csv$"
+    identity_name = re.compile(
+        r"^(?:peak_stats|peak_statslog)-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
+        r"h[A-Za-z0-9_.-]+-r[A-Za-z0-9_-]+-p\d+-q[0-9a-f]{16}"
+        r"(?P<checkpoint>-exec\d+)?\.csv$"
+    )
+    legacy_checkpoint = re.compile(
+        r"^(?:peak_stats|peak_statslog)-p\d+-exec\d+\.csv$"
     )
     all_csv = sorted(tmpdir.glob("*.csv"))
-    matched_csv = [(path, stats_name.fullmatch(path.name)) for path in all_csv]
-    unexpected_csv = [path for path, match in matched_csv if match is None]
+    matched_csv = [(path, identity_name.fullmatch(path.name)) for path in all_csv]
+    unexpected_csv = [
+        path for path, match in matched_csv
+        if match is None and legacy_checkpoint.fullmatch(path.name) is None
+    ]
     require(not unexpected_csv,
             f"unexpected CSV artifacts in {tmpdir}: {unexpected_csv}")
-    exec_files = [path for path, match in matched_csv if match["checkpoint"]]
-    final_files = [path for path, match in matched_csv if not match["checkpoint"]]
+    exec_files = [
+        path for path, match in matched_csv
+        if (match is not None and match["checkpoint"]) or
+        legacy_checkpoint.fullmatch(path.name) is not None
+    ]
+    final_files = [path for path, match in matched_csv
+                   if match is not None and not match["checkpoint"]]
     return exec_files, final_files
 
 
@@ -1166,6 +1179,22 @@ def run_checkpoint_contract_self_test():
         else:
             raise AssertionError(
                 "active-controller malformed checkpoint was accepted")
+        final_with_exec_metadata = (
+            workdir / "peak_stats-jjob-exec-sstep-hhost-exec-r0-p1-"
+            "q0123456789abcdef.csv"
+        )
+        final_with_exec_metadata.write_text("function,count\n", encoding="utf-8")
+        _, final_files = csv_files(workdir)
+        require(final_with_exec_metadata in final_files,
+                "identity metadata containing -exec was misclassified as checkpoint")
+        legacy_final = workdir / "peak_stats-p1.csv"
+        legacy_final.write_text("function,count\n", encoding="utf-8")
+        try:
+            csv_files(workdir)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("legacy PID-only final was accepted")
     print("exec_chain_checkpoint_contract_ok")
 
 
@@ -1592,11 +1621,13 @@ def check_common(args, proc, tmpdir: Path, native_observation=None):
         parent_pid = match.group(5)
         parent_exec_files = [
             path for path in exec_files
-            if f"-p{parent_pid}-exec" in path.name
+            if re.search(rf"-p{re.escape(parent_pid)}-q[0-9a-f]{{16}}-exec\d+\.csv$",
+                         path.name)
         ]
         parent_final_files = [
             path for path in final_files
-            if f"-p{parent_pid}.csv" in path.name
+            if re.search(rf"-p{re.escape(parent_pid)}-q[0-9a-f]{{16}}\.csv$",
+                         path.name)
         ]
         require(parent_exec_files,
                 f"clone parent wrote no exec checkpoint: {exec_files}")

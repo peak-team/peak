@@ -159,6 +159,9 @@ in detail.
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
 | `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Force the C++ symbol-map lookup path for target matching. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
+| `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
+| `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |
+| `PEAK_OUTPUT_ALLOW_OVERWRITE` | Explicitly permit replacement of a completed statistics CSV. Default: disabled. |
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
 | `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
@@ -180,7 +183,9 @@ in detail.
 | `PEAK_OUTPUT_AGGREGATION_PORT` | Override the socket reducer port. |
 | `PEAK_OUTPUT_AGGREGATION_TIMEOUT_MS` | Socket no-progress timeout and root-release phase timeout. Default: `60000`. The absolute gather cap adds `5000` ms per 128-peer wave, with at most `300000` ms adaptive margin; explicit values are never shortened. |
 | `PEAK_OUTPUT_AGGREGATION_RELEASE_TIMEOUT_MS` | Peer-side end-to-end socket release budget spanning the absolute gather cap, report publication, and confirmed release. Default and minimum: gather hard cap plus two socket phase timeouts. |
-| `PEAK_OUTPUT_AGGREGATION_TOKEN` | Override the socket reducer session token. |
+| `PEAK_OUTPUT_AGGREGATION_TOKEN` | Override the deterministic socket peer-enrollment identifier for controlled tests. Root still issues an unpredictable per-report session nonce; neither value is authentication. |
+| `PEAK_OUTPUT_AGGREGATION_BIND_ADDRESS` | Bind the socket reducer to this IPv4 node-local address. By default it binds only the resolved root-host address. |
+| `PEAK_OUTPUT_AGGREGATION_ALLOW_BROAD_BIND` | Explicitly permit binding the reducer to all interfaces. Default: disabled. |
 | `PEAK_OUTPUT_AGGREGATION_SOCKET_FALLBACK` | Enable MPI-reducer-to-socket and socket-to-rank-local fallback paths. Default: enabled. |
 
 MPI finalization and aggregation are deliberately bounded and locally
@@ -193,9 +198,10 @@ default because its hwloc teardown can crash after PEAK instrumentation; this
 compatibility path is non-conforming and must be validated with the target
 launcher. A gate error or timeout permanently disables later teardown MPI
 calls, even when `PEAK_MPI_REAL_FINALIZE=1` was requested.
-Aggregate CSVs retain `base-pPID.csv`; multi-rank local fallback files use
-`base-pPID-rRANK.csv` (or a sanitized hostname suffix when rank metadata is
-unavailable) to avoid cross-node PID collisions.
+CSV publication uses the same job/step/host/rank/PID/session identity as the
+default report name, including rank-local fallback. Completed outputs are
+published no-clobber by default; replacement requires the explicit
+`PEAK_OUTPUT_ALLOW_OVERWRITE` opt-in.
 In both CSV and text reports, `count` is the exact total call count,
 `per_thread` is the ceiling over active threads, and `per_rank`/`avg/rank` is
 the non-truncated arithmetic mean over all ranks represented by the report.

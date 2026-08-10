@@ -28,6 +28,7 @@
 #include "internal/general_listener_internal.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
+#include "internal/general_listener/output_identity.h"
 #include "internal/jit_provider.h"
 #include "logging.h"
 #include "pthread_listener.h"
@@ -1160,6 +1161,7 @@ peak_test_parse_max_num_threads(void)
 
 void peak_init()
 {
+    peak_output_identity_initialize();
     PeakRuntimeNumericConfig numeric_config;
 
     peak_log_configure();

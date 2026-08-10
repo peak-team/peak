@@ -51,12 +51,14 @@ bool peak_report_formatter_write_rank_local_csv(
     const PeakReportSnapshot* snapshot);
 
 /**
- * Write a rank-local CSV with a rank or sanitized-host suffix.
+ * Write a strict rank-local CSV that always adds a sanitized-host suffix.
  *
- * A consistent launcher pair uses `-rRANK`; missing or inconsistent metadata
- * uses a sanitized hostname. The host suffix reduces cross-node PID collision
- * risk but cannot guarantee uniqueness when host identity is unavailable or
- * duplicated. This is the fail-closed fallback for an active MPI job whose
+ * This strict variant always appends a sanitized hostname as a
+ * `-ranklocal-hHOST` suffix, including when launcher rank metadata is valid;
+ * a valid rank suffix may also remain in the base name.
+ * The suffix makes a rank-local root fallback distinct from an already
+ * published aggregate. Component-bound names retain a hostname preview plus
+ * a stable digest. It is the fail-closed fallback for an active MPI job whose
  * strict socket path cannot identify the world without MPI.
  */
 bool peak_report_formatter_write_rank_local_csv_host_disambiguated(

@@ -32,6 +32,7 @@ add_executable(test_mpi_report_reduction test_mpi_report_reduction.c)
 add_executable(test_mpi_report_transport
     test_mpi_report_transport.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/mpi_report_transport.c
+    ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_formatter.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c

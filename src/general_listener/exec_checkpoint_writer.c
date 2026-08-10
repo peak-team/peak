@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "internal/general_listener/exec_checkpoint_writer.h"
+#include "internal/general_listener/output_identity.h"
 
 #include "internal/exec_raw_syscall.h"
 
@@ -103,7 +104,7 @@ peak_exec_checkpoint_path(char* buffer,
                           size_t buffer_size,
                           unsigned long long checkpoint_index)
 {
-    const char* base = getenv("PEAK_STATSLOG_PATH");
+    const char* base;
     size_t out = 0;
 
     if (buffer == NULL || buffer_size == 0) {
@@ -111,9 +112,18 @@ peak_exec_checkpoint_path(char* buffer,
         return -1;
     }
     buffer[0] = '\0';
-    if (base == NULL || base[0] == '\0') {
-        base = "./peak_statslog";
+    int identity_path = peak_output_identity_checkpoint_path(buffer,
+                                                              buffer_size,
+                                                              checkpoint_index);
+    if (identity_path == PEAK_OUTPUT_CHECKPOINT_READY) {
+        return 0;
     }
+    if (identity_path == PEAK_OUTPUT_CHECKPOINT_UNAVAILABLE) {
+        errno = EINVAL;
+        return -1;
+    }
+    base = getenv("PEAK_STATSLOG_PATH");
+    if (base == NULL || base[0] == '\0') base = "./peak_statslog";
 
     if (!peak_exec_checkpoint_append_literal(buffer, buffer_size, &out, base) ||
         !peak_exec_checkpoint_append_literal(buffer, buffer_size, &out, "-p") ||

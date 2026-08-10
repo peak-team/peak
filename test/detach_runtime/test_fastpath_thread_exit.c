@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <pthread.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -33,6 +34,27 @@ static atomic_int aba_worker_ready;
 static atomic_int aba_worker_release;
 typedef unsigned long (*CountFunction)(size_t);
 typedef uint64_t (*DroppedFunction)(void);
+
+static int
+checkpoint_name_matches(const char* name, long pid)
+{
+    char prefix[64];
+    const char* session;
+
+    if (snprintf(prefix, sizeof(prefix), "fastpath-checkpoint-%ld-", pid) >=
+            (int)sizeof(prefix) ||
+        strncmp(name, prefix, strlen(prefix)) != 0) {
+        return 0;
+    }
+    session = name + strlen(prefix);
+    for (size_t index = 0; index < 16; index++) {
+        if (!((session[index] >= '0' && session[index] <= '9') ||
+              (session[index] >= 'a' && session[index] <= 'f'))) {
+            return 0;
+        }
+    }
+    return strcmp(session + 16, "-exec1.csv") == 0;
+}
 typedef void (*MarkNextHelperFunction)(void);
 typedef int (*StaleGenerationRemoveFunction)(pthread_t);
 typedef int (*RemoveAmbiguousMappingFunction)(pthread_t);
@@ -618,12 +640,45 @@ main(void)
             RTLD_DEFAULT, "peak_checkpoint_for_exec");
         const char* base = getenv("PEAK_STATSLOG_PATH");
         char path[1024];
+        char directory[1024];
+        char* slash;
+        DIR* stream;
+        struct dirent* entry;
+        int matches = 0;
         char* argv[] = { (char*)"checkpoint-test", NULL };
         if (checkpoint == NULL || base == NULL ||
             checkpoint("checkpoint-test", argv) != 0 ||
-            snprintf(path, sizeof(path), "%s-p%ld-exec1.csv", base,
-                     (long)getpid()) >= (int)sizeof(path)) {
+            snprintf(directory, sizeof(directory), "%s", base) >=
+                (int)sizeof(directory) ||
+            (slash = strrchr(directory, '/')) == NULL) {
             fputs("checkpoint capture failed\n", stderr);
+            return 1;
+        }
+        *slash = '\0';
+        stream = opendir(directory);
+        if (stream == NULL) {
+            fputs("checkpoint directory unavailable\n", stderr);
+            return 1;
+        }
+        if (!checkpoint_name_matches(
+                "fastpath-checkpoint-1-0123456789abcdef-exec1.csv", 1) ||
+            checkpoint_name_matches("fastpath-checkpoint-p1-exec1.csv", 1)) {
+            fputs("checkpoint name contract mismatch\n", stderr);
+            return 1;
+        }
+        while ((entry = readdir(stream)) != NULL) {
+            if (checkpoint_name_matches(entry->d_name, (long)getpid())) {
+                if (snprintf(path, sizeof(path), "%s/%s", directory,
+                             entry->d_name) >= (int)sizeof(path)) {
+                    (void)closedir(stream);
+                    return 1;
+                }
+                matches++;
+            }
+        }
+        (void)closedir(stream);
+        if (matches != 1) {
+            fputs("checkpoint output identity mismatch\n", stderr);
             return 1;
         }
         FILE* checkpoint_csv = fopen(path, "r");
