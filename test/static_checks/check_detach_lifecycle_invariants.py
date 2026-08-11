@@ -2415,6 +2415,9 @@ def check_runtime_configuration_freeze(repo_root):
     dlopen_selector = extract_function(
         dlopen, "dlopen_interceptor_target_uses_selector_resolution"
     )
+    dlopen_dynamic_attach = extract_function(
+        dlopen, "dlopen_interceptor_attach_from_request"
+    )
     dlopen_trace = extract_function(
         dlopen, "dlopen_interceptor_trace_counters"
     )
@@ -2427,9 +2430,13 @@ def check_runtime_configuration_freeze(repo_root):
             dlopen_config and
             "getenv" not in dlopen_debug and
             "g_getenv" not in dlopen_debug and
-            "configured_cxx_symbol_scan_enabled" in dlopen_selector and
+            "configured_cxx_symbol_scan_enabled" not in dlopen_selector and
             "getenv" not in dlopen_selector and
             "g_getenv" not in dlopen_selector and
+            "dlsym(request->handle" in dlopen_dynamic_attach and
+            "configured_cxx_symbol_scan_enabled" in dlopen_dynamic_attach and
+            "getenv" not in dlopen_dynamic_attach and
+            "g_getenv" not in dlopen_dynamic_attach and
             "getenv" not in dlopen_trace and
             "g_getenv" not in dlopen_trace and
             "dlopen_interceptor_init_runtime_config();" in dlopen_attach,

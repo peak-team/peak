@@ -7,6 +7,7 @@ set(sources_utils_c
     parent_registry.c
     process_filter.c
     source_target.c
+    target_selector_syntax.c
     target_config.c
     timing.c
 )

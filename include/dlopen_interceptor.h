@@ -153,6 +153,18 @@ PEAK_DLOPEN_API void dlopen_interceptor_get_dynamic_attach_diagnostics(
  * otherwise.
  * @{ */
 
+typedef struct {
+    unsigned long long deferred_module_sync_drains;
+    unsigned long long selector_resolver_batches;
+} PeakDlopenSelectorDiagnostics;
+
+/** Resets test-only selector-path counters. */
+PEAK_DLOPEN_API void dlopen_interceptor_test_reset_selector_diagnostics(void);
+
+/** Copies test-only selector-path counters. */
+PEAK_DLOPEN_API void dlopen_interceptor_test_get_selector_diagnostics(
+    PeakDlopenSelectorDiagnostics* diagnostics);
+
 /**
  * Discards queued work, releases retained handles, resets counters, and
  * selects open/closed state.

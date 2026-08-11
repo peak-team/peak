@@ -11,6 +11,7 @@
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
+#include "internal/general_listener/selector_test_hooks.h"
 #include "internal/general_listener/socket_report_transport.h"
 #ifdef HAVE_MPI
 #include "internal/general_listener/mpi_report_transport.h"
@@ -88,6 +89,9 @@ static gboolean* array_listener_reattached;
 static gboolean* array_listener_revisited;
 static gboolean* array_listener_gum_detached;
 static gboolean* array_listener_gum_detach_flushed;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic gulong peak_general_listener_test_startup_selector_batch_count = 0;
+#endif
 static double* peak_hook_last_detach_time;
 static PeakHookState* peak_hook_states;
 static double* peak_hook_next_retry_time;
@@ -1013,10 +1017,6 @@ peak_general_controller_allocate_batch_id_unlocked(void)
 static gboolean
 peak_symbol_should_use_cpp_map(const char* symbol)
 {
-    if (peak_env_truthy_general(g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN"))) {
-        return TRUE;
-    }
-
     return symbol != NULL &&
            (g_str_has_prefix(symbol, "_Z") ||
             strstr(symbol, "::") != NULL ||
@@ -2686,6 +2686,13 @@ peak_general_listener_test_call_count(size_t hook_id)
     }
     pthread_mutex_unlock(&lock);
     return total;
+}
+
+gulong
+peak_general_listener_test_startup_selector_batches(void)
+{
+    return atomic_load_explicit(&peak_general_listener_test_startup_selector_batch_count,
+                                memory_order_relaxed);
 }
 
 PEAK_API gulong
@@ -7013,32 +7020,31 @@ peak_general_listener_configure_detach_threshold(void)
 }
 
 static gpointer
-peak_general_listener_resolve_selector(const char* selector,
-                                       char** demangled_name,
-                                       gboolean* terminal)
+peak_general_listener_use_selector_resolution(
+    const char* selector,
+    PeakTargetResolveResult result,
+    PeakTargetResolution* resolution,
+    char** demangled_name,
+    gboolean* terminal)
 {
-    PeakTargetResolution resolution = {0};
-    PeakTargetResolveResult result =
-        peak_target_resolver_resolve(selector, NULL, TRUE, &resolution);
     gpointer address = NULL;
 
     *terminal = FALSE;
 
     if (result == PEAK_TARGET_RESOLVE_UNIQUE) {
         PeakTargetSymbolCandidate* candidate =
-            g_ptr_array_index(resolution.candidates, 0);
+            g_ptr_array_index(resolution->candidates, 0);
         address = candidate->address;
         *demangled_name = g_strdup(candidate->demangled);
     } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
         g_printerr("[peak] ambiguous target selector; refusing to attach\n");
-        peak_target_resolver_print(stderr, selector, &resolution);
+        peak_target_resolver_print(stderr, selector, resolution);
         *terminal = TRUE;
     } else if (result == PEAK_TARGET_RESOLVE_INVALID) {
         g_printerr("[peak] invalid target selector; refusing to attach: %s\n",
                    selector != NULL ? selector : "<null>");
         *terminal = TRUE;
     }
-    peak_target_resolution_clear(&resolution);
     return address;
 }
 
@@ -7103,6 +7109,52 @@ peak_general_listener_attach()
     peak_general_listener_configure_detach_threshold();
     gboolean startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
+    /* Resolver bookkeeping is optional: pre-mutation allocation failure must
+     * leave direct targets usable and skip only the C++ fallback. */
+    gpointer* startup_direct = g_try_new0(gpointer, peak_hook_address_count);
+    PeakTargetResolveRequest* startup_resolutions = g_try_new0(
+        PeakTargetResolveRequest, peak_hook_address_count);
+    gboolean startup_legacy_cxx_fallback =
+        peak_env_truthy_general(g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN"));
+    gboolean startup_has_selector_resolution = FALSE;
+
+    if (startup_direct == NULL || startup_resolutions == NULL) {
+        g_free(startup_resolutions);
+        g_free(startup_direct);
+        startup_resolutions = NULL;
+        startup_direct = NULL;
+    }
+
+    /* Preserve the loader's cheap exact lookup for ordinary C names.  The
+     * resolver receives only explicit selectors and direct misses, then walks
+     * modules/symbols once for the whole startup snapshot. */
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        gboolean explicit_selector =
+            peak_symbol_should_use_cpp_map(peak_hook_strings[i]);
+
+        if (!explicit_selector && startup_direct != NULL) {
+            startup_direct[i] = peak_general_listener_find_function(peak_hook_strings[i]);
+        }
+        if (startup_resolutions != NULL &&
+            (explicit_selector ||
+             ((startup_direct == NULL || startup_direct[i] == NULL) &&
+              startup_legacy_cxx_fallback))) {
+            startup_resolutions[i] = (PeakTargetResolveRequest){
+                .selector = peak_hook_strings[i],
+                .allow_legacy_short = startup_legacy_cxx_fallback,
+            };
+            startup_has_selector_resolution = TRUE;
+        }
+    }
+    if (startup_resolutions != NULL && startup_has_selector_resolution) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_fetch_add_explicit(
+            &peak_general_listener_test_startup_selector_batch_count, 1,
+            memory_order_relaxed);
+#endif
+        peak_target_resolver_resolve_many(startup_resolutions,
+                                          peak_hook_address_count);
+    }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         /* Redirect functions for which PEAK already owns support wrappers. */
         if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
@@ -7167,8 +7219,11 @@ peak_general_listener_attach()
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else {
-            gpointer ptr = peak_symbol_should_use_cpp_map(peak_hook_strings[i])
-                ? NULL
+            gboolean explicit_selector =
+                peak_symbol_should_use_cpp_map(peak_hook_strings[i]);
+            gboolean legacy_cxx_fallback = startup_legacy_cxx_fallback;
+            gpointer ptr = startup_direct != NULL
+                ? startup_direct[i]
                 : peak_general_listener_find_function(peak_hook_strings[i]);
             if (ptr) {
                 hook_address[i] = ptr;
@@ -7176,11 +7231,13 @@ peak_general_listener_attach()
                 peak_demangled_strings[i] = g_strdup(demangled);
                 free(demangled);
             } else {
-                if (peak_symbol_should_use_cpp_map(peak_hook_strings[i])) {
+                if (startup_resolutions != NULL &&
+                    (explicit_selector || legacy_cxx_fallback)) {
                     gboolean terminal = FALSE;
-                    hook_address[i] = peak_general_listener_resolve_selector(
-                        peak_hook_strings[i], &peak_demangled_strings[i],
-                        &terminal);
+                    hook_address[i] = peak_general_listener_use_selector_resolution(
+                        peak_hook_strings[i], startup_resolutions[i].result,
+                        &startup_resolutions[i].resolution,
+                        &peak_demangled_strings[i], &terminal);
                     if (terminal) {
                         peak_demangled_strings[i] =
                             g_strdup(peak_hook_strings[i]);
@@ -7303,6 +7360,12 @@ peak_general_listener_attach()
             }
         }
     }
+    for (size_t i = 0; startup_resolutions != NULL &&
+                       i < peak_hook_address_count; i++) {
+        peak_target_resolution_clear(&startup_resolutions[i].resolution);
+    }
+    g_free(startup_resolutions);
+    g_free(startup_direct);
 }
 
 /* Checkpoint and report snapshot capture. */

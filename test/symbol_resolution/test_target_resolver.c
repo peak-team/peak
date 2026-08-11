@@ -41,8 +41,142 @@ unique_address(const char* selector)
     return address;
 }
 
+static void
+test_batch_scaling(void)
+{
+    PeakTargetResolveRequest one = {
+        .selector = "legacy_short_unique",
+        .allow_legacy_short = TRUE,
+    };
+    PeakTargetResolveRequest many[64] = {0};
+    PeakTargetResolverDiagnostics one_stats;
+    PeakTargetResolverDiagnostics many_stats;
+    char* missing[63] = {0};
+
+    peak_target_resolver_reset_diagnostics();
+    peak_target_resolver_resolve_many(&one, 1);
+    peak_target_resolver_get_diagnostics(&one_stats);
+    peak_target_resolution_clear(&one.resolution);
+
+    many[0].selector = "legacy_short_unique";
+    many[0].allow_legacy_short = TRUE;
+    for (size_t i = 1; i < G_N_ELEMENTS(many); i++) {
+        missing[i - 1] = g_strdup_printf("missing_legacy_target_%zu", i);
+        many[i].selector = missing[i - 1];
+        many[i].allow_legacy_short = TRUE;
+    }
+    peak_target_resolver_reset_diagnostics();
+    peak_target_resolver_resolve_many(many, G_N_ELEMENTS(many));
+    peak_target_resolver_get_diagnostics(&many_stats);
+    for (size_t i = 0; i < G_N_ELEMENTS(many); i++) {
+        peak_target_resolution_clear(&many[i].resolution);
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(missing); i++) {
+        g_free(missing[i]);
+    }
+    expect_true(one_stats.module_passes == 1 && many_stats.module_passes == 1 &&
+                    one_stats.module_symbol_enumerations ==
+                        many_stats.module_symbol_enumerations &&
+                    one_stats.symbol_visits == many_stats.symbol_visits &&
+                    one_stats.demangles == many_stats.demangles &&
+                    one_stats.candidate_match_evaluations ==
+                        many_stats.candidate_match_evaluations,
+                "resolver batch counters stay constant from 1 to 64 targets");
+
+    {
+        PeakTargetResolveRequest mangled = {
+            .selector = "_ZN9peak_test6Widget4funcEid",
+            .module_path = PEAK_TEST_SYMBOL_MODULE_A,
+            .allow_legacy_short = TRUE,
+        };
+        PeakTargetResolverDiagnostics mangled_stats;
+
+        peak_target_resolver_reset_diagnostics();
+        peak_target_resolver_resolve_many(&mangled, 1);
+        peak_target_resolver_get_diagnostics(&mangled_stats);
+        expect_true(mangled.result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                        mangled_stats.demangles == 0,
+                    "exact mangled selector skips demangling");
+        peak_target_resolution_clear(&mangled.resolution);
+    }
+
+    {
+        PeakTargetResolveRequest complex_one = {
+            .selector = "missing_complex_selector_0<std::enable_if_t<(N<0),int>>()",
+            .allow_legacy_short = FALSE,
+        };
+        PeakTargetResolveRequest complex_many[64] = {0};
+        PeakTargetResolverDiagnostics complex_one_stats;
+        PeakTargetResolverDiagnostics complex_many_stats;
+        char* complex_missing[63] = {0};
+
+        peak_target_resolver_reset_diagnostics();
+        peak_target_resolver_resolve_many(&complex_one, 1);
+        peak_target_resolver_get_diagnostics(&complex_one_stats);
+        peak_target_resolution_clear(&complex_one.resolution);
+        complex_many[0].selector = complex_one.selector;
+        for (size_t i = 1; i < G_N_ELEMENTS(complex_many); i++) {
+            complex_missing[i - 1] = g_strdup_printf(
+                "missing_complex_selector_%zu<std::enable_if_t<(N<0),int>>()", i);
+            complex_many[i].selector = complex_missing[i - 1];
+        }
+        peak_target_resolver_reset_diagnostics();
+        peak_target_resolver_resolve_many(complex_many,
+                                          G_N_ELEMENTS(complex_many));
+        peak_target_resolver_get_diagnostics(&complex_many_stats);
+        for (size_t i = 0; i < G_N_ELEMENTS(complex_many); i++) {
+            peak_target_resolution_clear(&complex_many[i].resolution);
+        }
+        for (size_t i = 0; i < G_N_ELEMENTS(complex_missing); i++) {
+            g_free(complex_missing[i]);
+        }
+        expect_true(complex_one_stats.module_passes == 1 &&
+                        complex_many_stats.module_passes == 1 &&
+                        complex_one_stats.module_symbol_enumerations ==
+                            complex_many_stats.module_symbol_enumerations &&
+                        complex_one_stats.symbol_visits ==
+                            complex_many_stats.symbol_visits &&
+                        complex_one_stats.demangles == complex_many_stats.demangles &&
+                        complex_one_stats.candidate_match_evaluations ==
+                            complex_many_stats.candidate_match_evaluations,
+                    "complex selector batch avoids target-by-symbol fallback");
+    }
+}
+
+static void
+print_symbol_count_stats(gboolean load_rich)
+{
+    PeakTargetResolveRequest request = {
+        .selector = "missing_rich_target(int)",
+        .allow_legacy_short = FALSE,
+    };
+    PeakTargetResolverDiagnostics stats;
+
+    if (load_rich) {
+        expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_RICH, RTLD_NOW | RTLD_LOCAL) != NULL,
+                    "load symbol-rich module");
+    }
+    gum_init_embedded();
+    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL) != NULL,
+                "load module a");
+    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL) != NULL,
+                "load module b");
+    peak_target_resolver_reset_diagnostics();
+    peak_target_resolver_resolve_many(&request, 1);
+    peak_target_resolver_get_diagnostics(&stats);
+    peak_target_resolution_clear(&request.resolution);
+    printf("symbol_count_stats module_passes=%llu module_enumerations=%llu "
+           "symbol_visits=%llu demangles=%llu candidate_matches=%llu\n",
+           (unsigned long long)stats.module_passes,
+           (unsigned long long)stats.module_symbol_enumerations,
+           (unsigned long long)stats.symbol_visits,
+           (unsigned long long)stats.demangles,
+           (unsigned long long)stats.candidate_match_evaluations);
+    gum_deinit_embedded();
+}
+
 int
-main(void)
+main(int argc, char** argv)
 {
     char* module_a_selector;
     char* module_b_selector;
@@ -60,11 +194,20 @@ main(void)
     gpointer weak_address;
     gpointer strong_address;
 
+    if (argc == 2 && strcmp(argv[1], "--symbol-count") == 0) {
+        print_symbol_count_stats(g_getenv("PEAK_TEST_LOAD_RICH") != NULL);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc != 1) {
+        return 2;
+    }
+
     gum_init_embedded();
     expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL) != NULL,
                 "load module a");
     expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL) != NULL,
                 "load module b");
+    test_batch_scaling();
 
     temporary_directory = g_dir_make_tmp("peak-symbol-resolution-XXXXXX", NULL);
     expect_true(temporary_directory != NULL, "create temporary directory");
@@ -136,9 +279,10 @@ main(void)
 
     mangled_selector = g_strdup_printf(
         "%s!_ZN9peak_test6Widget4funcEid", PEAK_TEST_SYMBOL_MODULE_A);
-    offset_selector = g_strdup_printf("%s+0x0", mangled_selector);
-    expect_true(unique_address(mangled_selector) == unique_address(offset_selector),
-                "mangled selector and zero offset resolve deterministically");
+    offset_selector = g_strdup_printf("%s+0x1", mangled_selector);
+    expect_true(resolve(offset_selector, &resolution) == PEAK_TARGET_RESOLVE_INVALID,
+                "nonzero instruction offsets are rejected for function listeners");
+    peak_target_resolution_clear(&resolution);
     {
         char* function_pointer_selector = g_strdup_printf(
             "%s!function_pointer_return<int>(int)", PEAK_TEST_SYMBOL_MODULE_A);
@@ -150,9 +294,9 @@ main(void)
                     "full selector excludes GCC IPA clone candidates");
         expect_true(resolve(clone_selector, &resolution) ==
                         PEAK_TARGET_RESOLVE_UNIQUE &&
-                        strstr(((PeakTargetSymbolCandidate*)
-                                g_ptr_array_index(resolution.candidates, 0))->demangled,
-                               "[clone .clone_for_test.0]") != NULL,
+                        strcmp(((PeakTargetSymbolCandidate*)
+                                g_ptr_array_index(resolution.candidates, 0))->mangled,
+                               "_Z23function_pointer_returnIiEPFiiET_.clone_for_test.0") == 0,
                     "GCC IPA clone remains selectable by exact mangled name");
         peak_target_resolution_clear(&resolution);
         g_free(clone_selector);
@@ -178,9 +322,9 @@ main(void)
             "%s!_ZThn8_N7Derived6targetEi", PEAK_TEST_SYMBOL_MODULE_A);
         expect_true(resolve(thunk_selector, &resolution) ==
                         PEAK_TARGET_RESOLVE_UNIQUE &&
-                        strstr(((PeakTargetSymbolCandidate*)
-                                g_ptr_array_index(resolution.candidates, 0))->demangled,
-                               "non-virtual thunk to Derived::target(int)") != NULL,
+                        strcmp(((PeakTargetSymbolCandidate*)
+                                g_ptr_array_index(resolution.candidates, 0))->mangled,
+                               "_ZThn8_N7Derived6targetEi") == 0,
                     "GCC ABI thunk remains selectable only by exact mangled name");
         peak_target_resolution_clear(&resolution);
         g_free(thunk_selector);
@@ -190,8 +334,8 @@ main(void)
         char* out_of_module_selector = g_strdup_printf("%s+0x10000000",
                                                         mangled_selector);
         expect_true(resolve(out_of_module_selector, &resolution) ==
-                        PEAK_TARGET_RESOLVE_NONE,
-                    "out-of-module offset is not accepted");
+                        PEAK_TARGET_RESOLVE_INVALID,
+                    "out-of-module instruction offset is rejected");
         peak_target_resolution_clear(&resolution);
         g_free(out_of_module_selector);
     }
@@ -282,8 +426,10 @@ main(void)
     strong_address = unique_address(strong_selector);
     {
         char* c_offset_selector = g_strdup_printf("%s+0x1", strong_selector);
-        expect_true(unique_address(c_offset_selector) != NULL,
-                    "plain C selector accepts an in-module offset");
+        expect_true(resolve(c_offset_selector, &resolution) ==
+                        PEAK_TARGET_RESOLVE_INVALID,
+                    "plain C selector rejects an instruction offset");
+        peak_target_resolution_clear(&resolution);
         g_free(c_offset_selector);
     }
 #if defined(__ELF__)
@@ -309,6 +455,10 @@ main(void)
     expect_true(resolve("module!symbol+0x10+0x20", &resolution) ==
                     PEAK_TARGET_RESOLVE_INVALID,
                 "repeated offsets are invalid");
+    peak_target_resolution_clear(&resolution);
+    expect_true(resolve("module!f<(N+0x10)>()", &resolution) ==
+                    PEAK_TARGET_RESOLVE_NONE,
+                "nested hexadecimal expression is not an offset suffix");
     peak_target_resolution_clear(&resolution);
     expect_true(peak_target_resolver_validate_selector(
                     "module!ns::Widget::operator!() const"),
@@ -631,6 +781,7 @@ main(void)
                     PEAK_TARGET_RESOLVE_INVALID,
                 "overflowing offset is invalid");
     peak_target_resolution_clear(&resolution);
+
 
     g_free(strong_selector);
     g_free(weak_selector);

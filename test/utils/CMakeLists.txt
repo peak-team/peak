@@ -15,6 +15,7 @@ set_tests_properties(test_command_filter
 add_executable(test_target_config
     test_target_config.c
     ${PROJECT_SOURCE_DIR}/src/utils/target_config.c
+    ${PROJECT_SOURCE_DIR}/src/utils/target_selector_syntax.c
     ${PROJECT_SOURCE_DIR}/src/utils/source_target.c
     ${PROJECT_SOURCE_DIR}/src/logging.c)
 target_compile_definitions(test_target_config PRIVATE PEAK_TARGET_CONFIG_TESTING=1)
@@ -34,6 +35,7 @@ if(PEAK_BUILD_FUZZ_TESTS)
         add_executable(fuzz_target_config
             fuzz_target_config.c
             ${PROJECT_SOURCE_DIR}/src/utils/target_config.c
+            ${PROJECT_SOURCE_DIR}/src/utils/target_selector_syntax.c
             ${PROJECT_SOURCE_DIR}/src/utils/source_target.c
             ${PROJECT_SOURCE_DIR}/src/logging.c)
         target_include_directories(fuzz_target_config PRIVATE

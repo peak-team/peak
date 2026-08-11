@@ -135,8 +135,13 @@ On Linux with `RTLD_NOLOAD`, PEAK obtains a second, unobserved reference using
 the application's original binding mode and verifies that it identifies the
 same `link_map` in the same loader namespace. This runs on the ownership
 thread, outside the Gum callback and PEAK controller locks. Resolution later
-uses ordinary handle-scoped `dlsym()`; PEAK does not construct a second
-dependency graph or choose providers by filename.
+uses ordinary handle-scoped `dlsym()` for plain C names; PEAK does not
+construct a second dependency graph or choose providers by filename. A dynamic
+C++ selector instead requires a slash-containing `path!symbol` scope. After
+the resolver proves that the candidate belongs to this exact `link_map`, PEAK
+attaches the resolved address directly, including local symbols that `dlsym()`
+cannot export. Basename and unqualified C++ selectors are refused dynamically,
+so their result cannot depend on controller drain order.
 
 Resolved addresses are deduplicated and attached in bounded strict ATTACH
 batches. Symbol lookup does not hold the general-listener mutex. Listener
@@ -312,12 +317,15 @@ retry may still be dropped if PEAK cannot preserve its request handle.
 
 Unresolved plain C symbols do not trigger Gum's global C++ scan. The
 asynchronous `dlopen` path uses exact-name `dlsym()` when their DSO appears.
-C++ selectors (a mangled name, full demangled signature, or module-qualified
-selector) use the same candidate resolver as startup. It resolves globally to
-detect cross-DSO ambiguity, then looks up the chosen mangled symbol through the
-request's retained handle so it attaches that exact loader instance. The
-resolver never loads a module. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` also permits a
-plain short target name to use the legacy C++ candidate scan.
+C++ dynamic selectors must use a slash-containing `path!symbol` scope. PEAK
+resolves that path-qualified selector with the startup resolver, proves the
+candidate belongs to the request's exact loader instance, and attaches the
+candidate address directly; this also supports local (non-`dlsym`-exported)
+symbols. Basename and unqualified C++ selectors are refused dynamically so
+their result cannot depend on loader/controller-drain order. The resolver never
+loads a module. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits legacy C++ matching
+only after a plain C exact lookup misses, and is subject to the same dynamic
+path requirement.
 
 ## Supported Boundary
 

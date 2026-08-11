@@ -71,6 +71,7 @@ add_library(peak SHARED ${sources_peak})
 add_executable(peak_inspect_symbols
     peak_inspect_symbols.c
     general_listener/target_resolver.c
+    utils/target_selector_syntax.c
     $<TARGET_OBJECTS:utils_cxx>)
 set_target_properties(peak_inspect_symbols PROPERTIES
     OUTPUT_NAME peak
@@ -114,6 +115,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
 endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+    target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
 endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)

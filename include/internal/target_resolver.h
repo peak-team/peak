@@ -5,6 +5,7 @@
 
 #include "internal/gum_peak_compat.h"
 
+#include <stddef.h>
 #include <stdio.h>
 
 typedef enum {
@@ -28,9 +29,33 @@ typedef struct {
     GPtrArray* candidates;
 } PeakTargetResolution;
 
+typedef struct {
+    const char* selector;
+    const char* module_path;
+    gboolean allow_legacy_short;
+    PeakTargetResolution resolution;
+    PeakTargetResolveResult result;
+} PeakTargetResolveRequest;
+
+#if defined(PEAK_TARGET_RESOLVER_TESTING) && defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(__GNUC__) || defined(__clang__)
+#define PEAK_TARGET_RESOLVER_TEST_API __attribute__((visibility("default")))
+#else
+#define PEAK_TARGET_RESOLVER_TEST_API
+#endif
+typedef struct {
+    guint64 module_passes;
+    guint64 module_symbol_enumerations;
+    guint64 symbol_visits;
+    guint64 demangles;
+    guint64 candidate_match_evaluations;
+} PeakTargetResolverDiagnostics;
+
+#endif
+
 /*
  * Resolves a PEAK target selector. A selector may be qualified as
- * "module!symbol" and may have a +0xOFFSET suffix. When module_path is set,
+ * "module!symbol". When module_path is set,
  * resolution is additionally restricted to that loaded module. The caller
  * owns the result and must call peak_target_resolution_clear().
  */
@@ -39,6 +64,17 @@ PeakTargetResolveResult peak_target_resolver_resolve(
     const char* module_path,
     gboolean allow_legacy_short,
     PeakTargetResolution* resolution);
+
+/* Resolves a startup/dynamic selector batch with one module-symbol walk and
+ * at most one demangle per encountered symbol. */
+void peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
+                                       size_t count);
+
+#if defined(PEAK_TARGET_RESOLVER_TESTING) && defined(PEAK_ENABLE_TEST_HOOKS)
+PEAK_TARGET_RESOLVER_TEST_API void peak_target_resolver_reset_diagnostics(void);
+PEAK_TARGET_RESOLVER_TEST_API void peak_target_resolver_get_diagnostics(
+    PeakTargetResolverDiagnostics* out);
+#endif
 
 /* Validates selector syntax without enumerating or loading a module. */
 gboolean peak_target_resolver_validate_selector(const char* selector);

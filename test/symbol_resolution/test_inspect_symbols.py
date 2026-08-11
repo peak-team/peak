@@ -17,6 +17,22 @@ def run(*args, expected, env=None):
     return completed.stdout
 
 
+def probe_optional_demangle(*args):
+    """Return the platform demangler capability without weakening its result."""
+    try:
+        completed = subprocess.run(args, capture_output=True, text=True,
+                                   timeout=20)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(f"timed out: {args}") from error
+    if completed.returncode not in (0, 1):
+        raise AssertionError(
+            f"expected resolver result 0 or 1, got {completed.returncode}: "
+            f"{completed.stderr}")
+    expected_candidates = 1 if completed.returncode == 0 else 0
+    assert f"candidates={expected_candidates}" in completed.stdout
+    return completed.returncode
+
+
 def main():
     peak, module_a, module_b = sys.argv[1:]
     output = run(
@@ -28,17 +44,10 @@ def main():
     assert "mangled=_ZN9peak_test6Widget4funcEid" in output
     assert "demangled=peak_test::Widget::func(int, double)" in output
 
-    output = run(
-        peak, "inspect-symbols",
-        f"{module_a}!_ZN9peak_test6Widget4funcEid+0x0", expected=0)
-    assert "candidates=1" in output
-    assert f"module={module_a}" in output
-
-    output = run(
-        peak, "inspect-symbols", f"{module_a}!peak_symbol_strong_alias+0x1",
-        expected=0)
-    assert "candidates=1" in output
-    assert "mangled=peak_symbol_strong_alias" in output
+    run(peak, "inspect-symbols",
+        f"{module_a}!_ZN9peak_test6Widget4funcEid+0x0", expected=2)
+    run(peak, "inspect-symbols", f"{module_a}!peak_symbol_strong_alias+0x1",
+        expected=2)
 
     output = run(
         peak, "inspect-symbols",
@@ -130,17 +139,17 @@ def main():
     output = run(peak, "inspect-symbols", f"{module_a}!{conversion_mangled}",
                  expected=0)
     assert "candidates=1" in output
-    if "demangled=decltype (&peak_test::ConversionPointerSource::operator int)" in output:
-        for selector in conversion_selectors:
-            output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
-                         expected=0)
-            assert "candidates=1" in output
-    else:
-        assert f"demangled={conversion_mangled}" in output
-        for selector in conversion_selectors:
-            output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
-                         expected=1)
-            assert "candidates=0" in output
+    # Exact mangled lookup deliberately avoids demangling, so probe the human
+    # selector path itself. Older Frontera libstdc++ demanglers return this ABI
+    # spelling unchanged; both human spellings must then be consistently
+    # unavailable while the exact mangled selector above remains usable.
+    conversion_expected = probe_optional_demangle(
+        peak, "inspect-symbols", f"{module_a}!{conversion_selectors[0]}")
+    for selector in conversion_selectors[1:]:
+        output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
+                     expected=conversion_expected)
+        expected_candidates = 1 if conversion_expected == 0 else 0
+        assert f"candidates={expected_candidates}" in output
 
     for selector in (
             "const", "(int) const",
@@ -197,6 +206,9 @@ def main():
     run(peak, "inspect-symbols", "symbol+0x 1", expected=2)
     run(peak, "inspect-symbols", "symbol+0x10+0x20", expected=2)
     run(peak, "inspect-symbols", "symbol+0X1", expected=2)
+    output = run(peak, "inspect-symbols", f"{module_a}!f<(N+0x10)>()",
+                 expected=1)
+    assert "candidates=0" in output
     output = run(peak, "inspect-symbols", "--module", module_a,
                  "peak_symbol_does_not_exist", expected=1)
     assert "candidates=0" in output

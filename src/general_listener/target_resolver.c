@@ -1,10 +1,9 @@
 #include "internal/target_resolver.h"
 
 #include "utils/cxx_utils.h"
+#include "utils/target_selector_syntax.h"
 
 #include <ctype.h>
-#include <errno.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -14,7 +13,6 @@
 typedef struct {
     gchar* module;
     gchar* symbol;
-    guintptr offset;
 } PeakTargetSelector;
 
 typedef struct {
@@ -28,11 +26,43 @@ typedef struct {
     gboolean cxx_selector;
 } PeakTargetCollectContext;
 
+typedef struct {
+    PeakTargetCollectContext* contexts;
+    size_t count;
+    const char* current_module;
+    GHashTable* exact;
+    GHashTable* full;
+    GHashTable* full_by_name;
+    GHashTable* legacy_qualified;
+    GHashTable* legacy_short;
+} PeakTargetBatchCollectContext;
+
 enum {
     PEAK_TARGET_MATCH_EXACT = 0,
     PEAK_TARGET_MATCH_FULL = 1,
     PEAK_TARGET_MATCH_LEGACY = 2,
 };
+
+#if defined(PEAK_TARGET_RESOLVER_TESTING) && defined(PEAK_ENABLE_TEST_HOOKS)
+static PeakTargetResolverDiagnostics peak_target_resolver_diagnostics;
+#define PEAK_RESOLVER_DIAG_ADD(field, value) \
+    (peak_target_resolver_diagnostics.field += (value))
+void
+peak_target_resolver_reset_diagnostics(void)
+{
+    memset(&peak_target_resolver_diagnostics, 0,
+           sizeof(peak_target_resolver_diagnostics));
+}
+void
+peak_target_resolver_get_diagnostics(PeakTargetResolverDiagnostics* out)
+{
+    if (out != NULL) {
+        *out = peak_target_resolver_diagnostics;
+    }
+}
+#else
+#define PEAK_RESOLVER_DIAG_ADD(field, value) ((void)0)
+#endif
 
 static void
 peak_target_symbol_candidate_free(gpointer data)
@@ -55,18 +85,6 @@ peak_target_resolution_clear(PeakTargetResolution* resolution)
         return;
     }
     g_clear_pointer(&resolution->candidates, g_ptr_array_unref);
-}
-
-static gboolean
-peak_target_operator_token_ends_at(const char* text, const char* cursor)
-{
-    while (cursor > text && g_ascii_isspace(cursor[-1])) {
-        cursor--;
-    }
-    return cursor - text >= 8 &&
-           memcmp(cursor - 8, "operator", 8) == 0 &&
-           (cursor - 8 == text ||
-            (!isalnum((unsigned char)cursor[-9]) && cursor[-9] != '_'));
 }
 
 static gboolean
@@ -192,135 +210,25 @@ static gboolean
 peak_target_find_module_separator(const char* text, const char** separator_out)
 {
     const char* separator = NULL;
-    PeakTargetParseFrame root = { FALSE, '\0', 0 };
-    size_t length = strlen(text);
-    size_t capacity;
-    PeakTargetParseFrame* frames = NULL;
-    PeakTargetAngleDelimiter* angles = NULL;
-    size_t frame_count = 0;
-    size_t angle_count = 0;
-    size_t next_frame_id = 1;
-    gboolean valid = FALSE;
 
-    if (length == SIZE_MAX ||
-        length + 1 > SIZE_MAX / sizeof(*frames) ||
-        length + 1 > SIZE_MAX / sizeof(*angles)) {
+    /* Keep selector validation and PEAK_TARGET splitting on the same lexer. */
+    if (!peak_target_selector_next_delimiter(text, '!', FALSE, &separator)) {
         return FALSE;
     }
-    capacity = length + 1;
-    frames = malloc(capacity * sizeof(*frames));
-    angles = malloc(capacity * sizeof(*angles));
-    if (frames == NULL || angles == NULL) {
-        goto done;
-    }
-    frames[frame_count++] = root;
-    for (const char* cursor = text; *cursor != '\0'; cursor++) {
-        if (*cursor == '(' || *cursor == '[' || *cursor == '{') {
-            PeakTargetParseFrame frame = {
-                *cursor == '(' ? peak_target_parenthesis_is_grouping(text, cursor) : TRUE,
-                *cursor == '(' ? ')' : (*cursor == '[' ? ']' : '}'),
-                next_frame_id++
-            };
-
-            frames[frame_count++] = frame;
-        } else if (*cursor == ')' || *cursor == ']' || *cursor == '}') {
-            size_t frame;
-            PeakTargetParseFrame current;
-
-            if (frame_count == 1) {
-                goto done;
-            }
-            frame = frame_count - 1;
-            current = frames[frame];
-            if (*cursor != current.closer) {
-                goto done;
-            }
-            if (peak_target_frame_has_angle(angles, angle_count, current.id)) {
-                if (!current.grouping) {
-                    goto done;
-                }
-                peak_target_drop_frame_angles(angles, &angle_count, current.id);
-            }
-            frame_count = frame;
-        } else if (*cursor == '<' &&
-                   !peak_target_operator_punctuation_at(text, cursor) &&
-                   cursor[1] != '=') {
-            PeakTargetAngleDelimiter angle = { frames[frame_count - 1].id };
-
-            angles[angle_count++] = angle;
-        } else if (*cursor == '>' &&
-                   !peak_target_operator_punctuation_at(text, cursor)) {
-            PeakTargetParseFrame current = frames[frame_count - 1];
-
-            if (cursor > text && cursor[-1] == '=') {
-                goto done;
-            }
-            if (cursor[1] != '=' &&
-                !peak_target_close_frame_angle(angles, &angle_count, current.id) &&
-                !current.grouping) {
-                goto done;
-            }
-        } else if (*cursor == '!' && frame_count == 1 && angle_count == 0 &&
-                   !peak_target_operator_token_ends_at(text, cursor)) {
-            if (separator != NULL) {
-                goto done;
-            }
-            separator = cursor;
-        }
-    }
-    if (frame_count != 1 || angle_count != 0) {
-        goto done;
-    }
-    valid = TRUE;
-
-done:
-    free(angles);
-    free(frames);
-    if (!valid) {
-        return FALSE;
-    }
-    *separator_out = separator;
-    return TRUE;
-}
-
-static gboolean
-peak_target_parse_offset(char* symbol, guintptr* offset_out)
-{
-    char* plus = strrchr(symbol, '+');
-    char* marker;
-    char* end = NULL;
-    unsigned long long value;
-
-    *offset_out = 0;
-    if (strstr(symbol, "+0X") != NULL) {
-        return FALSE;
-    }
-    marker = strstr(symbol, "+0x");
-    if (plus == NULL || strncmp(plus, "+0x", 3) != 0) {
-        if (marker != NULL) {
-            return FALSE;
-        }
+    if (separator == NULL) {
+        *separator_out = NULL;
         return TRUE;
     }
-    if (marker != plus || plus[3] == '\0') {
-        return FALSE;
-    }
-    for (char* cursor = plus + 3; *cursor != '\0'; cursor++) {
-        if (!g_ascii_isxdigit(*cursor)) {
+    /* A second top-level '!' is invalid.  The shared lexer also handles
+     * operator! and nested punctuation here. */
+    {
+        const char* extra = NULL;
+        if (!peak_target_selector_next_delimiter(separator + 1, '!', FALSE,
+                                                  &extra) || extra != NULL) {
             return FALSE;
         }
     }
-    errno = 0;
-    value = strtoull(plus + 3, &end, 16);
-    if (errno == ERANGE || end == plus + 3 || *end != '\0' ||
-        value > UINTPTR_MAX) {
-        return FALSE;
-    }
-    *plus = '\0';
-    if (symbol[0] == '\0') {
-        return FALSE;
-    }
-    *offset_out = (guintptr)value;
+    *separator_out = separator;
     return TRUE;
 }
 
@@ -347,7 +255,7 @@ peak_target_parse_selector(const char* input, PeakTargetSelector* selector)
     }
     selector->symbol = g_strdup(symbol);
     if (selector->symbol == NULL ||
-        !peak_target_parse_offset(selector->symbol, &selector->offset)) {
+        peak_target_selector_has_top_level_offset(selector->symbol)) {
         g_free(selector->module);
         g_free(selector->symbol);
         memset(selector, 0, sizeof(*selector));
@@ -523,6 +431,12 @@ static gboolean
 peak_target_selector_is_complete_signature(const char* selector)
 {
     const char* parameter_open = peak_target_final_parameter_open(selector);
+
+    /* `operator()` is the function-id of call-operator overloads.  Its own
+     * empty pair is not the overload's parameter list. */
+    if (g_str_has_suffix(selector, "operator()")) {
+        return FALSE;
+    }
 
     return parameter_open != NULL &&
            peak_target_selector_has_function_id(selector, parameter_open);
@@ -851,109 +765,30 @@ peak_target_without_final_parameters(const char* demangled)
     return g_strdup(demangled);
 }
 
-static gboolean
-peak_target_is_cxx_selector(const char* symbol)
+static void
+peak_target_collect_candidate(const GumSymbolDetails* details,
+                              PeakTargetCollectContext* context,
+                              const char* mangled,
+                              const char* demangled,
+                              int tier,
+                              const char* current_module)
 {
-    return g_str_has_prefix(symbol, "_Z") || strstr(symbol, "::") != NULL ||
-           strchr(symbol, '(') != NULL || strchr(symbol, '<') != NULL ||
-           strstr(symbol, "operator") != NULL;
-}
-
-static gboolean
-peak_target_legacy_short_matches(const char* selector, const char* demangled)
-{
-    char* short_name;
-    const char* parameters;
-    gboolean matched;
-
-    if (peak_target_is_artificial_prefix(demangled)) {
-        return FALSE;
-    }
-    /* Legacy qualified names may omit the final function parameter list, but
-     * must retain their full namespace/class spelling. */
-    if (strstr(selector, "::") != NULL) {
-        char* qualified = peak_target_without_final_parameters(demangled);
-        parameters = strrchr(qualified, ' ');
-        if (parameters != NULL) {
-            memmove(qualified, parameters + 1, strlen(parameters + 1) + 1);
-        }
-        matched = peak_target_equal_normalized(selector, qualified);
-        g_free(qualified);
-        return matched;
-    }
-    short_name = extract_function_name(demangled);
-    matched = short_name != NULL && strcmp(selector, short_name) == 0;
-    free(short_name);
-    return matched;
-}
-
-static int
-peak_target_symbol_matches(const PeakTargetCollectContext* context,
-                           const char* mangled,
-                           const char* demangled)
-{
-    const char* symbol = context->selector->symbol;
-
-    if (strcmp(symbol, mangled) == 0) {
-        return PEAK_TARGET_MATCH_EXACT;
-    }
-    if (!context->cxx_selector || demangled == NULL) {
-        return -1;
-    }
-    if (peak_target_resolver_full_signature_matches(symbol, demangled)) {
-        return PEAK_TARGET_MATCH_FULL;
-    }
-    return peak_target_legacy_short_matches(symbol, demangled)
-        ? PEAK_TARGET_MATCH_LEGACY : -1;
-}
-
-static gboolean
-peak_target_collect_symbol(const GumSymbolDetails* details, gpointer user_data)
-{
-    PeakTargetCollectContext* context = user_data;
-    const char* mangled;
-    char* demangled;
     PeakTargetSymbolCandidate* candidate;
-    int tier;
 
-    if (details->type != GUM_SYMBOL_FUNCTION || details->address == 0 ||
-        details->name == NULL) {
-        return TRUE;
+    if (!peak_target_resolver_module_matches(context->selector->module,
+                                             current_module) ||
+        !peak_target_resolver_module_matches(context->module_path,
+                                             current_module)) {
+        return;
     }
-    mangled = details->name;
-    demangled = cxa_demangle(mangled);
-    tier = demangled != NULL
-        ? peak_target_symbol_matches(context, mangled, demangled) : -1;
-    if (tier < 0) {
-        free(demangled);
-        return TRUE;
-    }
-    if (context->selector->offset > 0 && details->size > 0 &&
-        context->selector->offset >= (guintptr)details->size) {
-        free(demangled);
-        return TRUE;
-    }
-    if (UINTPTR_MAX - (guintptr)details->address < context->selector->offset) {
-        free(demangled);
-        return TRUE;
-    }
-    if (context->selector->offset > 0 &&
-        (!context->current_module_range_valid ||
-         (guintptr)details->address + context->selector->offset <
-             context->current_module_start ||
-         (guintptr)details->address + context->selector->offset >=
-             context->current_module_end)) {
-        free(demangled);
-        return TRUE;
-    }
+
     candidate = g_new0(PeakTargetSymbolCandidate, 1);
-    candidate->address = (gpointer)((guintptr)details->address +
-                                    context->selector->offset);
+    candidate->address = (gpointer)details->address;
     candidate->symbol_address = (gpointer)details->address;
     candidate->size = details->size > 0 ? (gsize)details->size : 0;
-    candidate->module = g_strdup(context->current_module);
+    candidate->module = g_strdup(current_module);
     candidate->mangled = g_strdup(mangled);
-    candidate->demangled = g_strdup(demangled);
+    candidate->demangled = g_strdup(demangled != NULL ? demangled : mangled);
     candidate->match_tier = (unsigned int)tier;
     for (gsize i = 0; i < context->candidates->len; i++) {
         PeakTargetSymbolCandidate* existing =
@@ -962,38 +797,259 @@ peak_target_collect_symbol(const GumSymbolDetails* details, gpointer user_data)
             g_strcmp0(existing->module, candidate->module) == 0 &&
             g_strcmp0(existing->mangled, candidate->mangled) == 0) {
             peak_target_symbol_candidate_free(candidate);
-            free(demangled);
-            return TRUE;
+            return;
         }
     }
     g_ptr_array_add(context->candidates, candidate);
+}
+
+static gboolean
+peak_target_string_equal(gconstpointer left, gconstpointer right)
+{
+    return strcmp(left, right) == 0;
+}
+
+static char*
+peak_target_full_function_id(const char* signature)
+{
+    const char* operator_word = strstr(signature, "operator");
+    char* name = NULL;
+
+    if (operator_word != NULL) {
+        const char* end = strchr(operator_word, '(');
+        size_t length = end != NULL ? (size_t)(end - operator_word)
+                                    : strlen(operator_word);
+        char* operator_name = strndup(operator_word, length);
+        char* write = operator_name;
+
+        if (operator_name == NULL) {
+            return NULL;
+        }
+        for (char* read = operator_name; *read != '\0'; read++) {
+            if (!g_ascii_isspace(*read)) {
+                *write++ = *read;
+            }
+        }
+        *write = '\0';
+        free(name);
+        return operator_name;
+    }
+    for (const char* cursor = signature; *cursor != '\0'; ) {
+        const char* begin;
+        const char* end;
+
+        if (!g_ascii_isalpha(*cursor) && *cursor != '_') {
+            cursor++;
+            continue;
+        }
+        begin = cursor++;
+        while (g_ascii_isalnum(*cursor) || *cursor == '_') {
+            cursor++;
+        }
+        end = cursor;
+        if (*cursor == '<' || *cursor == '(') {
+            free(name);
+            name = strndup(begin, (size_t)(end - begin));
+        }
+    }
+    return name != NULL ? name : extract_function_name(signature);
+}
+
+static void
+peak_target_batch_add(GHashTable* table,
+                      gchar* key,
+                      PeakTargetCollectContext* context)
+{
+    GPtrArray* matches;
+
+    if (key == NULL) {
+        return;
+    }
+    matches = g_hash_table_lookup(table, key);
+    if (matches == NULL) {
+        matches = g_ptr_array_new();
+        g_hash_table_insert(table, key, matches);
+    } else {
+        g_free(key);
+    }
+    g_ptr_array_add(matches, context);
+}
+
+static void
+peak_target_batch_add_signature_keys(GHashTable* table,
+                                     const char* signature,
+                                     PeakTargetCollectContext* context)
+{
+    for (const char* cursor = signature; *cursor != '\0'; ) {
+        const char* begin;
+        const char* end;
+
+        if (!g_ascii_isalpha(*cursor) && *cursor != '_') {
+            cursor++;
+            continue;
+        }
+        begin = cursor++;
+        while (g_ascii_isalnum(*cursor) || *cursor == '_') {
+            cursor++;
+        }
+        end = cursor;
+        if (*cursor == '<' || *cursor == '(') {
+            peak_target_batch_add(table, g_strndup(begin, end - begin), context);
+        }
+    }
+}
+
+static void
+peak_target_collect_batch_matches(const GumSymbolDetails* details,
+                                  GPtrArray* matches,
+                                  const char* mangled,
+                                  const char* demangled,
+                                  int tier,
+                                  const char* current_module)
+{
+    if (matches == NULL) {
+        return;
+    }
+    PEAK_RESOLVER_DIAG_ADD(candidate_match_evaluations, matches->len);
+    for (guint i = 0; i < matches->len; i++) {
+        PeakTargetCollectContext* context = g_ptr_array_index(matches, i);
+        if (current_module != NULL) {
+            peak_target_collect_candidate(details, context, mangled,
+                                          demangled, tier, current_module);
+        }
+    }
+}
+
+static void
+peak_target_collect_full_matches(const GumSymbolDetails* details,
+                                 GPtrArray* matches,
+                                 const char* mangled,
+                                 const char* demangled,
+                                 const char* current_module)
+{
+    if (matches == NULL) {
+        return;
+    }
+    PEAK_RESOLVER_DIAG_ADD(candidate_match_evaluations, matches->len);
+    for (guint i = 0; i < matches->len; i++) {
+        PeakTargetCollectContext* context = g_ptr_array_index(matches, i);
+        if (current_module != NULL &&
+            peak_target_resolver_full_signature_matches(
+                context->selector->symbol, demangled)) {
+            peak_target_collect_candidate(details, context, mangled, demangled,
+                                          PEAK_TARGET_MATCH_FULL, current_module);
+        }
+    }
+}
+
+static void
+peak_target_collect_legacy_matches(const GumSymbolDetails* details,
+                                   GPtrArray* matches,
+                                   const char* mangled,
+                                   const char* demangled,
+                                   const char* current_module)
+{
+    if (matches == NULL || peak_target_is_artificial_prefix(demangled)) {
+        return;
+    }
+    peak_target_collect_batch_matches(details, matches, mangled, demangled,
+                                      PEAK_TARGET_MATCH_LEGACY, current_module);
+}
+
+static gboolean
+peak_target_collect_batch_symbol(const GumSymbolDetails* details,
+                                 gpointer user_data)
+{
+    PeakTargetBatchCollectContext* batch = user_data;
+    char* demangled = NULL;
+    gchar* normalized = NULL;
+    gchar* qualified = NULL;
+    char* short_name = NULL;
+
+    if (details->type != GUM_SYMBOL_FUNCTION || details->address == 0 ||
+        details->name == NULL) {
+        return TRUE;
+    }
+    PEAK_RESOLVER_DIAG_ADD(symbol_visits, 1);
+    demangled = (g_hash_table_size(batch->full) != 0 ||
+                 g_hash_table_size(batch->full_by_name) != 0 ||
+                 g_hash_table_size(batch->legacy_qualified) != 0 ||
+                 g_hash_table_size(batch->legacy_short) != 0)
+        ? cxa_demangle(details->name) : NULL;
+    if (demangled != NULL) {
+        PEAK_RESOLVER_DIAG_ADD(demangles, 1);
+    }
+    peak_target_collect_batch_matches(details,
+                                      g_hash_table_lookup(batch->exact,
+                                                          details->name),
+                                      details->name, demangled,
+                                      PEAK_TARGET_MATCH_EXACT, batch->current_module);
+    if (demangled != NULL) {
+        normalized = peak_target_without_space(demangled);
+        peak_target_collect_batch_matches(details,
+                                          g_hash_table_lookup(batch->full,
+                                                              normalized),
+                                          details->name, demangled,
+                                          PEAK_TARGET_MATCH_FULL, batch->current_module);
+        short_name = peak_target_full_function_id(demangled);
+        peak_target_collect_full_matches(details,
+                                         g_hash_table_lookup(batch->full_by_name,
+                                                             short_name),
+                                         details->name, demangled, batch->current_module);
+        for (const char* cursor = demangled; *cursor != '\0'; ) {
+            const char* begin;
+            const char* end;
+            gchar* key;
+            if (!g_ascii_isalpha(*cursor) && *cursor != '_') { cursor++; continue; }
+            begin = cursor++;
+            while (g_ascii_isalnum(*cursor) || *cursor == '_') cursor++;
+            end = cursor;
+            if (*cursor != '<' && *cursor != '(') continue;
+            key = g_strndup(begin, end - begin);
+            peak_target_collect_full_matches(details,
+                g_hash_table_lookup(batch->full_by_name, key),
+                details->name, demangled, batch->current_module);
+            g_free(key);
+        }
+        qualified = peak_target_without_final_parameters(demangled);
+        {
+            char* return_prefix = strrchr(qualified, ' ');
+            if (return_prefix != NULL) {
+                memmove(qualified, return_prefix + 1,
+                        strlen(return_prefix + 1) + 1);
+            }
+        }
+        {
+            gchar* normalized_qualified = peak_target_without_space(qualified);
+            peak_target_collect_legacy_matches(details,
+                                               g_hash_table_lookup(
+                                                   batch->legacy_qualified,
+                                                   normalized_qualified),
+                                               details->name, demangled, batch->current_module);
+            g_free(normalized_qualified);
+        }
+        peak_target_collect_legacy_matches(details,
+                                           g_hash_table_lookup(batch->legacy_short,
+                                                               short_name),
+                                           details->name, demangled, batch->current_module);
+    }
+    free(short_name);
+    g_free(qualified);
+    g_free(normalized);
     free(demangled);
     return TRUE;
 }
 
 static gboolean
-peak_target_collect_module(GumModule* module, gpointer user_data)
+peak_target_collect_batch_module(GumModule* module, gpointer user_data)
 {
-    PeakTargetCollectContext* context = user_data;
+    PeakTargetBatchCollectContext* batch = user_data;
     const char* path = gum_module_get_path(module);
-    const GumMemoryRange* range;
-
-    if (!peak_target_resolver_module_matches(context->selector->module, path) ||
-        !peak_target_resolver_module_matches(context->module_path, path)) {
-        return TRUE;
-    }
-    context->current_module = path != NULL ? path : "<unknown>";
-    range = gum_module_get_range(module);
-    context->current_module_range_valid =
-        range != NULL && range->size > 0 &&
-        UINTPTR_MAX - (guintptr)range->base_address >= range->size;
-    if (context->current_module_range_valid) {
-        context->current_module_start = (guintptr)range->base_address;
-        context->current_module_end = context->current_module_start + range->size;
-    }
-    gum_module_enumerate_symbols(module, peak_target_collect_symbol, context);
-    context->current_module = NULL;
-    context->current_module_range_valid = FALSE;
+    batch->current_module = path != NULL ? path : "<unknown>";
+    PEAK_RESOLVER_DIAG_ADD(module_symbol_enumerations, 1);
+    gum_module_enumerate_symbols(module, peak_target_collect_batch_symbol,
+                                 batch);
+    batch->current_module = NULL;
     return TRUE;
 }
 
@@ -1012,32 +1068,9 @@ peak_target_candidate_compare(gconstpointer left, gconstpointer right)
     return 0;
 }
 
-PeakTargetResolveResult
-peak_target_resolver_resolve(const char* selector_text,
-                             const char* module_path,
-                             gboolean allow_legacy_short,
-                             PeakTargetResolution* resolution)
+static PeakTargetResolveResult
+peak_target_resolution_finalize(PeakTargetResolution* resolution)
 {
-    PeakTargetSelector selector;
-    PeakTargetCollectContext context;
-
-    if (resolution == NULL) {
-        return PEAK_TARGET_RESOLVE_INVALID;
-    }
-    peak_target_resolution_clear(resolution);
-    if (!peak_target_parse_selector(selector_text, &selector)) {
-        return PEAK_TARGET_RESOLVE_INVALID;
-    }
-    resolution->candidates = g_ptr_array_new_with_free_func(
-        peak_target_symbol_candidate_free);
-    context = (PeakTargetCollectContext){
-        .selector = &selector,
-        .module_path = module_path,
-        .candidates = resolution->candidates,
-        .cxx_selector = allow_legacy_short ||
-                        peak_target_is_cxx_selector(selector.symbol),
-    };
-    gum_process_enumerate_modules(peak_target_collect_module, &context);
     g_ptr_array_sort(resolution->candidates, peak_target_candidate_compare);
     if (resolution->candidates->len > 1) {
         unsigned int best_tier = PEAK_TARGET_MATCH_LEGACY;
@@ -1058,12 +1091,150 @@ peak_target_resolver_resolve(const char* selector_text,
             }
         }
     }
-    peak_target_selector_clear(&selector);
     if (resolution->candidates->len == 0) {
         return PEAK_TARGET_RESOLVE_NONE;
     }
     return resolution->candidates->len == 1 ? PEAK_TARGET_RESOLVE_UNIQUE
                                              : PEAK_TARGET_RESOLVE_AMBIGUOUS;
+}
+
+void
+peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
+                                  size_t count)
+{
+    PeakTargetSelector* selectors;
+    PeakTargetCollectContext* contexts;
+    PeakTargetBatchCollectContext batch;
+    size_t active = 0;
+
+    if (requests == NULL || count == 0) {
+        return;
+    }
+    selectors = g_try_new0(PeakTargetSelector, count);
+    contexts = g_try_new0(PeakTargetCollectContext, count);
+    if (selectors == NULL || contexts == NULL) {
+        g_free(contexts);
+        g_free(selectors);
+        for (size_t i = 0; i < count; i++) {
+            peak_target_resolution_clear(&requests[i].resolution);
+            requests[i].result = PEAK_TARGET_RESOLVE_NONE;
+        }
+        return;
+    }
+    batch.exact = g_hash_table_new_full(g_str_hash, peak_target_string_equal, g_free,
+                                        (GDestroyNotify)g_ptr_array_unref);
+    batch.full = g_hash_table_new_full(g_str_hash, peak_target_string_equal, g_free,
+                                       (GDestroyNotify)g_ptr_array_unref);
+    batch.full_by_name = g_hash_table_new_full(
+        g_str_hash, peak_target_string_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
+    batch.legacy_qualified = g_hash_table_new_full(
+        g_str_hash, peak_target_string_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
+    batch.legacy_short = g_hash_table_new_full(g_str_hash, peak_target_string_equal, g_free,
+                                               (GDestroyNotify)g_ptr_array_unref);
+    for (size_t i = 0; i < count; i++) {
+        peak_target_resolution_clear(&requests[i].resolution);
+        requests[i].result = PEAK_TARGET_RESOLVE_INVALID;
+        if (!peak_target_parse_selector(requests[i].selector, &selectors[i])) {
+            continue;
+        }
+        requests[i].resolution.candidates = g_ptr_array_new_with_free_func(
+            peak_target_symbol_candidate_free);
+        gboolean mangled_selector = g_str_has_prefix(selectors[i].symbol, "_Z");
+        gboolean human_signature = !mangled_selector &&
+            (strchr(selectors[i].symbol, '(') != NULL ||
+             strchr(selectors[i].symbol, '<') != NULL);
+        gboolean complete_signature = human_signature &&
+            peak_target_selector_is_complete_signature(selectors[i].symbol);
+
+        contexts[i] = (PeakTargetCollectContext){
+            .selector = &selectors[i],
+            .module_path = requests[i].module_path,
+            .candidates = requests[i].resolution.candidates,
+            .cxx_selector = human_signature || requests[i].allow_legacy_short,
+        };
+        active++;
+        peak_target_batch_add(batch.exact, g_strdup(selectors[i].symbol),
+                              &contexts[i]);
+        if (human_signature) {
+            peak_target_batch_add(batch.full,
+                                  peak_target_without_space(selectors[i].symbol),
+                                  &contexts[i]);
+        }
+        if (complete_signature) {
+            {
+                char* function_name;
+
+                function_name = peak_target_full_function_id(selectors[i].symbol);
+                if (function_name != NULL) {
+                    peak_target_batch_add(batch.full_by_name,
+                                          g_strdup(function_name), &contexts[i]);
+                    free(function_name);
+                }
+                peak_target_batch_add_signature_keys(batch.full_by_name,
+                                                     selectors[i].symbol,
+                                                     &contexts[i]);
+            }
+        } else if (!mangled_selector && requests[i].allow_legacy_short) {
+            if (strstr(selectors[i].symbol, "::") != NULL) {
+                peak_target_batch_add(batch.legacy_qualified,
+                                      peak_target_without_space(selectors[i].symbol),
+                                      &contexts[i]);
+            } else {
+                peak_target_batch_add(batch.legacy_short,
+                                      g_strdup(selectors[i].symbol),
+                                      &contexts[i]);
+            }
+        }
+    }
+    batch.contexts = contexts;
+    batch.count = count;
+    if (active == 0) {
+        g_hash_table_unref(batch.legacy_short);
+        g_hash_table_unref(batch.legacy_qualified);
+        g_hash_table_unref(batch.full_by_name);
+        g_hash_table_unref(batch.full);
+        g_hash_table_unref(batch.exact);
+        g_free(contexts);
+        g_free(selectors);
+        return;
+    }
+    PEAK_RESOLVER_DIAG_ADD(module_passes, 1);
+    gum_process_enumerate_modules(peak_target_collect_batch_module, &batch);
+    for (size_t i = 0; i < count; i++) {
+        if (contexts[i].selector != NULL) {
+            requests[i].result = peak_target_resolution_finalize(
+                &requests[i].resolution);
+            peak_target_selector_clear(&selectors[i]);
+        }
+    }
+    g_hash_table_unref(batch.legacy_short);
+    g_hash_table_unref(batch.legacy_qualified);
+    g_hash_table_unref(batch.full_by_name);
+    g_hash_table_unref(batch.full);
+    g_hash_table_unref(batch.exact);
+    g_free(contexts);
+    g_free(selectors);
+}
+
+PeakTargetResolveResult
+peak_target_resolver_resolve(const char* selector_text,
+                             const char* module_path,
+                             gboolean allow_legacy_short,
+                             PeakTargetResolution* resolution)
+{
+    PeakTargetResolveRequest request = {
+        .selector = selector_text,
+        .module_path = module_path,
+        .allow_legacy_short = allow_legacy_short,
+    };
+
+    if (resolution == NULL) {
+        return PEAK_TARGET_RESOLVE_INVALID;
+    }
+    request.resolution = *resolution;
+    peak_target_resolver_resolve_many(&request, 1);
+    *resolution = request.resolution;
+    return request.result;
 }
 
 void

@@ -57,6 +57,45 @@ test_environment_tokens(void)
          peak_target_config_test_empty_token_warning_count() == 1;
     free_parsed_result(names, count);
 
+    setenv("PEAK_TEST_TARGETS",
+           "module!f<std::enable_if_t<(N<0),int>>(),next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){
+                           "module!f<std::enable_if_t<(N<0),int>>()",
+                           "next_target"}, 2);
+    free_parsed_result(names, count);
+
+    setenv("PEAK_TEST_TARGETS", "module!f<(N+0x10)>(),next_target", 1);
+    names = NULL;
+    count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+    ok &= expect_names(names, count,
+                       (const char* const[]){"module!f<(N+0x10)>()",
+                                             "next_target"}, 2);
+    free_parsed_result(names, count);
+
+    {
+        char* long_list = malloc(512 * 16);
+        size_t used = 0;
+
+        for (size_t i = 0; long_list != NULL && i < 512; i++) {
+            used += (size_t)snprintf(long_list + used, 512 * 16 - used,
+                                     "target_%zu%s", i,
+                                     i + 1 == 512 ? "" : ",");
+        }
+        if (long_list == NULL) {
+            return 0;
+        }
+        setenv("PEAK_TEST_TARGETS", long_list, 1);
+        names = NULL;
+        count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
+        ok &= count == 512 && strcmp(names[0], "target_0") == 0 &&
+              strcmp(names[511], "target_511") == 0;
+        free_parsed_result(names, count);
+        free(long_list);
+    }
+
     setenv("PEAK_TEST_TARGETS", "duplicate,duplicate", 1);
     names = NULL;
     count = parse_env_w_delim("PEAK_TEST_TARGETS", ',', &names);
