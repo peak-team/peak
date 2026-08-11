@@ -2412,16 +2412,24 @@ def check_runtime_configuration_freeze(repo_root):
     dlopen_debug = extract_function(
         dlopen, "dlopen_interceptor_debug_enabled"
     )
+    dlopen_selector = extract_function(
+        dlopen, "dlopen_interceptor_target_uses_selector_resolution"
+    )
     dlopen_trace = extract_function(
         dlopen, "dlopen_interceptor_trace_counters"
     )
     dlopen_attach = extract_function(dlopen, "dlopen_interceptor_attach")
     require("PEAK_DLOPEN_TRACE_PATH" in dlopen_config_once and
             "PEAK_DLOPEN_DEBUG" in dlopen_config_once and
+            "PEAK_ENABLE_CXX_SYMBOL_SCAN" in dlopen_config_once and
+            "configured_cxx_symbol_scan_enabled" in dlopen_config_once and
             "g_once_init_enter(&dlopen_runtime_config_initialized)" in
             dlopen_config and
             "getenv" not in dlopen_debug and
             "g_getenv" not in dlopen_debug and
+            "configured_cxx_symbol_scan_enabled" in dlopen_selector and
+            "getenv" not in dlopen_selector and
+            "g_getenv" not in dlopen_selector and
             "getenv" not in dlopen_trace and
             "g_getenv" not in dlopen_trace and
             "dlopen_interceptor_init_runtime_config();" in dlopen_attach,

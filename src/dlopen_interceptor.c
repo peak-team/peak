@@ -158,6 +158,7 @@ static _Atomic size_t active_dlclose_guard_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static gsize dlopen_runtime_config_initialized = 0;
 static gboolean configured_dlopen_debug_enabled = FALSE;
+static gboolean configured_cxx_symbol_scan_enabled = FALSE;
 static gchar* configured_dlopen_trace_path = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
@@ -196,6 +197,8 @@ dlopen_interceptor_init_runtime_config_once(void)
 
     configured_dlopen_debug_enabled =
         dlopen_interceptor_parse_truthy(g_getenv("PEAK_DLOPEN_DEBUG"));
+    configured_cxx_symbol_scan_enabled =
+        dlopen_interceptor_parse_truthy(g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN"));
     if (trace_path != NULL && trace_path[0] != '\0') {
         configured_dlopen_trace_path = g_strdup(trace_path);
     }
@@ -2300,8 +2303,7 @@ dlopen_interceptor_release_resolved_targets(PeakDlopenResolvedTarget* targets,
 static gboolean
 dlopen_interceptor_target_uses_selector_resolution(const char* target)
 {
-    return dlopen_interceptor_parse_truthy(
-               g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN")) ||
+    return configured_cxx_symbol_scan_enabled ||
            (target != NULL &&
            (g_str_has_prefix(target, "_Z") || strstr(target, "::") != NULL ||
             strchr(target, '(') != NULL || strchr(target, '<') != NULL ||

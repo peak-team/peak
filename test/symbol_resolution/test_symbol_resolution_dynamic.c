@@ -8,6 +8,7 @@
 #include <link.h>
 #endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -35,11 +36,13 @@ main(int argc, char** argv)
     int ambiguous;
     int exact_instance;
     int mixed;
+    int selector_env_snapshot;
 
     if (argc != 2 ||
         (strcmp(argv[1], "unique") != 0 && strcmp(argv[1], "ambiguous") != 0 &&
          strcmp(argv[1], "mixed") != 0 &&
          strcmp(argv[1], "exact-instance") != 0 &&
+         strcmp(argv[1], "env-snapshot") != 0 &&
          strcmp(argv[1], "startup-unique") != 0 &&
          strcmp(argv[1], "startup-ambiguous") != 0)) {
         return 2;
@@ -69,6 +72,7 @@ main(int argc, char** argv)
     ambiguous = strcmp(argv[1], "ambiguous") == 0;
     exact_instance = strcmp(argv[1], "exact-instance") == 0;
     mixed = strcmp(argv[1], "mixed") == 0;
+    selector_env_snapshot = strcmp(argv[1], "env-snapshot") == 0;
     dlopen_interceptor_test_set_manual_drain(TRUE);
     if ((mixed ? !load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &module_a)
                : !load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &module_a)) ||
@@ -85,6 +89,11 @@ main(int argc, char** argv)
         (ambiguous && !dlopen_interceptor_test_enqueue_loaded_dynamic_attach(
                           PEAK_TEST_SYMBOL_MODULE_B, module_b))) {
         fprintf(stderr, "not ok - dynamic attach queue rejected loaded module\n");
+        return 1;
+    }
+    if (selector_env_snapshot &&
+        unsetenv("PEAK_ENABLE_CXX_SYMBOL_SCAN") != 0) {
+        fprintf(stderr, "not ok - unable to clear selector environment\n");
         return 1;
     }
     usleep(10000);
@@ -157,6 +166,7 @@ main(int argc, char** argv)
     puts(ambiguous ? "dynamic_ambiguous_terminal_ok" :
          mixed ? "dynamic_mixed_targets_ok" :
          exact_instance ? "dynamic_exact_instance_ok" :
+         selector_env_snapshot ? "dynamic_selector_env_snapshot_ok" :
                  "dynamic_unique_selector_ok");
     return 0;
 }

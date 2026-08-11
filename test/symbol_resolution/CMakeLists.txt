@@ -78,6 +78,11 @@ add_test(NAME test_symbol_resolution_dynamic_legacy_short
 set_tests_properties(test_symbol_resolution_dynamic_legacy_short PROPERTIES
     ENVIRONMENT "PEAK_TARGET=legacy_short_unique;PEAK_ENABLE_CXX_SYMBOL_SCAN=1;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0")
 
+add_test(NAME test_symbol_resolution_dynamic_selector_env_snapshot
+    COMMAND test_symbol_resolution_dynamic env-snapshot)
+set_tests_properties(test_symbol_resolution_dynamic_selector_env_snapshot PROPERTIES
+    ENVIRONMENT "PEAK_TARGET=legacy_short_unique;PEAK_ENABLE_CXX_SYMBOL_SCAN=1;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0")
+
 add_test(NAME test_symbol_resolution_dynamic_ambiguous
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/test_dynamic_ambiguity.py
@@ -103,6 +108,7 @@ set_tests_properties(
     test_symbol_resolution_dynamic_unique
     test_symbol_resolution_dynamic_exact_instance
     test_symbol_resolution_dynamic_legacy_short
+    test_symbol_resolution_dynamic_selector_env_snapshot
     test_symbol_resolution_dynamic_ambiguous
     test_symbol_resolution_dynamic_mixed_targets
     test_symbol_resolution_startup_selectors
