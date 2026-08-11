@@ -89,15 +89,38 @@ test_batch_scaling(void)
             .module_path = PEAK_TEST_SYMBOL_MODULE_A,
             .allow_legacy_short = TRUE,
         };
+        PeakTargetResolveRequest mixed[2] = {
+            {
+                .selector = "_ZN9peak_test6Widget4funcEid",
+                .module_path = PEAK_TEST_SYMBOL_MODULE_A,
+                .allow_legacy_short = TRUE,
+            },
+            {
+                .selector = "missing_human_signature(int)",
+            },
+        };
         PeakTargetResolverDiagnostics mangled_stats;
+        const char* expected_demangled =
+            "peak_test::Widget::func(int, double)";
 
         peak_target_resolver_reset_diagnostics();
         peak_target_resolver_resolve_many(&mangled, 1);
         peak_target_resolver_get_diagnostics(&mangled_stats);
         expect_true(mangled.result == PEAK_TARGET_RESOLVE_UNIQUE &&
-                        mangled_stats.demangles == 0,
-                    "exact mangled selector skips demangling");
+                        mangled_stats.demangles == 1 &&
+                        strcmp(((PeakTargetSymbolCandidate*)g_ptr_array_index(
+                                   mangled.resolution.candidates, 0))->demangled,
+                               expected_demangled) == 0,
+                    "exact mangled selector demangles only its matched symbol");
+        peak_target_resolver_resolve_many(mixed, G_N_ELEMENTS(mixed));
+        expect_true(mixed[0].result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                        strcmp(((PeakTargetSymbolCandidate*)g_ptr_array_index(
+                                   mixed[0].resolution.candidates, 0))->demangled,
+                               expected_demangled) == 0,
+                    "exact mangled display is independent of batch composition");
         peak_target_resolution_clear(&mangled.resolution);
+        peak_target_resolution_clear(&mixed[0].resolution);
+        peak_target_resolution_clear(&mixed[1].resolution);
     }
 
     {

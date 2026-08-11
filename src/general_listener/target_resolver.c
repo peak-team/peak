@@ -957,10 +957,31 @@ peak_target_collect_legacy_matches(const GumSymbolDetails* details,
 }
 
 static gboolean
+peak_target_exact_matches_current_module(GPtrArray* matches,
+                                         const char* current_module)
+{
+    if (matches == NULL || current_module == NULL) {
+        return FALSE;
+    }
+    for (guint i = 0; i < matches->len; i++) {
+        PeakTargetCollectContext* context = g_ptr_array_index(matches, i);
+
+        if (peak_target_resolver_module_matches(context->selector->module,
+                                                current_module) &&
+            peak_target_resolver_module_matches(context->module_path,
+                                                current_module)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static gboolean
 peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                                  gpointer user_data)
 {
     PeakTargetBatchCollectContext* batch = user_data;
+    GPtrArray* exact_matches;
     char* demangled = NULL;
     gchar* normalized = NULL;
     gchar* qualified = NULL;
@@ -971,17 +992,25 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
         return TRUE;
     }
     PEAK_RESOLVER_DIAG_ADD(symbol_visits, 1);
+    exact_matches = g_hash_table_lookup(batch->exact, details->name);
     demangled = (g_hash_table_size(batch->full) != 0 ||
                  g_hash_table_size(batch->full_by_name) != 0 ||
                  g_hash_table_size(batch->legacy_qualified) != 0 ||
                  g_hash_table_size(batch->legacy_short) != 0)
         ? cxa_demangle(details->name) : NULL;
+    /* Exact mangled lookup keeps non-candidates at zero demangles, but the
+     * selected symbol must have the same human-readable name whether or not
+     * another selector in the batch happens to require global demangling. */
+    if (demangled == NULL && g_str_has_prefix(details->name, "_Z") &&
+        peak_target_exact_matches_current_module(exact_matches,
+                                                 batch->current_module)) {
+        demangled = cxa_demangle(details->name);
+    }
     if (demangled != NULL) {
         PEAK_RESOLVER_DIAG_ADD(demangles, 1);
     }
     peak_target_collect_batch_matches(details,
-                                      g_hash_table_lookup(batch->exact,
-                                                          details->name),
+                                      exact_matches,
                                       details->name, demangled,
                                       PEAK_TARGET_MATCH_EXACT, batch->current_module);
     if (demangled != NULL) {

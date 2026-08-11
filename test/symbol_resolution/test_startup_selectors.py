@@ -41,6 +41,12 @@ def main():
     assert stderr.count("ambiguous target selector; refusing to attach") == 1
     assert stderr.count(f"module={module_a}") == 1
     assert stderr.count(f"module={module_b}") == 1
+
+    stdout, stderr = run(program, module_a,
+                         "peak_symbol_fixture_invoke+0X10",
+                         "startup-invalid")
+    assert "startup_invalid_selector_ok" in stdout
+    assert stderr.count("invalid target selector; refusing to attach") == 1
     print("startup_selectors_test_ok")
 
 

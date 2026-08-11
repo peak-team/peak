@@ -28,6 +28,19 @@ load_fixture(const char* path, void** handle_out)
     return 1;
 }
 
+static int
+enqueue_and_drain_fixture(const char* path, void* handle)
+{
+    if (!dlopen_interceptor_test_enqueue_loaded_dynamic_attach(path, handle)) {
+        fprintf(stderr, "not ok - dynamic attach queue rejected %s\n", path);
+        return 0;
+    }
+    usleep(10000);
+    dlopen_interceptor_test_drain_dynamic_attach_queue();
+    dlopen_interceptor_test_drain_dynamic_attach_queue();
+    return 1;
+}
+
 int
 main(int argc, char** argv)
 {
@@ -42,6 +55,8 @@ main(int argc, char** argv)
     int selector_env_snapshot;
     int local;
     int plain_c;
+    int plain_c_unrelated_first;
+    int selector_unrelated_first;
     int legacy;
     int legacy_disabled;
     PeakDlopenSelectorDiagnostics selector_diagnostics;
@@ -50,6 +65,8 @@ main(int argc, char** argv)
         (strcmp(argv[1], "unique") != 0 && strcmp(argv[1], "ambiguous") != 0 &&
          strcmp(argv[1], "mixed") != 0 && strcmp(argv[1], "local") != 0 &&
          strcmp(argv[1], "plain-c") != 0 &&
+         strcmp(argv[1], "plain-c-unrelated-first") != 0 &&
+         strcmp(argv[1], "selector-unrelated-first") != 0 &&
          strcmp(argv[1], "legacy") != 0 &&
          strcmp(argv[1], "legacy-disabled") != 0 &&
          strcmp(argv[1], "ambiguous-sequential") != 0 &&
@@ -57,15 +74,27 @@ main(int argc, char** argv)
          strcmp(argv[1], "env-snapshot") != 0 &&
          strcmp(argv[1], "startup-unique") != 0 &&
          strcmp(argv[1], "startup-ambiguous") != 0 &&
+         strcmp(argv[1], "startup-invalid") != 0 &&
          strcmp(argv[1], "startup-plain-c") != 0)) {
         return 2;
     }
     if (strcmp(argv[1], "startup-unique") == 0) {
+        const char* report_name =
+            peak_general_listener_test_demangled_name(0);
+
         invoke = (fixture_invoke_fn)dlsym(RTLD_DEFAULT,
                                           "peak_symbol_fixture_invoke");
         if (invoke == NULL || invoke() == 0 ||
             peak_general_listener_test_call_count(0) == 0) {
             fprintf(stderr, "not ok - startup selector did not hook the requested overload\n");
+            return 1;
+        }
+        if (strstr(g_getenv("PEAK_TARGET"),
+                   "_ZN9peak_test6Widget4funcEid") != NULL &&
+            (report_name == NULL ||
+             strcmp(report_name,
+                    "peak_test::Widget::func(int, double)") != 0)) {
+            fprintf(stderr, "not ok - exact mangled startup report name was not demangled\n");
             return 1;
         }
         puts("startup_unique_selector_ok");
@@ -80,6 +109,17 @@ main(int argc, char** argv)
             return 1;
         }
         puts("startup_ambiguous_terminal_ok");
+        return 0;
+    }
+    if (strcmp(argv[1], "startup-invalid") == 0) {
+        invoke = (fixture_invoke_fn)dlsym(RTLD_DEFAULT,
+                                          "peak_symbol_fixture_invoke");
+        if (invoke == NULL || invoke() == 0 ||
+            peak_general_listener_test_call_count(0) != 0) {
+            fprintf(stderr, "not ok - invalid startup selector attached a target\n");
+            return 1;
+        }
+        puts("startup_invalid_selector_ok");
         return 0;
     }
     if (strcmp(argv[1], "startup-plain-c") == 0) {
@@ -105,11 +145,84 @@ main(int argc, char** argv)
     mixed = strcmp(argv[1], "mixed") == 0;
     local = strcmp(argv[1], "local") == 0;
     plain_c = strcmp(argv[1], "plain-c") == 0;
+    plain_c_unrelated_first =
+        strcmp(argv[1], "plain-c-unrelated-first") == 0;
+    selector_unrelated_first =
+        strcmp(argv[1], "selector-unrelated-first") == 0;
     legacy = strcmp(argv[1], "legacy") == 0;
     legacy_disabled = strcmp(argv[1], "legacy-disabled") == 0;
     selector_env_snapshot = strcmp(argv[1], "env-snapshot") == 0;
     dlopen_interceptor_test_set_manual_drain(TRUE);
     dlopen_interceptor_test_reset_selector_diagnostics();
+    if (plain_c_unrelated_first) {
+        if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &module_a) ||
+            !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING,
+                                       module_a)) {
+            return 1;
+        }
+        dlopen_interceptor_get_dynamic_attach_diagnostics(&diagnostics);
+        dlopen_interceptor_test_get_selector_diagnostics(&selector_diagnostics);
+        if (diagnostics.retained_handles != 0 ||
+            selector_diagnostics.deferred_module_sync_drains != 0 ||
+            selector_diagnostics.selector_resolver_batches != 0) {
+            fprintf(stderr, "not ok - unrelated DSO made ordinary C miss terminal or expensive\n");
+            return 1;
+        }
+        if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &module_b) ||
+            !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_A, module_b)) {
+            return 1;
+        }
+        invoke = (fixture_invoke_fn)dlsym(module_b,
+                                          "peak_symbol_fixture_invoke");
+        dlopen_interceptor_get_dynamic_attach_diagnostics(&diagnostics);
+        dlopen_interceptor_test_get_selector_diagnostics(&selector_diagnostics);
+        if (invoke == NULL || invoke() == 0 ||
+            peak_general_listener_test_call_count(0) == 0 ||
+            diagnostics.retained_handles == 0 ||
+            selector_diagnostics.deferred_module_sync_drains != 0 ||
+            selector_diagnostics.selector_resolver_batches != 0) {
+            fprintf(stderr, "not ok - ordinary C target did not survive unrelated dlopen miss\n");
+            return 1;
+        }
+        dlopen_interceptor_test_set_manual_drain(FALSE);
+        puts("dynamic_plain_c_unrelated_first_ok");
+        return 0;
+    }
+    if (selector_unrelated_first) {
+        void* rich_module = NULL;
+
+        if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_RICH, &rich_module) ||
+            !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_RICH,
+                                       rich_module) ||
+            !load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &module_a) ||
+            !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING,
+                                       module_a)) {
+            return 1;
+        }
+        dlopen_interceptor_test_get_selector_diagnostics(&selector_diagnostics);
+        if (selector_diagnostics.deferred_module_sync_drains != 0 ||
+            selector_diagnostics.selector_resolver_batches != 0) {
+            fprintf(stderr, "not ok - unrelated DSOs triggered path-qualified resolver\n");
+            return 1;
+        }
+        if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &module_b) ||
+            !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_A, module_b)) {
+            return 1;
+        }
+        invoke = (fixture_invoke_fn)dlsym(module_b,
+                                          "peak_symbol_fixture_invoke");
+        dlopen_interceptor_test_get_selector_diagnostics(&selector_diagnostics);
+        if (invoke == NULL || invoke() == 0 ||
+            peak_general_listener_test_call_count(0) == 0 ||
+            selector_diagnostics.deferred_module_sync_drains == 0 ||
+            selector_diagnostics.selector_resolver_batches != 1) {
+            fprintf(stderr, "not ok - matching DSO did not trigger one selector batch\n");
+            return 1;
+        }
+        dlopen_interceptor_test_set_manual_drain(FALSE);
+        puts("dynamic_selector_unrelated_first_ok");
+        return 0;
+    }
     if ((mixed ? !load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &module_a)
                : !load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &module_a)) ||
         ((ambiguous || exact_instance) && !ambiguous_sequential &&
@@ -209,6 +322,11 @@ main(int argc, char** argv)
             (void)function_a(1, 2.0);
             if (peak_general_listener_test_call_count(0) == 0) {
                 fprintf(stderr, "not ok - requested module did not receive hook\n");
+                return 1;
+            }
+            if (g_strcmp0(peak_general_listener_test_demangled_name(0),
+                          "peak_test::Widget::func(int, double)") != 0) {
+                fprintf(stderr, "not ok - exact mangled dynamic report name was not demangled\n");
                 return 1;
             }
         } else {

@@ -323,9 +323,12 @@ candidate belongs to the request's exact loader instance, and attaches the
 candidate address directly; this also supports local (non-`dlsym`-exported)
 symbols. Basename and unqualified C++ selectors are refused dynamically so
 their result cannot depend on loader/controller-drain order. The resolver never
-loads a module. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits legacy C++ matching
-only after a plain C exact lookup misses, and is subject to the same dynamic
-path requirement.
+loads a module. An unrelated `dlopen()` does not synchronize or scan symbols
+for a path-qualified selector; the selector's module must first match that
+request. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits startup legacy fallback after
+an ordinary exact lookup misses. In the dynamic path it permits legacy matching
+only for an explicit slash-containing `path!symbol`; an unqualified C miss
+always stays unresolved for a later DSO.
 
 ## Supported Boundary
 

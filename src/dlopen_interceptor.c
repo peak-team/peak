@@ -14,6 +14,7 @@
 #include "internal/unsafe_gum_prologue.h"
 #include "internal/target_resolver.h"
 #include "utils/source_target.h"
+#include "utils/target_selector_syntax.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -102,6 +103,7 @@ typedef struct {
     const char* name;
     gpointer address;
     char* demangled;
+    gboolean selector_applicable;
     gboolean terminal;
 } PeakDlopenResolvedTarget;
 
@@ -2330,8 +2332,10 @@ dlopen_interceptor_target_uses_selector_resolution(const char* target)
     return target != NULL &&
            (g_str_has_prefix(target, "_Z") || strstr(target, "::") != NULL ||
             strchr(target, '(') != NULL || strchr(target, '<') != NULL ||
-            strchr(target, '!') != NULL || strstr(target, "+0x") != NULL ||
-            strstr(target, "operator") != NULL);
+            strchr(target, '!') != NULL ||
+            strstr(target, "operator") != NULL ||
+            (strchr(target, '+') != NULL &&
+             peak_target_selector_has_top_level_offset(target)));
 }
 
 static gboolean
@@ -2732,13 +2736,6 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(target_interceptor);
 #endif
-    selector_resolutions = g_try_new0(PeakTargetResolveRequest, target_count);
-    if (selector_resolutions == NULL) {
-        gum_interceptor_unignore_current_thread(target_interceptor);
-        peak_general_listener_fast_unignore_current_thread();
-        dlopen_interceptor_release_resolved_targets(resolved_targets, target_count);
-        return PEAK_DLOPEN_ATTACH_DONE;
-    }
     for (size_t i = 0; i < target_count; i++) {
         if (resolved_targets[i].name != NULL) {
             gboolean explicit_selector =
@@ -2748,45 +2745,60 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             if (!explicit_selector) {
                 resolved_targets[i].address = dlsym(request->handle,
                                                     resolved_targets[i].name);
+                continue;
             }
-            if (explicit_selector ||
-                (resolved_targets[i].address == NULL &&
-                 configured_cxx_symbol_scan_enabled)) {
-                gchar* selector_module = NULL;
 
-                if (!peak_target_resolver_dup_selector_module(
-                        resolved_targets[i].name, &selector_module)) {
-                    resolved_targets[i].terminal = TRUE;
-                    g_printerr("[peak] invalid dynamic target selector; refusing to attach: %s\n",
-                               resolved_targets[i].name);
-                    continue;
-                }
-                /* A later module can make an unqualified C++ selector
-                 * ambiguous.  Do not attach opportunistically based on the
-                 * controller drain order; dynamic C++ selectors require an
-                 * explicit module scope. */
-                if (selector_module == NULL ||
-                    strchr(selector_module, G_DIR_SEPARATOR) == NULL) {
-                    g_printerr("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
-                               resolved_targets[i].name);
-                    g_free(selector_module);
-                    resolved_targets[i].terminal = TRUE;
-                    continue;
-                }
+            gchar* selector_module = NULL;
+
+            if (!peak_target_resolver_dup_selector_module(
+                    resolved_targets[i].name, &selector_module)) {
+                resolved_targets[i].terminal = TRUE;
+                g_printerr("[peak] invalid dynamic target selector; refusing to attach: %s\n",
+                           resolved_targets[i].name);
+                continue;
+            }
+            /* Dynamic C++ resolution is deliberately explicit. An
+             * unqualified ordinary C miss stays unresolved for later DSOs;
+             * C++ selectors must name the DSO whose completed dlopen request
+             * is allowed to trigger a resolver scan. */
+            if (selector_module == NULL ||
+                strchr(selector_module, G_DIR_SEPARATOR) == NULL) {
+                g_printerr("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
+                           resolved_targets[i].name);
                 g_free(selector_module);
-                selector_resolutions[i] = (PeakTargetResolveRequest){
-                    .selector = resolved_targets[i].name,
-                    .allow_legacy_short = configured_cxx_symbol_scan_enabled,
-                };
+                resolved_targets[i].terminal = TRUE;
+                continue;
+            }
+            if (request->filename != NULL &&
+                peak_target_resolver_module_matches(selector_module,
+                                                    request->filename)) {
+                resolved_targets[i].selector_applicable = TRUE;
                 needs_selector_resolution = TRUE;
             }
+            g_free(selector_module);
+        }
+    }
+
+    if (needs_selector_resolution) {
+        selector_resolutions = g_try_new0(PeakTargetResolveRequest,
+                                          target_count);
+    }
+    if (selector_resolutions != NULL) {
+        for (size_t i = 0; i < target_count; i++) {
+            if (!resolved_targets[i].selector_applicable) {
+                continue;
+            }
+            selector_resolutions[i] = (PeakTargetResolveRequest){
+                .selector = resolved_targets[i].name,
+                .allow_legacy_short = configured_cxx_symbol_scan_enabled,
+            };
         }
     }
 #if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
     GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 2
     /* A real selector batch must see the module whose completed dlopen queued
      * this request. Exact C hits never reach this path. */
-    while (needs_selector_resolution) {
+    while (selector_resolutions != NULL && needs_selector_resolution) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         atomic_fetch_add_explicit(&dynamic_attach_test_deferred_module_sync_drains,
                                   1, memory_order_relaxed);
@@ -2796,7 +2808,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         }
     }
 #endif
-    for (size_t i = 0; i < target_count; i++) {
+    for (size_t i = 0; selector_resolutions != NULL && i < target_count; i++) {
         if (selector_resolutions[i].selector != NULL) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
             atomic_fetch_add_explicit(
@@ -2808,7 +2820,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         }
     }
     for (size_t i = 0; i < target_count; i++) {
-        if (selector_resolutions[i].selector != NULL) {
+        if (selector_resolutions != NULL &&
+            selector_resolutions[i].selector != NULL) {
             PeakTargetResolution* resolution = &selector_resolutions[i].resolution;
             PeakTargetResolveResult result = selector_resolutions[i].result;
 
@@ -2852,7 +2865,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             }
         }
     }
-    for (size_t i = 0; i < target_count; i++) {
+    for (size_t i = 0; selector_resolutions != NULL && i < target_count; i++) {
         peak_target_resolution_clear(&selector_resolutions[i].resolution);
     }
     g_free(selector_resolutions);

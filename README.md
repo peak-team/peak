@@ -188,7 +188,7 @@ in detail.
 | `PEAK_TARGET_GROUP` | Comma-separated built-in groups: `FFTW`, `PBLAS`, `ScaLAPACK`, `LAPACK`, and `BLAS`. |
 | `PEAK_TARGET_FILE` | File containing one complete CPU target name or C++ selector per line; this avoids comma-list quoting concerns for complex signatures. |
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
-| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Permit legacy C++ short-name matching only after an ordinary exact lookup misses. A C++ target attached after `dlopen()` must use an absolute or slash-containing `path!symbol` selector, so its result is independent of load/controller-drain order. |
+| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | At startup, permit legacy C++ short-name matching only after an ordinary exact lookup misses. After `dlopen()`, legacy matching is available only through an absolute or slash-containing `path!symbol` selector; an unqualified C miss remains unresolved for later DSOs. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
 | `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |

@@ -44,6 +44,12 @@ def main():
     assert "mangled=_ZN9peak_test6Widget4funcEid" in output
     assert "demangled=peak_test::Widget::func(int, double)" in output
 
+    output = run(
+        peak, "inspect-symbols",
+        f"{module_a}!_ZN9peak_test6Widget4funcEid", expected=0)
+    assert "mangled=_ZN9peak_test6Widget4funcEid" in output
+    assert "demangled=peak_test::Widget::func(int, double)" in output
+
     run(peak, "inspect-symbols",
         f"{module_a}!_ZN9peak_test6Widget4funcEid+0x0", expected=2)
     run(peak, "inspect-symbols", f"{module_a}!peak_symbol_strong_alias+0x1",
@@ -139,10 +145,10 @@ def main():
     output = run(peak, "inspect-symbols", f"{module_a}!{conversion_mangled}",
                  expected=0)
     assert "candidates=1" in output
-    # Exact mangled lookup deliberately avoids demangling, so probe the human
-    # selector path itself. Older Frontera libstdc++ demanglers return this ABI
-    # spelling unchanged; both human spellings must then be consistently
-    # unavailable while the exact mangled selector above remains usable.
+    # Exact mangled lookup demangles only the matching candidate. Older
+    # Frontera libstdc++ demanglers return this ABI spelling unchanged, so
+    # probe the human selector path itself: both human spellings must then be
+    # consistently unavailable while the exact mangled selector remains usable.
     conversion_expected = probe_optional_demangle(
         peak, "inspect-symbols", f"{module_a}!{conversion_selectors[0]}")
     for selector in conversion_selectors[1:]:

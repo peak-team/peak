@@ -2415,6 +2415,9 @@ def check_runtime_configuration_freeze(repo_root):
     dlopen_selector = extract_function(
         dlopen, "dlopen_interceptor_target_uses_selector_resolution"
     )
+    startup_selector = extract_function(
+        general, "peak_symbol_should_use_cpp_map"
+    )
     dlopen_dynamic_attach = extract_function(
         dlopen, "dlopen_interceptor_attach_from_request"
     )
@@ -2431,9 +2434,22 @@ def check_runtime_configuration_freeze(repo_root):
             "getenv" not in dlopen_debug and
             "g_getenv" not in dlopen_debug and
             "configured_cxx_symbol_scan_enabled" not in dlopen_selector and
+            "peak_target_selector_has_top_level_offset" in dlopen_selector and
+            'strstr(target, "+0x")' not in dlopen_selector and
+            "peak_target_selector_has_top_level_offset" in startup_selector and
+            'strstr(symbol, "+0x")' not in startup_selector and
             "getenv" not in dlopen_selector and
             "g_getenv" not in dlopen_selector and
             "dlsym(request->handle" in dlopen_dynamic_attach and
+            dlopen_dynamic_attach.index("dlsym(request->handle") <
+            dlopen_dynamic_attach.index(
+                "selector_resolutions = g_try_new0") and
+            "if (needs_selector_resolution)" in dlopen_dynamic_attach and
+            "if (selector_resolutions == NULL)" not in
+            dlopen_dynamic_attach and
+            "peak_target_resolver_module_matches(selector_module" in
+            dlopen_dynamic_attach and
+            "request->filename" in dlopen_dynamic_attach and
             "configured_cxx_symbol_scan_enabled" in dlopen_dynamic_attach and
             "getenv" not in dlopen_dynamic_attach and
             "g_getenv" not in dlopen_dynamic_attach and

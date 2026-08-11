@@ -77,11 +77,13 @@ target_compile_definitions(test_symbol_resolution_dynamic PRIVATE
     PEAK_ENABLE_TEST_HOOKS=1
     PEAK_TARGET_RESOLVER_TESTING=1
     PEAK_TEST_SYMBOL_MODULE_A="$<TARGET_FILE:test_symbol_resolution_a>"
-    PEAK_TEST_SYMBOL_MODULE_B="$<TARGET_FILE:test_symbol_resolution_b>")
+    PEAK_TEST_SYMBOL_MODULE_B="$<TARGET_FILE:test_symbol_resolution_b>"
+    PEAK_TEST_SYMBOL_MODULE_RICH="$<TARGET_FILE:test_symbol_resolution_rich>")
 target_compile_definitions(test_symbol_resolution_dynamic PRIVATE
     PEAK_TEST_SYMBOL_MODULE_MISSING="$<TARGET_FILE:test_symbol_resolution_missing>")
 add_dependencies(test_symbol_resolution_dynamic
-    test_symbol_resolution_a test_symbol_resolution_b test_symbol_resolution_missing peak)
+    test_symbol_resolution_a test_symbol_resolution_b test_symbol_resolution_rich
+    test_symbol_resolution_missing peak)
 
 add_test(NAME test_symbol_resolution_dynamic_unique
     COMMAND test_symbol_resolution_dynamic unique)
@@ -107,6 +109,16 @@ add_test(NAME test_symbol_resolution_dynamic_plain_c_fast_path
     COMMAND test_symbol_resolution_dynamic plain-c)
 set_tests_properties(test_symbol_resolution_dynamic_plain_c_fast_path PROPERTIES
     ENVIRONMENT "PEAK_TARGET=peak_symbol_fixture_invoke;PEAK_ENABLE_CXX_SYMBOL_SCAN=1;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0")
+
+add_test(NAME test_symbol_resolution_dynamic_plain_c_unrelated_first
+    COMMAND test_symbol_resolution_dynamic plain-c-unrelated-first)
+set_tests_properties(test_symbol_resolution_dynamic_plain_c_unrelated_first PROPERTIES
+    ENVIRONMENT "PEAK_TARGET=peak_symbol_fixture_invoke;PEAK_ENABLE_CXX_SYMBOL_SCAN=1;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0")
+
+add_test(NAME test_symbol_resolution_dynamic_selector_unrelated_first
+    COMMAND test_symbol_resolution_dynamic selector-unrelated-first)
+set_tests_properties(test_symbol_resolution_dynamic_selector_unrelated_first PROPERTIES
+    ENVIRONMENT "PEAK_TARGET=$<TARGET_FILE:test_symbol_resolution_a>!peak_test::Widget::func(int,double);PEAK_ENABLE_CXX_SYMBOL_SCAN=1;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0")
 
 add_test(NAME test_symbol_resolution_dynamic_local_symbol
     COMMAND test_symbol_resolution_dynamic local)
@@ -150,6 +162,8 @@ set_tests_properties(
     test_symbol_resolution_dynamic_legacy_short
     test_symbol_resolution_dynamic_legacy_short_requires_opt_in
     test_symbol_resolution_dynamic_plain_c_fast_path
+    test_symbol_resolution_dynamic_plain_c_unrelated_first
+    test_symbol_resolution_dynamic_selector_unrelated_first
     test_symbol_resolution_dynamic_local_symbol
     test_symbol_resolution_dynamic_selector_env_snapshot
     test_symbol_resolution_dynamic_ambiguous

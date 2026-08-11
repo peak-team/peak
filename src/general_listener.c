@@ -22,6 +22,7 @@
 #include "detach_controller.h"
 #include "logging.h"
 #include "utils/env_parser.h"
+#include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
 #include <errno.h>
 #include <float.h>
@@ -1023,8 +1024,9 @@ peak_symbol_should_use_cpp_map(const char* symbol)
             strchr(symbol, '(') != NULL ||
             strchr(symbol, '<') != NULL ||
             strchr(symbol, '!') != NULL ||
-            strstr(symbol, "+0x") != NULL ||
-            strstr(symbol, "operator") != NULL);
+            strstr(symbol, "operator") != NULL ||
+            (strchr(symbol, '+') != NULL &&
+             peak_target_selector_has_top_level_offset(symbol)));
 }
 
 gpointer
@@ -2693,6 +2695,15 @@ peak_general_listener_test_startup_selector_batches(void)
 {
     return atomic_load_explicit(&peak_general_listener_test_startup_selector_batch_count,
                                 memory_order_relaxed);
+}
+
+const char*
+peak_general_listener_test_demangled_name(size_t hook_id)
+{
+    if (peak_demangled_strings == NULL || hook_id >= peak_hook_address_count) {
+        return NULL;
+    }
+    return peak_demangled_strings[hook_id];
 }
 
 PEAK_API gulong
