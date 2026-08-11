@@ -111,8 +111,6 @@ def main():
             "decltype ({parm#1}<<(1)) shift_return<int>(int)",
             "nested_pointer_return<int>(int)",
             "int (*(*nested_pointer_return<int>(int))())(int)",
-            "conversion_pointer_return<peak_test::ConversionPointerSource>(peak_test::ConversionPointerSource)",
-            "decltype (&peak_test::ConversionPointerSource::operator int) conversion_pointer_return<peak_test::ConversionPointerSource>(peak_test::ConversionPointerSource)",
             "probe::concrete_angle_plus_return<int>(int)",
             "probe::Holder<&probe::operator+> probe::concrete_angle_plus_return<int>(int)",
             "peak_test::OperatorSurface::operator new(unsigned long)",
@@ -122,6 +120,27 @@ def main():
         output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
                      expected=0)
         assert "candidates=1" in output
+
+    # Older libstdc++ demanglers return this ABI spelling unchanged.
+    conversion_mangled = (
+        "_Z25conversion_pointer_returnIN9peak_test23ConversionPointerSourceEEDTadsrT_oncviES2_")
+    conversion_selectors = (
+        "conversion_pointer_return<peak_test::ConversionPointerSource>(peak_test::ConversionPointerSource)",
+        "decltype (&peak_test::ConversionPointerSource::operator int) conversion_pointer_return<peak_test::ConversionPointerSource>(peak_test::ConversionPointerSource)")
+    output = run(peak, "inspect-symbols", f"{module_a}!{conversion_mangled}",
+                 expected=0)
+    assert "candidates=1" in output
+    if "demangled=decltype (&peak_test::ConversionPointerSource::operator int)" in output:
+        for selector in conversion_selectors:
+            output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
+                         expected=0)
+            assert "candidates=1" in output
+    else:
+        assert f"demangled={conversion_mangled}" in output
+        for selector in conversion_selectors:
+            output = run(peak, "inspect-symbols", f"{module_a}!{selector}",
+                         expected=1)
+            assert "candidates=0" in output
 
     for selector in (
             "const", "(int) const",
