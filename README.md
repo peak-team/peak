@@ -15,9 +15,10 @@
 
 # PEAK (Performance Evaluation and Analysis Kit)
 
-PEAK is an `LD_PRELOAD`-based profiler for HPC applications. It profiles
+PEAK is a dynamic-library injection profiler for HPC applications. It profiles
 selected CPU functions, optional CUDA kernels, memory allocation activity, and
-JIT-published code without requiring application recompilation.
+JIT-published code without requiring application recompilation. Linux uses
+`LD_PRELOAD`; macOS uses `DYLD_INSERT_LIBRARIES` for baseline CPU profiling.
 
 PEAK is designed for long-running and MPI applications where profiler overhead,
 safe attach and detach behavior, and reliable final reports matter.
@@ -25,12 +26,15 @@ safe attach and detach behavior, and reliable final reports matter.
 ## Highlights
 
 - Profile named functions instead of instrumenting the whole application.
-- Preload PEAK around existing Linux binaries without rebuilding them.
+- Inject PEAK around existing Linux and macOS applications without rebuilding
+  them.
 - Control profiling overhead by detaching and reattaching selected targets.
 - Produce human-readable and CSV reports, including MPI-aware aggregation.
 - Optionally profile CUDA kernels, memory activity, and JIT-published symbols.
 
 ## Quick Start
+
+### Linux
 
 ```bash
 mkdir -p build
@@ -46,13 +50,37 @@ LD_PRELOAD="$PWD/src/libpeak.so" \
 PEAK writes a report to stderr and a CSV profile log using the default prefix
 `./peak_statslog`.
 
+### macOS
+
+Build the baseline macOS configuration, then inject the installed library into
+an application you built or otherwise control:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DPEAK_ENABLE_MPI=OFF \
+  -DBUILD_CUDA_PROFILE=OFF
+cmake --build build
+cmake --install build
+
+PEAK_TARGET=my_function \
+DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
+./target_application
+```
+
+System Integrity Protection prevents `DYLD_INSERT_LIBRARIES` from affecting
+protected Apple system executables. Use PEAK with an ordinary application you
+built or installed outside the protected system locations.
+
 ## Requirements
 
-- Linux for the primary `LD_PRELOAD` runtime path
+- Linux for the full `LD_PRELOAD` runtime path, or macOS for baseline named CPU
+  function profiling through `DYLD_INSERT_LIBRARIES`
 - CMake 3.13 or newer
 - C and C++ compilers (a Fortran compiler is needed only for
   `PEAK_ENABLE_FORTRAN_TESTS=ON`)
-- POSIX threads and standard Linux runtime libraries
+- POSIX threads and standard platform runtime libraries
 
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
 CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
@@ -98,10 +126,23 @@ Common CMake options:
 After installation:
 
 ```bash
+# Linux
 PEAK_TARGET=my_function \
 LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 ./target_application
+
+# macOS
+PEAK_TARGET=my_function \
+DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
+./target_application
 ```
+
+The macOS path currently supports startup attachment and reporting for named
+CPU functions. Linux-specific physical detach/reattach, the detach helper,
+raw-syscall exec handling, CUDA profiling, and Linux signal-policy interception
+are unavailable on macOS. macOS CI builds and installs PEAK on Arm64 and runs a
+real `DYLD_INSERT_LIBRARIES` profiling smoke test with MPI, CUDA, and OTF2
+disabled.
 
 On Linux x86_64 and Arm64, the detach helper is built and installed at the
 configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
