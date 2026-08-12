@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 
-def run(program, preload, target, mode):
+def run(program, preload, target, mode, legacy=False):
     env = os.environ.copy()
     env.update({
         "LD_PRELOAD": preload,
@@ -16,6 +16,8 @@ def run(program, preload, target, mode):
         "PEAK_ENABLE_GLOBAL_HEARTBEAT": "0",
         "PEAK_ENABLE_REATTACH": "0",
     })
+    if legacy:
+        env["PEAK_ENABLE_CXX_SYMBOL_SCAN"] = "1"
     try:
         completed = subprocess.run([program, mode], env=env,
                                    capture_output=True, text=True, timeout=20)
@@ -34,6 +36,26 @@ def main():
                    f"{module_a}!peak_test::Widget::operator!() const"):
         stdout, _ = run(program, module_a, target, "startup-unique")
         assert "startup_unique_selector_ok" in stdout
+
+    # Process-wide operator() is intentionally ambiguous once libstdc++ is
+    # loaded, so exercise it with an explicit module below. These two names
+    # remain unique process-wide and preserve the original legacy behavior.
+    for target in ("~Widget", "concrete_angle_plus_return"):
+        stdout, _ = run(program, module_a, target, "startup-unique",
+                        legacy=True)
+        assert "startup_unique_selector_ok" in stdout
+
+    stdout, _ = run(program, module_a, f"{module_a}!operator()",
+                    "startup-unique", legacy=True)
+    assert "startup_unique_selector_ok" in stdout
+
+    dual_target = ",".join((
+        f"{module_a}!_ZN9peak_test6Widget4funcEid",
+        f"{module_b}!_ZN9peak_test6Widget4funcEid",
+    ))
+    stdout, _ = run(program, f"{module_a}:{module_b}", dual_target,
+                    "startup-dual-module")
+    assert "startup_dual_module_report_names_ok" in stdout
 
     stdout, stderr = run(program, f"{module_a}:{module_b}", selector,
                          "startup-ambiguous")

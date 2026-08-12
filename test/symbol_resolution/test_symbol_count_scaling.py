@@ -4,10 +4,12 @@ import subprocess
 import sys
 
 
-def collect(program, rich):
+def collect(program, rich_kind):
     env = os.environ.copy()
-    if rich:
+    if rich_kind == "cxx":
         env["PEAK_TEST_LOAD_RICH"] = "1"
+    elif rich_kind == "c":
+        env["PEAK_TEST_LOAD_C_RICH"] = "1"
     completed = subprocess.run([program, "--symbol-count"], env=env,
                                capture_output=True, text=True, timeout=20)
     if completed.returncode != 0:
@@ -18,13 +20,19 @@ def collect(program, rich):
 
 
 def main():
-    small = collect(sys.argv[1], False)
-    large = collect(sys.argv[1], True)
-    assert small["module_passes"] == large["module_passes"] == 1
-    assert large["module_enumerations"] == small["module_enumerations"] + 1
-    assert large["symbol_visits"] >= small["symbol_visits"] + 128
-    assert large["demangles"] >= small["demangles"] + 128
-    assert large["candidate_matches"] == small["candidate_matches"] == 0
+    small = collect(sys.argv[1], None)
+    cxx_rich = collect(sys.argv[1], "cxx")
+    c_rich = collect(sys.argv[1], "c")
+    assert small["module_passes"] == cxx_rich["module_passes"] == 1
+    assert c_rich["module_passes"] == 1
+    assert cxx_rich["module_enumerations"] == small["module_enumerations"] + 1
+    assert c_rich["module_enumerations"] == small["module_enumerations"] + 1
+    assert cxx_rich["symbol_visits"] >= small["symbol_visits"] + 128
+    assert c_rich["symbol_visits"] >= small["symbol_visits"] + 128
+    assert cxx_rich["demangles"] >= small["demangles"] + 128
+    assert c_rich["demangles"] == small["demangles"]
+    assert cxx_rich["candidate_matches"] == small["candidate_matches"] == 0
+    assert c_rich["candidate_matches"] == 0
     print("symbol_count_scaling_test_ok")
 
 

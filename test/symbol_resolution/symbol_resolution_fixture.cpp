@@ -293,6 +293,13 @@ struct QualifierOnly {
     }
 };
 
+__attribute__((noinline, used))
+int invoke_qualifier_lref_method()
+{
+    QualifierOnly value;
+    return value.lref_method(13);
+}
+
 struct OperatorSurface {
     static __attribute__((noinline, used, visibility("default")))
     void* operator new(std::size_t size)
@@ -431,6 +438,7 @@ int operator+(const TemplateOperatorValue&, T value)
 template int operator+<int>(const TemplateOperatorValue&, int);
 
 struct Widget {
+    ~Widget();
     static int func(int value, double scale);
     static int func(double value);
     int operator()(int value) const;
@@ -438,6 +446,12 @@ struct Widget {
     bool operator!() const;
     bool operator!=(const Widget& other) const;
 };
+
+__attribute__((noinline, used, visibility("default")))
+Widget::~Widget()
+{
+    (void)peak_symbol_legacy_helper(PEAK_FIXTURE_VALUE);
+}
 
 __attribute__((noinline, used, visibility("default")))
 int Widget::func(int value, double scale)
@@ -570,7 +584,7 @@ int peak_symbol_fixture_invoke(void)
            shift_return<int>(14) +
            nested_pointer_return<int>(15)()(16) +
            peak_test::QualifierOnly{}.const_method(12) +
-           ([] { peak_test::QualifierOnly value; return value.lref_method(13); })() +
+           peak_test::invoke_qualifier_lref_method() +
            peak_test::QualifierOnly{}.noexcept_method(14) +
            (delete new peak_test::OperatorSurface, 0) +
            static_cast<bool>(peak_test::OperatorSurface{}) +
@@ -579,7 +593,7 @@ int peak_symbol_fixture_invoke(void)
            (peak_test::ConversionPointerSource{}.*
                 conversion_pointer_return<peak_test::ConversionPointerSource>(
                     peak_test::ConversionPointerSource{}))() +
-           sizeof(probe::concrete_angle_plus_return<int>(18)) +
+           (probe::concrete_angle_plus_return<int>(18), 0) +
            (!peak_test::Widget{}) +
            (peak_test::Widget{} != peak_test::Widget{}) +
            static_cast<ThunkBaseB*>(&derived)->target(7);

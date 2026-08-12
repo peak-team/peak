@@ -83,6 +83,12 @@ gboolean peak_target_resolver_validate_selector(const char* selector);
 gboolean peak_target_resolver_dup_selector_module(const char* selector,
                                                    gchar** module_out);
 
+/* Formats the user-visible target name. Module-qualified selectors retain the
+ * module spelling supplied by the user; unqualified selectors use only the
+ * resolved demangled signature. The caller owns the returned string. */
+gchar* peak_target_resolver_format_display_name(const char* selector,
+                                                const char* demangled);
+
 /* Matches a target signature while excluding ABI/compiler-generated aliases. */
 gboolean peak_target_resolver_full_signature_matches(const char* selector,
                                                       const char* demangled);

@@ -178,6 +178,10 @@ print_symbol_count_stats(gboolean load_rich)
     if (load_rich) {
         expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_RICH, RTLD_NOW | RTLD_LOCAL) != NULL,
                     "load symbol-rich module");
+    } else if (g_getenv("PEAK_TEST_LOAD_C_RICH") != NULL) {
+        expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_C_RICH,
+                           RTLD_NOW | RTLD_LOCAL) != NULL,
+                    "load C-symbol-rich module");
     }
     gum_init_embedded();
     expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL) != NULL,
@@ -299,6 +303,47 @@ main(int argc, char** argv)
                     &resolution) == PEAK_TARGET_RESOLVE_UNIQUE,
                 "loaded-module resolver resolves the exact module path");
     peak_target_resolution_clear(&resolution);
+    {
+        const char* legacy_names[] = {
+            "~Widget",
+            "operator()",
+            "concrete_angle_plus_return",
+        };
+
+        for (size_t i = 0; i < G_N_ELEMENTS(legacy_names); i++) {
+            char* selector = g_strdup_printf("%s!%s",
+                                             PEAK_TEST_SYMBOL_MODULE_A,
+                                             legacy_names[i]);
+            expect_true(unique_address(selector) != NULL,
+                        "legacy bare-name extraction matches main semantics");
+            g_free(selector);
+        }
+    }
+    {
+        PeakTargetResolveRequest scoped = {
+            .selector = module_a_selector,
+            .module_path = PEAK_TEST_SYMBOL_MODULE_A,
+        };
+        PeakTargetResolverDiagnostics diagnostics;
+        gchar* display_name;
+        gchar* expected_display = g_strdup_printf(
+            "%s!peak_test::Widget::func(int, double)",
+            PEAK_TEST_SYMBOL_MODULE_A);
+
+        peak_target_resolver_reset_diagnostics();
+        peak_target_resolver_resolve_many(&scoped, 1);
+        peak_target_resolver_get_diagnostics(&diagnostics);
+        expect_true(scoped.result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                        diagnostics.module_symbol_enumerations == 1,
+                    "module-qualified batch enumerates only its target DSO");
+        display_name = peak_target_resolver_format_display_name(
+            module_a_selector, "peak_test::Widget::func(int, double)");
+        expect_true(g_strcmp0(display_name, expected_display) == 0,
+                    "module-qualified display preserves requested module spelling");
+        g_free(expected_display);
+        g_free(display_name);
+        peak_target_resolution_clear(&scoped.resolution);
+    }
 
     mangled_selector = g_strdup_printf(
         "%s!_ZN9peak_test6Widget4funcEid", PEAK_TEST_SYMBOL_MODULE_A);

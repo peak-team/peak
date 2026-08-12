@@ -73,6 +73,7 @@ main(int argc, char** argv)
          strcmp(argv[1], "exact-instance") != 0 &&
          strcmp(argv[1], "env-snapshot") != 0 &&
          strcmp(argv[1], "startup-unique") != 0 &&
+         strcmp(argv[1], "startup-dual-module") != 0 &&
          strcmp(argv[1], "startup-ambiguous") != 0 &&
          strcmp(argv[1], "startup-invalid") != 0 &&
          strcmp(argv[1], "startup-plain-c") != 0)) {
@@ -81,6 +82,8 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "startup-unique") == 0) {
         const char* report_name =
             peak_general_listener_test_demangled_name(0);
+        const char* target = g_getenv("PEAK_TARGET");
+        const char* separator = target != NULL ? strchr(target, '!') : NULL;
 
         invoke = (fixture_invoke_fn)dlsym(RTLD_DEFAULT,
                                           "peak_symbol_fixture_invoke");
@@ -89,15 +92,64 @@ main(int argc, char** argv)
             fprintf(stderr, "not ok - startup selector did not hook the requested overload\n");
             return 1;
         }
-        if (strstr(g_getenv("PEAK_TARGET"),
-                   "_ZN9peak_test6Widget4funcEid") != NULL &&
+        if (separator != NULL &&
             (report_name == NULL ||
-             strcmp(report_name,
-                    "peak_test::Widget::func(int, double)") != 0)) {
-            fprintf(stderr, "not ok - exact mangled startup report name was not demangled\n");
+             strncmp(report_name, target, (size_t)(separator - target)) != 0 ||
+             report_name[separator - target] != '!')) {
+            fprintf(stderr, "not ok - startup report lost requested module identity\n");
             return 1;
         }
+        if (target != NULL &&
+            strstr(target, "_ZN9peak_test6Widget4funcEid") != NULL) {
+            char* expected_report_name = separator != NULL
+                ? g_strdup_printf(
+                      "%.*s!peak_test::Widget::func(int, double)",
+                      (int)(separator - target), target)
+                : g_strdup("peak_test::Widget::func(int, double)");
+            int name_matches = g_strcmp0(report_name,
+                                         expected_report_name) == 0;
+            g_free(expected_report_name);
+            if (!name_matches) {
+                fprintf(stderr, "not ok - exact mangled startup report name was not demangled\n");
+                return 1;
+            }
+        }
         puts("startup_unique_selector_ok");
+        return 0;
+    }
+    if (strcmp(argv[1], "startup-dual-module") == 0) {
+        void* handle_a = dlopen(PEAK_TEST_SYMBOL_MODULE_A,
+                                RTLD_NOW | RTLD_NOLOAD);
+        void* handle_b = dlopen(PEAK_TEST_SYMBOL_MODULE_B,
+                                RTLD_NOW | RTLD_NOLOAD);
+        widget_func_fn function_a = handle_a != NULL
+            ? (widget_func_fn)dlsym(handle_a, "_ZN9peak_test6Widget4funcEid")
+            : NULL;
+        widget_func_fn function_b = handle_b != NULL
+            ? (widget_func_fn)dlsym(handle_b, "_ZN9peak_test6Widget4funcEid")
+            : NULL;
+        char* expected_a = g_strdup_printf(
+            "%s!peak_test::Widget::func(int, double)",
+            PEAK_TEST_SYMBOL_MODULE_A);
+        char* expected_b = g_strdup_printf(
+            "%s!peak_test::Widget::func(int, double)",
+            PEAK_TEST_SYMBOL_MODULE_B);
+        int ok = function_a != NULL && function_b != NULL &&
+            function_a(1, 2.0) != function_b(1, 2.0) &&
+            peak_general_listener_test_call_count(0) != 0 &&
+            peak_general_listener_test_call_count(1) != 0 &&
+            g_strcmp0(peak_general_listener_test_demangled_name(0),
+                      expected_a) == 0 &&
+            g_strcmp0(peak_general_listener_test_demangled_name(1),
+                      expected_b) == 0;
+
+        g_free(expected_b);
+        g_free(expected_a);
+        if (!ok) {
+            fprintf(stderr, "not ok - dual-module report names lost DSO identity\n");
+            return 1;
+        }
+        puts("startup_dual_module_report_names_ok");
         return 0;
     }
     if (strcmp(argv[1], "startup-ambiguous") == 0) {
@@ -324,11 +376,16 @@ main(int argc, char** argv)
                 fprintf(stderr, "not ok - requested module did not receive hook\n");
                 return 1;
             }
+            char* expected_report_name = g_strdup_printf(
+                "%s!peak_test::Widget::func(int, double)",
+                PEAK_TEST_SYMBOL_MODULE_A);
             if (g_strcmp0(peak_general_listener_test_demangled_name(0),
-                          "peak_test::Widget::func(int, double)") != 0) {
+                          expected_report_name) != 0) {
+                g_free(expected_report_name);
                 fprintf(stderr, "not ok - exact mangled dynamic report name was not demangled\n");
                 return 1;
             }
+            g_free(expected_report_name);
         } else {
             invoke = (fixture_invoke_fn)dlsym(
                 module_a, mixed ? "peak_symbol_missing_dynamic_target"

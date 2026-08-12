@@ -159,7 +159,10 @@ only at resolved function entries; arbitrary instruction offsets are not a
 supported target syntax. PEAK first considers exact symbol names, then exact full
 demangled signatures, then legacy C++ short names. A selector with more than
 one candidate at its best matching level is not attached; PEAK prints every
-candidate instead of choosing one.
+candidate instead of choosing one. Reports retain the module spelling from a
+module-qualified selector, for example
+`/opt/lib/libfoo.so!namespace::Class::func(int, double)`, so equal signatures
+from different DSOs remain distinguishable.
 
 Use the installed inspection command before profiling when selecting an
 overload or checking several DSOs:

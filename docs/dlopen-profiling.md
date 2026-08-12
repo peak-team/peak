@@ -328,7 +328,9 @@ for a path-qualified selector; the selector's module must first match that
 request. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits startup legacy fallback after
 an ordinary exact lookup misses. In the dynamic path it permits legacy matching
 only for an explicit slash-containing `path!symbol`; an unqualified C miss
-always stays unresolved for a later DSO.
+always stays unresolved for a later DSO. Once a matching DSO request arrives,
+the resolver enumerates symbols only in modules applicable to that selector.
+The report name retains the module spelling supplied in `path!symbol`.
 
 ## Supported Boundary
 

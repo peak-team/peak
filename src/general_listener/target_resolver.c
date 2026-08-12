@@ -298,6 +298,24 @@ peak_target_resolver_dup_selector_module(const char* selector_text,
     return TRUE;
 }
 
+gchar*
+peak_target_resolver_format_display_name(const char* selector_text,
+                                         const char* demangled)
+{
+    PeakTargetSelector selector;
+    gchar* display_name;
+
+    if (demangled == NULL ||
+        !peak_target_parse_selector(selector_text, &selector)) {
+        return NULL;
+    }
+    display_name = selector.module != NULL
+        ? g_strdup_printf("%s!%s", selector.module, demangled)
+        : g_strdup(demangled);
+    peak_target_selector_clear(&selector);
+    return display_name;
+}
+
 gboolean
 peak_target_resolver_module_matches(const char* requested,
                                     const char* module_path)
@@ -794,8 +812,7 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
         PeakTargetSymbolCandidate* existing =
             g_ptr_array_index(context->candidates, i);
         if (existing->address == candidate->address &&
-            g_strcmp0(existing->module, candidate->module) == 0 &&
-            g_strcmp0(existing->mangled, candidate->mangled) == 0) {
+            g_strcmp0(existing->module, candidate->module) == 0) {
             peak_target_symbol_candidate_free(candidate);
             return;
         }
@@ -986,6 +1003,7 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
     gchar* normalized = NULL;
     gchar* qualified = NULL;
     char* short_name = NULL;
+    char* legacy_short_name = NULL;
 
     if (details->type != GUM_SYMBOL_FUNCTION || details->address == 0 ||
         details->name == NULL) {
@@ -993,7 +1011,8 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
     }
     PEAK_RESOLVER_DIAG_ADD(symbol_visits, 1);
     exact_matches = g_hash_table_lookup(batch->exact, details->name);
-    demangled = (g_hash_table_size(batch->full) != 0 ||
+    demangled = g_str_has_prefix(details->name, "_Z") &&
+                (g_hash_table_size(batch->full) != 0 ||
                  g_hash_table_size(batch->full_by_name) != 0 ||
                  g_hash_table_size(batch->legacy_qualified) != 0 ||
                  g_hash_table_size(batch->legacy_short) != 0)
@@ -1057,11 +1076,15 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
                                                details->name, demangled, batch->current_module);
             g_free(normalized_qualified);
         }
-        peak_target_collect_legacy_matches(details,
-                                           g_hash_table_lookup(batch->legacy_short,
-                                                               short_name),
-                                           details->name, demangled, batch->current_module);
+        if (g_hash_table_size(batch->legacy_short) != 0) {
+            legacy_short_name = extract_function_name(demangled);
+            peak_target_collect_legacy_matches(
+                details,
+                g_hash_table_lookup(batch->legacy_short, legacy_short_name),
+                details->name, demangled, batch->current_module);
+        }
     }
+    free(legacy_short_name);
     free(short_name);
     g_free(qualified);
     g_free(normalized);
@@ -1070,10 +1093,32 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
 }
 
 static gboolean
+peak_target_batch_module_is_applicable(PeakTargetBatchCollectContext* batch,
+                                       const char* module_path)
+{
+    for (size_t i = 0; i < batch->count; i++) {
+        PeakTargetCollectContext* context = &batch->contexts[i];
+
+        if (context->selector != NULL &&
+            peak_target_resolver_module_matches(context->selector->module,
+                                                module_path) &&
+            peak_target_resolver_module_matches(context->module_path,
+                                                module_path)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static gboolean
 peak_target_collect_batch_module(GumModule* module, gpointer user_data)
 {
     PeakTargetBatchCollectContext* batch = user_data;
     const char* path = gum_module_get_path(module);
+
+    if (!peak_target_batch_module_is_applicable(batch, path)) {
+        return TRUE;
+    }
     batch->current_module = path != NULL ? path : "<unknown>";
     PEAK_RESOLVER_DIAG_ADD(module_symbol_enumerations, 1);
     gum_module_enumerate_symbols(module, peak_target_collect_batch_symbol,

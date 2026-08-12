@@ -7046,7 +7046,8 @@ peak_general_listener_use_selector_resolution(
         PeakTargetSymbolCandidate* candidate =
             g_ptr_array_index(resolution->candidates, 0);
         address = candidate->address;
-        *demangled_name = g_strdup(candidate->demangled);
+        *demangled_name = peak_target_resolver_format_display_name(
+            selector, candidate->demangled);
     } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
         g_printerr("[peak] ambiguous target selector; refusing to attach\n");
         peak_target_resolver_print(stderr, selector, resolution);

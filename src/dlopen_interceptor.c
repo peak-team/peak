@@ -2833,7 +2833,10 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                     if (dlopen_interceptor_symbol_matches_candidate_module(
                             candidate->symbol_address, candidate, request)) {
                         resolved_targets[i].address = candidate->address;
-                        resolved_targets[i].demangled = g_strdup(candidate->demangled);
+                        resolved_targets[i].demangled =
+                            peak_target_resolver_format_display_name(
+                                resolved_targets[i].name,
+                                candidate->demangled);
                     }
                 }
             } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
