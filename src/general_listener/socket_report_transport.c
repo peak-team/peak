@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)
+#if PEAK_HAVE_SYS_RANDOM_H
 #include <sys/random.h>
 #endif
 #include <sys/resource.h>
