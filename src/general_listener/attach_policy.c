@@ -6,6 +6,9 @@
 
 #include <dirent.h>
 #include <errno.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -96,6 +99,9 @@ peak_general_listener_support_attach_target_is_supported(const char* symbol_name
 gboolean
 peak_general_listener_startup_attach_can_skip_stop(void)
 {
+#if defined(__APPLE__)
+    return pthread_is_threaded_np() == 0;
+#else
     DIR* dir = opendir("/proc/self/task");
     struct dirent* entry;
     unsigned int task_count = 0;
@@ -126,4 +132,5 @@ peak_general_listener_startup_attach_can_skip_stop(void)
 
     closedir(dir);
     return read_errno == 0 && task_count == 1;
+#endif
 }

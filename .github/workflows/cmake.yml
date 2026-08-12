@@ -87,3 +87,19 @@ jobs:
 
     - name: Install
       run: cmake --install ${{ github.workspace }}/build
+
+    - name: Test DYLD injection
+      run: |
+        cc -dynamiclib test/macos/smoke_target.c \
+          -o build/libpeak_macos_smoke_target.dylib
+        cc test/macos/smoke_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-smoke
+        PEAK_TARGET=peak_macos_smoke_target \
+        PEAK_HEARTBEAT_INTERVAL=0 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-smoke \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-smoke 2>&1 | tee build/macos-smoke.log
+        grep -E 'peak_macos_smoke_target[*]*[[:space:]]*\|[[:space:]]+7[[:space:]]*\|' \
+          build/macos-smoke.log
