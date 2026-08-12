@@ -13,7 +13,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#if defined(__linux__)
+#include <linux/limits.h>
+#else
 #include <limits.h>
+#endif
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
