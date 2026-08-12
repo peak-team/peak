@@ -61,11 +61,17 @@ rejected with no Gum hooks installed. Once activation succeeds, `ATTACH`,
 `REPLACE`, `REVERT`, and `SHUTDOWN` fail closed as unsupported rather than
 claiming a strict window while no application threads are held. Because runtime
 dynamic attach is unsupported, Darwin never installs the `dlopen` listener,
-`dlclose` guard, ownership thread, or queue. Memory profiling is rejected as
-outside the named-CPU-only scope. A Darwin process destructor stops PEAK-owned
-controller work and writes the final report, then leaves installed target and
-support Gum hooks plus their reachable PEAK state alive for process exit to
-reclaim.
+`dlclose` guard, ownership thread, or queue, and JIT provider activation is
+skipped. Memory profiling is rejected as outside the named-CPU-only scope. A
+Darwin process destructor stops PEAK-owned controller work and writes the final
+report, then leaves installed target and support Gum hooks plus their reachable
+PEAK state alive for process exit to reclaim.
+
+Darwin entry-byte mutation additionally requires exclusive ownership of the
+canonical Gum context: its listener array must contain exactly the requested
+PEAK listener, and no replacement function may be installed. Different raw
+targets that Frida canonicalizes to one context, or contexts shared with another
+Gum client, therefore fail closed without restoring entry bytes.
 
 The Darwin creation gate covers `pthread_create`. Two Mach thread enumerations
 cover a pthread creator that crossed the gate before it closed, but individual

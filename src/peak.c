@@ -992,7 +992,9 @@ peak_activate_runtime(void)
     }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     peak_detached = g_new0(gboolean, peak_hook_address_count);
+#if !defined(__APPLE__)
     peak_jit_provider_enable();
+#endif
     /*
      * This is the post-MPI module rescan. Gum initialization and this scan
      * both occur in the deferred activation, so symbol lookup sees UCX,

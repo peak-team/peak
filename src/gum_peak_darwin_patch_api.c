@@ -44,6 +44,8 @@ typedef struct {
     gpointer on_invoke_trampoline;
     gpointer on_leave_trampoline;
     volatile GPtrArray* listener_entries;
+    gpointer replacement_function;
+    gpointer replacement_data;
 } PeakGumFunctionContext17;
 
 typedef struct {
@@ -64,29 +66,23 @@ G_STATIC_ASSERT(sizeof(gpointer) == 8);
 G_STATIC_ASSERT(sizeof(guint) == 4);
 
 static gboolean
-peak_gum_darwin_context_has_listener(PeakGumFunctionContext17* context,
-                                     GumInvocationListener* listener)
+peak_gum_darwin_context_has_only_listener(PeakGumFunctionContext17* context,
+                                          GumInvocationListener* listener)
 {
     GPtrArray* entries;
+    PeakGumListenerEntry17* entry;
 
     if (listener == NULL) {
-        return TRUE;
-    }
-
-    entries = (GPtrArray*)g_atomic_pointer_get(&context->listener_entries);
-    if (entries == NULL) {
         return FALSE;
     }
 
-    for (guint i = 0; i < entries->len; i++) {
-        PeakGumListenerEntry17* entry = g_ptr_array_index(entries, i);
-
-        if (entry != NULL && entry->listener_instance == listener) {
-            return TRUE;
-        }
+    entries = (GPtrArray*)g_atomic_pointer_get(&context->listener_entries);
+    if (entries == NULL || entries->len != 1) {
+        return FALSE;
     }
 
-    return FALSE;
+    entry = g_ptr_array_index(entries, 0);
+    return entry != NULL && entry->listener_instance == listener;
 }
 
 static gboolean
@@ -99,11 +95,12 @@ peak_gum_darwin_context_is_entry_patch(PeakGumFunctionContext17* context,
            context->function_address != NULL &&
            context->grafted_hook == NULL &&
            context->import_target == NULL &&
+           context->replacement_function == NULL &&
            context->overwritten_prologue != NULL &&
            context->overwritten_prologue_len > 0 &&
            context->overwritten_prologue_len <=
                PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE &&
-           peak_gum_darwin_context_has_listener(context, listener);
+           peak_gum_darwin_context_has_only_listener(context, listener);
 }
 
 static PeakGumFunctionContext17*

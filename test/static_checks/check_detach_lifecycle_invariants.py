@@ -118,11 +118,26 @@ def check_darwin_strict_lifecycle(repo_root):
     exact_context = extract_function(
         gum_bridge, "peak_gum_darwin_find_context_exact"
     )
+    exclusive_listener = extract_function(
+        gum_bridge, "peak_gum_darwin_context_has_only_listener"
+    )
+    entry_patch = extract_function(
+        gum_bridge, "peak_gum_darwin_context_is_entry_patch"
+    )
     require("peak_gum_darwin_find_context_exact" in exact_lookup and
             "peak_gum_darwin_find_context(" not in exact_lookup and
             "g_hash_table_lookup" in exact_context and
             "g_hash_table_iter_init" not in exact_context,
             "Darwin reattach identity lookup must not fall back to listener-only discovery")
+    require("gpointer replacement_function;" in gum_bridge and
+            "gpointer replacement_data;" in gum_bridge and
+            "entries->len != 1" in exclusive_listener and
+            "g_ptr_array_index(entries, 0)" in exclusive_listener and
+            "entry->listener_instance == listener" in exclusive_listener and
+            "context->replacement_function == NULL" in entry_patch and
+            "peak_gum_darwin_context_has_only_listener" in entry_patch,
+            "Darwin physical patch lookup must require exclusive listener "
+            "ownership and no Gum replacement")
 
     prepare = extract_function(
         controller, "peak_detach_controller_prepare_hook_mutation"
@@ -199,6 +214,14 @@ def check_darwin_strict_lifecycle(repo_root):
             "macOS activation must not install or enable dlopen/dlclose "
             "dynamic-attach machinery")
 
+    jit_enable = activation.find("peak_jit_provider_enable()")
+    jit_enable_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, jit_enable
+    )
+    jit_enable_end = activation.find("#endif", jit_enable)
+    require(0 <= jit_enable_guard < jit_enable < jit_enable_end,
+            "macOS activation must not enable the JIT metadata provider")
+
     require("detach_concurrent_main.c" in workflow and
             "timeout-minutes: 2" in workflow and
             "PEAK_MAX_NUM_THREADS=32" in workflow and
@@ -217,15 +240,28 @@ def check_darwin_strict_lifecycle(repo_root):
             "peak_macos_branch_target" in workflow and
             "b _peak_macos_smoke_target" in branch_target,
             "macOS CI must exercise reattach through a Gum-followed Arm64 branch")
+    require("Test shared canonical context fails closed" in workflow and
+            "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" in
+            workflow and
+            "macos-detach-shared.csv" in workflow and
+            "gum-patch-missing" in workflow and
+            "! grep -E ',(peak_macos_branch_target|peak_macos_smoke_target),detach,success,1,safe,'" in
+            workflow,
+            "macOS CI must prove shared canonical Gum contexts cannot be "
+            "physically detached")
     require("rejecting PEAK_MEMORY_PROFILE on macOS" in workflow,
             "macOS CI must exercise explicit memory-profile rejection")
     require("Runtime `ATTACH`, `REPLACE`, and" in readme and
             "`REVERT` mutations fail closed" in readme and
             "does not install" in readme and
+            "JIT metadata provider is also kept disabled" in readme and
             "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
+            "exactly the requested PEAK listener" in readme and
             "does not claim to cover threads" in readme and
             "created directly through Mach APIs" in readme and
             "Memory profiling is rejected" in controller_doc and
+            "exclusive ownership of the" in controller_doc and
+            "canonical Gum context" in controller_doc and
             "arbitrary Mach thread creation" in controller_doc and
             "not claimed by this backend" in controller_doc,
             "Darwin docs must bound v1 safety to startup attach and pthread-based workloads")

@@ -148,8 +148,9 @@ installing hooks if an early constructor or deferred post-MPI activation has
 already made the process multithreaded. Runtime `ATTACH`, `REPLACE`, and
 `REVERT` mutations fail closed as unsupported; PEAK therefore does not install
 its `dlopen` listener, `dlclose` guard, ownership thread, or dynamic-attach
-queue on macOS. `PEAK_MEMORY_PROFILE` is also rejected explicitly rather than
-starting a partially supported memory profiler.
+queue on macOS. The JIT metadata provider is also kept disabled on macOS.
+`PEAK_MEMORY_PROFILE` is also rejected explicitly rather than starting a
+partially supported memory profiler.
 
 On Arm64, PEAK supports zero-overhead physical detach and reattach for
 pthread-based workloads: it gates `pthread_create`, suspends the other
@@ -159,6 +160,9 @@ crossed the gate before it closed; this v1 does not claim to cover threads
 created directly through Mach APIs. If a thread is observed inside the
 overwritten prologue, PEAK resumes every thread and retries through the normal
 controller backoff; it deliberately does not single-step threads for liveness.
+Entry-byte mutation is eligible only when the canonical Gum context contains
+exactly the requested PEAK listener and has no replacement; a context shared by
+canonical aliases or another Gum client fails closed and remains instrumented.
 At process exit, Darwin stops PEAK-owned controller work and writes the final
 report but leaves installed Gum hooks, listeners, and their reachable state
 alive for the operating system to reclaim; it does not claim an unheld final
