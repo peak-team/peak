@@ -593,7 +593,7 @@ peak_darwin_build_patch_plan(const PeakDetachRequest* request,
     gpointer current_function_address = NULL;
     if (!peak_gum_darwin_get_canonical_address_exact(
             request->interceptor,
-            request->function_address,
+            record->function_address,
             request->listener,
             &current_function_address)) {
         peak_darwin_note_failure("reattach-patch-context-missing",

@@ -54,13 +54,18 @@ arrive or cannot be released safely.
 Darwin Arm64 uses a separate Mach STOP backend only for entry-byte physical
 detach and reattach. It does not use the Linux helper, reserved-signal PC
 classifier, runtime Gum mutation protocol, or final Gum shutdown protocol
-described below. Single-threaded startup attachment bypasses the controller;
-once peers exist, `ATTACH`, `REPLACE`, `REVERT`, and `SHUTDOWN` fail closed as
-unsupported rather than claiming a strict window while no application threads
-are held. A Darwin process destructor first stops PEAK-owned controller work,
-closes loader admission, and writes the final report. It then leaves target,
-loader, allocator, `close`, and pthread Gum hooks plus their reachable PEAK
-state alive for process exit to reclaim.
+described below. Before the first Gum initialization or hook mutation, Darwin
+activation proves that the process is still single-threaded. If peers already
+exist, including after deferred MPI initialization, the entire activation is
+rejected with no Gum hooks installed. Once activation succeeds, `ATTACH`,
+`REPLACE`, `REVERT`, and `SHUTDOWN` fail closed as unsupported rather than
+claiming a strict window while no application threads are held. Because runtime
+dynamic attach is unsupported, Darwin never installs the `dlopen` listener,
+`dlclose` guard, ownership thread, or queue. Memory profiling is rejected as
+outside the named-CPU-only scope. A Darwin process destructor stops PEAK-owned
+controller work and writes the final report, then leaves installed target and
+support Gum hooks plus their reachable PEAK state alive for process exit to
+reclaim.
 
 The Darwin creation gate covers `pthread_create`. Two Mach thread enumerations
 cover a pthread creator that crossed the gate before it closed, but individual

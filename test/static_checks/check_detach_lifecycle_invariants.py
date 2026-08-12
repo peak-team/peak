@@ -61,6 +61,26 @@ def check_darwin_strict_lifecycle(repo_root):
     concurrent_test = read_source(
         repo_root, "test/macos/detach_concurrent_main.c"
     )
+    threaded_bootstrap_test = read_source(
+        repo_root, "test/macos/threaded_bootstrap_main.c"
+    )
+    branch_target = read_source(
+        repo_root, "test/macos/smoke_branch_target.S"
+    )
+
+    activation = extract_function(peak, "peak_activate_runtime")
+    bootstrap_proof = activation.find(
+        "peak_general_listener_startup_attach_can_skip_stop"
+    )
+    gum_init = activation.find("gum_init_embedded()")
+    pthread_attach = activation.find("pthread_listener_attach()")
+    require(0 <= bootstrap_proof < gum_init < pthread_attach and
+            "PEAK_RUNTIME_ACTIVATION_REJECTED" in
+            activation[bootstrap_proof:gum_init] and
+            "no Gum hooks were installed" in
+            activation[bootstrap_proof:gum_init],
+            "Darwin activation must prove single-threaded bootstrap before "
+            "Gum initialization or pthread hook mutation")
 
     cancel = extract_function(controller, "peak_darwin_cancel_stop_window")
     resume = cancel.find("if (!peak_darwin_resume_threads")
@@ -83,6 +103,14 @@ def check_darwin_strict_lifecycle(repo_root):
             "PEAK_DETACH_STATUS_CLASSIFY_FAILED" in
             patch_plan[identity_lookup:saved_address_use],
             "Darwin reattach must verify current canonical patch identity before using saved bytes")
+    require(re.search(
+                r"peak_gum_darwin_get_canonical_address_exact\s*\(\s*"
+                r"request->interceptor,\s*record->function_address,\s*"
+                r"request->listener,",
+                patch_plan,
+            ) is not None,
+            "Darwin reattach exact lookup must use the saved Gum canonical "
+            "address, not the original PEAK request address")
 
     exact_lookup = extract_function(
         gum_bridge, "peak_gum_darwin_get_canonical_address_exact"
@@ -128,10 +156,48 @@ def check_darwin_strict_lifecycle(repo_root):
             final_detach.find("pthread_t controller_tid"),
             "Darwin process exit must retain Gum target listener state")
     finalizer = extract_function(peak, "peak_fini_impl")
-    require("dlopen_interceptor_shutdown_dynamic_attach" in finalizer and
+    loader_state = finalizer.find("gboolean dlopen_shutdown_flushed")
+    darwin_loader_guard = finalizer.find("#if defined(__APPLE__)", loader_state)
+    darwin_loader_else = finalizer.find("#else", darwin_loader_guard)
+    require(0 <= loader_state < darwin_loader_guard < darwin_loader_else and
+            "dlopen_interceptor_" not in
+            finalizer[darwin_loader_guard:darwin_loader_else] and
+            "no loader listener" in
+            finalizer[darwin_loader_guard:darwin_loader_else] and
             "Darwin process-exit teardown leaves Gum support hook state alive"
             in finalizer,
-            "Darwin process exit must quiesce loader work and retain Gum support hooks")
+            "Darwin must neither install nor shut down dynamic-loader attach machinery")
+
+    init = extract_function(peak, "peak_init")
+    memory_parse = init.find(
+        "peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE)"
+    )
+    memory_reject = init.find("rejecting PEAK_MEMORY_PROFILE on macOS")
+    requested_work = init.find("gboolean has_requested_work")
+    require(0 <= memory_parse < memory_reject < requested_work and
+            "peak_memory_profile = false;" in
+            init[memory_reject:requested_work] and
+            "peak_memory_track_all = false;" in
+            init[memory_reject:requested_work],
+            "macOS must reject memory profiling before deciding whether any "
+            "supported work was requested")
+
+    dynamic_attach = activation.find("dlopen_interceptor_attach()")
+    dynamic_attach_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, dynamic_attach
+    )
+    dynamic_attach_end = activation.find("#endif", dynamic_attach)
+    dynamic_enable = activation.find(
+        "dlopen_interceptor_enable_dynamic_attach()"
+    )
+    dynamic_enable_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, dynamic_enable
+    )
+    dynamic_enable_end = activation.find("#endif", dynamic_enable)
+    require(0 <= dynamic_attach_guard < dynamic_attach < dynamic_attach_end and
+            0 <= dynamic_enable_guard < dynamic_enable < dynamic_enable_end,
+            "macOS activation must not install or enable dlopen/dlclose "
+            "dynamic-attach machinery")
 
     require("detach_concurrent_main.c" in workflow and
             "timeout-minutes: 2" in workflow and
@@ -142,9 +208,24 @@ def check_darwin_strict_lifecycle(repo_root):
             "pthread_create" in concurrent_test and
             "pthread_join" in concurrent_test,
             "macOS CI must exercise bounded concurrent detach/reattach and pthread creation")
-    require("Runtime `ATTACH`, `REPLACE`, and `REVERT` mutations fail" in
-            readme and
-            "threads created directly through Mach APIs" in readme and
+    require("threaded_bootstrap_main.c" in workflow and
+            "refusing macOS runtime activation" in workflow and
+            "pthread_create" in threaded_bootstrap_test and
+            "dlopen(argv[1]" in threaded_bootstrap_test,
+            "macOS CI must exercise fail-closed activation after peers exist")
+    require("smoke_branch_target.S" in workflow and
+            "peak_macos_branch_target" in workflow and
+            "b _peak_macos_smoke_target" in branch_target,
+            "macOS CI must exercise reattach through a Gum-followed Arm64 branch")
+    require("rejecting PEAK_MEMORY_PROFILE on macOS" in workflow,
+            "macOS CI must exercise explicit memory-profile rejection")
+    require("Runtime `ATTACH`, `REPLACE`, and" in readme and
+            "`REVERT` mutations fail closed" in readme and
+            "does not install" in readme and
+            "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
+            "does not claim to cover threads" in readme and
+            "created directly through Mach APIs" in readme and
+            "Memory profiling is rejected" in controller_doc and
             "arbitrary Mach thread creation" in controller_doc and
             "not claimed by this backend" in controller_doc,
             "Darwin docs must bound v1 safety to startup attach and pthread-based workloads")

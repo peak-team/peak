@@ -26,6 +26,9 @@
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
+#if defined(__APPLE__)
+#include "internal/general_listener/attach_policy.h"
+#endif
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
 #include "internal/general_listener/output_identity.h"
@@ -120,6 +123,9 @@ typedef enum {
     PEAK_RUNTIME_ACTIVATION_IN_PROGRESS = 2,
     PEAK_RUNTIME_ACTIVATION_ACTIVE = 3,
     PEAK_RUNTIME_ACTIVATION_CANCELED = 4,
+#if defined(__APPLE__)
+    PEAK_RUNTIME_ACTIVATION_REJECTED = 5,
+#endif
 } PeakRuntimeActivationState;
 static _Atomic int peak_runtime_activation_state =
     PEAK_RUNTIME_ACTIVATION_NOT_READY;
@@ -934,6 +940,23 @@ peak_activate_runtime(void)
                           1,
                           memory_order_release);
 
+#if defined(__APPLE__)
+    /*
+     * Darwin v1 has no strict protocol for installing Gum hooks after peer
+     * threads exist.  Prove the process is still single-threaded before even
+     * initializing Gum, so pthread, MPI, and target hook installation cannot
+     * begin from a post-init or early-constructor multithreaded state.
+     */
+    if (!peak_general_listener_startup_attach_can_skip_stop()) {
+        peak_log_warn(
+            "[peak] refusing macOS runtime activation because the process is already multithreaded; Darwin Gum bootstrap requires single-threaded startup and no Gum hooks were installed\n");
+        atomic_store_explicit(&peak_runtime_activation_state,
+                              PEAK_RUNTIME_ACTIVATION_REJECTED,
+                              memory_order_release);
+        return;
+    }
+#endif
+
     /*
      * The default path reaches this point before application main. An MPI rank
      * using PEAK_MPI_ACTIVATION_POLICY=post-init reaches it only after a
@@ -978,11 +1001,13 @@ peak_activate_runtime(void)
      */
     peak_general_listener_attach();
     syscall_interceptor_attach();
+#if !defined(__APPLE__)
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
     gboolean dynamic_attach_listener_ready = FALSE;
     if (need_dynamic_attach) {
         dynamic_attach_listener_ready = dlopen_interceptor_attach() == 0;
     }
+#endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
@@ -1030,9 +1055,11 @@ peak_activate_runtime(void)
         }
     }
     peak_general_listener_controller_start();
+#if !defined(__APPLE__)
     if (dynamic_attach_listener_ready) {
         dlopen_interceptor_enable_dynamic_attach();
     }
+#endif
     if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
@@ -1198,6 +1225,14 @@ void peak_init()
     hb_ema_a = numeric_config.heartbeat_ema_alpha;
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
+#if defined(__APPLE__)
+    if (peak_memory_profile) {
+        peak_log_warn(
+            "[peak] rejecting PEAK_MEMORY_PROFILE on macOS; only named CPU profiling is supported\n");
+    }
+    peak_memory_profile = false;
+    peak_memory_track_all = false;
+#endif
 
     gboolean has_requested_work = peak_has_requested_work();
     peak_set_process_requests_work(has_requested_work);
@@ -1335,12 +1370,9 @@ peak_fini_impl(void)
     gboolean dlopen_shutdown_flushed = TRUE;
 #if defined(__APPLE__)
     /*
-     * Darwin process-exit teardown leaves Gum hooks installed.  Close loader
-     * admission and drain PEAK-owned work, but do not mutate Gum while other
-     * application threads may still be running; process exit reclaims it.
+     * Darwin runtime dynamic attach is unsupported, so no loader listener,
+     * dlclose guard, ownership thread, or queue was installed.
      */
-    dlopen_shutdown_flushed =
-        dlopen_interceptor_shutdown_dynamic_attach();
 #else
 #ifdef HAVE_MPI
     if (mpi_finalize_path) {

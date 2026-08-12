@@ -1,7 +1,11 @@
 #include <stdio.h>
 #include <unistd.h>
 
-unsigned long peak_macos_smoke_target(unsigned long value);
+#ifndef PEAK_MACOS_TARGET
+#define PEAK_MACOS_TARGET peak_macos_smoke_target
+#endif
+
+unsigned long PEAK_MACOS_TARGET(unsigned long value);
 
 int
 main(void)
@@ -12,11 +16,11 @@ main(void)
     /* Cross the explicit detach threshold, then leave enough observation
      * windows for physical detach and conservative retry-based reattach. */
     for (unsigned long i = 0; i < 10; i++) {
-        result += peak_macos_smoke_target(i);
+        result += PEAK_MACOS_TARGET(i);
         expected += i * 3 + 1;
     }
     for (unsigned long i = 10; i < 3010; i++) {
-        result += peak_macos_smoke_target(i);
+        result += PEAK_MACOS_TARGET(i);
         expected += i * 3 + 1;
         usleep(1000);
     }
