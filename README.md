@@ -75,8 +75,9 @@ built or installed outside the protected system locations.
 
 ## Requirements
 
-- Linux for the full `LD_PRELOAD` runtime path, or macOS for baseline named CPU
-  function profiling through `DYLD_INSERT_LIBRARIES`
+- Linux for the full `LD_PRELOAD` runtime path, or macOS for named CPU function
+  profiling through `DYLD_INSERT_LIBRARIES` (including physical detach and
+  reattach on Arm64)
 - CMake 3.13 or newer
 - C and C++ compilers (a Fortran compiler is needed only for
   `PEAK_ENABLE_FORTRAN_TESTS=ON`)
@@ -85,7 +86,8 @@ built or installed outside the protected system locations.
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
 CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
 provider downloads a pinned Frida Gum devkit and applies the PEAK patch; on
-macOS x86_64 and Arm64, it downloads a pinned stock devkit. Other
+macOS x86_64 and Arm64, it downloads a pinned stock devkit. The pinned macOS
+Arm64 devkit also enables PEAK's small Darwin patch-metadata overlay. Other
 platforms/architectures require a caller-provided Frida Gum provider. For
 controlled or offline builds, set
 `PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
@@ -137,12 +139,17 @@ DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
 ./target_application
 ```
 
-The macOS path currently supports startup attachment and reporting for named
-CPU functions. Linux-specific physical detach/reattach, the detach helper,
-raw-syscall exec handling, CUDA profiling, and Linux signal-policy interception
-are unavailable on macOS. macOS CI builds and installs PEAK on Arm64 and runs a
-real `DYLD_INSERT_LIBRARIES` profiling smoke test with MPI, CUDA, and OTF2
-disabled.
+The macOS path supports startup attachment and reporting for named CPU
+functions. On Arm64 it also supports zero-overhead physical detach and
+reattach: PEAK suspends the other Mach threads, changes only the saved entry
+patch bytes, and resumes them after the mutation. If a thread is observed
+inside the overwritten prologue, PEAK resumes every thread and retries through
+the normal controller backoff; this first implementation deliberately does not
+single-step threads for liveness. The Linux detach helper, raw-syscall exec
+handling, CUDA profiling, and Linux signal-policy interception remain
+Linux-only. macOS CI builds and installs PEAK on Arm64 and runs real
+`DYLD_INSERT_LIBRARIES` profiling plus physical detach/reattach smoke tests with
+MPI, CUDA, and OTF2 disabled.
 
 On Linux x86_64 and Arm64, the detach helper is built and installed at the
 configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,

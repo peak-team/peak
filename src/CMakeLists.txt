@@ -7,6 +7,16 @@ else()
     set(PEAK_SIGNAL_POLICY_SOURCE signal_policy_stub.c)
 endif()
 
+if(CMAKE_SYSTEM_NAME MATCHES "Darwin" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND
+   PEAK_GUM_DARWIN_PATCH_API_AVAILABLE)
+    set(PEAK_DETACH_CONTROLLER_SOURCE detach_controller_darwin.c)
+    set(PEAK_DARWIN_GUM_PATCH_SOURCE gum_peak_darwin_patch_api.c)
+else()
+    set(PEAK_DETACH_CONTROLLER_SOURCE detach_controller.c)
+    set(PEAK_DARWIN_GUM_PATCH_SOURCE)
+endif()
+
 # Add all source files
 set(sources_peak
     dlopen_interceptor.c
@@ -23,7 +33,7 @@ set(sources_peak
     general_listener/target_resolver.c
     malloc_interceptor.c
     peak.c
-    detach_controller.c
+    ${PEAK_DETACH_CONTROLLER_SOURCE}
     jit_provider.c
     ${PEAK_SIGNAL_POLICY_SOURCE}
     pthread_listener.c
@@ -33,6 +43,7 @@ set(sources_peak
     exec_memory.c
     exec_interceptor.c
     exec_raw_syscall.c
+    ${PEAK_DARWIN_GUM_PATCH_SOURCE}
 )
 
 if(PEAK_ENABLE_OTF2)
@@ -118,6 +129,11 @@ target_include_directories(peak
 
 if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     target_compile_definitions(peak PRIVATE PEAK_HAVE_GUM_PEAK_PC_API=1)
+endif()
+if(PEAK_GUM_DARWIN_PATCH_API_AVAILABLE AND
+   CMAKE_SYSTEM_NAME MATCHES "Darwin" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    target_compile_definitions(peak PRIVATE PEAK_HAVE_GUM_DARWIN_PATCH_API=1)
 endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)

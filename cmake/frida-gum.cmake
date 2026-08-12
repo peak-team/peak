@@ -427,7 +427,9 @@ macro(configure_frida_gum _download_module_path _download_root)
     set(PEAK_GUM_PEAK_API_AVAILABLE OFF)
     set(PEAK_GUM_PEAK_PC_API_AVAILABLE OFF)
     set(PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE OFF)
+    set(PEAK_GUM_DARWIN_PATCH_API_AVAILABLE OFF)
     set(_peak_using_peak_patched_gum_api OFF)
+    set(_peak_using_downloaded_stock_gum OFF)
 
     if(NOT PEAK_FRIDA_GUM_PROVIDER STREQUAL "auto" AND
        NOT PEAK_FRIDA_GUM_PROVIDER STREQUAL "prebuilt" AND
@@ -486,6 +488,7 @@ macro(configure_frida_gum _download_module_path _download_root)
             ${_download_module_path}
             ${_download_root}
         )
+        set(_peak_using_downloaded_stock_gum ON)
         if(_peak_effective_gum_provider STREQUAL "auto-patched-devkit")
             message(STATUS "Building PEAK-patched Frida Gum devkit overlay")
             _peak_compile_peak_gum_overlay(
@@ -495,6 +498,16 @@ macro(configure_frida_gum _download_module_path _download_root)
             )
             set(_peak_using_peak_patched_gum_api ON)
         endif()
+    endif()
+
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_processor)
+    if(CMAKE_SYSTEM_NAME MATCHES "Darwin" AND
+       _peak_processor MATCHES "^(aarch64|arm64)$" AND
+       _peak_using_downloaded_stock_gum)
+        # The small Darwin patch-metadata overlay mirrors private fields from
+        # the exact 17.15.3 devkit pinned by frida-gum-download.cmake.  Fail
+        # closed for caller-provided Gum, whose private ABI is unknown.
+        set(PEAK_GUM_DARWIN_PATCH_API_AVAILABLE ON)
     endif()
 
     if(PEAK_REQUIRE_GUM_PEAK_API OR
