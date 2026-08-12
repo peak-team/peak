@@ -1323,6 +1323,7 @@ peak_fini_impl(void)
         heartbeat_overhead = NULL;
     }
     peak_jit_provider_disable();
+#if !defined(__APPLE__)
     if (
 #ifdef HAVE_MPI
         !mpi_finalize_path &&
@@ -1330,7 +1331,17 @@ peak_fini_impl(void)
         peak_memory_profile) {
         malloc_interceptor_detach();
     }
+#endif
     gboolean dlopen_shutdown_flushed = TRUE;
+#if defined(__APPLE__)
+    /*
+     * Darwin process-exit teardown leaves Gum hooks installed.  Close loader
+     * admission and drain PEAK-owned work, but do not mutate Gum while other
+     * application threads may still be running; process exit reclaims it.
+     */
+    dlopen_shutdown_flushed =
+        dlopen_interceptor_shutdown_dynamic_attach();
+#else
 #ifdef HAVE_MPI
     if (mpi_finalize_path) {
         /*
@@ -1345,6 +1356,7 @@ peak_fini_impl(void)
     {
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
+#endif
     if (!dlopen_shutdown_flushed) {
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
@@ -1668,10 +1680,12 @@ peak_fini_impl(void)
                 peak_log_info("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
             }
         }
+#if !defined(__APPLE__)
         syscall_interceptor_dettach();
         if (!pthread_listener_dettach()) {
             g_printerr("[peak] Leaving pthread listener bookkeeping allocated before application PMPI_Finalize\n");
         }
+#endif
         return;
     }
 #else
@@ -1683,6 +1697,11 @@ peak_fini_impl(void)
     #endif
 #endif
     gboolean general_listener_shutdown_flushed = peak_general_listener_dettach();
+#if defined(__APPLE__)
+    (void)general_listener_shutdown_flushed;
+    peak_log_info("[peak] Darwin process-exit teardown leaves Gum support hook state alive\n");
+    return;
+#else
     if (general_listener_shutdown_flushed) {
         dlopen_interceptor_release_retained_dynamic_handles();
     }
@@ -1707,6 +1726,7 @@ peak_fini_impl(void)
     } else {
         g_printerr("[peak] Leaving general listener bookkeeping allocated for in-flight callbacks\n");
     }
+#endif
 }
 
 void peak_fini()

@@ -8699,6 +8699,17 @@ gboolean peak_general_listener_dettach()
 
     peak_general_listener_controller_stop();
 
+#if defined(__APPLE__)
+    /*
+     * A process destructor cannot prove that arbitrary application threads
+     * have stopped.  Keep every Gum target context and listener reachable and
+     * let process exit reclaim them instead of performing an unguarded final
+     * detach/free sequence.
+     */
+    peak_log_info("[peak] Darwin process-exit teardown leaves Gum target listener state alive\n");
+    return FALSE;
+#endif
+
     pthread_t controller_tid = pthread_self();
     pthread_t* tid_keys = g_new0(pthread_t, peak_max_num_threads);
     size_t* mapped_ids = g_new0(size_t, peak_max_num_threads);

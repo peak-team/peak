@@ -146,11 +146,14 @@ reattach: PEAK suspends the other Mach threads, changes only the saved entry
 patch bytes, and resumes them after the mutation. If a thread is observed
 inside the overwritten prologue, PEAK resumes every thread and retries through
 the normal controller backoff; this first implementation deliberately does not
-single-step threads for liveness. The Linux detach helper, raw-syscall exec
-handling, CUDA profiling, and Linux signal-policy interception remain
-Linux-only. macOS CI builds and installs PEAK on Arm64 and runs real
-`DYLD_INSERT_LIBRARIES` profiling plus physical detach/reattach smoke tests with
-MPI, CUDA, and OTF2 disabled.
+single-step threads for liveness. At process exit, Darwin stops PEAK-owned
+controller work and writes the final report but leaves Gum hooks, listeners,
+and their reachable state alive for the operating system to reclaim; it does
+not claim an unheld final shutdown mutation is safe. The Linux detach helper,
+raw-syscall exec handling, CUDA profiling, and Linux signal-policy interception
+remain Linux-only. macOS CI builds and installs PEAK on Arm64 and runs real
+`DYLD_INSERT_LIBRARIES` profiling plus single- and multithreaded physical
+detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.
 
 On Linux x86_64 and Arm64, the detach helper is built and installed at the
 configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,

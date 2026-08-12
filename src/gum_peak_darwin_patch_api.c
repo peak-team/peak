@@ -189,3 +189,34 @@ peak_gum_darwin_get_function_patch(GumInterceptor* interceptor,
 
     return found;
 }
+
+gboolean
+peak_gum_darwin_get_canonical_address(GumInterceptor* interceptor,
+                                      gpointer function_address,
+                                      GumInvocationListener* listener,
+                                      gpointer* canonical_address_out)
+{
+    PeakGumInterceptor17* private_interceptor;
+    PeakGumFunctionContext17* context;
+    gboolean found = FALSE;
+
+    if (interceptor == NULL || function_address == NULL || listener == NULL ||
+        canonical_address_out == NULL) {
+        return FALSE;
+    }
+
+    *canonical_address_out = NULL;
+    private_interceptor = (PeakGumInterceptor17*)interceptor;
+
+    g_rec_mutex_lock(&private_interceptor->mutex);
+    context = peak_gum_darwin_find_context(private_interceptor,
+                                           function_address,
+                                           listener);
+    if (context != NULL) {
+        *canonical_address_out = context->function_address;
+        found = TRUE;
+    }
+    g_rec_mutex_unlock(&private_interceptor->mutex);
+
+    return found;
+}

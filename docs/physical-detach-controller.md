@@ -49,6 +49,17 @@ from `ucontext_t`, classifies those PCs with the patched Gum API, performs only
 audited PC rewrites and byte writes, and fails closed if any thread does not
 arrive or cannot be released safely.
 
+### Darwin Arm64 lifecycle split
+
+Darwin Arm64 uses a separate Mach STOP backend only for entry-byte physical
+detach and reattach. It does not use the Linux helper, reserved-signal PC
+classifier, or final Gum shutdown protocol described below. A Darwin process
+destructor first stops PEAK-owned controller work, closes loader admission, and
+writes the final report. It then leaves target, loader, allocator, `close`, and
+pthread Gum hooks plus their reachable PEAK state alive for process exit to
+reclaim. The Darwin controller rejects `SHUTDOWN` rather than claiming a strict
+window while it holds no application threads.
+
 ## Original Failure Mode
 
 The pre-controller implementation let callbacks, heartbeat, `dlopen`, and

@@ -48,6 +48,78 @@ def check_shutdown_order(repo_root):
                 "shutdown Gum detach must happen before controller finish/resume")
 
 
+def check_darwin_strict_lifecycle(repo_root):
+    controller = read_source(repo_root, "src/detach_controller_darwin.c")
+    general = read_source(repo_root, "src/general_listener.c")
+    peak = read_source(repo_root, "src/peak.c")
+    workflow = read_source(repo_root, ".github/workflows/cmake.yml")
+    concurrent_test = read_source(
+        repo_root, "test/macos/detach_concurrent_main.c"
+    )
+
+    cancel = extract_function(controller, "peak_darwin_cancel_stop_window")
+    resume = cancel.find("if (!peak_darwin_resume_threads")
+    abort = cancel.find("peak_detach_controller_abort_after_failed_finish")
+    dispose = cancel.find("peak_darwin_dispose_writable_pages")
+    require(0 <= resume < abort < dispose,
+            "Darwin STOP cancellation must fail-stop before clearing held state when resume fails")
+
+    patch_plan = extract_function(controller, "peak_darwin_build_patch_plan")
+    identity_lookup = patch_plan.find(
+        "peak_gum_darwin_get_canonical_address"
+    )
+    identity_check = patch_plan.find(
+        "current_function_address != record->function_address"
+    )
+    saved_address_use = patch_plan.find(
+        "plan->function_address = record->function_address"
+    )
+    require(0 <= identity_lookup < identity_check < saved_address_use and
+            "PEAK_DETACH_STATUS_CLASSIFY_FAILED" in
+            patch_plan[identity_lookup:saved_address_use],
+            "Darwin reattach must verify current canonical patch identity before using saved bytes")
+
+    prepare = extract_function(
+        controller, "peak_detach_controller_prepare_hook_mutation"
+    )
+    shutdown_reject = prepare.find(
+        "request->operation == PEAK_DETACH_OPERATION_SHUTDOWN"
+    )
+    nonphysical_safe = prepare.find(
+        "request->operation != PEAK_DETACH_OPERATION_DETACH"
+    )
+    require(0 <= shutdown_reject < nonphysical_safe and
+            "PEAK_DETACH_STATUS_UNSUPPORTED" in
+            prepare[shutdown_reject:nonphysical_safe],
+            "Darwin SHUTDOWN must not claim an unheld strict-safe window")
+    finish = extract_function(
+        controller, "peak_detach_controller_finish_hook_mutation"
+    )
+    require("request->operation == PEAK_DETACH_OPERATION_SHUTDOWN" in
+            finish and
+            "status = PEAK_DETACH_STATUS_UNSUPPORTED" in finish,
+            "Darwin SHUTDOWN finish must remain fail-closed without a held window")
+
+    final_detach = extract_function(general, "peak_general_listener_dettach")
+    require("Darwin process-exit teardown leaves Gum target listener state alive"
+            in final_detach and
+            final_detach.find("return FALSE;") <
+            final_detach.find("pthread_t controller_tid"),
+            "Darwin process exit must retain Gum target listener state")
+    finalizer = extract_function(peak, "peak_fini_impl")
+    require("dlopen_interceptor_shutdown_dynamic_attach" in finalizer and
+            "Darwin process-exit teardown leaves Gum support hook state alive"
+            in finalizer,
+            "Darwin process exit must quiesce loader work and retain Gum support hooks")
+
+    require("detach_concurrent_main.c" in workflow and
+            "timeout-minutes: 2" in workflow and
+            "PEAK_MACOS_WORKER_COUNT 4u" in concurrent_test and
+            "pthread_create" in concurrent_test and
+            "pthread_join" in concurrent_test,
+            "macOS CI must exercise bounded concurrent detach/reattach and pthread creation")
+
+
 def check_safe_pc_alignment(repo_root):
     gum_source = (repo_root / "cmake/peak-gum/gum_peak_pc_api.c").read_text(
         encoding="utf-8"
@@ -3061,6 +3133,7 @@ def main():
         return 2
     repo_root = pathlib.Path(sys.argv[1]).resolve()
     check_shutdown_order(repo_root)
+    check_darwin_strict_lifecycle(repo_root)
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
     check_dlopen_detach_transaction(repo_root)

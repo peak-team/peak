@@ -452,18 +452,20 @@ peak_darwin_dispose_writable_pages(void)
 }
 
 static void
-peak_darwin_cancel_stop_window(PeakDetachStatus* status_out)
+peak_darwin_cancel_stop_window(void)
 {
     PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
-    gboolean resumed = peak_darwin_resume_threads(&resume_status);
+
+    if (!peak_darwin_resume_threads(&resume_status)) {
+        peak_detach_controller_abort_after_failed_finish(
+            "Darwin STOP cancellation",
+            resume_status);
+    }
 
     peak_darwin_dispose_writable_pages();
     peak_darwin_end_thread_gate();
     peak_darwin_publish_window(FALSE, &peak_darwin_held.started_at);
     peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
-    if (!resumed) {
-        peak_darwin_set_status(status_out, resume_status);
-    }
 }
 
 static gboolean
@@ -588,6 +590,30 @@ peak_darwin_build_patch_plan(const PeakDetachRequest* request,
         return FALSE;
     }
 
+    gpointer current_function_address = NULL;
+    if (!peak_gum_darwin_get_canonical_address(
+            request->interceptor,
+            request->function_address,
+            request->listener,
+            &current_function_address)) {
+        peak_darwin_note_failure("reattach-patch-context-missing",
+                                 0,
+                                 (uintptr_t)record->function_address,
+                                 (uintptr_t)request->function_address);
+        peak_darwin_set_status(status_out,
+                               PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+        return FALSE;
+    }
+    if (current_function_address != record->function_address) {
+        peak_darwin_note_failure("reattach-patch-address-mismatch",
+                                 0,
+                                 (uintptr_t)record->function_address,
+                                 (uintptr_t)current_function_address);
+        peak_darwin_set_status(status_out,
+                               PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+        return FALSE;
+    }
+
     plan->function_address = record->function_address;
     plan->patch_size = record->patch_size;
     memcpy(plan->active_patch, record->active_patch, record->patch_size);
@@ -618,6 +644,16 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     if (peak_darwin_held.active) {
         peak_darwin_note_failure("mutation-already-active", 0, 0, 0);
         peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+        pthread_mutex_unlock(&peak_darwin_mutation_mutex);
+        return FALSE;
+    }
+
+    if (request->operation == PEAK_DETACH_OPERATION_SHUTDOWN) {
+        peak_darwin_note_failure("shutdown-gum-teardown-disabled",
+                                 0,
+                                 (uintptr_t)request->function_address,
+                                 request->operation);
+        peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_UNSUPPORTED);
         pthread_mutex_unlock(&peak_darwin_mutation_mutex);
         return FALSE;
     }
@@ -697,7 +733,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     goto beach;
 
 cancel:
-    peak_darwin_cancel_stop_window(&status);
+    peak_darwin_cancel_stop_window();
 
 beach:
     if (MACH_PORT_VALID(controller_thread)) {
@@ -909,12 +945,12 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
         peak_darwin_publish_window(finished, &started_at);
     } else if (request != NULL &&
                request->operation == PEAK_DETACH_OPERATION_SHUTDOWN) {
-        PeakDarwinPatchRecord* record =
-            peak_darwin_find_patch_record(request->hook_id, FALSE);
-
-        if (record != NULL) {
-            *record = (PeakDarwinPatchRecord){ 0 };
-        }
+        peak_darwin_note_failure("shutdown-gum-teardown-disabled",
+                                 0,
+                                 (uintptr_t)request->function_address,
+                                 request->operation);
+        status = PEAK_DETACH_STATUS_UNSUPPORTED;
+        finished = FALSE;
     }
     peak_darwin_set_status(status_out, status);
     pthread_mutex_unlock(&peak_darwin_mutation_mutex);
