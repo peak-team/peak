@@ -24,6 +24,7 @@
 #include "utils/env_parser.h"
 #include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
+#include <dlfcn.h>
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
@@ -1040,10 +1041,8 @@ peak_general_listener_find_function(const char* symbol)
 
     address = gum_find_function(symbol);
 #if defined(__APPLE__)
-    if (address == NULL && symbol[0] != '_') {
-        char* macho_symbol = g_strconcat("_", symbol, NULL);
-        address = gum_find_function(macho_symbol);
-        g_free(macho_symbol);
+    if (address == NULL) {
+        address = dlsym(RTLD_DEFAULT, symbol);
     }
 #endif
     return address;
