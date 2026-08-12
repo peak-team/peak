@@ -1032,11 +1032,21 @@ peak_symbol_should_use_cpp_map(const char* symbol)
 gpointer
 peak_general_listener_find_function(const char* symbol)
 {
+    gpointer address;
+
     if (symbol == NULL) {
         return NULL;
     }
 
-    return gum_find_function(symbol);
+    address = gum_find_function(symbol);
+#if defined(__APPLE__)
+    if (address == NULL && symbol[0] != '_') {
+        char* macho_symbol = g_strconcat("_", symbol, NULL);
+        address = gum_find_function(macho_symbol);
+        g_free(macho_symbol);
+    }
+#endif
+    return address;
 }
 
 /* Invocation listener and thread-pause primitives. */
