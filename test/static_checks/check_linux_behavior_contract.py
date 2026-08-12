@@ -17,6 +17,7 @@ def main():
     parser.add_argument("repo_root", type=pathlib.Path)
     parser.add_argument("--library", type=pathlib.Path, required=True)
     parser.add_argument("--nm", required=True)
+    parser.add_argument("--expect-getrandom", action="store_true")
     args = parser.parse_args()
 
     for relative in (
@@ -64,17 +65,27 @@ def main():
         "signal policy source must stay between jit_provider and pthread_listener",
     )
 
-    symbols = subprocess.run(
-        [args.nm, "-D", str(args.library)],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout
+    malloc_header = (
+        args.repo_root / "include/malloc_interceptor.h"
+    ).read_text(encoding="utf-8")
     require(
-        re.search(r"\bU\s+getrandom(?:@|\s|$)", symbols),
-        "built Linux libpeak must retain the getrandom fast path",
+        "#if defined(__linux__)\n#include <linux/limits.h>\n#else\n"
+        "#include <limits.h>\n#endif" in malloc_header,
+        "Linux must retain its original linux/limits.h include",
     )
+
+    if args.expect_getrandom:
+        symbols = subprocess.run(
+            [args.nm, "-D", str(args.library)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        require(
+            re.search(r"\bU\s+getrandom(?:@|\s|$)", symbols),
+            "built Linux libpeak must retain the getrandom fast path",
+        )
 
     print("linux_behavior_contract_ok")
 

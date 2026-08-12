@@ -512,12 +512,18 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "cuda_interceptor_consistency_ok")
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_NM)
+        set(_peak_linux_behavior_contract_args
+            ${PROJECT_SOURCE_DIR}
+            --library $<TARGET_FILE:peak>
+            --nm ${CMAKE_NM})
+        if(PEAK_HAVE_SYS_RANDOM_H)
+            list(APPEND _peak_linux_behavior_contract_args
+                --expect-getrandom)
+        endif()
         add_test(NAME test_linux_behavior_contract
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/static_checks/check_linux_behavior_contract.py
-                    ${PROJECT_SOURCE_DIR}
-                    --library $<TARGET_FILE:peak>
-                    --nm ${CMAKE_NM})
+                    ${_peak_linux_behavior_contract_args})
         set_tests_properties(test_linux_behavior_contract
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "linux_behavior_contract_ok")
