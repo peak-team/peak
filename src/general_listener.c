@@ -24,7 +24,9 @@
 #include "utils/env_parser.h"
 #include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
+#if defined(__APPLE__)
 #include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
@@ -1033,19 +1035,21 @@ peak_symbol_should_use_cpp_map(const char* symbol)
 gpointer
 peak_general_listener_find_function(const char* symbol)
 {
-    gpointer address;
-
     if (symbol == NULL) {
         return NULL;
     }
 
-    address = gum_find_function(symbol);
 #if defined(__APPLE__)
+    gpointer address;
+
+    address = gum_find_function(symbol);
     if (address == NULL) {
         address = dlsym(RTLD_DEFAULT, symbol);
     }
-#endif
     return address;
+#else
+    return gum_find_function(symbol);
+#endif
 }
 
 /* Invocation listener and thread-pause primitives. */

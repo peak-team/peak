@@ -130,14 +130,30 @@ def main():
             "general listener must not use a loader-first resolver")
     require("peak_symbol_resolver" not in general,
             "general listener must not include the removed symbol resolver")
-    require("dlsym(" not in general and "RTLD_" not in general,
-            "general listener generic lookup must remain Frida-native")
     require("peak_general_listener_find_function(peak_hook_strings[i])" in general,
             "generic target lookup must use the Frida-native helper")
     generic_lookup = function_body(general,
                                    "peak_general_listener_find_function")
-    require("gum_find_function(symbol)" in generic_lookup,
+    require(generic_lookup.count("gum_find_function(symbol)") == 2,
             "generic target lookup must keep Gum dynamic-binary resolution")
+    require(generic_lookup.count("dlsym(RTLD_DEFAULT, symbol)") == 1,
+            "generic target lookup must keep the Darwin loader fallback")
+    darwin_fallback = re.search(
+        r"#if defined\(__APPLE__\)(.*?)#else(.*?)#endif",
+        generic_lookup,
+        re.DOTALL)
+    require(darwin_fallback is not None,
+            "Darwin loader fallback must remain Apple-only")
+    apple_lookup, non_apple_lookup = darwin_fallback.groups()
+    require_order(apple_lookup,
+                  "address = gum_find_function(symbol);",
+                  "if (address == NULL)",
+                  "address = dlsym(RTLD_DEFAULT, symbol);",
+                  "return address;")
+    require("dlsym(" not in non_apple_lookup and
+            "RTLD_" not in non_apple_lookup and
+            "return gum_find_function(symbol);" in non_apple_lookup,
+            "non-Apple generic lookup must remain Frida-native")
     require("gum_module_find_global_export_by_name" not in generic_lookup,
             "generic target lookup must not switch MPI ranks to export-only resolution")
     for relpath, symbols in support_sources.items():
