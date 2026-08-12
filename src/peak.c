@@ -1825,8 +1825,17 @@ peak_checkpoint_for_exec(const char* path, char* const argv[])
 }
 
 #if defined(__APPLE__)
-__attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_init;
-__attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
+__attribute__((constructor)) static void
+peak_macos_init(void)
+{
+    peak_init();
+}
+
+__attribute__((destructor)) static void
+peak_macos_fini(void)
+{
+    peak_fini();
+}
 #elif defined(__ELF__)
 typedef int (*main_fn)(int, char**, char**);
 typedef int (*libc_start_main_fn)(main_fn, int, char**,
