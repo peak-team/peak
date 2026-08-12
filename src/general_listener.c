@@ -1078,11 +1078,15 @@ typedef struct _PeakInvocationData {
     gboolean initialized;
 } PeakInvocationData;
 
+#if defined(__APPLE__)
+#define PEAK_LISTENER_FAST_DISPATCH_SECTION __attribute__((noinline))
+#else
 #define PEAK_LISTENER_FAST_DISPATCH_SECTION \
     __attribute__((section("peak_listener_fast_dispatch"), noinline, noclone))
 
 extern const guint8 __start_peak_listener_fast_dispatch[];
 extern const guint8 __stop_peak_listener_fast_dispatch[];
+#endif
 
 /*
  * PEAK is loaded during process startup (normally through LD_PRELOAD), so its
@@ -1463,6 +1467,7 @@ peak_general_listener_invocation_stack_address(
 #endif
 }
 
+#if defined(__linux__)
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
 {
     struct timespec now;
@@ -1730,6 +1735,38 @@ int pthread_unpause(pthread_t thread, int session_id)
 
     return 0;
 }
+#else
+void pthread_pause_enable(void)
+{
+}
+
+void pthread_pause_disable(void)
+{
+}
+
+static int
+pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session_id_out)
+{
+    (void)thread;
+    (void)mapped_id;
+    if (session_id_out != NULL) {
+        *session_id_out = -1;
+    }
+    return -1;
+}
+
+int pthread_pause(pthread_t thread, int* session_id_out)
+{
+    return pthread_pause_mapped(thread, 0, session_id_out);
+}
+
+int pthread_unpause(pthread_t thread, int session_id)
+{
+    (void)thread;
+    (void)session_id;
+    return -1;
+}
+#endif
 
 static gboolean peak_general_hook_is_published_unlocked(size_t hook_id)
 {
@@ -6737,11 +6774,16 @@ peak_general_listener_init(PeakGeneralListener* self)
         .active_reset = peak_general_listener_fast_active_reset,
         .user_data = self,
         .listener_instance = GUM_INVOCATION_LISTENER(self),
+#if defined(__APPLE__)
+        .dispatch_start = NULL,
+        .dispatch_size = 0,
+#else
         .dispatch_start =
             (gpointer)__start_peak_listener_fast_dispatch,
         .dispatch_size =
             (gsize)(__stop_peak_listener_fast_dispatch -
                     __start_peak_listener_fast_dispatch),
+#endif
         .enabled = 0,
     };
     /*

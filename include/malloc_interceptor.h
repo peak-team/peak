@@ -13,7 +13,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
-#include <linux/limits.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>

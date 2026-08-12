@@ -15,7 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#if PEAK_HAVE_SYS_RANDOM_H
+#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)
 #include <sys/random.h>
 #endif
 
@@ -73,7 +73,7 @@ peak_output_identity_session_once(void)
         remaining = sizeof(peak_output_session);
     } else {
 #endif
-#if PEAK_HAVE_SYS_RANDOM_H
+#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)
     while (remaining != 0) {
         ssize_t read_bytes;
 

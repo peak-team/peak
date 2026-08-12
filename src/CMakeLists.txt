@@ -19,7 +19,6 @@ set(sources_peak
     peak.c
     detach_controller.c
     jit_provider.c
-    signal_policy.c
     pthread_listener.c
     pthread_slot_registry.c
     syscall_interceptor.c
@@ -28,6 +27,12 @@ set(sources_peak
     exec_interceptor.c
     exec_raw_syscall.c
 )
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    list(APPEND sources_peak signal_policy.c)
+else()
+    list(APPEND sources_peak signal_policy_stub.c)
+endif()
 
 if(PEAK_ENABLE_OTF2)
     list(APPEND sources_peak malloc_otf2.c)
