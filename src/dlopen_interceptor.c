@@ -12,7 +12,9 @@
 #include "internal/general_listener/attach_policy.h"
 #include "internal/gum_module_mutation.h"
 #include "internal/unsafe_gum_prologue.h"
+#include "internal/target_resolver.h"
 #include "utils/source_target.h"
+#include "utils/target_selector_syntax.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -21,7 +23,6 @@
 #include <string.h>
 #include <time.h>
 
-typedef void (*fn_void)(void);
 typedef int (*PeakDlcloseFunction)(void*);
 
 typedef enum {
@@ -101,6 +102,9 @@ typedef struct {
 typedef struct {
     const char* name;
     gpointer address;
+    char* demangled;
+    gboolean selector_applicable;
+    gboolean terminal;
 } PeakDlopenResolvedTarget;
 
 typedef struct {
@@ -156,6 +160,7 @@ static _Atomic size_t active_dlclose_guard_count = 0;
 static size_t dynamic_attach_queue_max_depth = 0;
 static gsize dlopen_runtime_config_initialized = 0;
 static gboolean configured_dlopen_debug_enabled = FALSE;
+static gboolean configured_cxx_symbol_scan_enabled = FALSE;
 static gchar* configured_dlopen_trace_path = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static gboolean dynamic_attach_test_manual_drain = FALSE;
@@ -175,6 +180,8 @@ static gboolean dynamic_attach_test_hold_ownership_pin = FALSE;
 static gboolean dynamic_attach_test_ownership_pin_is_waiting = FALSE;
 static gboolean dynamic_attach_test_hold_dlclose_guard = FALSE;
 static gboolean dynamic_attach_test_dlclose_guard_is_waiting = FALSE;
+static _Atomic unsigned long long dynamic_attach_test_deferred_module_sync_drains = 0;
+static _Atomic unsigned long long dynamic_attach_test_selector_resolver_batches = 0;
 #endif
 
 static gboolean
@@ -194,6 +201,8 @@ dlopen_interceptor_init_runtime_config_once(void)
 
     configured_dlopen_debug_enabled =
         dlopen_interceptor_parse_truthy(g_getenv("PEAK_DLOPEN_DEBUG"));
+    configured_cxx_symbol_scan_enabled =
+        dlopen_interceptor_parse_truthy(g_getenv("PEAK_ENABLE_CXX_SYMBOL_SCAN"));
     if (trace_path != NULL && trace_path[0] != '\0') {
         configured_dlopen_trace_path = g_strdup(trace_path);
     }
@@ -1861,6 +1870,28 @@ dlopen_interceptor_enqueue_dynamic_attach_request(
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 void
+dlopen_interceptor_test_reset_selector_diagnostics(void)
+{
+    atomic_store_explicit(&dynamic_attach_test_deferred_module_sync_drains, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&dynamic_attach_test_selector_resolver_batches, 0,
+                          memory_order_relaxed);
+}
+
+void
+dlopen_interceptor_test_get_selector_diagnostics(
+    PeakDlopenSelectorDiagnostics* diagnostics)
+{
+    if (diagnostics == NULL) {
+        return;
+    }
+    diagnostics->deferred_module_sync_drains = atomic_load_explicit(
+        &dynamic_attach_test_deferred_module_sync_drains, memory_order_relaxed);
+    diagnostics->selector_resolver_batches = atomic_load_explicit(
+        &dynamic_attach_test_selector_resolver_batches, memory_order_relaxed);
+}
+
+void
 dlopen_interceptor_test_reset_dynamic_attach(gboolean open)
 {
     GPtrArray* retained_handles;
@@ -2282,16 +2313,65 @@ dlopen_interceptor_release_attach_candidate(
     candidate->demangled_name = NULL;
 }
 
+static void
+dlopen_interceptor_release_resolved_targets(PeakDlopenResolvedTarget* targets,
+                                            size_t target_count)
+{
+    if (targets == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < target_count; i++) {
+        g_free(targets[i].demangled);
+    }
+    g_free(targets);
+}
+
+static gboolean
+dlopen_interceptor_target_uses_selector_resolution(const char* target)
+{
+    return target != NULL &&
+           (g_str_has_prefix(target, "_Z") || strstr(target, "::") != NULL ||
+            strchr(target, '(') != NULL || strchr(target, '<') != NULL ||
+            strchr(target, '!') != NULL ||
+            strstr(target, "operator") != NULL ||
+            (strchr(target, '+') != NULL &&
+             peak_target_selector_has_top_level_offset(target)));
+}
+
+static gboolean
+dlopen_interceptor_symbol_matches_candidate_module(
+    gpointer symbol,
+    const PeakTargetSymbolCandidate* candidate,
+    const PeakDlopenDynamicAttachRequest* request)
+{
+    Dl_info details = {0};
+
+    if (symbol == NULL || candidate == NULL || request == NULL ||
+        dladdr(symbol, &details) == 0 || details.dli_fname == NULL) {
+        return FALSE;
+    }
+#if defined(__linux__)
+    if (request->module_token != NULL) {
+        struct link_map* module_map = NULL;
+
+        return dladdr1(symbol, &details, (void**)&module_map,
+                       RTLD_DL_LINKMAP) != 0 &&
+               module_map == (struct link_map*)request->module_token;
+    }
+#endif
+    return peak_target_resolver_module_matches(candidate->module,
+                                               details.dli_fname);
+}
+
 static gboolean
 dlopen_interceptor_initialize_attach_candidate(
     size_t hook_id,
     gpointer dynamic_hook_address,
+    const char* demangled_name,
     GumInterceptor* target_interceptor,
     PeakDlopenAttachCandidate* candidate,
     PeakDetachRequest* mutation_request)
 {
-    char* demangled;
-
     memset(candidate, 0, sizeof(*candidate));
     memset(mutation_request, 0, sizeof(*mutation_request));
     if (!peak_general_listener_attach_target_is_supported(
@@ -2305,10 +2385,8 @@ dlopen_interceptor_initialize_attach_candidate(
         return FALSE;
     }
 
-    demangled = cxa_demangle(peak_hook_strings[hook_id]);
     candidate->demangled_name =
-        g_strdup(demangled != NULL ? demangled : peak_hook_strings[hook_id]);
-    free(demangled);
+        g_strdup(demangled_name != NULL ? demangled_name : peak_hook_strings[hook_id]);
     candidate->listener =
         g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
     PEAKGENERAL_LISTENER(candidate->listener)->hook_id = hook_id;
@@ -2567,15 +2645,17 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     gboolean completed_fftw_scan = FALSE;
     gboolean resolved_fftw_from_handle = FALSE;
     gboolean needs_resolution = FALSE;
-    gboolean use_batch;
+    gboolean needs_selector_resolution = FALSE;
+    gboolean use_batch = FALSE;
     GumInterceptor* target_interceptor;
     PeakDlopenResolvedTarget* resolved_targets;
+    PeakTargetResolveRequest* selector_resolutions = NULL;
     PeakDlopenAttachCandidate* attach_candidates = NULL;
     PeakDetachRequest* mutation_requests = NULL;
     PeakDetachBatchResult* batch_results = NULL;
     GumAttachReturn* attach_statuses = NULL;
     size_t target_count;
-    size_t batch_capacity;
+    size_t batch_capacity = 0;
     size_t candidate_count = 0;
     size_t resolved_count = 0;
     gboolean unresolved_non_fftw = FALSE;
@@ -2638,7 +2718,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     peak_general_listener_controller_unlock();
 
     if (!needs_resolution) {
-        g_free(resolved_targets);
+        dlopen_interceptor_release_resolved_targets(resolved_targets,
+                                                    target_count);
         return PEAK_DLOPEN_ATTACH_DONE;
     }
 
@@ -2647,17 +2728,134 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
      * A dlopen on-leave callback still owns the loader lock on some platforms;
      * the controller taking these locks in the opposite order would deadlock.
      */
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 2
     peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(target_interceptor);
+#else
+    peak_general_listener_fast_ignore_current_thread();
+    gum_interceptor_ignore_current_thread(target_interceptor);
+#endif
     for (size_t i = 0; i < target_count; i++) {
         if (resolved_targets[i].name != NULL) {
-            resolved_targets[i].address =
-                (gpointer)(fn_void)dlsym(request->handle,
-                                         resolved_targets[i].name);
+            gboolean explicit_selector =
+                dlopen_interceptor_target_uses_selector_resolution(
+                    resolved_targets[i].name);
+
+            if (!explicit_selector) {
+                resolved_targets[i].address = dlsym(request->handle,
+                                                    resolved_targets[i].name);
+                continue;
+            }
+
+            gchar* selector_module = NULL;
+
+            if (!peak_target_resolver_dup_selector_module(
+                    resolved_targets[i].name, &selector_module)) {
+                resolved_targets[i].terminal = TRUE;
+                g_printerr("[peak] invalid dynamic target selector; refusing to attach: %s\n",
+                           resolved_targets[i].name);
+                continue;
+            }
+            /* Dynamic C++ resolution is deliberately explicit. An
+             * unqualified ordinary C miss stays unresolved for later DSOs;
+             * C++ selectors must name the DSO whose completed dlopen request
+             * is allowed to trigger a resolver scan. */
+            if (selector_module == NULL ||
+                strchr(selector_module, G_DIR_SEPARATOR) == NULL) {
+                g_printerr("[peak] dynamic C++ selector requires path-qualified module!symbol scope; refusing to attach: %s\n",
+                           resolved_targets[i].name);
+                g_free(selector_module);
+                resolved_targets[i].terminal = TRUE;
+                continue;
+            }
+            if (request->filename != NULL &&
+                peak_target_resolver_module_matches(selector_module,
+                                                    request->filename)) {
+                resolved_targets[i].selector_applicable = TRUE;
+                needs_selector_resolution = TRUE;
+            }
+            g_free(selector_module);
+        }
+    }
+
+    if (needs_selector_resolution) {
+        selector_resolutions = g_try_new0(PeakTargetResolveRequest,
+                                          target_count);
+    }
+    if (selector_resolutions != NULL) {
+        for (size_t i = 0; i < target_count; i++) {
+            if (!resolved_targets[i].selector_applicable) {
+                continue;
+            }
+            selector_resolutions[i] = (PeakTargetResolveRequest){
+                .selector = resolved_targets[i].name,
+                .allow_legacy_short = configured_cxx_symbol_scan_enabled,
+            };
+        }
+    }
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 2
+    /* A real selector batch must see the module whose completed dlopen queued
+     * this request. Exact C hits never reach this path. */
+    while (selector_resolutions != NULL && needs_selector_resolution) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        atomic_fetch_add_explicit(&dynamic_attach_test_deferred_module_sync_drains,
+                                  1, memory_order_relaxed);
+#endif
+        if (!gum_interceptor_peak_drain_deferred_module_sync()) {
+            break;
+        }
+    }
+#endif
+    for (size_t i = 0; selector_resolutions != NULL && i < target_count; i++) {
+        if (selector_resolutions[i].selector != NULL) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+            atomic_fetch_add_explicit(
+                &dynamic_attach_test_selector_resolver_batches, 1,
+                memory_order_relaxed);
+#endif
+            peak_target_resolver_resolve_many(selector_resolutions, target_count);
+            break;
+        }
+    }
+    for (size_t i = 0; i < target_count; i++) {
+        if (selector_resolutions != NULL &&
+            selector_resolutions[i].selector != NULL) {
+            PeakTargetResolution* resolution = &selector_resolutions[i].resolution;
+            PeakTargetResolveResult result = selector_resolutions[i].result;
+
+            if (result == PEAK_TARGET_RESOLVE_UNIQUE) {
+                PeakTargetSymbolCandidate* candidate =
+                    g_ptr_array_index(resolution->candidates, 0);
+                if (peak_target_resolver_module_matches(
+                        request->filename, candidate->module)) {
+                    if (dlopen_interceptor_symbol_matches_candidate_module(
+                            candidate->symbol_address, candidate, request)) {
+                        resolved_targets[i].address = candidate->address;
+                        resolved_targets[i].demangled =
+                            peak_target_resolver_format_display_name(
+                                resolved_targets[i].name,
+                                candidate->demangled);
+                    }
+                }
+            } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
+                g_printerr("[peak] ambiguous dynamic target selector; refusing to attach\n");
+                peak_target_resolver_print(stderr, resolved_targets[i].name,
+                                           resolution);
+                resolved_targets[i].terminal = TRUE;
+            } else if (result == PEAK_TARGET_RESOLVE_INVALID) {
+                g_printerr("[peak] invalid dynamic target selector; refusing to attach: %s\n",
+                           resolved_targets[i].name);
+                resolved_targets[i].terminal = TRUE;
+            }
+        }
+        if (resolved_targets[i].name != NULL) {
             /*
              * Treat a NULL symbol address as unresolved. Querying the loader
-             * error state here can enter gettext/getenv under heavy concurrent
-             * loader activity, widening a harmless miss into the crash surface
+             * error state here can enter locale and environment machinery
+             * under heavy concurrent loader activity, widening a harmless
+             * miss into the crash surface
              * observed at scale.
              */
             if (resolved_targets[i].address != NULL) {
@@ -2670,12 +2868,13 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             }
         }
     }
+    for (size_t i = 0; selector_resolutions != NULL && i < target_count; i++) {
+        peak_target_resolution_clear(&selector_resolutions[i].resolution);
+    }
+    g_free(selector_resolutions);
 
     if (resolved_count == 0) {
-        gum_interceptor_unignore_current_thread(target_interceptor);
-        peak_general_listener_fast_unignore_current_thread();
-        g_free(resolved_targets);
-        return PEAK_DLOPEN_ATTACH_DONE;
+        goto publish_resolved_targets;
     }
 
     use_batch = FALSE;
@@ -2706,10 +2905,12 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         g_free(attach_candidates);
         gum_interceptor_unignore_current_thread(target_interceptor);
         peak_general_listener_fast_unignore_current_thread();
-        g_free(resolved_targets);
+        dlopen_interceptor_release_resolved_targets(resolved_targets,
+                                                    target_count);
         return PEAK_DLOPEN_ATTACH_DONE;
     }
 
+publish_resolved_targets:
     peak_general_listener_controller_lock();
     if (interceptor != target_interceptor ||
         hook_address == NULL ||
@@ -2724,11 +2925,18 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         g_free(batch_results);
         g_free(mutation_requests);
         g_free(attach_candidates);
-        g_free(resolved_targets);
+        dlopen_interceptor_release_resolved_targets(resolved_targets,
+                                                    target_count);
         return PEAK_DLOPEN_ATTACH_DONE;
     }
 
     for (size_t i = 0; i < target_count; i++) {
+        if (resolved_targets[i].terminal &&
+            dlopen_interceptor_target_is_unresolved_unlocked(i)) {
+            peak_demangled_strings[i] = g_strdup(resolved_targets[i].name);
+            dlopen_interceptor_mark_target_resolved_unlocked(i);
+            continue;
+        }
         if (hook_address[i] != NULL || array_listener[i] != NULL ||
             peak_demangled_strings[i] != NULL) {
             continue;
@@ -2771,6 +2979,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         if (!dlopen_interceptor_initialize_attach_candidate(
                 i,
                 dynamic_hook_address,
+                resolved_targets[i].demangled,
                 target_interceptor,
                 &attach_candidates[candidate_count],
                 &mutation_requests[candidate_count])) {
@@ -2827,7 +3036,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     g_free(batch_results);
     g_free(mutation_requests);
     g_free(attach_candidates);
-    g_free(resolved_targets);
+    dlopen_interceptor_release_resolved_targets(resolved_targets,
+                                                target_count);
 
     if (retained_handle_for_hooks && retry_later) {
         pthread_mutex_lock(&dynamic_attach_gate_mutex);

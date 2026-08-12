@@ -14,6 +14,7 @@ set(sources_peak
     general_listener/report_snapshot.c
     general_listener/runtime_config.c
     general_listener/socket_report_transport.c
+    general_listener/target_resolver.c
     malloc_interceptor.c
     peak.c
     detach_controller.c
@@ -67,6 +68,25 @@ list(APPEND sources_peak
 
 add_library(peak SHARED ${sources_peak})
 
+add_executable(peak_inspect_symbols
+    peak_inspect_symbols.c
+    general_listener/target_resolver.c
+    utils/target_selector_syntax.c
+    $<TARGET_OBJECTS:utils_cxx>)
+set_target_properties(peak_inspect_symbols PROPERTIES
+    OUTPUT_NAME peak
+    LINKER_LANGUAGE CXX)
+target_include_directories(peak_inspect_symbols PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${FRIDA_GUM_INCLUDE_DIRS})
+target_link_libraries(peak_inspect_symbols PRIVATE
+    ${FRIDA_GUM_LIBRARIES}
+    Threads::Threads
+    ${DL_LIBRARY}
+    ${RT_LIBRARY}
+    ${RESOLV_LIBRARY}
+    ${M_LIBRARY})
+
 if(PEAK_DETACH_HELPER_SUPPORTED)
     add_executable(peak_detach_helper detach_helper.c)
     target_include_directories(peak_detach_helper
@@ -95,6 +115,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
 endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+    target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
 endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)
@@ -157,6 +178,7 @@ install(TARGETS peak
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS peak_inspect_symbols DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET peak_detach_helper)
     install(TARGETS peak_detach_helper DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

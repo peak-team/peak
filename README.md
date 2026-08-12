@@ -143,6 +143,40 @@ Set `PEAK_TEXT_OUTPUT=0` for per-function CSV-only output. Heartbeat
 profile/control/risk diagnostics are currently text-only. `PEAK_TARGET`,
 `PEAK_TARGET_GROUP`, and `PEAK_TARGET_FILE` are merged into one CPU target list.
 
+### C++ target selectors
+
+For C++ targets, use a full demangled signature, an exact mangled name, or a
+module-qualified selector. For example:
+
+```bash
+PEAK_TARGET='/opt/lib/libfoo.so!namespace::Class::func(int,double),libfoo.so!_ZN9namespace5Class4funcEid'
+```
+
+`module!symbol` restricts resolution to matching loaded DSOs. A basename
+matches every loaded DSO with that basename; a path is matched exactly or
+canonically when both paths can be resolved. PEAK attaches function listeners
+only at resolved function entries; arbitrary instruction offsets are not a
+supported target syntax. PEAK first considers exact symbol names, then exact full
+demangled signatures, then legacy C++ short names. A selector with more than
+one candidate at its best matching level is not attached; PEAK prints every
+candidate instead of choosing one. Reports retain the module spelling from a
+module-qualified selector, for example
+`/opt/lib/libfoo.so!namespace::Class::func(int, double)`, so equal signatures
+from different DSOs remain distinguishable.
+
+Use the installed inspection command before profiling when selecting an
+overload or checking several DSOs:
+
+```bash
+peak inspect-symbols --module /opt/lib/libfoo.so --module /opt/lib/libbar.so 'namespace::Class::func(int,double)'
+```
+
+It prints each candidate's address, module, mangled name, and full demangled
+signature. Its exit status is `0` for one candidate, `1` for no candidate or
+ambiguity, and `2` for invalid input or an explicitly requested module that
+cannot be loaded. A module-qualified selector implicitly loads that module for
+inspection only; profiling itself never loads a DSO to resolve a target.
+
 ## Configuration
 
 PEAK is configured through environment variables. The tables below are a
@@ -153,11 +187,11 @@ in detail.
 
 | Variable | Purpose |
 | --- | --- |
-| `PEAK_TARGET` | Comma-separated CPU symbol names. Fortran names commonly need a trailing underscore. |
+| `PEAK_TARGET` | Comma-separated CPU symbol names or C++ selectors. Fortran names commonly need a trailing underscore. Use `PEAK_TARGET_FILE` for long or complex selector lists (one complete selector per line). |
 | `PEAK_TARGET_GROUP` | Comma-separated built-in groups: `FFTW`, `PBLAS`, `ScaLAPACK`, `LAPACK`, and `BLAS`. |
-| `PEAK_TARGET_FILE` | File containing one CPU target name per line. |
+| `PEAK_TARGET_FILE` | File containing one complete CPU target name or C++ selector per line; this avoids comma-list quoting concerns for complex signatures. |
 | `PEAK_PROFILE_INTERPRETERS` | Allow normally skipped interpreter processes to initialize PEAK. |
-| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | Force the C++ symbol-map lookup path for target matching. |
+| `PEAK_ENABLE_CXX_SYMBOL_SCAN` | At startup, permit legacy C++ short-name matching only after an ordinary exact lookup misses. After `dlopen()`, legacy matching is available only through an absolute or slash-containing `path!symbol` selector; an unqualified C miss remains unresolved for later DSOs. |
 | `PEAK_STATSLOG_PATH` | CSV output prefix. Default: `./peak_statslog`. |
 | `PEAK_STATSLOG_TEMPLATE` | Complete statistics-CSV pathname template. Supports `{jobid}`, `{stepid}`, `{host}`, `{rank}`, `{pid}`, and `{session}`; for example `{jobid}/{stepid}/{host}/peak-{rank}-{pid}-{session}.csv`. Missing parent directories are created for an explicit template. A template without `.csv` is valid; an exec checkpoint appends `-execN.csv` to it, while the final report uses the literal rendered name. The default adds all identity fields plus `.csv` to the prefix. |
 | `PEAK_MEMLOG_TEMPLATE` | Complete memory-log CSV pathname template; it supports the same fields. |

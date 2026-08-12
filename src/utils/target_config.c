@@ -4,6 +4,7 @@
 
 #include "logging.h"
 #include "source_target.h"
+#include "utils/target_selector_syntax.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -241,6 +242,15 @@ append_trimmed_token(TargetBuilder* builder, char* token, bool* warned_empty)
     return target_builder_append(builder, token);
 }
 
+static char*
+target_config_next_delimiter(char* token, char delimiter)
+{
+    const char* next = NULL;
+
+    return peak_target_selector_next_delimiter(token, delimiter, true, &next)
+        ? (char*)next : NULL;
+}
+
 size_t
 parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
 {
@@ -268,7 +278,7 @@ parse_env_w_delim(const char* env_var, const char a_delim, char*** result)
     }
     token = copy;
     do {
-        next = strchr(token, a_delim);
+        next = target_config_next_delimiter(token, a_delim);
         if (next != NULL) {
             *next++ = '\0';
         }

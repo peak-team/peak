@@ -575,6 +575,7 @@ if(BUILD_TESTING)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
     add_subdirectory(dlopen_controller)
+    add_subdirectory(symbol_resolution)
     add_subdirectory(jit)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
         add_test(NAME test_unsafe_gum_prologue_policy_unit
