@@ -812,7 +812,8 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
         PeakTargetSymbolCandidate* existing =
             g_ptr_array_index(context->candidates, i);
         if (existing->address == candidate->address &&
-            g_strcmp0(existing->module, candidate->module) == 0) {
+            g_strcmp0(existing->module, candidate->module) == 0 &&
+            g_strcmp0(existing->demangled, candidate->demangled) == 0) {
             peak_target_symbol_candidate_free(candidate);
             return;
         }

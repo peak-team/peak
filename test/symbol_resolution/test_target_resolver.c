@@ -503,6 +503,38 @@ main(int argc, char** argv)
 #if defined(__ELF__)
     expect_true(weak_address == strong_address,
                 "weak and strong aliases retain their shared address");
+    {
+        char* alias_selector = g_strdup_printf("%s!same",
+                                               PEAK_TEST_SYMBOL_MODULE_A);
+
+        expect_true(resolve(alias_selector, &resolution) ==
+                        PEAK_TARGET_RESOLVE_AMBIGUOUS &&
+                        resolution.candidates->len == 2,
+                    "same-address C++ identities remain ambiguous");
+        if (resolution.candidates != NULL &&
+            resolution.candidates->len == 2) {
+            PeakTargetSymbolCandidate* first =
+                g_ptr_array_index(resolution.candidates, 0);
+            PeakTargetSymbolCandidate* second =
+                g_ptr_array_index(resolution.candidates, 1);
+            gboolean first_is_alias_a =
+                strstr(first->demangled, "alias_a::same(int)") != NULL;
+            gboolean first_is_alias_b =
+                strstr(first->demangled, "alias_b::same(int)") != NULL;
+            gboolean second_is_alias_a =
+                strstr(second->demangled, "alias_a::same(int)") != NULL;
+            gboolean second_is_alias_b =
+                strstr(second->demangled, "alias_b::same(int)") != NULL;
+
+            expect_true(first->address == second->address,
+                        "ambiguous C++ aliases share one physical address");
+            expect_true((first_is_alias_a && second_is_alias_b) ||
+                            (first_is_alias_b && second_is_alias_a),
+                        "ambiguous C++ aliases retain distinct identities");
+        }
+        peak_target_resolution_clear(&resolution);
+        g_free(alias_selector);
+    }
 #else
     expect_true(weak_address != NULL && strong_address != NULL,
                 "weak and strong alias symbols both resolve");

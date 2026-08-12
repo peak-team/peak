@@ -548,6 +548,27 @@ int peak_symbol_strong_alias(void)
     return PEAK_FIXTURE_VALUE;
 }
 
+namespace alias_a {
+__attribute__((noinline, used, visibility("default")))
+int same(int value)
+{
+    return peak_symbol_legacy_helper(value + PEAK_FIXTURE_VALUE);
+}
+}
+
+namespace alias_b {
+#if defined(__ELF__)
+int same(int value)
+    __attribute__((used, alias("_ZN7alias_a4sameEi"), visibility("default")));
+#else
+__attribute__((noinline, used, visibility("default")))
+int same(int value)
+{
+    return alias_a::same(value);
+}
+#endif
+}
+
 #if defined(__ELF__)
 extern "C" int peak_symbol_weak_alias(void)
     __attribute__((weak, alias("peak_symbol_strong_alias"), visibility("default")));
