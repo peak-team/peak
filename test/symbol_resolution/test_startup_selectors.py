@@ -37,16 +37,11 @@ def main():
         stdout, _ = run(program, module_a, target, "startup-unique")
         assert "startup_unique_selector_ok" in stdout
 
-    # Process-wide operator() is intentionally ambiguous once libstdc++ is
-    # loaded, so exercise it with an explicit module below. These two names
-    # remain unique process-wide and preserve the original legacy behavior.
-    for target in ("~Widget", "concrete_angle_plus_return"):
-        stdout, _ = run(program, module_a, target, "startup-unique",
-                        legacy=True)
-        assert "startup_unique_selector_ok" in stdout
-
-    stdout, _ = run(program, module_a, f"{module_a}!operator()",
-                    "startup-unique", legacy=True)
+    # The resolver unit test covers all three legacy extraction regressions.
+    # The destructor also has a listener-safe production prologue, so exercise
+    # that target through the complete startup attach path.
+    stdout, _ = run(program, module_a, "~Widget", "startup-unique",
+                    legacy=True)
     assert "startup_unique_selector_ok" in stdout
 
     dual_target = ",".join((
