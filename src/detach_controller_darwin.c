@@ -591,7 +591,7 @@ peak_darwin_build_patch_plan(const PeakDetachRequest* request,
     }
 
     gpointer current_function_address = NULL;
-    if (!peak_gum_darwin_get_canonical_address(
+    if (!peak_gum_darwin_get_canonical_address_exact(
             request->interceptor,
             request->function_address,
             request->listener,
@@ -660,9 +660,13 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
 
     if (request->operation != PEAK_DETACH_OPERATION_DETACH &&
         request->operation != PEAK_DETACH_OPERATION_REATTACH) {
-        peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_SAFE);
+        peak_darwin_note_failure("runtime-gum-mutation-disabled",
+                                 0,
+                                 (uintptr_t)request->function_address,
+                                 request->operation);
+        peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_UNSUPPORTED);
         pthread_mutex_unlock(&peak_darwin_mutation_mutex);
-        return TRUE;
+        return FALSE;
     }
 
     if (atomic_load_explicit(&peak_darwin_thread_gate_installed,
@@ -944,11 +948,15 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
         peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
         peak_darwin_publish_window(finished, &started_at);
     } else if (request != NULL &&
-               request->operation == PEAK_DETACH_OPERATION_SHUTDOWN) {
-        peak_darwin_note_failure("shutdown-gum-teardown-disabled",
-                                 0,
-                                 (uintptr_t)request->function_address,
-                                 request->operation);
+               request->operation != PEAK_DETACH_OPERATION_DETACH &&
+               request->operation != PEAK_DETACH_OPERATION_REATTACH) {
+        peak_darwin_note_failure(
+            request->operation == PEAK_DETACH_OPERATION_SHUTDOWN
+                ? "shutdown-gum-teardown-disabled"
+                : "runtime-gum-mutation-disabled",
+            0,
+            (uintptr_t)request->function_address,
+            request->operation);
         status = PEAK_DETACH_STATUS_UNSUPPORTED;
         finished = FALSE;
     }

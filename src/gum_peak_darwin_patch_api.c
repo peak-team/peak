@@ -107,26 +107,35 @@ peak_gum_darwin_context_is_entry_patch(PeakGumFunctionContext17* context,
 }
 
 static PeakGumFunctionContext17*
+peak_gum_darwin_find_context_exact(PeakGumInterceptor17* interceptor,
+                                   gpointer function_address,
+                                   GumInvocationListener* listener)
+{
+    PeakGumFunctionContext17* context;
+    gpointer stripped_address = gum_strip_code_pointer(function_address);
+
+    if (interceptor->function_by_address == NULL || stripped_address == NULL) {
+        return NULL;
+    }
+
+    context = g_hash_table_lookup(interceptor->function_by_address,
+                                  stripped_address);
+    return peak_gum_darwin_context_is_entry_patch(context, listener)
+               ? context
+               : NULL;
+}
+
+static PeakGumFunctionContext17*
 peak_gum_darwin_find_context(PeakGumInterceptor17* interceptor,
                              gpointer function_address,
                              GumInvocationListener* listener)
 {
-    PeakGumFunctionContext17* context = NULL;
-    gpointer stripped_address = gum_strip_code_pointer(function_address);
+    PeakGumFunctionContext17* context = peak_gum_darwin_find_context_exact(
+        interceptor, function_address, listener);
 
-    if (interceptor->function_by_address == NULL) {
-        return NULL;
-    }
-
-    if (stripped_address != NULL) {
-        context = g_hash_table_lookup(interceptor->function_by_address,
-                                      stripped_address);
-    }
-    if (peak_gum_darwin_context_is_entry_patch(context, listener)) {
+    if (context != NULL) {
         return context;
     }
-
-    context = NULL;
     if (listener != NULL) {
         GHashTableIter iter;
         gpointer value;
@@ -191,10 +200,11 @@ peak_gum_darwin_get_function_patch(GumInterceptor* interceptor,
 }
 
 gboolean
-peak_gum_darwin_get_canonical_address(GumInterceptor* interceptor,
-                                      gpointer function_address,
-                                      GumInvocationListener* listener,
-                                      gpointer* canonical_address_out)
+peak_gum_darwin_get_canonical_address_exact(
+    GumInterceptor* interceptor,
+    gpointer function_address,
+    GumInvocationListener* listener,
+    gpointer* canonical_address_out)
 {
     PeakGumInterceptor17* private_interceptor;
     PeakGumFunctionContext17* context;
@@ -209,9 +219,9 @@ peak_gum_darwin_get_canonical_address(GumInterceptor* interceptor,
     private_interceptor = (PeakGumInterceptor17*)interceptor;
 
     g_rec_mutex_lock(&private_interceptor->mutex);
-    context = peak_gum_darwin_find_context(private_interceptor,
-                                           function_address,
-                                           listener);
+    context = peak_gum_darwin_find_context_exact(private_interceptor,
+                                                 function_address,
+                                                 listener);
     if (context != NULL) {
         *canonical_address_out = context->function_address;
         found = TRUE;

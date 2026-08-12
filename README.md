@@ -140,18 +140,22 @@ DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
 ./target_application
 ```
 
-The macOS path supports startup attachment and reporting for named CPU
-functions. On Arm64 it also supports zero-overhead physical detach and
-reattach: PEAK suspends the other Mach threads, changes only the saved entry
-patch bytes, and resumes them after the mutation. If a thread is observed
+The macOS path supports single-threaded startup attachment and reporting for
+named CPU functions. Runtime `ATTACH`, `REPLACE`, and `REVERT` mutations fail
+closed as unsupported. On Arm64, PEAK also supports zero-overhead physical
+detach and reattach for pthread-based workloads: it gates `pthread_create`,
+suspends the other enumerated Mach threads, changes only the saved entry patch
+bytes, and resumes them after the mutation. A second enumeration covers a
+pthread creator that crossed the gate before it closed; this v1 does not claim
+to cover threads created directly through Mach APIs. If a thread is observed
 inside the overwritten prologue, PEAK resumes every thread and retries through
-the normal controller backoff; this first implementation deliberately does not
-single-step threads for liveness. At process exit, Darwin stops PEAK-owned
-controller work and writes the final report but leaves Gum hooks, listeners,
-and their reachable state alive for the operating system to reclaim; it does
-not claim an unheld final shutdown mutation is safe. The Linux detach helper,
-raw-syscall exec handling, CUDA profiling, and Linux signal-policy interception
-remain Linux-only. macOS CI builds and installs PEAK on Arm64 and runs real
+the normal controller backoff; it deliberately does not single-step threads
+for liveness. At process exit, Darwin stops PEAK-owned controller work and
+writes the final report but leaves Gum hooks, listeners, and their reachable
+state alive for the operating system to reclaim; it does not claim an unheld
+final shutdown mutation is safe. The Linux detach helper, raw-syscall exec
+handling, CUDA profiling, and Linux signal-policy interception remain
+Linux-only. macOS CI builds and installs PEAK on Arm64 and runs real
 `DYLD_INSERT_LIBRARIES` profiling plus single- and multithreaded physical
 detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.
 

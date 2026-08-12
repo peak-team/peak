@@ -19,8 +19,8 @@ gboolean peak_gum_darwin_get_function_patch(
     guint8* original_prologue,
     guint* prologue_len);
 
-/* Revalidate a live Gum context without reading its current entry bytes. */
-gboolean peak_gum_darwin_get_canonical_address(
+/* Revalidate the exact-address Gum context without reading its entry bytes. */
+gboolean peak_gum_darwin_get_canonical_address_exact(
     GumInterceptor* interceptor,
     gpointer function_address,
     GumInvocationListener* listener,

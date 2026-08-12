@@ -50,8 +50,13 @@ def check_shutdown_order(repo_root):
 
 def check_darwin_strict_lifecycle(repo_root):
     controller = read_source(repo_root, "src/detach_controller_darwin.c")
+    gum_bridge = read_source(repo_root, "src/gum_peak_darwin_patch_api.c")
     general = read_source(repo_root, "src/general_listener.c")
     peak = read_source(repo_root, "src/peak.c")
+    readme = read_source(repo_root, "README.md")
+    controller_doc = read_source(
+        repo_root, "docs/physical-detach-controller.md"
+    )
     workflow = read_source(repo_root, ".github/workflows/cmake.yml")
     concurrent_test = read_source(
         repo_root, "test/macos/detach_concurrent_main.c"
@@ -66,7 +71,7 @@ def check_darwin_strict_lifecycle(repo_root):
 
     patch_plan = extract_function(controller, "peak_darwin_build_patch_plan")
     identity_lookup = patch_plan.find(
-        "peak_gum_darwin_get_canonical_address"
+        "peak_gum_darwin_get_canonical_address_exact"
     )
     identity_check = patch_plan.find(
         "current_function_address != record->function_address"
@@ -79,26 +84,42 @@ def check_darwin_strict_lifecycle(repo_root):
             patch_plan[identity_lookup:saved_address_use],
             "Darwin reattach must verify current canonical patch identity before using saved bytes")
 
+    exact_lookup = extract_function(
+        gum_bridge, "peak_gum_darwin_get_canonical_address_exact"
+    )
+    exact_context = extract_function(
+        gum_bridge, "peak_gum_darwin_find_context_exact"
+    )
+    require("peak_gum_darwin_find_context_exact" in exact_lookup and
+            "peak_gum_darwin_find_context(" not in exact_lookup and
+            "g_hash_table_lookup" in exact_context and
+            "g_hash_table_iter_init" not in exact_context,
+            "Darwin reattach identity lookup must not fall back to listener-only discovery")
+
     prepare = extract_function(
         controller, "peak_detach_controller_prepare_hook_mutation"
     )
     shutdown_reject = prepare.find(
         "request->operation == PEAK_DETACH_OPERATION_SHUTDOWN"
     )
-    nonphysical_safe = prepare.find(
+    nonphysical_reject = prepare.find(
         "request->operation != PEAK_DETACH_OPERATION_DETACH"
     )
-    require(0 <= shutdown_reject < nonphysical_safe and
+    require(0 <= shutdown_reject < nonphysical_reject and
             "PEAK_DETACH_STATUS_UNSUPPORTED" in
-            prepare[shutdown_reject:nonphysical_safe],
-            "Darwin SHUTDOWN must not claim an unheld strict-safe window")
+            prepare[shutdown_reject:nonphysical_reject] and
+            "PEAK_DETACH_STATUS_UNSUPPORTED" in
+            prepare[nonphysical_reject:] and
+            "return FALSE;" in prepare[nonphysical_reject:] and
+            "return TRUE;" not in prepare[nonphysical_reject:],
+            "Darwin non-physical Gum mutations must fail closed without a held window")
     finish = extract_function(
         controller, "peak_detach_controller_finish_hook_mutation"
     )
-    require("request->operation == PEAK_DETACH_OPERATION_SHUTDOWN" in
-            finish and
+    require("request->operation != PEAK_DETACH_OPERATION_DETACH" in finish and
+            "request->operation != PEAK_DETACH_OPERATION_REATTACH" in finish and
             "status = PEAK_DETACH_STATUS_UNSUPPORTED" in finish,
-            "Darwin SHUTDOWN finish must remain fail-closed without a held window")
+            "Darwin non-physical finish must remain fail-closed without a held window")
 
     final_detach = extract_function(general, "peak_general_listener_dettach")
     require("Darwin process-exit teardown leaves Gum target listener state alive"
@@ -114,10 +135,19 @@ def check_darwin_strict_lifecycle(repo_root):
 
     require("detach_concurrent_main.c" in workflow and
             "timeout-minutes: 2" in workflow and
+            "PEAK_MAX_NUM_THREADS=32" in workflow and
+            "! grep -F 'Accounting diagnostics:'" in workflow and
+            "! grep -F '\"PEAK_ACCOUNTING_DIAGNOSTICS\"'" in workflow and
             "PEAK_MACOS_WORKER_COUNT 4u" in concurrent_test and
             "pthread_create" in concurrent_test and
             "pthread_join" in concurrent_test,
             "macOS CI must exercise bounded concurrent detach/reattach and pthread creation")
+    require("Runtime `ATTACH`, `REPLACE`, and `REVERT` mutations fail" in
+            readme and
+            "threads created directly through Mach APIs" in readme and
+            "arbitrary Mach thread creation" in controller_doc and
+            "not claimed by this backend" in controller_doc,
+            "Darwin docs must bound v1 safety to startup attach and pthread-based workloads")
 
 
 def check_safe_pc_alignment(repo_root):
