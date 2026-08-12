@@ -18,7 +18,8 @@
 PEAK is a dynamic-library injection profiler for HPC applications. It profiles
 selected CPU functions, optional CUDA kernels, memory allocation activity, and
 JIT-published code without requiring application recompilation. Linux uses
-`LD_PRELOAD`; macOS uses `DYLD_INSERT_LIBRARIES` for baseline CPU profiling.
+`LD_PRELOAD`; macOS uses `DYLD_INSERT_LIBRARIES` for CPU profiling, with
+physical detach and reattach available on Arm64.
 
 PEAK is designed for long-running and MPI applications where profiler overhead,
 safe attach and detach behavior, and reliable final reports matter.
