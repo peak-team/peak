@@ -24,6 +24,9 @@
 #include "utils/env_parser.h"
 #include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
@@ -1036,7 +1039,17 @@ peak_general_listener_find_function(const char* symbol)
         return NULL;
     }
 
+#if defined(__APPLE__)
+    gpointer address;
+
+    address = gum_find_function(symbol);
+    if (address == NULL) {
+        address = dlsym(RTLD_DEFAULT, symbol);
+    }
+    return address;
+#else
     return gum_find_function(symbol);
+#endif
 }
 
 /* Invocation listener and thread-pause primitives. */
@@ -1078,11 +1091,15 @@ typedef struct _PeakInvocationData {
     gboolean initialized;
 } PeakInvocationData;
 
+#if defined(__APPLE__)
+#define PEAK_LISTENER_FAST_DISPATCH_SECTION __attribute__((noinline))
+#else
 #define PEAK_LISTENER_FAST_DISPATCH_SECTION \
     __attribute__((section("peak_listener_fast_dispatch"), noinline, noclone))
 
 extern const guint8 __start_peak_listener_fast_dispatch[];
 extern const guint8 __stop_peak_listener_fast_dispatch[];
+#endif
 
 /*
  * PEAK is loaded during process startup (normally through LD_PRELOAD), so its
@@ -1463,6 +1480,7 @@ peak_general_listener_invocation_stack_address(
 #endif
 }
 
+#if defined(__linux__)
 static int pthread_pause_deadline_ms(const struct timespec* deadline)
 {
     struct timespec now;
@@ -1730,6 +1748,38 @@ int pthread_unpause(pthread_t thread, int session_id)
 
     return 0;
 }
+#else
+void pthread_pause_enable(void)
+{
+}
+
+void pthread_pause_disable(void)
+{
+}
+
+static int
+pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session_id_out)
+{
+    (void)thread;
+    (void)mapped_id;
+    if (session_id_out != NULL) {
+        *session_id_out = -1;
+    }
+    return -1;
+}
+
+int pthread_pause(pthread_t thread, int* session_id_out)
+{
+    return pthread_pause_mapped(thread, 0, session_id_out);
+}
+
+int pthread_unpause(pthread_t thread, int session_id)
+{
+    (void)thread;
+    (void)session_id;
+    return -1;
+}
+#endif
 
 static gboolean peak_general_hook_is_published_unlocked(size_t hook_id)
 {
@@ -6737,11 +6787,16 @@ peak_general_listener_init(PeakGeneralListener* self)
         .active_reset = peak_general_listener_fast_active_reset,
         .user_data = self,
         .listener_instance = GUM_INVOCATION_LISTENER(self),
+#if defined(__APPLE__)
+        .dispatch_start = NULL,
+        .dispatch_size = 0,
+#else
         .dispatch_start =
             (gpointer)__start_peak_listener_fast_dispatch,
         .dispatch_size =
             (gsize)(__stop_peak_listener_fast_dispatch -
                     __start_peak_listener_fast_dispatch),
+#endif
         .enabled = 0,
     };
     /*
@@ -8643,6 +8698,17 @@ gboolean peak_general_listener_dettach()
     }
 
     peak_general_listener_controller_stop();
+
+#if defined(__APPLE__)
+    /*
+     * A process destructor cannot prove that arbitrary application threads
+     * have stopped.  Keep every Gum target context and listener reachable and
+     * let process exit reclaim them instead of performing an unguarded final
+     * detach/free sequence.
+     */
+    peak_log_info("[peak] Darwin process-exit teardown leaves Gum target listener state alive\n");
+    return FALSE;
+#endif
 
     pthread_t controller_tid = pthread_self();
     pthread_t* tid_keys = g_new0(pthread_t, peak_max_num_threads);

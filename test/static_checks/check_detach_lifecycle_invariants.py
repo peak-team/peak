@@ -48,6 +48,265 @@ def check_shutdown_order(repo_root):
                 "shutdown Gum detach must happen before controller finish/resume")
 
 
+def check_darwin_strict_lifecycle(repo_root):
+    controller = read_source(repo_root, "src/detach_controller_darwin.c")
+    gum_bridge = read_source(repo_root, "src/gum_peak_darwin_patch_api.c")
+    general = read_source(repo_root, "src/general_listener.c")
+    attach_policy = read_source(
+        repo_root, "src/general_listener/attach_policy.c"
+    )
+    peak = read_source(repo_root, "src/peak.c")
+    readme = read_source(repo_root, "README.md")
+    controller_doc = read_source(
+        repo_root, "docs/physical-detach-controller.md"
+    )
+    workflow = read_source(repo_root, ".github/workflows/cmake.yml")
+    concurrent_test = read_source(
+        repo_root, "test/macos/detach_concurrent_main.c"
+    )
+    threaded_bootstrap_test = read_source(
+        repo_root, "test/macos/threaded_bootstrap_main.c"
+    )
+    branch_target = read_source(
+        repo_root, "test/macos/smoke_branch_target.S"
+    )
+    branch_attribution_test = read_source(
+        repo_root, "test/macos/branch_attribution_main.c"
+    )
+
+    activation = extract_function(peak, "peak_activate_runtime")
+    bootstrap_proof = activation.find(
+        "peak_general_listener_startup_attach_can_skip_stop"
+    )
+    gum_init = activation.find("gum_init_embedded()")
+    pthread_attach = activation.find("pthread_listener_attach()")
+    require(0 <= bootstrap_proof < gum_init < pthread_attach and
+            "PEAK_RUNTIME_ACTIVATION_REJECTED" in
+            activation[bootstrap_proof:gum_init] and
+            "no Gum hooks were installed" in
+            activation[bootstrap_proof:gum_init],
+            "Darwin activation must prove single-threaded bootstrap before "
+            "Gum initialization or pthread hook mutation")
+
+    cancel = extract_function(controller, "peak_darwin_cancel_stop_window")
+    resume = cancel.find("if (!peak_darwin_resume_threads")
+    abort = cancel.find("peak_detach_controller_abort_after_failed_finish")
+    dispose = cancel.find("peak_darwin_dispose_writable_pages")
+    require(0 <= resume < abort < dispose,
+            "Darwin STOP cancellation must fail-stop before clearing held state when resume fails")
+
+    patch_plan = extract_function(controller, "peak_darwin_build_patch_plan")
+    identity_lookup = patch_plan.find(
+        "peak_gum_darwin_get_canonical_address_exact"
+    )
+    identity_check = patch_plan.find(
+        "current_function_address != record->function_address"
+    )
+    saved_address_use = patch_plan.find(
+        "plan->function_address = record->function_address"
+    )
+    require(0 <= identity_lookup < identity_check < saved_address_use and
+            "PEAK_DETACH_STATUS_CLASSIFY_FAILED" in
+            patch_plan[identity_lookup:saved_address_use],
+            "Darwin reattach must verify current canonical patch identity before using saved bytes")
+    require(re.search(
+                r"peak_gum_darwin_get_canonical_address_exact\s*\(\s*"
+                r"request->interceptor,\s*record->function_address,\s*"
+                r"request->listener,",
+                patch_plan,
+            ) is not None,
+            "Darwin reattach exact lookup must use the saved Gum canonical "
+            "address, not the original PEAK request address")
+
+    exact_lookup = extract_function(
+        gum_bridge, "peak_gum_darwin_get_canonical_address_exact"
+    )
+    exact_context = extract_function(
+        gum_bridge, "peak_gum_darwin_find_context_exact"
+    )
+    exclusive_listener = extract_function(
+        gum_bridge, "peak_gum_darwin_context_has_only_listener"
+    )
+    entry_patch = extract_function(
+        gum_bridge, "peak_gum_darwin_context_is_entry_patch"
+    )
+    require("peak_gum_darwin_find_context_exact" in exact_lookup and
+            "peak_gum_darwin_find_context(" not in exact_lookup and
+            "g_hash_table_lookup" in exact_context and
+            "g_hash_table_iter_init" not in exact_context,
+            "Darwin reattach identity lookup must not fall back to listener-only discovery")
+    require("gpointer replacement_function;" in gum_bridge and
+            "gpointer replacement_data;" in gum_bridge and
+            "entries->len != 1" in exclusive_listener and
+            "g_ptr_array_index(entries, 0)" in exclusive_listener and
+            "entry->listener_instance == listener" in exclusive_listener and
+            "context->replacement_function == NULL" in entry_patch and
+            "peak_gum_darwin_context_has_only_listener" in entry_patch,
+            "Darwin physical patch lookup must require exclusive listener "
+            "ownership and no Gum replacement")
+
+    prepare = extract_function(
+        controller, "peak_detach_controller_prepare_hook_mutation"
+    )
+    shutdown_reject = prepare.find(
+        "request->operation == PEAK_DETACH_OPERATION_SHUTDOWN"
+    )
+    nonphysical_reject = prepare.find(
+        "request->operation != PEAK_DETACH_OPERATION_DETACH"
+    )
+    require(0 <= shutdown_reject < nonphysical_reject and
+            "PEAK_DETACH_STATUS_UNSUPPORTED" in
+            prepare[shutdown_reject:nonphysical_reject] and
+            "PEAK_DETACH_STATUS_UNSUPPORTED" in
+            prepare[nonphysical_reject:] and
+            "return FALSE;" in prepare[nonphysical_reject:] and
+            "return TRUE;" not in prepare[nonphysical_reject:],
+            "Darwin non-physical Gum mutations must fail closed without a held window")
+    finish = extract_function(
+        controller, "peak_detach_controller_finish_hook_mutation"
+    )
+    require("request->operation != PEAK_DETACH_OPERATION_DETACH" in finish and
+            "request->operation != PEAK_DETACH_OPERATION_REATTACH" in finish and
+            "status = PEAK_DETACH_STATUS_UNSUPPORTED" in finish,
+            "Darwin non-physical finish must remain fail-closed without a held window")
+
+    final_detach = extract_function(general, "peak_general_listener_dettach")
+    require("Darwin process-exit teardown leaves Gum target listener state alive"
+            in final_detach and
+            final_detach.find("return FALSE;") <
+            final_detach.find("pthread_t controller_tid"),
+            "Darwin process exit must retain Gum target listener state")
+    finalizer = extract_function(peak, "peak_fini_impl")
+    loader_state = finalizer.find("gboolean dlopen_shutdown_flushed")
+    darwin_loader_guard = finalizer.find("#if defined(__APPLE__)", loader_state)
+    darwin_loader_else = finalizer.find("#else", darwin_loader_guard)
+    require(0 <= loader_state < darwin_loader_guard < darwin_loader_else and
+            "dlopen_interceptor_" not in
+            finalizer[darwin_loader_guard:darwin_loader_else] and
+            "no loader listener" in
+            finalizer[darwin_loader_guard:darwin_loader_else] and
+            "Darwin process-exit teardown leaves Gum support hook state alive"
+            in finalizer,
+            "Darwin must neither install nor shut down dynamic-loader attach machinery")
+
+    init = extract_function(peak, "peak_init")
+    memory_parse = init.find(
+        "peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE)"
+    )
+    memory_reject = init.find("rejecting PEAK_MEMORY_PROFILE on macOS")
+    requested_work = init.find("gboolean has_requested_work")
+    require(0 <= memory_parse < memory_reject < requested_work and
+            "peak_memory_profile = false;" in
+            init[memory_reject:requested_work] and
+            "peak_memory_track_all = false;" in
+            init[memory_reject:requested_work],
+            "macOS must reject memory profiling before deciding whether any "
+            "supported work was requested")
+
+    dynamic_attach = activation.find("dlopen_interceptor_attach()")
+    dynamic_attach_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, dynamic_attach
+    )
+    dynamic_attach_end = activation.find("#endif", dynamic_attach)
+    dynamic_enable = activation.find(
+        "dlopen_interceptor_enable_dynamic_attach()"
+    )
+    dynamic_enable_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, dynamic_enable
+    )
+    dynamic_enable_end = activation.find("#endif", dynamic_enable)
+    require(0 <= dynamic_attach_guard < dynamic_attach < dynamic_attach_end and
+            0 <= dynamic_enable_guard < dynamic_enable < dynamic_enable_end,
+            "macOS activation must not install or enable dlopen/dlclose "
+            "dynamic-attach machinery")
+
+    jit_enable = activation.find("peak_jit_provider_enable()")
+    jit_enable_guard = activation.rfind(
+        "#if !defined(__APPLE__)", 0, jit_enable
+    )
+    jit_enable_end = activation.find("#endif", jit_enable)
+    require(0 <= jit_enable_guard < jit_enable < jit_enable_end,
+            "macOS activation must not enable the JIT metadata provider")
+
+    require("detach_concurrent_main.c" in workflow and
+            "timeout-minutes: 2" in workflow and
+            "PEAK_MAX_NUM_THREADS=32" in workflow and
+            "! grep -F 'Accounting diagnostics:'" in workflow and
+            "! grep -F '\"PEAK_ACCOUNTING_DIAGNOSTICS\"'" in workflow and
+            "PEAK_MACOS_WORKER_COUNT 4u" in concurrent_test and
+            "pthread_create" in concurrent_test and
+            "pthread_join" in concurrent_test,
+            "macOS CI must exercise bounded concurrent detach/reattach and pthread creation")
+    require("threaded_bootstrap_main.c" in workflow and
+            "refusing macOS runtime activation" in workflow and
+            "pthread_create" in threaded_bootstrap_test and
+            "dlopen(argv[1]" in threaded_bootstrap_test,
+            "macOS CI must exercise fail-closed activation after peers exist")
+    attach_supported = extract_function(
+        attach_policy, "peak_general_listener_attach_target_is_supported"
+    )
+    strip_pointer = attach_supported.find(
+        "stripped_address = gum_strip_code_pointer(address)"
+    )
+    redirect_check = attach_supported.find(
+        "gum_arm64_reader_try_get_relative_jump_target(stripped_address)"
+    )
+    unsafe_override = attach_supported.find(
+        "if (peak_allow_unsafe_gum_prologue)"
+    )
+    require(0 <= strip_pointer < redirect_check < unsafe_override and
+            "defined(__APPLE__)" in attach_supported[:redirect_check] and
+            "defined(__arm64__)" in attach_supported[:redirect_check] and
+            "peak_log_warn(" in
+            attach_supported[redirect_check:unsafe_override] and
+            "gum_arm64_reader_try_get_relative_jump_target(address)" not in
+            attach_supported and
+            "Darwin exact-entry attach is unavailable" in attach_supported,
+            "Darwin Arm64 must strip code pointers and warn when rejecting "
+            "Gum-canonicalizing targets before the unsafe-prologue override")
+    branch_step_start = workflow.find(
+        "- name: Test canonicalizing Arm64 target fails closed"
+    )
+    branch_step_end = workflow.find("\n    - name:", branch_step_start + 1)
+    require(branch_step_start >= 0 and branch_step_end > branch_step_start,
+            "missing bounded canonicalizing Arm64 target CI step")
+    branch_step = workflow[branch_step_start:branch_step_end]
+    require("branch_attribution_main.c" in branch_step and
+            "PEAK_TARGET=peak_macos_branch_target" in branch_step and
+            "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" not in
+            workflow and
+            "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1" in branch_step and
+            "PEAK_VERBOSITY" not in branch_step and
+            "Instrumented targets: 0" in branch_step and
+            "Recorded calls: 0" in branch_step and
+            "peak_macos_branch_target" in branch_attribution_test and
+            "peak_macos_smoke_target" in branch_attribution_test and
+            "b _peak_macos_smoke_target" in branch_target,
+            "macOS CI must prove canonicalizing Arm64 targets fail closed "
+            "instead of merging direct destination calls into the requested "
+            "target")
+    require("rejecting PEAK_MEMORY_PROFILE on macOS" in workflow,
+            "macOS CI must exercise explicit memory-profile rejection")
+    require("Runtime `ATTACH`, `REPLACE`, and" in readme and
+            "`REVERT` mutations fail closed" in readme and
+            "does not install" in readme and
+            "JIT metadata provider is also kept disabled" in readme and
+            "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
+            "macOS Arm64 v1 requires PEAK's default downloaded, hash-pinned "
+            "Frida Gum" in readme and
+            "Darwin v1 has no exact-entry attach" in readme and
+            "cannot override this" in readme and
+            "exactly the requested PEAK listener" in readme and
+            "does not claim to cover threads" in readme and
+            "created directly through Mach APIs" in readme and
+            "Memory profiling is rejected" in controller_doc and
+            "exclusive ownership of the" in controller_doc and
+            "canonical Gum context" in controller_doc and
+            "arbitrary Mach thread creation" in controller_doc and
+            "not claimed by this backend" in controller_doc,
+            "Darwin docs must bound v1 safety to startup attach and pthread-based workloads")
+
+
 def check_safe_pc_alignment(repo_root):
     gum_source = (repo_root / "cmake/peak-gum/gum_peak_pc_api.c").read_text(
         encoding="utf-8"
@@ -1903,10 +2162,12 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
     require(general_attach_supported.count("peak_log_info(") == 2 and
+            general_attach_supported.count("peak_log_warn(") == 1 and
             "g_printerr(" not in general_attach_supported and
-            "peak_log_warn(" not in general_attach_supported,
-            "expected target safety-policy skips must remain INFO diagnostics "
-            "instead of producing one WARN per MPI rank")
+            "target entry redirects to another address" in
+            general_attach_supported,
+            "relocation-policy skips must remain INFO while target-attribution "
+            "rejection is a default-visible WARN")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and
@@ -3061,6 +3322,7 @@ def main():
         return 2
     repo_root = pathlib.Path(sys.argv[1]).resolve()
     check_shutdown_order(repo_root)
+    check_darwin_strict_lifecycle(repo_root)
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)
     check_dlopen_detach_transaction(repo_root)

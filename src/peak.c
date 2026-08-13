@@ -26,6 +26,9 @@
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
 #include "internal/general_listener_internal.h"
+#if defined(__APPLE__)
+#include "internal/general_listener/attach_policy.h"
+#endif
 #include "internal/general_listener/report_snapshot.h"
 #include "internal/general_listener/runtime_config.h"
 #include "internal/general_listener/output_identity.h"
@@ -120,6 +123,9 @@ typedef enum {
     PEAK_RUNTIME_ACTIVATION_IN_PROGRESS = 2,
     PEAK_RUNTIME_ACTIVATION_ACTIVE = 3,
     PEAK_RUNTIME_ACTIVATION_CANCELED = 4,
+#if defined(__APPLE__)
+    PEAK_RUNTIME_ACTIVATION_REJECTED = 5,
+#endif
 } PeakRuntimeActivationState;
 static _Atomic int peak_runtime_activation_state =
     PEAK_RUNTIME_ACTIVATION_NOT_READY;
@@ -934,6 +940,23 @@ peak_activate_runtime(void)
                           1,
                           memory_order_release);
 
+#if defined(__APPLE__)
+    /*
+     * Darwin v1 has no strict protocol for installing Gum hooks after peer
+     * threads exist.  Prove the process is still single-threaded before even
+     * initializing Gum, so pthread, MPI, and target hook installation cannot
+     * begin from a post-init or early-constructor multithreaded state.
+     */
+    if (!peak_general_listener_startup_attach_can_skip_stop()) {
+        peak_log_warn(
+            "[peak] refusing macOS runtime activation because the process is already multithreaded; Darwin Gum bootstrap requires single-threaded startup and no Gum hooks were installed\n");
+        atomic_store_explicit(&peak_runtime_activation_state,
+                              PEAK_RUNTIME_ACTIVATION_REJECTED,
+                              memory_order_release);
+        return;
+    }
+#endif
+
     /*
      * The default path reaches this point before application main. An MPI rank
      * using PEAK_MPI_ACTIVATION_POLICY=post-init reaches it only after a
@@ -969,7 +992,9 @@ peak_activate_runtime(void)
     }
     peak_need_detach = g_new0(gboolean, peak_hook_address_count);
     peak_detached = g_new0(gboolean, peak_hook_address_count);
+#if !defined(__APPLE__)
     peak_jit_provider_enable();
+#endif
     /*
      * This is the post-MPI module rescan. Gum initialization and this scan
      * both occur in the deferred activation, so symbol lookup sees UCX,
@@ -978,11 +1003,13 @@ peak_activate_runtime(void)
      */
     peak_general_listener_attach();
     syscall_interceptor_attach();
+#if !defined(__APPLE__)
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
     gboolean dynamic_attach_listener_ready = FALSE;
     if (need_dynamic_attach) {
         dynamic_attach_listener_ready = dlopen_interceptor_attach() == 0;
     }
+#endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
     if (heartbeat_time != 0) {
@@ -1030,9 +1057,11 @@ peak_activate_runtime(void)
         }
     }
     peak_general_listener_controller_start();
+#if !defined(__APPLE__)
     if (dynamic_attach_listener_ready) {
         dlopen_interceptor_enable_dynamic_attach();
     }
+#endif
     if (heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
@@ -1198,6 +1227,14 @@ void peak_init()
     hb_ema_a = numeric_config.heartbeat_ema_alpha;
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
+#if defined(__APPLE__)
+    if (peak_memory_profile) {
+        peak_log_warn(
+            "[peak] rejecting PEAK_MEMORY_PROFILE on macOS; only named CPU profiling is supported\n");
+    }
+    peak_memory_profile = false;
+    peak_memory_track_all = false;
+#endif
 
     gboolean has_requested_work = peak_has_requested_work();
     peak_set_process_requests_work(has_requested_work);
@@ -1323,6 +1360,7 @@ peak_fini_impl(void)
         heartbeat_overhead = NULL;
     }
     peak_jit_provider_disable();
+#if !defined(__APPLE__)
     if (
 #ifdef HAVE_MPI
         !mpi_finalize_path &&
@@ -1330,7 +1368,14 @@ peak_fini_impl(void)
         peak_memory_profile) {
         malloc_interceptor_detach();
     }
+#endif
     gboolean dlopen_shutdown_flushed = TRUE;
+#if defined(__APPLE__)
+    /*
+     * Darwin runtime dynamic attach is unsupported, so no loader listener,
+     * dlclose guard, ownership thread, or queue was installed.
+     */
+#else
 #ifdef HAVE_MPI
     if (mpi_finalize_path) {
         /*
@@ -1345,6 +1390,7 @@ peak_fini_impl(void)
     {
         dlopen_shutdown_flushed = dlopen_interceptor_dettach();
     }
+#endif
     if (!dlopen_shutdown_flushed) {
         g_printerr("[peak] Skipping remaining PEAK teardown because dlopen listener teardown was not proven safe\n");
         return;
@@ -1668,10 +1714,12 @@ peak_fini_impl(void)
                 peak_log_info("[peak] Leaving PEAK target hooks pinned after application PMPI_Finalize to avoid post-finalize helper-backed Gum teardown\n");
             }
         }
+#if !defined(__APPLE__)
         syscall_interceptor_dettach();
         if (!pthread_listener_dettach()) {
             g_printerr("[peak] Leaving pthread listener bookkeeping allocated before application PMPI_Finalize\n");
         }
+#endif
         return;
     }
 #else
@@ -1683,6 +1731,11 @@ peak_fini_impl(void)
     #endif
 #endif
     gboolean general_listener_shutdown_flushed = peak_general_listener_dettach();
+#if defined(__APPLE__)
+    (void)general_listener_shutdown_flushed;
+    peak_log_info("[peak] Darwin process-exit teardown leaves Gum support hook state alive\n");
+    return;
+#else
     if (general_listener_shutdown_flushed) {
         dlopen_interceptor_release_retained_dynamic_handles();
     }
@@ -1707,6 +1760,7 @@ peak_fini_impl(void)
     } else {
         g_printerr("[peak] Leaving general listener bookkeeping allocated for in-flight callbacks\n");
     }
+#endif
 }
 
 void peak_fini()
@@ -1825,8 +1879,17 @@ peak_checkpoint_for_exec(const char* path, char* const argv[])
 }
 
 #if defined(__APPLE__)
-__attribute__((used, section("__DATA,__mod_init_func"))) void* __init = peak_init;
-__attribute__((used, section("__DATA,__mod_fini_func"))) void* __fini = peak_fini;
+__attribute__((constructor)) static void
+peak_macos_init(void)
+{
+    peak_init();
+}
+
+__attribute__((destructor)) static void
+peak_macos_fini(void)
+{
+    peak_fini();
+}
 #elif defined(__ELF__)
 typedef int (*main_fn)(int, char**, char**);
 typedef int (*libc_start_main_fn)(main_fn, int, char**,

@@ -14,9 +14,11 @@ void peak_general_listener_init_attach_policy(void);
 /**
  * Returns whether a profiling target satisfies PEAK's Gum attach policy.
  *
- * The policy is initialized once from the process environment. An unsafe
- * override permits every target; otherwise the target must pass both the
- * minimum-prologue and relocation-safety checks.
+ * The policy is initialized once from the process environment. Darwin Arm64
+ * rejects targets that stock Gum would redirect to another entry because its
+ * v1 backend has no exact-entry attach. That attribution check cannot be
+ * overridden. Otherwise, an unsafe override bypasses the minimum-prologue and
+ * relocation-safety checks.
  */
 gboolean peak_general_listener_attach_target_is_supported(
     const char* symbol_name,

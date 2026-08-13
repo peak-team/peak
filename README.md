@@ -15,9 +15,11 @@
 
 # PEAK (Performance Evaluation and Analysis Kit)
 
-PEAK is an `LD_PRELOAD`-based profiler for HPC applications. It profiles
-selected CPU functions, optional CUDA kernels, memory allocation activity, and
-JIT-published code without requiring application recompilation.
+PEAK is a dynamic-library injection profiler for HPC applications. It profiles
+selected CPU functions and, on Linux, optional CUDA kernels, memory allocation
+activity, and JIT-published code without requiring application recompilation.
+Linux uses `LD_PRELOAD`; macOS uses `DYLD_INSERT_LIBRARIES` for named CPU
+profiling, with physical detach and reattach available on Arm64.
 
 PEAK is designed for long-running and MPI applications where profiler overhead,
 safe attach and detach behavior, and reliable final reports matter.
@@ -25,12 +27,16 @@ safe attach and detach behavior, and reliable final reports matter.
 ## Highlights
 
 - Profile named functions instead of instrumenting the whole application.
-- Preload PEAK around existing Linux binaries without rebuilding them.
+- Inject PEAK around existing Linux and macOS applications without rebuilding
+  them.
 - Control profiling overhead by detaching and reattaching selected targets.
 - Produce human-readable and CSV reports, including MPI-aware aggregation.
-- Optionally profile CUDA kernels, memory activity, and JIT-published symbols.
+- On Linux, optionally profile CUDA kernels, memory activity, and JIT-published
+  symbols.
 
 ## Quick Start
+
+### Linux
 
 ```bash
 mkdir -p build
@@ -46,22 +52,54 @@ LD_PRELOAD="$PWD/src/libpeak.so" \
 PEAK writes a report to stderr and a CSV profile log using the default prefix
 `./peak_statslog`.
 
+### macOS
+
+Build the baseline macOS configuration, then inject the installed library into
+an application you built or otherwise control:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+  -DPEAK_ENABLE_MPI=OFF \
+  -DBUILD_CUDA_PROFILE=OFF
+cmake --build build
+cmake --install build
+
+PEAK_TARGET=my_function \
+DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
+./target_application
+```
+
+System Integrity Protection prevents `DYLD_INSERT_LIBRARIES` from affecting
+protected Apple system executables. Use PEAK with an ordinary application you
+built or installed outside the protected system locations.
+
 ## Requirements
 
-- Linux for the primary `LD_PRELOAD` runtime path
+- Linux for the full `LD_PRELOAD` runtime path, or macOS for named CPU function
+  profiling through `DYLD_INSERT_LIBRARIES` (including physical detach and
+  reattach on Arm64)
 - CMake 3.13 or newer
 - C and C++ compilers (a Fortran compiler is needed only for
   `PEAK_ENABLE_FORTRAN_TESTS=ON`)
-- POSIX threads and standard Linux runtime libraries
+- POSIX threads and standard platform runtime libraries
 
 MPI, CUDA, and OTF2 memory-trace export are optional. CUDA profiling requires
 CUDA Toolkit 11.2 or newer. On Linux x86_64 and Arm64, the default `auto`
 provider downloads a pinned Frida Gum devkit and applies the PEAK patch; on
-macOS x86_64 and Arm64, it downloads a pinned stock devkit. Other
+macOS x86_64 and Arm64, it downloads a pinned stock devkit. The pinned macOS
+Arm64 devkit also enables PEAK's small Darwin patch-metadata overlay. Other
 platforms/architectures require a caller-provided Frida Gum provider. For
 controlled or offline builds, set
 `PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
 `FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
+
+macOS Arm64 v1 requires PEAK's default downloaded, hash-pinned Frida Gum
+17.15.3 devkit. A caller-provided Gum is not supported for that path: startup
+target-identity checking depends on its exported Arm64 reader symbol, and
+physical detach depends on the pinned private patch-metadata layout. Provider
+portability is deferred to [#80](https://github.com/peak-team/peak/issues/80).
 
 ## Build and Install
 
@@ -88,7 +126,7 @@ Common CMake options:
 | `PEAK_ENABLE_MPI=OFF` | Build without MPI support. |
 | `BUILD_CUDA_PROFILE=OFF` | Build without CUDA profiling support. |
 | `PEAK_FETCH_DEPS=OFF` | Disable dependency downloads. Provide Frida Gum explicitly for controlled/offline builds. Default: `ON`. |
-| `PEAK_ENABLE_OTF2=ON` | Enable OTF2 memory-trace export. Default: `OFF`; CSV memory profiling remains available. |
+| `PEAK_ENABLE_OTF2=ON` | Enable Linux OTF2 memory-trace export. Default: `OFF`; Linux CSV memory profiling remains available. |
 | `PEAK_USE_SYSTEM_OTF2=ON` | Search for a system OTF2 before fetching it. |
 | `PEAK_ENABLE_FORTRAN_TESTS=ON` | Build the optional Fortran dgemm tests and require a Fortran compiler. |
 | `BUILD_TESTING=ON` | Build the CTest suite. `BUILD_TESTS=ON` is also accepted. |
@@ -98,10 +136,54 @@ Common CMake options:
 After installation:
 
 ```bash
+# Linux
 PEAK_TARGET=my_function \
 LD_PRELOAD="$HOME/.local/lib/libpeak.so" \
 ./target_application
+
+# macOS
+PEAK_TARGET=my_function \
+DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
+./target_application
 ```
+
+The macOS path supports startup attachment and reporting for named CPU
+functions only while the process is still single-threaded. PEAK proves that
+condition before Gum initialization and refuses the entire activation without
+installing hooks if an early constructor or deferred post-MPI activation has
+already made the process multithreaded. Runtime `ATTACH`, `REPLACE`, and
+`REVERT` mutations fail closed as unsupported; PEAK therefore does not install
+its `dlopen` listener, `dlclose` guard, ownership thread, or dynamic-attach
+queue on macOS. The JIT metadata provider is also kept disabled on macOS.
+`PEAK_MEMORY_PROFILE` is also rejected explicitly rather than starting a
+partially supported memory profiler.
+
+On Arm64, PEAK supports zero-overhead physical detach and reattach for
+pthread-based workloads: it gates `pthread_create`, suspends the other
+enumerated Mach threads, changes only the saved entry patch bytes, and resumes
+them after the mutation. A second enumeration covers a pthread creator that
+crossed the gate before it closed; this v1 does not claim to cover threads
+created directly through Mach APIs. If a thread is observed inside the
+overwritten prologue, PEAK resumes every thread and retries through the normal
+controller backoff; it deliberately does not single-step threads for liveness.
+Before startup attach, Apple Arm64 rejects any target entry that stock Gum would
+resolve to another address. Darwin v1 has no exact-entry attach, so profiling
+such a branch or thunk would silently attribute direct calls to the destination
+to the requested symbol; `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` cannot override this
+target-identity check.
+
+Entry-byte mutation is eligible only when the canonical Gum context contains
+exactly the requested PEAK listener and has no replacement; a context shared by
+another Gum client fails closed and remains instrumented.
+At process exit, Darwin stops PEAK-owned controller work and writes the final
+report but leaves installed Gum hooks, listeners, and their reachable state
+alive for the operating system to reclaim; it does not claim an unheld final
+shutdown mutation is safe. The Linux detach helper, raw-syscall exec handling,
+CUDA profiling, memory profiling, runtime dynamic attach, and Linux
+signal-policy interception remain Linux-only. macOS CI builds and installs
+PEAK on Arm64 and runs real `DYLD_INSERT_LIBRARIES` profiling plus startup
+rejection, redirect-attribution rejection, and single- and multithreaded
+physical detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.
 
 On Linux x86_64 and Arm64, the detach helper is built and installed at the
 configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
@@ -316,7 +398,7 @@ child-environment precedence, fork safety, and limitations.
 | `PEAK_STRICT_GATE_WAIT_TIMEOUT_MS` | Thread-creation gate timeout. Default: `10000`; `0` waits indefinitely. |
 | `PEAK_DETACH_TRACE_PATH` | Optional CSV path for detach-controller transition evidence. |
 | `PEAK_UNSAFE_GUM_PROLOGUE_POLICY` | Select the default or conservative fail-closed prologue policy. |
-| `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` | Diagnostic override that permits known or suspected unsafe prologues. |
+| `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` | Diagnostic override that permits known or suspected unsafe prologues; it does not bypass Darwin target-identity rejection. |
 | `PEAK_REQUIRE_SAFE_DETACH` | Deprecated and ignored legacy knob; strict physical transition safety remains enabled. |
 
 See [Physical detach controller](docs/physical-detach-controller.md) and
@@ -350,8 +432,8 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_GPU_TARGET_FILE` | File containing one GPU kernel name per line. |
 | `PEAK_GPU_MONITOR_ALL` | Profile every observed GPU kernel. |
 | `PEAK_CUDA_EVENT_POOL_CAPACITY` | CUDA event-pool capacity. Default: `256` events; accepts `1` through `65536`. |
-| `PEAK_MEMORY_PROFILE` | Enable experimental memory allocation profiling for selected CPU targets. |
-| `PEAK_MEMORY_TRACK_ALL` | Track all allocation events instead of filtering by target backtraces. |
+| `PEAK_MEMORY_PROFILE` | Enable experimental Linux memory allocation profiling for selected CPU targets. Rejected on macOS. |
+| `PEAK_MEMORY_TRACK_ALL` | On Linux, track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |
 | `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed event capacity. A positive decimal value allocates that many slots once; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |

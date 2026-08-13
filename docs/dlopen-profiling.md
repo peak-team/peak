@@ -1,5 +1,10 @@
 # Runtime `dlopen` Profiling
 
+This subsystem is Linux-only. macOS runtime Gum attachment is deliberately
+fail-closed, so the Darwin runtime does not install the `dlopen` listener,
+`dlclose` guard, ownership thread, or dynamic-attach queue. Targets must resolve
+during the proven single-threaded startup attachment on macOS.
+
 ## Purpose and Contract
 
 PEAK can profile configured CPU targets that are not present when the process

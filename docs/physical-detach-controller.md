@@ -49,6 +49,40 @@ from `ucontext_t`, classifies those PCs with the patched Gum API, performs only
 audited PC rewrites and byte writes, and fails closed if any thread does not
 arrive or cannot be released safely.
 
+### Darwin Arm64 lifecycle split
+
+Darwin Arm64 uses a separate Mach STOP backend only for entry-byte physical
+detach and reattach. It does not use the Linux helper, reserved-signal PC
+classifier, runtime Gum mutation protocol, or final Gum shutdown protocol
+described below. Before the first Gum initialization or hook mutation, Darwin
+activation proves that the process is still single-threaded. If peers already
+exist, including after deferred MPI initialization, the entire activation is
+rejected with no Gum hooks installed. Once activation succeeds, `ATTACH`,
+`REPLACE`, `REVERT`, and `SHUTDOWN` fail closed as unsupported rather than
+claiming a strict window while no application threads are held. Because runtime
+dynamic attach is unsupported, Darwin never installs the `dlopen` listener,
+`dlclose` guard, ownership thread, or queue, and JIT provider activation is
+skipped. Memory profiling is rejected as outside the named-CPU-only scope. A
+Darwin process destructor stops PEAK-owned controller work and writes the final
+report, then leaves installed target and support Gum hooks plus their reachable
+PEAK state alive for process exit to reclaim.
+
+Darwin entry-byte mutation additionally requires exclusive ownership of the
+canonical Gum context: its listener array must contain exactly the requested
+PEAK listener, and no replacement function may be installed. Different raw
+targets that stock Gum would canonicalize are rejected before startup attach:
+Darwin v1 lacks exact-entry attach, and following a branch or thunk would merge
+direct destination calls into the requested target's profile. This attribution
+check cannot be bypassed with `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE`. Contexts shared
+with another Gum client still fail closed without restoring entry bytes.
+
+The Darwin creation gate covers `pthread_create`. Two Mach thread enumerations
+cover a pthread creator that crossed the gate before it closed, but individual
+`thread_suspend` calls do not establish the task-wide suspend count needed to
+prevent execution of threads created directly through Mach APIs. The v1 safety
+scope is therefore pthread-based workloads; arbitrary Mach thread creation is
+not claimed by this backend.
+
 ## Original Failure Mode
 
 The pre-controller implementation let callbacks, heartbeat, `dlopen`, and
@@ -919,6 +953,9 @@ The top-level `dlopen` listener and dynamic `dlopen` user targets remain governe
 by the default or `conservative` user-target policy.
 
 `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1` is a diagnostic override, not a safety mode.
+On Darwin Arm64 it does not bypass rejection of an entry that stock Gum would
+redirect to another address, because that guard preserves target attribution
+rather than prologue relocation safety.
 
 ## Testing Strategy
 

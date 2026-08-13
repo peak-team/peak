@@ -8,6 +8,10 @@
 #include <strings.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #define PEAK_JIT_ENABLE_ENV "PEAK_JIT_ENABLE"
 #define PEAK_PROFILE_INTERPRETERS_ENV "PEAK_PROFILE_INTERPRETERS"
 #define PEAK_TARGET_ENV "PEAK_TARGET"
@@ -26,6 +30,15 @@ void get_argv0(char** argv0)
 {
     char* buffer = (char*)malloc(sizeof(char) * (1024));
     strcpy(buffer, "null\0");
+#if defined(__APPLE__)
+    uint32_t size = 1024;
+    if (_NSGetExecutablePath(buffer, &size) == 0) {
+        *argv0 = buffer;
+        return;
+    }
+    strcpy(buffer, "null\0");
+    *argv0 = buffer;
+#else
     FILE* fp = fopen("/proc/self/cmdline", "r");
     if (!fp) {
         perror("fopen");
@@ -48,6 +61,7 @@ void get_argv0(char** argv0)
     (void)fclose(fp);
     *argv0 = buffer;
     errno = fread_errno;
+#endif
 }
 
 // Hardcoded list of command basenames, null-terminated.
@@ -436,12 +450,19 @@ static int
 peak_process_profile_from_proc_exe(void)
 {
     char exe[4096];
+#if defined(__APPLE__)
+    uint32_t size = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size) != 0) {
+        return PEAK_PROFILE_DECISION_UNKNOWN;
+    }
+#else
     ssize_t nread = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (nread <= 0) {
         return PEAK_PROFILE_DECISION_UNKNOWN;
     }
 
     exe[nread] = '\0';
+#endif
     char* argv[] = {
         exe,
         NULL

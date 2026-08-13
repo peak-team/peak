@@ -64,3 +64,150 @@ jobs:
       # Execute tests defined by the CMake configuration. Note that --build-config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
       run: ctest --build-config ${{ matrix.build_type }} -LE "(benchmark|stress)" -V
+
+  macos:
+    runs-on: macos-14
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: >
+        cmake -S ${{ github.workspace }}
+        -B ${{ github.workspace }}/build
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed
+        -DPEAK_ENABLE_MPI=OFF
+        -DBUILD_CUDA_PROFILE=OFF
+        -DPEAK_ENABLE_OTF2=OFF
+        -DBUILD_TESTING=OFF
+
+    - name: Build
+      run: cmake --build ${{ github.workspace }}/build --parallel
+
+    - name: Install
+      run: cmake --install ${{ github.workspace }}/build
+
+    - name: Test DYLD injection
+      run: |
+        cc -dynamiclib test/macos/smoke_target.c \
+          test/macos/smoke_branch_target.S \
+          -o build/libpeak_macos_smoke_target.dylib
+        cc test/macos/smoke_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-smoke
+        PEAK_TARGET=peak_macos_smoke_target \
+        PEAK_HEARTBEAT_INTERVAL=0 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-smoke \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-smoke 2>&1 | tee build/macos-smoke.log
+        grep -E 'peak_macos_smoke_target[*]*[[:space:]]*\|[[:space:]]+7[[:space:]]*\|' \
+          build/macos-smoke.log
+
+    - name: Test fail-closed Darwin feature scope
+      run: |
+        cc -pthread test/macos/threaded_bootstrap_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-threaded-bootstrap
+        PEAK_TARGET=peak_macos_smoke_target \
+        PEAK_HEARTBEAT_INTERVAL=0 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-threaded-bootstrap \
+          build/peak-macos-threaded-bootstrap \
+          ${{ github.workspace }}/installed/lib/libpeak.dylib 2>&1 | \
+          tee build/macos-threaded-bootstrap.log
+        grep -F 'refusing macOS runtime activation because the process is already multithreaded' \
+          build/macos-threaded-bootstrap.log
+        PEAK_MEMORY_PROFILE=1 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-memory \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-smoke 2>&1 | tee build/macos-memory.log
+        grep -F 'rejecting PEAK_MEMORY_PROFILE on macOS' \
+          build/macos-memory.log
+
+    - name: Test physical detach and reattach
+      run: |
+        cc test/macos/detach_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-detach
+        PEAK_TARGET=peak_macos_smoke_target \
+        PEAK_DETACH_COUNT=10 \
+        PEAK_ENABLE_PER_TARGET_HEARTBEAT=1 \
+        PEAK_ENABLE_GLOBAL_HEARTBEAT=1 \
+        PEAK_ENABLE_REATTACH=1 \
+        PEAK_COST=0.0000001 \
+        PEAK_OVERHEAD_RATIO=1 \
+        PEAK_GLOBAL_OVERHEAD_RATIO=1 \
+        PEAK_GLOBAL_REATTACH_FACTOR=1 \
+        PEAK_HEARTBEAT_INTERVAL=0.001 \
+        PEAK_HIBERNATION_CYCLE=1 \
+        PEAK_REATTACH_COOLDOWN_MS=0 \
+        PEAK_DETACH_TRACE_PATH=${{ github.workspace }}/build/macos-detach.csv \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-detach \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-detach 2>&1 | tee build/macos-detach.log
+        grep -E ',detach,success,1,safe,' build/macos-detach.csv
+        grep -E ',reattach,success,1,safe,' build/macos-detach.csv
+
+    - name: Test canonicalizing Arm64 target fails closed
+      run: |
+        cc test/macos/branch_attribution_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-branch-attribution
+        PEAK_TARGET=peak_macos_branch_target \
+        PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1 \
+        PEAK_HEARTBEAT_INTERVAL=0 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-branch-attribution \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-branch-attribution 2>&1 | \
+          tee build/macos-branch-attribution.log
+        grep -F 'macos_branch_calls=7 direct_calls=11 result=477' \
+          build/macos-branch-attribution.log
+        grep -F 'skipping Gum attach for hook peak_macos_branch_target: target entry redirects to another address and Darwin exact-entry attach is unavailable; target will remain unprofiled' \
+          build/macos-branch-attribution.log
+        grep -F 'Instrumented targets: 0' build/macos-branch-attribution.log
+        grep -F 'Recorded calls: 0' build/macos-branch-attribution.log
+        ! grep -E 'peak_macos_branch_target[*]*[[:space:]]*\|' \
+          build/macos-branch-attribution.log
+
+    - name: Test concurrent physical lifecycle
+      timeout-minutes: 2
+      run: |
+        cc -pthread test/macos/detach_concurrent_main.c \
+          -Lbuild -lpeak_macos_smoke_target \
+          -Wl,-rpath,@executable_path \
+          -o build/peak-macos-detach-concurrent
+        PEAK_TARGET=peak_macos_smoke_target \
+        PEAK_DETACH_COUNT=10 \
+        PEAK_ENABLE_PER_TARGET_HEARTBEAT=1 \
+        PEAK_ENABLE_GLOBAL_HEARTBEAT=1 \
+        PEAK_ENABLE_REATTACH=1 \
+        PEAK_COST=0.0000001 \
+        PEAK_OVERHEAD_RATIO=1 \
+        PEAK_GLOBAL_OVERHEAD_RATIO=1 \
+        PEAK_GLOBAL_REATTACH_FACTOR=1 \
+        PEAK_HEARTBEAT_INTERVAL=0.001 \
+        PEAK_HIBERNATION_CYCLE=1 \
+        PEAK_REATTACH_COOLDOWN_MS=0 \
+        PEAK_MAX_NUM_THREADS=32 \
+        PEAK_VERBOSITY=info \
+        PEAK_DETACH_TRACE_PATH=${{ github.workspace }}/build/macos-detach-concurrent.csv \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-detach-concurrent \
+        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
+          build/peak-macos-detach-concurrent 2>&1 | \
+          tee build/macos-detach-concurrent.log
+        grep -E ',detach,success,1,safe,' \
+          build/macos-detach-concurrent.csv
+        grep -E ',reattach,success,1,safe,' \
+          build/macos-detach-concurrent.csv
+        grep -F 'Darwin process-exit teardown leaves Gum target listener state alive' \
+          build/macos-detach-concurrent.log
+        ! grep -F 'Accounting diagnostics:' \
+          build/macos-detach-concurrent.log
+        ! grep -F '"PEAK_ACCOUNTING_DIAGNOSTICS"' \
+          build/macos-detach-concurrent-*.csv
+        grep -E '^"peak_macos_smoke_target",.*,0,0$' \
+          build/macos-detach-concurrent-*.csv
