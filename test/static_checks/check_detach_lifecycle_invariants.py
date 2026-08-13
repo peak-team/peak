@@ -263,6 +263,12 @@ def check_darwin_strict_lifecycle(repo_root):
             "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" not in
             workflow and
             "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1" in workflow and
+            re.search(
+                r"PEAK_TARGET=peak_macos_branch_target[\s\\]+"
+                r"PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1[\s\\]+"
+                r"PEAK_VERBOSITY=info",
+                workflow,
+            ) is not None and
             "Instrumented targets: 0" in workflow and
             "Recorded calls: 0" in workflow and
             "peak_macos_branch_target" in branch_attribution_test and
