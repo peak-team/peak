@@ -26,6 +26,12 @@ and provide `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` from the site
 devkit, or select `PEAK_FRIDA_GUM_PROVIDER=patched-devkit` with a
 caller-provided patched-devkit root.
 
+macOS Arm64 v1 is an exception: it requires PEAK's default downloaded,
+hash-pinned Frida Gum 17.15.3 devkit. Its startup target-identity check directly
+uses the exported Arm64 redirect reader, and its physical-detach bridge mirrors
+the pinned private context layout. Caller-provided Gum compatibility for this
+path is deferred to issue #80 instead of being assumed from headers alone.
+
 On Linux x86_64 and Linux Arm64 this produces
 `frida-gum-peak-patched/libfrida-gum.a` in the build tree and validates that the
 linked headers and archive expose the architecture-specific PEAK ABI.

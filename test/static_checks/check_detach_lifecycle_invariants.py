@@ -245,32 +245,40 @@ def check_darwin_strict_lifecycle(repo_root):
     attach_supported = extract_function(
         attach_policy, "peak_general_listener_attach_target_is_supported"
     )
+    strip_pointer = attach_supported.find(
+        "stripped_address = gum_strip_code_pointer(address)"
+    )
     redirect_check = attach_supported.find(
-        "gum_arm64_reader_try_get_relative_jump_target(address)"
+        "gum_arm64_reader_try_get_relative_jump_target(stripped_address)"
     )
     unsafe_override = attach_supported.find(
         "if (peak_allow_unsafe_gum_prologue)"
     )
-    require(0 <= redirect_check < unsafe_override and
+    require(0 <= strip_pointer < redirect_check < unsafe_override and
             "defined(__APPLE__)" in attach_supported[:redirect_check] and
             "defined(__arm64__)" in attach_supported[:redirect_check] and
+            "peak_log_warn(" in
+            attach_supported[redirect_check:unsafe_override] and
+            "gum_arm64_reader_try_get_relative_jump_target(address)" not in
+            attach_supported and
             "Darwin exact-entry attach is unavailable" in attach_supported,
-            "Darwin Arm64 must reject Gum-canonicalizing targets before the "
-            "unsafe-prologue override")
-    require("Test canonicalizing Arm64 target fails closed" in workflow and
-            "branch_attribution_main.c" in workflow and
-            "PEAK_TARGET=peak_macos_branch_target" in workflow and
+            "Darwin Arm64 must strip code pointers and warn when rejecting "
+            "Gum-canonicalizing targets before the unsafe-prologue override")
+    branch_step_start = workflow.find(
+        "- name: Test canonicalizing Arm64 target fails closed"
+    )
+    branch_step_end = workflow.find("\n    - name:", branch_step_start + 1)
+    require(branch_step_start >= 0 and branch_step_end > branch_step_start,
+            "missing bounded canonicalizing Arm64 target CI step")
+    branch_step = workflow[branch_step_start:branch_step_end]
+    require("branch_attribution_main.c" in branch_step and
+            "PEAK_TARGET=peak_macos_branch_target" in branch_step and
             "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" not in
             workflow and
-            "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1" in workflow and
-            re.search(
-                r"PEAK_TARGET=peak_macos_branch_target[\s\\]+"
-                r"PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1[\s\\]+"
-                r"PEAK_VERBOSITY=info",
-                workflow,
-            ) is not None and
-            "Instrumented targets: 0" in workflow and
-            "Recorded calls: 0" in workflow and
+            "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1" in branch_step and
+            "PEAK_VERBOSITY" not in branch_step and
+            "Instrumented targets: 0" in branch_step and
+            "Recorded calls: 0" in branch_step and
             "peak_macos_branch_target" in branch_attribution_test and
             "peak_macos_smoke_target" in branch_attribution_test and
             "b _peak_macos_smoke_target" in branch_target,
@@ -284,6 +292,8 @@ def check_darwin_strict_lifecycle(repo_root):
             "does not install" in readme and
             "JIT metadata provider is also kept disabled" in readme and
             "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
+            "macOS Arm64 v1 requires PEAK's default downloaded, hash-pinned "
+            "Frida Gum" in readme and
             "Darwin v1 has no exact-entry attach" in readme and
             "cannot override this" in readme and
             "exactly the requested PEAK listener" in readme and
@@ -2151,11 +2161,13 @@ def check_stop_window_accounting_sidecar(repo_root):
             "Gum attach support predicate must use cached attach policy")
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
-    require(general_attach_supported.count("peak_log_info(") == 3 and
+    require(general_attach_supported.count("peak_log_info(") == 2 and
+            general_attach_supported.count("peak_log_warn(") == 1 and
             "g_printerr(" not in general_attach_supported and
-            "peak_log_warn(" not in general_attach_supported,
-            "expected target safety-policy skips must remain INFO diagnostics "
-            "instead of producing one WARN per MPI rank")
+            "target entry redirects to another address" in
+            general_attach_supported,
+            "relocation-policy skips must remain INFO while target-attribution "
+            "rejection is a default-visible WARN")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and

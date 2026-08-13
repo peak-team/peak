@@ -159,7 +159,6 @@ jobs:
           -o build/peak-macos-branch-attribution
         PEAK_TARGET=peak_macos_branch_target \
         PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1 \
-        PEAK_VERBOSITY=info \
         PEAK_HEARTBEAT_INTERVAL=0 \
         PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-branch-attribution \
         DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \

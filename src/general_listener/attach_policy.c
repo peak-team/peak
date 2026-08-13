@@ -68,9 +68,12 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
 
 #if defined(__APPLE__) && \
     (defined(__arm64__) || defined(__aarch64__))
-    if (address != NULL &&
-        gum_arm64_reader_try_get_relative_jump_target(address) != NULL) {
-        peak_log_info("[peak] skipping Gum attach for hook %s: target entry redirects to another address and Darwin exact-entry attach is unavailable; target will remain unprofiled\n",
+    gpointer stripped_address = gum_strip_code_pointer(address);
+
+    if (stripped_address != NULL &&
+        gum_arm64_reader_try_get_relative_jump_target(stripped_address) !=
+            NULL) {
+        peak_log_warn("[peak] skipping Gum attach for hook %s: target entry redirects to another address and Darwin exact-entry attach is unavailable; target will remain unprofiled\n",
                       symbol_name != NULL ? symbol_name : "<unknown>");
         return FALSE;
     }

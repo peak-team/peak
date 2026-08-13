@@ -95,6 +95,12 @@ controlled or offline builds, set
 `PEAK_FETCH_DEPS=OFF` and provide Frida Gum through `FRIDA_GUM_LIBRARIES` and
 `FRIDA_GUM_INCLUDE_DIRS`, or select a caller-provided `patched-devkit`.
 
+macOS Arm64 v1 requires PEAK's default downloaded, hash-pinned Frida Gum
+17.15.3 devkit. A caller-provided Gum is not supported for that path: startup
+target-identity checking depends on its exported Arm64 reader symbol, and
+physical detach depends on the pinned private patch-metadata layout. Provider
+portability is deferred to [#80](https://github.com/peak-team/peak/issues/80).
+
 ## Build and Install
 
 On Linux x86_64 and Arm64, the default build downloads the pinned Frida Gum
