@@ -70,8 +70,11 @@ PEAK state alive for process exit to reclaim.
 Darwin entry-byte mutation additionally requires exclusive ownership of the
 canonical Gum context: its listener array must contain exactly the requested
 PEAK listener, and no replacement function may be installed. Different raw
-targets that Frida canonicalizes to one context, or contexts shared with another
-Gum client, therefore fail closed without restoring entry bytes.
+targets that stock Gum would canonicalize are rejected before startup attach:
+Darwin v1 lacks exact-entry attach, and following a branch or thunk would merge
+direct destination calls into the requested target's profile. This attribution
+check cannot be bypassed with `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE`. Contexts shared
+with another Gum client still fail closed without restoring entry bytes.
 
 The Darwin creation gate covers `pthread_create`. Two Mach thread enumerations
 cover a pthread creator that crossed the gate before it closed, but individual
@@ -950,6 +953,9 @@ The top-level `dlopen` listener and dynamic `dlopen` user targets remain governe
 by the default or `conservative` user-target policy.
 
 `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1` is a diagnostic override, not a safety mode.
+On Darwin Arm64 it does not bypass rejection of an entry that stock Gum would
+redirect to another address, because that guard preserves target attribution
+rather than prologue relocation safety.
 
 ## Testing Strategy
 

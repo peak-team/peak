@@ -52,6 +52,9 @@ def check_darwin_strict_lifecycle(repo_root):
     controller = read_source(repo_root, "src/detach_controller_darwin.c")
     gum_bridge = read_source(repo_root, "src/gum_peak_darwin_patch_api.c")
     general = read_source(repo_root, "src/general_listener.c")
+    attach_policy = read_source(
+        repo_root, "src/general_listener/attach_policy.c"
+    )
     peak = read_source(repo_root, "src/peak.c")
     readme = read_source(repo_root, "README.md")
     controller_doc = read_source(
@@ -66,6 +69,9 @@ def check_darwin_strict_lifecycle(repo_root):
     )
     branch_target = read_source(
         repo_root, "test/macos/smoke_branch_target.S"
+    )
+    branch_attribution_test = read_source(
+        repo_root, "test/macos/branch_attribution_main.c"
     )
 
     activation = extract_function(peak, "peak_activate_runtime")
@@ -236,19 +242,35 @@ def check_darwin_strict_lifecycle(repo_root):
             "pthread_create" in threaded_bootstrap_test and
             "dlopen(argv[1]" in threaded_bootstrap_test,
             "macOS CI must exercise fail-closed activation after peers exist")
-    require("smoke_branch_target.S" in workflow and
-            "peak_macos_branch_target" in workflow and
-            "b _peak_macos_smoke_target" in branch_target,
-            "macOS CI must exercise reattach through a Gum-followed Arm64 branch")
-    require("Test shared canonical context fails closed" in workflow and
-            "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" in
+    attach_supported = extract_function(
+        attach_policy, "peak_general_listener_attach_target_is_supported"
+    )
+    redirect_check = attach_supported.find(
+        "gum_arm64_reader_try_get_relative_jump_target(address)"
+    )
+    unsafe_override = attach_supported.find(
+        "if (peak_allow_unsafe_gum_prologue)"
+    )
+    require(0 <= redirect_check < unsafe_override and
+            "defined(__APPLE__)" in attach_supported[:redirect_check] and
+            "defined(__arm64__)" in attach_supported[:redirect_check] and
+            "Darwin exact-entry attach is unavailable" in attach_supported,
+            "Darwin Arm64 must reject Gum-canonicalizing targets before the "
+            "unsafe-prologue override")
+    require("Test canonicalizing Arm64 target fails closed" in workflow and
+            "branch_attribution_main.c" in workflow and
+            "PEAK_TARGET=peak_macos_branch_target" in workflow and
+            "PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target" not in
             workflow and
-            "macos-detach-shared.csv" in workflow and
-            "gum-patch-missing" in workflow and
-            "! grep -E ',(peak_macos_branch_target|peak_macos_smoke_target),detach,success,1,safe,'" in
-            workflow,
-            "macOS CI must prove shared canonical Gum contexts cannot be "
-            "physically detached")
+            "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1" in workflow and
+            "Instrumented targets: 0" in workflow and
+            "Recorded calls: 0" in workflow and
+            "peak_macos_branch_target" in branch_attribution_test and
+            "peak_macos_smoke_target" in branch_attribution_test and
+            "b _peak_macos_smoke_target" in branch_target,
+            "macOS CI must prove canonicalizing Arm64 targets fail closed "
+            "instead of merging direct destination calls into the requested "
+            "target")
     require("rejecting PEAK_MEMORY_PROFILE on macOS" in workflow,
             "macOS CI must exercise explicit memory-profile rejection")
     require("Runtime `ATTACH`, `REPLACE`, and" in readme and
@@ -256,6 +278,8 @@ def check_darwin_strict_lifecycle(repo_root):
             "does not install" in readme and
             "JIT metadata provider is also kept disabled" in readme and
             "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
+            "Darwin v1 has no exact-entry attach" in readme and
+            "cannot override this" in readme and
             "exactly the requested PEAK listener" in readme and
             "does not claim to cover threads" in readme and
             "created directly through Mach APIs" in readme and
@@ -2121,7 +2145,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "Gum attach support predicate must use cached attach policy")
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
-    require(general_attach_supported.count("peak_log_info(") == 2 and
+    require(general_attach_supported.count("peak_log_info(") == 3 and
             "g_printerr(" not in general_attach_supported and
             "peak_log_warn(" not in general_attach_supported,
             "expected target safety-policy skips must remain INFO diagnostics "

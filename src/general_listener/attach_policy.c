@@ -10,6 +10,13 @@
 #include <pthread.h>
 #endif
 
+#if defined(__APPLE__) && \
+    (defined(__arm64__) || defined(__aarch64__))
+/* The pinned devkit exports this public API but omits its reader header. */
+GUM_API gpointer gum_arm64_reader_try_get_relative_jump_target(
+    gconstpointer address);
+#endif
+
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -58,6 +65,16 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     const char* reason = NULL;
 
     peak_general_listener_init_attach_policy();
+
+#if defined(__APPLE__) && \
+    (defined(__arm64__) || defined(__aarch64__))
+    if (address != NULL &&
+        gum_arm64_reader_try_get_relative_jump_target(address) != NULL) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: target entry redirects to another address and Darwin exact-entry attach is unavailable; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+#endif
 
     if (peak_allow_unsafe_gum_prologue) {
         return TRUE;

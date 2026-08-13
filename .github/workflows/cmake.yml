@@ -151,57 +151,27 @@ jobs:
         grep -E ',detach,success,1,safe,' build/macos-detach.csv
         grep -E ',reattach,success,1,safe,' build/macos-detach.csv
 
-    - name: Test canonical Arm64 branch reattach
+    - name: Test canonicalizing Arm64 target fails closed
       run: |
-        cc -DPEAK_MACOS_TARGET=peak_macos_branch_target \
-          test/macos/detach_main.c \
+        cc test/macos/branch_attribution_main.c \
           -Lbuild -lpeak_macos_smoke_target \
           -Wl,-rpath,@executable_path \
-          -o build/peak-macos-detach-branch
+          -o build/peak-macos-branch-attribution
         PEAK_TARGET=peak_macos_branch_target \
-        PEAK_DETACH_COUNT=10 \
-        PEAK_ENABLE_PER_TARGET_HEARTBEAT=1 \
-        PEAK_ENABLE_GLOBAL_HEARTBEAT=1 \
-        PEAK_ENABLE_REATTACH=1 \
-        PEAK_COST=0.0000001 \
-        PEAK_OVERHEAD_RATIO=1 \
-        PEAK_GLOBAL_OVERHEAD_RATIO=1 \
-        PEAK_GLOBAL_REATTACH_FACTOR=1 \
-        PEAK_HEARTBEAT_INTERVAL=0.001 \
-        PEAK_HIBERNATION_CYCLE=1 \
-        PEAK_REATTACH_COOLDOWN_MS=0 \
-        PEAK_DETACH_TRACE_PATH=${{ github.workspace }}/build/macos-detach-branch.csv \
-        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-detach-branch \
+        PEAK_ALLOW_UNSAFE_GUM_PROLOGUE=1 \
+        PEAK_HEARTBEAT_INTERVAL=0 \
+        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-branch-attribution \
         DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
-          build/peak-macos-detach-branch 2>&1 | \
-          tee build/macos-detach-branch.log
-        grep -E ',detach,success,1,safe,' build/macos-detach-branch.csv
-        grep -E ',reattach,success,1,safe,' build/macos-detach-branch.csv
-
-    - name: Test shared canonical context fails closed
-      run: |
-        PEAK_TARGET=peak_macos_branch_target,peak_macos_smoke_target \
-        PEAK_DETACH_COUNT=10 \
-        PEAK_ENABLE_PER_TARGET_HEARTBEAT=1 \
-        PEAK_ENABLE_GLOBAL_HEARTBEAT=1 \
-        PEAK_ENABLE_REATTACH=1 \
-        PEAK_COST=0.0000001 \
-        PEAK_OVERHEAD_RATIO=1 \
-        PEAK_GLOBAL_OVERHEAD_RATIO=1 \
-        PEAK_GLOBAL_REATTACH_FACTOR=1 \
-        PEAK_HEARTBEAT_INTERVAL=0.001 \
-        PEAK_HIBERNATION_CYCLE=1 \
-        PEAK_REATTACH_COOLDOWN_MS=0 \
-        PEAK_CONTROLLER_MAX_RETRY_COUNT=1 \
-        PEAK_DETACH_TRACE_PATH=${{ github.workspace }}/build/macos-detach-shared.csv \
-        PEAK_STATSLOG_PATH=${{ github.workspace }}/build/macos-detach-shared \
-        DYLD_INSERT_LIBRARIES=${{ github.workspace }}/installed/lib/libpeak.dylib \
-          build/peak-macos-detach-branch 2>&1 | \
-          tee build/macos-detach-shared.log
-        grep -E ',peak_macos_branch_target,detach,prepare-failed,0,classify-failed,.*gum-patch-missing,' \
-          build/macos-detach-shared.csv
-        ! grep -E ',(peak_macos_branch_target|peak_macos_smoke_target),detach,success,1,safe,' \
-          build/macos-detach-shared.csv
+          build/peak-macos-branch-attribution 2>&1 | \
+          tee build/macos-branch-attribution.log
+        grep -F 'macos_branch_calls=7 direct_calls=11 result=477' \
+          build/macos-branch-attribution.log
+        grep -F 'skipping Gum attach for hook peak_macos_branch_target: target entry redirects to another address and Darwin exact-entry attach is unavailable; target will remain unprofiled' \
+          build/macos-branch-attribution.log
+        grep -F 'Instrumented targets: 0' build/macos-branch-attribution.log
+        grep -F 'Recorded calls: 0' build/macos-branch-attribution.log
+        ! grep -E 'peak_macos_branch_target[*]*[[:space:]]*\|' \
+          build/macos-branch-attribution.log
 
     - name: Test concurrent physical lifecycle
       timeout-minutes: 2

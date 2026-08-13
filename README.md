@@ -160,9 +160,15 @@ crossed the gate before it closed; this v1 does not claim to cover threads
 created directly through Mach APIs. If a thread is observed inside the
 overwritten prologue, PEAK resumes every thread and retries through the normal
 controller backoff; it deliberately does not single-step threads for liveness.
+Before startup attach, Apple Arm64 rejects any target entry that stock Gum would
+resolve to another address. Darwin v1 has no exact-entry attach, so profiling
+such a branch or thunk would silently attribute direct calls to the destination
+to the requested symbol; `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` cannot override this
+target-identity check.
+
 Entry-byte mutation is eligible only when the canonical Gum context contains
 exactly the requested PEAK listener and has no replacement; a context shared by
-canonical aliases or another Gum client fails closed and remains instrumented.
+another Gum client fails closed and remains instrumented.
 At process exit, Darwin stops PEAK-owned controller work and writes the final
 report but leaves installed Gum hooks, listeners, and their reachable state
 alive for the operating system to reclaim; it does not claim an unheld final
@@ -170,8 +176,8 @@ shutdown mutation is safe. The Linux detach helper, raw-syscall exec handling,
 CUDA profiling, memory profiling, runtime dynamic attach, and Linux
 signal-policy interception remain Linux-only. macOS CI builds and installs
 PEAK on Arm64 and runs real `DYLD_INSERT_LIBRARIES` profiling plus startup
-rejection, canonical branch-target, and single- and multithreaded physical
-detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.
+rejection, redirect-attribution rejection, and single- and multithreaded
+physical detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.
 
 On Linux x86_64 and Arm64, the detach helper is built and installed at the
 configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
@@ -386,7 +392,7 @@ child-environment precedence, fork safety, and limitations.
 | `PEAK_STRICT_GATE_WAIT_TIMEOUT_MS` | Thread-creation gate timeout. Default: `10000`; `0` waits indefinitely. |
 | `PEAK_DETACH_TRACE_PATH` | Optional CSV path for detach-controller transition evidence. |
 | `PEAK_UNSAFE_GUM_PROLOGUE_POLICY` | Select the default or conservative fail-closed prologue policy. |
-| `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` | Diagnostic override that permits known or suspected unsafe prologues. |
+| `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` | Diagnostic override that permits known or suspected unsafe prologues; it does not bypass Darwin target-identity rejection. |
 | `PEAK_REQUIRE_SAFE_DETACH` | Deprecated and ignored legacy knob; strict physical transition safety remains enabled. |
 
 See [Physical detach controller](docs/physical-detach-controller.md) and
