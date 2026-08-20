@@ -159,6 +159,20 @@ typedef struct {
     int mapping_live;
 } PeakMemLogTestSnapshot;
 
+typedef struct {
+    void* (*malloc_fn)(size_t size);
+    void (*free_fn)(void* ptr);
+    void* (*realloc_fn)(void* ptr, size_t size);
+} PeakMallocTestAllocator;
+
+typedef struct {
+    size_t entry_count;
+    size_t table_bytes;
+    size_t current_bytes;
+    int pointer_tracked;
+    size_t pointer_size;
+} PeakMallocTestTrackingSnapshot;
+
 PEAK_MALLOC_TEST_API void
 peak_memlog_test_set_failure(PeakMemLogTestFailure failure);
 
@@ -191,6 +205,28 @@ peak_malloc_test_failed_realloc_preserves_accounting(void);
 
 PEAK_MALLOC_TEST_API int
 peak_malloc_test_tracking_allocation_failure(void);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_begin(const PeakMallocTestAllocator* allocator);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_seed(void* ptr, size_t size);
+
+PEAK_MALLOC_TEST_API void*
+peak_malloc_test_malloc(size_t size);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_free(void* ptr);
+
+PEAK_MALLOC_TEST_API void*
+peak_malloc_test_realloc(void* ptr, size_t size);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_tracking_snapshot(void* ptr,
+                                   PeakMallocTestTrackingSnapshot* out);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_end(void);
 #endif
 
 /** @} */

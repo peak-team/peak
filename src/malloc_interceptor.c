@@ -59,6 +59,7 @@ static PeakMemLog          g_memlog = {
 static __thread int        in_peak_alloc_hook = 0;
 static __thread int        in_backtrace = 0;
 static PeakEnvWarningState peak_memlog_capacity_warning_emitted;
+static _Atomic int         peak_memory_tracking_warning_emitted = 0;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic PeakMemLogTestFailure g_memlog_test_failure = PEAK_MEMLOG_TEST_FAIL_NONE;
@@ -66,6 +67,11 @@ static _Atomic int g_memlog_test_pause_before_commit = 0;
 static _Atomic int g_memlog_test_writer_paused = 0;
 static _Atomic size_t g_memlog_test_capacity_override = 0;
 static _Atomic size_t g_memlog_test_exported = 0;
+static void* (*g_malloc_test_saved_malloc)(size_t size);
+static void (*g_malloc_test_saved_free)(void* ptr);
+static void* (*g_malloc_test_saved_realloc)(void* ptr, size_t size);
+static gboolean g_malloc_test_saved_track_all;
+static int g_malloc_test_active;
 
 static void* peak_memlog_test_realloc_failure(void* ptr, size_t size) {
     (void) ptr;
@@ -680,12 +686,25 @@ static void peak_memlog_finalize(void) {
   Tracking table helpers
 =========================*/
 
+static void
+note_memory_tracking_degraded(const char* reason)
+{
+    if (atomic_exchange_explicit(&peak_memory_tracking_warning_emitted, 1,
+                                 memory_order_relaxed) == 0) {
+        peak_log_message_always(
+            "[peak] memory allocation tracking degraded (%s)\n", reason);
+    }
+}
+
 static void add_tracking_entry(void* ptr, size_t size, int log) {
     if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return;
     if (!log) return;
 
     AllocationEntry* entry = internal_malloc(sizeof(AllocationEntry));
-    if (!entry) return;
+    if (!entry) {
+        note_memory_tracking_degraded("tracking entry allocation failed");
+        return;
+    }
 
     entry->ptr      = ptr;
     entry->size     = size;
@@ -694,7 +713,7 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
     if (size > G_MAXULONG - current_memory) {
         pthread_mutex_unlock(&track_mutex);
         internal_free(entry);
-        peak_log_warn("[peak] memory profiler accounting overflow; allocation not tracked\n");
+        note_memory_tracking_degraded("allocation accounting overflow");
         return;
     }
     gum_metal_hash_table_insert(track_table, ptr, entry);
@@ -709,79 +728,86 @@ static void add_tracking_entry(void* ptr, size_t size, int log) {
     }
 }
 
-static AllocationEntry* find_tracking_entry(void* ptr) {
-    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return NULL;
-
-    pthread_mutex_lock(&track_mutex);
-    AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
-    if (entry && entry->ptr == ptr) {
-        pthread_mutex_unlock(&track_mutex);
-        return entry;
-    }
-    pthread_mutex_unlock(&track_mutex);
-    return NULL;
-}
-
-static void remove_tracking_entry(void* ptr) {
-    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) return;
-
-    pthread_mutex_lock(&track_mutex);
-    AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
-    if (entry) {
-        gum_metal_hash_table_remove(track_table, ptr);
-        current_memory -= entry->size;
-    }
-
-    if (entry) {
-        int64_t delta;
-        if (size_to_event_delta(entry->size, &delta)) {
-            peak_log_event(nsec_now(), -delta, (uint64_t) current_memory, 2);
-        }
-        internal_free(entry);
-    }
-    pthread_mutex_unlock(&track_mutex);
-}
-
-static int update_tracking_entry_after_realloc(void* old_ptr,
-                                               void* new_ptr,
-                                               size_t new_size,
-                                               size_t* old_size_out,
-                                               gulong* current_after_remove_out,
-                                               gulong* current_after_add_out) {
+static AllocationEntry*
+detach_tracking_entry(void* ptr, gulong* current_after_remove_out)
+{
     AllocationEntry* entry;
 
-    if (!track_table || atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
-        return 0;
+    if (!track_table ||
+        atomic_load_explicit(&cleanup_in_progress, memory_order_acquire)) {
+        return NULL;
     }
 
+    /*
+     * Removing the entry and its bytes under one lock is the lifetime
+     * transition.  It must precede the allocator call, which may immediately
+     * make the same address visible to another allocation.
+     */
     pthread_mutex_lock(&track_mutex);
-    entry = gum_metal_hash_table_lookup(track_table, old_ptr);
-    if (!entry || entry->ptr != old_ptr) {
+    entry = gum_metal_hash_table_lookup(track_table, ptr);
+    if (!entry || entry->ptr != ptr) {
         pthread_mutex_unlock(&track_mutex);
-        return 0;
+        return NULL;
     }
-
-    *old_size_out = entry->size;
+    gum_metal_hash_table_remove(track_table, ptr);
     current_memory -= entry->size;
     *current_after_remove_out = current_memory;
+    pthread_mutex_unlock(&track_mutex);
+    return entry;
+}
+
+static void
+restore_tracking_entry(AllocationEntry* entry)
+{
+    int overflowed = 0;
+
+    pthread_mutex_lock(&track_mutex);
+    gum_metal_hash_table_insert(track_table, entry->ptr, entry);
+    if (entry->size > G_MAXULONG - current_memory) {
+        current_memory = G_MAXULONG;
+        overflowed = 1;
+    } else {
+        current_memory += entry->size;
+    }
+    max_memory = current_memory > max_memory ? current_memory : max_memory;
+    pthread_mutex_unlock(&track_mutex);
+    if (overflowed) {
+        note_memory_tracking_degraded("realloc rollback accounting overflow");
+    }
+}
+
+static int
+commit_reallocated_entry(AllocationEntry* entry,
+                         void* new_ptr,
+                         size_t new_size,
+                         gulong* current_after_add_out)
+{
+    pthread_mutex_lock(&track_mutex);
     if (new_size > G_MAXULONG - current_memory) {
-        gum_metal_hash_table_remove(track_table, old_ptr);
         pthread_mutex_unlock(&track_mutex);
         internal_free(entry);
-        peak_log_warn("[peak] memory profiler accounting overflow after realloc\n");
+        note_memory_tracking_degraded("realloc accounting overflow");
         return 0;
-    }
-    if (new_ptr != old_ptr) {
-        gum_metal_hash_table_remove(track_table, old_ptr);
-        gum_metal_hash_table_insert(track_table, new_ptr, entry);
     }
     entry->ptr = new_ptr;
     entry->size = new_size;
+    gum_metal_hash_table_insert(track_table, new_ptr, entry);
     current_memory += new_size;
     max_memory = current_memory > max_memory ? current_memory : max_memory;
     *current_after_add_out = current_memory;
     pthread_mutex_unlock(&track_mutex);
     return 1;
+}
+
+static void
+publish_removed_entry(AllocationEntry* entry, gulong current_after_remove)
+{
+    int64_t delta;
+
+    if (size_to_event_delta(entry->size, &delta)) {
+        peak_log_event(nsec_now(), -delta,
+                       (uint64_t) current_after_remove, 2);
+    }
 }
 
 static void
@@ -894,6 +920,9 @@ static void* custom_malloc(size_t size) {
 }
 
 static void custom_free(void* ptr) {
+    AllocationEntry* entry;
+    gulong current_after_remove = 0;
+
     if (!ptr) return;
 
     PeakMallocHookEntry hook_entry = malloc_hook_enter();
@@ -907,9 +936,13 @@ static void custom_free(void* ptr) {
 
     int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
+    /* Keep the old entry local while the allocator exposes its address. */
+    entry = detach_tracking_entry(ptr, &current_after_remove);
     original_free(ptr);
-    AllocationEntry* entry = find_tracking_entry(ptr);
-    if (entry) remove_tracking_entry(ptr);
+    if (entry) {
+        publish_removed_entry(entry, current_after_remove);
+        internal_free(entry);
+    }
     in_peak_alloc_hook = hook_val;
     malloc_hook_leave();
 }
@@ -945,6 +978,13 @@ static void* custom_calloc(size_t nmemb, size_t size) {
 }
 
 static void* custom_realloc(void* ptr, size_t size) {
+    AllocationEntry* entry = NULL;
+    gulong current_after_remove = 0;
+    gulong current_after_add = 0;
+    int saved_errno = 0;
+    int realloc_errno;
+    int result_errno;
+
     PeakMallocHookEntry hook_entry = malloc_hook_enter();
     if (hook_entry != PEAK_MALLOC_HOOK_TRACKING) {
         void* result = original_realloc(ptr, size);
@@ -957,59 +997,61 @@ static void* custom_realloc(void* ptr, size_t size) {
     if (!ptr) {
         int hook_val = in_peak_alloc_hook;
         in_peak_alloc_hook = 1;
-        void* new_ptr = original_malloc(size);
+        void* new_ptr = original_realloc(NULL, size);
+        result_errno = errno;
         if (new_ptr) {
             int flag = peak_log_backtrace_malloc();
             add_tracking_entry(new_ptr, size, flag);
         }
+        errno = result_errno;
         in_peak_alloc_hook = hook_val;
         malloc_hook_leave();
         return new_ptr;
     }
-    if (!size) {
-        int hook_val = in_peak_alloc_hook;
-        in_peak_alloc_hook = 1;
-        original_free(ptr);
-        AllocationEntry* entry = find_tracking_entry(ptr);
-        if (entry) remove_tracking_entry(ptr);
-        in_peak_alloc_hook = hook_val;
-        malloc_hook_leave();
-        return NULL;
-    }
 
     int hook_val = in_peak_alloc_hook;
     in_peak_alloc_hook = 1;
+    /*
+     * Keep the entry operation-local while the allocator runs.  Failure
+     * restores the same lifetime without events; success publishes the old
+     * removal and commits the returned pointer as the new lifetime.
+     */
+    entry = detach_tracking_entry(ptr, &current_after_remove);
+
+    if (size == 0) {
+        saved_errno = errno;
+        errno = 0;
+    }
     void* new_ptr = original_realloc(ptr, size);
-    if (!new_ptr) {
-        /* ISO C preserves ptr on realloc failure; do not touch its entry. */
+    realloc_errno = errno;
+    result_errno = size == 0 && realloc_errno == 0
+        ? saved_errno
+        : realloc_errno;
+    if (!new_ptr && (size != 0 || realloc_errno == ENOMEM)) {
+        if (entry) restore_tracking_entry(entry);
+        errno = result_errno;
         in_peak_alloc_hook = hook_val;
         malloc_hook_leave();
         return NULL;
     }
 
-    size_t old_size;
-    gulong current_after_remove;
-    gulong current_after_add;
-    if (update_tracking_entry_after_realloc(ptr,
-                                            new_ptr,
-                                            size,
-                                            &old_size,
-                                            &current_after_remove,
-                                            &current_after_add)) {
-        int64_t old_delta;
+    if (entry) {
+        publish_removed_entry(entry, current_after_remove);
+    }
+    if (entry && new_ptr != NULL &&
+        commit_reallocated_entry(entry, new_ptr, size, &current_after_add)) {
         int64_t new_delta;
-        if (size_to_event_delta(old_size, &old_delta)) {
-            peak_log_event(nsec_now(), -old_delta,
-                           (uint64_t) current_after_remove, 2);
-        }
         if (size_to_event_delta(size, &new_delta)) {
             peak_log_event(nsec_now(), new_delta,
                            (uint64_t) current_after_add, 1);
         }
-    } else {
+    } else if (entry && new_ptr == NULL) {
+        internal_free(entry);
+    } else if (!entry && new_ptr != NULL) {
         int flag = peak_log_backtrace_malloc();
         add_tracking_entry(new_ptr, size, flag);
     }
+    errno = result_errno;
     in_peak_alloc_hook = hook_val;
     malloc_hook_leave();
 
@@ -1410,5 +1452,134 @@ peak_malloc_test_tracking_allocation_failure(void)
     original_malloc = saved_malloc;
     original_free = saved_free;
     return rejected;
+}
+
+int
+peak_malloc_test_begin(const PeakMallocTestAllocator* allocator)
+{
+    GumMetalHashTable* table;
+
+    if (allocator == NULL || allocator->malloc_fn == NULL ||
+        allocator->free_fn == NULL || allocator->realloc_fn == NULL ||
+        g_malloc_test_active || track_table != NULL) {
+        return 0;
+    }
+    table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
+    if (table == NULL) return 0;
+
+    g_malloc_test_saved_malloc = original_malloc;
+    g_malloc_test_saved_free = original_free;
+    g_malloc_test_saved_realloc = original_realloc;
+    g_malloc_test_saved_track_all = peak_memory_track_all;
+    original_malloc = allocator->malloc_fn;
+    original_free = allocator->free_fn;
+    original_realloc = allocator->realloc_fn;
+    peak_memory_track_all = TRUE;
+    track_table = table;
+    current_memory = 0;
+    max_memory = 0;
+    atomic_store_explicit(&cleanup_in_progress, 0, memory_order_release);
+    atomic_store_explicit(&active_alloc_hooks, 0, memory_order_release);
+    in_peak_alloc_hook = 0;
+    g_malloc_test_active = 1;
+    return 1;
+}
+
+int
+peak_malloc_test_seed(void* ptr, size_t size)
+{
+    AllocationEntry* entry;
+
+    if (!g_malloc_test_active || ptr == NULL) return 0;
+    entry = original_malloc(sizeof(*entry));
+    if (entry == NULL) return 0;
+    entry->ptr = ptr;
+    entry->size = size;
+
+    pthread_mutex_lock(&track_mutex);
+    if (gum_metal_hash_table_lookup(track_table, ptr) != NULL ||
+        size > G_MAXULONG - current_memory) {
+        pthread_mutex_unlock(&track_mutex);
+        original_free(entry);
+        return 0;
+    }
+    gum_metal_hash_table_insert(track_table, ptr, entry);
+    current_memory += size;
+    max_memory = current_memory > max_memory ? current_memory : max_memory;
+    pthread_mutex_unlock(&track_mutex);
+    return 1;
+}
+
+void*
+peak_malloc_test_malloc(size_t size)
+{
+    return g_malloc_test_active ? custom_malloc(size) : NULL;
+}
+
+void
+peak_malloc_test_free(void* ptr)
+{
+    if (g_malloc_test_active) custom_free(ptr);
+}
+
+void*
+peak_malloc_test_realloc(void* ptr, size_t size)
+{
+    return g_malloc_test_active ? custom_realloc(ptr, size) : NULL;
+}
+
+void
+peak_malloc_test_tracking_snapshot(void* ptr,
+                                   PeakMallocTestTrackingSnapshot* out)
+{
+    GumMetalHashTableIter iter;
+    gpointer value;
+    AllocationEntry* observed;
+
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (!g_malloc_test_active) return;
+
+    pthread_mutex_lock(&track_mutex);
+    out->entry_count = gum_metal_hash_table_size(track_table);
+    gum_metal_hash_table_iter_init(&iter, track_table);
+    while (gum_metal_hash_table_iter_next(&iter, NULL, &value)) {
+        AllocationEntry* entry = value;
+        out->table_bytes += entry->size;
+    }
+    out->current_bytes = current_memory;
+    observed = gum_metal_hash_table_lookup(track_table, ptr);
+    if (observed != NULL) {
+        out->pointer_tracked = 1;
+        out->pointer_size = observed->size;
+    }
+    pthread_mutex_unlock(&track_mutex);
+}
+
+void
+peak_malloc_test_end(void)
+{
+    GumMetalHashTable* table;
+    GumMetalHashTableIter iter;
+    gpointer value;
+
+    if (!g_malloc_test_active) return;
+    pthread_mutex_lock(&track_mutex);
+    table = track_table;
+    track_table = NULL;
+    current_memory = 0;
+    max_memory = 0;
+    pthread_mutex_unlock(&track_mutex);
+
+    gum_metal_hash_table_iter_init(&iter, table);
+    while (gum_metal_hash_table_iter_next(&iter, NULL, &value)) {
+        original_free(value);
+    }
+    gum_metal_hash_table_unref(table);
+    original_malloc = g_malloc_test_saved_malloc;
+    original_free = g_malloc_test_saved_free;
+    original_realloc = g_malloc_test_saved_realloc;
+    peak_memory_track_all = g_malloc_test_saved_track_all;
+    g_malloc_test_active = 0;
 }
 #endif

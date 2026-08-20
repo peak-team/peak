@@ -6,3 +6,8 @@ add_executable(test_memlog_safety test_memlog_safety.c)
 target_include_directories(test_memlog_safety PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_definitions(test_memlog_safety PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
 target_link_libraries(test_memlog_safety PRIVATE peak Threads::Threads)
+
+add_executable(test_allocation_lifetime test_allocation_lifetime.c)
+target_include_directories(test_allocation_lifetime PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_definitions(test_allocation_lifetime PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+target_link_libraries(test_allocation_lifetime PRIVATE peak Threads::Threads)

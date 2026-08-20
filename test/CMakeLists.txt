@@ -3437,6 +3437,14 @@ if(BUILD_TESTING)
                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
                 TIMEOUT 10)
     endforeach()
+    foreach(allocation_lifetime_case free-reuse realloc-reuse realloc-matrix stress)
+        add_test(NAME test_allocation_lifetime_${allocation_lifetime_case}
+            COMMAND test_allocation_lifetime ${allocation_lifetime_case})
+        set_tests_properties(test_allocation_lifetime_${allocation_lifetime_case}
+            PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                TIMEOUT 30)
+    endforeach()
     set_tests_properties(test_memlog_sizing
         PROPERTIES PASS_REGULAR_EXPRESSION "memlog: ftruncate init failed")
     add_test(NAME test_memory COMMAND ${PROJECT_BINARY_DIR}/test/memory/test_memory)
