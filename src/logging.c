@@ -170,17 +170,27 @@ peak_log_enabled(PeakVerbosity level)
     return level <= peak_log_verbosity();
 }
 
+static FILE*
+peak_log_output_stream(void)
+{
+    return peak_log_output_initialized ? peak_log_output : stderr;
+}
+
+static void
+peak_log_vwrite(const char* format, va_list args)
+{
+    FILE* output = peak_log_output_stream();
+
+    if (output != NULL) {
+        vfprintf(output, format, args);
+    }
+}
+
 static void
 peak_log_vmessage(PeakVerbosity level, const char* format, va_list args)
 {
-    FILE* output;
-
-    if (!peak_log_enabled(level)) {
-        return;
-    }
-    output = peak_log_output_initialized ? peak_log_output : stderr;
-    if (output != NULL) {
-        vfprintf(output, format, args);
+    if (peak_log_enabled(level)) {
+        peak_log_vwrite(format, args);
     }
 }
 
@@ -194,10 +204,20 @@ peak_log_message(PeakVerbosity level, const char* format, ...)
     va_end(args);
 }
 
+void
+peak_log_message_always(const char* format, ...)
+{
+    va_list args;
+
+    va_start(args, format);
+    peak_log_vwrite(format, args);
+    va_end(args);
+}
+
 int
 peak_log_flush(void)
 {
-    FILE* output = peak_log_output_initialized ? peak_log_output : stderr;
+    FILE* output = peak_log_output_stream();
 
     if (output == NULL) {
         errno = EBADF;

@@ -71,6 +71,15 @@ void peak_log_message(PeakVerbosity level,
                       const char* format,
                       ...) PEAK_PRINTF_FORMAT(2, 3);
 
+/**
+ * @brief Write a mandatory diagnostic without applying the verbosity filter.
+ *
+ * This is reserved for fail-open degradation notices that must remain visible
+ * even when normal PEAK diagnostics are disabled.
+ */
+void peak_log_message_always(const char* format,
+                             ...) PEAK_PRINTF_FORMAT(1, 2);
+
 /** Flush the PEAK-owned report stream. */
 int peak_log_flush(void);
 
