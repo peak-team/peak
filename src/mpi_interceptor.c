@@ -6,7 +6,6 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -82,7 +81,7 @@ mpi_interceptor_call_init(PeakMpiInitFunction init,
 
     peak_mpi_init_wrapper_depth++;
     if (init == NULL) {
-        fprintf(stderr, "[peak] unable to resolve next %s\n", symbol);
+        peak_log_warn("[peak] unable to resolve next %s\n", symbol);
         result = MPI_ERR_OTHER;
     } else {
         result = init(argc, argv);
@@ -106,7 +105,7 @@ mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
 
     peak_mpi_init_wrapper_depth++;
     if (init == NULL) {
-        fprintf(stderr, "[peak] unable to resolve next %s\n", symbol);
+        peak_log_warn("[peak] unable to resolve next %s\n", symbol);
         result = MPI_ERR_OTHER;
     } else {
         result = init(argc, argv, required, provided);

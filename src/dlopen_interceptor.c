@@ -2841,8 +2841,22 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                 }
             } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
                 g_printerr("[peak] ambiguous dynamic target selector; refusing to attach\n");
-                peak_target_resolver_print(stderr, resolved_targets[i].name,
-                                           resolution);
+                g_printerr("selector=%s candidates=%" G_GSIZE_FORMAT "\n",
+                           resolved_targets[i].name,
+                           (gsize)resolution->candidates->len);
+                for (gsize candidate_index = 0;
+                     candidate_index < resolution->candidates->len;
+                     candidate_index++) {
+                    const PeakTargetSymbolCandidate* candidate =
+                        g_ptr_array_index(resolution->candidates,
+                                          candidate_index);
+                    g_printerr(
+                        "address=%p module=%s mangled=%s demangled=%s\n",
+                        candidate->address,
+                        candidate->module,
+                        candidate->mangled,
+                        candidate->demangled);
+                }
                 resolved_targets[i].terminal = TRUE;
             } else if (result == PEAK_TARGET_RESOLVE_INVALID) {
                 g_printerr("[peak] invalid dynamic target selector; refusing to attach: %s\n",

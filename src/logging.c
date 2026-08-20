@@ -1,15 +1,22 @@
 #include "logging.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define PEAK_VERBOSITY_ENV "PEAK_VERBOSITY"
 
 static pthread_once_t peak_log_configuration_once = PTHREAD_ONCE_INIT;
+static pthread_once_t peak_log_output_once = PTHREAD_ONCE_INIT;
 static PeakVerbosity peak_log_cached_verbosity = PEAK_VERBOSITY_WARN;
+static FILE* peak_log_output;
+static int peak_log_output_initialized;
+static int peak_log_force_output_failure;
 
 static int
 peak_log_streq_ci(const char* left, const char* right)
@@ -109,6 +116,47 @@ peak_log_configure(void)
                        peak_log_configure_once);
 }
 
+static void
+peak_log_initialize_output_once(void)
+{
+    int output_fd;
+
+    peak_log_output_initialized = 1;
+    if (peak_log_force_output_failure) {
+        errno = EMFILE;
+        output_fd = -1;
+    } else {
+        output_fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    }
+    if (output_fd < 0) {
+        int error = errno;
+
+        fprintf(stderr,
+                "[peak] unable to duplicate the report descriptor: %s; disabling PEAK diagnostics and text reports\n",
+                strerror(error));
+        return;
+    }
+    peak_log_output = fdopen(output_fd, "w");
+    if (peak_log_output == NULL) {
+        int error = errno;
+
+        (void)close(output_fd);
+        fprintf(stderr,
+                "[peak] unable to open the owned report stream: %s; disabling PEAK diagnostics and text reports\n",
+                strerror(error));
+        return;
+    }
+    (void)setvbuf(peak_log_output, NULL, _IONBF, 0);
+}
+
+void
+peak_log_initialize_output(int fail_descriptor_dup_for_test)
+{
+    peak_log_force_output_failure = fail_descriptor_dup_for_test;
+    (void)pthread_once(&peak_log_output_once,
+                       peak_log_initialize_output_once);
+}
+
 static PeakVerbosity
 peak_log_verbosity(void)
 {
@@ -122,13 +170,28 @@ peak_log_enabled(PeakVerbosity level)
     return level <= peak_log_verbosity();
 }
 
+static FILE*
+peak_log_output_stream(void)
+{
+    return peak_log_output_initialized ? peak_log_output : stderr;
+}
+
+static void
+peak_log_vwrite(const char* format, va_list args)
+{
+    FILE* output = peak_log_output_stream();
+
+    if (output != NULL) {
+        vfprintf(output, format, args);
+    }
+}
+
 static void
 peak_log_vmessage(PeakVerbosity level, const char* format, va_list args)
 {
-    if (!peak_log_enabled(level)) {
-        return;
+    if (peak_log_enabled(level)) {
+        peak_log_vwrite(format, args);
     }
-    vfprintf(stderr, format, args);
 }
 
 void
@@ -139,4 +202,43 @@ peak_log_message(PeakVerbosity level, const char* format, ...)
     va_start(args, format);
     peak_log_vmessage(level, format, args);
     va_end(args);
+}
+
+void
+peak_log_message_always(const char* format, ...)
+{
+    va_list args;
+
+    va_start(args, format);
+    peak_log_vwrite(format, args);
+    va_end(args);
+}
+
+int
+peak_log_flush(void)
+{
+    FILE* output = peak_log_output_stream();
+
+    if (output == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (fflush(output) != 0 || ferror(output)) {
+        if (errno == 0) {
+            errno = EIO;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+void
+peak_log_shutdown(void)
+{
+    FILE* output = peak_log_output;
+
+    peak_log_output = NULL;
+    if (output != NULL) {
+        (void)fclose(output);
+    }
 }

@@ -7105,7 +7105,19 @@ peak_general_listener_use_selector_resolution(
             selector, candidate->demangled);
     } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
         g_printerr("[peak] ambiguous target selector; refusing to attach\n");
-        peak_target_resolver_print(stderr, selector, resolution);
+        g_printerr("selector=%s candidates=%" G_GSIZE_FORMAT "\n",
+                   selector != NULL ? selector : "<null>",
+                   (gsize)resolution->candidates->len);
+        for (gsize i = 0; i < resolution->candidates->len; i++) {
+            const PeakTargetSymbolCandidate* candidate =
+                g_ptr_array_index(resolution->candidates, i);
+            g_printerr(
+                "address=%p module=%s mangled=%s demangled=%s\n",
+                candidate->address,
+                candidate->module,
+                candidate->mangled,
+                candidate->demangled);
+        }
         *terminal = TRUE;
     } else if (result == PEAK_TARGET_RESOLVE_INVALID) {
         g_printerr("[peak] invalid target selector; refusing to attach: %s\n",
@@ -7227,9 +7239,6 @@ peak_general_listener_attach()
         if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
             strcmp(peak_hook_strings[i], "PMPI_Finalize") == 0) {
             hook_address[i] = NULL;
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "close") == 0) {
-            hook_address[i] = peak_general_listener_find_function("peak_close");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
         } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
             hook_address[i] = peak_general_listener_find_function("peak_exit");

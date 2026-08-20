@@ -68,6 +68,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" OR CMAKE_SYSTEM_NAME MATCHES "Darwin")
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    add_executable(test_close_semantics test_close_semantics.c)
+    set_target_properties(test_close_semantics PROPERTIES ENABLE_EXPORTS TRUE)
+    add_test(NAME test_close_semantics
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/run_close_semantics_check.py
+                --exe $<TARGET_FILE:test_close_semantics>
+                --libpeak $<TARGET_FILE:peak>)
+    set_tests_properties(test_close_semantics PROPERTIES
+        PASS_REGULAR_EXPRESSION "close_semantics_ok"
+        TIMEOUT 30)
+
     add_executable(test_parent_registry
         test_parent_registry.c
         ${PROJECT_SOURCE_DIR}/src/utils/parent_registry.c)

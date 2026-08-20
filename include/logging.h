@@ -34,6 +34,19 @@ typedef enum {
  */
 void peak_log_configure(void);
 
+/**
+ * @brief Duplicate standard error into the PEAK-owned report stream.
+ *
+ * PEAK calls this once after confirming that the process requested profiling
+ * work and before installing hooks or starting controller threads. Failure
+ * disables PEAK diagnostics and text reports without changing application
+ * descriptor semantics.
+ *
+ * @param fail_descriptor_dup_for_test Nonzero only for the test-only failure
+ *        injection selected by the libpeak test build.
+ */
+void peak_log_initialize_output(int fail_descriptor_dup_for_test);
+
 #if defined(__GNUC__) || defined(__clang__)
 #define PEAK_PRINTF_FORMAT(fmt_index, first_arg) \
     __attribute__((format(printf, fmt_index, first_arg)))
@@ -45,8 +58,9 @@ void peak_log_configure(void);
  * @brief Write a formatted message when its verbosity is enabled.
  *
  * The active level is read once from `PEAK_VERBOSITY` and then cached. Invalid
- * values produce a warning and select `PEAK_VERBOSITY_WARN`. Messages are
- * written to `stderr` without adding a prefix or trailing newline.
+ * values produce a warning and select `PEAK_VERBOSITY_WARN`. After runtime
+ * initialization, messages are written to PEAK's owned duplicate of the
+ * original standard-error descriptor without adding a prefix or newline.
  *
  * @param level Message verbosity; emitted when no greater than the cached
  *              active verbosity.
@@ -56,6 +70,21 @@ void peak_log_configure(void);
 void peak_log_message(PeakVerbosity level,
                       const char* format,
                       ...) PEAK_PRINTF_FORMAT(2, 3);
+
+/**
+ * @brief Write a mandatory diagnostic without applying the verbosity filter.
+ *
+ * This is reserved for fail-open degradation notices that must remain visible
+ * even when normal PEAK diagnostics are disabled.
+ */
+void peak_log_message_always(const char* format,
+                             ...) PEAK_PRINTF_FORMAT(1, 2);
+
+/** Flush the PEAK-owned report stream. */
+int peak_log_flush(void);
+
+/** Close the PEAK-owned report stream after final teardown output. */
+void peak_log_shutdown(void);
 
 #define peak_log_report(...) \
     peak_log_message(PEAK_VERBOSITY_REPORT, __VA_ARGS__)
