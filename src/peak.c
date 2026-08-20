@@ -35,7 +35,6 @@
 #include "internal/jit_provider.h"
 #include "logging.h"
 #include "pthread_listener.h"
-#include "syscall_interceptor.h"
 #include "dlopen_interceptor.h"
 #include "malloc_interceptor.h"
 #include "utils/env_parser.h"
@@ -1002,7 +1001,6 @@ peak_activate_runtime(void)
      * target attachment begins.
      */
     peak_general_listener_attach();
-    syscall_interceptor_attach();
 #if !defined(__APPLE__)
     gboolean need_dynamic_attach = peak_general_listener_needs_dynamic_attach();
     gboolean dynamic_attach_listener_ready = FALSE;
@@ -1240,6 +1238,14 @@ void peak_init()
     peak_set_process_requests_work(has_requested_work);
     if (!has_requested_work) {
         return;
+    }
+    {
+        int force_log_output_failure = 0;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        force_log_output_failure =
+            getenv("PEAK_TEST_FAIL_LOG_DESCRIPTOR_DUP") != NULL;
+#endif
+        peak_log_initialize_output(force_log_output_failure);
     }
     /*
      * Publish process ownership before READY can be inherited across fork().
@@ -1598,7 +1604,7 @@ peak_fini_impl(void)
             }
         }
         errno = 0;
-        if (fflush(stderr) != 0 || ferror(stderr)) {
+        if (peak_log_flush() != 0) {
             report_write_succeeded = FALSE;
             peak_log_warn("[peak] failed to flush the complete CUDA report: %s\n",
                           strerror(errno != 0 ? errno : EIO));
@@ -1715,11 +1721,11 @@ peak_fini_impl(void)
             }
         }
 #if !defined(__APPLE__)
-        syscall_interceptor_dettach();
         if (!pthread_listener_dettach()) {
             g_printerr("[peak] Leaving pthread listener bookkeeping allocated before application PMPI_Finalize\n");
         }
 #endif
+        peak_log_shutdown();
         return;
     }
 #else
@@ -1734,12 +1740,12 @@ peak_fini_impl(void)
 #if defined(__APPLE__)
     (void)general_listener_shutdown_flushed;
     peak_log_info("[peak] Darwin process-exit teardown leaves Gum support hook state alive\n");
+    peak_log_shutdown();
     return;
 #else
     if (general_listener_shutdown_flushed) {
         dlopen_interceptor_release_retained_dynamic_handles();
     }
-    syscall_interceptor_dettach();
     if (general_listener_shutdown_flushed) {
         if (!pthread_listener_dettach()) {
             g_printerr("[peak] Leaving pthread listener bookkeeping allocated for in-flight callbacks\n");
@@ -1760,6 +1766,7 @@ peak_fini_impl(void)
     } else {
         g_printerr("[peak] Leaving general listener bookkeeping allocated for in-flight callbacks\n");
     }
+    peak_log_shutdown();
 #endif
 }
 

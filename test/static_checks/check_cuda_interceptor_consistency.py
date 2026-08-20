@@ -123,7 +123,6 @@ def main():
         "src/dlopen_interceptor.c": ["dlopen"],
         "src/mpi_interceptor.c": ["PMPI_Finalize"],
         "src/pthread_listener.c": ["pthread_create", "pthread_join"],
-        "src/syscall_interceptor.c": ["close"],
     }
 
     require("peak_resolve_function" not in general,

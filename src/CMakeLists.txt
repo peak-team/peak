@@ -38,7 +38,6 @@ set(sources_peak
     ${PEAK_SIGNAL_POLICY_SOURCE}
     pthread_listener.c
     pthread_slot_registry.c
-    syscall_interceptor.c
     unsafe_gum_prologue.c
     exec_memory.c
     exec_interceptor.c

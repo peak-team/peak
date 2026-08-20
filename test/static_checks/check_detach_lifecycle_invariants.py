@@ -336,7 +336,6 @@ def check_safe_pc_alignment(repo_root):
 def check_support_hook_lifetimes(repo_root):
     checks = [
         ("src/mpi_interceptor.c", "mpi_interceptor_dettach", "mpi_interceptor"),
-        ("src/syscall_interceptor.c", "syscall_interceptor_dettach", "syscall_interceptor"),
     ]
     for rel, function, object_name in checks:
         source = (repo_root / rel).read_text(encoding="utf-8")
@@ -719,7 +718,7 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
             "dlopen cancellation must be restored only after callback cleanup")
 
 
-def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
+def check_safe_arm64_plt_reads(repo_root):
     unsafe = (repo_root / "src/unsafe_gum_prologue.c").read_text(
         encoding="utf-8"
     )
@@ -802,19 +801,26 @@ def check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root):
             dlopen_attach.find("dlopen_interceptor_attach_candidates(") != -1,
             "dlopen mutation requests must be planned and processed through the guarded helpers")
 
-    syscall = (repo_root / "src/syscall_interceptor.c").read_text(
-        encoding="utf-8"
-    )
-    overlap = extract_function(syscall, "peak_close_overlaps_nocancel_entry")
-    attach = extract_function(syscall, "syscall_interceptor_attach")
-    guard = attach.find("peak_close_overlaps_nocancel_entry(hook_address)")
-    replace = attach.find("gum_interceptor_replace_fast")
-    require("__close_nocancel" in overlap and
-            overlap.count("gum_process_find_function_range") == 2 and
-            "PEAK_GUM_X86_MAX_REDIRECT_SIZE" in overlap,
-            "close support hook must detect overlapping and nearby __close_nocancel entries")
-    require(guard != -1 and replace != -1 and guard < replace,
-            "close overlap guard must run before Gum mutates the close entry")
+    peak_source = read_source(repo_root, "src/peak.c")
+    product_cmake = read_source(repo_root, "src/CMakeLists.txt")
+    require(not (repo_root / "src/syscall_interceptor.c").exists() and
+            not (repo_root / "include/syscall_interceptor.h").exists() and
+            "syscall_interceptor" not in peak_source and
+            "syscall_interceptor" not in product_cmake,
+            "production must not replace application close semantics")
+    require('strcmp(peak_hook_strings[i], "close")' not in general,
+            "the ordinary close target must not redirect to a PEAK wrapper")
+    for rel in (
+        "src/general_listener.c",
+        "src/dlopen_interceptor.c",
+        "src/mpi_interceptor.c",
+        "src/general_listener/report_snapshot.c",
+    ):
+        runtime_source = read_source(repo_root, rel)
+        require("peak_target_resolver_print(stderr" not in runtime_source and
+                "write(STDERR_FILENO" not in runtime_source and
+                "fprintf(stderr" not in runtime_source,
+                f"{rel} diagnostics must use the PEAK-owned report descriptor")
 
 
 def check_x86_patched_gum_requires_exact_attach(repo_root):
@@ -898,6 +904,7 @@ def check_fast_listener_unwind_abi(repo_root):
 
 def check_peak_init_heartbeat_order(repo_root):
     source = (repo_root / "src/peak.c").read_text(encoding="utf-8")
+    logging = (repo_root / "src/logging.c").read_text(encoding="utf-8")
     init = extract_function(source, "peak_init")
     body = extract_function(source, "peak_activate_runtime")
     fini = extract_function(source, "peak_fini_impl")
@@ -907,6 +914,15 @@ def check_peak_init_heartbeat_order(repo_root):
     require(group_load_position != -1 and deduplicate_position != -1 and
             group_load_position < deduplicate_position,
             "explicit and group target names must be deduplicated before setup")
+    log_output_position = init.find("peak_log_initialize_output(")
+    runtime_activation_position = init.find("peak_activate_runtime()")
+    require(log_output_position != -1 and runtime_activation_position != -1 and
+            log_output_position < runtime_activation_position and
+            "F_DUPFD_CLOEXEC" in logging and
+            "fdopen(output_fd, \"w\")" in logging,
+            "PEAK must own a close-on-exec report descriptor before runtime activation")
+    require("PEAK_TEST_FAIL_LOG_DESCRIPTOR_DUP" not in logging,
+            "shared production logging must not inspect test-only environment switches")
 
     main_time_position = body.find("peak_main_time = peak_second();")
     runtime_start_position = body.find("peak_general_listener_note_runtime_start")
@@ -927,7 +943,6 @@ def check_peak_init_heartbeat_order(repo_root):
             "general listener attach must not start mutation processing")
     gum_init_position = body.find("gum_init_embedded()")
     general_attach_position = body.find("peak_general_listener_attach()")
-    syscall_attach_position = body.find("syscall_interceptor_attach()")
     dlopen_attach_position = body.find("dlopen_interceptor_attach()")
     malloc_attach_position = body.find("malloc_interceptor_attach()")
     controller_start_position = body.find(
@@ -935,11 +950,9 @@ def check_peak_init_heartbeat_order(repo_root):
     )
     dynamic_enable_position = body.find("dlopen_interceptor_enable_dynamic_attach()")
     require(-1 not in (gum_init_position, general_attach_position,
-                       syscall_attach_position,
                        dlopen_attach_position, malloc_attach_position,
                        controller_start_position, dynamic_enable_position) and
             gum_init_position < general_attach_position <
-            syscall_attach_position <
             dlopen_attach_position < malloc_attach_position <
             controller_start_position < dynamic_enable_position <
             heartbeat_position,
@@ -949,7 +962,6 @@ def check_peak_init_heartbeat_order(repo_root):
         "pthread_listener_attach()",
         "mpi_interceptor_attach()",
         "peak_general_listener_attach()",
-        "syscall_interceptor_attach()",
         "dlopen_interceptor_attach()",
         "malloc_interceptor_attach()",
         "peak_general_listener_controller_start()",
@@ -1336,8 +1348,8 @@ def check_final_report_snapshot_order(repo_root):
         "publication_timeout_minimum_ms," in
             fini[combined_release_position:report_release_position],
         "the combined gate must use the stable attempted socket mode, including socket-to-local fallback, to select the R+2T timeout floor")
-    require("fflush(stderr)" in fini and
-            fini.find("fflush(stderr)", cuda_position) <
+    require("peak_log_flush()" in fini and
+            fini.find("peak_log_flush()", cuda_position) <
                 combined_release_position,
             "CUDA text output must be flushed before the all-rank report release")
     require("report_release_protocol_completed &&" in fini and
@@ -2190,9 +2202,6 @@ def check_stop_window_accounting_sidecar(repo_root):
         attach_policy,
         "peak_general_listener_support_attach_target_is_supported",
     )
-    syscall = (repo_root / "src/syscall_interceptor.c").read_text(
-        encoding="utf-8"
-    )
     dlopen = (repo_root / "src/dlopen_interceptor.c").read_text(
         encoding="utf-8"
     )
@@ -2204,16 +2213,6 @@ def check_stop_window_accounting_sidecar(repo_root):
             "peak_unsafe_gum_support_prologue_check" not in support_attach_supported and
             "peak_gum_prologue_too_short_for_attach" not in support_attach_supported,
             "support replacements must not apply user-target prologue guards")
-    require("peak_general_listener_support_attach_target_is_supported" in syscall,
-            "close support replacement must call the support attach predicate")
-    syscall_attach = extract_function(syscall, "syscall_interceptor_attach")
-    require(
-        "skipping close support hook:" in syscall_attach and
-        "peak_log_info(" in syscall_attach and
-        "g_printerr(" not in syscall_attach,
-        "the expected close/__close_nocancel overlap fallback must remain an "
-        "INFO diagnostic instead of producing one WARN per MPI rank",
-    )
     require('peak_general_listener_attach_target_is_supported("dlopen"' in
             dlopen_attach,
             "dlopen listener must use normal target prologue policy so dynamic attach is not disabled by support-only early-return guards")
@@ -3328,7 +3327,7 @@ def main():
     check_dlopen_detach_transaction(repo_root)
     check_dlopen_resolution_lock_order(repo_root)
     check_dlopen_fftw_scope_and_fork_guard(repo_root)
-    check_safe_arm64_plt_reads_and_close_overlap_guard(repo_root)
+    check_safe_arm64_plt_reads(repo_root)
     check_x86_patched_gum_requires_exact_attach(repo_root)
     check_fast_listener_unwind_abi(repo_root)
     check_peak_init_heartbeat_order(repo_root)

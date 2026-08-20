@@ -1,7 +1,7 @@
 #include "internal/general_listener/report_snapshot.h"
+#include "logging.h"
 
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <stdatomic.h>
 
@@ -36,8 +36,9 @@ peak_report_snapshot_note_degraded(uint32_t mask, const char* reason)
         (atomic_fetch_or_explicit(&peak_report_snapshot_warned,
                                   mask,
                                   memory_order_acq_rel) & mask) != mask) {
-        fprintf(stderr, "[peak] disabling non-critical profiler subsystem (%s)\n",
-                reason != NULL ? reason : "unknown");
+        peak_log_warn(
+            "[peak] disabling non-critical profiler subsystem (%s)\n",
+            reason != NULL ? reason : "unknown");
     }
 }
 

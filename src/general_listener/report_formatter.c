@@ -286,7 +286,7 @@ peak_report_formatter_test_signal_publication_phase(const char* phase)
                   signal_number,
                   current_rank,
                   phase);
-    (void)fflush(stderr);
+    (void)peak_log_flush();
     (void)kill(getpid(), signal_number);
 }
 
@@ -1255,7 +1255,7 @@ peak_report_formatter_write_text(
     }
     peak_log_report("%s\n", row_separator);
     errno = 0;
-    if (fflush(stderr) != 0 || ferror(stderr)) {
+    if (peak_log_flush() != 0) {
         peak_log_warn("[peak] failed to flush the complete text report: %s\n",
                       strerror(errno != 0 ? errno : EIO));
         return false;

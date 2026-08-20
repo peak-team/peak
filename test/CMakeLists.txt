@@ -162,10 +162,12 @@ if(BUILD_TESTING)
     add_executable(test_report_snapshot
         report/test_report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
-        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c)
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_report_snapshot PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_compile_options(test_report_snapshot PRIVATE -UNDEBUG)
+    target_link_libraries(test_report_snapshot PRIVATE Threads::Threads)
     add_test(NAME test_report_snapshot COMMAND test_report_snapshot)
     set_tests_properties(test_report_snapshot
         PROPERTIES
@@ -175,9 +177,11 @@ if(BUILD_TESTING)
         report/test_report_snapshot_cxx_link.cpp
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
-        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c)
+        ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
+        ${PROJECT_SOURCE_DIR}/src/logging.c)
     target_include_directories(test_report_snapshot_cxx_link PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test_report_snapshot_cxx_link PRIVATE Threads::Threads)
     add_test(NAME test_report_snapshot_cxx_link
         COMMAND test_report_snapshot_cxx_link)
     set_tests_properties(test_report_snapshot_cxx_link
