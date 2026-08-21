@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define STRESS_THREADS 8
@@ -199,6 +201,44 @@ static int run_output_no_clobber(void)
     return 0;
 }
 
+static int run_tid_fork(void)
+{
+    struct {
+        uint32_t cached;
+        uint32_t actual;
+    } child_ids = {0};
+    uint32_t parent_tid = peak_malloc_test_thread_id();
+    int pipe_fds[2];
+    pid_t child;
+    int status;
+
+    if (pipe(pipe_fds) != 0) return 1;
+    child = fork();
+    if (child < 0) return 1;
+    if (child == 0) {
+        ssize_t written;
+
+        close(pipe_fds[0]);
+        child_ids.cached = peak_malloc_test_thread_id();
+        child_ids.actual = (uint32_t)syscall(SYS_gettid);
+        written = write(pipe_fds[1], &child_ids, sizeof(child_ids));
+        close(pipe_fds[1]);
+        _exit(written == (ssize_t)sizeof(child_ids) ? 0 : 1);
+    }
+    close(pipe_fds[1]);
+    if (read(pipe_fds[0], &child_ids, sizeof(child_ids)) !=
+        (ssize_t)sizeof(child_ids)) {
+        close(pipe_fds[0]);
+        waitpid(child, &status, 0);
+        return 1;
+    }
+    close(pipe_fds[0]);
+    if (waitpid(child, &status, 0) != child) return 1;
+    return !(WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             child_ids.cached == child_ids.actual &&
+             child_ids.cached != parent_tid);
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2) return 2;
@@ -210,6 +250,7 @@ int main(int argc, char** argv)
     if (strcmp(argv[1], "stalled") == 0) return run_stalled_writer();
     if (strcmp(argv[1], "stress") == 0) return run_multithread_stress();
     if (strcmp(argv[1], "no-clobber") == 0) return run_output_no_clobber();
+    if (strcmp(argv[1], "tid-fork") == 0) return run_tid_fork();
     if (strcmp(argv[1], "realloc") == 0) {
         gum_init_embedded();
         int result = !peak_malloc_test_failed_realloc_preserves_accounting();

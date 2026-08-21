@@ -25,7 +25,7 @@ extern "C" {
  * The archive directory is `PEAK_MEMLOG_OTF2_DIR` when that variable is
  * nonempty, or the current directory otherwise; @p filename is used as the
  * archive name within that directory.  Event timestamps are copied as
- * nanosecond ticks from the `CLOCK_MONOTONIC_RAW` domain, with a 1 GHz timer
+ * nanosecond ticks from the `CLOCK_MONOTONIC` domain, with a 1 GHz timer
  * resolution and the minimum event timestamp as the OTF2 global offset.  They
  * are not Unix-epoch timestamps.
  *

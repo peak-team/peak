@@ -3402,6 +3402,17 @@ if(BUILD_TESTING)
     set_tests_properties(test_memory_interceptor_recoverable_rollback_fail_open
         PROPERTIES
             ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_TEST_FAIL_MALLOC_REPLACE=free;${PRELOAD_VAR}")
+    add_test(NAME test_memory_interceptor_standard_replace_fallback
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                --exit-code 0
+                --stderr-regex "Memory allocation functions intercepted successfully"
+                --stderr-count-regex "disabling non-critical profiler subsystem"
+                --stderr-count 0
+                -- ${PROJECT_BINARY_DIR}/test/heartbeat/test_heartbeat)
+    set_tests_properties(test_memory_interceptor_standard_replace_fallback
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=main,my_sleep_func;PEAK_MEMORY_PROFILE=1;PEAK_VERBOSITY=info;PEAK_TEST_FORCE_MALLOC_STANDARD_REPLACE=posix_memalign;${PRELOAD_VAR}")
     foreach(peak_rollback_failure_target malloc free)
         add_test(NAME test_memory_interceptor_pre_main_worker_${peak_rollback_failure_target}
             COMMAND ${Python3_EXECUTABLE}
@@ -3429,13 +3440,21 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
-    foreach(memlog_case create sizing mapping overflow capacity stalled stress no-clobber allocation realloc)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stress no-clobber allocation realloc tid-fork)
         add_test(NAME test_memlog_${memlog_case}
             COMMAND test_memlog_safety ${memlog_case})
         set_tests_properties(test_memlog_${memlog_case}
             PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
                 TIMEOUT 10)
+    endforeach()
+    foreach(allocation_lifetime_case free-reuse realloc-reuse realloc-matrix stress)
+        add_test(NAME test_allocation_lifetime_${allocation_lifetime_case}
+            COMMAND test_allocation_lifetime ${allocation_lifetime_case})
+        set_tests_properties(test_allocation_lifetime_${allocation_lifetime_case}
+            PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+                TIMEOUT 30)
     endforeach()
     set_tests_properties(test_memlog_sizing
         PROPERTIES PASS_REGULAR_EXPRESSION "memlog: ftruncate init failed")

@@ -50,10 +50,12 @@
 
 /** One packed allocation-accounting event in the PEAK memory log. */
 typedef struct {
-    uint64_t ts_ns;     /**< Absolute `CLOCK_MONOTONIC_RAW` timestamp, in nanoseconds. */
+    uint64_t ts_ns;     /**< Absolute `CLOCK_MONOTONIC` timestamp, in nanoseconds. */
     int64_t  delta;     /**< Signed change in tracked allocated bytes. */
-    uint64_t current;   /**< Tracked allocated-byte total after applying @c delta. */
+    uint64_t current;   /**< Total after @c delta, reconstructed during finalization. */
+    uint64_t accounting_sequence; /**< Internal per-shard transition order. */
     uint32_t tid;       /**< Linux thread ID that recorded the event. */
+    uint16_t accounting_shard; /**< Internal accounting shard, or UINT16_MAX. */
     uint8_t  op;        /**< 1=add/allocation, 2=remove/free; realloc emits those operations. */
 } __attribute__((packed)) PeakMemEvent;
 
@@ -70,7 +72,7 @@ typedef struct {
     char     magic[8];       /**< The eight bytes `PEAKMEM\0`. */
     uint32_t header_bytes;   /**< Page-aligned offset from the mapping to the first event. */
     uint64_t t0_ns;          /**< Log-open time in the same clock domain as event timestamps. */
-    uint64_t clock_id;       /**< Numeric value of `CLOCK_MONOTONIC_RAW`. */
+    uint64_t clock_id;       /**< Numeric value of `CLOCK_MONOTONIC`. */
     int32_t  mpi_rank;       /**< MPI rank, or -1 when unavailable. */
     int32_t  pid;            /**< Process ID captured with `getpid()`. */
     int32_t  ppid;           /**< Parent process ID captured with `getppid()`. */
@@ -78,19 +80,20 @@ typedef struct {
 
 /** Module-owned mutable state for the mapped binary log and its exports. */
 typedef struct {
-    int      fd;                  /**< Descriptor for the temporary binary log. */
+    int      fd;                  /**< Descriptor reserving the temporary output path. */
     void    *map;                 /**< Mapping base containing header followed by events. */
     size_t   map_bytes;           /**< Fixed mapping size, in bytes. */
     size_t   header_bytes;        /**< Page-aligned event-region offset. */
-    size_t   capacity_events;     /**< Number of event slots in the fixed mapping. */
+    size_t   capacity_events;     /**< Configured number of exportable events. */
+    size_t   storage_capacity_events; /**< Slots including bounded reservation slack. */
     size_t   ready_offset;        /**< Offset of one-byte atomic ready flags after events. */
-    _Atomic size_t reserved;      /**< Successfully reserved event slots. */
-    _Atomic size_t committed;     /**< Slots whose payload publication completed. */
-    _Atomic size_t dropped;       /**< Events rejected after capacity is exhausted. */
+    _Alignas(64) _Atomic size_t reserved; /**< Thread-local blocks claimed globally. */
+    _Atomic size_t committed;     /**< Published payloads, compacted at finalization. */
+    _Atomic size_t dropped;       /**< Events rejected or truncated at logical capacity. */
     _Atomic size_t active_writers;/**< Writers admitted before DISABLED. */
-    _Atomic PeakMemLogState state;/**< UNINITIALIZED, ACTIVE, DISABLED, or FINALIZED. */
-    uint64_t t0_ns;               /**< Log-open `CLOCK_MONOTONIC_RAW` time, in nanoseconds. */
-    char     tmp_path[512];       /**< Temporary mapped-file path, unlinked after export. */
+    _Alignas(64) _Atomic PeakMemLogState state; /**< Log lifecycle gate. */
+    uint64_t t0_ns;               /**< Log-open `CLOCK_MONOTONIC` time, in nanoseconds. */
+    char     tmp_path[512];       /**< Temporary reservation path, unlinked after export. */
     char     csv_path[512];       /**< Final CSV output path. */
     char     otf2_prefix[512];    /**< Final OTF2 archive prefix for this rank and process. */
 } PeakMemLog;
@@ -107,9 +110,10 @@ extern "C" {
 /**
  * @brief Installs allocation replacements and opens the memory log.
  *
- * The implementation prepares tracking tables and the binary log before any
- * replacement.  If replacement is only partially successful it reverts every
- * changed entry and flushes before returning a recoverable degraded outcome.
+ * The implementation prepares lock-free tracking state and the binary log
+ * before any replacement. If replacement is only partially successful it
+ * reverts every changed entry and flushes before returning a recoverable
+ * degraded outcome.
  *
  * @return PEAK_MALLOC_ATTACH_OK, PEAK_MALLOC_ATTACH_PREPARE_FAILED, or
  *         PEAK_MALLOC_ATTACH_ROLLED_BACK.  An unprovable post-mutation
@@ -159,6 +163,20 @@ typedef struct {
     int mapping_live;
 } PeakMemLogTestSnapshot;
 
+typedef struct {
+    void* (*malloc_fn)(size_t size);
+    void (*free_fn)(void* ptr);
+    void* (*realloc_fn)(void* ptr, size_t size);
+} PeakMallocTestAllocator;
+
+typedef struct {
+    size_t entry_count;
+    size_t table_bytes;
+    size_t current_bytes;
+    int pointer_tracked;
+    size_t pointer_size;
+} PeakMallocTestTrackingSnapshot;
+
 PEAK_MALLOC_TEST_API void
 peak_memlog_test_set_failure(PeakMemLogTestFailure failure);
 
@@ -186,11 +204,36 @@ peak_memlog_test_writer_is_paused(void);
 PEAK_MALLOC_TEST_API void
 peak_memlog_test_finalize(void);
 
+PEAK_MALLOC_TEST_API uint32_t
+peak_malloc_test_thread_id(void);
+
 PEAK_MALLOC_TEST_API int
 peak_malloc_test_failed_realloc_preserves_accounting(void);
 
 PEAK_MALLOC_TEST_API int
 peak_malloc_test_tracking_allocation_failure(void);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_begin(const PeakMallocTestAllocator* allocator);
+
+PEAK_MALLOC_TEST_API int
+peak_malloc_test_seed(void* ptr, size_t size);
+
+PEAK_MALLOC_TEST_API void*
+peak_malloc_test_malloc(size_t size);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_free(void* ptr);
+
+PEAK_MALLOC_TEST_API void*
+peak_malloc_test_realloc(void* ptr, size_t size);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_tracking_snapshot(void* ptr,
+                                   PeakMallocTestTrackingSnapshot* out);
+
+PEAK_MALLOC_TEST_API void
+peak_malloc_test_end(void);
 #endif
 
 /** @} */

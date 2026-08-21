@@ -435,8 +435,17 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_MEMORY_PROFILE` | Enable experimental Linux memory allocation profiling for selected CPU targets. Rejected on macOS. |
 | `PEAK_MEMORY_TRACK_ALL` | On Linux, track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |
-| `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed event capacity. A positive decimal value allocates that many slots once; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
+| `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed export capacity. A positive decimal value reserves that many events plus at most one 64-event reservation block of slack per tracked thread; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |
+
+Allocation lifetimes are tracked in a lock-free pointer radix. Memory events
+use sharded ordering metadata, and their process-wide `current` totals and
+maximum are reconstructed after allocation hooks quiesce. Concurrent
+allocation calls therefore neither acquire a process-wide tracking lock nor
+update a single process-wide byte counter on the hot path. On Linux, PEAK
+initializes the fixed anonymous event buffer before installing hooks, so event
+writes incur neither first-write faults nor parallel-filesystem dirty-page
+bookkeeping on the allocation hot path.
 
 ### Legacy Controls
 
