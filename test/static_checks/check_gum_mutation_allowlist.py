@@ -25,6 +25,7 @@ EXPECTED = {
         "begin_transaction": 1,
         "end_transaction": 2,
         "flush": 1,
+        "replace": 1,
         "replace_fast": 2,
         "revert": 6,
     },
