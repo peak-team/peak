@@ -587,7 +587,7 @@ typedef guint8 PeakGumInterceptorType17;
 typedef struct _PeakGumInterceptorBackend17 PeakGumInterceptorBackend17;
 typedef struct _PeakGumFunctionContext17 PeakGumFunctionContext17;
 typedef union _PeakGumFunctionContextBackendData17 PeakGumFunctionContextBackendData17;
-#if defined(__x86_64__) || defined(__amd64__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
 typedef struct _GumInterceptorBackend GumInterceptorBackend;
 
 G_GNUC_INTERNAL gpointer
@@ -723,6 +723,53 @@ typedef struct _PeakGumInterceptor17 {
     PeakGumInterceptorTransaction17 current_transaction;
     gpointer unwind_broker;
 } PeakGumInterceptor17;
+
+#if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
+gboolean
+gum_interceptor_peak_resolve_redirect_chain(
+    GumInterceptor * interceptor,
+    gpointer function_address,
+    gpointer * resolved_address)
+{
+    PeakGumInterceptor17 * private_interceptor;
+    gpointer visited[64];
+    gpointer current;
+    guint depth;
+
+    if (interceptor == NULL || function_address == NULL ||
+        resolved_address == NULL) {
+        return FALSE;
+    }
+
+    private_interceptor = (PeakGumInterceptor17 *)interceptor;
+    if (private_interceptor->backend == NULL) {
+        return FALSE;
+    }
+
+    current = function_address;
+    for (depth = 0; depth != G_N_ELEMENTS(visited); ++depth) {
+        gpointer next;
+        guint previous;
+
+        visited[depth] = current;
+        next = _gum_interceptor_backend_resolve_redirect(
+            (GumInterceptorBackend *)private_interceptor->backend,
+            current);
+        if (next == NULL) {
+            *resolved_address = current;
+            return TRUE;
+        }
+        for (previous = 0; previous <= depth; ++previous) {
+            if (visited[previous] == next) {
+                return FALSE;
+            }
+        }
+        current = next;
+    }
+
+    return FALSE;
+}
+#endif
 
 union _PeakGumFunctionContextBackendData17 {
     gchar storage[3 * GLIB_SIZEOF_VOID_P];

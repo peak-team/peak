@@ -9,7 +9,7 @@ set(PEAK_PATCHED_GUM_INCLUDE_DIR "" CACHE PATH
 set(PEAK_PATCHED_GUM_LIBRARY "" CACHE FILEPATH
     "Static library for a PEAK-patched Frida Gum devkit")
 option(PEAK_REQUIRE_GUM_PEAK_API
-    "Require the selected Frida Gum headers to expose PEAK PC classification and x86 exact-entry APIs"
+    "Require the selected Frida Gum headers to expose PEAK PC classification and exact-entry APIs"
     OFF)
 
 macro(fetch_frida_gum _download_module_path _download_root)
@@ -389,8 +389,10 @@ int main(void)
 #include <frida-gum.h>
 
 #if !defined(GUM_PEAK_EXACT_ATTACH_API_VERSION) || \
-    GUM_PEAK_EXACT_ATTACH_API_VERSION != 1
-#error Missing PEAK exact-attach API
+    GUM_PEAK_EXACT_ATTACH_API_VERSION != 1 || \
+    !defined(GUM_PEAK_REDIRECT_RESOLVER_API_VERSION) || \
+    GUM_PEAK_REDIRECT_RESOLVER_API_VERSION != 1
+#error Missing PEAK exact-entry APIs
 #endif
 
 int main(void)
@@ -402,7 +404,11 @@ int main(void)
         const GumAttachOptions *);
     PeakAttachExactFunc volatile attach_exact =
         gum_interceptor_peak_attach_exact;
-    return attach_exact == NULL;
+    typedef gboolean (*PeakResolveRedirectFunc)(
+        GumInterceptor *, gpointer, gpointer *);
+    PeakResolveRedirectFunc volatile resolve_redirect =
+        gum_interceptor_peak_resolve_redirect_chain;
+    return attach_exact == NULL || resolve_redirect == NULL;
 }
 ")
     unset(PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API CACHE)
@@ -411,11 +417,11 @@ int main(void)
 
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_processor)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-       _peak_processor MATCHES "^(x86_64|amd64)$" AND
+       _peak_processor MATCHES "^(x86_64|amd64|aarch64|arm64)$" AND
        NOT PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API)
         message(FATAL_ERROR
-            "The selected PEAK-patched Frida Gum devkit does not expose the x86 exact-entry attach API. "
-            "Use the current auto-patched devkit, or rebuild the caller-provided devkit with GUM_PEAK_EXACT_ATTACH_API_VERSION=1 and gum_interceptor_peak_attach_exact().")
+            "The selected PEAK-patched Frida Gum devkit does not expose the exact-entry attach and redirect-resolution APIs for this architecture. "
+            "Use the current auto-patched devkit, or rebuild the caller-provided devkit with the current PEAK Gum API overlay.")
     endif()
 
     set(CMAKE_REQUIRED_INCLUDES "${_saved_required_includes}")

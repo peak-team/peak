@@ -40,7 +40,14 @@ def main():
     source_cmake = read(root, "src/CMakeLists.txt")
     tests_cmake = read(root, "test/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
+    detach_runtime_cmake = read(root, "test/detach_runtime/CMakeLists.txt")
     dlopen_tests_cmake = read(root, "test/dlopen_controller/CMakeLists.txt")
+    exact_attach_test = read(
+        root, "test/detach_runtime/test_gum_exact_attach_aarch64.c"
+    )
+    exact_attach_fixture = read(
+        root, "test/detach_runtime/gum_exact_attach_aarch64.S"
+    )
 
     require("peak_exec_configure_platform_support()" in top_cmake and
             "set(PEAK_DETACH_HELPER_SUPPORTED" not in top_cmake,
@@ -152,6 +159,19 @@ def main():
     require("test_gum_raw_syscall_aarch64" in dlopen_tests_cmake and
             "test_gum_module_sync_idle_quiesce" in dlopen_tests_cmake,
             "Arm64 raw syscall and idle module-sync quiesce regressions must remain enabled")
+    require("test_gum_exact_attach_aarch64" in detach_runtime_cmake and
+            "PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE" in detach_runtime_cmake,
+            "Linux Arm64 exact attach execution test must remain enabled")
+    require("gum_interceptor_peak_attach_exact" in exact_attach_test and
+            "peak_test_exact_entry_one" in exact_attach_test and
+            "peak_test_exact_entry_two" in exact_attach_test and
+            "peak_test_exact_dispatch" in exact_attach_test and
+            "gum_interceptor_detach" in exact_attach_test,
+            "Arm64 exact attach test must cover distinct entries, the shared "
+            "dispatcher, and detach")
+    require(exact_attach_fixture.count("b peak_test_exact_dispatch") == 2,
+            "Arm64 exact attach fixture must expose two tail-branch entries "
+            "sharing one dispatcher")
 
     for rel in [
         "test/detach_controller/test_detach_controller.c",

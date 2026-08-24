@@ -833,13 +833,15 @@ def check_x86_patched_gum_requires_exact_attach(repo_root):
     require(match is not None, "missing patched Gum API validation function")
     validate = match.group(0)
     exact_probe = validate.find("PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API")
-    x86_guard = validate.find('MATCHES "^(x86_64|amd64)$"', exact_probe)
-    fatal = validate.find("message(FATAL_ERROR", x86_guard)
-    require(exact_probe != -1 and x86_guard != -1 and fatal != -1 and
-            exact_probe < x86_guard < fatal and
+    linux_guard = validate.find(
+        'MATCHES "^(x86_64|amd64|aarch64|arm64)$"', exact_probe)
+    fatal = validate.find("message(FATAL_ERROR", linux_guard)
+    require(exact_probe != -1 and linux_guard != -1 and fatal != -1 and
+            exact_probe < linux_guard < fatal and
             "NOT PEAK_GUM_HAS_PEAK_EXACT_ATTACH_API" in
-            validate[x86_guard:fatal],
-            "Linux x86 PEAK-patched Gum must fail configuration without exact-entry attach")
+            validate[linux_guard:fatal] and
+            "GUM_PEAK_REDIRECT_RESOLVER_API_VERSION" in validate,
+            "supported Linux PEAK-patched Gum must require exact-entry and redirect-resolution APIs")
 
 
 def check_fast_listener_unwind_abi(repo_root):

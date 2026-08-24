@@ -75,9 +75,11 @@ EXPECTED = {
         "begin_transaction": 1,
         "end_transaction": 1,
         "replace_fast": 10,
+        "revert": 5,
     },
     ("support-shutdown-debt", "src/cuda_interceptor.cpp"): {
         "begin_transaction": 1,
+        "detach": 2,
         "end_transaction": 1,
         "flush": 1,
         "revert": 10,

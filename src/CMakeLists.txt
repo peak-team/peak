@@ -137,6 +137,10 @@ endif()
 if(BUILD_TESTS OR BUILD_TESTING)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
+    if(TARGET cuda_interceptor_obj)
+        target_compile_definitions(cuda_interceptor_obj
+            PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
+    endif()
 endif()
 
 if (CUDA_FOUND OR CUDAToolkit_FOUND)

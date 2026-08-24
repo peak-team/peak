@@ -431,12 +431,84 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_GPU_TARGET` | Comma-separated demangled base kernel names. |
 | `PEAK_GPU_TARGET_FILE` | File containing one GPU kernel name per line. |
 | `PEAK_GPU_MONITOR_ALL` | Profile every observed GPU kernel. |
-| `PEAK_CUDA_EVENT_POOL_CAPACITY` | CUDA event-pool capacity. Default: `256` events; accepts `1` through `65536`. |
+| `PEAK_CUDA_EVENT_POOL_CAPACITY` | Maximum in-flight CUDA timing samples. Each fixed slot owns one start/end event pair. Default: `256`; accepts `1` through `65536`. |
+| `PEAK_CUDA_FINALIZATION_TIMEOUT_MS` | Maximum time for bounded CUDA timing completion at report or detach. Default: `1000`; accepts `1` through `60000`. |
 | `PEAK_MEMORY_PROFILE` | Enable experimental Linux memory allocation profiling for selected CPU targets. Rejected on macOS. |
 | `PEAK_MEMORY_TRACK_ALL` | On Linux, track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |
 | `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed export capacity. A positive decimal value reserves that many events plus at most one 64-event reservation block of slack per tracked thread; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |
+
+CUDA timing uses one process-wide, fixed-capacity slot pool partitioned by CUDA
+context. An event pair is created and reused only in its owning context, after
+the previous end event reports completion. Slot allocation, launch accounting,
+and producer-to-harvester handoff are partitioned across fixed shards, so
+concurrent launch wrappers do not acquire a process-wide lock or update one
+shared queue position. A dedicated helper harvests a bounded number of ready
+samples without making launch wrappers wait. Neither the launch path nor
+finalization calls a device, stream, or context-wide synchronization API. PEAK
+initializes the CUDA backend and helper only when
+`PEAK_GPU_TARGET`, `PEAK_GPU_TARGET_FILE`, or `PEAK_GPU_MONITOR_ALL` explicitly
+requests GPU profiling; CPU-only profiling does not load the Driver API or
+create an idle CUDA helper.
+
+When the complete typed Driver launch surface is available, PEAK times Runtime
+launches at the corresponding Driver entry point and does not install a second
+Runtime launch replacement. This keeps mixed Runtime/Driver coverage and exact
+one-sample accounting without sending each Runtime launch through two Gum
+dispatches. Driver timing records events through the Driver API, including
+when the intercepted Driver launch originated in the Runtime, so the wrapper
+does not re-enter the Runtime API from inside a Runtime launch. If that Driver
+surface is incomplete, PEAK retains the Runtime launch replacements as the
+compatibility path.
+
+The CUDA report distinguishes launches that entered profiler accounting
+(`observed`), timing samples that were successfully recorded and queued
+(`accepted`), and samples whose elapsed time was harvested (`completed`). Pool
+exhaustion skips only the timing sample and increments `pool_full`; the
+application launch still runs. This makes `accepted` the sustainable-sampling
+count when launches outpace the fixed pool and harvester. Reports also carry
+`pool_high_water`, `identity_full`, `harvester_unavailable`, event
+creation/record/query/elapsed failures, capture-query failures,
+context-query/switch/restore failures, `unsupported_multi_device`,
+`dimension_overflow`, and finalization timeout/incomplete counts through the
+normal local, socket, or MPI report transport. CUDA kernel `Calls` and timing
+averages describe harvested completed samples, not all application launches
+when any sample was skipped or dropped.
+Kernel and graph identities are also process-bounded; new graph handles beyond
+four times the event-pool capacity increment `identity_full` instead of growing
+the aggregate map.
+
+Runtime and Driver capture lifecycle listeners close a sharded timing-admission
+gate before a capture transition and reopen it only after capture quiescence is
+proven. Launch wrappers therefore do not repeat a Driver capture query for each
+target. Active capture, incomplete capture interception, or a capture-query
+error keeps the gate closed and skips timing without recording events into the
+captured stream. Cooperative
+multi-device launch APIs are also passed through without timing because one
+reusable event pair cannot safely represent multiple device contexts. These
+skips are reported and do not change the application launch. The dedicated
+capture lifecycle listeners cover both legacy-stream and per-thread-default
+entry points. Before timing opens, PEAK validates the Driver's known capture
+entry-point variants; incomplete interception or an uninstrumented returned
+pointer disables CUDA timing while leaving application CUDA calls unchanged.
+Driver launch timing is likewise disabled for ABI-generic redirect stubs that
+cannot safely receive typed replacements. The dedicated
+harvester enters CUDA's relaxed thread-local capture interaction mode before
+timing admission opens, so it can query PEAK events recorded before an
+unrelated concurrent global capture without invalidating that capture. The
+one-time cold handshake is requested by the first matching CUDA launch; attach
+and non-target launches do not initialize CUDA. Matching launches pass through
+without waiting while the helper is initializing, and increment
+`harvester_unavailable`. If the mode cannot be established, CUDA timing remains
+disabled and launches continue to pass through unchanged.
+
+At report or detach, PEAK stops admitting CUDA samples and lets the harvester
+run until the configured monotonic deadline. If work remains, PEAK reports the
+incomplete count, logs bounded context/device diagnostics, and retains the
+affected event state instead of destroying an event in the wrong or unfinished
+context. That retained state remains process-owned until operating-system
+reclamation, so a blocked CUDA query cannot race library teardown.
 
 Allocation lifetimes are tracked in a lock-free pointer radix. Memory events
 use sharded ordering metadata, and their process-wide `current` totals and
@@ -492,8 +564,8 @@ toolchains and host capabilities detected during configuration.
 - `PEAK_TARGET`, `PEAK_TARGET_GROUP`, and `PEAK_TARGET_FILE` are merged;
   duplicate entries are handled automatically but are best avoided.
 - CUDA profiling includes first-use initialization and kernel warm-up effects.
-  CUDA graphs may be reported as graph execution or as captured launches,
-  depending on how the graph was created.
+  Launches issued while a stream is being captured are not timed; later graph
+  execution outside capture can be reported as graph execution.
 - JIT targets require runtime metadata; PEAK does not infer names or boundaries
   from anonymous executable pages.
 - Strict detach backend availability depends on platform signal support and,
