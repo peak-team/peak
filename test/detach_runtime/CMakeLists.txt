@@ -152,3 +152,27 @@ target_link_libraries(test_unsafe_gum_prologue_policy
     ${RT_LIBRARY}
     ${M_LIBRARY}
 )
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND
+   PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE)
+  enable_language(ASM)
+  add_executable(test_gum_exact_attach_aarch64
+    test_gum_exact_attach_aarch64.c
+    gum_exact_attach_aarch64.S)
+  target_include_directories(test_gum_exact_attach_aarch64
+    PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
+  target_link_libraries(test_gum_exact_attach_aarch64
+    PRIVATE
+      ${FRIDA_GUM_LIBRARIES}
+      Threads::Threads
+      ${DL_LIBRARY}
+      ${RT_LIBRARY}
+      ${M_LIBRARY})
+  add_test(NAME test_gum_exact_attach_aarch64
+    COMMAND $<TARGET_FILE:test_gum_exact_attach_aarch64>)
+  set_tests_properties(test_gum_exact_attach_aarch64
+    PROPERTIES
+      TIMEOUT 15
+      PASS_REGULAR_EXPRESSION "gum_exact_attach_aarch64_ok")
+endif()
