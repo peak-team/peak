@@ -1178,7 +1178,7 @@ def main() -> int:
     if args.nm is None or args.objcopy is None:
         fail("PEAK invocation dispatch patch requires --nm and --objcopy")
 
-    if machine == 62:  # EM_X86_64
+    if machine in (62, 183):  # EM_X86_64 or EM_AARCH64
         route_redirect_resolver_through_overlay(
             library,
             members,

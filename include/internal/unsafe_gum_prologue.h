@@ -8,6 +8,10 @@
 
 #include "frida-gum.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define PEAK_ALLOW_UNSAFE_GUM_PROLOGUE_ENV "PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"
 #define PEAK_UNSAFE_GUM_PROLOGUE_POLICY_ENV "PEAK_UNSAFE_GUM_PROLOGUE_POLICY"
 
@@ -65,5 +69,9 @@ peak_gum_interceptor_attach_target(GumInterceptor* interceptor,
 gboolean
 peak_unsafe_gum_support_prologue_check(gpointer address,
                                        const char** reason_out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PEAK_UNSAFE_GUM_PROLOGUE_H */
