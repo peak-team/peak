@@ -760,9 +760,17 @@ peak_freeze_capability_requests(void)
 
     manifest.compiled =
         PEAK_CAPABILITY_CPU_TARGET |
-        PEAK_CAPABILITY_STRICT_MUTATION |
         PEAK_CAPABILITY_LOCAL_REPORT |
         PEAK_CAPABILITY_SOCKET_REPORT;
+#if defined(PEAK_HAVE_GUM_PEAK_PC_API) || \
+    defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+    manifest.compiled |= PEAK_CAPABILITY_STRICT_MUTATION;
+#endif
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION") != NULL) {
+        manifest.compiled &= ~PEAK_CAPABILITY_STRICT_MUTATION;
+    }
+#endif
 #ifdef HAVE_CUDA
     manifest.compiled |= PEAK_CAPABILITY_CUDA;
     manifest.cuda_compiled_apis =
@@ -807,6 +815,12 @@ peak_disable_uncompiled_requested_work(void)
         peak_report_capability_manifest();
     uint32_t unavailable = manifest.requested & ~manifest.compiled;
 
+    if ((unavailable & PEAK_CAPABILITY_STRICT_MUTATION) != 0) {
+        peak_report_capability_note_partial(
+            PEAK_CAPABILITY_STRICT_MUTATION);
+        peak_report_capability_note_failed(
+            PEAK_CAPABILITY_STRICT_MUTATION);
+    }
     if ((unavailable & PEAK_CAPABILITY_CUDA) != 0) {
         peak_requested_work.gpu = FALSE;
         peak_report_capability_note_failed(PEAK_CAPABILITY_CUDA);
@@ -1159,9 +1173,12 @@ peak_activate_runtime(void)
      */
     if (peak_requested_work.cpu) {
         peak_general_listener_attach();
-        peak_report_capability_note_active(
-            PEAK_CAPABILITY_CPU_TARGET |
-            PEAK_CAPABILITY_STRICT_MUTATION);
+        peak_report_capability_note_active(PEAK_CAPABILITY_CPU_TARGET);
+        if ((peak_report_capability_manifest().compiled &
+             PEAK_CAPABILITY_STRICT_MUTATION) != 0) {
+            peak_report_capability_note_active(
+                PEAK_CAPABILITY_STRICT_MUTATION);
+        }
     }
 #if !defined(__APPLE__)
     gboolean need_dynamic_attach = peak_requested_work.cpu &&

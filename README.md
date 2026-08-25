@@ -291,12 +291,14 @@ the selected output transport. Each row distinguishes `requested`, `compiled`,
 include stable masks for compiled, found, installed, and failed API families.
 MPI and socket aggregation preserve the common installed coverage, OR
 failure/degradation evidence across ranks, and mark rank-varying coverage as
-partial. Report-transport `active` state records the transport that actually
-published that report; a fallback marks the requested transport partial and
-failed while marking the rank-local or socket fallback active. An unavailable
-requested optional backend fails open: PEAK emits one warning, records the
-failed capability, and continues the application and any independently
-installed profiler backends.
+partial. Report-transport `active` state records the transport selected for
+the final report after fallback; a fallback marks the requested transport
+partial and failed while marking the rank-local or socket fallback active. An
+unavailable requested optional backend fails open: PEAK emits one warning,
+records the failed capability, and continues the application and any
+independently installed profiler backends. CPU target profiling remains active
+when strict mutation support is not compiled, while `strict-mutation` is
+reported partial and failed.
 
 ### MPI Output
 

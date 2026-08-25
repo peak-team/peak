@@ -119,6 +119,7 @@ def run_partial_capability(args: argparse.Namespace, directory: Path) -> None:
         profiled_environment(
             args.peak,
             PEAK_GPU_MONITOR_ALL="1",
+            PEAK_HEARTBEAT_INTERVAL="0.1",
             PEAK_TEST_FAIL_CUDA_REPLACEMENT="cudaLaunchKernel",
         ),
         30.0,

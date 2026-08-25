@@ -207,6 +207,18 @@ if(BUILD_TESTING)
             PROPERTIES
                 ENVIRONMENT "PEAK_GPU_MONITOR_ALL=1;PEAK_TEST_HIDE_COMPILED_CUDA=1;${PRELOAD_VAR}"
                 TIMEOUT 15)
+
+        add_test(NAME test_uncompiled_strict_mutation_capability
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                    --exit-code 0
+                    --stdout-regex "failed_mask=0x2 runtime_active=1 heartbeat_started=0"
+                    --stderr-regex "Profiler capability \\[strict-mutation\\]: requested=1 compiled=0 active=0 partial=1 retained=0 failed=1"
+                    -- $<TARGET_FILE:test_uncompiled_backend_gating>)
+        set_tests_properties(test_uncompiled_strict_mutation_capability
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0;PEAK_TEXT_OUTPUT=1;PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION=1;${PRELOAD_VAR}"
+                TIMEOUT 15)
     endif()
 
     add_executable(test_report_snapshot_cxx_link
