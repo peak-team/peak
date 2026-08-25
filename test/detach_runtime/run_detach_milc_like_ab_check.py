@@ -29,14 +29,33 @@ STATS_CSV_FIELDS = (
     "overhead_s",
     "dropped_calls",
     "dropped_threads",
+    "capability_requested",
+    "capability_compiled",
+    "capability_active",
+    "capability_partial",
+    "capability_retained",
+    "capability_failed",
+    "cuda_compiled_apis",
+    "cuda_found_apis",
+    "cuda_installed_apis",
+    "cuda_failed_apis",
+    "degraded_mask",
 )
 PEAK_STATS_NAME_RE = re.compile(
     r"^milc-like-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
     r"h[A-Za-z0-9_.-]+-r[A-Za-z0-9_-]+-p\d+-q[0-9a-f]{16}\.csv$"
 )
 STATS_CSV_METRIC_FIELDS = STATS_CSV_FIELDS[4:11]
-STATS_CSV_DIAGNOSTIC_FIELDS = STATS_CSV_FIELDS[11:]
+STATS_CSV_DIAGNOSTIC_FIELDS = ("dropped_calls", "dropped_threads")
+STATS_CSV_CAPABILITY_FIELDS = STATS_CSV_FIELDS[13:]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
+CAPABILITY_METADATA_FUNCTION_RE = re.compile(
+    r"^PEAK_CAPABILITY_[a-z-]+$"
+)
+CAPABILITY_METADATA_FUNCTIONS = {
+    "PEAK_CUDA_API_COVERAGE",
+    "PEAK_DEGRADED_CAPABILITIES",
+}
 HOT_TARGETS = [
     f"peak_milc_hot_{phase}_s{slot:02d}"
     for phase in range(TARGET_PHASES)
@@ -922,6 +941,29 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
                     for field in STATS_CSV_FIELDS)):
             raise AssertionError(f"stats CSV row has missing/extra values: {row}")
         function = row["function"]
+        if (CAPABILITY_METADATA_FUNCTION_RE.fullmatch(function) or
+                function in CAPABILITY_METADATA_FUNCTIONS):
+            if function in seen:
+                raise AssertionError(
+                    f"duplicate stats CSV metadata row: {function!r}"
+                )
+            for field in STATS_CSV_FIELDS[1:13]:
+                try:
+                    if float(row[field]) != 0.0:
+                        raise AssertionError(
+                            f"nonzero metadata metric {field}: {row}"
+                        )
+                except ValueError as exc:
+                    raise AssertionError(
+                        f"invalid metadata metric {field}: {row}"
+                    ) from exc
+            for field in STATS_CSV_CAPABILITY_FIELDS:
+                if not re.fullmatch(r"[0-9]+", row[field]):
+                    raise AssertionError(
+                        f"invalid capability metadata {field}: {row}"
+                    )
+            seen.add(function)
+            continue
         if function == ACCOUNTING_DIAGNOSTICS_FUNCTION:
             if diagnostics is not None:
                 raise AssertionError("duplicate accounting diagnostics row")

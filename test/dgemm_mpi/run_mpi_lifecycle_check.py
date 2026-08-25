@@ -86,8 +86,25 @@ STATS_FIELDS = [
     "overhead_s",
     "dropped_calls",
     "dropped_threads",
+    "capability_requested",
+    "capability_compiled",
+    "capability_active",
+    "capability_partial",
+    "capability_retained",
+    "capability_failed",
+    "cuda_compiled_apis",
+    "cuda_found_apis",
+    "cuda_installed_apis",
+    "cuda_failed_apis",
+    "degraded_mask",
 ]
+STATS_ACCOUNTING_FIELDS = ["dropped_calls", "dropped_threads"]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
+CAPABILITY_METADATA_FUNCTION_RE = re.compile(r"^PEAK_CAPABILITY_[a-z-]+$")
+CAPABILITY_METADATA_FUNCTIONS = {
+    "PEAK_CUDA_API_COVERAGE",
+    "PEAK_DEGRADED_CAPABILITIES",
+}
 SOCKET_TEST_PORT_MIN = 20000
 SOCKET_TEST_PORT_MAX = 30000
 SOCKET_TEST_PORT_ATTEMPTS = 128
@@ -189,19 +206,25 @@ def require_valid_accounting_diagnostics(name, rows):
                 raise AssertionError(
                     f"invalid accounting diagnostics metric {field}: {name}"
                 ) from exc
-        for field in STATS_FIELDS[11:]:
+        for field in STATS_ACCOUNTING_FIELDS:
             if not re.fullmatch(r"[0-9]+", row.get(field, "") or ""):
                 raise AssertionError(
                     f"invalid accounting diagnostic {field}: {name}"
                 )
-        diagnostics_values = tuple(int(row[field]) for field in STATS_FIELDS[11:])
+        diagnostics_values = tuple(
+            int(row[field]) for field in STATS_ACCOUNTING_FIELDS
+        )
 
     target_values = None
     for row in rows:
         if row.get("function") == ACCOUNTING_DIAGNOSTICS_FUNCTION:
             continue
+        function = row.get("function", "")
+        if (CAPABILITY_METADATA_FUNCTION_RE.fullmatch(function) or
+                function in CAPABILITY_METADATA_FUNCTIONS):
+            continue
         values = []
-        for field in STATS_FIELDS[11:]:
+        for field in STATS_ACCOUNTING_FIELDS:
             value = row.get(field, "") or ""
             if not re.fullmatch(r"[0-9]+", value):
                 raise AssertionError(
@@ -232,10 +255,11 @@ def require_valid_accounting_diagnostics(name, rows):
 
 def run_synthetic_stats_diagnostics():
     def row(function, dropped_calls="0", dropped_threads="0"):
-        return dict(zip(
-            STATS_FIELDS,
-            [function] + ["0"] * 10 + [dropped_calls, dropped_threads],
-        ))
+        values = {field: "0" for field in STATS_FIELDS}
+        values["function"] = function
+        values["dropped_calls"] = dropped_calls
+        values["dropped_threads"] = dropped_threads
+        return values
 
     def expect_assertion(label, callback):
         try:
