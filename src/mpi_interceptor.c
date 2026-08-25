@@ -513,18 +513,6 @@ mpi_interceptor_call_original_finalize_once(void)
 {
     int direct_finalize = mpi_interceptor_direct_finalize_enabled();
 
-    if (!mpi_interceptor_real_finalize_enabled() ||
-        !__atomic_load_n(&peak_real_finalize_allowed, __ATOMIC_ACQUIRE)) {
-        mpi_interceptor_finalize_publish_done(0);
-        return 0;
-    }
-
-    if (original_pmpi_finalize == NULL &&
-        (!direct_finalize || hook_address == NULL)) {
-        mpi_interceptor_finalize_publish_done(0);
-        return 0;
-    }
-
     for (;;) {
         int state = __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE);
 
@@ -553,6 +541,15 @@ mpi_interceptor_call_original_finalize_once(void)
                 __ATOMIC_ACQ_REL,
                 __ATOMIC_ACQUIRE)) {
             continue;
+        }
+
+        if (!mpi_interceptor_real_finalize_enabled() ||
+            !__atomic_load_n(&peak_real_finalize_allowed,
+                             __ATOMIC_ACQUIRE) ||
+            (original_pmpi_finalize == NULL &&
+             (!direct_finalize || hook_address == NULL))) {
+            mpi_interceptor_finalize_publish_done(0);
+            return 0;
         }
 
         int result = 0;

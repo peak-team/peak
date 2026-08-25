@@ -122,8 +122,8 @@ main(int argc, char** argv)
               stderr);
         return 3;
     }
-    (void)call_original_finalize_once();
-    if (original_finalize_call_count() != 0) {
+    result = call_original_finalize_once();
+    if (result == 0 || original_finalize_call_count() != 0) {
         fputs("mpi_finalize_owner_timeout_error real MPI call after timeout\n",
               stderr);
         return 4;
