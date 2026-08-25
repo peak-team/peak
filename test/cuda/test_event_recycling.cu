@@ -30,9 +30,13 @@ int
 main()
 {
     using PeakCpuTargetStorageFn = int (*)(void);
+    using PeakHeartbeatStartedFn = int (*)(void);
     PeakCpuTargetStorageFn cpu_target_storage =
         reinterpret_cast<PeakCpuTargetStorageFn>(dlsym(
             RTLD_DEFAULT, "peak_test_cpu_target_storage_allocated"));
+    PeakHeartbeatStartedFn heartbeat_started =
+        reinterpret_cast<PeakHeartbeatStartedFn>(dlsym(
+            RTLD_DEFAULT, "peak_test_heartbeat_started"));
     int requirement = peak_cuda_test_require_devices(1, nullptr);
     if (requirement != 0) {
         return requirement;
@@ -85,8 +89,9 @@ main()
 
     std::printf("cuda_event_recycling_ok capacity=%d launches=%d "
                 "late_marker=1 per_launch_synchronizations=0 result=%u "
-                "cpu_target_storage=%d\n",
+                "cpu_target_storage=%d heartbeat_started=%d\n",
                 kPoolCapacity, kSustainedLaunches + 1, value,
-                cpu_target_storage != nullptr ? cpu_target_storage() : -1);
+                cpu_target_storage != nullptr ? cpu_target_storage() : -1,
+                heartbeat_started != nullptr ? heartbeat_started() : -1);
     return 0;
 }

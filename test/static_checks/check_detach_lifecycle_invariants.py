@@ -193,15 +193,24 @@ def check_darwin_strict_lifecycle(repo_root):
     memory_parse = init.find(
         "peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE)"
     )
-    memory_reject = init.find("rejecting PEAK_MEMORY_PROFILE on macOS")
+    memory_request = init.find(
+        "peak_requested_work.memory = peak_memory_profile"
+    )
+    capability_freeze = init.find("peak_freeze_capability_requests()")
+    unavailable_disable = init.find(
+        "peak_disable_uncompiled_requested_work()"
+    )
     requested_work = init.find("gboolean has_requested_work")
-    require(0 <= memory_parse < memory_reject < requested_work and
-            "peak_memory_profile = false;" in
-            init[memory_reject:requested_work] and
-            "peak_memory_track_all = false;" in
-            init[memory_reject:requested_work],
-            "macOS must reject memory profiling before deciding whether any "
-            "supported work was requested")
+    disable_uncompiled = extract_function(
+        peak, "peak_disable_uncompiled_requested_work"
+    )
+    require(0 <= memory_parse < memory_request < capability_freeze <
+            unavailable_disable < requested_work and
+            "peak_requested_work.memory = FALSE;" in disable_uncompiled and
+            "peak_memory_profile = FALSE;" in disable_uncompiled and
+            "peak_memory_track_all = FALSE;" in disable_uncompiled,
+            "unsupported memory profiling must remain requested in the "
+            "manifest, then be removed from work-to-activate")
 
     dynamic_attach = activation.find("dlopen_interceptor_attach()")
     dynamic_attach_guard = activation.rfind(

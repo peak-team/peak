@@ -767,6 +767,12 @@ peak_freeze_capability_requests(void)
     manifest.compiled |= PEAK_CAPABILITY_CUDA;
     manifest.cuda_compiled_apis =
         cuda_interceptor_compiled_api_mask();
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (getenv("PEAK_TEST_HIDE_COMPILED_CUDA") != NULL) {
+        manifest.compiled &= ~PEAK_CAPABILITY_CUDA;
+        manifest.cuda_compiled_apis = 0;
+    }
+#endif
 #endif
 #if !defined(__APPLE__)
     manifest.compiled |=
@@ -794,6 +800,38 @@ peak_freeze_capability_requests(void)
     peak_report_capability_reset(&manifest);
 }
 
+static void
+peak_disable_uncompiled_requested_work(void)
+{
+    PeakProfilerCapabilityManifest manifest =
+        peak_report_capability_manifest();
+    uint32_t unavailable = manifest.requested & ~manifest.compiled;
+
+    if ((unavailable & PEAK_CAPABILITY_CUDA) != 0) {
+        peak_requested_work.gpu = FALSE;
+        peak_report_capability_note_failed(PEAK_CAPABILITY_CUDA);
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_CUDA,
+            "requested CUDA backend is not compiled into this PEAK build");
+    }
+    if ((unavailable & PEAK_CAPABILITY_MEMORY) != 0) {
+        peak_requested_work.memory = FALSE;
+        peak_memory_profile = FALSE;
+        peak_memory_track_all = FALSE;
+        peak_report_capability_note_failed(PEAK_CAPABILITY_MEMORY);
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
+            "requested memory backend is not compiled into this PEAK build");
+    }
+    if ((unavailable & PEAK_CAPABILITY_JIT) != 0) {
+        peak_requested_work.jit = FALSE;
+        peak_report_capability_note_failed(PEAK_CAPABILITY_JIT);
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_JIT,
+            "requested JIT backend is not compiled into this PEAK build");
+    }
+}
+
 static uint32_t
 peak_output_capability(PeakOutputAggregationMode mode)
 {
@@ -804,20 +842,6 @@ peak_output_capability(PeakOutputAggregationMode mode)
         return PEAK_CAPABILITY_SOCKET_REPORT;
     }
     return PEAK_CAPABILITY_LOCAL_REPORT;
-}
-
-static void
-peak_note_output_capability(PeakOutputAggregationMode actual)
-{
-    const uint32_t requested =
-        peak_output_capability(peak_requested_output_aggregation);
-    const uint32_t active = peak_output_capability(actual);
-
-    peak_report_capability_note_active(active);
-    if (requested != active) {
-        peak_report_capability_note_partial(requested);
-        peak_report_capability_note_failed(requested);
-    }
 }
 
 #ifdef HAVE_MPI
@@ -1000,6 +1024,7 @@ static void
 peak_activate_runtime(void)
 {
     int expected = PEAK_RUNTIME_ACTIVATION_READY;
+    gboolean jit_provider_active = FALSE;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
     peak_test_activation_pause_before_claim();
@@ -1111,7 +1136,8 @@ peak_activate_runtime(void)
 #if !defined(__APPLE__)
     if (peak_requested_work.jit) {
         peak_jit_provider_enable();
-        if (peak_jit_provider_is_active()) {
+        jit_provider_active = peak_jit_provider_is_active();
+        if (jit_provider_active) {
             peak_report_capability_note_active(PEAK_CAPABILITY_JIT);
         } else {
             peak_report_capability_note_failed(PEAK_CAPABILITY_JIT);
@@ -1152,7 +1178,7 @@ peak_activate_runtime(void)
 #endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
-    if (heartbeat_time != 0) {
+    if (peak_requested_work.cpu && heartbeat_time != 0) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         if (getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL) {
             heartbeat_overhead = NULL;
@@ -1175,7 +1201,7 @@ peak_activate_runtime(void)
             heartbeat_time = 0;
         }
     }
-    if (heartbeat_time != 0) {
+    if (peak_requested_work.cpu && heartbeat_time != 0) {
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
         args->hb_min_us = hb_min_us;
@@ -1199,7 +1225,7 @@ peak_activate_runtime(void)
             peak_report_capability_note_active(PEAK_CAPABILITY_MEMORY);
         }
     }
-    if (peak_requested_work.cpu || peak_requested_work.jit) {
+    if (peak_requested_work.cpu || jit_provider_active) {
         peak_general_listener_controller_start();
     }
 #if !defined(__APPLE__)
@@ -1208,7 +1234,7 @@ peak_activate_runtime(void)
         peak_report_capability_note_active(PEAK_CAPABILITY_DYNAMIC_DSO);
     }
 #endif
-    if (heartbeat_time != 0) {
+    if (peak_requested_work.cpu && heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
@@ -1332,6 +1358,26 @@ peak_test_parse_max_num_threads(void)
 {
     return peak_parse_max_num_threads();
 }
+
+PEAK_API uint32_t
+peak_test_capability_failed_mask(void)
+{
+    return peak_report_capability_manifest().failed;
+}
+
+PEAK_API int
+peak_test_runtime_active(void)
+{
+    return atomic_load_explicit(&peak_runtime_active,
+                                memory_order_acquire);
+}
+
+PEAK_API int
+peak_test_heartbeat_started(void)
+{
+    return atomic_load_explicit(&peak_heartbeat_started,
+                                memory_order_acquire);
+}
 #endif
 
 void peak_init()
@@ -1373,24 +1419,13 @@ void peak_init()
     hb_ema_a = numeric_config.heartbeat_ema_alpha;
     peak_memory_profile = parse_env_to_bool(PEAK_MEMORY_PROFILE);
     peak_memory_track_all = parse_env_to_bool(PEAK_MEMORY_TRACK_ALL);
-#if defined(__APPLE__)
-    if (peak_memory_profile) {
-        peak_log_warn(
-            "[peak] rejecting PEAK_MEMORY_PROFILE on macOS; only named CPU profiling is supported\n");
-    }
-    peak_memory_profile = false;
-    peak_memory_track_all = false;
-#endif
     peak_requested_work.cpu = peak_hook_address_count > 0;
     peak_requested_work.gpu =
         peak_gpu_hook_address_count > 0 || peak_gpu_monitor_all;
     peak_requested_work.memory = peak_memory_profile;
-#if defined(__APPLE__)
-    peak_requested_work.jit = FALSE;
-#else
     peak_requested_work.jit = peak_jit_provider_requested();
-#endif
     peak_freeze_capability_requests();
+    peak_disable_uncompiled_requested_work();
 
     gboolean has_requested_work = peak_has_requested_work();
     peak_set_process_requests_work(has_requested_work);
@@ -1628,7 +1663,6 @@ peak_fini_impl(void)
         } else if (found_MPI && mpi_collectives_failed_closed && mpi_log_rank) {
             g_printerr("[peak] PEAK MPI collective path was already failed closed; writing rank-local output without touching MPI again\n");
         }
-        peak_note_output_capability(output_mode);
         used_mpi_aggregation =
             peak_general_listener_print_with_mpi_job_policy(
                 output_mode,
@@ -1730,7 +1764,6 @@ peak_fini_impl(void)
                    mpi_log_rank) {
             g_printerr("[peak] Aggregate output was not proven safe; writing rank-local output before process exit\n");
         }
-        peak_note_output_capability(output_mode);
         used_mpi_aggregation =
             peak_general_listener_print_with_mpi_job_policy(
                 output_mode,
@@ -1899,7 +1932,6 @@ peak_fini_impl(void)
         return;
     }
 #else
-    peak_note_output_capability(PEAK_OUTPUT_AGGREGATION_LOCAL);
     (void)peak_general_listener_print(0, NULL);
     #ifdef HAVE_CUDA
     if (peak_requested_work.gpu) {

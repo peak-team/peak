@@ -187,6 +187,28 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_snapshot_test_ok")
 
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_executable(test_uncompiled_backend_gating
+            report/test_uncompiled_backend_gating.c)
+        set_target_properties(test_uncompiled_backend_gating
+            PROPERTIES ENABLE_EXPORTS ON)
+        target_link_libraries(test_uncompiled_backend_gating
+            PRIVATE ${CMAKE_DL_LIBS})
+        add_test(NAME test_uncompiled_cuda_backend_fail_open
+            COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/utils/run_expect_exit.py
+                    --exit-code 0
+                    --stdout-regex "failed_mask=0x4 runtime_active=0 heartbeat_started=0"
+                    --stderr-regex "requested CUDA backend is not compiled into this PEAK build"
+                    --stderr-count-regex "disabling non-critical profiler subsystem"
+                    --stderr-count 1
+                    -- $<TARGET_FILE:test_uncompiled_backend_gating>)
+        set_tests_properties(test_uncompiled_cuda_backend_fail_open
+            PROPERTIES
+                ENVIRONMENT "PEAK_GPU_MONITOR_ALL=1;PEAK_TEST_HIDE_COMPILED_CUDA=1;${PRELOAD_VAR}"
+                TIMEOUT 15)
+    endif()
+
     add_executable(test_report_snapshot_cxx_link
         report/test_report_snapshot_cxx_link.cpp
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c

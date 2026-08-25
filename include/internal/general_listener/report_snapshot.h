@@ -45,6 +45,11 @@ typedef enum {
     PEAK_CAPABILITY_LOCAL_REPORT    = 1u << 8,
 } PeakProfilerCapabilityMask;
 
+#define PEAK_CAPABILITY_REPORT_TRANSPORTS \
+    (PEAK_CAPABILITY_MPI_REPORT | \
+     PEAK_CAPABILITY_SOCKET_REPORT | \
+     PEAK_CAPABILITY_LOCAL_REPORT)
+
 typedef struct {
     uint32_t requested;
     uint32_t compiled;
@@ -70,6 +75,22 @@ void peak_report_capability_note_active(uint32_t mask);
 void peak_report_capability_note_partial(uint32_t mask);
 void peak_report_capability_note_retained(uint32_t mask);
 void peak_report_capability_note_failed(uint32_t mask);
+
+/**
+ * Replaces the report-transport outcome in one captured manifest.
+ *
+ * This is used to project an attempted transport into a snapshot before that
+ * snapshot is handed to the transport. A later fallback may replace the same
+ * bits without retaining a false active transport from the failed attempt.
+ */
+void peak_report_capability_manifest_set_output_outcome(
+    PeakProfilerCapabilityManifest* manifest,
+    uint32_t requested,
+    uint32_t active);
+
+/** Publishes the final report-transport outcome for later report domains. */
+void peak_report_capability_set_output_outcome(uint32_t requested,
+                                               uint32_t active);
 
 /** Stores the immutable CUDA API coverage masks produced by CUDA attach. */
 void peak_report_capability_set_cuda_apis(uint32_t compiled,

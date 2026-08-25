@@ -253,6 +253,39 @@ def require_valid_accounting_diagnostics(name, rows):
         raise AssertionError(f"accounting diagnostics mismatch: {name}")
 
 
+def require_transport_capability_outcome(name, rows, requested, active):
+    by_name = {row.get("function", ""): row for row in rows}
+    requested_row = by_name.get(f"PEAK_CAPABILITY_{requested}-report")
+    active_row = by_name.get(f"PEAK_CAPABILITY_{active}-report")
+    if requested_row is None or active_row is None:
+        raise AssertionError(f"missing transport capability rows: {name}")
+    expected_requested = {
+        "capability_requested": "1",
+        "capability_active": "0" if requested != active else "1",
+        "capability_partial": "1" if requested != active else "0",
+        "capability_failed": "1" if requested != active else "0",
+    }
+    for field, expected in expected_requested.items():
+        if requested_row.get(field) != expected:
+            raise AssertionError(
+                f"incorrect {requested} transport {field} in {name}: "
+                f"expected {expected}, got {requested_row.get(field)!r}"
+            )
+    if requested != active:
+        expected_active = {
+            "capability_requested": "0",
+            "capability_active": "1",
+            "capability_partial": "0",
+            "capability_failed": "0",
+        }
+        for field, expected in expected_active.items():
+            if active_row.get(field) != expected:
+                raise AssertionError(
+                    f"incorrect {active} fallback {field} in {name}: "
+                    f"expected {expected}, got {active_row.get(field)!r}"
+                )
+
+
 def run_synthetic_stats_diagnostics():
     def row(function, dropped_calls="0", dropped_threads="0"):
         values = {field: "0" for field in STATS_FIELDS}
@@ -1261,6 +1294,12 @@ def main():
                 stats_rows.extend(rows)
         for name, evidence in stats_file_evidence.items():
             require_valid_accounting_diagnostics(name, evidence["rows"])
+            if args.mode in {
+                    "finalize-clean-output-socket-bad-host",
+                    "finalize-clean-output-socket-token-mismatch"}:
+                require_transport_capability_outcome(
+                    name, evidence["rows"], "socket", "local"
+                )
         selected_stats_files = [
             path for path in stats_files
             if nprocs == 1 or stats_name.fullmatch(path.name)["rank"] == "0"

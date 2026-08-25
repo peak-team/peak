@@ -291,9 +291,12 @@ the selected output transport. Each row distinguishes `requested`, `compiled`,
 include stable masks for compiled, found, installed, and failed API families.
 MPI and socket aggregation preserve the common installed coverage, OR
 failure/degradation evidence across ranks, and mark rank-varying coverage as
-partial. An unavailable requested optional backend fails open: PEAK emits one
-warning, records the failed capability, and continues the application and any
-independently installed profiler backends.
+partial. Report-transport `active` state records the transport that actually
+published that report; a fallback marks the requested transport partial and
+failed while marking the rank-local or socket fallback active. An unavailable
+requested optional backend fails open: PEAK emits one warning, records the
+failed capability, and continues the application and any independently
+installed profiler backends.
 
 ### MPI Output
 
@@ -355,6 +358,9 @@ full output and teardown behavior.
 | `PEAK_HB_MIN_US`, `PEAK_HB_MAX_US` | Adaptive heartbeat sleep bounds. Defaults: `10000` and `500000` microseconds. |
 | `PEAK_HB_K_ERR`, `PEAK_HB_K_RATE` | Adaptive response coefficients. Defaults: `3.0` and `0.8`. |
 | `PEAK_HB_EMA_A` | Growth-rate EMA alpha in `(0, 1]`. Default: `0.3`. |
+
+PEAK creates the heartbeat helper only when at least one CPU target is
+requested. GPU-only, memory-only, and JIT-only workloads do not start it.
 
 Numeric overhead-control values must consume the complete value and be finite.
 Invalid present values emit one warning and use their documented default.
@@ -527,7 +533,10 @@ run until the configured monotonic deadline. If work remains, PEAK reports the
 incomplete count, logs bounded context/device diagnostics, and retains the
 affected event state instead of destroying an event in the wrong or unfinished
 context. That retained state remains process-owned until operating-system
-reclamation, so a blocked CUDA query cannot race library teardown.
+reclamation, so a blocked CUDA query cannot race library teardown. The
+capability manifest records retention decisions made before its report
+snapshot. A later physical-detach flush failure is reported by its teardown
+warning but cannot retroactively change an already published manifest.
 
 Allocation lifetimes are tracked in a lock-free pointer radix. Memory events
 use sharded ordering metadata, and their process-wide `current` totals and

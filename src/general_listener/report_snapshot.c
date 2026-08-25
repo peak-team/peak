@@ -84,6 +84,90 @@ PEAK_CAPABILITY_NOTE(peak_report_capability_note_failed,
 
 #undef PEAK_CAPABILITY_NOTE
 
+static uint32_t
+peak_report_capability_replace_mask(uint32_t value,
+                                    uint32_t mask,
+                                    uint32_t replacement)
+{
+    return (value & ~mask) | (replacement & mask);
+}
+
+void
+peak_report_capability_manifest_set_output_outcome(
+    PeakProfilerCapabilityManifest* manifest,
+    uint32_t requested,
+    uint32_t active)
+{
+    uint32_t mismatch;
+
+    if (manifest == NULL) {
+        return;
+    }
+    requested &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    active &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    mismatch = requested != active ? requested : 0;
+    manifest->requested |= requested;
+    manifest->active = peak_report_capability_replace_mask(
+        manifest->active,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        active);
+    manifest->partial = peak_report_capability_replace_mask(
+        manifest->partial,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+    manifest->failed = peak_report_capability_replace_mask(
+        manifest->failed,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+}
+
+static void
+peak_report_capability_atomic_replace_mask(_Atomic uint32_t* destination,
+                                           uint32_t mask,
+                                           uint32_t replacement)
+{
+    uint32_t observed = atomic_load_explicit(destination,
+                                             memory_order_acquire);
+
+    for (;;) {
+        uint32_t desired = peak_report_capability_replace_mask(
+            observed, mask, replacement);
+        if (atomic_compare_exchange_weak_explicit(destination,
+                                                  &observed,
+                                                  desired,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+void
+peak_report_capability_set_output_outcome(uint32_t requested,
+                                          uint32_t active)
+{
+    uint32_t mismatch;
+
+    requested &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    active &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    mismatch = requested != active ? requested : 0;
+    atomic_fetch_or_explicit(&peak_capability_requested,
+                             requested,
+                             memory_order_acq_rel);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_active,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        active);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_partial,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_failed,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+}
+
 void
 peak_report_capability_set_cuda_apis(uint32_t compiled,
                                      uint32_t found,

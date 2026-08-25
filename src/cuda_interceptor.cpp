@@ -44,6 +44,51 @@ enum PeakCudaOutputAggregationMode {
     PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2,
 };
 
+static uint32_t
+peak_cuda_output_capability(int aggregation_mode)
+{
+    if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI) {
+        return PEAK_CAPABILITY_MPI_REPORT;
+    }
+    if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET) {
+        return PEAK_CAPABILITY_SOCKET_REPORT;
+    }
+    return PEAK_CAPABILITY_LOCAL_REPORT;
+}
+
+static uint32_t
+peak_cuda_requested_output_capability(const PeakReportSnapshot* snapshot,
+                                      int attempted_mode)
+{
+    uint32_t requested = snapshot->capabilities.requested &
+        PEAK_CAPABILITY_REPORT_TRANSPORTS;
+
+    return requested != 0
+        ? requested
+        : peak_cuda_output_capability(attempted_mode);
+}
+
+static void
+peak_cuda_project_output_outcome(PeakReportSnapshot* snapshot,
+                                 int attempted_mode,
+                                 int actual_mode)
+{
+    peak_report_capability_manifest_set_output_outcome(
+        &snapshot->capabilities,
+        peak_cuda_requested_output_capability(snapshot, attempted_mode),
+        peak_cuda_output_capability(actual_mode));
+}
+
+static void
+peak_cuda_commit_output_outcome(const PeakReportSnapshot* snapshot,
+                                int attempted_mode,
+                                int actual_mode)
+{
+    peak_report_capability_set_output_outcome(
+        peak_cuda_requested_output_capability(snapshot, attempted_mode),
+        peak_cuda_output_capability(actual_mode));
+}
+
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
 static GMutex cuda_kernel_local_dim_mapping_mutex;
@@ -185,6 +230,16 @@ struct PeakCudaBackendApi {
 
 static PeakCudaBackendApi peak_cuda_backend_api;
 static PeakCudaCapabilities peak_cuda_capabilities;
+
+static void
+peak_cuda_note_retained_state()
+{
+    peak_cuda_capabilities.retained = TRUE;
+    peak_cuda_capabilities.partial = TRUE;
+    peak_report_capability_note_retained(PEAK_CAPABILITY_CUDA);
+    peak_report_capability_note_partial(PEAK_CAPABILITY_CUDA);
+}
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static std::atomic<std::uint64_t> peak_cuda_test_attach_calls{0};
 
@@ -1495,6 +1550,7 @@ peak_cuda_destroy_event_pool()
     std::unique_lock<std::mutex> capture_teardown_lock(
         peak_cuda_capture_teardown_mutex, std::try_to_lock);
     if (!capture_teardown_lock.owns_lock()) {
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] retaining CUDA event state while a stream-capture call crosses teardown\n");
         return FALSE;
@@ -1506,6 +1562,7 @@ peak_cuda_destroy_event_pool()
             std::memory_order_acquire);
     pthread_mutex_unlock(&peak_cuda_capture_mutex);
     if (capture_unsafe) {
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] retaining CUDA event state because stream-capture quiescence is not proven\n");
         return FALSE;
@@ -1529,6 +1586,7 @@ peak_cuda_destroy_event_pool()
         }
     }
     if (retained) {
+        peak_cuda_note_retained_state();
         peak_log_warn("[peak] retaining CUDA event state that could not be destroyed in its owning context\n");
         return FALSE;
     }
@@ -2345,6 +2403,7 @@ peak_cuda_finalize_pending()
         peak_cuda_profiler_state.record_finalization_timeout(
             deadline_incomplete);
         peak_cuda_finalization_timed_out = TRUE;
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] CUDA finalization_timeout=1 finalization_incomplete=%zu helper_initialization_inflight=%d; retaining incomplete event state\n",
             deadline_incomplete,
@@ -3860,6 +3919,7 @@ extern "C" void cuda_interceptor_dettach()
         gum_interceptor_end_transaction(cuda_interceptor);
 
         if (!gum_interceptor_flush(cuda_interceptor)) {
+            peak_cuda_note_retained_state();
             peak_log_warn("[peak] CUDA interceptor teardown did not flush; leaving CUDA interceptor state alive\n");
             return;
         }
@@ -3870,6 +3930,7 @@ extern "C" void cuda_interceptor_dettach()
 
     unsigned int active_cuda_wrappers = peak_cuda_active_wrapper_count();
     if (active_cuda_wrappers != 0) {
+        peak_cuda_note_retained_state();
         peak_log_warn("[peak] CUDA interceptor teardown observed %u active wrapper(s); keeping all CUDA state alive for cleanup retry\n",
                    active_cuda_wrappers);
         /*
@@ -4438,11 +4499,26 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
 #ifdef HAVE_MPI
         if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode, PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local, &aggregate);
             if (result == PEAK_MPI_REPORT_TRANSPORT_ROOT_READY) {
                 (void)peak_cuda_render_report_snapshot(aggregate);
-            } else if (result != PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
+            } else if (result == PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
+            } else {
+                peak_cuda_project_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                 (void)peak_cuda_render_report_snapshot(local);
             }
             peak_report_snapshot_destroy(aggregate);
@@ -4451,6 +4527,9 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
         if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET) {
             PeakSocketReportSession* session = NULL;
             PeakReportSnapshot* aggregate = NULL;
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
             PeakSocketReportRankSource socket_rank_source = active_mpi_job
                 ? PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED
                 : PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV;
@@ -4459,19 +4538,47 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
                 PEAK_SOCKET_REPORT_CHANNEL_CUDA, &session, &aggregate);
             if (status == PEAK_SOCKET_REPORT_SINGLE_READY) {
                 (void)peak_cuda_render_report_snapshot(aggregate);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
             } else if (status == PEAK_SOCKET_REPORT_ROOT_PREPARED) {
                 if (peak_cuda_render_report_snapshot(aggregate)) {
                     (void)peak_socket_report_transport_commit(session);
+                    peak_cuda_commit_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
                 } else {
                     peak_socket_report_transport_abort(session);
+                    peak_cuda_project_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                    peak_cuda_commit_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                     (void)peak_cuda_render_report_snapshot(local);
                 }
-            } else if (status != PEAK_SOCKET_REPORT_PEER_RELEASED) {
+            } else if (status == PEAK_SOCKET_REPORT_PEER_RELEASED) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
+            } else {
                 peak_socket_report_transport_abort(session);
+                peak_cuda_project_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                 (void)peak_cuda_render_report_snapshot(local);
             }
             peak_report_snapshot_destroy(aggregate);
         } else {
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+            peak_cuda_commit_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
             (void)peak_cuda_render_report_snapshot(local);
         }
         peak_report_snapshot_destroy(local);

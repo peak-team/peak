@@ -130,6 +130,8 @@ def run_partial_capability(args: argparse.Namespace, directory: Path) -> None:
                      "partial CUDA application completion")
     require_contains(profile.output, "cpu_target_storage=0",
                      "GPU-only CPU target storage gating")
+    require_contains(profile.output, "heartbeat_started=0",
+                     "GPU-only heartbeat gating")
     require_contains(
         profile.output,
         "Profiler capability [cuda]: requested=1 compiled=1 active=1 "
@@ -694,6 +696,12 @@ def run_finalization(args: argparse.Namespace, directory: Path) -> None:
     require_contains(forced.output,
                      "cuda_forced_incomplete_finalization_ok",
                      "forced-incomplete application output")
+    require_contains(
+        forced.output,
+        "Profiler capability [cuda]: requested=1 compiled=1 active=1 "
+        "partial=1 retained=1 failed=0",
+        "forced-incomplete retained CUDA capability manifest",
+    )
     require_contains(forced.output, "CUDA incomplete event context=",
                      "forced-incomplete context diagnostic")
     require_contains(forced.output, "device=",
