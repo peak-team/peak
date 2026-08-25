@@ -6,6 +6,8 @@
 
 namespace {
 constexpr const char* kUnknownKernelName = "<unknown>";
+constexpr const char* kIdentityOverflowName = "<identity-overflow>";
+constexpr std::size_t kMaxOverflowIdentityCapacity = 256;
 constexpr std::size_t kInvalidSlot = std::numeric_limits<std::size_t>::max();
 constexpr std::uint32_t kInvalidSlotIndex =
     std::numeric_limits<std::uint32_t>::max();
@@ -593,9 +595,16 @@ PeakCudaPendingQueue::requeue_local(const PeakCudaSlotLease& lease)
 
 PeakCudaProfilerState::PeakCudaProfilerState(std::size_t capacity)
     : identity_capacity_(capacity),
+      overflow_identity_capacity_(std::min(
+          capacity, kMaxOverflowIdentityCapacity)),
+      monitor_all_(false),
       completed_launches_(0),
       dropped_pool_full_(0),
       dropped_identity_full_(0),
+      positive_identity_admission_failures_(0),
+      negative_identity_overflow_(0),
+      monitor_all_identity_overflow_(0),
+      repeated_identity_overflow_suppressed_(0),
       dropped_event_create_(0),
       dropped_timing_error_(0),
       dropped_harvester_unavailable_(0),
@@ -623,12 +632,19 @@ PeakCudaProfilerState::PeakCudaProfilerState(std::size_t capacity)
 
 void
 PeakCudaProfilerState::reset(std::size_t capacity,
-                             std::size_t identity_capacity)
+                             std::size_t identity_capacity,
+                             bool monitor_all,
+                             const std::vector<std::string>& targets)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
     identities_.clear();
+    overflow_identities_.clear();
     identity_capacity_ = identity_capacity == 0 ? capacity : identity_capacity;
+    overflow_identity_capacity_ = std::min(
+        identity_capacity_, kMaxOverflowIdentityCapacity);
+    monitor_all_ = monitor_all;
+    targets_ = targets;
     for (std::size_t shard = 0;
          shard < PeakCudaSlotAllocator::kShardCount; ++shard) {
         launch_counter_shards_[shard].observed.store(
@@ -639,6 +655,12 @@ PeakCudaProfilerState::reset(std::size_t capacity,
     completed_launches_.store(0, std::memory_order_relaxed);
     dropped_pool_full_.store(0, std::memory_order_relaxed);
     dropped_identity_full_.store(0, std::memory_order_relaxed);
+    positive_identity_admission_failures_.store(
+        0, std::memory_order_relaxed);
+    negative_identity_overflow_.store(0, std::memory_order_relaxed);
+    monitor_all_identity_overflow_.store(0, std::memory_order_relaxed);
+    repeated_identity_overflow_suppressed_.store(
+        0, std::memory_order_relaxed);
     dropped_event_create_.store(0, std::memory_order_relaxed);
     dropped_timing_error_.store(0, std::memory_order_relaxed);
     dropped_harvester_unavailable_.store(0, std::memory_order_relaxed);
@@ -662,8 +684,6 @@ PeakCudaProfilerState::identify(
     bool driver_function,
     const char* display_name,
     const char* target_name,
-    bool monitor_all,
-    const std::vector<std::string>& targets,
     std::uintptr_t context)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -673,16 +693,57 @@ PeakCudaProfilerState::identify(
     if (existing != identities_.end()) {
         return existing->second;
     }
-
-    if (identities_.size() >= identity_capacity_) {
-        record_identity_full();
-        return make_kernel_identity(kUnknownKernelName, monitor_all);
+    const auto existing_overflow = overflow_identities_.find(key);
+    if (existing_overflow != overflow_identities_.end()) {
+        repeated_identity_overflow_suppressed_.fetch_add(
+            1, std::memory_order_relaxed);
+        return existing_overflow->second;
     }
 
     PeakCudaKernelIdentity result = make_kernel_identity(display_name, false);
-    result.target_match = monitor_all ||
+    result.target_match = monitor_all_ ||
                           (target_name != nullptr && target_name[0] != '\0' &&
-                           target_matches(target_name, targets));
+                           target_matches(target_name, targets_));
+    if (identities_.size() >= identity_capacity_) {
+        record_identity_full();
+        if (result.target_match && !monitor_all_) {
+            const auto negative = std::find_if(
+                identities_.begin(), identities_.end(),
+                [](const auto& entry) {
+                    return !entry.second.target_match;
+                });
+            if (negative != identities_.end()) {
+                if (overflow_identities_.size() <
+                    overflow_identity_capacity_) {
+                    overflow_identities_.emplace(
+                        negative->first, negative->second);
+                }
+                negative_identity_overflow_.fetch_add(
+                    1, std::memory_order_relaxed);
+                identities_.erase(negative);
+                identities_.emplace(key, result);
+                return result;
+            }
+            positive_identity_admission_failures_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+
+        PeakCudaKernelIdentity overflow = monitor_all_
+            ? make_kernel_identity(kIdentityOverflowName, true)
+            : result;
+        if (overflow_identities_.size() < overflow_identity_capacity_) {
+            overflow_identities_.emplace(key, overflow);
+        }
+        if (monitor_all_) {
+            monitor_all_identity_overflow_.fetch_add(
+                1, std::memory_order_relaxed);
+        } else if (!result.target_match) {
+            negative_identity_overflow_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        return overflow;
+    }
+
     identities_.emplace(key, result);
     return result;
 }
@@ -692,17 +753,27 @@ PeakCudaProfilerState::cached_identity(
     std::uintptr_t identity,
     bool driver_function,
     PeakCudaKernelIdentity* result,
-    std::uintptr_t context) const
+    std::uintptr_t context)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto existing = identities_.find(
         {identity, driver_function, context});
 
-    if (existing == identities_.end()) {
+    if (existing != identities_.end()) {
+        if (result != nullptr) {
+            *result = existing->second;
+        }
+        return true;
+    }
+    const auto overflow = overflow_identities_.find(
+        {identity, driver_function, context});
+    if (overflow == overflow_identities_.end()) {
         return false;
     }
+    repeated_identity_overflow_suppressed_.fetch_add(
+        1, std::memory_order_relaxed);
     if (result != nullptr) {
-        *result = existing->second;
+        *result = overflow->second;
     }
     return true;
 }
@@ -855,6 +926,7 @@ PeakCudaProfilerState::counters() const
     PeakCudaProfilerCounters result = {};
     result.identity_capacity = identity_capacity_;
     result.cached_identities = identities_.size();
+    result.cached_overflow_identities = overflow_identities_.size();
     for (std::size_t shard = 0;
          shard < PeakCudaSlotAllocator::kShardCount; ++shard) {
         result.observed_launches +=
@@ -870,6 +942,16 @@ PeakCudaProfilerState::counters() const
         dropped_pool_full_.load(std::memory_order_relaxed);
     result.dropped_identity_full =
         dropped_identity_full_.load(std::memory_order_relaxed);
+    result.positive_identity_admission_failures =
+        positive_identity_admission_failures_.load(
+            std::memory_order_relaxed);
+    result.negative_identity_overflow =
+        negative_identity_overflow_.load(std::memory_order_relaxed);
+    result.monitor_all_identity_overflow =
+        monitor_all_identity_overflow_.load(std::memory_order_relaxed);
+    result.repeated_identity_overflow_suppressed =
+        repeated_identity_overflow_suppressed_.load(
+            std::memory_order_relaxed);
     result.dropped_event_create =
         dropped_event_create_.load(std::memory_order_relaxed);
     result.dropped_timing_error =

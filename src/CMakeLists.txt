@@ -61,7 +61,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
         ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
 endif()
 
-if (CUDA_FOUND OR CUDAToolkit_FOUND)
+if(PEAK_CUDA_ENABLED)
     add_library(cuda_interceptor_obj OBJECT
         cuda_interceptor.cpp
         cuda_profiler_state.cpp)
@@ -74,7 +74,7 @@ if(MPI_FOUND)
         mpi_teardown_guard.c
         mpi_interceptor.c)
 endif()
-if(CUDA_FOUND OR CUDAToolkit_FOUND)
+if(PEAK_CUDA_ENABLED)
     list(APPEND sources_peak $<TARGET_OBJECTS:cuda_interceptor_obj>)
 endif()
 list(APPEND sources_peak
@@ -143,12 +143,16 @@ if(BUILD_TESTS OR BUILD_TESTING)
     endif()
 endif()
 
-if (CUDA_FOUND OR CUDAToolkit_FOUND)
+if(PEAK_CUDA_ENABLED)
 target_include_directories(cuda_interceptor_obj
     PUBLIC
         ${PROJECT_SOURCE_DIR}/include
         ${FRIDA_GUM_INCLUDE_DIRS}
+        ${PEAK_CUDA_INCLUDE_DIRS}
 )
+target_compile_definitions(cuda_interceptor_obj PRIVATE
+    $<$<BOOL:${PEAK_CUDA_HAS_RUNTIME_LAUNCH_EX}>:PEAK_CUDA_COMPILE_RUNTIME_LAUNCH_EX=1>
+    $<$<BOOL:${PEAK_CUDA_HAS_DRIVER_LAUNCH_EX}>:PEAK_CUDA_COMPILE_DRIVER_LAUNCH_EX=1>)
 endif()
 
 target_link_libraries(peak
@@ -162,7 +166,7 @@ target_link_libraries(peak
         ${OTF2_LIBRARIES}
 )
 
-if (CUDA_FOUND OR CUDAToolkit_FOUND)
+if(PEAK_CUDA_ENABLED)
 target_link_libraries(cuda_interceptor_obj
     PRIVATE
         ${FRIDA_GUM_LIBRARIES}
@@ -181,21 +185,15 @@ if(MPI_FOUND)
     )
 endif()
 
-if(MPI_FOUND AND (CUDA_FOUND OR CUDAToolkit_FOUND))
+if(MPI_FOUND AND PEAK_CUDA_ENABLED)
     target_link_libraries(cuda_interceptor_obj
         PRIVATE
             MPI::MPI_C
     )
 endif()
 
-if(CUDA_FOUND)
-    target_link_libraries(peak PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.a")
-    target_link_libraries(peak PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudart.so")
-    target_link_options(peak PRIVATE -Wl,-rpath,${CUDA_TOOLKIT_ROOT_DIR}/lib64)
-elseif(CUDAToolkit_FOUND)
-    target_link_libraries(peak PRIVATE CUDA::cudart)
-    target_link_libraries(peak PRIVATE "${CUDAToolkit_LIBRARY_DIR}/libcufilt.a")
-    target_link_options(peak PRIVATE -Wl,-rpath,${CUDAToolkit_LIBRARY_DIR})
+if(PEAK_CUDA_ENABLED)
+    target_link_libraries(peak PRIVATE ${PEAK_CUDA_RUNTIME_LIBRARIES})
 endif()
 
 install(TARGETS peak

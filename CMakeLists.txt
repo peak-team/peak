@@ -160,36 +160,87 @@ else()
     message(STATUS "MPI support disabled by PEAK_ENABLE_MPI=OFF")
 endif()
 
-# Find CUDA
-# Define the option to enable CUDA profiling and CUDA tests, use -DBUILD_CUDA_PROFILE=OFF to disable them.
+# Find and validate CUDA once. Every CUDA source, definition, library, and test
+# is gated by PEAK_CUDA_ENABLED instead of the package finder's raw result.
 option(BUILD_CUDA_PROFILE "Build CUDA kernel profiling feature" ON)
-if (BUILD_CUDA_PROFILE)
-    if (CMAKE_VERSION VERSION_LESS 3.17)
-        find_package(CUDA)
-    else()
-        find_package(CUDAToolkit)
-    endif()
-    if(CUDAToolkit_FOUND)
-        if(CUDAToolkit_VERSION VERSION_LESS "11.2")
-            message(WARNING "CUDA version must be >= 11.2. Found ${CUDAToolkit_VERSION} - Skipping CUDA-related features.")
-        else()
-            enable_language(CUDA)
-            message(STATUS "CUDA ToolKit found: ${CUDAToolkit_VERSION}")
-            add_definitions(-DHAVE_CUDA)
-            include_directories(${CUDAToolkit_INCLUDE_DIRS})
+set(PEAK_CUDA_ENABLED OFF)
+set(PEAK_CUDA_HAS_RUNTIME_LAUNCH_EX OFF)
+set(PEAK_CUDA_HAS_DRIVER_LAUNCH_EX OFF)
+set(PEAK_CUDA_INCLUDE_DIRS)
+set(PEAK_CUDA_RUNTIME_LIBRARIES)
+set(PEAK_CUDA_DRIVER_LIBRARY)
+set(PEAK_CUDA_TOOLKIT_FOUND OFF)
+set(PEAK_CUDA_TOOLKIT_VERSION)
+include(cmake/cuda-capability.cmake)
+if(BUILD_CUDA_PROFILE)
+    if(CMAKE_VERSION VERSION_LESS 3.17)
+        find_package(CUDA QUIET)
+        if(CUDA_FOUND)
+            set(PEAK_CUDA_TOOLKIT_FOUND ON)
+            set(PEAK_CUDA_TOOLKIT_VERSION "${CUDA_VERSION}")
+            set(PEAK_CUDA_INCLUDE_DIRS "${CUDA_INCLUDE_DIRS}")
+            if(CUDA_CUDART_LIBRARY)
+                set(PEAK_CUDA_RUNTIME_LIBRARIES "${CUDA_CUDART_LIBRARY}")
+            else()
+                set(PEAK_CUDA_RUNTIME_LIBRARIES "${CUDA_LIBRARIES}")
+            endif()
+            set(PEAK_CUDA_DRIVER_LIBRARY "${CUDA_CUDA_LIBRARY}")
         endif()
-    elseif(CUDA_FOUND)
-        if(CUDA_VERSION VERSION_LESS "11.2")
-            message(WARNING "CUDA version must be >= 11.2. Found ${CUDA_VERSION} - Skipping CUDA-related features.")
-        else()
-            enable_language(CUDA)
-            message(STATUS "CUDA found: ${CUDA_VERSION}")
-            add_definitions(-DHAVE_CUDA)
-            include_directories(${CUDA_INCLUDE_DIRS})
-        endif()
     else()
-        message(WARNING "CUDA not found. Skipping CUDA-related features.")
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            set(PEAK_CUDA_TOOLKIT_FOUND ON)
+            set(PEAK_CUDA_TOOLKIT_VERSION "${CUDAToolkit_VERSION}")
+            set(PEAK_CUDA_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
+            if(TARGET CUDA::cudart)
+                set(PEAK_CUDA_RUNTIME_LIBRARIES CUDA::cudart)
+            endif()
+            if(TARGET CUDA::cuda_driver)
+                set(PEAK_CUDA_DRIVER_LIBRARY CUDA::cuda_driver)
+            endif()
+        endif()
     endif()
+
+    peak_cuda_evaluate_capability(
+        "${PEAK_CUDA_TOOLKIT_FOUND}"
+        "${PEAK_CUDA_TOOLKIT_VERSION}"
+        PEAK_CUDA)
+    if(PEAK_CUDA_ENABLED AND
+       PEAK_CUDA_INCLUDE_DIRS AND
+       PEAK_CUDA_RUNTIME_LIBRARIES)
+        include(CheckLanguage)
+        check_language(CUDA)
+        if(CMAKE_CUDA_COMPILER)
+            enable_language(CUDA)
+        else()
+            message(STATUS
+                "CUDA compiler unavailable; CUDA profiling remains enabled "
+                "and CUDA-language tests are skipped")
+        endif()
+        add_compile_definitions(HAVE_CUDA=1)
+        include_directories(${PEAK_CUDA_INCLUDE_DIRS})
+        message(STATUS
+            "CUDA profiling enabled: toolkit=${PEAK_CUDA_TOOLKIT_VERSION} "
+            "runtime_launch_ex=${PEAK_CUDA_HAS_RUNTIME_LAUNCH_EX} "
+            "driver_launch_ex=${PEAK_CUDA_HAS_DRIVER_LAUNCH_EX}")
+    elseif(PEAK_CUDA_TOOLKIT_FOUND AND
+           PEAK_CUDA_TOOLKIT_VERSION VERSION_LESS "11.2")
+        set(PEAK_CUDA_ENABLED OFF)
+        message(STATUS
+            "CUDA profiling disabled: toolkit ${PEAK_CUDA_TOOLKIT_VERSION} "
+            "is older than the supported minimum 11.2")
+    elseif(PEAK_CUDA_TOOLKIT_FOUND)
+        set(PEAK_CUDA_ENABLED OFF)
+        set(PEAK_CUDA_HAS_RUNTIME_LAUNCH_EX OFF)
+        set(PEAK_CUDA_HAS_DRIVER_LAUNCH_EX OFF)
+        message(STATUS
+            "CUDA profiling disabled: toolkit headers or the CUDA Runtime "
+            "library are unavailable")
+    else()
+        message(STATUS "CUDA profiling disabled: no toolkit was found")
+    endif()
+else()
+    message(STATUS "CUDA profiling disabled by BUILD_CUDA_PROFILE=OFF")
 endif()
 
 # Define the option to enable tests, use -DBUILD_TESTS=ON to enable tests.
@@ -226,6 +277,10 @@ endif()
 
 include(CMakePackageConfigHelpers)
 set(PEAK_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/PEAK")
+set(PEAK_CUDA_PACKAGE_REQUIRES_CUDATOOLKIT OFF)
+if(PEAK_CUDA_ENABLED AND TARGET CUDA::cudart)
+    set(PEAK_CUDA_PACKAGE_REQUIRES_CUDATOOLKIT ON)
+endif()
 install(EXPORT PEAKTargets
     FILE PEAKTargets.cmake
     NAMESPACE PEAK::

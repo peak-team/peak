@@ -160,11 +160,16 @@ private:
 struct PeakCudaProfilerCounters {
     std::size_t identity_capacity;
     std::size_t cached_identities;
+    std::size_t cached_overflow_identities;
     std::uint64_t observed_launches;
     std::uint64_t accepted_launches;
     std::uint64_t completed_launches;
     std::uint64_t dropped_pool_full;
     std::uint64_t dropped_identity_full;
+    std::uint64_t positive_identity_admission_failures;
+    std::uint64_t negative_identity_overflow;
+    std::uint64_t monitor_all_identity_overflow;
+    std::uint64_t repeated_identity_overflow_suppressed;
     std::uint64_t dropped_event_create;
     /** Legacy aggregate for event record/query/elapsed-time failures. */
     std::uint64_t dropped_timing_error;
@@ -214,21 +219,22 @@ class PeakCudaProfilerState {
 public:
     explicit PeakCudaProfilerState(std::size_t capacity = 256);
 
-    void reset(std::size_t capacity, std::size_t identity_capacity = 0);
+    void reset(std::size_t capacity,
+               std::size_t identity_capacity = 0,
+               bool monitor_all = false,
+               const std::vector<std::string>& targets = {});
 
     PeakCudaKernelIdentity identify(
         std::uintptr_t identity,
         bool driver_function,
         const char* display_name,
         const char* target_name,
-        bool monitor_all,
-        const std::vector<std::string>& targets,
         std::uintptr_t context = 0);
 
     bool cached_identity(std::uintptr_t identity,
                          bool driver_function,
                          PeakCudaKernelIdentity* result,
-                         std::uintptr_t context = 0) const;
+                         std::uintptr_t context = 0);
 
     void record_launch_observed(std::size_t shard = 0,
                                 bool exclusive = false);
@@ -273,12 +279,21 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<PeakCudaIdentityKey, PeakCudaKernelIdentity,
                        PeakCudaIdentityKeyHash> identities_;
+    std::unordered_map<PeakCudaIdentityKey, PeakCudaKernelIdentity,
+                       PeakCudaIdentityKeyHash> overflow_identities_;
     std::size_t identity_capacity_;
+    std::size_t overflow_identity_capacity_;
+    bool monitor_all_;
+    std::vector<std::string> targets_;
     std::array<LaunchCounterShard,
                PeakCudaSlotAllocator::kShardCount> launch_counter_shards_;
     std::atomic<std::uint64_t> completed_launches_;
     std::atomic<std::uint64_t> dropped_pool_full_;
     std::atomic<std::uint64_t> dropped_identity_full_;
+    std::atomic<std::uint64_t> positive_identity_admission_failures_;
+    std::atomic<std::uint64_t> negative_identity_overflow_;
+    std::atomic<std::uint64_t> monitor_all_identity_overflow_;
+    std::atomic<std::uint64_t> repeated_identity_overflow_suppressed_;
     std::atomic<std::uint64_t> dropped_event_create_;
     std::atomic<std::uint64_t> dropped_timing_error_;
     std::atomic<std::uint64_t> dropped_harvester_unavailable_;

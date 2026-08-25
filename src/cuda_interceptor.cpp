@@ -23,6 +23,15 @@
 
 #define PEAK_CUDA_WRAPPER_EXPORT extern "C" __attribute__((visibility("default")))
 
+#if defined(PEAK_CUDA_COMPILE_RUNTIME_LAUNCH_EX) && \
+    defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+#define PEAK_CUDA_RUNTIME_LAUNCH_EX 1
+#endif
+#if defined(PEAK_CUDA_COMPILE_DRIVER_LAUNCH_EX) && \
+    defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+#define PEAK_CUDA_DRIVER_LAUNCH_EX 1
+#endif
+
 extern "C" gpointer peak_general_listener_find_function(const char* symbol);
 extern "C" void peak_general_listener_exclude_current_thread(void);
 extern "C" void peak_general_listener_fast_ignore_current_thread(void);
@@ -95,9 +104,11 @@ static cudaError_t (*original_cuda_launch_cooperative_kernel_multiple_device)(
     struct cudaLaunchParams* launchParamsList, unsigned int numDevices,
     unsigned int flags);
 
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
 static cudaError_t (*original_cuda_launch_kernel_exc)(
     const cudaLaunchConfig_t* config,
     const void* func, void** args);
+#endif
 
 static CUresult (*original_cu_launch_kernel)(
     CUfunction func,
@@ -115,9 +126,11 @@ static CUresult (*original_cu_launch_cooperative_kernel_multiple_device)(
     CUDA_LAUNCH_PARAMS* launchParamsList,
     unsigned int numDevices, unsigned int flags);
 
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
 static CUresult (*original_cu_launch_kernel_ex)(
     const CUlaunchConfig* config, CUfunction func,
     void** kernelParams, void** extra);
+#endif
 
 static cudaError_t (*original_cuda_graph_launch)(
     cudaGraphExec_t graphExec, cudaStream_t stream);
@@ -136,7 +149,13 @@ typedef CUresult (*PeakCuCtxGetCurrentFn)(CUcontext* context);
 typedef CUresult (*PeakCuCtxGetDeviceFn)(CUdevice* device);
 typedef CUresult (*PeakCuCtxPushCurrentFn)(CUcontext context);
 typedef CUresult (*PeakCuCtxPopCurrentFn)(CUcontext* context);
+typedef CUresult (*PeakCuEventCreateFn)(CUevent* event, unsigned int flags);
+typedef CUresult (*PeakCuEventDestroyFn)(CUevent event);
 typedef CUresult (*PeakCuEventRecordFn)(CUevent event, CUstream stream);
+typedef CUresult (*PeakCuEventQueryFn)(CUevent event);
+typedef CUresult (*PeakCuEventElapsedTimeFn)(float* milliseconds,
+                                             CUevent start,
+                                             CUevent end);
 typedef CUresult (*PeakCuStreamIsCapturingFn)(
     CUstream stream, CUstreamCaptureStatus* status);
 typedef CUresult (*PeakCuThreadExchangeStreamCaptureModeFn)(
@@ -154,13 +173,25 @@ struct PeakCudaBackendApi {
     PeakCuCtxGetDeviceFn ctx_get_device;
     PeakCuCtxPushCurrentFn ctx_push_current;
     PeakCuCtxPopCurrentFn ctx_pop_current;
+    PeakCuEventCreateFn event_create;
+    PeakCuEventDestroyFn event_destroy;
     PeakCuEventRecordFn event_record;
+    PeakCuEventQueryFn event_query;
+    PeakCuEventElapsedTimeFn event_elapsed_time;
     PeakCuStreamIsCapturingFn driver_stream_is_capturing;
     PeakCuThreadExchangeStreamCaptureModeFn
         driver_thread_exchange_stream_capture_mode;
 };
 
 static PeakCudaBackendApi peak_cuda_backend_api;
+struct PeakCudaCapabilityReport {
+    gboolean runtime_base_installed;
+    gboolean runtime_ex_installed;
+    gboolean driver_base_installed;
+    gboolean driver_ex_installed;
+    gboolean driver_timing_available;
+};
+static PeakCudaCapabilityReport peak_cuda_capability_report;
 
 enum PeakCudaCaptureApi {
     PEAK_CUDA_CAPTURE_API_RUNTIME = 0,
@@ -1037,7 +1068,6 @@ peak_cuda_identify_kernel(gpointer identity, gboolean driver_function,
         peak_cuda_thread_identity.driver_function == driver_function) {
         return &peak_cuda_thread_identity.value;
     }
-    std::vector<std::string> targets;
     gchar* resolved_name = NULL;
     char* demangled_name = NULL;
     char* target_name = NULL;
@@ -1050,11 +1080,6 @@ peak_cuda_identify_kernel(gpointer identity, gboolean driver_function,
             peak_cuda_thread_identity.value,
         };
         return &peak_cuda_thread_identity.value;
-    }
-    for (size_t index = 0; index < peak_gpu_hook_address_count; ++index) {
-        if (peak_gpu_hook_strings[index] != NULL) {
-            targets.emplace_back(peak_gpu_hook_strings[index]);
-        }
     }
     if (driver_function) {
         resolved_name = peak_cuda_driver_kernel_name(
@@ -1072,8 +1097,6 @@ peak_cuda_identify_kernel(gpointer identity, gboolean driver_function,
         driver_function,
         demangled_name != NULL ? demangled_name : resolved_name,
         target_name,
-        peak_gpu_monitor_all,
-        targets,
         context_value);
     g_free(resolved_name);
     free(demangled_name);
@@ -1306,9 +1329,25 @@ peak_cuda_resolve_backend_api()
         ? reinterpret_cast<PeakCuCtxPopCurrentFn>(
               dlsym(driver, "cuCtxPopCurrent_v2"))
         : NULL;
+    peak_cuda_backend_api.event_create = driver != NULL
+        ? reinterpret_cast<PeakCuEventCreateFn>(
+              dlsym(driver, "cuEventCreate"))
+        : NULL;
+    peak_cuda_backend_api.event_destroy = driver != NULL
+        ? reinterpret_cast<PeakCuEventDestroyFn>(
+              dlsym(driver, "cuEventDestroy_v2"))
+        : NULL;
     peak_cuda_backend_api.event_record = driver != NULL
         ? reinterpret_cast<PeakCuEventRecordFn>(
               dlsym(driver, "cuEventRecord"))
+        : NULL;
+    peak_cuda_backend_api.event_query = driver != NULL
+        ? reinterpret_cast<PeakCuEventQueryFn>(
+              dlsym(driver, "cuEventQuery"))
+        : NULL;
+    peak_cuda_backend_api.event_elapsed_time = driver != NULL
+        ? reinterpret_cast<PeakCuEventElapsedTimeFn>(
+              dlsym(driver, "cuEventElapsedTime"))
         : NULL;
     peak_cuda_backend_api.driver_stream_is_capturing = driver != NULL
         ? reinterpret_cast<PeakCuStreamIsCapturingFn>(
@@ -1323,6 +1362,16 @@ peak_cuda_resolve_backend_api()
         ? reinterpret_cast<PeakCudaFuncGetNameFn>(
               dlsym(driver, "cuFuncGetName"))
         : NULL;
+}
+
+static gboolean
+peak_cuda_driver_timing_available()
+{
+    return peak_cuda_backend_api.event_create != NULL &&
+        peak_cuda_backend_api.event_destroy != NULL &&
+        peak_cuda_backend_api.event_record != NULL &&
+        peak_cuda_backend_api.event_query != NULL &&
+        peak_cuda_backend_api.event_elapsed_time != NULL;
 }
 
 struct PeakCudaContextActivation {
@@ -1385,14 +1434,18 @@ peak_cuda_destroy_slot_events_current(PeakCudaEventSlot* slot)
         return TRUE;
     }
     if (slot->start != NULL) {
-        if (cudaEventDestroy(slot->start) == cudaSuccess) {
+        if (peak_cuda_backend_api.event_destroy != NULL &&
+            peak_cuda_backend_api.event_destroy(
+                reinterpret_cast<CUevent>(slot->start)) == CUDA_SUCCESS) {
             slot->start = NULL;
         } else {
             destroyed = FALSE;
         }
     }
     if (slot->end != NULL) {
-        if (cudaEventDestroy(slot->end) == cudaSuccess) {
+        if (peak_cuda_backend_api.event_destroy != NULL &&
+            peak_cuda_backend_api.event_destroy(
+                reinterpret_cast<CUevent>(slot->end)) == CUDA_SUCCESS) {
             slot->end = NULL;
         } else {
             destroyed = FALSE;
@@ -1543,15 +1596,16 @@ peak_cuda_harvest_one_current(const PeakCudaSlotLease& lease)
     }
     PeakCudaEventSlot& slot = peak_cuda_event_pool[lease.index];
 
-    cudaError_t query;
+    CUresult query;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (peak_cuda_test_force_query_error.exchange(
             false, std::memory_order_relaxed)) {
-        query = cudaErrorInvalidResourceHandle;
+        query = CUDA_ERROR_INVALID_HANDLE;
     } else
 #endif
     {
-        query = cudaEventQuery(slot.end);
+        query = peak_cuda_backend_api.event_query(
+            reinterpret_cast<CUevent>(slot.end));
 #ifdef PEAK_ENABLE_TEST_HOOKS
         peak_cuda_test_harvester_queries.fetch_add(
             1, std::memory_order_relaxed);
@@ -1560,10 +1614,10 @@ peak_cuda_harvest_one_current(const PeakCudaSlotLease& lease)
     if (!peak_cuda_harvester_running.load(std::memory_order_acquire)) {
         return PEAK_CUDA_HARVEST_RETAIN;
     }
-    if (query == cudaErrorNotReady) {
+    if (query == CUDA_ERROR_NOT_READY) {
         return PEAK_CUDA_HARVEST_RETRY;
     }
-    if (query != cudaSuccess) {
+    if (query != CUDA_SUCCESS) {
         peak_cuda_profiler_state.record_event_query_failure();
         gboolean destroyed = peak_cuda_destroy_slot_events_current(&slot);
         if (destroyed) {
@@ -1575,7 +1629,9 @@ peak_cuda_harvest_one_current(const PeakCudaSlotLease& lease)
 
     if (slot.start != NULL && slot.end != NULL) {
         float ms = 0.0f;
-        if (cudaEventElapsedTime(&ms, slot.start, slot.end) != cudaSuccess) {
+        if (peak_cuda_backend_api.event_elapsed_time(
+                &ms, reinterpret_cast<CUevent>(slot.start),
+                reinterpret_cast<CUevent>(slot.end)) != CUDA_SUCCESS) {
             peak_cuda_profiler_state.record_elapsed_time_failure();
         } else {
             peak_cuda_complete_record(&slot, ms);
@@ -1953,6 +2009,10 @@ peak_cuda_acquire_timing(PeakCudaLaunchBackend backend,
     if (capture_guard == NULL || timing == NULL) {
         return FALSE;
     }
+    if (!peak_cuda_driver_timing_available()) {
+        peak_cuda_profiler_state.record_event_create_failure();
+        return FALSE;
+    }
     if (!capture_guard->try_enter()) {
         if (peak_cuda_capture_tracking_terminal.load(
                 std::memory_order_acquire)) {
@@ -2005,8 +2065,14 @@ peak_cuda_acquire_timing(PeakCudaLaunchBackend backend,
                 peak_cuda_profiler_state.record_context_query_failure();
             }
         }
-        if (cudaEventCreate(&slot.start) != cudaSuccess ||
-            cudaEventCreate(&slot.end) != cudaSuccess) {
+        CUevent start = NULL;
+        CUevent end = NULL;
+        if (peak_cuda_backend_api.event_create(
+                &start, CU_EVENT_DEFAULT) != CUDA_SUCCESS ||
+            peak_cuda_backend_api.event_create(
+                &end, CU_EVENT_DEFAULT) != CUDA_SUCCESS) {
+            slot.start = reinterpret_cast<cudaEvent_t>(start);
+            slot.end = reinterpret_cast<cudaEvent_t>(end);
             peak_cuda_profiler_state.record_event_create_failure();
             if (peak_cuda_destroy_slot_events_current(&slot)) {
                 (void)peak_cuda_slot_allocator.release(lease);
@@ -2014,6 +2080,8 @@ peak_cuda_acquire_timing(PeakCudaLaunchBackend backend,
             capture_guard->leave();
             return FALSE;
         }
+        slot.start = reinterpret_cast<cudaEvent_t>(start);
+        slot.end = reinterpret_cast<cudaEvent_t>(end);
         slot.initialized = TRUE;
     } else if (slot.owner_context != context) {
         peak_cuda_profiler_state.record_context_query_failure();
@@ -2031,15 +2099,12 @@ static gboolean
 peak_cuda_record_event(PeakCudaLaunchBackend backend,
                        cudaEvent_t event, cudaStream_t stream)
 {
-    gboolean recorded = FALSE;
-    if (event != NULL && backend == PEAK_CUDA_LAUNCH_BACKEND_DRIVER &&
-        peak_cuda_backend_api.event_record != NULL) {
-        recorded = peak_cuda_backend_api.event_record(
+    (void)backend;
+    const gboolean recorded = event != NULL &&
+        peak_cuda_backend_api.event_record != NULL &&
+        peak_cuda_backend_api.event_record(
             reinterpret_cast<CUevent>(event),
             reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS;
-    } else if (event != NULL) {
-        recorded = cudaEventRecord(event, stream) == cudaSuccess;
-    }
     if (!recorded) {
         peak_cuda_profiler_state.record_timing_error();
         return FALSE;
@@ -2260,6 +2325,10 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
+    if (func == NULL) {
+        return original_cuda_launch_kernel(
+            func, gridDim, blockDim, args, sharedMem, stream);
+    }
     PeakCudaInflightGuard in_flight;
     if (!in_flight.entered()) {
         return original_cuda_launch_kernel(
@@ -2308,6 +2377,10 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel(
     const void* func, dim3 gridDim, dim3 blockDim,
     void** args, size_t sharedMem, cudaStream_t stream)
 {
+    if (func == NULL) {
+        return original_cuda_launch_cooperative_kernel(
+            func, gridDim, blockDim, args, sharedMem, stream);
+    }
     PeakCudaInflightGuard in_flight;
     if (!in_flight.entered()) {
         return original_cuda_launch_cooperative_kernel(
@@ -2355,6 +2428,10 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel(
 PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel_multiple_device(
     struct cudaLaunchParams* launchParamsList, unsigned int numDevices, unsigned int flags)
 {
+    if (launchParamsList == NULL || numDevices == 0) {
+        return original_cuda_launch_cooperative_kernel_multiple_device(
+            launchParamsList, numDevices, flags);
+    }
     PeakCudaInflightGuard in_flight;
     if (!in_flight.entered()) {
         return original_cuda_launch_cooperative_kernel_multiple_device(
@@ -2367,15 +2444,16 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_cooperative_kernel_multipl
         launchParamsList, numDevices, flags);
 }
 
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
 PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel_exc(
     const cudaLaunchConfig_t* config,
     const void* func, void** args)
 {
-    PeakCudaInflightGuard in_flight;
-    if (!in_flight.entered()) {
+    if (config == NULL || func == NULL) {
         return original_cuda_launch_kernel_exc(config, func, args);
     }
-    if (config == NULL) {
+    PeakCudaInflightGuard in_flight;
+    if (!in_flight.entered()) {
         return original_cuda_launch_kernel_exc(config, func, args);
     }
     dim3 gridDim = config->gridDim;
@@ -2418,6 +2496,7 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_launch_kernel_exc(
         timing, kernel_label, dimensions, result);
     return result;
 }
+#endif
 
 static void
 peak_cuda_record_blocked_driver_launch(gboolean known_target)
@@ -2437,6 +2516,12 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel(
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra)
 {
+    if (func == NULL) {
+        return original_cu_launch_kernel(
+            func, gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes, hStream, kernelParams, extra);
+    }
     if (peak_cuda_runtime_launch_wrapper_depth != 0) {
         return original_cu_launch_kernel(
             func, gridDimX, gridDimY, gridDimZ,
@@ -2515,6 +2600,12 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel(
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams)
 {
+    if (func == NULL) {
+        return original_cu_launch_cooperative_kernel(
+            func, gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes, hStream, kernelParams);
+    }
     if (peak_cuda_runtime_launch_wrapper_depth != 0) {
         return original_cu_launch_cooperative_kernel(
             func, gridDimX, gridDimY, gridDimZ,
@@ -2593,6 +2684,10 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel_multiple_dev
     CUDA_LAUNCH_PARAMS* launchParamsList,
     unsigned int numDevices, unsigned int flags)
 {
+    if (launchParamsList == NULL || numDevices == 0) {
+        return original_cu_launch_cooperative_kernel_multiple_device(
+            launchParamsList, numDevices, flags);
+    }
     if (peak_cuda_runtime_launch_wrapper_depth != 0) {
         return original_cu_launch_cooperative_kernel_multiple_device(
             launchParamsList, numDevices, flags);
@@ -2608,10 +2703,14 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_cooperative_kernel_multiple_dev
         launchParamsList, numDevices, flags);
 }
 
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
 PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
     const CUlaunchConfig* config, CUfunction func,
     void** kernelParams, void** extra)
 {
+    if (config == NULL || func == NULL) {
+        return original_cu_launch_kernel_ex(config, func, kernelParams, extra);
+    }
     if (peak_cuda_runtime_launch_wrapper_depth != 0) {
         return original_cu_launch_kernel_ex(
             config, func, kernelParams, extra);
@@ -2620,9 +2719,6 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
     if (!in_flight.entered()) {
         return original_cu_launch_kernel_ex(
             config, func, kernelParams, extra);
-    }
-    if (config == NULL) {
-        return original_cu_launch_kernel_ex(config, func, kernelParams, extra);
     }
     unsigned int gridDimX = config->gridDimX;
     unsigned int gridDimY = config->gridDimY;
@@ -2677,10 +2773,14 @@ PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_launch_kernel_ex(
         timing, kernel_label, dimensions, (cudaError_t)result);
     return result;
 }
+#endif
 
 PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_graph_launch(
     cudaGraphExec_t graphExec, cudaStream_t stream)
 {
+    if (graphExec == NULL) {
+        return original_cuda_graph_launch(graphExec, stream);
+    }
     PeakCudaInflightGuard in_flight;
     if (!in_flight.entered()) {
         return original_cuda_graph_launch(graphExec, stream);
@@ -2715,6 +2815,9 @@ PEAK_CUDA_WRAPPER_EXPORT cudaError_t peak_cuda_graph_launch(
 PEAK_CUDA_WRAPPER_EXPORT CUresult peak_cu_graph_launch(
     CUgraphExec hGraphExec, CUstream hStream)
 {
+    if (hGraphExec == NULL) {
+        return original_cu_graph_launch(hGraphExec, hStream);
+    }
     if (peak_cuda_runtime_launch_wrapper_depth != 0) {
         return original_cu_graph_launch(hGraphExec, hStream);
     }
@@ -2792,7 +2895,9 @@ peak_cuda_driver_typed_replacements_are_isolated()
         "cuLaunchKernel",
         "cuLaunchCooperativeKernel",
         "cuLaunchCooperativeKernelMultiDevice",
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
         "cuLaunchKernelEx",
+#endif
         "cuGraphLaunch",
     };
     PeakCudaResolvedEntry timed[G_N_ELEMENTS(timed_symbols)] = {};
@@ -3197,8 +3302,18 @@ extern "C" int cuda_interceptor_attach()
     peak_cuda_graph_identity_capacity = peak_cuda_event_pool_capacity * 4;
     peak_cuda_finalization_timeout_ms =
         peak_cuda_parse_finalization_timeout_ms();
-    peak_cuda_profiler_state.reset(peak_cuda_event_pool_capacity,
-                                   peak_cuda_event_pool_capacity * 4);
+    std::vector<std::string> configured_targets;
+    configured_targets.reserve(peak_gpu_hook_address_count);
+    for (size_t index = 0; index < peak_gpu_hook_address_count; ++index) {
+        if (peak_gpu_hook_strings[index] != NULL) {
+            configured_targets.emplace_back(peak_gpu_hook_strings[index]);
+        }
+    }
+    peak_cuda_profiler_state.reset(
+        peak_cuda_event_pool_capacity,
+        peak_cuda_event_pool_capacity * 4,
+        peak_gpu_monitor_all,
+        configured_targets);
     peak_cuda_identity_epoch.fetch_add(1, std::memory_order_acq_rel);
     peak_cuda_slot_allocator.reset(peak_cuda_event_pool_capacity);
     peak_cuda_pending_queue.reset(peak_cuda_event_pool_capacity);
@@ -3299,6 +3414,7 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
     hook_cuda_launch_exc =
         (gpointer*) peak_general_listener_find_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
@@ -3314,6 +3430,7 @@ extern "C" int cuda_interceptor_attach()
             hook_cuda_launch_exc = NULL;
         }
     }
+#endif
 
     hook_cu_launch = driver_typed_replacements_are_isolated
         ? (gpointer*) peak_general_listener_find_function("cuLaunchKernel")
@@ -3369,6 +3486,7 @@ extern "C" int cuda_interceptor_attach()
         }
     }
 
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
     hook_cu_launch_ex = driver_typed_replacements_are_isolated
         ? (gpointer*) peak_general_listener_find_function("cuLaunchKernelEx")
         : NULL;
@@ -3385,6 +3503,7 @@ extern "C" int cuda_interceptor_attach()
             hook_cu_launch_ex = NULL;
         }
     }
+#endif
 
     hook_cuda_graph_launch =
         (gpointer*) peak_general_listener_find_function("cudaGraphLaunch");
@@ -3442,10 +3561,13 @@ extern "C" int cuda_interceptor_attach()
                 hook_cuda_launch_cooperative_multiple_device);
             hook_cuda_launch_cooperative_multiple_device = NULL;
         }
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX) && \
+    defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
         if (hook_cuda_launch_exc != NULL && hook_cu_launch_ex != NULL) {
             gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_exc);
             hook_cuda_launch_exc = NULL;
         }
+#endif
         if (hook_cuda_graph_launch != NULL &&
             hook_cu_graph_launch != NULL) {
             gum_interceptor_revert(cuda_interceptor,
@@ -3530,6 +3652,21 @@ extern "C" int cuda_interceptor_attach()
          capture_entry_points_ready &&
          !runtime_capture_hook_install_failed &&
          !driver_capture_hook_install_failed);
+
+    peak_cuda_capability_report.runtime_base_installed =
+        hook_cuda_launch != NULL ||
+        hook_cuda_launch_cooperative != NULL ||
+        hook_cuda_graph_launch != NULL;
+    peak_cuda_capability_report.runtime_ex_installed =
+        hook_cuda_launch_exc != NULL;
+    peak_cuda_capability_report.driver_base_installed =
+        hook_cu_launch != NULL ||
+        hook_cu_launch_cooperative != NULL ||
+        hook_cu_graph_launch != NULL;
+    peak_cuda_capability_report.driver_ex_installed =
+        hook_cu_launch_ex != NULL;
+    peak_cuda_capability_report.driver_timing_available =
+        peak_cuda_driver_timing_available();
 
     peak_cuda_lifecycle_open();
     gum_interceptor_end_transaction(cuda_interceptor);
@@ -3732,7 +3869,7 @@ static void cuda_interceptor_print_graph_result(GHashTable* hashTable)
 static PeakReportSnapshot*
 peak_cuda_build_report_snapshot()
 {
-    static constexpr size_t kCounterCount = 21;
+    static constexpr size_t kCounterCount = 25;
     std::vector<std::pair<std::string, KernelDimInfo>> kernels;
     PeakReportSnapshot* snapshot;
     size_t index = 0;
@@ -3804,6 +3941,10 @@ peak_cuda_build_report_snapshot()
         "CUDA profiler counter [pool_high_water]",
         "CUDA profiler counter [pool_full]",
         "CUDA profiler counter [identity_full]",
+        "CUDA profiler counter [positive_identity_admission_failed]",
+        "CUDA profiler counter [negative_identity_overflow]",
+        "CUDA profiler counter [monitor_all_identity_overflow]",
+        "CUDA profiler counter [identity_overflow_suppressed]",
         "CUDA profiler counter [event_create_failed]",
         "CUDA profiler counter [timing_error]",
         "CUDA profiler counter [harvester_unavailable]",
@@ -3827,6 +3968,10 @@ peak_cuda_build_report_snapshot()
         slots.high_water_slots,
         counters.dropped_pool_full,
         counters.dropped_identity_full,
+        counters.positive_identity_admission_failures,
+        counters.negative_identity_overflow,
+        counters.monitor_all_identity_overflow,
+        counters.repeated_identity_overflow_suppressed,
         counters.dropped_event_create,
         counters.dropped_timing_error,
         counters.dropped_harvester_unavailable,
@@ -3870,6 +4015,10 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
         PEAK_CUDA_COUNTER_POOL_HIGH_WATER,
         PEAK_CUDA_COUNTER_POOL_FULL,
         PEAK_CUDA_COUNTER_IDENTITY_FULL,
+        PEAK_CUDA_COUNTER_POSITIVE_IDENTITY_ADMISSION_FAILED,
+        PEAK_CUDA_COUNTER_NEGATIVE_IDENTITY_OVERFLOW,
+        PEAK_CUDA_COUNTER_MONITOR_ALL_IDENTITY_OVERFLOW,
+        PEAK_CUDA_COUNTER_IDENTITY_OVERFLOW_SUPPRESSED,
         PEAK_CUDA_COUNTER_EVENT_CREATE_FAILED,
         PEAK_CUDA_COUNTER_TIMING_ERROR,
         PEAK_CUDA_COUNTER_HARVESTER_UNAVAILABLE,
@@ -3894,6 +4043,10 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
         "[pool_high_water]",
         "[pool_full]",
         "[identity_full]",
+        "[positive_identity_admission_failed]",
+        "[negative_identity_overflow]",
+        "[monitor_all_identity_overflow]",
+        "[identity_overflow_suppressed]",
         "[event_create_failed]",
         "[timing_error]",
         "[harvester_unavailable]",
@@ -3965,8 +4118,33 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
         counters[PEAK_CUDA_COUNTER_COMPLETED],
         counters[PEAK_CUDA_COUNTER_POOL_HIGH_WATER]);
     peak_log_report(
+        "[peak] CUDA profiler capabilities: compiled_runtime_base=1"
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
+        " compiled_runtime_ex=1"
+#else
+        " compiled_runtime_ex=0"
+#endif
+        " compiled_driver_base=1"
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
+        " compiled_driver_ex=1"
+#else
+        " compiled_driver_ex=0"
+#endif
+        " installed_runtime_base=%d installed_runtime_ex=%d"
+        " installed_driver_base=%d installed_driver_ex=%d"
+        " driver_timing=%d\n",
+        (int)peak_cuda_capability_report.runtime_base_installed,
+        (int)peak_cuda_capability_report.runtime_ex_installed,
+        (int)peak_cuda_capability_report.driver_base_installed,
+        (int)peak_cuda_capability_report.driver_ex_installed,
+        (int)peak_cuda_capability_report.driver_timing_available);
+    peak_log_report(
         "[peak] CUDA profiler drops: pool_full=%" G_GUINT64_FORMAT
         " identity_full=%" G_GUINT64_FORMAT
+        " positive_identity_admission_failed=%" G_GUINT64_FORMAT
+        " negative_identity_overflow=%" G_GUINT64_FORMAT
+        " monitor_all_identity_overflow=%" G_GUINT64_FORMAT
+        " identity_overflow_suppressed=%" G_GUINT64_FORMAT
         " event_create_failed=%" G_GUINT64_FORMAT
         " timing_error=%" G_GUINT64_FORMAT
         " harvester_unavailable=%" G_GUINT64_FORMAT
@@ -3982,6 +4160,10 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
         " dimension_overflow=%" G_GUINT64_FORMAT "\n",
         counters[PEAK_CUDA_COUNTER_POOL_FULL],
         counters[PEAK_CUDA_COUNTER_IDENTITY_FULL],
+        counters[PEAK_CUDA_COUNTER_POSITIVE_IDENTITY_ADMISSION_FAILED],
+        counters[PEAK_CUDA_COUNTER_NEGATIVE_IDENTITY_OVERFLOW],
+        counters[PEAK_CUDA_COUNTER_MONITOR_ALL_IDENTITY_OVERFLOW],
+        counters[PEAK_CUDA_COUNTER_IDENTITY_OVERFLOW_SUPPRESSED],
         counters[PEAK_CUDA_COUNTER_EVENT_CREATE_FAILED],
         counters[PEAK_CUDA_COUNTER_TIMING_ERROR],
         counters[PEAK_CUDA_COUNTER_HARVESTER_UNAVAILABLE],

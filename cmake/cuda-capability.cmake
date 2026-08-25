@@ -1,0 +1,15 @@
+function(peak_cuda_evaluate_capability found version prefix)
+    set(_enabled OFF)
+    set(_launch_ex OFF)
+
+    if(found AND NOT version VERSION_LESS "11.2")
+        set(_enabled ON)
+        if(NOT version VERSION_LESS "11.8")
+            set(_launch_ex ON)
+        endif()
+    endif()
+
+    set(${prefix}_ENABLED ${_enabled} PARENT_SCOPE)
+    set(${prefix}_HAS_RUNTIME_LAUNCH_EX ${_launch_ex} PARENT_SCOPE)
+    set(${prefix}_HAS_DRIVER_LAUNCH_EX ${_launch_ex} PARENT_SCOPE)
+endfunction()
