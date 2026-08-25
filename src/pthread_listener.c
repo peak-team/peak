@@ -9,6 +9,7 @@
 
 #include <limits.h>
 #include <sched.h>
+#include <time.h>
 
 #define PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_ENV \
     "PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS"
@@ -127,18 +128,38 @@ peak_pthread_start_context_release(PeakPthreadStartContext* context)
 }
 
 static void
-peak_pthread_start_warn_abandoned(void)
+peak_pthread_start_warn_abandoned(double elapsed_ms)
 {
     int expected = 0;
 
     if (atomic_compare_exchange_strong_explicit(
             &pthread_start_timeout_warning_emitted, &expected, 1,
             memory_order_acq_rel, memory_order_acquire)) {
-        peak_log_warn(
-            "[peak] pthread child metadata publication did not complete "
-            "within %u ms; running the child untracked\n",
-            pthread_start_handshake_timeout_ms);
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] pthread child metadata publication did not complete "
+                "after %.3f ms (timeout=%u ms); running the child untracked\n",
+                elapsed_ms, pthread_start_handshake_timeout_ms);
+        } else {
+            peak_log_warn(
+                "[peak] pthread child metadata publication did not complete "
+                "(elapsed unavailable; timeout=%u ms); running the child "
+                "untracked\n",
+                pthread_start_handshake_timeout_ms);
+        }
     }
+}
+
+static double
+peak_pthread_start_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
 }
 
 static void
@@ -191,12 +212,17 @@ peak_pthread_start(void* data)
     void* start_arg = context->start_arg;
     void* ret = NULL;
     PeakPthreadStartHandshakeState handshake_state;
+    struct timespec wait_started;
+    gboolean wait_clock_available =
+        clock_gettime(CLOCK_MONOTONIC, &wait_started) == 0;
 
     pthread_cleanup_push(peak_pthread_start_cleanup, context);
     handshake_state = peak_pthread_slot_registry_wait_ready(
         &context->handshake_state, pthread_start_handshake_timeout_ms);
     if (handshake_state == PEAK_PTHREAD_START_ABANDONED) {
-        peak_pthread_start_warn_abandoned();
+        peak_pthread_start_warn_abandoned(
+            wait_clock_available ?
+                peak_pthread_start_elapsed_ms(&wait_started) : -1.0);
     }
     if (!context->skip_tracking &&
         handshake_state == PEAK_PTHREAD_START_READY) {

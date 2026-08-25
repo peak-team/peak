@@ -152,6 +152,9 @@ static _Atomic int peak_runtime_activation_wait_warning_emitted;
 static PeakEnvWarningState peak_runtime_activation_timeout_warning_emitted;
 static unsigned int peak_runtime_activation_wait_timeout_ms =
     PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_DEFAULT;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic unsigned int peak_test_activation_waiters;
+#endif
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
 #define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
@@ -222,13 +225,15 @@ peak_runtime_activation_cond_is_ready(void)
 }
 
 static gboolean
-peak_runtime_activation_deadline(struct timespec* deadline)
+peak_runtime_activation_deadline(struct timespec* started,
+                                 struct timespec* deadline)
 {
     unsigned int timeout_ms = peak_runtime_activation_wait_timeout_ms;
 
-    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, started) != 0) {
         return FALSE;
     }
+    *deadline = *started;
     deadline->tv_sec += timeout_ms / 1000U;
     deadline->tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
     if (deadline->tv_nsec >= 1000000000L) {
@@ -236,6 +241,18 @@ peak_runtime_activation_deadline(struct timespec* deadline)
         deadline->tv_nsec -= 1000000000L;
     }
     return TRUE;
+}
+
+static double
+peak_runtime_activation_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
 }
 
 static int
@@ -272,7 +289,8 @@ peak_runtime_activation_cond_timedwait(const struct timespec* deadline)
 }
 
 static void
-peak_runtime_activation_warn_wait_timeout(const char* reason)
+peak_runtime_activation_warn_wait_timeout(const char* reason,
+                                          double elapsed_ms)
 {
     int expected = 0;
 
@@ -282,17 +300,36 @@ peak_runtime_activation_warn_wait_timeout(const char* reason)
             1,
             memory_order_acq_rel,
             memory_order_acquire)) {
-        peak_log_warn(
-            "[peak] runtime activation did not complete within %u ms (%s); "
-            "skipping dependent PEAK work so the application can continue\n",
-            peak_runtime_activation_wait_timeout_ms,
-            reason);
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] runtime activation did not complete after %.3f ms "
+                "(timeout=%u ms; %s); skipping dependent PEAK work so the "
+                "application can continue\n",
+                elapsed_ms, peak_runtime_activation_wait_timeout_ms, reason);
+        } else {
+            peak_log_warn(
+                "[peak] runtime activation did not complete "
+                "(elapsed unavailable; timeout=%u ms; %s); skipping dependent "
+                "PEAK work so the application can continue\n",
+                peak_runtime_activation_wait_timeout_ms, reason);
+        }
     }
+}
+
+static void
+peak_runtime_activation_wait_cancel(void* data)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
+    (void)pthread_mutex_unlock((pthread_mutex_t*)data);
 }
 
 static PeakRuntimeActivationState
 peak_runtime_activation_wait_for_terminal(void)
 {
+    struct timespec started;
     struct timespec deadline;
     int state = atomic_load_explicit(&peak_runtime_activation_state,
                                      memory_order_acquire);
@@ -306,12 +343,23 @@ peak_runtime_activation_wait_for_terminal(void)
         pthread_equal(pthread_self(), peak_runtime_activation_owner)) {
         return PEAK_RUNTIME_ACTIVATION_IN_PROGRESS;
     }
-    if (!peak_runtime_activation_cond_is_ready() ||
-        !peak_runtime_activation_deadline(&deadline) ||
-        pthread_mutex_lock(&peak_runtime_activation_mutex) != 0) {
-        peak_runtime_activation_warn_wait_timeout("wait unavailable");
+    if (!peak_runtime_activation_deadline(&started, &deadline)) {
+        peak_runtime_activation_warn_wait_timeout("wait unavailable", -1.0);
         return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
     }
+    if (!peak_runtime_activation_cond_is_ready() ||
+        pthread_mutex_lock(&peak_runtime_activation_mutex) != 0) {
+        peak_runtime_activation_warn_wait_timeout(
+            "wait unavailable",
+            peak_runtime_activation_elapsed_ms(&started));
+        return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
+    }
+    pthread_cleanup_push(peak_runtime_activation_wait_cancel,
+                         &peak_runtime_activation_mutex);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_add_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
     while ((state = atomic_load_explicit(&peak_runtime_activation_state,
                                          memory_order_acquire)) ==
            PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
@@ -320,10 +368,16 @@ peak_runtime_activation_wait_for_terminal(void)
             break;
         }
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
+    pthread_cleanup_pop(0);
     (void)pthread_mutex_unlock(&peak_runtime_activation_mutex);
     if (state == PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
         peak_runtime_activation_warn_wait_timeout(
-            wait_status == ETIMEDOUT ? "deadline expired" : "wait failed");
+            wait_status == ETIMEDOUT ? "deadline expired" : "wait failed",
+            peak_runtime_activation_elapsed_ms(&started));
         return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
     }
     return (PeakRuntimeActivationState)state;
@@ -544,6 +598,13 @@ peak_test_activation_after_claim_release(void)
     atomic_store_explicit(&peak_test_activation_after_claim_released,
                           1,
                           memory_order_release);
+}
+
+PEAK_EXEC_API unsigned int
+peak_test_activation_waiter_count(void)
+{
+    return atomic_load_explicit(&peak_test_activation_waiters,
+                                memory_order_acquire);
 }
 
 static void

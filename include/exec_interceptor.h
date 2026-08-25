@@ -116,6 +116,9 @@ PEAK_EXEC_API int peak_test_activation_after_claim_is_held(void);
 /** Releases an activation paused after claiming ownership. */
 PEAK_EXEC_API void peak_test_activation_after_claim_release(void);
 
+/** Returns the number of threads blocked on activation publication. */
+PEAK_EXEC_API unsigned int peak_test_activation_waiter_count(void);
+
 /** @} */
 #endif
 

@@ -8,11 +8,16 @@
 
 typedef void (*PeakVoidFunction)(void);
 typedef int (*PeakIntFunction)(void);
+typedef unsigned int (*PeakUnsignedFunction)(void);
 typedef void (*PeakMpiInitCompletedFunction)(int);
 
 typedef struct {
     PeakMpiInitCompletedFunction complete;
 } CompletionArgs;
+
+typedef struct {
+    PeakVoidFunction fini;
+} FiniArgs;
 
 __attribute__((visibility("default"), noinline))
 int
@@ -27,6 +32,15 @@ complete_mpi_init(void* opaque)
     CompletionArgs* args = (CompletionArgs*)opaque;
 
     args->complete(0);
+    return NULL;
+}
+
+static void*
+run_fini(void* opaque)
+{
+    FiniArgs* args = (FiniArgs*)opaque;
+
+    args->fini();
     return NULL;
 }
 
@@ -45,6 +59,7 @@ int
 main(int argc, char** argv)
 {
     int timeout_mode = argc == 2 && strcmp(argv[1], "timeout") == 0;
+    int cancel_mode = argc == 2 && strcmp(argv[1], "cancel") == 0;
     PeakVoidFunction pause_enable =
         (PeakVoidFunction)dlsym(
             RTLD_DEFAULT, "peak_test_activation_pause_enable");
@@ -65,6 +80,9 @@ main(int argc, char** argv)
             RTLD_DEFAULT, "peak_test_activation_after_claim_release");
     PeakVoidFunction fini =
         (PeakVoidFunction)dlsym(RTLD_DEFAULT, "peak_test_fini");
+    PeakUnsignedFunction activation_waiter_count =
+        (PeakUnsignedFunction)dlsym(
+            RTLD_DEFAULT, "peak_test_activation_waiter_count");
     PeakIntFunction runtime_active =
         (PeakIntFunction)dlsym(
             RTLD_DEFAULT, "peak_runtime_is_active_for_checkpoint");
@@ -77,12 +95,13 @@ main(int argc, char** argv)
     if (pause_enable == NULL || activation_held == NULL ||
         activation_release == NULL || after_claim_enable == NULL ||
         after_claim_held == NULL || after_claim_release == NULL || fini == NULL ||
-        runtime_active == NULL || completion.complete == NULL) {
+        activation_waiter_count == NULL || runtime_active == NULL ||
+        completion.complete == NULL) {
         fputs("mpi_activation_exit_race_error missing hooks\n", stderr);
         return 2;
     }
 
-    if (timeout_mode) {
+    if (timeout_mode || cancel_mode) {
         after_claim_enable();
     } else {
         pause_enable();
@@ -92,8 +111,39 @@ main(int argc, char** argv)
         fputs("mpi_activation_exit_race_error pthread_create\n", stderr);
         return 3;
     }
-    while (!(timeout_mode ? after_claim_held() : activation_held())) {
+    while (!((timeout_mode || cancel_mode) ? after_claim_held() :
+                                              activation_held())) {
         sched_yield();
+    }
+
+    if (cancel_mode) {
+        pthread_t waiter;
+        void* canceled_result = NULL;
+        FiniArgs fini_args = { .fini = fini };
+
+        if (pthread_create(&waiter, NULL, run_fini, &fini_args) != 0) {
+            fputs("mpi_activation_exit_race_error waiter create\n", stderr);
+            return 5;
+        }
+        while (activation_waiter_count() == 0) {
+            sched_yield();
+        }
+        if (pthread_cancel(waiter) != 0 ||
+            pthread_join(waiter, &canceled_result) != 0 ||
+            canceled_result != PTHREAD_CANCELED) {
+            fputs("mpi_activation_exit_race_error waiter cancel\n", stderr);
+            return 6;
+        }
+        after_claim_release();
+        pthread_join(completion_thread, NULL);
+        if (runtime_active() == 0) {
+            fputs("mpi_activation_exit_race_error owner publication blocked\n",
+                  stderr);
+            return 7;
+        }
+        fini();
+        puts("mpi_activation_wait_cancellation_ok");
+        return 0;
     }
 
     if (timeout_mode) {

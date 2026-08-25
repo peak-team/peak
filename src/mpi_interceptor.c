@@ -44,6 +44,10 @@ static _Atomic int peak_finalize_wait_warning_emitted;
 static PeakEnvWarningState peak_finalize_timeout_config_warning;
 static unsigned int peak_finalize_owner_timeout_ms =
     PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_DEFAULT;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic unsigned int peak_finalize_test_waiters;
+static _Atomic unsigned int peak_finalize_test_original_calls;
+#endif
 
 static int (*original_pmpi_finalize)(void);
 extern void peak_fini(void);
@@ -171,9 +175,32 @@ mpi_interceptor_finalize_publish_done(int result)
     (void)pthread_mutex_unlock(&peak_finalize_mutex);
 }
 
+static void
+mpi_interceptor_finalize_wait_cancel(void* data)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_finalize_test_waiters, 1,
+                              memory_order_release);
+#endif
+    (void)pthread_mutex_unlock((pthread_mutex_t*)data);
+}
+
+static double
+mpi_interceptor_finalize_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
+}
+
 static int
 mpi_interceptor_wait_for_finalize_owner(void)
 {
+    struct timespec started;
     struct timespec deadline;
     int state;
     int wait_status = 0;
@@ -182,10 +209,11 @@ mpi_interceptor_wait_for_finalize_owner(void)
                      mpi_interceptor_finalize_cond_initialize) != 0 ||
         !atomic_load_explicit(&peak_finalize_cond_ready,
                               memory_order_acquire) ||
-        clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
         wait_status = ENOTSUP;
         goto failed_closed;
     }
+    deadline = started;
     deadline.tv_sec += peak_finalize_owner_timeout_ms / 1000U;
     deadline.tv_nsec +=
         (long)(peak_finalize_owner_timeout_ms % 1000U) * 1000000L;
@@ -197,6 +225,12 @@ mpi_interceptor_wait_for_finalize_owner(void)
         wait_status = EINVAL;
         goto failed_closed;
     }
+    pthread_cleanup_push(mpi_interceptor_finalize_wait_cancel,
+                         &peak_finalize_mutex);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_add_explicit(&peak_finalize_test_waiters, 1,
+                              memory_order_release);
+#endif
     while ((state = __atomic_load_n(&peak_finalize_state,
                                      __ATOMIC_ACQUIRE)) ==
            PEAK_MPI_FINALIZE_IN_PROGRESS) {
@@ -205,6 +239,11 @@ mpi_interceptor_wait_for_finalize_owner(void)
             break;
         }
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_finalize_test_waiters, 1,
+                              memory_order_release);
+#endif
+    pthread_cleanup_pop(0);
     (void)pthread_mutex_unlock(&peak_finalize_mutex);
     if (state == PEAK_MPI_FINALIZE_DONE) {
         return __atomic_load_n(&peak_finalize_result, __ATOMIC_ACQUIRE);
@@ -233,12 +272,26 @@ failed_closed:
             if (atomic_exchange_explicit(
                     &peak_finalize_wait_warning_emitted, 1,
                     memory_order_acq_rel) == 0) {
-                peak_log_warn(
-                    "[peak] MPI finalizer owner did not complete within %u ms "
-                    "(%s); failing closed without another MPI call\n",
-                    peak_finalize_owner_timeout_ms,
-                    wait_status == ETIMEDOUT ? "deadline expired" :
-                                                "wait unavailable");
+                double elapsed_ms = wait_status == ENOTSUP ? -1.0 :
+                    mpi_interceptor_finalize_elapsed_ms(&started);
+
+                if (elapsed_ms >= 0.0) {
+                    peak_log_warn(
+                        "[peak] MPI finalizer owner did not complete after "
+                        "%.3f ms (timeout=%u ms; %s); failing closed without "
+                        "another MPI call\n",
+                        elapsed_ms, peak_finalize_owner_timeout_ms,
+                        wait_status == ETIMEDOUT ? "deadline expired" :
+                                                    "wait unavailable");
+                } else {
+                    peak_log_warn(
+                        "[peak] MPI finalizer owner did not complete "
+                        "(elapsed unavailable; timeout=%u ms; %s); failing "
+                        "closed without another MPI call\n",
+                        peak_finalize_owner_timeout_ms,
+                        wait_status == ETIMEDOUT ? "deadline expired" :
+                                                    "wait unavailable");
+                }
             }
         }
     }
@@ -516,6 +569,16 @@ mpi_interceptor_call_original_finalize_once(void)
     }
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static int
+mpi_interceptor_test_original_finalize_stub(void)
+{
+    atomic_fetch_add_explicit(&peak_finalize_test_original_calls, 1,
+                              memory_order_relaxed);
+    return MPI_SUCCESS;
+}
+#endif
+
 /**
  * @brief Custom implementation of `PMPI_Finalize` function
  *
@@ -604,6 +667,41 @@ PEAK_MPI_INTERCEPTOR_API int
 mpi_interceptor_test_collectives_failed_closed(void)
 {
     return peak_mpi_teardown_collectives_failed_closed() ? 1 : 0;
+}
+
+PEAK_MPI_INTERCEPTOR_API unsigned int
+mpi_interceptor_test_finalize_waiter_count(void)
+{
+    return atomic_load_explicit(&peak_finalize_test_waiters,
+                                memory_order_acquire);
+}
+
+PEAK_MPI_INTERCEPTOR_API void
+mpi_interceptor_test_publish_finalize_result(int result)
+{
+    mpi_interceptor_finalize_publish_done(result);
+}
+
+PEAK_MPI_INTERCEPTOR_API void
+mpi_interceptor_test_prepare_original_finalize_stub(void)
+{
+    original_pmpi_finalize = mpi_interceptor_test_original_finalize_stub;
+    __atomic_store_n(&peak_real_finalize_allowed, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&peak_finalize_test_original_calls, 0,
+                          memory_order_relaxed);
+}
+
+PEAK_MPI_INTERCEPTOR_API int
+mpi_interceptor_test_call_original_finalize_once(void)
+{
+    return mpi_interceptor_call_original_finalize_once();
+}
+
+PEAK_MPI_INTERCEPTOR_API unsigned int
+mpi_interceptor_test_original_finalize_call_count(void)
+{
+    return atomic_load_explicit(&peak_finalize_test_original_calls,
+                                memory_order_relaxed);
 }
 #endif
 

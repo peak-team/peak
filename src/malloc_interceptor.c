@@ -658,6 +658,18 @@ peak_memlog_wait_for_writers(void)
     return drained;
 }
 
+static double
+peak_memlog_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
+}
+
 static int peak_memlog_disable(void) {
     PeakMemLogState state;
 
@@ -953,6 +965,8 @@ static inline int peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
 static void peak_memlog_finalize(void) {
     size_t events;
     PeakMemLogState state;
+    struct timespec writer_wait_started;
+    int writer_wait_clock_available;
 
     /* Serialize finalizers; a DISABLED state can still have admitted writers. */
     pthread_mutex_lock(&memlog_finalize_mutex);
@@ -967,7 +981,12 @@ static void peak_memlog_finalize(void) {
         return;
     }
 
+    writer_wait_clock_available =
+        clock_gettime(CLOCK_MONOTONIC, &writer_wait_started) == 0;
     if (!peak_memlog_disable()) {
+        double elapsed_ms = writer_wait_clock_available ?
+            peak_memlog_elapsed_ms(&writer_wait_started) : -1.0;
+
         note_memory_tracking_degraded(
             "memory-log writer drain deadline expired; retaining live log state");
         peak_report_capability_note_partial(PEAK_CAPABILITY_MEMORY);
@@ -975,12 +994,23 @@ static void peak_memlog_finalize(void) {
         peak_report_snapshot_note_degraded(
             PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
             "memory-log writer drain deadline expired");
-        peak_log_warn(
-            "[peak] memlog: %zu active writer(s) did not drain within %u ms; "
-            "retaining the mapping and skipping export so process exit can continue\n",
-            atomic_load_explicit(&g_memlog.active_writers,
-                                 memory_order_acquire),
-            peak_memlog_writer_timeout_ms);
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] memlog: %zu active writer(s) did not drain after "
+                "%.3f ms (timeout=%u ms); retaining the mapping and skipping "
+                "export so process exit can continue\n",
+                atomic_load_explicit(&g_memlog.active_writers,
+                                     memory_order_acquire),
+                elapsed_ms, peak_memlog_writer_timeout_ms);
+        } else {
+            peak_log_warn(
+                "[peak] memlog: %zu active writer(s) did not drain "
+                "(elapsed unavailable; timeout=%u ms); retaining the mapping "
+                "and skipping export so process exit can continue\n",
+                atomic_load_explicit(&g_memlog.active_writers,
+                                     memory_order_acquire),
+                peak_memlog_writer_timeout_ms);
+        }
         pthread_mutex_unlock(&memlog_finalize_mutex);
         return;
     }
