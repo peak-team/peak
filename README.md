@@ -283,16 +283,17 @@ in detail.
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
 | `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. |
 
-Every text report includes a capability manifest for CPU targets, strict
-mutation, CUDA, memory tracking, JIT input, dynamic DSO discovery, and the
-selected output transport. Each row distinguishes `requested`, `compiled`,
-`active`, `partial`, `retained`, and `failed` state. CUDA reports also include
-stable hexadecimal masks for compiled, found, installed, and failed API
-families. MPI and socket aggregation preserve the common installed coverage,
-OR failure/degradation evidence across ranks, and mark rank-varying coverage
-as partial. An unavailable requested optional backend fails open: PEAK emits
-one warning, records the failed capability, and continues the application and
-any independently installed profiler backends.
+Every text and stats CSV report includes a capability manifest for CPU targets,
+strict mutation, CUDA, memory tracking, JIT input, dynamic DSO discovery, and
+the selected output transport. Each row distinguishes `requested`, `compiled`,
+`active`, `partial`, `retained`, and `failed` state. CSV rows prefixed with
+`PEAK_CAPABILITY_` provide the same machine-readable fields. CUDA reports also
+include stable masks for compiled, found, installed, and failed API families.
+MPI and socket aggregation preserve the common installed coverage, OR
+failure/degradation evidence across ranks, and mark rank-varying coverage as
+partial. An unavailable requested optional backend fails open: PEAK emits one
+warning, records the failed capability, and continues the application and any
+independently installed profiler backends.
 
 ### MPI Output
 

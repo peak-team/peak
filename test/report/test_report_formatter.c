@@ -229,6 +229,17 @@ create_fixture(const char* name)
     snapshot->overhead_per_call = 0.01;
     snapshot->dropped_calls = 7;
     snapshot->dropped_threads = 3;
+    snapshot->degraded_mask = PEAK_PROFILER_DEGRADED_CUDA;
+    snapshot->capabilities.requested =
+        PEAK_CAPABILITY_CPU_TARGET | PEAK_CAPABILITY_CUDA;
+    snapshot->capabilities.compiled = snapshot->capabilities.requested;
+    snapshot->capabilities.active = PEAK_CAPABILITY_CPU_TARGET;
+    snapshot->capabilities.partial = PEAK_CAPABILITY_CUDA;
+    snapshot->capabilities.failed = PEAK_CAPABILITY_CUDA;
+    snapshot->capabilities.cuda_compiled_apis = 7;
+    snapshot->capabilities.cuda_found_apis = 3;
+    snapshot->capabilities.cuda_installed_apis = 1;
+    snapshot->capabilities.cuda_failed_apis = 2;
     snapshot->rank_count = 2;
 
     snapshot->instrumented[1] = 0;
@@ -261,11 +272,39 @@ check_csv_golden(const char* csv_path)
 {
     static const char expected[] =
         "function,count,per_thread,per_rank,call_max_s,call_min_s,"
-        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,dropped_calls,dropped_threads\n"
+        "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,"
+        "dropped_calls,dropped_threads,capability_requested,"
+        "capability_compiled,capability_active,capability_partial,"
+        "capability_retained,capability_failed,cuda_compiled_apis,"
+        "cuda_found_apis,cuda_installed_apis,cuda_failed_apis,"
+        "degraded_mask\n"
         "\"alpha\",5,3,2.5,5.000000000e-01,1.250000000e-01,"
         "1.250000000e+00,1.250000000e+00,7.500000000e-01,"
-        "2.500000000e-01,5.000000000e-02,7,3\n"
-        "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,7,3\n";
+        "2.500000000e-01,5.000000000e-02,7,3,0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,7,3,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_cpu-target\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "1,1,1,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_strict-mutation\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_cuda\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "1,1,0,1,0,1,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_memory\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_dynamic-dso\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_mpi-report\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_socket-report\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_local-report\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CUDA_API_COVERAGE\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,7,3,1,2,0\n"
+        "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,0,0,0,0,0,0,16\n";
     PeakReportSnapshot* snapshot = create_fixture("alpha");
     PeakReportSnapshot* prepared = peak_report_snapshot_clone(snapshot);
     char* actual;
@@ -550,6 +589,30 @@ check_no_output(const char* csv_path)
     assert(text[0] == '\0');
     assert(access(csv_path, F_OK) != 0);
     free(text);
+    peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_capability_only_output(const char* csv_path)
+{
+    PeakReportSnapshot* snapshot = peak_report_snapshot_create(0);
+    char* contents;
+
+    assert(snapshot != NULL);
+    snapshot->degraded_mask = PEAK_PROFILER_DEGRADED_JIT;
+    snapshot->capabilities.requested = PEAK_CAPABILITY_JIT;
+    snapshot->capabilities.compiled = PEAK_CAPABILITY_JIT;
+    snapshot->capabilities.failed = PEAK_CAPABILITY_JIT;
+    assert(peak_report_formatter_write_csv(snapshot));
+    contents = read_file(csv_path);
+    assert(strstr(contents,
+                  "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,"
+                  "1,1,0,0,0,1,0,0,0,0,0\n") != NULL);
+    assert(strstr(contents,
+                  "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,"
+                  "0,0,0,0,0,0,0,0,0,0,0,0,0,32\n") != NULL);
+    free(contents);
+    assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);
 }
 
@@ -1094,6 +1157,7 @@ main(void)
     check_rank_local_csv_names(stats_base, csv_path);
     check_csv_permissions(csv_path);
     check_no_output(csv_path);
+    check_capability_only_output(csv_path);
     check_dropped_only_output(csv_path);
     check_text_name_policy();
     check_text_flush_failure();
