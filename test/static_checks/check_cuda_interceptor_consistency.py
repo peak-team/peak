@@ -147,6 +147,10 @@ def main():
     cuda_test_cmake = (
         repo_root / "test" / "cuda" /
         "CMakeLists.txt").read_text(encoding="utf-8")
+    root_cmake = (repo_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    package_config = (
+        repo_root / "cmake" / "PEAKConfig.cmake.in").read_text(
+            encoding="utf-8")
     cuda_state = (repo_root / "src" / "cuda_profiler_state.cpp").read_text(
         encoding="utf-8")
     c_api_headers = [
@@ -377,9 +381,9 @@ def main():
             "each timed wrapper must handle both event-record failures")
     record_event = function_body(cuda, "peak_cuda_record_event")
     require("peak_cuda_backend_api.event_record(" in record_event and
-            "cudaEventRecord(event, stream)" in record_event,
-            "Driver timing must avoid re-entering the Runtime API while "
-            "retaining the Runtime fallback")
+            "cudaEventRecord(" not in record_event,
+            "PEAK timing must stay on the Driver API and never perturb "
+            "CUDA Runtime last-error state")
     require("peak_cuda_acquire_event_pair" not in cuda and
             "peak_cuda_release_event_pair" not in cuda and
             "peak_cuda_drain_kernel_event_map" not in cuda and
@@ -393,12 +397,40 @@ def main():
             cuda.find("#include \"cuda_interceptor.h\"") and
             "std::max(" in cuda and "std::min(" in cuda,
             "CUDA launch statistics must use standard min/max without macro pollution")
-    require("recorded = cudaEventRecord(event, stream) == cudaSuccess" in cuda and
+    require("peak_cuda_backend_api.event_create(" in cuda and
+            "peak_cuda_backend_api.event_destroy(" in cuda and
+            "peak_cuda_backend_api.event_record(" in cuda and
+            "peak_cuda_backend_api.event_query(" in cuda and
+            "peak_cuda_backend_api.event_elapsed_time(" in cuda and
+            "cudaEventCreate(" not in cuda and
+            "cudaEventDestroy(" not in cuda and
+            "cudaEventRecord(" not in cuda and
+            "cudaEventQuery(" not in cuda and
+            "cudaEventElapsedTime(" not in cuda and
             "if (!recorded)" in cuda and
-            "cudaEventQuery(slot.end)" in cuda and
-            "cudaEventElapsedTime(&ms" in cuda and
-            "!= cudaSuccess" in cuda,
-            "CUDA event record/query/elapsed failures must be checked")
+            "!= CUDA_SUCCESS" in cuda,
+            "PEAK event lifecycle must use checked Driver calls only")
+    require("cudaGetLastError(" not in cuda,
+            "CUDA Runtime error transparency must not use destructive "
+            "last-error save/restore calls")
+    require_order(
+        function_body(cuda, "peak_cuda_launch_kernel_exc"),
+        "if (config == NULL || func == NULL)",
+        "return original_cuda_launch_kernel_exc(config, func, args);",
+        "config->gridDim")
+    require_order(
+        function_body(cuda, "peak_cu_launch_kernel_ex"),
+        "if (config == NULL || func == NULL)",
+        "return original_cu_launch_kernel_ex(config, func, kernelParams, extra);",
+        "config->gridDimX")
+    for wrapper in (
+            "peak_cuda_launch_cooperative_kernel_multiple_device",
+            "peak_cu_launch_cooperative_kernel_multiple_device"):
+        require_order(
+            function_body(cuda, wrapper),
+            "if (launchParamsList == NULL || numDevices == 0)",
+            "return original_",
+            "PeakCudaInflightGuard in_flight;")
     require("record_timing_error" in cuda and
             '"[timing_error]"' in cuda,
             "timing failures must be counted and transported")
@@ -406,6 +438,14 @@ def main():
             '"[harvester_unavailable]"' in cuda,
             "deferred helper initialization skips must be counted and "
             "transported")
+    require("CUDA profiler capabilities:" in cuda and
+            "compiled_runtime_ex=" in cuda and
+            "compiled_driver_ex=" in cuda and
+            "installed_runtime_ex=%d" in cuda and
+            "installed_driver_ex=%d" in cuda and
+            "driver_timing=%d" in cuda,
+            "CUDA reports must distinguish compiled and installed launch "
+            "capabilities")
     require("peak_cuda_new_event_slot" not in cuda,
             "per-launch CUDA event allocation must not bypass the bounded pool")
     require("PEAK_CUDA_EVENT_POOL_CAPACITY" in cuda and
@@ -661,8 +701,8 @@ def main():
             "the helper must amortize context activation across one bounded "
             "same-context batch")
     harvest_one = function_body(cuda, "peak_cuda_harvest_one_current")
-    require("cudaEventQuery(slot.end)" in harvest_one and
-            "cudaEventElapsedTime(&ms, slot.start, slot.end)" in harvest_one and
+    require("peak_cuda_backend_api.event_query(" in harvest_one and
+            "peak_cuda_backend_api.event_elapsed_time(" in harvest_one and
             "pthread_mutex_lock" not in harvest_one and
             "peak_cuda_activate_context" not in harvest_one and
             "peak_cuda_restore_context" not in harvest_one,
@@ -676,7 +716,7 @@ def main():
     require_order(
         harvest_one,
         "peak_cuda_test_force_query_error.exchange(",
-        "cudaEventQuery(slot.end)",
+        "peak_cuda_backend_api.event_query(",
         "peak_cuda_test_harvester_queries.fetch_add(",
         "!peak_cuda_harvester_running.load(",
         "record_event_query_failure()",
@@ -992,7 +1032,7 @@ def main():
 
     for wrapper, original in MULTI_DEVICE_CUDA_WRAPPERS.items():
         body = function_body(cuda, wrapper)
-        expected_original_calls = 3 if wrapper.startswith("peak_cu_") else 2
+        expected_original_calls = 4 if wrapper.startswith("peak_cu_") else 3
         require("record_unsupported_multi_device" in body and
                 body.count(original) == expected_original_calls and
                 "peak_cuda_acquire_timing" not in body and
@@ -1099,6 +1139,8 @@ def main():
         "harvester_unavailable",
         "stream_capture_skipped", "capture_query_failed",
         "capture_query_unsupported", "unsupported_multi_device",
+        "positive_identity_admission_failed", "negative_identity_overflow",
+        "monitor_all_identity_overflow", "identity_overflow_suppressed",
         "event_query_failed", "elapsed_failed", "context_query_failed",
         "context_switch_failed", "context_restore_failed",
         "finalization_timeout", "finalization_incomplete",
@@ -1119,9 +1161,20 @@ def main():
     require("cuda_interceptor_prepare_report_snapshot" not in general_source and
             "auxiliary" not in general_source,
             "CPU report snapshots must not depend on CUDA rows")
-    require("if (CUDA_FOUND OR CUDAToolkit_FOUND)" in source_cmake and
+    require("if(PEAK_CUDA_ENABLED)" in source_cmake and
+            "CUDA_FOUND OR CUDAToolkit_FOUND" not in source_cmake and
             "cuda_profiler_state.cpp" in source_cmake,
-            "CUDA profiling state must remain an optional CUDA-only object")
+            "CUDA profiling state must use the validated CUDA capability")
+    require("set(PEAK_CUDA_TOOLKIT_FOUND OFF)" in root_cmake and
+            "peak_cuda_evaluate_capability(" in root_cmake and
+            "add_compile_definitions(HAVE_CUDA=1)" in root_cmake and
+            "find_dependency(CUDAToolkit 11.2)" in package_config and
+            'set(PEAK_CUDA_ENABLED "@PEAK_CUDA_ENABLED@")' in
+            package_config and
+            "CUDA_FOUND" not in package_config and
+            "CUDAToolkit_FOUND" not in package_config,
+            "configured and installed CUDA metadata must use the validated "
+            "capability instead of stale package finder results")
     cpu_capture = function_body(
         general_source, "peak_general_listener_print_with_mpi_job_policy")
     require_order(cpu_capture,

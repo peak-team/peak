@@ -43,15 +43,8 @@ if(BUILD_TESTING)
     find_package(OpenMP)
     find_package(MPI)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    if(BUILD_CUDA_PROFILE)
-        if (CMAKE_VERSION VERSION_LESS 3.17)
-            find_package(CUDA)
-        else()
-            find_package(CUDAToolkit)
-        endif()
-        if (CUDA_FOUND OR CUDAToolkit_FOUND)
-            include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
-        endif()
+    if(PEAK_CUDA_ENABLED)
+        include_directories(${PEAK_CUDA_INCLUDE_DIRS})
     endif()
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -102,6 +95,13 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "test_cmake_portability_ok")
 
+    add_test(NAME test_cuda_capability_contract
+        COMMAND ${CMAKE_COMMAND}
+                -DPEAK_SOURCE_ROOT=${PROJECT_SOURCE_DIR}
+                -P ${PROJECT_SOURCE_DIR}/test/cuda/test_cuda_capability_contract.cmake)
+    set_tests_properties(test_cuda_capability_contract
+        PROPERTIES PASS_REGULAR_EXPRESSION "cuda_capability_contract_ok")
+
     add_test(NAME test_mpi_lifecycle_checker_policy
         COMMAND ${Python3_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/test/dgemm_mpi/test_mpi_lifecycle_checker_policy.py)
@@ -126,6 +126,20 @@ if(BUILD_TESTING)
     add_test(NAME test_cuda_profiler_state COMMAND test_cuda_profiler_state)
     set_tests_properties(test_cuda_profiler_state
         PROPERTIES PASS_REGULAR_EXPRESSION "cuda_profiler_state_test_ok")
+
+    add_executable(test_cuda_identity_cache_benchmark
+        cuda_identity_cache_benchmark.cpp
+        ${PROJECT_SOURCE_DIR}/src/cuda_profiler_state.cpp)
+    target_include_directories(test_cuda_identity_cache_benchmark PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(test_cuda_identity_cache_benchmark
+        PRIVATE Threads::Threads)
+    add_test(NAME test_cuda_identity_cache_benchmark
+        COMMAND test_cuda_identity_cache_benchmark)
+    set_tests_properties(test_cuda_identity_cache_benchmark
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "cuda_identity_cache_benchmark_ok"
+            LABELS "benchmark")
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND CMAKE_READELF)
         add_test(NAME test_peak_shared_unwinder
@@ -3429,7 +3443,7 @@ if(BUILD_TESTING)
     endforeach()
 
     # Add Cuda Test cases
-    if(BUILD_CUDA_PROFILE AND (CUDA_FOUND OR CUDAToolkit_FOUND))
+    if(PEAK_CUDA_ENABLED)
         add_subdirectory(cuda)
     endif()
 

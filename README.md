@@ -439,6 +439,13 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed export capacity. A positive decimal value reserves that many events plus at most one 64-event reservation block of slack per tracked thread; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |
 
+CUDA kernel identity state is also fixed at attach time. The primary identity
+cache contains four entries per event-pool slot. A separate overflow-suppression
+map is capped at the smaller of that identity capacity and 256 entries.
+Configured targets displace cached non-targets when the primary cache is full;
+monitor-all overflow is reported as `<identity-overflow>` instead of being
+attributed to a real kernel name.
+
 CUDA timing uses one process-wide, fixed-capacity slot pool partitioned by CUDA
 context. An event pair is created and reused only in its owning context, after
 the previous end event reports completion. Slot allocation, launch accounting,

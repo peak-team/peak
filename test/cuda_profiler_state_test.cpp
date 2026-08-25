@@ -14,12 +14,13 @@ test_identity_cache_and_non_target_fast_path()
 {
     PeakCudaProfilerState state(2);
     const std::vector<std::string> targets = {"wanted"};
+    state.reset(2, 2, false, targets);
     PeakCudaKernelIdentity first =
-        state.identify(0x1000, false, "unwanted", "unwanted", false, targets);
+        state.identify(0x1000, false, "unwanted", "unwanted");
     PeakCudaKernelIdentity cached =
-        state.identify(0x1000, false, "wanted", "wanted", false, targets);
+        state.identify(0x1000, false, "wanted", "wanted");
     PeakCudaKernelIdentity driver =
-        state.identify(0x1000, true, "wanted", "wanted", false, targets);
+        state.identify(0x1000, true, "wanted", "wanted");
     PeakCudaKernelIdentity lookup;
 
     if (first.target_match || cached.target_match ||
@@ -33,20 +34,93 @@ test_identity_cache_and_non_target_fast_path()
 }
 
 static int
-test_identity_cache_is_bounded()
+test_identity_overflow_is_bounded_and_suppressed()
 {
     PeakCudaProfilerState state(4);
+    const std::vector<std::string> targets;
+
+    state.reset(4, 1, true, targets);
+    (void)state.identify(0x1, false, "first", "first");
+    PeakCudaKernelIdentity overflow =
+        state.identify(0x2, false, "another", "another");
+    PeakCudaKernelIdentity cached;
+    if (!state.cached_identity(0x2, false, &cached)) {
+        return 1;
+    }
+    PeakCudaProfilerCounters counters = state.counters();
+    return std::strcmp(overflow.name.data(), "<identity-overflow>") != 0 ||
+           !overflow.target_match ||
+           std::strcmp(cached.name.data(), "<identity-overflow>") != 0 ||
+           counters.cached_identities != 1 ||
+           counters.cached_overflow_identities != 1 ||
+           counters.dropped_identity_full != 1 ||
+           counters.monitor_all_identity_overflow != 1 ||
+           counters.repeated_identity_overflow_suppressed != 1;
+}
+
+static int
+test_target_survives_negative_identity_saturation()
+{
+    PeakCudaProfilerState state(1);
     const std::vector<std::string> targets = {"wanted"};
 
-    state.reset(4, 1);
-    (void)state.identify(0x1, false, "wanted", "wanted", false, targets);
-    PeakCudaKernelIdentity overflow =
-        state.identify(0x2, false, "another", "another", true, targets);
+    state.reset(1, 1, false, targets);
+    PeakCudaKernelIdentity negative =
+        state.identify(0x1, false, "unwanted", "unwanted");
+    PeakCudaKernelIdentity target =
+        state.identify(0x2, false, "wanted_display", "wanted");
+    PeakCudaKernelIdentity cached_target;
+    PeakCudaKernelIdentity suppressed_negative;
     PeakCudaProfilerCounters counters = state.counters();
-    return std::strcmp(overflow.name.data(), "<unknown>") != 0 ||
-           !overflow.target_match ||
+    return negative.target_match || !target.target_match ||
+           std::strcmp(target.name.data(), "wanted_display") != 0 ||
+           !state.cached_identity(0x2, false, &cached_target) ||
+           !cached_target.target_match ||
+           !state.cached_identity(0x1, false, &suppressed_negative) ||
+           suppressed_negative.target_match ||
            counters.cached_identities != 1 ||
-           counters.dropped_identity_full != 1;
+           counters.cached_overflow_identities != 1 ||
+           counters.negative_identity_overflow != 1 ||
+           counters.positive_identity_admission_failures != 0;
+}
+
+static int
+test_concurrent_target_after_saturation_is_unique()
+{
+    PeakCudaProfilerState state(8);
+    const std::vector<std::string> targets = {"wanted"};
+    state.reset(8, 8, false, targets);
+    for (std::uintptr_t identity = 1; identity <= 8; ++identity) {
+        (void)state.identify(identity, false, "unwanted", "unwanted");
+    }
+
+    std::atomic<bool> start(false);
+    std::atomic<int> failures(0);
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 16; ++worker) {
+        workers.emplace_back([&state, &start, &failures]() {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            PeakCudaKernelIdentity result =
+                state.identify(0x1000, false, "wanted_display", "wanted");
+            if (!result.target_match ||
+                std::strcmp(result.name.data(), "wanted_display") != 0) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    PeakCudaKernelIdentity cached;
+    PeakCudaProfilerCounters counters = state.counters();
+    return failures.load(std::memory_order_relaxed) != 0 ||
+           !state.cached_identity(0x1000, false, &cached) ||
+           !cached.target_match || counters.cached_identities != 8 ||
+           counters.cached_overflow_identities != 1 ||
+           counters.positive_identity_admission_failures != 0;
 }
 
 static int
@@ -54,10 +128,11 @@ test_driver_identity_cache_is_context_aware()
 {
     PeakCudaProfilerState state(4);
     const std::vector<std::string> targets = {"wanted"};
+    state.reset(4, 4, false, targets);
     PeakCudaKernelIdentity first = state.identify(
-        0x1000, true, "context-a", "not-wanted", false, targets, 0xa);
+        0x1000, true, "context-a", "not-wanted", 0xa);
     PeakCudaKernelIdentity second = state.identify(
-        0x1000, true, "context-b", "wanted", false, targets, 0xb);
+        0x1000, true, "context-b", "wanted", 0xb);
     PeakCudaKernelIdentity cached_first;
     PeakCudaKernelIdentity cached_second;
 
@@ -489,7 +564,9 @@ int
 main()
 {
     if (test_identity_cache_and_non_target_fast_path() != 0 ||
-        test_identity_cache_is_bounded() != 0 ||
+        test_identity_overflow_is_bounded_and_suppressed() != 0 ||
+        test_target_survives_negative_identity_saturation() != 0 ||
+        test_concurrent_target_after_saturation_is_unique() != 0 ||
         test_driver_identity_cache_is_context_aware() != 0 ||
         test_concurrent_stress_remains_bounded() != 0 ||
         test_pending_queue_shards_preserve_exact_handoff() != 0 ||

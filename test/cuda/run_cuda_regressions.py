@@ -73,6 +73,43 @@ def run_process(command: list[str], env: dict[str, str], timeout: float,
     return RunResult(process.returncode, stdout, stderr)
 
 
+def run_error_transparency(args: argparse.Namespace, directory: Path) -> None:
+    listed = run_process([str(args.exe), "list"], clean_environment(), 5.0,
+                         directory)
+    require_success("error-list", listed, allow_skip=False)
+    cases = listed.stdout.split()
+    if not cases:
+        raise RuntimeError("CUDA error fixture listed no cases")
+    for case in cases:
+        native = run_process([str(args.exe), case], clean_environment(),
+                             20.0, directory)
+        if native.returncode == SKIP:
+            print_result(f"error-native-{case}", native)
+            raise SystemExit(SKIP)
+        profiles = {
+            "target": profiled_environment(
+                args.peak, PEAK_GPU_MONITOR_ALL="1"),
+            "non-target": profiled_environment(
+                args.peak, PEAK_GPU_TARGET="peak_cuda_never_matches"),
+        }
+        for mode, environment in profiles.items():
+            profiled = run_process([str(args.exe), case], environment,
+                                   20.0, directory)
+            if (native.returncode, native.stdout) != (
+                    profiled.returncode, profiled.stdout):
+                print_result(f"error-native-{case}", native)
+                print_result(f"error-profile-{mode}-{case}", profiled)
+                raise RuntimeError(
+                    "CUDA Runtime contract changed under PEAK for "
+                    f"{mode} {case}")
+            if native.returncode == 0:
+                require_contains(
+                    profiled.stdout,
+                    f"cuda_error_transparency_ok case={case}",
+                    f"error-profile-{mode}-{case}")
+    print("cuda_error_transparency_validation_ok")
+
+
 def print_result(label: str, result: RunResult) -> None:
     print(f"[{label}] stdout:")
     print(result.stdout.rstrip())
@@ -981,7 +1018,8 @@ def run_benchmark(args: argparse.Namespace, directory: Path) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("case", choices=(
-        "sampling", "capture", "context", "finalization", "benchmark"))
+        "sampling", "capture", "context", "finalization", "benchmark",
+        "errors"))
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--peak", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=3)
@@ -1031,6 +1069,8 @@ def main() -> int:
             run_context(args, directory)
         elif args.case == "finalization":
             run_finalization(args, directory)
+        elif args.case == "errors":
+            run_error_transparency(args, directory)
         else:
             run_benchmark(args, directory)
     return 0

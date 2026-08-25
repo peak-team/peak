@@ -1,5 +1,5 @@
-if (NOT BUILD_CUDA_PROFILE)
-    message(STATUS "Skipping CUDA tests because BUILD_CUDA_PROFILE=OFF")
+if(NOT PEAK_CUDA_ENABLED)
+    message(STATUS "Skipping CUDA tests because CUDA profiling is disabled")
     return()
 endif()
 
@@ -12,34 +12,9 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp -fPIC")
 
-if (CMAKE_VERSION VERSION_LESS 3.17)
-    find_package(CUDA QUIET)
-else()
-    find_package(CUDAToolkit QUIET)
-endif()
-
-set(PEAK_CUDA_TEST_LIBRARIES)
-set(PEAK_CUDA_DRIVER_TEST_LIBRARY)
-if (CUDAToolkit_FOUND)
-    message(STATUS "CUDA Toolkit found: ${CUDAToolkit_VERSION}")
-    add_definitions(-DHAVE_CUDA)
-    include_directories(${CUDA_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
-    if (TARGET CUDA::cudart)
-        list(APPEND PEAK_CUDA_TEST_LIBRARIES CUDA::cudart)
-    endif()
-    if (TARGET CUDA::cuda_driver)
-        set(PEAK_CUDA_DRIVER_TEST_LIBRARY CUDA::cuda_driver)
-    endif()
-elseif (CUDA_FOUND)
-    message(STATUS "Legacy CUDA found: ${CUDA_VERSION}")
-    add_definitions(-DHAVE_CUDA)
-    include_directories(${CUDA_INCLUDE_DIRS})
-    list(APPEND PEAK_CUDA_TEST_LIBRARIES ${CUDA_LIBRARIES})
-    set(PEAK_CUDA_DRIVER_TEST_LIBRARY ${CUDA_CUDA_LIBRARY})
-else()
-    message(STATUS "CUDA not found. Skipping CUDA tests.")
-    return()
-endif()
+set(PEAK_CUDA_TEST_LIBRARIES ${PEAK_CUDA_RUNTIME_LIBRARIES})
+set(PEAK_CUDA_DRIVER_TEST_LIBRARY ${PEAK_CUDA_DRIVER_LIBRARY})
+include_directories(${PEAK_CUDA_INCLUDE_DIRS})
 
 find_package(OpenMP QUIET)
 find_package(MPI QUIET COMPONENTS CXX)
@@ -89,6 +64,12 @@ else()
 endif()
 
 peak_add_cuda_fixture(test_cuda_event_recycling test_event_recycling.cu)
+peak_add_cuda_fixture(test_cuda_error_transparency test_error_transparency.cu
+    ${PEAK_CUDA_DRIVER_TEST_LIBRARY})
+if(PEAK_CUDA_DRIVER_TEST_LIBRARY)
+    target_compile_definitions(test_cuda_error_transparency
+        PRIVATE PEAK_TEST_CUDA_DRIVER=1)
+endif()
 if (PEAK_CUDA_DRIVER_TEST_LIBRARY)
     peak_add_cuda_fixture(test_cuda_stream_capture test_stream_capture.cu
         ${PEAK_CUDA_DRIVER_TEST_LIBRARY})
@@ -115,6 +96,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND Python3_EXECUTABLE)
                 ${CMAKE_CURRENT_SOURCE_DIR}/run_cuda_regressions.py
                 sampling
                 --exe $<TARGET_FILE:test_cuda_event_recycling>
+                --peak $<TARGET_FILE:peak>)
+    add_test(NAME test_cuda_error_transparency_runtime
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/run_cuda_regressions.py
+                errors
+                --exe $<TARGET_FILE:test_cuda_error_transparency>
                 --peak $<TARGET_FILE:peak>)
     if (PEAK_CUDA_DRIVER_TEST_LIBRARY)
         add_test(NAME test_cuda_stream_capture_runtime
@@ -147,6 +134,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND Python3_EXECUTABLE)
 
     set(_peak_cuda_runtime_tests
         test_cuda_event_recycling_runtime
+        test_cuda_error_transparency_runtime
         test_cuda_finalization_deadline_runtime)
     if (TARGET benchmark_cuda_launch_overhead)
         list(APPEND _peak_cuda_runtime_tests
@@ -164,6 +152,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND Python3_EXECUTABLE)
             SKIP_RETURN_CODE 77)
     set(_peak_cuda_correctness_tests
         test_cuda_event_recycling_runtime
+        test_cuda_error_transparency_runtime
         test_cuda_finalization_deadline_runtime)
     if (PEAK_CUDA_DRIVER_TEST_LIBRARY)
         list(APPEND _peak_cuda_correctness_tests
