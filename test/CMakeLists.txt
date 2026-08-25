@@ -217,7 +217,7 @@ if(BUILD_TESTING)
                     -- $<TARGET_FILE:test_uncompiled_backend_gating>)
         set_tests_properties(test_uncompiled_strict_mutation_capability
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0;PEAK_TEXT_OUTPUT=1;PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION=1;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=main;PEAK_HEARTBEAT_INTERVAL=0.1;PEAK_TEXT_OUTPUT=1;PEAK_TEST_HIDE_COMPILED_STRICT_MUTATION=1;${PRELOAD_VAR}"
                 TIMEOUT 15)
     endif()
 

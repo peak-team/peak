@@ -1037,6 +1037,7 @@ peak_activate_runtime(void)
 {
     int expected = PEAK_RUNTIME_ACTIVATION_READY;
     gboolean jit_provider_active = FALSE;
+    gboolean strict_mutation_active = FALSE;
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
     peak_test_activation_pause_before_claim();
@@ -1167,7 +1168,6 @@ peak_activate_runtime(void)
      */
     if (peak_requested_work.cpu) {
         PeakProfilerCapabilityManifest capabilities;
-        gboolean strict_mutation_active;
 
         peak_general_listener_attach();
         peak_report_capability_note_active(PEAK_CAPABILITY_CPU_TARGET);
@@ -1208,7 +1208,8 @@ peak_activate_runtime(void)
 #endif
     peak_main_time = peak_second();
     peak_general_listener_note_runtime_start(peak_main_time);
-    if (peak_requested_work.cpu && heartbeat_time != 0) {
+    if (peak_requested_work.cpu && strict_mutation_active &&
+        heartbeat_time != 0) {
 #ifdef PEAK_ENABLE_TEST_HOOKS
         if (getenv("PEAK_TEST_FAIL_HEARTBEAT_SETUP_ALLOCATION") != NULL) {
             heartbeat_overhead = NULL;
@@ -1231,7 +1232,8 @@ peak_activate_runtime(void)
             heartbeat_time = 0;
         }
     }
-    if (peak_requested_work.cpu && heartbeat_time != 0) {
+    if (peak_requested_work.cpu && strict_mutation_active &&
+        heartbeat_time != 0) {
         args->heartbeat_time = heartbeat_time;
         args->check_interval = check_interval;
         args->hb_min_us = hb_min_us;
@@ -1264,7 +1266,8 @@ peak_activate_runtime(void)
         peak_report_capability_note_active(PEAK_CAPABILITY_DYNAMIC_DSO);
     }
 #endif
-    if (peak_requested_work.cpu && heartbeat_time != 0) {
+    if (peak_requested_work.cpu && strict_mutation_active &&
+        heartbeat_time != 0) {
         pthread_mutex_lock(&heartbeat_mutex);
         atomic_store(&heartbeat_running, true);
         pthread_mutex_unlock(&heartbeat_mutex);
