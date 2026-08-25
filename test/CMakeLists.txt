@@ -904,6 +904,16 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
+        add_test(NAME test_pthread_start_publication_timeout
+            COMMAND
+                ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_pthread_start_publication_timeout
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS=10;PEAK_TEST_PTHREAD_START_TIMEOUT=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "pthread child metadata publication did not complete within 10 ms.*pthread_start_publication_timeout_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|pthread start-timeout.*failed|published late|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
         add_test(NAME test_fastpath_thread_exit_nonwrapper_drops
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
         set_tests_properties(test_fastpath_thread_exit_nonwrapper_drops
@@ -2296,6 +2306,24 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "mpi_activation_exit_race_ok"
                 FAIL_REGULAR_EXPRESSION "mpi_activation_exit_race_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
                 TIMEOUT 15)
+        add_test(NAME test_mpi_activation_wait_is_bounded
+            COMMAND $<TARGET_FILE:test_mpi_activation_exit_race> timeout)
+        set_tests_properties(
+            test_mpi_activation_wait_is_bounded
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_mpi_activation_exit_race_target;PEAK_MPI_ACTIVATION_POLICY=post-init;PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS=20;PEAK_VERBOSITY=warn;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "runtime activation did not complete within 20 ms.*mpi_activation_wait_timeout_ok"
+                FAIL_REGULAR_EXPRESSION "mpi_activation_exit_race_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 15)
+        add_test(NAME test_mpi_finalize_owner_wait_is_bounded
+            COMMAND $<TARGET_FILE:test_mpi_finalize_owner_timeout>)
+        set_tests_properties(
+            test_mpi_finalize_owner_wait_is_bounded
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=main;PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS=10;PEAK_VERBOSITY=warn;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "MPI finalizer owner did not complete within 10 ms.*mpi_finalize_owner_timeout_ok"
+                FAIL_REGULAR_EXPRESSION "mpi_finalize_owner_timeout_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
+                TIMEOUT 15)
         set(_PEAK_MPI_TEST_NPROCS 2)
         if(MPIEXEC_MAX_NUMPROCS AND MPIEXEC_MAX_NUMPROCS LESS _PEAK_MPI_TEST_NPROCS)
             set(_PEAK_MPI_TEST_NPROCS ${MPIEXEC_MAX_NUMPROCS})
@@ -3488,7 +3516,7 @@ if(BUILD_TESTING)
 
     # Add test of memory allocation intercepting
     add_subdirectory(memory)
-    foreach(memlog_case create sizing mapping overflow capacity stalled stress no-clobber allocation realloc tid-fork)
+    foreach(memlog_case create sizing mapping overflow capacity stalled stalled-timeout stress no-clobber allocation realloc tid-fork)
         add_test(NAME test_memlog_${memlog_case}
             COMMAND test_memlog_safety ${memlog_case})
         set_tests_properties(test_memlog_${memlog_case}

@@ -1023,9 +1023,12 @@ def check_peak_init_heartbeat_order(repo_root):
             "PEAK_RUNTIME_ACTIVATION_CANCELED" in activation_close and
             "atomic_compare_exchange_weak_explicit(" in activation_close,
             "inactive teardown must atomically claim READY -> CANCELED")
-    require("PEAK_RUNTIME_ACTIVATION_IN_PROGRESS" in activation_close and
-            "sched_yield();" in activation_close,
-            "teardown must wait if activation wins the READY transition")
+    require("peak_runtime_activation_wait_for_terminal();" in activation_close and
+            "sched_yield();" not in activation_close and
+            "pthread_cond_timedwait" in source and
+            "PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS" in source,
+            "teardown must use a bounded wakeup when activation wins the "
+            "READY transition")
     require("peak_runtime_close_activation_for_teardown();" in
             extract_function(source, "peak_fini"),
             "main-return finalization must close deferred activation")

@@ -282,6 +282,8 @@ in detail.
 | `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
 | `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. |
+| `PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS` | Maximum wait for another thread to finish deferred runtime activation. On timeout, dependent teardown/report work is skipped. Default: `5000`. |
+| `PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS` | Maximum wait for a `pthread_create()` caller to publish child slot metadata. On timeout, the child runs untracked and late metadata is discarded safely. Default: `5000`. |
 
 Every text and stats CSV report includes a capability manifest for CPU targets,
 strict mutation, CUDA, memory tracking, JIT input, dynamic DSO discovery, and
@@ -310,6 +312,7 @@ reported partial and failed.
 | `PEAK_MPI_FINALIZE_POLICY` | Report during MPI finalization (`report`, the default for every transport) or explicitly defer PEAK output until process exit (`defer`). Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer immediately and therefore bypasses the Intel MPI 2019 compatibility skip. |
 | `PEAK_MPI_REAL_FINALIZE` | Override for the real MPI finalizer. Healthy non-Intel-MPI-2019 jobs enable it by default; Intel MPI 2019 skips its crash-prone finalizer unless set to `1`. Setting it to `0` also disables the immediate real-finalizer call in `defer` mode. Setting it to `1` cannot override a failed collective safety gate on the default `report` path. |
 | `PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS` | Timeout for the proof-first MPI aggregation finalization-participation check. Default: `10000`. |
+| `PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS` | Maximum wait for another thread in the same process to complete the one-owner real MPI finalizer path. On timeout, PEAK fails closed without making a second MPI call. Default: `5000`. |
 | `PEAK_MPI_REPORT_RELEASE_TIMEOUT_MS` | Baseline timeout for the post-publication all-rank release gate. For socket/local output this same gate also proves finalize participation. Default: `180000`; only a path that attempted socket publication raises the effective timeout to at least the peer release budget plus two socket-phase margins (`300000` for a singleton-size default and scale-adjusted for larger jobs). |
 | `PEAK_MPI_OUTPUT_AGGREGATION_TIMEOUT_MS` | Timeout for each MPI payload reduction. Default: `5000`. |
 | `PEAK_OUTPUT_AGGREGATION_HOST` | Override the socket reducer host. |
@@ -457,6 +460,7 @@ semantics, module lifetime, and supported boundaries.
 | `PEAK_MEMORY_TRACK_ALL` | On Linux, track all allocation events instead of filtering by target backtraces. |
 | `PEAK_MEMLOG_PATH` | Memory CSV output prefix. Default: `./peak_memlog`. |
 | `PEAK_MEMLOG_CHUNK_EVENTS` | Experimental memory-profiler fixed export capacity. A positive decimal value reserves that many events plus at most one 64-event reservation block of slack per tracked thread; when full, new events are dropped and reported at finalization. The mapping never grows or moves. |
+| `PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS` | Maximum wait for admitted memory-log writers after shutdown closes admission. On timeout, PEAK retains the live mapping and skips export/destructive cleanup. Default: `5000`. |
 | `PEAK_MEMLOG_OTF2_DIR` | Override the directory for memory-profile OTF2 output. |
 
 CUDA kernel identity state is also fixed at attach time. The primary identity

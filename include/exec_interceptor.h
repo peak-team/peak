@@ -107,6 +107,15 @@ PEAK_EXEC_API int peak_test_activation_is_held(void);
 /** Releases an activation paused by `peak_test_activation_pause_enable()`. */
 PEAK_EXEC_API void peak_test_activation_release(void);
 
+/** Pauses the next runtime activation after it claims ownership. */
+PEAK_EXEC_API void peak_test_activation_pause_after_claim_enable(void);
+
+/** Returns nonzero while activation is paused after claiming ownership. */
+PEAK_EXEC_API int peak_test_activation_after_claim_is_held(void);
+
+/** Releases an activation paused after claiming ownership. */
+PEAK_EXEC_API void peak_test_activation_after_claim_release(void);
+
 /** @} */
 #endif
 

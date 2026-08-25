@@ -1,15 +1,22 @@
 #define _GNU_SOURCE
 #include "mpi_interceptor.h"
 #include "general_listener.h"
+#include "internal/mpi_teardown_guard.h"
 #include "logging.h"
+#include "utils/env_parser.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define PEAK_MPI_FINALIZE_POLICY_ENV "PEAK_MPI_FINALIZE_POLICY"
+#define PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_ENV \
+    "PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS"
+#define PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_DEFAULT 5000U
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -21,6 +28,7 @@ typedef enum {
     PEAK_MPI_FINALIZE_REQUESTED = 1,
     PEAK_MPI_FINALIZE_IN_PROGRESS = 2,
     PEAK_MPI_FINALIZE_DONE = 3,
+    PEAK_MPI_FINALIZE_FAILED_CLOSED = 4,
 } PeakMpiFinalizeState;
 
 static int peak_finalize_state = PEAK_MPI_FINALIZE_NOT_REQUESTED;
@@ -28,6 +36,14 @@ static int peak_finalize_result = 0;
 static int peak_real_finalize_allowed = 0;
 static int peak_finalize_path_active = 0;
 static gpointer hook_address;
+static pthread_mutex_t peak_finalize_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t peak_finalize_cond;
+static pthread_once_t peak_finalize_cond_once = PTHREAD_ONCE_INIT;
+static _Atomic int peak_finalize_cond_ready;
+static _Atomic int peak_finalize_wait_warning_emitted;
+static PeakEnvWarningState peak_finalize_timeout_config_warning;
+static unsigned int peak_finalize_owner_timeout_ms =
+    PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_DEFAULT;
 
 static int (*original_pmpi_finalize)(void);
 extern void peak_fini(void);
@@ -44,6 +60,190 @@ static pthread_once_t real_pmpi_init_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_mpi_init_thread_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_pmpi_init_thread_once = PTHREAD_ONCE_INIT;
 static _Thread_local unsigned int peak_mpi_init_wrapper_depth;
+
+static void
+mpi_interceptor_configure_finalize_owner_timeout(void)
+{
+    PeakEnvUnsignedSchema schema = {
+        PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_ENV,
+        "milliseconds",
+        PEAK_MPI_FINALIZE_OWNER_TIMEOUT_MS_DEFAULT,
+        1,
+        UINT_MAX,
+        false,
+        &peak_finalize_timeout_config_warning,
+        false,
+    };
+
+    peak_finalize_owner_timeout_ms =
+        (unsigned int)peak_parse_env_unsigned(&schema);
+}
+
+static void
+mpi_interceptor_finalize_cond_initialize(void)
+{
+#if defined(__linux__)
+    pthread_condattr_t attr;
+    int status;
+
+    if (pthread_condattr_init(&attr) != 0) {
+        return;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&peak_finalize_cond, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+    if (status == 0) {
+        atomic_store_explicit(&peak_finalize_cond_ready, 1,
+                              memory_order_release);
+    }
+#elif defined(__APPLE__)
+    if (pthread_cond_init(&peak_finalize_cond, NULL) == 0) {
+        atomic_store_explicit(&peak_finalize_cond_ready, 1,
+                              memory_order_release);
+    }
+#endif
+}
+
+static int
+mpi_interceptor_finalize_cond_timedwait(const struct timespec* deadline)
+{
+#if defined(__linux__)
+    return pthread_cond_timedwait(&peak_finalize_cond,
+                                  &peak_finalize_mutex,
+                                  deadline);
+#elif defined(__APPLE__)
+    struct timespec now;
+    struct timespec remaining;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return EINVAL;
+    }
+    remaining.tv_sec = deadline->tv_sec - now.tv_sec;
+    remaining.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    if (remaining.tv_nsec < 0) {
+        remaining.tv_sec--;
+        remaining.tv_nsec += 1000000000L;
+    }
+    if (remaining.tv_sec < 0 ||
+        (remaining.tv_sec == 0 && remaining.tv_nsec == 0)) {
+        return ETIMEDOUT;
+    }
+    return pthread_cond_timedwait_relative_np(&peak_finalize_cond,
+                                              &peak_finalize_mutex,
+                                              &remaining);
+#else
+    (void)deadline;
+    return ENOTSUP;
+#endif
+}
+
+static void
+mpi_interceptor_finalize_mark_done(void)
+{
+    int state = __atomic_load_n(&peak_finalize_state, __ATOMIC_ACQUIRE);
+
+    while (state == PEAK_MPI_FINALIZE_REQUESTED ||
+           state == PEAK_MPI_FINALIZE_IN_PROGRESS) {
+        if (__atomic_compare_exchange_n(
+                &peak_finalize_state, &state, PEAK_MPI_FINALIZE_DONE,
+                FALSE, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+    }
+}
+
+static void
+mpi_interceptor_finalize_publish_done(int result)
+{
+    __atomic_store_n(&peak_finalize_result, result, __ATOMIC_RELEASE);
+    if (pthread_once(&peak_finalize_cond_once,
+                     mpi_interceptor_finalize_cond_initialize) != 0 ||
+        !atomic_load_explicit(&peak_finalize_cond_ready,
+                              memory_order_acquire) ||
+        pthread_mutex_lock(&peak_finalize_mutex) != 0) {
+        mpi_interceptor_finalize_mark_done();
+        return;
+    }
+    mpi_interceptor_finalize_mark_done();
+    (void)pthread_cond_broadcast(&peak_finalize_cond);
+    (void)pthread_mutex_unlock(&peak_finalize_mutex);
+}
+
+static int
+mpi_interceptor_wait_for_finalize_owner(void)
+{
+    struct timespec deadline;
+    int state;
+    int wait_status = 0;
+
+    if (pthread_once(&peak_finalize_cond_once,
+                     mpi_interceptor_finalize_cond_initialize) != 0 ||
+        !atomic_load_explicit(&peak_finalize_cond_ready,
+                              memory_order_acquire) ||
+        clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        wait_status = ENOTSUP;
+        goto failed_closed;
+    }
+    deadline.tv_sec += peak_finalize_owner_timeout_ms / 1000U;
+    deadline.tv_nsec +=
+        (long)(peak_finalize_owner_timeout_ms % 1000U) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    if (pthread_mutex_lock(&peak_finalize_mutex) != 0) {
+        wait_status = EINVAL;
+        goto failed_closed;
+    }
+    while ((state = __atomic_load_n(&peak_finalize_state,
+                                     __ATOMIC_ACQUIRE)) ==
+           PEAK_MPI_FINALIZE_IN_PROGRESS) {
+        wait_status = mpi_interceptor_finalize_cond_timedwait(&deadline);
+        if (wait_status != 0) {
+            break;
+        }
+    }
+    (void)pthread_mutex_unlock(&peak_finalize_mutex);
+    if (state == PEAK_MPI_FINALIZE_DONE) {
+        return __atomic_load_n(&peak_finalize_result, __ATOMIC_ACQUIRE);
+    }
+    if (state == PEAK_MPI_FINALIZE_FAILED_CLOSED) {
+        return MPI_ERR_OTHER;
+    }
+    if (state != PEAK_MPI_FINALIZE_IN_PROGRESS) {
+        return 0;
+    }
+
+failed_closed:
+    {
+        int expected = PEAK_MPI_FINALIZE_IN_PROGRESS;
+
+        if (__atomic_compare_exchange_n(
+                &peak_finalize_state,
+                &expected,
+                PEAK_MPI_FINALIZE_FAILED_CLOSED,
+                FALSE,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&peak_real_finalize_allowed, 0,
+                             __ATOMIC_RELEASE);
+            peak_mpi_teardown_collectives_mark_failed_closed();
+            if (atomic_exchange_explicit(
+                    &peak_finalize_wait_warning_emitted, 1,
+                    memory_order_acq_rel) == 0) {
+                peak_log_warn(
+                    "[peak] MPI finalizer owner did not complete within %u ms "
+                    "(%s); failing closed without another MPI call\n",
+                    peak_finalize_owner_timeout_ms,
+                    wait_status == ETIMEDOUT ? "deadline expired" :
+                                                "wait unavailable");
+            }
+        }
+    }
+    return MPI_ERR_OTHER;
+}
 
 static void
 mpi_interceptor_resolve_mpi_init_once(void)
@@ -262,18 +462,13 @@ mpi_interceptor_call_original_finalize_once(void)
 
     if (!mpi_interceptor_real_finalize_enabled() ||
         !__atomic_load_n(&peak_real_finalize_allowed, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&peak_finalize_result, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&peak_finalize_state,
-                         PEAK_MPI_FINALIZE_DONE,
-                         __ATOMIC_RELEASE);
+        mpi_interceptor_finalize_publish_done(0);
         return 0;
     }
 
     if (original_pmpi_finalize == NULL &&
         (!direct_finalize || hook_address == NULL)) {
-        __atomic_store_n(&peak_finalize_state,
-                         PEAK_MPI_FINALIZE_DONE,
-                         __ATOMIC_RELEASE);
+        mpi_interceptor_finalize_publish_done(0);
         return 0;
     }
 
@@ -284,9 +479,12 @@ mpi_interceptor_call_original_finalize_once(void)
             return __atomic_load_n(&peak_finalize_result, __ATOMIC_ACQUIRE);
         }
 
+        if (state == PEAK_MPI_FINALIZE_FAILED_CLOSED) {
+            return MPI_ERR_OTHER;
+        }
+
         if (state == PEAK_MPI_FINALIZE_IN_PROGRESS) {
-            sched_yield();
-            continue;
+            return mpi_interceptor_wait_for_finalize_owner();
         }
 
         if (state != PEAK_MPI_FINALIZE_REQUESTED) {
@@ -313,10 +511,7 @@ mpi_interceptor_call_original_finalize_once(void)
         } else if (original_pmpi_finalize != NULL) {
             result = original_pmpi_finalize();
         }
-        __atomic_store_n(&peak_finalize_result, result, __ATOMIC_RELEASE);
-        __atomic_store_n(&peak_finalize_state,
-                         PEAK_MPI_FINALIZE_DONE,
-                         __ATOMIC_RELEASE);
+        mpi_interceptor_finalize_publish_done(result);
         return result;
     }
 }
@@ -373,6 +568,8 @@ mpi_interceptor_set_real_finalize_allowed(int allowed)
 int mpi_interceptor_attach()
 {
     GumReplaceReturn replace_check = -1;
+
+    mpi_interceptor_configure_finalize_owner_timeout();
     mpi_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(mpi_interceptor);
@@ -386,6 +583,29 @@ int mpi_interceptor_attach()
     gum_interceptor_end_transaction(mpi_interceptor);
     return replace_check;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_MPI_INTERCEPTOR_API void
+mpi_interceptor_test_set_finalize_in_progress(void)
+{
+    mpi_interceptor_configure_finalize_owner_timeout();
+    __atomic_store_n(&peak_finalize_state,
+                     PEAK_MPI_FINALIZE_IN_PROGRESS,
+                     __ATOMIC_RELEASE);
+}
+
+PEAK_MPI_INTERCEPTOR_API int
+mpi_interceptor_test_wait_for_finalize_owner(void)
+{
+    return mpi_interceptor_wait_for_finalize_owner();
+}
+
+PEAK_MPI_INTERCEPTOR_API int
+mpi_interceptor_test_collectives_failed_closed(void)
+{
+    return peak_mpi_teardown_collectives_failed_closed() ? 1 : 0;
+}
+#endif
 
 void mpi_interceptor_dettach(int allow_delayed_finalize)
 {

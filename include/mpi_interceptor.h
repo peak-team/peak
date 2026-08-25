@@ -78,6 +78,15 @@ int mpi_interceptor_finalize_was_requested();
  */
 int mpi_interceptor_finalize_path_active();
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_MPI_INTERCEPTOR_API void
+mpi_interceptor_test_set_finalize_in_progress(void);
+PEAK_MPI_INTERCEPTOR_API int
+mpi_interceptor_test_wait_for_finalize_owner(void);
+PEAK_MPI_INTERCEPTOR_API int
+mpi_interceptor_test_collectives_failed_closed(void);
+#endif
+
 /**
  * @brief Controls whether the intercepted finalizer may call real PMPI_Finalize.
  *
