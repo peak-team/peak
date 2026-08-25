@@ -821,7 +821,11 @@ peak_disable_uncompiled_requested_work(void)
         peak_report_capability_note_failed(PEAK_CAPABILITY_MEMORY);
         peak_report_snapshot_note_degraded(
             PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
+#if defined(__APPLE__)
+            "rejecting PEAK_MEMORY_PROFILE on macOS; only named CPU profiling is supported");
+#else
             "requested memory backend is not compiled into this PEAK build");
+#endif
     }
     if ((unavailable & PEAK_CAPABILITY_JIT) != 0) {
         peak_requested_work.jit = FALSE;
