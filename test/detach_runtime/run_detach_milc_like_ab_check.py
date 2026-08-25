@@ -2512,10 +2512,20 @@ def run_synthetic_policy_diagnostics():
         output.seek(0)
         return output
 
-    valid_stats_values = [
-        "target", "1", "1", "1", "0", "0", "0", "0", "0", "0", "1e-6",
-        "0", "0",
-    ]
+    def synthetic_stats_values(function="target", dropped_calls="0",
+                               dropped_threads="0", target=True):
+        row = {field: "0" for field in STATS_CSV_FIELDS}
+        row["function"] = function
+        row["dropped_calls"] = dropped_calls
+        row["dropped_threads"] = dropped_threads
+        if target:
+            row["count"] = "1"
+            row["per_thread"] = "1"
+            row["per_rank"] = "1"
+            row["overhead_s"] = "1e-6"
+        return [row[field] for field in STATS_CSV_FIELDS]
+
+    valid_stats_values = synthetic_stats_values()
     valid_stats_rows = validated_profiled_stats_rows(
         synthetic_stats_csv(STATS_CSV_FIELDS, valid_stats_values),
         {"target"},
@@ -2525,8 +2535,13 @@ def run_synthetic_policy_diagnostics():
     diagnostics_stats_rows = validated_profiled_stats_rows(
         synthetic_stats_csv(
             STATS_CSV_FIELDS,
-            valid_stats_values[:-2] + ["7", "3"],
-            [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"]],
+            synthetic_stats_values(dropped_calls="7", dropped_threads="3"),
+            [synthetic_stats_values(
+                ACCOUNTING_DIAGNOSTICS_FUNCTION,
+                dropped_calls="7",
+                dropped_threads="3",
+                target=False,
+            )],
         ),
         {"target"},
     )
@@ -2537,7 +2552,9 @@ def run_synthetic_policy_diagnostics():
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
-                valid_stats_values[:-2] + ["7", "3"],
+                synthetic_stats_values(
+                    dropped_calls="7", dropped_threads="3"
+                ),
             ),
             {"target"},
         ),
@@ -2547,8 +2564,15 @@ def run_synthetic_policy_diagnostics():
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
-                valid_stats_values[:-2] + ["7", "3"],
-                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["8", "3"]],
+                synthetic_stats_values(
+                    dropped_calls="7", dropped_threads="3"
+                ),
+                [synthetic_stats_values(
+                    ACCOUNTING_DIAGNOSTICS_FUNCTION,
+                    dropped_calls="8",
+                    dropped_threads="3",
+                    target=False,
+                )],
             ),
             {"target"},
         ),
@@ -2558,10 +2582,22 @@ def run_synthetic_policy_diagnostics():
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
-                valid_stats_values[:-2] + ["7", "3"],
+                synthetic_stats_values(
+                    dropped_calls="7", dropped_threads="3"
+                ),
                 [
-                    [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
-                    [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
+                    synthetic_stats_values(
+                        ACCOUNTING_DIAGNOSTICS_FUNCTION,
+                        dropped_calls="7",
+                        dropped_threads="3",
+                        target=False,
+                    ),
+                    synthetic_stats_values(
+                        ACCOUNTING_DIAGNOSTICS_FUNCTION,
+                        dropped_calls="7",
+                        dropped_threads="3",
+                        target=False,
+                    ),
                 ],
             ),
             {"target"},
@@ -2573,7 +2609,9 @@ def run_synthetic_policy_diagnostics():
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
                 valid_stats_values,
-                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 12],
+                [synthetic_stats_values(
+                    ACCOUNTING_DIAGNOSTICS_FUNCTION, target=False
+                )],
             ),
             {"target"},
         ),
@@ -2583,19 +2621,32 @@ def run_synthetic_policy_diagnostics():
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
-                valid_stats_values[:-2] + ["7", "3"],
-                [["target-two"] + valid_stats_values[1:-2] + ["8", "3"]],
+                synthetic_stats_values(
+                    dropped_calls="7", dropped_threads="3"
+                ),
+                [synthetic_stats_values(
+                    "target-two", dropped_calls="8", dropped_threads="3"
+                )],
             ),
             {"target", "target-two"},
         ),
     )
+    nonzero_metric_diagnostics = synthetic_stats_values(
+        ACCOUNTING_DIAGNOSTICS_FUNCTION,
+        dropped_calls="7",
+        dropped_threads="3",
+        target=False,
+    )
+    nonzero_metric_diagnostics[STATS_CSV_FIELDS.index("count")] = "1"
     expect_assertion(
         "nonzero accounting diagnostics metric",
         lambda: validated_profiled_stats_rows(
             synthetic_stats_csv(
                 STATS_CSV_FIELDS,
-                valid_stats_values[:-2] + ["7", "3"],
-                [[ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["1"] + ["0"] * 9 + ["7", "3"]],
+                synthetic_stats_values(
+                    dropped_calls="7", dropped_threads="3"
+                ),
+                [nonzero_metric_diagnostics],
             ),
             {"target"},
         ),
@@ -2603,7 +2654,12 @@ def run_synthetic_policy_diagnostics():
     diagnostics_only_rows = validated_profiled_stats_rows(
         synthetic_stats_csv(
             STATS_CSV_FIELDS,
-            [ACCOUNTING_DIAGNOSTICS_FUNCTION] + ["0"] * 10 + ["7", "3"],
+            synthetic_stats_values(
+                ACCOUNTING_DIAGNOSTICS_FUNCTION,
+                dropped_calls="7",
+                dropped_threads="3",
+                target=False,
+            ),
         ),
         {"target"},
     )
@@ -2657,7 +2713,9 @@ def run_synthetic_policy_diagnostics():
         ),
     )
     malformed_diagnostic_values = list(valid_stats_values)
-    malformed_diagnostic_values[-1] = "3.5"
+    malformed_diagnostic_values[
+        STATS_CSV_FIELDS.index("dropped_threads")
+    ] = "3.5"
     expect_assertion(
         "malformed accounting diagnostic",
         lambda: validated_profiled_stats_rows(
