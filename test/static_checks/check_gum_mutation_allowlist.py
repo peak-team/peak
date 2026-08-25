@@ -74,7 +74,7 @@ EXPECTED = {
     ("support-init", "src/cuda_interceptor.cpp"): {
         "begin_transaction": 1,
         "end_transaction": 1,
-        "replace_fast": 10,
+        "replace_fast": 1,
         "revert": 5,
     },
     ("support-shutdown-debt", "src/cuda_interceptor.cpp"): {
@@ -116,6 +116,7 @@ FUNCTION_ANCHORS = {
         "mpi_interceptor_dettach": "support-shutdown-debt",
     },
     "src/cuda_interceptor.cpp": {
+        "peak_cuda_replace_fast": "support-init",
         "cuda_interceptor_attach": "support-init",
         "cuda_interceptor_dettach": "support-shutdown-debt",
     },
