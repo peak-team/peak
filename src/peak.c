@@ -815,12 +815,6 @@ peak_disable_uncompiled_requested_work(void)
         peak_report_capability_manifest();
     uint32_t unavailable = manifest.requested & ~manifest.compiled;
 
-    if ((unavailable & PEAK_CAPABILITY_STRICT_MUTATION) != 0) {
-        peak_report_capability_note_partial(
-            PEAK_CAPABILITY_STRICT_MUTATION);
-        peak_report_capability_note_failed(
-            PEAK_CAPABILITY_STRICT_MUTATION);
-    }
     if ((unavailable & PEAK_CAPABILITY_CUDA) != 0) {
         peak_requested_work.gpu = FALSE;
         peak_report_capability_note_failed(PEAK_CAPABILITY_CUDA);
@@ -1172,11 +1166,26 @@ peak_activate_runtime(void)
      * target attachment begins.
      */
     if (peak_requested_work.cpu) {
+        PeakProfilerCapabilityManifest capabilities;
+        gboolean strict_mutation_active;
+
         peak_general_listener_attach();
         peak_report_capability_note_active(PEAK_CAPABILITY_CPU_TARGET);
-        if ((peak_report_capability_manifest().compiled &
-             PEAK_CAPABILITY_STRICT_MUTATION) != 0) {
+        capabilities = peak_report_capability_manifest();
+        strict_mutation_active =
+            (capabilities.compiled &
+             PEAK_CAPABILITY_STRICT_MUTATION) != 0;
+#if !defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+        strict_mutation_active = strict_mutation_active &&
+            peak_detach_controller_strict_batch_supported();
+#endif
+        if (strict_mutation_active) {
             peak_report_capability_note_active(
+                PEAK_CAPABILITY_STRICT_MUTATION);
+        } else {
+            peak_report_capability_note_partial(
+                PEAK_CAPABILITY_STRICT_MUTATION);
+            peak_report_capability_note_failed(
                 PEAK_CAPABILITY_STRICT_MUTATION);
         }
     }
