@@ -86,8 +86,25 @@ STATS_FIELDS = [
     "overhead_s",
     "dropped_calls",
     "dropped_threads",
+    "capability_requested",
+    "capability_compiled",
+    "capability_active",
+    "capability_partial",
+    "capability_retained",
+    "capability_failed",
+    "cuda_compiled_apis",
+    "cuda_found_apis",
+    "cuda_installed_apis",
+    "cuda_failed_apis",
+    "degraded_mask",
 ]
+STATS_ACCOUNTING_FIELDS = ["dropped_calls", "dropped_threads"]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
+CAPABILITY_METADATA_FUNCTION_RE = re.compile(r"^PEAK_CAPABILITY_[a-z-]+$")
+CAPABILITY_METADATA_FUNCTIONS = {
+    "PEAK_CUDA_API_COVERAGE",
+    "PEAK_DEGRADED_CAPABILITIES",
+}
 SOCKET_TEST_PORT_MIN = 20000
 SOCKET_TEST_PORT_MAX = 30000
 SOCKET_TEST_PORT_ATTEMPTS = 128
@@ -189,19 +206,25 @@ def require_valid_accounting_diagnostics(name, rows):
                 raise AssertionError(
                     f"invalid accounting diagnostics metric {field}: {name}"
                 ) from exc
-        for field in STATS_FIELDS[11:]:
+        for field in STATS_ACCOUNTING_FIELDS:
             if not re.fullmatch(r"[0-9]+", row.get(field, "") or ""):
                 raise AssertionError(
                     f"invalid accounting diagnostic {field}: {name}"
                 )
-        diagnostics_values = tuple(int(row[field]) for field in STATS_FIELDS[11:])
+        diagnostics_values = tuple(
+            int(row[field]) for field in STATS_ACCOUNTING_FIELDS
+        )
 
     target_values = None
     for row in rows:
         if row.get("function") == ACCOUNTING_DIAGNOSTICS_FUNCTION:
             continue
+        function = row.get("function", "")
+        if (CAPABILITY_METADATA_FUNCTION_RE.fullmatch(function) or
+                function in CAPABILITY_METADATA_FUNCTIONS):
+            continue
         values = []
-        for field in STATS_FIELDS[11:]:
+        for field in STATS_ACCOUNTING_FIELDS:
             value = row.get(field, "") or ""
             if not re.fullmatch(r"[0-9]+", value):
                 raise AssertionError(
@@ -230,12 +253,46 @@ def require_valid_accounting_diagnostics(name, rows):
         raise AssertionError(f"accounting diagnostics mismatch: {name}")
 
 
+def require_transport_capability_outcome(name, rows, requested, active):
+    by_name = {row.get("function", ""): row for row in rows}
+    requested_row = by_name.get(f"PEAK_CAPABILITY_{requested}-report")
+    active_row = by_name.get(f"PEAK_CAPABILITY_{active}-report")
+    if requested_row is None or active_row is None:
+        raise AssertionError(f"missing transport capability rows: {name}")
+    expected_requested = {
+        "capability_requested": "1",
+        "capability_active": "0" if requested != active else "1",
+        "capability_partial": "1" if requested != active else "0",
+        "capability_failed": "1" if requested != active else "0",
+    }
+    for field, expected in expected_requested.items():
+        if requested_row.get(field) != expected:
+            raise AssertionError(
+                f"incorrect {requested} transport {field} in {name}: "
+                f"expected {expected}, got {requested_row.get(field)!r}"
+            )
+    if requested != active:
+        expected_active = {
+            "capability_requested": "0",
+            "capability_active": "1",
+            "capability_partial": "0",
+            "capability_failed": "0",
+        }
+        for field, expected in expected_active.items():
+            if active_row.get(field) != expected:
+                raise AssertionError(
+                    f"incorrect {active} fallback {field} in {name}: "
+                    f"expected {expected}, got {active_row.get(field)!r}"
+                )
+
+
 def run_synthetic_stats_diagnostics():
     def row(function, dropped_calls="0", dropped_threads="0"):
-        return dict(zip(
-            STATS_FIELDS,
-            [function] + ["0"] * 10 + [dropped_calls, dropped_threads],
-        ))
+        values = {field: "0" for field in STATS_FIELDS}
+        values["function"] = function
+        values["dropped_calls"] = dropped_calls
+        values["dropped_threads"] = dropped_threads
+        return values
 
     def expect_assertion(label, callback):
         try:
@@ -1237,6 +1294,12 @@ def main():
                 stats_rows.extend(rows)
         for name, evidence in stats_file_evidence.items():
             require_valid_accounting_diagnostics(name, evidence["rows"])
+            if args.mode in {
+                    "finalize-clean-output-socket-bad-host",
+                    "finalize-clean-output-socket-token-mismatch"}:
+                require_transport_capability_outcome(
+                    name, evidence["rows"], "socket", "local"
+                )
         selected_stats_files = [
             path for path in stats_files
             if nprocs == 1 or stats_name.fullmatch(path.name)["rank"] == "0"

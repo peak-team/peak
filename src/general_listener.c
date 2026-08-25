@@ -8445,6 +8445,60 @@ peak_general_listener_mpi_reducer_failed_closed(void)
 #endif
 }
 
+static uint32_t
+peak_general_listener_output_capability(
+    PeakOutputAggregationMode aggregation_mode)
+{
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
+        return PEAK_CAPABILITY_MPI_REPORT;
+    }
+    if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
+        return PEAK_CAPABILITY_SOCKET_REPORT;
+    }
+    return PEAK_CAPABILITY_LOCAL_REPORT;
+}
+
+static uint32_t
+peak_general_listener_requested_output_capability(
+    const PeakReportSnapshot* snapshot,
+    PeakOutputAggregationMode attempted_mode)
+{
+    uint32_t requested = snapshot != NULL
+        ? snapshot->capabilities.requested &
+            PEAK_CAPABILITY_REPORT_TRANSPORTS
+        : peak_report_capability_manifest().requested &
+            PEAK_CAPABILITY_REPORT_TRANSPORTS;
+
+    return requested != 0
+        ? requested
+        : peak_general_listener_output_capability(attempted_mode);
+}
+
+static void
+peak_general_listener_project_output_outcome(
+    PeakReportSnapshot* snapshot,
+    PeakOutputAggregationMode attempted_mode,
+    PeakOutputAggregationMode actual_mode)
+{
+    peak_report_capability_manifest_set_output_outcome(
+        &snapshot->capabilities,
+        peak_general_listener_requested_output_capability(
+            snapshot, attempted_mode),
+        peak_general_listener_output_capability(actual_mode));
+}
+
+static void
+peak_general_listener_commit_output_outcome(
+    const PeakReportSnapshot* snapshot,
+    PeakOutputAggregationMode attempted_mode,
+    PeakOutputAggregationMode actual_mode)
+{
+    peak_report_capability_set_output_outcome(
+        peak_general_listener_requested_output_capability(
+            snapshot, attempted_mode),
+        peak_general_listener_output_capability(actual_mode));
+}
+
 gboolean
 peak_general_listener_print_with_mpi_job_policy(
     PeakOutputAggregationMode aggregation_mode,
@@ -8576,6 +8630,12 @@ peak_general_listener_print_with_mpi_job_policy(
             &local_report);
         report_capture_ready = local_snapshot != NULL;
     }
+    if (local_snapshot != NULL) {
+        local_snapshot->degraded_mask |=
+            peak_report_snapshot_degraded_mask();
+        local_snapshot->capabilities =
+            peak_report_capability_manifest();
+    }
 
 #ifdef HAVE_MPI
     if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
@@ -8584,8 +8644,21 @@ peak_general_listener_print_with_mpi_job_policy(
         if (local_snapshot != NULL) {
             local_snapshot->degraded_mask |=
                 peak_report_snapshot_degraded_mask();
+            peak_general_listener_project_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_LOCAL);
+            peak_general_listener_commit_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_LOCAL);
             write_succeeded = peak_general_listener_write_report(
                 local_snapshot, TRUE, TRUE, active_mpi_job);
+        } else {
+            peak_report_capability_set_output_outcome(
+                peak_general_listener_requested_output_capability(
+                    NULL, aggregation_mode),
+                0);
         }
         /* All ranks have completed the preflight agreement.  Do not enter a
          * payload collective after an allocation failure or a poisoned MPI
@@ -8597,6 +8670,10 @@ peak_general_listener_print_with_mpi_job_policy(
 #ifdef HAVE_MPI
         if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
+            peak_general_listener_project_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_MPI);
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local_snapshot, &aggregate);
 
@@ -8615,6 +8692,10 @@ peak_general_listener_print_with_mpi_job_policy(
                     peak_general_listener_write_report(
                         aggregate, TRUE, FALSE, FALSE);
                 peak_report_snapshot_destroy(aggregate);
+                peak_general_listener_commit_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_MPI);
                 used_mpi_aggregation = TRUE;
             } else if (result == PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
                 PeakReportMarkerSwap marker_swap =
@@ -8622,42 +8703,108 @@ peak_general_listener_print_with_mpi_job_policy(
 
                 peak_general_listener_commit_report_marker_swap(&marker_swap);
                 write_succeeded = TRUE;
+                peak_general_listener_commit_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_MPI);
                 used_mpi_aggregation = TRUE;
             } else if (result == PEAK_MPI_REPORT_TRANSPORT_FAILED_CLOSED &&
                        peak_general_listener_socket_reduce_fallback_enabled()) {
                 g_printerr("[peak] MPI reducer failed; trying PEAK-owned socket aggregation fallback without further MPI calls\n");
+                peak_general_listener_project_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_SOCKET);
                 write_succeeded = peak_general_listener_run_socket_report(
                     local_snapshot,
                     active_mpi_job ?
                         PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED :
                         PEAK_SOCKET_REPORT_RANK_ENV_ONLY);
-                if (!write_succeeded) {
+                if (write_succeeded) {
+                    peak_general_listener_commit_output_outcome(
+                        local_snapshot,
+                        aggregation_mode,
+                        PEAK_OUTPUT_AGGREGATION_SOCKET);
+                } else {
                     g_printerr("[peak] MPI reducer socket fallback failed; writing rank-local output\n");
+                    peak_general_listener_project_output_outcome(
+                        local_snapshot,
+                        aggregation_mode,
+                        PEAK_OUTPUT_AGGREGATION_LOCAL);
+                    peak_general_listener_commit_output_outcome(
+                        local_snapshot,
+                        aggregation_mode,
+                        PEAK_OUTPUT_AGGREGATION_LOCAL);
                     write_succeeded = peak_general_listener_write_report(
                         local_snapshot, TRUE, TRUE, active_mpi_job);
                 }
             } else {
+                peak_general_listener_project_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_LOCAL);
+                peak_general_listener_commit_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_LOCAL);
                 write_succeeded = peak_general_listener_write_report(
                     local_snapshot, TRUE, TRUE, active_mpi_job);
             }
         } else if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_SOCKET) {
+            peak_general_listener_project_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_SOCKET);
             write_succeeded = peak_general_listener_run_socket_report(
                 local_snapshot,
                 active_mpi_job ?
                     PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED :
                     PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV);
-            if (!write_succeeded &&
+            if (write_succeeded) {
+                peak_general_listener_commit_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_SOCKET);
+            } else if (
                 peak_general_listener_socket_reduce_fallback_enabled()) {
                 g_printerr("[peak] Socket aggregation failed; falling back to rank-local output\n");
+                peak_general_listener_project_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_LOCAL);
+                peak_general_listener_commit_output_outcome(
+                    local_snapshot,
+                    aggregation_mode,
+                    PEAK_OUTPUT_AGGREGATION_LOCAL);
                 write_succeeded = peak_general_listener_write_report(
                     local_snapshot, TRUE, TRUE, active_mpi_job);
+            } else {
+                peak_report_capability_set_output_outcome(
+                    peak_general_listener_requested_output_capability(
+                        local_snapshot, aggregation_mode),
+                    0);
             }
         } else {
+            peak_general_listener_project_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_LOCAL);
+            peak_general_listener_commit_output_outcome(
+                local_snapshot,
+                aggregation_mode,
+                PEAK_OUTPUT_AGGREGATION_LOCAL);
             write_succeeded = peak_general_listener_write_report(
                 local_snapshot, TRUE, TRUE, active_mpi_job);
         }
 #else
-        (void)aggregation_mode;
+        peak_general_listener_project_output_outcome(
+            local_snapshot,
+            aggregation_mode,
+            PEAK_OUTPUT_AGGREGATION_LOCAL);
+        peak_general_listener_commit_output_outcome(
+            local_snapshot,
+            aggregation_mode,
+            PEAK_OUTPUT_AGGREGATION_LOCAL);
         write_succeeded = peak_general_listener_write_report(
             local_snapshot, TRUE, TRUE, active_mpi_job);
 #endif
@@ -8668,6 +8815,10 @@ peak_general_listener_print_with_mpi_job_policy(
 #endif
         peak_report_snapshot_note_degraded(PEAK_PROFILER_DEGRADED_REPORT,
                                            "final report snapshot allocation failed");
+        peak_report_capability_set_output_outcome(
+            peak_general_listener_requested_output_capability(
+                NULL, aggregation_mode),
+            0);
     }
 
     peak_report_snapshot_destroy(local_snapshot);

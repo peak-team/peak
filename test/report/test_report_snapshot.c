@@ -8,6 +8,7 @@ int main(void)
 {
     PeakReportSnapshot* snapshot = peak_report_snapshot_create(2);
     PeakReportSnapshot* copy;
+    PeakProfilerCapabilityManifest manifest = {0};
 
     assert(snapshot != NULL);
     assert(snapshot->hook_count == 2);
@@ -54,6 +55,49 @@ int main(void)
     assert(snapshot->exclusive_time[0] == 3.0);
     assert(peak_report_snapshot_set_name(copy, 1, "first"));
     assert(peak_report_snapshot_has_duplicate_names(copy));
+
+    manifest.requested = PEAK_CAPABILITY_MPI_REPORT;
+    manifest.compiled = PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    manifest.active = PEAK_CAPABILITY_CPU_TARGET |
+                      PEAK_CAPABILITY_MPI_REPORT;
+    manifest.partial = PEAK_CAPABILITY_CUDA;
+    manifest.failed = PEAK_CAPABILITY_CUDA;
+    peak_report_capability_manifest_set_output_outcome(
+        &manifest,
+        PEAK_CAPABILITY_MPI_REPORT,
+        PEAK_CAPABILITY_SOCKET_REPORT);
+    assert((manifest.active & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_SOCKET_REPORT);
+    assert((manifest.partial & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
+    assert((manifest.failed & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
+    assert((manifest.active & PEAK_CAPABILITY_CPU_TARGET) != 0);
+    assert((manifest.partial & PEAK_CAPABILITY_CUDA) != 0);
+    assert((manifest.failed & PEAK_CAPABILITY_CUDA) != 0);
+
+    peak_report_capability_manifest_set_output_outcome(
+        &manifest,
+        PEAK_CAPABILITY_MPI_REPORT,
+        PEAK_CAPABILITY_LOCAL_REPORT);
+    assert((manifest.active & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_LOCAL_REPORT);
+    assert((manifest.partial & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
+    assert((manifest.failed & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
+
+    peak_report_capability_reset(&manifest);
+    peak_report_capability_set_output_outcome(
+        PEAK_CAPABILITY_MPI_REPORT,
+        PEAK_CAPABILITY_LOCAL_REPORT);
+    manifest = peak_report_capability_manifest();
+    assert((manifest.active & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_LOCAL_REPORT);
+    assert((manifest.partial & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
+    assert((manifest.failed & PEAK_CAPABILITY_REPORT_TRANSPORTS) ==
+           PEAK_CAPABILITY_MPI_REPORT);
 
     peak_report_snapshot_destroy(copy);
     peak_report_snapshot_destroy(snapshot);

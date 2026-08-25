@@ -1039,6 +1039,10 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
     int any_duplicate_names = 0;
     unsigned int local_degraded_mask;
     unsigned int aggregate_degraded_mask = 0;
+    unsigned int local_capability_any[10];
+    unsigned int aggregate_capability_any[10] = {0};
+    unsigned int local_capability_all[5];
+    unsigned int aggregate_capability_all[5] = {0};
     uint64_t* slot_hashes;
     uint64_t* min_slot_hashes;
     uint64_t* max_slot_hashes;
@@ -1066,6 +1070,37 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
                                     MPI_UNSIGNED,
                                     MPI_BOR,
                                     "degraded-mode-mask")) {
+        peak_mpi_report_transport_refresh_degraded_metadata(local);
+        return peak_mpi_report_transport_collective_failure();
+    }
+
+    local_capability_any[0] = local->capabilities.requested;
+    local_capability_any[1] = local->capabilities.compiled;
+    local_capability_any[2] = local->capabilities.active;
+    local_capability_any[3] = local->capabilities.partial;
+    local_capability_any[4] = local->capabilities.retained;
+    local_capability_any[5] = local->capabilities.failed;
+    local_capability_any[6] = local->capabilities.cuda_compiled_apis;
+    local_capability_any[7] = local->capabilities.cuda_found_apis;
+    local_capability_any[8] = local->capabilities.cuda_installed_apis;
+    local_capability_any[9] = local->capabilities.cuda_failed_apis;
+    local_capability_all[0] = local->capabilities.compiled;
+    local_capability_all[1] = local->capabilities.active;
+    local_capability_all[2] = local->capabilities.cuda_compiled_apis;
+    local_capability_all[3] = local->capabilities.cuda_found_apis;
+    local_capability_all[4] = local->capabilities.cuda_installed_apis;
+    if (!peak_mpi_allreduce_checked(local_capability_any,
+                                    aggregate_capability_any,
+                                    10,
+                                    MPI_UNSIGNED,
+                                    MPI_BOR,
+                                    "capability-any") ||
+        !peak_mpi_allreduce_checked(local_capability_all,
+                                    aggregate_capability_all,
+                                    5,
+                                    MPI_UNSIGNED,
+                                    MPI_BAND,
+                                    "capability-all")) {
         peak_mpi_report_transport_refresh_degraded_metadata(local);
         return peak_mpi_report_transport_collective_failure();
     }
@@ -1412,6 +1447,27 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
     aggregate->dropped_calls = mpi_dropped_calls;
     aggregate->dropped_threads = mpi_dropped_threads;
     aggregate->degraded_mask = aggregate_degraded_mask;
+    aggregate->capabilities.requested = aggregate_capability_any[0];
+    aggregate->capabilities.compiled = aggregate_capability_all[0];
+    aggregate->capabilities.active = aggregate_capability_all[1];
+    aggregate->capabilities.partial = aggregate_capability_any[3] |
+        (aggregate_capability_any[2] ^ aggregate_capability_all[1]);
+    aggregate->capabilities.partial |= aggregate_capability_any[0] &
+        (aggregate_capability_any[1] ^ aggregate_capability_all[0]);
+    aggregate->capabilities.retained = aggregate_capability_any[4];
+    aggregate->capabilities.failed = aggregate_capability_any[5];
+    aggregate->capabilities.cuda_compiled_apis =
+        aggregate_capability_all[2];
+    aggregate->capabilities.cuda_found_apis =
+        aggregate_capability_all[3];
+    aggregate->capabilities.cuda_installed_apis =
+        aggregate_capability_all[4];
+    aggregate->capabilities.cuda_failed_apis =
+        aggregate_capability_any[9];
+    if ((aggregate_capability_any[7] ^ aggregate_capability_all[3]) != 0 ||
+        (aggregate_capability_any[8] ^ aggregate_capability_all[4]) != 0) {
+        aggregate->capabilities.partial |= PEAK_CAPABILITY_CUDA;
+    }
     peak_mpi_report_transport_set_overhead(
         aggregate,
         all_accounting_valid != 0,

@@ -44,6 +44,51 @@ enum PeakCudaOutputAggregationMode {
     PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET = 2,
 };
 
+static uint32_t
+peak_cuda_output_capability(int aggregation_mode)
+{
+    if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI) {
+        return PEAK_CAPABILITY_MPI_REPORT;
+    }
+    if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET) {
+        return PEAK_CAPABILITY_SOCKET_REPORT;
+    }
+    return PEAK_CAPABILITY_LOCAL_REPORT;
+}
+
+static uint32_t
+peak_cuda_requested_output_capability(const PeakReportSnapshot* snapshot,
+                                      int attempted_mode)
+{
+    uint32_t requested = snapshot->capabilities.requested &
+        PEAK_CAPABILITY_REPORT_TRANSPORTS;
+
+    return requested != 0
+        ? requested
+        : peak_cuda_output_capability(attempted_mode);
+}
+
+static void
+peak_cuda_project_output_outcome(PeakReportSnapshot* snapshot,
+                                 int attempted_mode,
+                                 int actual_mode)
+{
+    peak_report_capability_manifest_set_output_outcome(
+        &snapshot->capabilities,
+        peak_cuda_requested_output_capability(snapshot, attempted_mode),
+        peak_cuda_output_capability(actual_mode));
+}
+
+static void
+peak_cuda_commit_output_outcome(const PeakReportSnapshot* snapshot,
+                                int attempted_mode,
+                                int actual_mode)
+{
+    peak_report_capability_set_output_outcome(
+        peak_cuda_requested_output_capability(snapshot, attempted_mode),
+        peak_cuda_output_capability(actual_mode));
+}
+
 static GHashTable* cuda_kernel_local_dim_mapping;
 static GHashTable* cuda_graph_local_mapping;
 static GMutex cuda_kernel_local_dim_mapping_mutex;
@@ -184,14 +229,56 @@ struct PeakCudaBackendApi {
 };
 
 static PeakCudaBackendApi peak_cuda_backend_api;
-struct PeakCudaCapabilityReport {
-    gboolean runtime_base_installed;
-    gboolean runtime_ex_installed;
-    gboolean driver_base_installed;
-    gboolean driver_ex_installed;
-    gboolean driver_timing_available;
-};
-static PeakCudaCapabilityReport peak_cuda_capability_report;
+static PeakCudaCapabilities peak_cuda_capabilities;
+
+static void
+peak_cuda_note_retained_state()
+{
+    peak_cuda_capabilities.retained = TRUE;
+    peak_cuda_capabilities.partial = TRUE;
+    peak_report_capability_note_retained(PEAK_CAPABILITY_CUDA);
+    peak_report_capability_note_partial(PEAK_CAPABILITY_CUDA);
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static std::atomic<std::uint64_t> peak_cuda_test_attach_calls{0};
+
+extern "C" unsigned long long
+peak_cuda_test_attach_call_count(void)
+{
+    return peak_cuda_test_attach_calls.load(std::memory_order_acquire);
+}
+#endif
+
+extern "C" uint32_t
+cuda_interceptor_compiled_api_mask(void)
+{
+    uint32_t mask =
+        PEAK_CUDA_API_RUNTIME_LAUNCH |
+        PEAK_CUDA_API_RUNTIME_COOPERATIVE |
+        PEAK_CUDA_API_RUNTIME_MULTI_DEVICE |
+        PEAK_CUDA_API_RUNTIME_GRAPH |
+        PEAK_CUDA_API_DRIVER_LAUNCH |
+        PEAK_CUDA_API_DRIVER_COOPERATIVE |
+        PEAK_CUDA_API_DRIVER_MULTI_DEVICE |
+        PEAK_CUDA_API_DRIVER_GRAPH |
+        PEAK_CUDA_API_RUNTIME_CAPTURE |
+        PEAK_CUDA_API_DRIVER_CAPTURE |
+        PEAK_CUDA_API_DRIVER_TIMING;
+#if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX)
+    mask |= PEAK_CUDA_API_RUNTIME_LAUNCH_EX;
+#endif
+#if defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
+    mask |= PEAK_CUDA_API_DRIVER_LAUNCH_EX;
+#endif
+    return mask;
+}
+
+extern "C" PeakCudaCapabilities
+cuda_interceptor_get_capabilities(void)
+{
+    return peak_cuda_capabilities;
+}
 
 enum PeakCudaCaptureApi {
     PEAK_CUDA_CAPTURE_API_RUNTIME = 0,
@@ -1463,6 +1550,7 @@ peak_cuda_destroy_event_pool()
     std::unique_lock<std::mutex> capture_teardown_lock(
         peak_cuda_capture_teardown_mutex, std::try_to_lock);
     if (!capture_teardown_lock.owns_lock()) {
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] retaining CUDA event state while a stream-capture call crosses teardown\n");
         return FALSE;
@@ -1474,6 +1562,7 @@ peak_cuda_destroy_event_pool()
             std::memory_order_acquire);
     pthread_mutex_unlock(&peak_cuda_capture_mutex);
     if (capture_unsafe) {
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] retaining CUDA event state because stream-capture quiescence is not proven\n");
         return FALSE;
@@ -1497,6 +1586,7 @@ peak_cuda_destroy_event_pool()
         }
     }
     if (retained) {
+        peak_cuda_note_retained_state();
         peak_log_warn("[peak] retaining CUDA event state that could not be destroyed in its owning context\n");
         return FALSE;
     }
@@ -2313,6 +2403,7 @@ peak_cuda_finalize_pending()
         peak_cuda_profiler_state.record_finalization_timeout(
             deadline_incomplete);
         peak_cuda_finalization_timed_out = TRUE;
+        peak_cuda_note_retained_state();
         peak_log_warn(
             "[peak] CUDA finalization_timeout=1 finalization_incomplete=%zu helper_initialization_inflight=%d; retaining incomplete event state\n",
             deadline_incomplete,
@@ -3261,9 +3352,42 @@ peak_cuda_capture_entry_point_census(gboolean* available_out)
     return TRUE;
 }
 
+static GumReplaceReturn
+peak_cuda_replace_fast(gpointer address,
+                       gpointer replacement,
+                       gpointer* original,
+                       const char* symbol,
+                       uint32_t capability)
+{
+    GumReplaceReturn result;
+
+    peak_cuda_capabilities.found_apis |= capability;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    const char* fail_symbol = getenv("PEAK_TEST_FAIL_CUDA_REPLACEMENT");
+    if (fail_symbol != NULL && strcmp(fail_symbol, symbol) == 0) {
+        result = GUM_REPLACE_WRONG_TYPE;
+    } else
+#else
+    (void)symbol;
+#endif
+    {
+        result = gum_interceptor_replace_fast(
+            cuda_interceptor, address, replacement, original, NULL);
+    }
+    if (result == GUM_REPLACE_OK) {
+        peak_cuda_capabilities.installed_apis |= capability;
+    } else {
+        peak_cuda_capabilities.failed_apis |= capability;
+    }
+    return result;
+}
+
 extern "C" int cuda_interceptor_attach()
 {
     std::lock_guard<std::mutex> lifecycle_lock(peak_cuda_lifecycle_mutex);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_cuda_test_attach_calls.fetch_add(1, std::memory_order_acq_rel);
+#endif
     if (!peak_cuda_timing_requested()) {
         return GUM_REPLACE_OK;
     }
@@ -3290,6 +3414,9 @@ extern "C" int cuda_interceptor_attach()
 
     GumReplaceReturn replace_check = GUM_REPLACE_OK;
     GumReplaceReturn hook_replace_check = GUM_REPLACE_OK;
+    peak_cuda_capabilities = {};
+    peak_cuda_capabilities.compiled_apis =
+        cuda_interceptor_compiled_api_mask();
     gboolean capture_hook_present[PEAK_CUDA_CAPTURE_HOOK_COUNT] = {};
     gboolean runtime_capture_hook_install_failed = FALSE;
     gboolean driver_capture_hook_install_failed = FALSE;
@@ -3369,11 +3496,11 @@ extern "C" int cuda_interceptor_attach()
     hook_cuda_launch =
         (gpointer*) peak_general_listener_find_function("cudaLaunchKernel");
     if (hook_cuda_launch) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cuda_launch,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cuda_launch,
             (gpointer)&peak_cuda_launch_kernel,
             (gpointer*)&original_cuda_launch_kernel,
-            NULL);
+            "cudaLaunchKernel", PEAK_CUDA_API_RUNTIME_LAUNCH);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3385,11 +3512,12 @@ extern "C" int cuda_interceptor_attach()
     hook_cuda_launch_cooperative =
         (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernel");
     if (hook_cuda_launch_cooperative) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cuda_launch_cooperative,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cuda_launch_cooperative,
             (gpointer)&peak_cuda_launch_cooperative_kernel,
             (gpointer*)&original_cuda_launch_cooperative_kernel,
-            NULL);
+            "cudaLaunchCooperativeKernel",
+            PEAK_CUDA_API_RUNTIME_COOPERATIVE);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3401,11 +3529,12 @@ extern "C" int cuda_interceptor_attach()
     hook_cuda_launch_cooperative_multiple_device =
         (gpointer*) peak_general_listener_find_function("cudaLaunchCooperativeKernelMultiDevice");
     if (hook_cuda_launch_cooperative_multiple_device) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cuda_launch_cooperative_multiple_device,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cuda_launch_cooperative_multiple_device,
             (gpointer)&peak_cuda_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cuda_launch_cooperative_kernel_multiple_device,
-            NULL);
+            "cudaLaunchCooperativeKernelMultiDevice",
+            PEAK_CUDA_API_RUNTIME_MULTI_DEVICE);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3418,11 +3547,11 @@ extern "C" int cuda_interceptor_attach()
     hook_cuda_launch_exc =
         (gpointer*) peak_general_listener_find_function("cudaLaunchKernelExC");
     if (hook_cuda_launch_exc) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cuda_launch_exc,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cuda_launch_exc,
             (gpointer)&peak_cuda_launch_kernel_exc,
             (gpointer*)&original_cuda_launch_kernel_exc,
-            NULL);
+            "cudaLaunchKernelExC", PEAK_CUDA_API_RUNTIME_LAUNCH_EX);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3436,11 +3565,11 @@ extern "C" int cuda_interceptor_attach()
         ? (gpointer*) peak_general_listener_find_function("cuLaunchKernel")
         : NULL;
     if (hook_cu_launch) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cu_launch,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cu_launch,
             (gpointer)&peak_cu_launch_kernel,
             (gpointer*)&original_cu_launch_kernel,
-            NULL);
+            "cuLaunchKernel", PEAK_CUDA_API_DRIVER_LAUNCH);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3454,11 +3583,12 @@ extern "C" int cuda_interceptor_attach()
             "cuLaunchCooperativeKernel")
         : NULL;
     if (hook_cu_launch_cooperative) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cu_launch_cooperative,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cu_launch_cooperative,
             (gpointer)&peak_cu_launch_cooperative_kernel,
             (gpointer*)&original_cu_launch_cooperative_kernel,
-            NULL);
+            "cuLaunchCooperativeKernel",
+            PEAK_CUDA_API_DRIVER_COOPERATIVE);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3473,11 +3603,12 @@ extern "C" int cuda_interceptor_attach()
                 "cuLaunchCooperativeKernelMultiDevice")
             : NULL;
     if (hook_cu_launch_cooperative_multiple_device) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cu_launch_cooperative_multiple_device,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cu_launch_cooperative_multiple_device,
             (gpointer)&peak_cu_launch_cooperative_kernel_multiple_device,
             (gpointer*)&original_cu_launch_cooperative_kernel_multiple_device,
-            NULL);
+            "cuLaunchCooperativeKernelMultiDevice",
+            PEAK_CUDA_API_DRIVER_MULTI_DEVICE);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3491,11 +3622,11 @@ extern "C" int cuda_interceptor_attach()
         ? (gpointer*) peak_general_listener_find_function("cuLaunchKernelEx")
         : NULL;
     if (hook_cu_launch_ex) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cu_launch_ex,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cu_launch_ex,
             (gpointer)&peak_cu_launch_kernel_ex,
             (gpointer*)&original_cu_launch_kernel_ex,
-            NULL);
+            "cuLaunchKernelEx", PEAK_CUDA_API_DRIVER_LAUNCH_EX);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3508,11 +3639,11 @@ extern "C" int cuda_interceptor_attach()
     hook_cuda_graph_launch =
         (gpointer*) peak_general_listener_find_function("cudaGraphLaunch");
     if (hook_cuda_graph_launch) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cuda_graph_launch,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cuda_graph_launch,
             (gpointer)&peak_cuda_graph_launch,
             (gpointer*)&original_cuda_graph_launch,
-            NULL);
+            "cudaGraphLaunch", PEAK_CUDA_API_RUNTIME_GRAPH);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3525,11 +3656,11 @@ extern "C" int cuda_interceptor_attach()
         ? (gpointer*) peak_general_listener_find_function("cuGraphLaunch")
         : NULL;
     if (hook_cu_graph_launch) {
-        hook_replace_check = gum_interceptor_replace_fast(
-            cuda_interceptor, hook_cu_graph_launch,
+        hook_replace_check = peak_cuda_replace_fast(
+            hook_cu_graph_launch,
             (gpointer)&peak_cu_graph_launch,
             (gpointer*)&original_cu_graph_launch,
-            NULL);
+            "cuGraphLaunch", PEAK_CUDA_API_DRIVER_GRAPH);
         if (hook_replace_check != GUM_REPLACE_OK) {
             if (replace_check == GUM_REPLACE_OK) {
                 replace_check = hook_replace_check;
@@ -3547,12 +3678,16 @@ extern "C" int cuda_interceptor_attach()
         if (hook_cuda_launch != NULL && hook_cu_launch != NULL) {
             gum_interceptor_revert(cuda_interceptor, hook_cuda_launch);
             hook_cuda_launch = NULL;
+            peak_cuda_capabilities.installed_apis &=
+                ~PEAK_CUDA_API_RUNTIME_LAUNCH;
         }
         if (hook_cuda_launch_cooperative != NULL &&
             hook_cu_launch_cooperative != NULL) {
             gum_interceptor_revert(cuda_interceptor,
                                    hook_cuda_launch_cooperative);
             hook_cuda_launch_cooperative = NULL;
+            peak_cuda_capabilities.installed_apis &=
+                ~PEAK_CUDA_API_RUNTIME_COOPERATIVE;
         }
         if (hook_cuda_launch_cooperative_multiple_device != NULL &&
             hook_cu_launch_cooperative_multiple_device != NULL) {
@@ -3560,12 +3695,16 @@ extern "C" int cuda_interceptor_attach()
                 cuda_interceptor,
                 hook_cuda_launch_cooperative_multiple_device);
             hook_cuda_launch_cooperative_multiple_device = NULL;
+            peak_cuda_capabilities.installed_apis &=
+                ~PEAK_CUDA_API_RUNTIME_MULTI_DEVICE;
         }
 #if defined(PEAK_CUDA_RUNTIME_LAUNCH_EX) && \
     defined(PEAK_CUDA_DRIVER_LAUNCH_EX)
         if (hook_cuda_launch_exc != NULL && hook_cu_launch_ex != NULL) {
             gum_interceptor_revert(cuda_interceptor, hook_cuda_launch_exc);
             hook_cuda_launch_exc = NULL;
+            peak_cuda_capabilities.installed_apis &=
+                ~PEAK_CUDA_API_RUNTIME_LAUNCH_EX;
         }
 #endif
         if (hook_cuda_graph_launch != NULL &&
@@ -3573,6 +3712,8 @@ extern "C" int cuda_interceptor_attach()
             gum_interceptor_revert(cuda_interceptor,
                                    hook_cuda_graph_launch);
             hook_cuda_graph_launch = NULL;
+            peak_cuda_capabilities.installed_apis &=
+                ~PEAK_CUDA_API_RUNTIME_GRAPH;
         }
     }
 
@@ -3653,25 +3794,55 @@ extern "C" int cuda_interceptor_attach()
          !runtime_capture_hook_install_failed &&
          !driver_capture_hook_install_failed);
 
-    peak_cuda_capability_report.runtime_base_installed =
-        hook_cuda_launch != NULL ||
-        hook_cuda_launch_cooperative != NULL ||
-        hook_cuda_graph_launch != NULL;
-    peak_cuda_capability_report.runtime_ex_installed =
-        hook_cuda_launch_exc != NULL;
-    peak_cuda_capability_report.driver_base_installed =
-        hook_cu_launch != NULL ||
-        hook_cu_launch_cooperative != NULL ||
-        hook_cu_graph_launch != NULL;
-    peak_cuda_capability_report.driver_ex_installed =
-        hook_cu_launch_ex != NULL;
-    peak_cuda_capability_report.driver_timing_available =
+    gboolean driver_timing_available =
         peak_cuda_driver_timing_available();
+    if (runtime_capture_required_ready ||
+        runtime_capture_hook_install_failed) {
+        peak_cuda_capabilities.found_apis |=
+            PEAK_CUDA_API_RUNTIME_CAPTURE;
+    }
+    if (driver_capture_required_ready ||
+        driver_capture_hook_install_failed ||
+        capture_entry_point_census_available) {
+        peak_cuda_capabilities.found_apis |=
+            PEAK_CUDA_API_DRIVER_CAPTURE;
+    }
+    if (runtime_capture_required_ready &&
+        !runtime_capture_hook_install_failed) {
+        peak_cuda_capabilities.installed_apis |=
+            PEAK_CUDA_API_RUNTIME_CAPTURE;
+    } else if (runtime_timing_hook) {
+        peak_cuda_capabilities.failed_apis |=
+            PEAK_CUDA_API_RUNTIME_CAPTURE;
+    }
+    if (driver_capture_required_ready &&
+        !driver_capture_hook_install_failed &&
+        capture_entry_points_ready) {
+        peak_cuda_capabilities.installed_apis |=
+            PEAK_CUDA_API_DRIVER_CAPTURE;
+    } else if (driver_timing_hook) {
+        peak_cuda_capabilities.failed_apis |=
+            PEAK_CUDA_API_DRIVER_CAPTURE;
+    }
+    if (driver_timing_available) {
+        peak_cuda_capabilities.found_apis |=
+            PEAK_CUDA_API_DRIVER_TIMING;
+        peak_cuda_capabilities.installed_apis |=
+            PEAK_CUDA_API_DRIVER_TIMING;
+    }
+    peak_cuda_capabilities.active =
+        peak_cuda_has_timed_hook() && peak_cuda_capture_hooks_ready;
+    peak_cuda_capabilities.partial =
+        peak_cuda_capabilities.failed_apis != 0 ||
+        (peak_cuda_has_timed_hook() && !peak_cuda_capture_hooks_ready);
 
     peak_cuda_lifecycle_open();
     gum_interceptor_end_transaction(cuda_interceptor);
     if (peak_cuda_has_timed_hook() && peak_cuda_capture_hooks_ready) {
-        (void)peak_cuda_start_harvester();
+        if (!peak_cuda_start_harvester()) {
+            peak_cuda_capabilities.active = FALSE;
+            peak_cuda_capabilities.partial = TRUE;
+        }
     } else if (peak_cuda_has_timed_hook()) {
         peak_cuda_harvester_initialization_terminal.store(
             true, std::memory_order_release);
@@ -3748,6 +3919,7 @@ extern "C" void cuda_interceptor_dettach()
         gum_interceptor_end_transaction(cuda_interceptor);
 
         if (!gum_interceptor_flush(cuda_interceptor)) {
+            peak_cuda_note_retained_state();
             peak_log_warn("[peak] CUDA interceptor teardown did not flush; leaving CUDA interceptor state alive\n");
             return;
         }
@@ -3758,6 +3930,7 @@ extern "C" void cuda_interceptor_dettach()
 
     unsigned int active_cuda_wrappers = peak_cuda_active_wrapper_count();
     if (active_cuda_wrappers != 0) {
+        peak_cuda_note_retained_state();
         peak_log_warn("[peak] CUDA interceptor teardown observed %u active wrapper(s); keeping all CUDA state alive for cleanup retry\n",
                    active_cuda_wrappers);
         /*
@@ -4133,11 +4306,20 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
         " installed_runtime_base=%d installed_runtime_ex=%d"
         " installed_driver_base=%d installed_driver_ex=%d"
         " driver_timing=%d\n",
-        (int)peak_cuda_capability_report.runtime_base_installed,
-        (int)peak_cuda_capability_report.runtime_ex_installed,
-        (int)peak_cuda_capability_report.driver_base_installed,
-        (int)peak_cuda_capability_report.driver_ex_installed,
-        (int)peak_cuda_capability_report.driver_timing_available);
+        (peak_cuda_capabilities.installed_apis &
+         (PEAK_CUDA_API_RUNTIME_LAUNCH |
+          PEAK_CUDA_API_RUNTIME_COOPERATIVE |
+          PEAK_CUDA_API_RUNTIME_GRAPH)) != 0,
+        (peak_cuda_capabilities.installed_apis &
+         PEAK_CUDA_API_RUNTIME_LAUNCH_EX) != 0,
+        (peak_cuda_capabilities.installed_apis &
+         (PEAK_CUDA_API_DRIVER_LAUNCH |
+          PEAK_CUDA_API_DRIVER_COOPERATIVE |
+          PEAK_CUDA_API_DRIVER_GRAPH)) != 0,
+        (peak_cuda_capabilities.installed_apis &
+         PEAK_CUDA_API_DRIVER_LAUNCH_EX) != 0,
+        (peak_cuda_capabilities.installed_apis &
+         PEAK_CUDA_API_DRIVER_TIMING) != 0);
     peak_log_report(
         "[peak] CUDA profiler drops: pool_full=%" G_GUINT64_FORMAT
         " identity_full=%" G_GUINT64_FORMAT
@@ -4317,11 +4499,26 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
 #ifdef HAVE_MPI
         if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_MPI) {
             PeakReportSnapshot* aggregate = NULL;
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode, PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
             PeakMpiReportTransportResult result =
                 peak_mpi_report_transport_reduce(local, &aggregate);
             if (result == PEAK_MPI_REPORT_TRANSPORT_ROOT_READY) {
                 (void)peak_cuda_render_report_snapshot(aggregate);
-            } else if (result != PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
+            } else if (result == PEAK_MPI_REPORT_TRANSPORT_PEER_COMPLETE) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_MPI);
+            } else {
+                peak_cuda_project_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                 (void)peak_cuda_render_report_snapshot(local);
             }
             peak_report_snapshot_destroy(aggregate);
@@ -4330,6 +4527,9 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
         if (aggregation_mode == PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET) {
             PeakSocketReportSession* session = NULL;
             PeakReportSnapshot* aggregate = NULL;
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
             PeakSocketReportRankSource socket_rank_source = active_mpi_job
                 ? PEAK_SOCKET_REPORT_RANK_ENV_REQUIRED
                 : PEAK_SOCKET_REPORT_RANK_MPI_OR_ENV;
@@ -4338,19 +4538,47 @@ extern "C" void cuda_interceptor_print_with_mpi_job_policy(
                 PEAK_SOCKET_REPORT_CHANNEL_CUDA, &session, &aggregate);
             if (status == PEAK_SOCKET_REPORT_SINGLE_READY) {
                 (void)peak_cuda_render_report_snapshot(aggregate);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
             } else if (status == PEAK_SOCKET_REPORT_ROOT_PREPARED) {
                 if (peak_cuda_render_report_snapshot(aggregate)) {
                     (void)peak_socket_report_transport_commit(session);
+                    peak_cuda_commit_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
                 } else {
                     peak_socket_report_transport_abort(session);
+                    peak_cuda_project_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                    peak_cuda_commit_output_outcome(
+                        local, aggregation_mode,
+                        PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                     (void)peak_cuda_render_report_snapshot(local);
                 }
-            } else if (status != PEAK_SOCKET_REPORT_PEER_RELEASED) {
+            } else if (status == PEAK_SOCKET_REPORT_PEER_RELEASED) {
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_SOCKET);
+            } else {
                 peak_socket_report_transport_abort(session);
+                peak_cuda_project_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+                peak_cuda_commit_output_outcome(
+                    local, aggregation_mode,
+                    PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
                 (void)peak_cuda_render_report_snapshot(local);
             }
             peak_report_snapshot_destroy(aggregate);
         } else {
+            peak_cuda_project_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
+            peak_cuda_commit_output_outcome(
+                local, aggregation_mode,
+                PEAK_CUDA_OUTPUT_AGGREGATION_LOCAL);
             (void)peak_cuda_render_report_snapshot(local);
         }
         peak_report_snapshot_destroy(local);

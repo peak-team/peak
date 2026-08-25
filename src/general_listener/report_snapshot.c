@@ -8,6 +8,16 @@
 static PeakReportOverhead peak_report_snapshot_transport_overhead;
 static _Atomic uint32_t peak_report_snapshot_degraded = 0;
 static _Atomic uint32_t peak_report_snapshot_warned = 0;
+static _Atomic uint32_t peak_capability_requested = 0;
+static _Atomic uint32_t peak_capability_compiled = 0;
+static _Atomic uint32_t peak_capability_active = 0;
+static _Atomic uint32_t peak_capability_partial = 0;
+static _Atomic uint32_t peak_capability_retained = 0;
+static _Atomic uint32_t peak_capability_failed = 0;
+static _Atomic uint32_t peak_cuda_compiled_apis = 0;
+static _Atomic uint32_t peak_cuda_found_apis = 0;
+static _Atomic uint32_t peak_cuda_installed_apis = 0;
+static _Atomic uint32_t peak_cuda_failed_apis = 0;
 
 typedef struct {
     uint32_t mask;
@@ -19,7 +29,224 @@ static const PeakReportDegradedReason peak_report_degraded_reasons[] = {
     { PEAK_PROFILER_DEGRADED_REPORT, "report-allocation" },
     { PEAK_PROFILER_DEGRADED_MEMORY_TRACKING, "memory-tracking" },
     { PEAK_PROFILER_DEGRADED_EXIT_INTERPOSER, "exit-interposer" },
+    { PEAK_PROFILER_DEGRADED_CUDA, "cuda" },
+    { PEAK_PROFILER_DEGRADED_JIT, "jit" },
+    { PEAK_PROFILER_DEGRADED_DYNAMIC_DSO, "dynamic-dso" },
 };
+
+void
+peak_report_capability_reset(const PeakProfilerCapabilityManifest* manifest)
+{
+    const PeakProfilerCapabilityManifest empty = {0};
+    const PeakProfilerCapabilityManifest* value =
+        manifest != NULL ? manifest : &empty;
+
+    atomic_store_explicit(&peak_capability_requested, value->requested,
+                          memory_order_release);
+    atomic_store_explicit(&peak_capability_compiled, value->compiled,
+                          memory_order_release);
+    atomic_store_explicit(&peak_capability_active, value->active,
+                          memory_order_release);
+    atomic_store_explicit(&peak_capability_partial, value->partial,
+                          memory_order_release);
+    atomic_store_explicit(&peak_capability_retained, value->retained,
+                          memory_order_release);
+    atomic_store_explicit(&peak_capability_failed, value->failed,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_compiled_apis,
+                          value->cuda_compiled_apis,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_found_apis, value->cuda_found_apis,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_installed_apis,
+                          value->cuda_installed_apis,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_failed_apis, value->cuda_failed_apis,
+                          memory_order_release);
+}
+
+#define PEAK_CAPABILITY_NOTE(_name, _field)                                  \
+    void _name(uint32_t mask)                                                \
+    {                                                                        \
+        atomic_fetch_or_explicit(&_field, mask, memory_order_acq_rel);        \
+    }
+
+PEAK_CAPABILITY_NOTE(peak_report_capability_note_requested,
+                     peak_capability_requested)
+PEAK_CAPABILITY_NOTE(peak_report_capability_note_active,
+                     peak_capability_active)
+PEAK_CAPABILITY_NOTE(peak_report_capability_note_partial,
+                     peak_capability_partial)
+PEAK_CAPABILITY_NOTE(peak_report_capability_note_retained,
+                     peak_capability_retained)
+PEAK_CAPABILITY_NOTE(peak_report_capability_note_failed,
+                     peak_capability_failed)
+
+#undef PEAK_CAPABILITY_NOTE
+
+static uint32_t
+peak_report_capability_replace_mask(uint32_t value,
+                                    uint32_t mask,
+                                    uint32_t replacement)
+{
+    return (value & ~mask) | (replacement & mask);
+}
+
+void
+peak_report_capability_manifest_set_output_outcome(
+    PeakProfilerCapabilityManifest* manifest,
+    uint32_t requested,
+    uint32_t active)
+{
+    uint32_t mismatch;
+
+    if (manifest == NULL) {
+        return;
+    }
+    requested &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    active &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    mismatch = requested != active ? requested : 0;
+    manifest->requested |= requested;
+    manifest->active = peak_report_capability_replace_mask(
+        manifest->active,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        active);
+    manifest->partial = peak_report_capability_replace_mask(
+        manifest->partial,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+    manifest->failed = peak_report_capability_replace_mask(
+        manifest->failed,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+}
+
+static void
+peak_report_capability_atomic_replace_mask(_Atomic uint32_t* destination,
+                                           uint32_t mask,
+                                           uint32_t replacement)
+{
+    uint32_t observed = atomic_load_explicit(destination,
+                                             memory_order_acquire);
+
+    for (;;) {
+        uint32_t desired = peak_report_capability_replace_mask(
+            observed, mask, replacement);
+        if (atomic_compare_exchange_weak_explicit(destination,
+                                                  &observed,
+                                                  desired,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+void
+peak_report_capability_set_output_outcome(uint32_t requested,
+                                          uint32_t active)
+{
+    uint32_t mismatch;
+
+    requested &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    active &= PEAK_CAPABILITY_REPORT_TRANSPORTS;
+    mismatch = requested != active ? requested : 0;
+    atomic_fetch_or_explicit(&peak_capability_requested,
+                             requested,
+                             memory_order_acq_rel);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_active,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        active);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_partial,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+    peak_report_capability_atomic_replace_mask(
+        &peak_capability_failed,
+        PEAK_CAPABILITY_REPORT_TRANSPORTS,
+        mismatch);
+}
+
+void
+peak_report_capability_set_cuda_apis(uint32_t compiled,
+                                     uint32_t found,
+                                     uint32_t installed,
+                                     uint32_t failed)
+{
+    atomic_store_explicit(&peak_cuda_compiled_apis, compiled,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_found_apis, found,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_installed_apis, installed,
+                          memory_order_release);
+    atomic_store_explicit(&peak_cuda_failed_apis, failed,
+                          memory_order_release);
+}
+
+PeakProfilerCapabilityManifest
+peak_report_capability_manifest(void)
+{
+    PeakProfilerCapabilityManifest manifest = {0};
+
+    manifest.requested = atomic_load_explicit(&peak_capability_requested,
+                                               memory_order_acquire);
+    manifest.compiled = atomic_load_explicit(&peak_capability_compiled,
+                                              memory_order_acquire);
+    manifest.active = atomic_load_explicit(&peak_capability_active,
+                                            memory_order_acquire);
+    manifest.partial = atomic_load_explicit(&peak_capability_partial,
+                                             memory_order_acquire);
+    manifest.retained = atomic_load_explicit(&peak_capability_retained,
+                                              memory_order_acquire);
+    manifest.failed = atomic_load_explicit(&peak_capability_failed,
+                                            memory_order_acquire);
+    manifest.cuda_compiled_apis = atomic_load_explicit(
+        &peak_cuda_compiled_apis, memory_order_acquire);
+    manifest.cuda_found_apis = atomic_load_explicit(
+        &peak_cuda_found_apis, memory_order_acquire);
+    manifest.cuda_installed_apis = atomic_load_explicit(
+        &peak_cuda_installed_apis, memory_order_acquire);
+    manifest.cuda_failed_apis = atomic_load_explicit(
+        &peak_cuda_failed_apis, memory_order_acquire);
+    return manifest;
+}
+
+void
+peak_report_capability_manifest_merge(
+    PeakProfilerCapabilityManifest* aggregate,
+    const PeakProfilerCapabilityManifest* incoming)
+{
+    uint32_t active_difference;
+    uint32_t compiled_difference;
+    uint32_t cuda_found_difference;
+    uint32_t cuda_installed_difference;
+
+    if (aggregate == NULL || incoming == NULL) {
+        return;
+    }
+    active_difference = aggregate->active ^ incoming->active;
+    compiled_difference = aggregate->compiled ^ incoming->compiled;
+    cuda_found_difference =
+        aggregate->cuda_found_apis ^ incoming->cuda_found_apis;
+    cuda_installed_difference =
+        aggregate->cuda_installed_apis ^ incoming->cuda_installed_apis;
+    aggregate->requested |= incoming->requested;
+    aggregate->compiled &= incoming->compiled;
+    aggregate->active &= incoming->active;
+    aggregate->partial |= incoming->partial | active_difference;
+    aggregate->partial |= aggregate->requested & compiled_difference;
+    if (cuda_found_difference != 0 ||
+        cuda_installed_difference != 0) {
+        aggregate->partial |= PEAK_CAPABILITY_CUDA;
+    }
+    aggregate->retained |= incoming->retained;
+    aggregate->failed |= incoming->failed;
+    aggregate->cuda_compiled_apis &= incoming->cuda_compiled_apis;
+    aggregate->cuda_found_apis &= incoming->cuda_found_apis;
+    aggregate->cuda_installed_apis &= incoming->cuda_installed_apis;
+    aggregate->cuda_failed_apis |= incoming->cuda_failed_apis;
+}
 
 void
 peak_report_snapshot_note_degraded(uint32_t mask, const char* reason)
@@ -165,6 +392,7 @@ peak_report_snapshot_create(size_t hook_count)
     snapshot->hook_count = hook_count;
     snapshot->rank_count = 1;
     snapshot->degraded_mask = peak_report_snapshot_degraded_mask();
+    snapshot->capabilities = peak_report_capability_manifest();
     if (!peak_report_snapshot_allocate_arrays(snapshot)) {
         peak_report_snapshot_destroy(snapshot);
         return NULL;
@@ -261,6 +489,7 @@ peak_report_snapshot_clone(
     copy->dropped_calls = source->dropped_calls;
     copy->dropped_threads = source->dropped_threads;
     copy->degraded_mask = source->degraded_mask;
+    copy->capabilities = source->capabilities;
     copy->rank_count = source->rank_count;
     copy->overhead = source->overhead;
     return copy;
