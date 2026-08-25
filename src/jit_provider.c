@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -876,6 +877,25 @@ peak_jit_provider_enable(void)
                    0,
                    "enabled");
     peak_general_listener_controller_wake();
+}
+
+gboolean
+peak_jit_provider_requested(void)
+{
+    const char* value = getenv(PEAK_JIT_ENABLE_ENV);
+
+    /* This query runs before Gum initializes its embedded GLib runtime. */
+    return value != NULL &&
+           (strcmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0 ||
+            strcasecmp(value, "yes") == 0 ||
+            strcasecmp(value, "on") == 0);
+}
+
+gboolean
+peak_jit_provider_is_active(void)
+{
+    return peak_jit_provider_enabled;
 }
 
 void

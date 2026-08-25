@@ -44,6 +44,12 @@ extern "C" {
  */
 void peak_jit_provider_enable(void);
 
+/** Returns whether the immutable startup configuration requests JIT input. */
+gboolean peak_jit_provider_requested(void);
+
+/** Returns whether a supported JIT provider is currently active. */
+gboolean peak_jit_provider_is_active(void);
+
 /**
  * @brief Stops ingestion and releases module-owned provider state.
  *

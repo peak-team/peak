@@ -17,6 +17,7 @@
 #include "utils/utils.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <string.h>
 
@@ -35,6 +36,38 @@ extern "C" {
 
 /** @name Interceptor lifecycle
  * @{ */
+
+typedef enum {
+    PEAK_CUDA_API_RUNTIME_LAUNCH = 1u << 0,
+    PEAK_CUDA_API_RUNTIME_COOPERATIVE = 1u << 1,
+    PEAK_CUDA_API_RUNTIME_MULTI_DEVICE = 1u << 2,
+    PEAK_CUDA_API_RUNTIME_LAUNCH_EX = 1u << 3,
+    PEAK_CUDA_API_RUNTIME_GRAPH = 1u << 4,
+    PEAK_CUDA_API_DRIVER_LAUNCH = 1u << 5,
+    PEAK_CUDA_API_DRIVER_COOPERATIVE = 1u << 6,
+    PEAK_CUDA_API_DRIVER_MULTI_DEVICE = 1u << 7,
+    PEAK_CUDA_API_DRIVER_LAUNCH_EX = 1u << 8,
+    PEAK_CUDA_API_DRIVER_GRAPH = 1u << 9,
+    PEAK_CUDA_API_RUNTIME_CAPTURE = 1u << 10,
+    PEAK_CUDA_API_DRIVER_CAPTURE = 1u << 11,
+    PEAK_CUDA_API_DRIVER_TIMING = 1u << 12,
+} PeakCudaApiCapability;
+
+typedef struct {
+    uint32_t compiled_apis;
+    uint32_t found_apis;
+    uint32_t installed_apis;
+    uint32_t failed_apis;
+    int active;
+    int partial;
+    int retained;
+} PeakCudaCapabilities;
+
+/** Returns the CUDA API families supported by this build. */
+uint32_t cuda_interceptor_compiled_api_mask(void);
+
+/** Returns the immutable result of the most recent attach attempt. */
+PeakCudaCapabilities cuda_interceptor_get_capabilities(void);
 
 /**
  * @brief Installs the available CUDA launch replacements.
@@ -109,6 +142,9 @@ void cuda_interceptor_print_with_mpi_job_policy(int aggregation_mode,
                                                 int active_mpi_job);
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
+/** Returns top-level calls to CUDA attach, including disabled requests. */
+__attribute__((visibility("default")))
+unsigned long long peak_cuda_test_attach_call_count(void);
 /** Forces accepted CUDA events to remain pending in regression tests. */
 void peak_cuda_test_force_incomplete_events(int enabled);
 /** Forces the next harvested CUDA event query down the error path. */

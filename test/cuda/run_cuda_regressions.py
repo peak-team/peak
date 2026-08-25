@@ -110,6 +110,48 @@ def run_error_transparency(args: argparse.Namespace, directory: Path) -> None:
     print("cuda_error_transparency_validation_ok")
 
 
+def run_partial_capability(args: argparse.Namespace, directory: Path) -> None:
+    baseline = run_process([str(args.exe)], clean_environment(), 20.0,
+                           directory)
+    require_success("partial-capability-baseline", baseline)
+    profile = run_process(
+        [str(args.exe)],
+        profiled_environment(
+            args.peak,
+            PEAK_GPU_MONITOR_ALL="1",
+            PEAK_TEST_FAIL_CUDA_REPLACEMENT="cudaLaunchKernel",
+        ),
+        30.0,
+        directory,
+    )
+    require_success("partial-capability-profile", profile,
+                    allow_skip=False)
+    require_contains(profile.output, "cuda_event_recycling_ok",
+                     "partial CUDA application completion")
+    require_contains(profile.output, "cpu_target_storage=0",
+                     "GPU-only CPU target storage gating")
+    require_contains(
+        profile.output,
+        "Profiler capability [cuda]: requested=1 compiled=1 active=1 "
+        "partial=1 retained=0 failed=1",
+        "partial CUDA capability manifest",
+    )
+    coverage = re.search(
+        r"Profiler CUDA API coverage: compiled=0x([0-9a-f]+) "
+        r"found=0x([0-9a-f]+) installed=0x([0-9a-f]+) "
+        r"failed=0x([0-9a-f]+)",
+        profile.output,
+    )
+    if coverage is None or int(coverage.group(4), 16) == 0:
+        raise RuntimeError("partial CUDA capability report omitted the "
+                           "failed API mask")
+    if profile.output.count(
+            "disabling non-critical profiler subsystem") != 0:
+        raise RuntimeError("partial CUDA activation incorrectly disabled the "
+                           "remaining CUDA backend")
+    print("cuda_partial_capability_validation_ok")
+
+
 def print_result(label: str, result: RunResult) -> None:
     print(f"[{label}] stdout:")
     print(result.stdout.rstrip())
@@ -1019,7 +1061,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("case", choices=(
         "sampling", "capture", "context", "finalization", "benchmark",
-        "errors"))
+        "errors", "partial-capability"))
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--peak", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=3)
@@ -1071,6 +1113,8 @@ def main() -> int:
             run_finalization(args, directory)
         elif args.case == "errors":
             run_error_transparency(args, directory)
+        elif args.case == "partial-capability":
+            run_partial_capability(args, directory)
         else:
             run_benchmark(args, directory)
     return 0

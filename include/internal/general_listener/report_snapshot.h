@@ -28,7 +28,62 @@ typedef enum {
     PEAK_PROFILER_DEGRADED_REPORT           = 1u << 1,
     PEAK_PROFILER_DEGRADED_MEMORY_TRACKING  = 1u << 2,
     PEAK_PROFILER_DEGRADED_EXIT_INTERPOSER  = 1u << 3,
+    PEAK_PROFILER_DEGRADED_CUDA             = 1u << 4,
+    PEAK_PROFILER_DEGRADED_JIT              = 1u << 5,
+    PEAK_PROFILER_DEGRADED_DYNAMIC_DSO      = 1u << 6,
 } PeakProfilerDegradedMask;
+
+typedef enum {
+    PEAK_CAPABILITY_CPU_TARGET      = 1u << 0,
+    PEAK_CAPABILITY_STRICT_MUTATION = 1u << 1,
+    PEAK_CAPABILITY_CUDA            = 1u << 2,
+    PEAK_CAPABILITY_MEMORY          = 1u << 3,
+    PEAK_CAPABILITY_JIT             = 1u << 4,
+    PEAK_CAPABILITY_DYNAMIC_DSO     = 1u << 5,
+    PEAK_CAPABILITY_MPI_REPORT      = 1u << 6,
+    PEAK_CAPABILITY_SOCKET_REPORT   = 1u << 7,
+    PEAK_CAPABILITY_LOCAL_REPORT    = 1u << 8,
+} PeakProfilerCapabilityMask;
+
+typedef struct {
+    uint32_t requested;
+    uint32_t compiled;
+    uint32_t active;
+    uint32_t partial;
+    uint32_t retained;
+    uint32_t failed;
+    uint32_t cuda_compiled_apis;
+    uint32_t cuda_found_apis;
+    uint32_t cuda_installed_apis;
+    uint32_t cuda_failed_apis;
+} PeakProfilerCapabilityManifest;
+
+/** Publishes the immutable startup request and build capability masks. */
+void peak_report_capability_reset(
+    const PeakProfilerCapabilityManifest* manifest);
+
+/** Records a late-frozen request derived during startup symbol resolution. */
+void peak_report_capability_note_requested(uint32_t mask);
+
+/** Records control-path subsystem state transitions. */
+void peak_report_capability_note_active(uint32_t mask);
+void peak_report_capability_note_partial(uint32_t mask);
+void peak_report_capability_note_retained(uint32_t mask);
+void peak_report_capability_note_failed(uint32_t mask);
+
+/** Stores the immutable CUDA API coverage masks produced by CUDA attach. */
+void peak_report_capability_set_cuda_apis(uint32_t compiled,
+                                          uint32_t found,
+                                          uint32_t installed,
+                                          uint32_t failed);
+
+/** Returns one consistent process-local capability snapshot. */
+PeakProfilerCapabilityManifest peak_report_capability_manifest(void);
+
+/** Merges one rank manifest into an already initialized aggregate. */
+void peak_report_capability_manifest_merge(
+    PeakProfilerCapabilityManifest* aggregate,
+    const PeakProfilerCapabilityManifest* incoming);
 
 /** Records one non-critical subsystem that was safely disabled. */
 void peak_report_snapshot_note_degraded(uint32_t mask, const char* reason);
@@ -73,6 +128,7 @@ typedef struct {
     uint64_t dropped_threads;
     /** Non-critical profiler facilities disabled without mutating user code. */
     uint32_t degraded_mask;
+    PeakProfilerCapabilityManifest capabilities;
     double overhead_per_call;
     int rank_count;
     PeakReportOverhead overhead;

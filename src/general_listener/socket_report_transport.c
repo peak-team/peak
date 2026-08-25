@@ -78,7 +78,7 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL"
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 13U
+#define PEAK_SOCKET_REDUCE_VERSION 14U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT 0x41U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM 0x42U
 #define PEAK_SOCKET_REDUCE_GATHER_REGISTERED 0x01U
@@ -126,6 +126,17 @@ typedef struct {
     uint64_t dropped_threads;
     uint32_t local_ranks;
     uint32_t accounting_valid;
+    uint32_t degraded_mask;
+    uint32_t capability_requested;
+    uint32_t capability_compiled;
+    uint32_t capability_active;
+    uint32_t capability_partial;
+    uint32_t capability_retained;
+    uint32_t capability_failed;
+    uint32_t cuda_compiled_apis;
+    uint32_t cuda_found_apis;
+    uint32_t cuda_installed_apis;
+    uint32_t cuda_failed_apis;
 } PeakSocketReduceHeader;
 
 typedef struct {
@@ -155,19 +166,19 @@ typedef struct {
 } PeakSocketReduceRecord;
 
 /*
- * Wire-v13 intentionally targets a homogeneous job: every rank must use the
+ * Wire-v14 intentionally targets a homogeneous job: every rank must use the
  * same byte order, floating-point representation, and 64-bit Linux C ABI.
  * Lock the layouts so an accidental field or packing change cannot silently
  * corrupt a report without another wire-version bump.
  */
-_Static_assert(sizeof(PeakSocketReduceHeader) == 168,
-               "wire-v13 header layout changed");
+_Static_assert(sizeof(PeakSocketReduceHeader) == 216,
+               "wire-v14 header layout changed");
 _Static_assert(sizeof(PeakSocketReduceReleaseFrame) == 40,
-               "wire-v13 control-frame layout changed");
+               "wire-v14 control-frame layout changed");
 _Static_assert(sizeof(PeakSocketReduceRecord) == 80,
-               "wire-v13 record layout changed");
+               "wire-v14 record layout changed");
 _Static_assert(sizeof(unsigned long) == sizeof(uint64_t),
-               "wire-v13 requires a 64-bit unsigned long");
+               "wire-v14 requires a 64-bit unsigned long");
 
 struct PeakSocketReportSession {
     bool* release_targets;
@@ -2302,6 +2313,8 @@ typedef struct {
     uint64_t* dropped_calls;
     uint64_t* dropped_threads;
     bool* accounting_valid;
+    uint32_t* degraded_mask;
+    PeakProfilerCapabilityManifest* capabilities;
 } PeakSocketGatherAggregate;
 
 static bool
@@ -2333,6 +2346,8 @@ peak_socket_gather_prepare_receipt(
     const PeakReportRankTuple* tuple;
 
     if (connection == NULL || aggregate == NULL ||
+        aggregate->degraded_mask == NULL ||
+        aggregate->capabilities == NULL ||
         connection->record_index != aggregate->hook_count ||
         connection->record_bytes != 0 ||
         !peak_report_maxima_consider(aggregate->maxima,
@@ -2363,6 +2378,26 @@ peak_socket_gather_prepare_receipt(
         *aggregate->dropped_threads, connection->header.dropped_threads);
     *aggregate->accounting_valid =
         *aggregate->accounting_valid && tuple->accounting_valid;
+    *aggregate->degraded_mask |= connection->header.degraded_mask;
+    {
+        PeakProfilerCapabilityManifest peer_capabilities = {
+            .requested = connection->header.capability_requested,
+            .compiled = connection->header.capability_compiled,
+            .active = connection->header.capability_active,
+            .partial = connection->header.capability_partial,
+            .retained = connection->header.capability_retained,
+            .failed = connection->header.capability_failed,
+            .cuda_compiled_apis =
+                connection->header.cuda_compiled_apis,
+            .cuda_found_apis = connection->header.cuda_found_apis,
+            .cuda_installed_apis =
+                connection->header.cuda_installed_apis,
+            .cuda_failed_apis = connection->header.cuda_failed_apis,
+        };
+
+        peak_report_capability_manifest_merge(
+            aggregate->capabilities, &peer_capabilities);
+    }
 #ifdef PEAK_ENABLE_TEST_HOOKS
     if (peak_socket_test_telemetry.root_payload_count <
         UINT32_MAX) {
@@ -3398,6 +3433,17 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     header.session_token = session_token;
     header.dropped_calls = local->dropped_calls;
     header.dropped_threads = local->dropped_threads;
+    header.degraded_mask = local->degraded_mask;
+    header.capability_requested = local->capabilities.requested;
+    header.capability_compiled = local->capabilities.compiled;
+    header.capability_active = local->capabilities.active;
+    header.capability_partial = local->capabilities.partial;
+    header.capability_retained = local->capabilities.retained;
+    header.capability_failed = local->capabilities.failed;
+    header.cuda_compiled_apis = local->capabilities.cuda_compiled_apis;
+    header.cuda_found_apis = local->capabilities.cuda_found_apis;
+    header.cuda_installed_apis = local->capabilities.cuda_installed_apis;
+    header.cuda_failed_apis = local->capabilities.cuda_failed_apis;
     peak_socket_reduce_header_set_report_tuple(&header, &local_report_tuple);
 
     if (rank != 0) {
@@ -3451,6 +3497,9 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     uint64_t socket_dropped_calls = local->dropped_calls;
     uint64_t socket_dropped_threads = local->dropped_threads;
     bool socket_accounting_valid = local->overhead.accounting_valid;
+    uint32_t socket_degraded_mask = local->degraded_mask;
+    PeakProfilerCapabilityManifest socket_capabilities =
+        local->capabilities;
     unsigned int received = 0;
     bool failed;
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -3498,6 +3547,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     gather_aggregate.dropped_calls = &socket_dropped_calls;
     gather_aggregate.dropped_threads = &socket_dropped_threads;
     gather_aggregate.accounting_valid = &socket_accounting_valid;
+    gather_aggregate.degraded_mask = &socket_degraded_mask;
+    gather_aggregate.capabilities = &socket_capabilities;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     {
         int listener_ready = peak_socket_test_listener_ready_signal_root();
@@ -3576,6 +3627,8 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     free(aggregate_records);
     aggregate->dropped_calls = socket_dropped_calls;
     aggregate->dropped_threads = socket_dropped_threads;
+    aggregate->degraded_mask = socket_degraded_mask;
+    aggregate->capabilities = socket_capabilities;
     aggregate->rank_count = size;
     peak_socket_report_set_aggregate_overhead(
         aggregate,

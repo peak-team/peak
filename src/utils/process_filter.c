@@ -250,7 +250,8 @@ peak_process_requests_work(void)
         peak_env_nonempty(PEAK_GPU_TARGET_ENV) ||
         peak_env_nonempty(PEAK_GPU_TARGET_FILE_ENV) ||
         peak_env_truthy(getenv(PEAK_GPU_MONITOR_ALL_ENV)) ||
-        peak_env_truthy(getenv(PEAK_MEMORY_PROFILE_ENV));
+        peak_env_truthy(getenv(PEAK_MEMORY_PROFILE_ENV)) ||
+        peak_env_truthy(getenv(PEAK_JIT_ENABLE_ENV));
 
     int expected = PEAK_PROFILE_DECISION_UNKNOWN;
     if (!__atomic_compare_exchange_n(&peak_process_requests_work_cache,

@@ -1026,6 +1026,43 @@ peak_report_formatter_write_text(
         peak_log_report("Profiler degraded mode: enabled reasons=%s\n",
                         reasons[0] != '\0' ? reasons : "unknown");
     }
+    {
+        static const struct {
+            uint32_t mask;
+            const char* name;
+        } capability_names[] = {
+            { PEAK_CAPABILITY_CPU_TARGET, "cpu-target" },
+            { PEAK_CAPABILITY_STRICT_MUTATION, "strict-mutation" },
+            { PEAK_CAPABILITY_CUDA, "cuda" },
+            { PEAK_CAPABILITY_MEMORY, "memory" },
+            { PEAK_CAPABILITY_JIT, "jit" },
+            { PEAK_CAPABILITY_DYNAMIC_DSO, "dynamic-dso" },
+            { PEAK_CAPABILITY_MPI_REPORT, "mpi-report" },
+            { PEAK_CAPABILITY_SOCKET_REPORT, "socket-report" },
+            { PEAK_CAPABILITY_LOCAL_REPORT, "local-report" },
+        };
+        for (size_t capability = 0;
+             capability < sizeof(capability_names) /
+                              sizeof(capability_names[0]);
+             capability++) {
+            const uint32_t mask = capability_names[capability].mask;
+            peak_log_report(
+                "Profiler capability [%s]: requested=%d compiled=%d active=%d partial=%d retained=%d failed=%d\n",
+                capability_names[capability].name,
+                (snapshot->capabilities.requested & mask) != 0,
+                (snapshot->capabilities.compiled & mask) != 0,
+                (snapshot->capabilities.active & mask) != 0,
+                (snapshot->capabilities.partial & mask) != 0,
+                (snapshot->capabilities.retained & mask) != 0,
+                (snapshot->capabilities.failed & mask) != 0);
+        }
+        peak_log_report(
+            "Profiler CUDA API coverage: compiled=0x%08x found=0x%08x installed=0x%08x failed=0x%08x\n",
+            snapshot->capabilities.cuda_compiled_apis,
+            snapshot->capabilities.cuda_found_apis,
+            snapshot->capabilities.cuda_installed_apis,
+            snapshot->capabilities.cuda_failed_apis);
+    }
     if (snapshot->dropped_calls != 0 || snapshot->dropped_threads != 0) {
         peak_log_report("Accounting diagnostics: dropped_calls=%llu dropped_threads=%llu "
                         "(untracked, overflow, or unowned callers excluded)\n",

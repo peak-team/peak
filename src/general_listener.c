@@ -8576,6 +8576,12 @@ peak_general_listener_print_with_mpi_job_policy(
             &local_report);
         report_capture_ready = local_snapshot != NULL;
     }
+    if (local_snapshot != NULL) {
+        local_snapshot->degraded_mask |=
+            peak_report_snapshot_degraded_mask();
+        local_snapshot->capabilities =
+            peak_report_capability_manifest();
+    }
 
 #ifdef HAVE_MPI
     if (aggregation_mode == PEAK_OUTPUT_AGGREGATION_MPI &&
