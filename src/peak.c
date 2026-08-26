@@ -64,6 +64,9 @@
 #define PEAK_MPI_COLLECTIVE_OUTPUT_ENV         "PEAK_MPI_COLLECTIVE_OUTPUT"
 #define PEAK_MPI_ACTIVATION_POLICY_ENV          "PEAK_MPI_ACTIVATION_POLICY"
 #define PEAK_MPI_REAL_FINALIZE_ENV             "PEAK_MPI_REAL_FINALIZE"
+#define PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_ENV \
+    "PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS"
+#define PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_DEFAULT 5000U
 #ifdef PEAK_ENABLE_TEST_HOOKS
 #define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
 #endif
@@ -120,8 +123,8 @@ static PeakOutputAggregationMode peak_requested_output_aggregation =
 static int found_MPI;
 #endif
 
-static _Atomic int peak_exit_status_known = 0;
-static _Atomic int peak_exit_status_value = 0;
+static _Atomic uint64_t peak_exit_status = 0;
+#define PEAK_EXIT_STATUS_VALID (UINT64_C(1) << 63)
 static _Atomic int peak_runtime_active = 0;
 static _Atomic pid_t peak_runtime_owner_pid = 0;
 static PeakEnvWarningState peak_max_num_threads_warning_emitted;
@@ -134,12 +137,24 @@ typedef enum {
 #if defined(__APPLE__)
     PEAK_RUNTIME_ACTIVATION_REJECTED = 5,
 #endif
+    PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT = 6,
 } PeakRuntimeActivationState;
 static _Atomic int peak_runtime_activation_state =
     PEAK_RUNTIME_ACTIVATION_NOT_READY;
 static _Atomic int peak_deferred_activation_warning_emitted = 0;
 static pthread_t peak_runtime_activation_owner;
 static _Atomic int peak_runtime_activation_owner_known = 0;
+static pthread_mutex_t peak_runtime_activation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t peak_runtime_activation_cond;
+static pthread_once_t peak_runtime_activation_cond_once = PTHREAD_ONCE_INIT;
+static _Atomic int peak_runtime_activation_cond_ready;
+static _Atomic int peak_runtime_activation_wait_warning_emitted;
+static PeakEnvWarningState peak_runtime_activation_timeout_warning_emitted;
+static unsigned int peak_runtime_activation_wait_timeout_ms =
+    PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_DEFAULT;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic unsigned int peak_test_activation_waiters;
+#endif
 static _Atomic unsigned long long peak_exec_checkpoint_counter = 0;
 static _Atomic unsigned int peak_exec_checkpoint_gate = 0;
 #define PEAK_EXEC_CHECKPOINT_GATE_CLOSING (1U << 31)
@@ -173,6 +188,216 @@ peak_runtime_is_fork_child(void)
     return owner > 0 && getpid() != owner;
 }
 
+static void
+peak_runtime_activation_cond_initialize(void)
+{
+#if defined(__linux__)
+    pthread_condattr_t attr;
+    int status;
+
+    if (pthread_condattr_init(&attr) != 0) {
+        return;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&peak_runtime_activation_cond, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+    if (status == 0) {
+        atomic_store_explicit(&peak_runtime_activation_cond_ready, 1,
+                              memory_order_release);
+    }
+#elif defined(__APPLE__)
+    if (pthread_cond_init(&peak_runtime_activation_cond, NULL) == 0) {
+        atomic_store_explicit(&peak_runtime_activation_cond_ready, 1,
+                              memory_order_release);
+    }
+#endif
+}
+
+static gboolean
+peak_runtime_activation_cond_is_ready(void)
+{
+    return pthread_once(&peak_runtime_activation_cond_once,
+                        peak_runtime_activation_cond_initialize) == 0 &&
+           atomic_load_explicit(&peak_runtime_activation_cond_ready,
+                                memory_order_acquire) != 0;
+}
+
+static gboolean
+peak_runtime_activation_deadline(struct timespec* started,
+                                 struct timespec* deadline)
+{
+    unsigned int timeout_ms = peak_runtime_activation_wait_timeout_ms;
+
+    if (clock_gettime(CLOCK_MONOTONIC, started) != 0) {
+        return FALSE;
+    }
+    *deadline = *started;
+    deadline->tv_sec += timeout_ms / 1000U;
+    deadline->tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return TRUE;
+}
+
+static double
+peak_runtime_activation_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
+}
+
+static int
+peak_runtime_activation_cond_timedwait(const struct timespec* deadline)
+{
+#if defined(__linux__)
+    return pthread_cond_timedwait(&peak_runtime_activation_cond,
+                                  &peak_runtime_activation_mutex,
+                                  deadline);
+#elif defined(__APPLE__)
+    struct timespec now;
+    struct timespec remaining;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return EINVAL;
+    }
+    remaining.tv_sec = deadline->tv_sec - now.tv_sec;
+    remaining.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    if (remaining.tv_nsec < 0) {
+        remaining.tv_sec--;
+        remaining.tv_nsec += 1000000000L;
+    }
+    if (remaining.tv_sec < 0 ||
+        (remaining.tv_sec == 0 && remaining.tv_nsec == 0)) {
+        return ETIMEDOUT;
+    }
+    return pthread_cond_timedwait_relative_np(&peak_runtime_activation_cond,
+                                              &peak_runtime_activation_mutex,
+                                              &remaining);
+#else
+    (void)deadline;
+    return ENOTSUP;
+#endif
+}
+
+static void
+peak_runtime_activation_warn_wait_timeout(const char* reason,
+                                          double elapsed_ms)
+{
+    int expected = 0;
+
+    if (atomic_compare_exchange_strong_explicit(
+            &peak_runtime_activation_wait_warning_emitted,
+            &expected,
+            1,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] runtime activation did not complete after %.3f ms "
+                "(timeout=%u ms; %s); skipping dependent PEAK work so the "
+                "application can continue\n",
+                elapsed_ms, peak_runtime_activation_wait_timeout_ms, reason);
+        } else {
+            peak_log_warn(
+                "[peak] runtime activation did not complete "
+                "(elapsed unavailable; timeout=%u ms; %s); skipping dependent "
+                "PEAK work so the application can continue\n",
+                peak_runtime_activation_wait_timeout_ms, reason);
+        }
+    }
+}
+
+static void
+peak_runtime_activation_wait_cancel(void* data)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
+    (void)pthread_mutex_unlock((pthread_mutex_t*)data);
+}
+
+static PeakRuntimeActivationState
+peak_runtime_activation_wait_for_terminal(void)
+{
+    struct timespec started;
+    struct timespec deadline;
+    int state = atomic_load_explicit(&peak_runtime_activation_state,
+                                     memory_order_acquire);
+    int wait_status = 0;
+
+    if (state != PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+        return (PeakRuntimeActivationState)state;
+    }
+    if (atomic_load_explicit(&peak_runtime_activation_owner_known,
+                             memory_order_acquire) != 0 &&
+        pthread_equal(pthread_self(), peak_runtime_activation_owner)) {
+        return PEAK_RUNTIME_ACTIVATION_IN_PROGRESS;
+    }
+    if (!peak_runtime_activation_deadline(&started, &deadline)) {
+        peak_runtime_activation_warn_wait_timeout("wait unavailable", -1.0);
+        return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
+    }
+    if (!peak_runtime_activation_cond_is_ready() ||
+        pthread_mutex_lock(&peak_runtime_activation_mutex) != 0) {
+        peak_runtime_activation_warn_wait_timeout(
+            "wait unavailable",
+            peak_runtime_activation_elapsed_ms(&started));
+        return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
+    }
+    pthread_cleanup_push(peak_runtime_activation_wait_cancel,
+                         &peak_runtime_activation_mutex);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_add_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
+    while ((state = atomic_load_explicit(&peak_runtime_activation_state,
+                                         memory_order_acquire)) ==
+           PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+        wait_status = peak_runtime_activation_cond_timedwait(&deadline);
+        if (wait_status != 0) {
+            break;
+        }
+    }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    atomic_fetch_sub_explicit(&peak_test_activation_waiters, 1,
+                              memory_order_release);
+#endif
+    pthread_cleanup_pop(0);
+    (void)pthread_mutex_unlock(&peak_runtime_activation_mutex);
+    if (state == PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+        peak_runtime_activation_warn_wait_timeout(
+            wait_status == ETIMEDOUT ? "deadline expired" : "wait failed",
+            peak_runtime_activation_elapsed_ms(&started));
+        return PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT;
+    }
+    return (PeakRuntimeActivationState)state;
+}
+
+static void
+peak_runtime_activation_publish(PeakRuntimeActivationState state)
+{
+    if (!peak_runtime_activation_cond_is_ready() ||
+        pthread_mutex_lock(&peak_runtime_activation_mutex) != 0) {
+        atomic_store_explicit(&peak_runtime_activation_state, state,
+                              memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&peak_runtime_activation_state, state,
+                          memory_order_release);
+    (void)pthread_cond_broadcast(&peak_runtime_activation_cond);
+    (void)pthread_mutex_unlock(&peak_runtime_activation_mutex);
+}
+
 /*
  * Close the READY -> IN_PROGRESS race against process teardown.  Once this
  * function changes READY to CANCELED, an MPI completion can no longer start
@@ -204,15 +429,7 @@ peak_runtime_close_activation_for_teardown(void)
             }
             continue;
         }
-        if (state != PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
-            return (PeakRuntimeActivationState)state;
-        }
-        if (atomic_load_explicit(&peak_runtime_activation_owner_known,
-                                 memory_order_acquire) != 0 &&
-            pthread_equal(pthread_self(), peak_runtime_activation_owner)) {
-            return PEAK_RUNTIME_ACTIVATION_IN_PROGRESS;
-        }
-        sched_yield();
+        return peak_runtime_activation_wait_for_terminal();
     }
 }
 
@@ -227,6 +444,9 @@ static _Atomic int peak_test_fini_completion_wait_count_value = 0;
 static _Atomic int peak_test_activation_pause = 0;
 static _Atomic int peak_test_activation_held = 0;
 static _Atomic int peak_test_activation_released = 0;
+static _Atomic int peak_test_activation_after_claim_pause = 0;
+static _Atomic int peak_test_activation_after_claim_held = 0;
+static _Atomic int peak_test_activation_after_claim_released = 0;
 static _Atomic int peak_test_fail_heartbeat_create = 0;
 
 PEAK_API int
@@ -351,6 +571,42 @@ peak_test_activation_release(void)
                           memory_order_release);
 }
 
+PEAK_EXEC_API void
+peak_test_activation_pause_after_claim_enable(void)
+{
+    atomic_store_explicit(&peak_test_activation_after_claim_released,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_activation_after_claim_held,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&peak_test_activation_after_claim_pause,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_EXEC_API int
+peak_test_activation_after_claim_is_held(void)
+{
+    return atomic_load_explicit(&peak_test_activation_after_claim_held,
+                                memory_order_acquire);
+}
+
+PEAK_EXEC_API void
+peak_test_activation_after_claim_release(void)
+{
+    atomic_store_explicit(&peak_test_activation_after_claim_released,
+                          1,
+                          memory_order_release);
+}
+
+PEAK_EXEC_API unsigned int
+peak_test_activation_waiter_count(void)
+{
+    return atomic_load_explicit(&peak_test_activation_waiters,
+                                memory_order_acquire);
+}
+
 static void
 peak_test_checkpoint_reader_pause_after_acquire(void)
 {
@@ -385,6 +641,25 @@ peak_test_activation_pause_before_claim(void)
         sched_yield();
     }
     atomic_store_explicit(&peak_test_activation_pause,
+                          0,
+                          memory_order_release);
+}
+
+static void
+peak_test_activation_pause_after_claim(void)
+{
+    if (atomic_load_explicit(&peak_test_activation_after_claim_pause,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+    atomic_store_explicit(&peak_test_activation_after_claim_held,
+                          1,
+                          memory_order_release);
+    while (atomic_load_explicit(&peak_test_activation_after_claim_released,
+                                memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    atomic_store_explicit(&peak_test_activation_after_claim_pause,
                           0,
                           memory_order_release);
 }
@@ -1048,11 +1323,8 @@ peak_activate_runtime(void)
             PEAK_RUNTIME_ACTIVATION_IN_PROGRESS,
             memory_order_acq_rel,
             memory_order_acquire)) {
-        while (expected == PEAK_RUNTIME_ACTIVATION_IN_PROGRESS &&
-               atomic_load_explicit(&peak_runtime_activation_state,
-                                    memory_order_acquire) ==
-                   PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
-            sched_yield();
+        if (expected == PEAK_RUNTIME_ACTIVATION_IN_PROGRESS) {
+            (void)peak_runtime_activation_wait_for_terminal();
         }
         return;
     }
@@ -1060,6 +1332,9 @@ peak_activate_runtime(void)
     atomic_store_explicit(&peak_runtime_activation_owner_known,
                           1,
                           memory_order_release);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_test_activation_pause_after_claim();
+#endif
 
 #if defined(__APPLE__)
     /*
@@ -1071,9 +1346,7 @@ peak_activate_runtime(void)
     if (!peak_general_listener_startup_attach_can_skip_stop()) {
         peak_log_warn(
             "[peak] refusing macOS runtime activation because the process is already multithreaded; Darwin Gum bootstrap requires single-threaded startup and no Gum hooks were installed\n");
-        atomic_store_explicit(&peak_runtime_activation_state,
-                              PEAK_RUNTIME_ACTIVATION_REJECTED,
-                              memory_order_release);
+        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
         return;
     }
 #endif
@@ -1308,9 +1581,7 @@ peak_activate_runtime(void)
     }
 
     atomic_store_explicit(&peak_runtime_active, 1, memory_order_release);
-    atomic_store_explicit(&peak_runtime_activation_state,
-                          PEAK_RUNTIME_ACTIVATION_ACTIVE,
-                          memory_order_release);
+    peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_ACTIVE);
 }
 
 #ifdef HAVE_MPI
@@ -1417,8 +1688,20 @@ void peak_init()
 {
     peak_output_identity_initialize();
     PeakRuntimeNumericConfig numeric_config;
+    PeakEnvUnsignedSchema activation_wait_timeout_schema = {
+        PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_ENV,
+        "milliseconds",
+        PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_DEFAULT,
+        1,
+        UINT_MAX,
+        false,
+        &peak_runtime_activation_timeout_warning_emitted,
+        false,
+    };
 
     peak_log_configure();
+    peak_runtime_activation_wait_timeout_ms = (unsigned int)
+        peak_parse_env_unsigned(&activation_wait_timeout_schema);
     peak_max_num_threads = peak_parse_max_num_threads();
     peak_hook_address_count = parse_env_w_delim(PEAK_TARGET_ENV, PEAK_TARGET_DELIM, &peak_hook_strings);
     peak_hook_address_count += load_profiling_symbols(PEAK_TARGET_FILE_ENV, &peak_hook_strings, peak_hook_address_count);
@@ -1636,11 +1919,12 @@ peak_fini_impl(void)
         return;
     }
 #ifdef HAVE_MPI
+    uint64_t published_exit_status =
+        atomic_load_explicit(&peak_exit_status, memory_order_acquire);
     int exit_status_known =
-        atomic_load_explicit(&peak_exit_status_known, memory_order_acquire);
-    int exit_status =
-        atomic_load_explicit(&peak_exit_status_value, memory_order_acquire);
-    int abnormal_exit = exit_status_known == 2 && exit_status != 0;
+        (published_exit_status & PEAK_EXIT_STATUS_VALID) != 0;
+    int exit_status = (int)(int32_t)(uint32_t)published_exit_status;
+    int abnormal_exit = exit_status_known && exit_status != 0;
     PeakOutputAggregationMode aggregation_mode =
         found_MPI ? peak_requested_output_aggregation
                   : PEAK_OUTPUT_AGGREGATION_LOCAL;
@@ -2194,25 +2478,15 @@ peak_resolve_real_exit(void)
 static void
 peak_publish_exit_status(int status)
 {
-    int expected = 0;
+    uint64_t expected = 0;
+    uint64_t published = PEAK_EXIT_STATUS_VALID | (uint32_t)status;
 
-    if (atomic_compare_exchange_strong_explicit(&peak_exit_status_known,
-                                                &expected,
-                                                1,
-                                                memory_order_acq_rel,
-                                                memory_order_acquire)) {
-        atomic_store_explicit(&peak_exit_status_value,
-                              status,
-                              memory_order_release);
-        atomic_store_explicit(&peak_exit_status_known,
-                              2,
-                              memory_order_release);
-    } else {
-        while (atomic_load_explicit(&peak_exit_status_known,
-                                    memory_order_acquire) == 1) {
-            sched_yield();
-        }
-    }
+    (void)atomic_compare_exchange_strong_explicit(
+        &peak_exit_status,
+        &expected,
+        published,
+        memory_order_release,
+        memory_order_relaxed);
 }
 
 PEAK_API void

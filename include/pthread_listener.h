@@ -100,6 +100,12 @@ int pthread_listener_test_stale_generation_remove_preserves_mapping(
     pthread_t thread);
 int pthread_listener_test_untracked_create_removes_ambiguous_mapping(
     pthread_t thread);
+PEAK_PTHREAD_LISTENER_API void
+pthread_listener_test_pause_start_publication_enable(void);
+PEAK_PTHREAD_LISTENER_API void
+pthread_listener_test_release_start_publication(void);
+PEAK_PTHREAD_LISTENER_API int
+pthread_listener_test_current_thread_has_slot(void);
 #endif
 
 /**

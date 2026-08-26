@@ -2,6 +2,7 @@
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
 #include "internal/general_listener/output_identity.h"
+#include "internal/general_listener/report_snapshot.h"
 #include "logging.h"
 #include "utils/env_parser.h"
 #include <stddef.h>
@@ -62,6 +63,9 @@ typedef struct {
  * ready-flag cache line of physical slots without reducing the configured
  * export capacity. */
 #define PEAK_MEMLOG_MAX_TRACKED_THREADS 4096u
+#define PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS_ENV \
+    "PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS"
+#define PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS_DEFAULT 5000U
 
 /*=========================
   Globals
@@ -72,6 +76,10 @@ extern char**              peak_hook_strings;
 static GumInterceptor*     malloc_interceptor;
 static pthread_mutex_t     caller_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t     memlog_finalize_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t     memlog_writer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t      memlog_writer_cond;
+static pthread_once_t      memlog_writer_cond_once = PTHREAD_ONCE_INIT;
+static _Atomic int         memlog_writer_cond_ready;
 static pthread_once_t      malloc_tid_cache_once = PTHREAD_ONCE_INIT;
 static PeakAccountingShard accounting_shards[PEAK_ACCOUNTING_SHARD_COUNT];
 static PeakTrackingRadixNode tracking_root;
@@ -107,8 +115,13 @@ static __thread size_t     memlog_reservation_next = 0;
 static __thread size_t     memlog_reservation_end = 0;
 #endif
 static PeakEnvWarningState peak_memlog_capacity_warning_emitted;
+static PeakEnvWarningState peak_memlog_writer_timeout_warning_emitted;
 static _Atomic int         peak_memory_tracking_warning_emitted = 0;
 static _Atomic int         peak_memlog_full = 0;
+static unsigned int        peak_memlog_writer_timeout_ms =
+    PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS_DEFAULT;
+
+static void note_memory_tracking_degraded(const char* reason);
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic PeakMemLogTestFailure g_memlog_test_failure = PEAK_MEMLOG_TEST_FAIL_NONE;
@@ -394,7 +407,15 @@ static int peak_memlog_writer_enter(void) {
 }
 
 static void peak_memlog_writer_leave(void) {
-    atomic_fetch_sub_explicit(&g_memlog.active_writers, 1, memory_order_release);
+    if (atomic_fetch_sub_explicit(&g_memlog.active_writers, 1,
+                                  memory_order_acq_rel) == 1 &&
+        atomic_load_explicit(&memlog_writer_cond_ready,
+                             memory_order_acquire) != 0) {
+        if (pthread_mutex_lock(&memlog_writer_mutex) == 0) {
+            (void)pthread_cond_broadcast(&memlog_writer_cond);
+            (void)pthread_mutex_unlock(&memlog_writer_mutex);
+        }
+    }
 }
 #endif
 
@@ -539,18 +560,126 @@ peak_log_event(uint64_t ts,
                                accounting_shard, accounting_sequence);
 }
 
-static void peak_memlog_disable(void) {
+static void
+peak_memlog_writer_cond_initialize(void)
+{
+#if defined(__linux__)
+    pthread_condattr_t attr;
+    int status;
+
+    if (pthread_condattr_init(&attr) != 0) {
+        return;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&memlog_writer_cond, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+    if (status == 0) {
+        atomic_store_explicit(&memlog_writer_cond_ready, 1,
+                              memory_order_release);
+    }
+#elif defined(__APPLE__)
+    if (pthread_cond_init(&memlog_writer_cond, NULL) == 0) {
+        atomic_store_explicit(&memlog_writer_cond_ready, 1,
+                              memory_order_release);
+    }
+#endif
+}
+
+static int
+peak_memlog_writer_timedwait(const struct timespec* deadline)
+{
+#if defined(__linux__)
+    return pthread_cond_timedwait(&memlog_writer_cond,
+                                  &memlog_writer_mutex,
+                                  deadline);
+#elif defined(__APPLE__)
+    struct timespec now;
+    struct timespec remaining;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return EINVAL;
+    }
+    remaining.tv_sec = deadline->tv_sec - now.tv_sec;
+    remaining.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    if (remaining.tv_nsec < 0) {
+        remaining.tv_sec--;
+        remaining.tv_nsec += 1000000000L;
+    }
+    if (remaining.tv_sec < 0 ||
+        (remaining.tv_sec == 0 && remaining.tv_nsec == 0)) {
+        return ETIMEDOUT;
+    }
+    return pthread_cond_timedwait_relative_np(&memlog_writer_cond,
+                                              &memlog_writer_mutex,
+                                              &remaining);
+#else
+    (void)deadline;
+    return ENOTSUP;
+#endif
+}
+
+static int
+peak_memlog_wait_for_writers(void)
+{
+    struct timespec deadline;
+
+    if (atomic_load_explicit(&g_memlog.active_writers,
+                             memory_order_acquire) == 0) {
+        return 1;
+    }
+    if (pthread_once(&memlog_writer_cond_once,
+                     peak_memlog_writer_cond_initialize) != 0 ||
+        atomic_load_explicit(&memlog_writer_cond_ready,
+                             memory_order_acquire) == 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        return 0;
+    }
+    deadline.tv_sec += peak_memlog_writer_timeout_ms / 1000U;
+    deadline.tv_nsec +=
+        (long)(peak_memlog_writer_timeout_ms % 1000U) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    if (pthread_mutex_lock(&memlog_writer_mutex) != 0) {
+        return 0;
+    }
+    while (atomic_load_explicit(&g_memlog.active_writers,
+                                memory_order_acquire) != 0) {
+        if (peak_memlog_writer_timedwait(&deadline) != 0) {
+            break;
+        }
+    }
+    int drained = atomic_load_explicit(&g_memlog.active_writers,
+                                       memory_order_acquire) == 0;
+    (void)pthread_mutex_unlock(&memlog_writer_mutex);
+    return drained;
+}
+
+static double
+peak_memlog_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
+}
+
+static int peak_memlog_disable(void) {
     PeakMemLogState state;
 
     state = atomic_exchange_explicit(&g_memlog.state, PEAK_MEMLOG_DISABLED,
                                      memory_order_acq_rel);
 
     if (state == PEAK_MEMLOG_ACTIVE || state == PEAK_MEMLOG_DISABLED) {
-        while (atomic_load_explicit(&g_memlog.active_writers,
-                                    memory_order_acquire) != 0) {
-            sched_yield();
-        }
+        return peak_memlog_wait_for_writers();
     }
+    return 1;
 }
 
 static size_t peak_memlog_compact_committed(void) {
@@ -668,9 +797,22 @@ static void peak_memlog_open(void) {
     void* base = MAP_FAILED;
     const char* env_capacity;
     const char* output_template;
+    PeakEnvUnsignedSchema writer_timeout_schema = {
+        PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS_ENV,
+        "milliseconds",
+        PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS_DEFAULT,
+        1,
+        UINT_MAX,
+        false,
+        &peak_memlog_writer_timeout_warning_emitted,
+        false,
+    };
 
     if (atomic_load_explicit(&g_memlog.state, memory_order_acquire) !=
         PEAK_MEMLOG_UNINITIALIZED) return;
+
+    peak_memlog_writer_timeout_ms = (unsigned int)
+        peak_parse_env_unsigned(&writer_timeout_schema);
 
     env_capacity = getenv("PEAK_MEMLOG_CHUNK_EVENTS");
     if (env_capacity && !parse_memlog_capacity(&capacity_events)) {
@@ -823,6 +965,8 @@ static inline int peak_csv_emit_line(int fd_csv, const PeakMemEvent *e) {
 static void peak_memlog_finalize(void) {
     size_t events;
     PeakMemLogState state;
+    struct timespec writer_wait_started;
+    int writer_wait_clock_available;
 
     /* Serialize finalizers; a DISABLED state can still have admitted writers. */
     pthread_mutex_lock(&memlog_finalize_mutex);
@@ -837,7 +981,39 @@ static void peak_memlog_finalize(void) {
         return;
     }
 
-    peak_memlog_disable();
+    writer_wait_clock_available =
+        clock_gettime(CLOCK_MONOTONIC, &writer_wait_started) == 0;
+    if (!peak_memlog_disable()) {
+        double elapsed_ms = writer_wait_clock_available ?
+            peak_memlog_elapsed_ms(&writer_wait_started) : -1.0;
+
+        note_memory_tracking_degraded(
+            "memory-log writer drain deadline expired; retaining live log state");
+        peak_report_capability_note_partial(PEAK_CAPABILITY_MEMORY);
+        peak_report_capability_note_retained(PEAK_CAPABILITY_MEMORY);
+        peak_report_snapshot_note_degraded(
+            PEAK_PROFILER_DEGRADED_MEMORY_TRACKING,
+            "memory-log writer drain deadline expired");
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] memlog: %zu active writer(s) did not drain after "
+                "%.3f ms (timeout=%u ms); retaining the mapping and skipping "
+                "export so process exit can continue\n",
+                atomic_load_explicit(&g_memlog.active_writers,
+                                     memory_order_acquire),
+                elapsed_ms, peak_memlog_writer_timeout_ms);
+        } else {
+            peak_log_warn(
+                "[peak] memlog: %zu active writer(s) did not drain "
+                "(elapsed unavailable; timeout=%u ms); retaining the mapping "
+                "and skipping export so process exit can continue\n",
+                atomic_load_explicit(&g_memlog.active_writers,
+                                     memory_order_acquire),
+                peak_memlog_writer_timeout_ms);
+        }
+        pthread_mutex_unlock(&memlog_finalize_mutex);
+        return;
+    }
     if (!g_memlog.map) {
         atomic_store_explicit(&g_memlog.state, PEAK_MEMLOG_FINALIZED, memory_order_release);
         pthread_mutex_unlock(&memlog_finalize_mutex);

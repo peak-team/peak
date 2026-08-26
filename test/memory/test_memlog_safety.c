@@ -126,6 +126,41 @@ static int run_stalled_writer(void)
                    "finalizer did not complete after writer publication");
 }
 
+static int run_stalled_writer_timeout(void)
+{
+    PeakMemLogTestSnapshot snapshot;
+    pthread_t writer;
+
+    if (setenv("PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS", "10", 1) != 0) {
+        return 1;
+    }
+    if (!expect(peak_memlog_test_open(4),
+                "timeout log did not open")) return 1;
+    peak_memlog_test_pause_before_commit(1);
+    if (pthread_create(&writer, NULL, write_one_event, NULL) != 0) return 1;
+    for (unsigned int i = 0;
+         i < 10000 && !peak_memlog_test_writer_is_paused(); ++i) {
+        usleep(100);
+    }
+    if (!expect(peak_memlog_test_writer_is_paused(),
+                "timeout writer did not stall")) return 1;
+
+    peak_memlog_test_finalize();
+    peak_memlog_test_snapshot(&snapshot);
+    if (!expect(snapshot.state == PEAK_MEMLOG_DISABLED &&
+                snapshot.mapping_live && snapshot.exported == 0,
+                "timeout did not retain live memory-log state")) return 1;
+
+    peak_memlog_test_pause_before_commit(0);
+    pthread_join(writer, NULL);
+    peak_memlog_test_finalize();
+    peak_memlog_test_snapshot(&snapshot);
+    unsetenv("PEAK_MEMORY_WRITER_DRAIN_TIMEOUT_MS");
+    return !expect(snapshot.state == PEAK_MEMLOG_FINALIZED &&
+                   !snapshot.mapping_live,
+                   "retained memory-log state did not finalize after drain");
+}
+
 static int run_multithread_stress(void)
 {
     const size_t event_count = STRESS_THREADS * STRESS_EVENTS_PER_THREAD;
@@ -248,6 +283,9 @@ int main(int argc, char** argv)
     if (strcmp(argv[1], "overflow") == 0) return run_overflow();
     if (strcmp(argv[1], "capacity") == 0) return run_capacity();
     if (strcmp(argv[1], "stalled") == 0) return run_stalled_writer();
+    if (strcmp(argv[1], "stalled-timeout") == 0) {
+        return run_stalled_writer_timeout();
+    }
     if (strcmp(argv[1], "stress") == 0) return run_multithread_stress();
     if (strcmp(argv[1], "no-clobber") == 0) return run_output_no_clobber();
     if (strcmp(argv[1], "tid-fork") == 0) return run_tid_fork();

@@ -70,6 +70,7 @@ add_executable(test_pthread_slot_registry
   ${PROJECT_SOURCE_DIR}/src/pthread_slot_registry.c)
 target_include_directories(test_pthread_slot_registry PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(test_pthread_slot_registry PRIVATE Threads::Threads)
+target_compile_definitions(test_pthread_slot_registry PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
 if(PEAK_ENABLE_TSAN_TESTS)
   target_compile_options(test_pthread_slot_registry PRIVATE
     -fsanitize=thread -fno-omit-frame-pointer -O1 -g)

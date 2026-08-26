@@ -5,6 +5,15 @@
 #include "logging.h"
 #include "internal/pthread_slot_registry.h"
 #include "internal/signal_policy_internal.h"
+#include "utils/env_parser.h"
+
+#include <limits.h>
+#include <sched.h>
+#include <time.h>
+
+#define PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_ENV \
+    "PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS"
+#define PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_DEFAULT 5000U
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -21,6 +30,10 @@ static gpointer pthread_create_hook_address;
 static gpointer pthread_join_hook_address;
 extern pthread_t heartbeat_thread;
 extern gulong peak_max_num_threads;
+static unsigned int pthread_start_handshake_timeout_ms =
+    PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+static PeakEnvWarningState pthread_start_timeout_config_warning;
+static _Atomic int pthread_start_timeout_warning_emitted;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 static gboolean pthread_listener_insert_thread_unlocked(pthread_t tid);
@@ -48,6 +61,8 @@ static pthread_once_t pthread_slot_key_once = PTHREAD_ONCE_INIT;
 static gboolean pthread_slot_key_created = FALSE;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic unsigned int pthread_test_fail_slot_publish = 0;
+static _Atomic int pthread_test_pause_start_publication;
+static _Atomic int pthread_test_release_start_publication;
 #endif
 
 static void peak_pthread_slot_destructor(void* data);
@@ -98,8 +113,54 @@ typedef struct {
     gboolean tracked;
     size_t slot;
     uint64_t generation;
-    _Atomic int ready;
+    _Atomic int handshake_state;
+    _Atomic unsigned int references;
 } PeakPthreadStartContext;
+
+static void
+peak_pthread_start_context_release(PeakPthreadStartContext* context)
+{
+    if (context != NULL &&
+        atomic_fetch_sub_explicit(&context->references, 1,
+                                  memory_order_acq_rel) == 1) {
+        g_free(context);
+    }
+}
+
+static void
+peak_pthread_start_warn_abandoned(double elapsed_ms)
+{
+    int expected = 0;
+
+    if (atomic_compare_exchange_strong_explicit(
+            &pthread_start_timeout_warning_emitted, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        if (elapsed_ms >= 0.0) {
+            peak_log_warn(
+                "[peak] pthread child metadata publication did not complete "
+                "after %.3f ms (timeout=%u ms); running the child untracked\n",
+                elapsed_ms, pthread_start_handshake_timeout_ms);
+        } else {
+            peak_log_warn(
+                "[peak] pthread child metadata publication did not complete "
+                "(elapsed unavailable; timeout=%u ms); running the child "
+                "untracked\n",
+                pthread_start_handshake_timeout_ms);
+        }
+    }
+}
+
+static double
+peak_pthread_start_elapsed_ms(const struct timespec* started)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1.0;
+    }
+    return (double)(now.tv_sec - started->tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - started->tv_nsec) / 1000000.0;
+}
 
 static void
 peak_pthread_slot_destructor(void* data)
@@ -140,9 +201,7 @@ peak_pthread_start_cleanup(void* data)
 {
     PeakPthreadStartContext* context = data;
 
-    if (context != NULL) {
-        g_free(context);
-    }
+    peak_pthread_start_context_release(context);
 }
 
 static void*
@@ -152,9 +211,21 @@ peak_pthread_start(void* data)
     pthread_start_routine_t start_routine = context->start_routine;
     void* start_arg = context->start_arg;
     void* ret = NULL;
+    PeakPthreadStartHandshakeState handshake_state;
+    struct timespec wait_started;
+    gboolean wait_clock_available =
+        clock_gettime(CLOCK_MONOTONIC, &wait_started) == 0;
 
-    peak_pthread_slot_registry_wait_ready(&context->ready);
-    if (!context->skip_tracking) {
+    pthread_cleanup_push(peak_pthread_start_cleanup, context);
+    handshake_state = peak_pthread_slot_registry_wait_ready(
+        &context->handshake_state, pthread_start_handshake_timeout_ms);
+    if (handshake_state == PEAK_PTHREAD_START_ABANDONED) {
+        peak_pthread_start_warn_abandoned(
+            wait_clock_available ?
+                peak_pthread_start_elapsed_ms(&wait_started) : -1.0);
+    }
+    if (!context->skip_tracking &&
+        handshake_state == PEAK_PTHREAD_START_READY) {
         if (context->tracked) {
             if (!pthread_listener_publish_current_slot(context->slot,
                                                         context->generation)) {
@@ -169,7 +240,6 @@ peak_pthread_start(void* data)
     }
     (void)peak_signal_policy_unblock_reserved_for_current_thread();
 
-    pthread_cleanup_push(peak_pthread_start_cleanup, context);
     peak_detach_controller_wait_for_mutation_window();
     ret = start_routine(start_arg);
     pthread_cleanup_pop(1);
@@ -247,6 +317,9 @@ pthread_listener_on_enter(GumInvocationListener* listener,
     start_context->start_arg = gum_invocation_context_get_nth_argument(ic, 3);
     start_context->skip_tracking =
         (tid == &heartbeat_thread) || pthread_next_create_is_helper;
+    atomic_init(&start_context->handshake_state,
+                PEAK_PTHREAD_START_PENDING);
+    atomic_init(&start_context->references, 2);
     pthread_next_create_is_helper = FALSE;
     thread_state->start_context = start_context;
     gum_invocation_context_replace_nth_argument(ic, 2, (gpointer)peak_pthread_start);
@@ -261,6 +334,20 @@ pthread_listener_on_leave(GumInvocationListener* listener,
     int create_ret = GPOINTER_TO_INT(gum_invocation_context_get_return_value(ic));
     PeakPthreadStartContext* context = thread_state->start_context;
     if (context != NULL) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (create_ret == 0 &&
+            atomic_load_explicit(&pthread_test_pause_start_publication,
+                                 memory_order_acquire) != 0) {
+            while (atomic_load_explicit(
+                       &pthread_test_release_start_publication,
+                       memory_order_acquire) == 0) {
+                sched_yield();
+            }
+            atomic_store_explicit(&pthread_test_pause_start_publication,
+                                  0,
+                                  memory_order_release);
+        }
+#endif
         if (create_ret == 0) {
             if (tid_mapping_initialized && thread_state->child_tid != NULL) {
                 PeakPthreadSlotToken token;
@@ -287,7 +374,19 @@ pthread_listener_on_leave(GumInvocationListener* listener,
             g_free(context);
             thread_state->start_context = NULL;
         } else {
-            peak_pthread_slot_registry_publish_ready(&context->ready);
+            gboolean published =
+                peak_pthread_slot_registry_publish_ready(
+                    &context->handshake_state);
+
+            if (!published && context->tracked) {
+                (void)peak_pthread_slot_registry_compare_remove(
+                    &pthread_slot_registry,
+                    *thread_state->child_tid,
+                    context->generation,
+                    true);
+                context->tracked = FALSE;
+            }
+            peak_pthread_start_context_release(context);
             thread_state->start_context = NULL;
         }
     }
@@ -375,6 +474,19 @@ peak_pthread_join(pthread_t thread, void **retval)
 
 void pthread_listener_attach()
 {
+    PeakEnvUnsignedSchema handshake_timeout_schema = {
+        PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_ENV,
+        "milliseconds",
+        PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_DEFAULT,
+        1,
+        UINT_MAX,
+        false,
+        &pthread_start_timeout_config_warning,
+        false,
+    };
+
+    pthread_start_handshake_timeout_ms = (unsigned int)
+        peak_parse_env_unsigned(&handshake_timeout_schema);
     tid_mapping_initialized = peak_pthread_slot_registry_init(
         &pthread_slot_registry, peak_max_num_threads);
     if (tid_mapping_initialized) {
@@ -581,6 +693,31 @@ pthread_listener_test_untracked_create_removes_ambiguous_mapping(
 {
     return tid_mapping_initialized &&
         pthread_listener_quarantine_ambiguous_tid_unlocked(thread);
+}
+
+void
+pthread_listener_test_pause_start_publication_enable(void)
+{
+    atomic_store_explicit(&pthread_test_release_start_publication,
+                          0,
+                          memory_order_release);
+    atomic_store_explicit(&pthread_test_pause_start_publication,
+                          1,
+                          memory_order_release);
+}
+
+void
+pthread_listener_test_release_start_publication(void)
+{
+    atomic_store_explicit(&pthread_test_release_start_publication,
+                          1,
+                          memory_order_release);
+}
+
+int
+pthread_listener_test_current_thread_has_slot(void)
+{
+    return pthread_slot_identity.valid ? 1 : 0;
 }
 #endif
 

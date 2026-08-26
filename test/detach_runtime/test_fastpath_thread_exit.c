@@ -24,6 +24,9 @@ static atomic_int user_destructor_calls;
 static pthread_key_t user_destructor_key;
 static void (*clear_current_slot)(void);
 static int (*thread_is_tracked)(pthread_t);
+static int (*current_thread_has_slot)(void);
+static void (*release_start_publication)(void);
+static atomic_int start_timeout_child_untracked;
 static atomic_int destructor_tracking_failed;
 static atomic_int threshold_holder_ready;
 static atomic_int threshold_holder_release;
@@ -112,6 +115,49 @@ exit_worker(void* arg)
     (void)peak_fastpath_thread_exit_target(0);
     (void)peak_fastpath_thread_exit_target(1);
     return (void*)1;
+}
+
+static void*
+start_timeout_worker(void* arg)
+{
+    (void)arg;
+    if (current_thread_has_slot != NULL && !current_thread_has_slot()) {
+        atomic_store_explicit(&start_timeout_child_untracked, 1,
+                              memory_order_release);
+    }
+    (void)peak_fastpath_thread_exit_target(0);
+    if (release_start_publication != NULL) {
+        release_start_publication();
+    }
+    return NULL;
+}
+
+static int
+run_start_publication_timeout(void (*pause_enable)(void))
+{
+    pthread_t thread;
+
+    if (pause_enable == NULL || release_start_publication == NULL ||
+        current_thread_has_slot == NULL) {
+        fputs("missing pthread start-timeout hooks\n", stderr);
+        return 1;
+    }
+    atomic_store_explicit(&start_timeout_child_untracked, 0,
+                          memory_order_release);
+    pause_enable();
+    if (pthread_create(&thread, NULL, start_timeout_worker, NULL) != 0 ||
+        pthread_join(thread, NULL) != 0) {
+        fputs("pthread start-timeout worker failed\n", stderr);
+        return 1;
+    }
+    if (!atomic_load_explicit(&start_timeout_child_untracked,
+                              memory_order_acquire) ||
+        thread_is_tracked(thread)) {
+        fputs("pthread start-timeout child was published late\n", stderr);
+        return 1;
+    }
+    puts("pthread_start_publication_timeout_ok");
+    return 0;
 }
 
 static void*
@@ -494,6 +540,14 @@ main(void)
         RTLD_DEFAULT, "pthread_listener_test_clear_current_thread_slot");
     thread_is_tracked = (int (*)(pthread_t))dlsym(
         RTLD_DEFAULT, "pthread_listener_test_thread_is_tracked");
+    current_thread_has_slot = (int (*)(void))dlsym(
+        RTLD_DEFAULT, "pthread_listener_test_current_thread_has_slot");
+    void (*pause_start_publication)(void) = (void (*)(void))dlsym(
+        RTLD_DEFAULT,
+        "pthread_listener_test_pause_start_publication_enable");
+    release_start_publication = (void (*)(void))dlsym(
+        RTLD_DEFAULT,
+        "pthread_listener_test_release_start_publication");
     if (call_count == NULL || thread_count == NULL || dropped_calls == NULL ||
         dropped_threads == NULL || thread_is_tracked == NULL) {
         fputs("missing accounting test hooks\n", stderr);
@@ -512,6 +566,9 @@ main(void)
     }
     if (getenv("PEAK_TEST_RETIRED_ACTIVE_THRESHOLD") != NULL) {
         return run_retired_active_detach_threshold_regression();
+    }
+    if (getenv("PEAK_TEST_PTHREAD_START_TIMEOUT") != NULL) {
+        return run_start_publication_timeout(pause_start_publication);
     }
     (void)peak_fastpath_thread_exit_target(0);
     if (getenv("PEAK_TEST_RETIRED_DETACH_THRESHOLD") != NULL) {

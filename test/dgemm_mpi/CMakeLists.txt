@@ -24,6 +24,10 @@ add_executable(test_mpi_activation_exit_race
     test_mpi_activation_exit_race.c)
 target_link_libraries(test_mpi_activation_exit_race
     PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+add_executable(test_mpi_finalize_owner_timeout
+    test_mpi_finalize_owner_timeout.c)
+target_link_libraries(test_mpi_finalize_owner_timeout
+    PRIVATE ${CMAKE_DL_LIBS})
 add_library(test_mpi_init_chain_wrapper MODULE
     mpi_init_chain_wrapper.c)
 target_link_libraries(test_mpi_init_chain_wrapper

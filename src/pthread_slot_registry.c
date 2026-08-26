@@ -1,7 +1,122 @@
 #include "internal/pthread_slot_registry.h"
 
-#include <sched.h>
+#include <errno.h>
 #include <string.h>
+#include <time.h>
+
+static pthread_mutex_t peak_pthread_start_gate_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t peak_pthread_start_gate_cond;
+static pthread_once_t peak_pthread_start_gate_once = PTHREAD_ONCE_INIT;
+static _Atomic int peak_pthread_start_gate_ready;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static unsigned int peak_pthread_start_test_waiters;
+#endif
+
+static void
+peak_pthread_start_gate_initialize(void)
+{
+#if defined(__linux__)
+    pthread_condattr_t attr;
+    int status;
+
+    if (pthread_condattr_init(&attr) != 0) {
+        return;
+    }
+    status = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&peak_pthread_start_gate_cond, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+    if (status == 0) {
+        atomic_store_explicit(&peak_pthread_start_gate_ready, 1,
+                              memory_order_release);
+    }
+#elif defined(__APPLE__)
+    if (pthread_cond_init(&peak_pthread_start_gate_cond, NULL) == 0) {
+        atomic_store_explicit(&peak_pthread_start_gate_ready, 1,
+                              memory_order_release);
+    }
+#endif
+}
+
+static bool
+peak_pthread_start_gate_is_ready(void)
+{
+    return pthread_once(&peak_pthread_start_gate_once,
+                        peak_pthread_start_gate_initialize) == 0 &&
+           atomic_load_explicit(&peak_pthread_start_gate_ready,
+                                memory_order_acquire) != 0;
+}
+
+static bool
+peak_pthread_start_deadline(struct timespec* deadline,
+                            unsigned int timeout_ms)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) {
+        return false;
+    }
+    deadline->tv_sec += timeout_ms / 1000U;
+    deadline->tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+    return true;
+}
+
+static int
+peak_pthread_start_timedwait(const struct timespec* deadline)
+{
+#if defined(__linux__)
+    return pthread_cond_timedwait(&peak_pthread_start_gate_cond,
+                                  &peak_pthread_start_gate_mutex,
+                                  deadline);
+#elif defined(__APPLE__)
+    struct timespec now;
+    struct timespec remaining;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return EINVAL;
+    }
+    remaining.tv_sec = deadline->tv_sec - now.tv_sec;
+    remaining.tv_nsec = deadline->tv_nsec - now.tv_nsec;
+    if (remaining.tv_nsec < 0) {
+        remaining.tv_sec--;
+        remaining.tv_nsec += 1000000000L;
+    }
+    if (remaining.tv_sec < 0 ||
+        (remaining.tv_sec == 0 && remaining.tv_nsec == 0)) {
+        return ETIMEDOUT;
+    }
+    return pthread_cond_timedwait_relative_np(&peak_pthread_start_gate_cond,
+                                              &peak_pthread_start_gate_mutex,
+                                              &remaining);
+#else
+    (void)deadline;
+    return ENOTSUP;
+#endif
+}
+
+typedef struct {
+    pthread_mutex_t* mutex;
+    _Atomic int* state;
+} PeakPthreadStartWaitCleanup;
+
+static void
+peak_pthread_start_wait_cancel(void* data)
+{
+    PeakPthreadStartWaitCleanup* cleanup = data;
+    int expected = PEAK_PTHREAD_START_PENDING;
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_pthread_start_test_waiters--;
+#endif
+    (void)atomic_compare_exchange_strong_explicit(
+        cleanup->state, &expected, PEAK_PTHREAD_START_ABANDONED,
+        memory_order_acq_rel, memory_order_acquire);
+    (void)pthread_mutex_unlock(cleanup->mutex);
+}
 
 static bool
 peak_pthread_slot_registry_tid_equal(pthread_t left, pthread_t right)
@@ -216,16 +331,93 @@ peak_pthread_slot_registry_snapshot(PeakPthreadSlotRegistry* registry,
     return count;
 }
 
-void
-peak_pthread_slot_registry_publish_ready(_Atomic int* ready)
+bool
+peak_pthread_slot_registry_publish_ready(_Atomic int* state)
 {
-    atomic_store_explicit(ready, 1, memory_order_release);
+    int expected = PEAK_PTHREAD_START_PENDING;
+    bool published;
+
+    if (!peak_pthread_start_gate_is_ready() ||
+        pthread_mutex_lock(&peak_pthread_start_gate_mutex) != 0) {
+        return atomic_compare_exchange_strong_explicit(
+            state, &expected, PEAK_PTHREAD_START_READY,
+            memory_order_release, memory_order_acquire);
+    }
+    published = atomic_compare_exchange_strong_explicit(
+        state, &expected, PEAK_PTHREAD_START_READY,
+        memory_order_release, memory_order_acquire);
+    if (published) {
+        (void)pthread_cond_broadcast(&peak_pthread_start_gate_cond);
+    }
+    (void)pthread_mutex_unlock(&peak_pthread_start_gate_mutex);
+    return published;
 }
 
-void
-peak_pthread_slot_registry_wait_ready(const _Atomic int* ready)
+PeakPthreadStartHandshakeState
+peak_pthread_slot_registry_wait_ready(_Atomic int* state,
+                                      unsigned int timeout_ms)
 {
-    while (atomic_load_explicit(ready, memory_order_acquire) == 0) {
-        sched_yield();
+    struct timespec deadline;
+    int current = atomic_load_explicit(state, memory_order_acquire);
+    PeakPthreadStartHandshakeState result;
+    PeakPthreadStartWaitCleanup cleanup = {
+        .mutex = &peak_pthread_start_gate_mutex,
+        .state = state,
+    };
+
+    if (current != PEAK_PTHREAD_START_PENDING) {
+        return (PeakPthreadStartHandshakeState)current;
     }
+    if (timeout_ms == 0 || !peak_pthread_start_gate_is_ready() ||
+        !peak_pthread_start_deadline(&deadline, timeout_ms) ||
+        pthread_mutex_lock(&peak_pthread_start_gate_mutex) != 0) {
+        int expected = PEAK_PTHREAD_START_PENDING;
+
+        (void)atomic_compare_exchange_strong_explicit(
+            state, &expected, PEAK_PTHREAD_START_ABANDONED,
+            memory_order_acq_rel, memory_order_acquire);
+        return (PeakPthreadStartHandshakeState)atomic_load_explicit(
+            state, memory_order_acquire);
+    }
+    pthread_cleanup_push(peak_pthread_start_wait_cancel, &cleanup);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_pthread_start_test_waiters++;
+#endif
+    while ((current = atomic_load_explicit(state, memory_order_acquire)) ==
+           PEAK_PTHREAD_START_PENDING) {
+        int wait_status = peak_pthread_start_timedwait(&deadline);
+
+        if (wait_status != 0) {
+            int expected = PEAK_PTHREAD_START_PENDING;
+
+            (void)atomic_compare_exchange_strong_explicit(
+                state, &expected, PEAK_PTHREAD_START_ABANDONED,
+                memory_order_acq_rel, memory_order_acquire);
+            break;
+        }
+    }
+    result = (PeakPthreadStartHandshakeState)atomic_load_explicit(
+        state, memory_order_acquire);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_pthread_start_test_waiters--;
+#endif
+    pthread_cleanup_pop(0);
+    (void)pthread_mutex_unlock(&peak_pthread_start_gate_mutex);
+    return result;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+unsigned int
+peak_pthread_slot_registry_test_wake_waiters(void)
+{
+    unsigned int waiters = 0;
+
+    if (peak_pthread_start_gate_is_ready() &&
+        pthread_mutex_lock(&peak_pthread_start_gate_mutex) == 0) {
+        waiters = peak_pthread_start_test_waiters;
+        (void)pthread_cond_broadcast(&peak_pthread_start_gate_cond);
+        (void)pthread_mutex_unlock(&peak_pthread_start_gate_mutex);
+    }
+    return waiters;
+}
+#endif
