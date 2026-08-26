@@ -29,7 +29,6 @@ typedef enum {
     PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID,
     PEAK_JIT_WITH_PENDING_ROUND_ROBIN,
     PEAK_JIT_WITH_TRUNCATED_GENERATION,
-    PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION,
     PEAK_JIT_WITH_REPLACED_GENERATION
 } PeakJitMode;
 
@@ -102,7 +101,7 @@ print_usage(const char* argv0)
             "--with-duplicate-perf-map|--with-malformed-then-valid|"
             "--with-overlong-then-valid|--with-bounded-queue-then-valid|"
             "--with-pending-round-robin|"
-            "--with-truncated-generation|--with-truncated-larger-generation|"
+            "--with-truncated-generation|"
             "--with-replaced-generation) "
             "[--iterations N] [--metadata-sleep-us N] [--symbol NAME]\n",
             argv0);
@@ -179,10 +178,6 @@ parse_args(int argc,
             saw_mode++;
         } else if (strcmp(argv[i], "--with-truncated-generation") == 0) {
             *mode = PEAK_JIT_WITH_TRUNCATED_GENERATION;
-            saw_mode++;
-        } else if (strcmp(argv[i],
-                          "--with-truncated-larger-generation") == 0) {
-            *mode = PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION;
             saw_mode++;
         } else if (strcmp(argv[i], "--with-replaced-generation") == 0) {
             *mode = PEAK_JIT_WITH_REPLACED_GENERATION;
@@ -567,8 +562,6 @@ mode_name(PeakJitMode mode)
             return "with-pending-round-robin";
         case PEAK_JIT_WITH_TRUNCATED_GENERATION:
             return "with-truncated-generation";
-        case PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION:
-            return "with-truncated-larger-generation";
         case PEAK_JIT_WITH_REPLACED_GENERATION:
             return "with-replaced-generation";
         case PEAK_JIT_WITHOUT_METADATA:
@@ -625,7 +618,6 @@ main(int argc, char** argv)
          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
          mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
          mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
-         mode == PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION ||
          mode == PEAK_JIT_WITH_REPLACED_GENERATION) &&
         write_perf_map_row(code, code_size, symbol_name) != 0) {
         munmap(code, (size_t)sysconf(_SC_PAGESIZE));
@@ -763,8 +755,7 @@ main(int argc, char** argv)
         code = second_code;
         code_size = second_code_size;
     }
-    if (mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
-        mode == PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION) {
+    if (mode == PEAK_JIT_WITH_TRUNCATED_GENERATION) {
         if (metadata_sleep_us > 0) {
             usleep(metadata_sleep_us * 4);
         }
@@ -772,10 +763,8 @@ main(int argc, char** argv)
             munmap(code, (size_t)sysconf(_SC_PAGESIZE));
             return PEAK_JIT_SKIP;
         }
-        if (mode == PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION &&
-            write_malformed_perf_map_row(code) != 0) {
-            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
-            return PEAK_JIT_SKIP;
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us * 2);
         }
         if (write_perf_map_row(code, code_size, symbol_name) != 0) {
             munmap(code, (size_t)sysconf(_SC_PAGESIZE));
@@ -807,7 +796,6 @@ main(int argc, char** argv)
          mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID ||
          mode == PEAK_JIT_WITH_PENDING_ROUND_ROBIN ||
          mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
-         mode == PEAK_JIT_WITH_TRUNCATED_LARGER_GENERATION ||
          mode == PEAK_JIT_WITH_REPLACED_GENERATION) &&
         metadata_sleep_us > 0) {
         usleep(metadata_sleep_us);

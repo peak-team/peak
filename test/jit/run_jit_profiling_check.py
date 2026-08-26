@@ -83,8 +83,6 @@ def mode_flag(mode):
         return "--with-pending-round-robin"
     if mode == "truncated-generation":
         return "--with-truncated-generation"
-    if mode == "truncated-larger-generation":
-        return "--with-truncated-larger-generation"
     if mode == "replaced-generation":
         return "--with-replaced-generation"
     if mode == "attach-retry-timeout":
@@ -128,7 +126,6 @@ def expects_attached_record(mode):
         "allocation-failure",
         "shutdown-full-queue",
         "truncated-generation",
-        "truncated-larger-generation",
         "replaced-generation",
     )
 
@@ -153,7 +150,6 @@ def expects_positive_count(mode):
         "pending-round-robin",
         "allocation-failure",
         "truncated-generation",
-        "truncated-larger-generation",
         "replaced-generation",
     )
 
@@ -199,7 +195,6 @@ def expected_attached_records(mode):
         "two-generations",
         "two-generations-heartbeat",
         "truncated-generation",
-        "truncated-larger-generation",
         "replaced-generation",
     ):
         return 2
@@ -424,11 +419,7 @@ def run_one(args, tmpdir, mode):
                     f"symbol as one CSV field\nexpected={expected}\n"
                     f"rows={trace_rows}\ntrace={trace}\n{output}"
                 )
-        if mode in (
-            "truncated-generation",
-            "truncated-larger-generation",
-            "replaced-generation",
-        ):
+        if mode in ("truncated-generation", "replaced-generation"):
             generations = {row[7] for row in attached_records if len(row) >= 8}
             if len(generations) != 2:
                 raise AssertionError(
@@ -463,11 +454,9 @@ def run_one(args, tmpdir, mode):
         diagnostics, "jit_allocation_failure"
     ) != 1:
         raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
-    if mode in (
-        "truncated-generation",
-        "truncated-larger-generation",
-        "replaced-generation",
-    ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
+    if mode in ("truncated-generation", "replaced-generation") and diagnostic_int(
+        diagnostics, "jit_provider_generation"
+    ) < 2:
         raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
         if stats_csv is None:
@@ -533,7 +522,6 @@ def main():
             "attach-retry-timeout",
             "shutdown-full-queue",
             "truncated-generation",
-            "truncated-larger-generation",
             "replaced-generation",
         ),
         default="both",

@@ -172,11 +172,13 @@ interface is required before PEAK can safely support long-running code-cache GC,
 unload, or move events with reattach.
 
 The provider processes the perf-map file as append-only metadata and remembers
-the last drained offset. It detects source reset through size regression,
-same-size metadata timestamp changes, and bounded head/tail signatures of the
-committed prefix; inode replacement is detected separately. An observed reset
+the last drained offset. An observed size regression or inode replacement
 increments the provider generation, resets the offset and pending retries, and
-treats a repeated address/name as a new metadata lifetime.
+treats a repeated address/name as a new metadata lifetime. A same-inode
+truncate-and-rewrite that completes between observations without exposing a
+smaller size is indistinguishable from an append without rescanning unbounded
+history, so it is outside this bounded perf-map contract. Runtimes requiring an
+explicit reset or unload transition need an unload-aware provider.
 This generation models the metadata source lifetime only; it does not claim that
 perf-map can identify individual code unloads. During shutdown, the controller
 drains until no retry is pending or the shutdown drain deadline expires so
@@ -230,9 +232,8 @@ The default test suite includes:
 - bounded-queue coverage proving saturation is reported without blocking a later
   executable row, plus a full-queue shutdown bound;
 - finite attach-retry timeout and allocation-failure fail-open coverage;
-- immediate same-size truncation, larger prefix replacement, and inode
-  replacement coverage proving the same address/name is processed under a new
-  provider generation;
+- observed truncation and inode-replacement coverage proving the same
+  address/name is processed under a new provider generation;
 - V8 optimized-name alias coverage for both `JS:*name` and
   `LazyCompile:*name`;
 - CSV trace coverage for V8-style names containing commas and quotes;

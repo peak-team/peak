@@ -233,15 +233,15 @@ def require_valid_accounting_diagnostics(name, rows):
         if row.get("function") == ACCOUNTING_DIAGNOSTICS_FUNCTION:
             continue
         function = row.get("function", "")
+        for field in STATS_JIT_FIELDS:
+            if row.get(field, "") != "0":
+                raise AssertionError(
+                    f"nonzero row JIT diagnostic {field}: {name}"
+                )
         if (CAPABILITY_METADATA_FUNCTION_RE.fullmatch(function) or
                 function in CAPABILITY_METADATA_FUNCTIONS):
             continue
         values = []
-        for field in STATS_JIT_FIELDS:
-            if row.get(field, "") != "0":
-                raise AssertionError(
-                    f"nonzero target JIT diagnostic {field}: {name}"
-                )
         for field in STATS_ACCOUNTING_FIELDS:
             value = row.get(field, "") or ""
             if not re.fullmatch(r"[0-9]+", value):
