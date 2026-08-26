@@ -170,6 +170,7 @@ extern gboolean* peak_detached;
 extern gdouble* heartbeat_overhead;
 extern unsigned int check_interval;
 PEAK_API gpointer* hook_address = NULL;
+static uint64_t* peak_hook_provider_generation = NULL;
 static double peak_general_overhead;
 extern size_t peak_hook_address_count;
 extern char** peak_hook_strings;
@@ -2971,6 +2972,8 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_last_retry_status =
         g_renew(PeakDetachStatus, peak_hook_last_retry_status, new_count);
     hook_address = g_renew(gpointer, hook_address, new_count);
+    peak_hook_provider_generation =
+        g_renew(uint64_t, peak_hook_provider_generation, new_count);
     peak_demangled_strings = g_renew(char*, peak_demangled_strings, new_count);
     peak_need_detach = g_renew(gboolean, peak_need_detach, new_count);
     peak_detached = g_renew(gboolean, peak_detached, new_count);
@@ -3005,6 +3008,7 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     peak_hook_retry_count[old_count] = 0;
     peak_hook_last_retry_status[old_count] = PEAK_DETACH_STATUS_SAFE;
     hook_address[old_count] = NULL;
+    peak_hook_provider_generation[old_count] = 0;
     peak_demangled_strings[old_count] = NULL;
     peak_need_detach[old_count] = FALSE;
     peak_detached[old_count] = FALSE;
@@ -3023,7 +3027,8 @@ PeakDynamicAttachResult
 peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                                             gpointer symbol_address,
                                             gsize symbol_size,
-                                            const char* provider_name)
+                                            const char* provider_name,
+                                            uint64_t provider_generation)
 {
     (void)symbol_size;
 
@@ -3067,6 +3072,16 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         matched_target = TRUE;
         if (target_for_new_generation == NULL) {
             target_for_new_generation = peak_hook_strings[i];
+        }
+
+        if (hook_address[i] == symbol_address &&
+            peak_general_listener_provider_is_perfmap(provider_name) &&
+            peak_hook_provider_generation != NULL &&
+            peak_hook_provider_generation[i] != provider_generation) {
+            peak_hook_provider_generation[i] = provider_generation;
+            result = PEAK_DYNAMIC_ATTACH_GENERATION_REFRESHED;
+            duplicate_address = TRUE;
+            break;
         }
 
         if (hook_address[i] == symbol_address) {
@@ -3175,6 +3190,9 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
 
         if (attach_status == GUM_ATTACH_OK) {
             hook_address[i] = symbol_address;
+            if (peak_hook_provider_generation != NULL) {
+                peak_hook_provider_generation[i] = provider_generation;
+            }
             g_free(peak_demangled_strings[i]);
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
             array_listener[i] = new_listener;
@@ -7180,6 +7198,8 @@ peak_general_listener_attach()
     peak_hook_last_retry_status = g_new0(PeakDetachStatus, peak_hook_address_count);
 
     hook_address = g_new0(gpointer, peak_hook_address_count);
+    peak_hook_provider_generation =
+        g_new0(uint64_t, peak_hook_address_count);
     peak_demangled_strings = g_new0(char*, peak_hook_address_count);
     /*
      * Freeze the threshold before any target hook becomes executable.  The
@@ -8042,6 +8062,7 @@ peak_general_listener_build_report_snapshot(
         &peak_general_listener_dropped_calls, memory_order_relaxed);
     snapshot->dropped_threads = atomic_load_explicit(
         &peak_general_listener_dropped_threads, memory_order_relaxed);
+    peak_jit_provider_get_diagnostics(&snapshot->jit);
     snapshot->rank_count = rank_count;
     if (report_overhead != NULL) {
         snapshot->overhead = *report_overhead;
@@ -8970,6 +8991,7 @@ gboolean peak_general_listener_dettach()
     }
     g_object_unref(interceptor);
     g_free(hook_address);
+    g_free(peak_hook_provider_generation);
     g_free(array_listener_detached);
     g_free(array_listener_reattached);
     g_free(array_listener_revisited);
@@ -8997,6 +9019,7 @@ gboolean peak_general_listener_dettach()
 
     interceptor = NULL;
     hook_address = NULL;
+    peak_hook_provider_generation = NULL;
     array_listener_detached = NULL;
     array_listener_reattached = NULL;
     array_listener_revisited = NULL;

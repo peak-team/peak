@@ -1481,7 +1481,7 @@ def check_final_report_snapshot_order(repo_root):
         socket_prepare_receipt,
         re.DOTALL,
     ) is not None
-    require("#define PEAK_SOCKET_REDUCE_VERSION 14U" in socket_transport and
+    require("#define PEAK_SOCKET_REDUCE_VERSION 15U" in socket_transport and
             "peak_socket_reduce_header_set_report_tuple" in socket_result and
             "peak_socket_reduce_header_report_tuple" in
                 socket_validate_header and

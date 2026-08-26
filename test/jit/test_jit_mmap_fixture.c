@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,10 @@
 #define PEAK_JIT_SYMBOL "peak_jit_hot"
 #define PEAK_JIT_DEFAULT_ITERATIONS 1000000UL
 #define PEAK_JIT_SKIP 77
+#define PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER \
+    "PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"
+#define PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER \
+    "PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER"
 
 typedef int (*PeakJitFn)(int);
 
@@ -25,7 +30,16 @@ typedef enum {
     PEAK_JIT_WITH_STALE_THEN_VALID,
     PEAK_JIT_WITH_DUPLICATE_PERF_MAP,
     PEAK_JIT_WITH_MALFORMED_THEN_VALID,
-    PEAK_JIT_WITH_OVERLONG_THEN_VALID
+    PEAK_JIT_WITH_OVERLONG_THEN_VALID,
+    PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID,
+    PEAK_JIT_WITH_PENDING_ROUND_ROBIN,
+    PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG,
+    PEAK_JIT_WITH_TRUNCATED_GENERATION,
+    PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION,
+    PEAK_JIT_WITH_REPLACED_GENERATION,
+    PEAK_JIT_WITH_PENDING_REPLACED_GENERATION,
+    PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN,
+    PEAK_JIT_WITH_SHUTDOWN_TRUNCATE_REWRITE
 } PeakJitMode;
 
 static int
@@ -95,7 +109,12 @@ print_usage(const char* argv0)
             "usage: %s (--with-perf-map|--without-metadata|--with-partial-perf-map|"
             "--with-pre-exec-perf-map|--with-two-generations|--with-stale-then-valid|"
             "--with-duplicate-perf-map|--with-malformed-then-valid|"
-            "--with-overlong-then-valid) "
+            "--with-overlong-then-valid|--with-bounded-queue-then-valid|"
+            "--with-pending-round-robin|--with-pending-timeout-backlog|"
+            "--with-truncated-generation|--with-truncated-during-drain-generation|"
+            "--with-replaced-generation|--with-pending-replaced-generation|"
+            "--with-pending-replaced-during-drain|"
+            "--with-shutdown-truncate-rewrite) "
             "[--iterations N] [--metadata-sleep-us N] [--symbol NAME]\n",
             argv0);
 }
@@ -162,6 +181,37 @@ parse_args(int argc,
             saw_mode++;
         } else if (strcmp(argv[i], "--with-overlong-then-valid") == 0) {
             *mode = PEAK_JIT_WITH_OVERLONG_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-bounded-queue-then-valid") == 0) {
+            *mode = PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-pending-round-robin") == 0) {
+            *mode = PEAK_JIT_WITH_PENDING_ROUND_ROBIN;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-pending-timeout-backlog") == 0) {
+            *mode = PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-truncated-generation") == 0) {
+            *mode = PEAK_JIT_WITH_TRUNCATED_GENERATION;
+            saw_mode++;
+        } else if (strcmp(argv[i],
+                          "--with-truncated-during-drain-generation") == 0) {
+            *mode = PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-replaced-generation") == 0) {
+            *mode = PEAK_JIT_WITH_REPLACED_GENERATION;
+            saw_mode++;
+        } else if (strcmp(argv[i],
+                          "--with-pending-replaced-generation") == 0) {
+            *mode = PEAK_JIT_WITH_PENDING_REPLACED_GENERATION;
+            saw_mode++;
+        } else if (strcmp(argv[i],
+                          "--with-pending-replaced-during-drain") == 0) {
+            *mode = PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN;
+            saw_mode++;
+        } else if (strcmp(argv[i],
+                          "--with-shutdown-truncate-rewrite") == 0) {
+            *mode = PEAK_JIT_WITH_SHUTDOWN_TRUNCATE_REWRITE;
             saw_mode++;
         } else if (strcmp(argv[i], "--iterations") == 0) {
             if (i + 1 >= argc ||
@@ -253,6 +303,109 @@ write_perf_map_row(void* code, size_t code_size, const char* symbol_name)
         return -1;
     }
 
+    return 0;
+}
+
+static int
+truncate_perf_map(void)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    fp = fopen(path, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+    return fclose(fp) == 0 ? 0 : -1;
+}
+
+static int
+wait_for_barrier(const char* environment_name)
+{
+    const char* path = getenv(environment_name);
+
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    for (unsigned int i = 0; i < 10000; i++) {
+        if (access(path, F_OK) == 0) {
+            return 0;
+        }
+        usleep(100);
+    }
+    return -1;
+}
+
+static int
+wait_for_final_stat_done(void)
+{
+    const char* path = getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER);
+    char done_path[512];
+
+    if (path == NULL || path[0] == '\0' ||
+        snprintf(done_path, sizeof(done_path), "%s.done", path) >=
+            (int)sizeof(done_path)) {
+        return -1;
+    }
+    for (unsigned int i = 0; i < 10000; i++) {
+        if (access(done_path, F_OK) == 0) {
+            return unlink(done_path) == 0 ? 0 : -1;
+        }
+        usleep(100);
+    }
+    return -1;
+}
+
+static int
+replace_perf_map(void)
+{
+    char path[256];
+    char replacement[288];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0 ||
+        snprintf(replacement,
+                 sizeof(replacement),
+                 "%s.replacement-%ld",
+                 path,
+                 (long)getpid()) >= (int)sizeof(replacement)) {
+        return -1;
+    }
+    fp = fopen(replacement, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fclose(fp) != 0 || rename(replacement, path) != 0) {
+        unlink(replacement);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+start_shutdown_truncate_rewrite_helper(void* code,
+                                       size_t code_size,
+                                       const char* symbol_name)
+{
+    if (signal(SIGCHLD, SIG_IGN) == SIG_ERR) {
+        return -1;
+    }
+    pid_t child = fork();
+
+    if (child < 0) {
+        return -1;
+    }
+    if (child == 0) {
+        const char* barrier = getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER);
+        int ok = wait_for_barrier(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER) == 0 &&
+                 truncate_perf_map() == 0 &&
+                 write_perf_map_row(code, code_size, symbol_name) == 0 &&
+                 barrier != NULL && unlink(barrier) == 0;
+        _exit(ok ? 0 : 1);
+    }
     return 0;
 }
 
@@ -495,6 +648,24 @@ mode_name(PeakJitMode mode)
             return "with-malformed-then-valid";
         case PEAK_JIT_WITH_OVERLONG_THEN_VALID:
             return "with-overlong-then-valid";
+        case PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID:
+            return "with-bounded-queue-then-valid";
+        case PEAK_JIT_WITH_PENDING_ROUND_ROBIN:
+            return "with-pending-round-robin";
+        case PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG:
+            return "with-pending-timeout-backlog";
+        case PEAK_JIT_WITH_TRUNCATED_GENERATION:
+            return "with-truncated-generation";
+        case PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION:
+            return "with-truncated-during-drain-generation";
+        case PEAK_JIT_WITH_REPLACED_GENERATION:
+            return "with-replaced-generation";
+        case PEAK_JIT_WITH_PENDING_REPLACED_GENERATION:
+            return "with-pending-replaced-generation";
+        case PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN:
+            return "with-pending-replaced-during-drain";
+        case PEAK_JIT_WITH_SHUTDOWN_TRUNCATE_REWRITE:
+            return "with-shutdown-truncate-rewrite";
         case PEAK_JIT_WITHOUT_METADATA:
         default:
             return "without-metadata";
@@ -534,7 +705,12 @@ main(int argc, char** argv)
     unlink_stale_perf_map();
 
     rc = (mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
-          mode == PEAK_JIT_WITH_STALE_THEN_VALID) ?
+          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
+          mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID ||
+          mode == PEAK_JIT_WITH_PENDING_ROUND_ROBIN ||
+          mode == PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG ||
+          mode == PEAK_JIT_WITH_PENDING_REPLACED_GENERATION ||
+          mode == PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN) ?
              allocate_jit_code_with_mode(&code, &code_size, 0) :
              allocate_jit_code(&code, &code_size);
     if (rc != 0) {
@@ -545,7 +721,14 @@ main(int argc, char** argv)
          mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
          mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
-         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP) &&
+         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
+         mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
+         mode == PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION ||
+         mode == PEAK_JIT_WITH_REPLACED_GENERATION ||
+         mode == PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG ||
+         mode == PEAK_JIT_WITH_PENDING_REPLACED_GENERATION ||
+         mode == PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN ||
+         mode == PEAK_JIT_WITH_SHUTDOWN_TRUNCATE_REWRITE) &&
         write_perf_map_row(code, code_size, symbol_name) != 0) {
         munmap(code, (size_t)sysconf(_SC_PAGESIZE));
         return PEAK_JIT_SKIP;
@@ -631,14 +814,203 @@ main(int argc, char** argv)
         code = second_code;
         code_size = second_code_size;
     }
+    if (mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        for (size_t i = 1; i < 4; i++) {
+            if (write_perf_map_row((unsigned char*)code + i * 8,
+                                   1,
+                                   symbol_name) != 0) {
+                munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+                return PEAK_JIT_SKIP;
+            }
+        }
+        rc = allocate_jit_code(&second_code, &second_code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        if (write_perf_map_row(second_code, second_code_size, symbol_name) != 0) {
+            munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_PENDING_ROUND_ROBIN) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        if (allocate_jit_code_with_mode(&second_code,
+                                        &second_code_size,
+                                        0) != 0 ||
+            write_perf_map_row(code, code_size, symbol_name) != 0 ||
+            write_perf_map_row(second_code,
+                               second_code_size,
+                               symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            if (second_code != NULL) {
+                munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            }
+            return PEAK_JIT_SKIP;
+        }
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us * 2);
+        }
+        if (make_jit_code_executable(second_code, second_code_size) != 0) {
+            munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        char backlog_name[64];
+
+        rc = allocate_jit_code(&second_code, &second_code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        for (size_t i = 0; i < 64; i++) {
+            if (snprintf(backlog_name,
+                         sizeof(backlog_name),
+                         "peak_jit_backlog_%02zu",
+                         i) >= (int)sizeof(backlog_name) ||
+                write_perf_map_row(second_code,
+                                   second_code_size,
+                                   backlog_name) != 0) {
+                munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+                munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+                return PEAK_JIT_SKIP;
+            }
+        }
+        code = second_code;
+        code_size = second_code_size;
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us * 4);
+        }
+    }
+    if (mode == PEAK_JIT_WITH_TRUNCATED_GENERATION) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us * 4);
+        }
+        if (truncate_perf_map() != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us * 2);
+        }
+        if (write_perf_map_row(code, code_size, symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+    }
+    if (mode == PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION) {
+        const char* barrier = getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER);
+
+        if (wait_for_barrier(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER) != 0 ||
+            truncate_perf_map() != 0 ||
+            barrier == NULL ||
+            unlink(barrier) != 0 ||
+            wait_for_final_stat_done() != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        if (write_perf_map_row(code, code_size, symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+    }
+    if (mode == PEAK_JIT_WITH_REPLACED_GENERATION) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (replace_perf_map() != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (write_perf_map_row(code, code_size, symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+    }
+    if (mode == PEAK_JIT_WITH_PENDING_REPLACED_GENERATION) {
+        const char* barrier =
+            getenv(PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER);
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+
+        if (wait_for_barrier(PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER) != 0 ||
+            allocate_jit_code(&second_code, &second_code_size) != 0 ||
+            replace_perf_map() != 0 ||
+            write_perf_map_row(second_code, second_code_size, symbol_name) != 0 ||
+            make_jit_code_executable(code, code_size) != 0 ||
+            barrier == NULL || unlink(barrier) != 0) {
+            if (second_code != NULL) {
+                munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            }
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN) {
+        const char* barrier = getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER);
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+
+        if (wait_for_barrier(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER) != 0 ||
+            allocate_jit_code(&second_code, &second_code_size) != 0 ||
+            replace_perf_map() != 0 ||
+            write_perf_map_row(second_code, second_code_size, symbol_name) != 0 ||
+            make_jit_code_executable(code, code_size) != 0 ||
+            barrier == NULL || unlink(barrier) != 0 ||
+            wait_for_final_stat_done() != 0) {
+            if (second_code != NULL) {
+                munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            }
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_SHUTDOWN_TRUNCATE_REWRITE &&
+        (write_perf_map_row((unsigned char*)code + 8,
+                            1,
+                            "peak_jit_shutdown_padding") != 0 ||
+         start_shutdown_truncate_rewrite_helper(code,
+                                                code_size,
+                                                symbol_name) != 0)) {
+        munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+        return PEAK_JIT_SKIP;
+    }
     if ((mode == PEAK_JIT_WITH_PERF_MAP ||
          mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
          mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
          mode == PEAK_JIT_WITH_MALFORMED_THEN_VALID ||
-         mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID) &&
+         mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID ||
+         mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID ||
+         mode == PEAK_JIT_WITH_PENDING_ROUND_ROBIN ||
+         mode == PEAK_JIT_WITH_PENDING_TIMEOUT_BACKLOG ||
+         mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
+         mode == PEAK_JIT_WITH_TRUNCATED_DURING_DRAIN_GENERATION ||
+         mode == PEAK_JIT_WITH_REPLACED_GENERATION ||
+         mode == PEAK_JIT_WITH_PENDING_REPLACED_GENERATION ||
+         mode == PEAK_JIT_WITH_PENDING_REPLACED_DURING_DRAIN) &&
         metadata_sleep_us > 0) {
-        usleep(metadata_sleep_us);
+        usleep(metadata_sleep_us *
+               (mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID ? 4 : 1));
     }
     if (mode == PEAK_JIT_WITH_PARTIAL_PERF_MAP) {
         if (metadata_sleep_us > 0) {

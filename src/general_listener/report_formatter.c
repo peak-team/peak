@@ -781,7 +781,10 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         "capability_requested,capability_compiled,capability_active,"
         "capability_partial,capability_retained,capability_failed,"
         "cuda_compiled_apis,cuda_found_apis,cuda_installed_apis,"
-        "cuda_failed_apis,degraded_mask\n";
+        "cuda_failed_apis,degraded_mask,"
+        "jit_pending_queue_full,jit_non_executable_timeout,"
+        "jit_attach_retry_timeout,jit_allocation_failure,"
+        "jit_provider_generation,jit_pending_count,jit_pending_high_water\n";
     char* temp_csv;
     PeakReportCsvDestination destination = {.dirfd = -1};
     FILE* csv;
@@ -854,7 +857,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                   fprintf(
                       csv,
                       ",%lu,%lu,%.12Lg,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,"
-                      "%llu,%llu,0,0,0,0,0,0,0,0,0,0,0\n",
+                      "%llu,%llu,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
                       snapshot->num_calls[i],
                       peak_report_calls_per_active_thread(
                           snapshot->num_calls[i], snapshot->thread_count[i]),
@@ -876,9 +879,33 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_ACCOUNTING_DIAGNOSTICS") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,%llu,%llu,"
-                          "0,0,0,0,0,0,0,0,0,0,0\n",
+                          "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
                           (unsigned long long)snapshot->dropped_calls,
                           (unsigned long long)snapshot->dropped_threads) >= 0;
+    }
+    if (success &&
+        ((snapshot->capabilities.requested & PEAK_CAPABILITY_JIT) != 0 ||
+         snapshot->jit.provider_generation != 0 ||
+         snapshot->jit.pending_queue_full != 0 ||
+         snapshot->jit.non_executable_timeout != 0 ||
+         snapshot->jit.attach_retry_timeout != 0 ||
+         snapshot->jit.allocation_failure != 0 ||
+         snapshot->jit.pending_count != 0 ||
+         snapshot->jit.pending_high_water != 0)) {
+        success = peak_report_formatter_write_csv_name(
+                      csv, "PEAK_JIT_DIAGNOSTICS") &&
+                  fprintf(
+                      csv,
+                      ",0,0,0,0,0,0,0,0,0,0,0,0,"
+                      "0,0,0,0,0,0,0,0,0,0,0,"
+                      "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                      (unsigned long long)snapshot->jit.pending_queue_full,
+                      (unsigned long long)snapshot->jit.non_executable_timeout,
+                      (unsigned long long)snapshot->jit.attach_retry_timeout,
+                      (unsigned long long)snapshot->jit.allocation_failure,
+                      (unsigned long long)snapshot->jit.provider_generation,
+                      (unsigned long long)snapshot->jit.pending_count,
+                      (unsigned long long)snapshot->jit.pending_high_water) >= 0;
     }
     for (size_t capability = 0;
          success && capability < sizeof(peak_report_capability_names) /
@@ -897,7 +924,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                   fprintf(
                       csv,
                       ",0,0,0,0,0,0,0,0,0,0,0,0,%d,%d,%d,%d,%d,%d,"
-                      "0,0,0,0,0\n",
+                      "0,0,0,0,0,0,0,0,0,0,0,0\n",
                       (snapshot->capabilities.requested & mask) != 0,
                       (snapshot->capabilities.compiled & mask) != 0,
                       (snapshot->capabilities.active & mask) != 0,
@@ -910,7 +937,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_CUDA_API_COVERAGE") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                          "%u,%u,%u,%u,0\n",
+                          "%u,%u,%u,%u,0,0,0,0,0,0,0,0\n",
                           snapshot->capabilities.cuda_compiled_apis,
                           snapshot->capabilities.cuda_found_apis,
                           snapshot->capabilities.cuda_installed_apis,
@@ -921,7 +948,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_DEGRADED_CAPABILITIES") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                          "0,0,0,0,%u\n",
+                          "0,0,0,0,%u,0,0,0,0,0,0,0\n",
                           snapshot->degraded_mask) >= 0;
     }
     if (!success || ferror(csv)) {
@@ -1124,6 +1151,18 @@ peak_report_formatter_write_text(
             snapshot->capabilities.cuda_found_apis,
             snapshot->capabilities.cuda_installed_apis,
             snapshot->capabilities.cuda_failed_apis);
+        if ((snapshot->capabilities.requested & PEAK_CAPABILITY_JIT) != 0 ||
+            snapshot->jit.provider_generation != 0) {
+            peak_log_report(
+                "Profiler JIT diagnostics: generation=%llu pending=%llu high_water=%llu queue_full=%llu non_executable_timeout=%llu attach_retry_timeout=%llu allocation_failure=%llu\n",
+                (unsigned long long)snapshot->jit.provider_generation,
+                (unsigned long long)snapshot->jit.pending_count,
+                (unsigned long long)snapshot->jit.pending_high_water,
+                (unsigned long long)snapshot->jit.pending_queue_full,
+                (unsigned long long)snapshot->jit.non_executable_timeout,
+                (unsigned long long)snapshot->jit.attach_retry_timeout,
+                (unsigned long long)snapshot->jit.allocation_failure);
+        }
     }
     if (snapshot->dropped_calls != 0 || snapshot->dropped_threads != 0) {
         peak_log_report("Accounting diagnostics: dropped_calls=%llu dropped_threads=%llu "

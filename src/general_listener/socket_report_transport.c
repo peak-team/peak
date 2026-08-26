@@ -78,7 +78,7 @@
     "PEAK_TEST_OUTPUT_AGGREGATION_SESSION_ALLOC_FAIL"
 
 #define PEAK_SOCKET_REDUCE_MAGIC 0x5045414b52454431ULL
-#define PEAK_SOCKET_REDUCE_VERSION 14U
+#define PEAK_SOCKET_REDUCE_VERSION 15U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT 0x41U
 #define PEAK_SOCKET_REDUCE_GATHER_RECEIPT_CONFIRM 0x42U
 #define PEAK_SOCKET_REDUCE_GATHER_REGISTERED 0x01U
@@ -137,6 +137,13 @@ typedef struct {
     uint32_t cuda_found_apis;
     uint32_t cuda_installed_apis;
     uint32_t cuda_failed_apis;
+    uint64_t jit_pending_queue_full;
+    uint64_t jit_non_executable_timeout;
+    uint64_t jit_attach_retry_timeout;
+    uint64_t jit_allocation_failure;
+    uint64_t jit_provider_generation;
+    uint64_t jit_pending_count;
+    uint64_t jit_pending_high_water;
 } PeakSocketReduceHeader;
 
 typedef struct {
@@ -166,19 +173,19 @@ typedef struct {
 } PeakSocketReduceRecord;
 
 /*
- * Wire-v14 intentionally targets a homogeneous job: every rank must use the
+ * Wire-v15 intentionally targets a homogeneous job: every rank must use the
  * same byte order, floating-point representation, and 64-bit Linux C ABI.
  * Lock the layouts so an accidental field or packing change cannot silently
  * corrupt a report without another wire-version bump.
  */
-_Static_assert(sizeof(PeakSocketReduceHeader) == 216,
-               "wire-v14 header layout changed");
+_Static_assert(sizeof(PeakSocketReduceHeader) == 272,
+               "wire-v15 header layout changed");
 _Static_assert(sizeof(PeakSocketReduceReleaseFrame) == 40,
-               "wire-v14 control-frame layout changed");
+               "wire-v15 control-frame layout changed");
 _Static_assert(sizeof(PeakSocketReduceRecord) == 80,
-               "wire-v14 record layout changed");
+               "wire-v15 record layout changed");
 _Static_assert(sizeof(unsigned long) == sizeof(uint64_t),
-               "wire-v14 requires a 64-bit unsigned long");
+               "wire-v15 requires a 64-bit unsigned long");
 
 struct PeakSocketReportSession {
     bool* release_targets;
@@ -2315,6 +2322,7 @@ typedef struct {
     bool* accounting_valid;
     uint32_t* degraded_mask;
     PeakProfilerCapabilityManifest* capabilities;
+    PeakJitProviderDiagnostics* jit;
 } PeakSocketGatherAggregate;
 
 static bool
@@ -2348,6 +2356,7 @@ peak_socket_gather_prepare_receipt(
     if (connection == NULL || aggregate == NULL ||
         aggregate->degraded_mask == NULL ||
         aggregate->capabilities == NULL ||
+        aggregate->jit == NULL ||
         connection->record_index != aggregate->hook_count ||
         connection->record_bytes != 0 ||
         !peak_report_maxima_consider(aggregate->maxima,
@@ -2376,6 +2385,31 @@ peak_socket_gather_prepare_receipt(
         *aggregate->dropped_calls, connection->header.dropped_calls);
     *aggregate->dropped_threads = peak_socket_add_uint64_saturated(
         *aggregate->dropped_threads, connection->header.dropped_threads);
+    aggregate->jit->pending_queue_full = peak_socket_add_uint64_saturated(
+        aggregate->jit->pending_queue_full,
+        connection->header.jit_pending_queue_full);
+    aggregate->jit->non_executable_timeout = peak_socket_add_uint64_saturated(
+        aggregate->jit->non_executable_timeout,
+        connection->header.jit_non_executable_timeout);
+    aggregate->jit->attach_retry_timeout = peak_socket_add_uint64_saturated(
+        aggregate->jit->attach_retry_timeout,
+        connection->header.jit_attach_retry_timeout);
+    aggregate->jit->allocation_failure = peak_socket_add_uint64_saturated(
+        aggregate->jit->allocation_failure,
+        connection->header.jit_allocation_failure);
+    aggregate->jit->pending_count = peak_socket_add_uint64_saturated(
+        aggregate->jit->pending_count,
+        connection->header.jit_pending_count);
+    if (connection->header.jit_pending_high_water >
+        aggregate->jit->pending_high_water) {
+        aggregate->jit->pending_high_water =
+            connection->header.jit_pending_high_water;
+    }
+    if (connection->header.jit_provider_generation >
+        aggregate->jit->provider_generation) {
+        aggregate->jit->provider_generation =
+            connection->header.jit_provider_generation;
+    }
     *aggregate->accounting_valid =
         *aggregate->accounting_valid && tuple->accounting_valid;
     *aggregate->degraded_mask |= connection->header.degraded_mask;
@@ -3444,6 +3478,13 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     header.cuda_found_apis = local->capabilities.cuda_found_apis;
     header.cuda_installed_apis = local->capabilities.cuda_installed_apis;
     header.cuda_failed_apis = local->capabilities.cuda_failed_apis;
+    header.jit_pending_queue_full = local->jit.pending_queue_full;
+    header.jit_non_executable_timeout = local->jit.non_executable_timeout;
+    header.jit_attach_retry_timeout = local->jit.attach_retry_timeout;
+    header.jit_allocation_failure = local->jit.allocation_failure;
+    header.jit_provider_generation = local->jit.provider_generation;
+    header.jit_pending_count = local->jit.pending_count;
+    header.jit_pending_high_water = local->jit.pending_high_water;
     peak_socket_reduce_header_set_report_tuple(&header, &local_report_tuple);
 
     if (rank != 0) {
@@ -3500,6 +3541,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     uint32_t socket_degraded_mask = local->degraded_mask;
     PeakProfilerCapabilityManifest socket_capabilities =
         local->capabilities;
+    PeakJitProviderDiagnostics socket_jit = local->jit;
     unsigned int received = 0;
     bool failed;
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -3549,6 +3591,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     gather_aggregate.accounting_valid = &socket_accounting_valid;
     gather_aggregate.degraded_mask = &socket_degraded_mask;
     gather_aggregate.capabilities = &socket_capabilities;
+    gather_aggregate.jit = &socket_jit;
 #ifdef PEAK_ENABLE_TEST_HOOKS
     {
         int listener_ready = peak_socket_test_listener_ready_signal_root();
@@ -3629,6 +3672,7 @@ peak_socket_report_transport_begin(const PeakReportSnapshot* local,
     aggregate->dropped_threads = socket_dropped_threads;
     aggregate->degraded_mask = socket_degraded_mask;
     aggregate->capabilities = socket_capabilities;
+    aggregate->jit = socket_jit;
     aggregate->rank_count = size;
     peak_socket_report_set_aggregate_overhead(
         aggregate,

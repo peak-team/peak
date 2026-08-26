@@ -77,6 +77,26 @@ def mode_flag(mode):
         return "--with-malformed-then-valid"
     if mode == "overlong-then-valid":
         return "--with-overlong-then-valid"
+    if mode in ("bounded-queue", "allocation-failure", "shutdown-full-queue"):
+        return "--with-bounded-queue-then-valid"
+    if mode == "pending-round-robin":
+        return "--with-pending-round-robin"
+    if mode == "pending-timeout-backlog":
+        return "--with-pending-timeout-backlog"
+    if mode == "truncated-generation":
+        return "--with-truncated-generation"
+    if mode == "truncated-during-drain-generation":
+        return "--with-truncated-during-drain-generation"
+    if mode == "replaced-generation":
+        return "--with-replaced-generation"
+    if mode == "pending-replaced-generation":
+        return "--with-pending-replaced-generation"
+    if mode == "pending-replaced-during-drain":
+        return "--with-pending-replaced-during-drain"
+    if mode == "shutdown-truncate-rewrite":
+        return "--with-shutdown-truncate-rewrite"
+    if mode == "attach-retry-timeout":
+        return "--with-perf-map"
     if mode == "negative":
         return "--without-metadata"
     raise ValueError(f"unknown mode: {mode}")
@@ -111,6 +131,16 @@ def expects_attached_record(mode):
         "v8-js-csv-name",
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
+        "bounded-queue",
+        "pending-round-robin",
+        "allocation-failure",
+        "shutdown-full-queue",
+        "truncated-generation",
+        "truncated-during-drain-generation",
+        "replaced-generation",
+        "pending-replaced-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
     )
 
 
@@ -130,6 +160,14 @@ def expects_positive_count(mode):
         "v8-js-csv-name",
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
+        "bounded-queue",
+        "pending-round-robin",
+        "allocation-failure",
+        "truncated-generation",
+        "truncated-during-drain-generation",
+        "replaced-generation",
+        "pending-replaced-generation",
+        "pending-replaced-during-drain",
     )
 
 
@@ -146,6 +184,31 @@ def extra_env_for_mode(mode):
             "PEAK_ENABLE_REATTACH": "0",
             "PEAK_COST": "0",
             "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    if mode in ("bounded-queue", "shutdown-full-queue"):
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "2",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    if mode == "pending-round-robin":
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "2",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    if mode == "pending-timeout-backlog":
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "4",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "20",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    if mode == "allocation-failure":
+        return {"PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION": "1"}
+    if mode == "attach-retry-timeout":
+        return {
+            "PEAK_JIT_TEST_ATTACH_SEQUENCE": "always-retry",
+            "PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS": "20",
         }
     return {}
 
@@ -192,6 +255,20 @@ def symbol_count(rows, symbol):
     return total
 
 
+def jit_diagnostics(rows):
+    matches = [row for row in rows if row.get("function") == "PEAK_JIT_DIAGNOSTICS"]
+    if len(matches) != 1:
+        raise AssertionError(f"expected exactly one JIT diagnostics row, got {matches}")
+    return matches[0]
+
+
+def diagnostic_int(row, name):
+    try:
+        return int(row.get(name, ""))
+    except ValueError:
+        raise AssertionError(f"invalid {name} in JIT diagnostics: {row}") from None
+
+
 def read_text(path):
     if not os.path.exists(path):
         return ""
@@ -234,6 +311,21 @@ def run_one(args, tmpdir, mode):
     stats_prefix = os.path.join(tmpdir, f"peak-jit-{mode}")
     map_path = os.path.join(tmpdir, f"perf-{mode}.map")
     trace_path = os.path.join(tmpdir, f"jit-{mode}-trace.csv")
+    extra_env = extra_env_for_mode(mode)
+    if mode in (
+        "truncated-during-drain-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
+    ):
+        extra_env = dict(extra_env)
+        extra_env["PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"] = os.path.join(
+            tmpdir, "pre-final-stat.barrier"
+        )
+    if mode == "pending-replaced-generation":
+        extra_env = dict(extra_env)
+        extra_env["PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER"] = os.path.join(
+            tmpdir, "pre-source-observe.barrier"
+        )
     try:
         os.unlink(map_path)
     except FileNotFoundError:
@@ -244,7 +336,7 @@ def run_one(args, tmpdir, mode):
         "--iterations",
         str(args.iterations),
         "--metadata-sleep-us",
-        "0" if mode in ("final-drain", "final-drain-retry", "final-drain-stale-then-valid") else str(args.metadata_sleep_us),
+        "0" if mode in ("final-drain", "final-drain-retry", "final-drain-stale-then-valid", "shutdown-truncate-rewrite") else str(args.metadata_sleep_us),
         "--symbol",
         metadata_symbol(mode),
     ]
@@ -255,7 +347,7 @@ def run_one(args, tmpdir, mode):
             stats_prefix,
             map_path,
             trace_path,
-            extra_env_for_mode(mode),
+            extra_env,
         ),
         cwd=tmpdir,
         text=True,
@@ -290,6 +382,7 @@ def run_one(args, tmpdir, mode):
     stats_csv = find_stats_csv(stats_prefix, pid)
     rows = parse_stats_csv(stats_csv)
     count = symbol_count(rows, JIT_SYMBOL)
+    diagnostics = jit_diagnostics(rows)
     cleanup_perf_map(pid)
     try:
         os.unlink(map_path)
@@ -359,6 +452,131 @@ def run_one(args, tmpdir, mode):
                     f"symbol as one CSV field\nexpected={expected}\n"
                     f"rows={trace_rows}\ntrace={trace}\n{output}"
                 )
+        if mode in (
+            "truncated-generation",
+            "truncated-during-drain-generation",
+            "replaced-generation",
+        ):
+            refreshed_records = trace_rows_with_result(
+                trace_rows, "generation-refreshed"
+            )
+            generations = {
+                row[7]
+                for row in attached_records + refreshed_records
+                if len(row) >= 8
+            }
+            if len(refreshed_records) != 1:
+                raise AssertionError(
+                    f"{mode} did not report exactly one same-address generation "
+                    f"refresh\nrows={trace_rows}\ntrace={trace}"
+                )
+            if len(generations) != 2:
+                raise AssertionError(
+                    f"{mode} did not process the repeated address/name "
+                    f"as a new provider lifetime\nrows={trace_rows}\ntrace={trace}"
+                )
+        if mode == "pending-replaced-during-drain":
+            retry_records = trace_rows_with_result(
+                trace_rows, "not-executable-retry"
+            )
+            if not retry_records or retry_records[0][4] == attached_records[0][4]:
+                raise AssertionError(
+                    "replacement during final validation attached the stale "
+                    f"generation address\nrows={trace_rows}\ntrace={trace}"
+                )
+        if mode == "shutdown-truncate-rewrite":
+            reset_rows = [
+                row
+                for row in trace_rows
+                if len(row) >= 7
+                and row[1] == "provider-generation"
+                and row[6] == "source-truncated-during-drain"
+            ]
+            generation_two_results = [
+                row
+                for row in trace_rows
+                if len(row) >= 8
+                and row[1] == "perfmap-record"
+                and row[3] == JIT_SYMBOL
+                and row[7] == "2"
+                and row[6] in ("attached", "generation-refreshed")
+            ]
+            if (
+                len(reset_rows) != 1
+                or len(generation_two_results) != 1
+                or trace_rows.index(reset_rows[0])
+                >= trace_rows.index(generation_two_results[0])
+            ):
+                raise AssertionError(
+                    "shutdown source reset did not trigger a second drain of "
+                    f"the rewritten metadata\nrows={trace_rows}\ntrace={trace}"
+                )
+    if mode == "attach-retry-timeout":
+        trace, trace_rows = read_trace(trace_path)
+        if trace_has_result(trace_rows, "attached") or not trace_has_result(
+            trace_rows, "attach-retry-timeout"
+        ):
+            raise AssertionError(
+                "attach retry did not expire without attaching\n"
+                f"trace={trace}\n{output}"
+            )
+        if diagnostic_int(diagnostics, "jit_attach_retry_timeout") != 1:
+            raise AssertionError(f"missing attach retry timeout diagnostic: {diagnostics}")
+    if mode == "pending-timeout-backlog":
+        trace, trace_rows = read_trace(trace_path)
+        timeout_rows = trace_rows_with_result(
+            trace_rows, "not-executable-timeout"
+        )
+        backlog_end_rows = [
+            row
+            for row in trace_rows
+            if len(row) >= 7 and row[3] == "peak_jit_backlog_63"
+        ]
+        if len(timeout_rows) != 1 or len(backlog_end_rows) != 1 or not (
+            trace_rows.index(timeout_rows[0]) < trace_rows.index(backlog_end_rows[0])
+        ):
+            raise AssertionError(
+                "budget-1 pending timeout did not make progress before the "
+                f"metadata backlog reached EOF\ntrace={trace}\n{output}"
+            )
+    if mode in ("bounded-queue", "shutdown-full-queue"):
+        if diagnostic_int(diagnostics, "jit_pending_queue_full") < 1:
+            raise AssertionError(f"missing queue-full diagnostic: {diagnostics}")
+        if diagnostic_int(diagnostics, "jit_pending_high_water") != 2:
+            raise AssertionError(f"pending queue exceeded configured bound: {diagnostics}")
+        trace, trace_rows = read_trace(trace_path)
+        if not trace_has_result(trace_rows, "pending-queue-full"):
+            raise AssertionError(
+                f"queue-full record did not report its final drop outcome\n{trace}"
+            )
+    if mode == "pending-round-robin" and diagnostic_int(
+        diagnostics, "jit_pending_high_water"
+    ) != 2:
+        raise AssertionError(f"round-robin fixture did not fill both slots: {diagnostics}")
+    if mode in ("stale-then-valid", "final-drain-stale-then-valid") and diagnostic_int(
+        diagnostics, "jit_non_executable_timeout"
+    ) < 1:
+        raise AssertionError(f"missing non-executable timeout diagnostic: {diagnostics}")
+    if mode == "allocation-failure" and diagnostic_int(
+        diagnostics, "jit_allocation_failure"
+    ) != 1:
+        raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
+    if mode == "allocation-failure":
+        trace, trace_rows = read_trace(trace_path)
+        if not trace_has_result(trace_rows, "pending-allocation-failure"):
+            raise AssertionError(
+                "allocation-failure record did not report its final drop "
+                f"outcome\n{trace}"
+            )
+    if mode in (
+        "truncated-generation",
+        "truncated-during-drain-generation",
+        "replaced-generation",
+        "pending-replaced-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
+    ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
+        raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
         if stats_csv is None:
             raise AssertionError(
@@ -417,6 +635,18 @@ def main():
             "v8-js-csv-name",
             "v8-lazycompile-optimized",
             "two-generations-heartbeat",
+            "bounded-queue",
+            "pending-round-robin",
+            "allocation-failure",
+            "attach-retry-timeout",
+            "shutdown-full-queue",
+            "truncated-generation",
+            "truncated-during-drain-generation",
+            "replaced-generation",
+            "pending-replaced-generation",
+            "pending-replaced-during-drain",
+            "shutdown-truncate-rewrite",
+            "pending-timeout-backlog",
         ),
         default="both",
     )

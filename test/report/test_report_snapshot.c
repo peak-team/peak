@@ -26,6 +26,8 @@ int main(void)
     snapshot->overhead_per_call = 0.25;
     snapshot->dropped_calls = 7;
     snapshot->dropped_threads = 3;
+    snapshot->jit.provider_generation = 5;
+    snapshot->jit.pending_high_water = 11;
     peak_report_snapshot_set_transport_overhead(&snapshot->overhead);
     PeakReportOverhead transport = peak_report_snapshot_get_transport_overhead();
     assert(transport.valid && transport.elapsed_seconds == 4.0);
@@ -48,6 +50,8 @@ int main(void)
     assert(copy->overhead_per_call == 0.25);
     assert(copy->dropped_calls == 7);
     assert(copy->dropped_threads == 3);
+    assert(copy->jit.provider_generation == 5);
+    assert(copy->jit.pending_high_water == 11);
 
     peak_report_snapshot_prepare_for_render(copy);
     assert(strcmp(copy->program, "milc -i input") == 0);

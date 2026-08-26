@@ -23,6 +23,7 @@
  */
 
 #include "frida-gum.h"
+#include "internal/jit_provider_diagnostics.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,9 @@ gboolean peak_jit_provider_requested(void);
 /** Returns whether a supported JIT provider is currently active. */
 gboolean peak_jit_provider_is_active(void);
 
+/** Copies the process-local bounded-state and drop diagnostics. */
+void peak_jit_provider_get_diagnostics(PeakJitProviderDiagnostics* diagnostics);
+
 /**
  * @brief Stops ingestion and releases module-owned provider state.
  *
@@ -71,8 +75,8 @@ void peak_jit_provider_disable(void);
  * share the limit from `PEAK_JIT_DRAIN_RECORD_BUDGET` (default 1024 records;
  * zero also selects the default).  Incomplete lines remain uncommitted for a
  * later drain.  Non-executable matching symbols remain pending until their
- * millisecond timeout, while retryable attach results remain pending without
- * that timeout.
+ * configured millisecond timeout; retryable attach results have an independent
+ * configured age limit.
  *
  * @retval TRUE More work remains because of a retry, an incomplete record, or
  *              budget exhaustion.
@@ -81,12 +85,11 @@ void peak_jit_provider_disable(void);
 gboolean peak_jit_provider_drain_pending(void);
 
 /**
- * @brief Drains while immediately expiring non-executable pending symbols.
+ * @brief Drains after immediately expiring all existing pending symbols.
  *
- * This mode drops matching symbols whose ranges are still non-executable
- * instead of waiting for `PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS`.  It may still
- * return true for retryable attach results, incomplete input, or budget
- * exhaustion.
+ * This shutdown mode drops existing non-executable and attach-retry records
+ * instead of waiting for their normal age limits. It may still return true for
+ * incomplete input or budget exhaustion.
  *
  * @retval TRUE Work remains for a reason not eliminated by forced timeout.
  * @retval FALSE The provider is disabled or no known work remains.

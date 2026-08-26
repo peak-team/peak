@@ -479,6 +479,13 @@ fixture_snapshot(int rank, bool mismatch_name)
     snapshot->capabilities.cuda_installed_apis =
         rank == 0 ? 0x3U : 0x1U;
     snapshot->capabilities.cuda_failed_apis = rank == 0 ? 0 : 0x2U;
+    snapshot->jit.pending_queue_full = rank == 0 ? 1U : 10U;
+    snapshot->jit.non_executable_timeout = rank == 0 ? 2U : 20U;
+    snapshot->jit.attach_retry_timeout = rank == 0 ? 3U : 30U;
+    snapshot->jit.allocation_failure = rank == 0 ? 4U : 40U;
+    snapshot->jit.provider_generation = rank == 0 ? 5U : 9U;
+    snapshot->jit.pending_count = rank == 0 ? 6U : 60U;
+    snapshot->jit.pending_high_water = rank == 0 ? 7U : 70U;
 
     snapshot->overhead_per_call = rank == 0 ? 1e-7 : 9e-7;
     snapshot->overhead.valid = true;
@@ -557,7 +564,14 @@ aggregate_matches(const PeakReportSnapshot* aggregate)
         aggregate->capabilities.cuda_compiled_apis != 0x7U ||
         aggregate->capabilities.cuda_found_apis != 0x3U ||
         aggregate->capabilities.cuda_installed_apis != 0x1U ||
-        aggregate->capabilities.cuda_failed_apis != 0x2U) {
+        aggregate->capabilities.cuda_failed_apis != 0x2U ||
+        aggregate->jit.pending_queue_full != 11U ||
+        aggregate->jit.non_executable_timeout != 22U ||
+        aggregate->jit.attach_retry_timeout != 33U ||
+        aggregate->jit.allocation_failure != 44U ||
+        aggregate->jit.provider_generation != 9U ||
+        aggregate->jit.pending_count != 66U ||
+        aggregate->jit.pending_high_water != 70U) {
         return false;
     }
 
@@ -913,8 +927,8 @@ run_two_rank_case_with_peer_start_delay(int port,
         action == TEST_GATHER_PAYLOAD_DROP_FAILURE) {
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_AFTER_BYTES",
-            /* wire-v14 header (216 bytes) plus 17 payload bytes. */
-            action == TEST_GATHER_DROP_FAILURE ? "1" : "233",
+            /* wire-v15 header (272 bytes) plus 17 payload bytes. */
+            action == TEST_GATHER_DROP_FAILURE ? "1" : "289",
             1);
         (void)setenv(
             "PEAK_TEST_OUTPUT_AGGREGATION_GATHER_DROP_RANK",
@@ -1033,7 +1047,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         peer_ready_fds[0] = -1;
         memset(&telemetry, 0, sizeof(telemetry));
         peak_socket_report_test_telemetry_get(&telemetry);
-        if (telemetry.wire_version != 14U ||
+        if (telemetry.wire_version != 15U ||
             telemetry.peer_receipt_received !=
                 peer_registration_expected ||
             telemetry.peer_confirmation_sent !=
@@ -1102,7 +1116,7 @@ run_two_rank_case_with_peer_start_delay(int port,
         peak_socket_report_test_receipt_barrier_set(-1, -1);
     }
     if (!peer_exits_before_connect &&
-        (root_telemetry.wire_version != 14U ||
+        (root_telemetry.wire_version != 15U ||
          (!gather_must_fail &&
           root_telemetry.root_receipt_session_nonce == 0) ||
         (!early_drop_may_skip_accept &&
@@ -1408,7 +1422,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_socket_report_transport_abort(peer_session);
         peak_report_snapshot_destroy(peer_aggregate);
         if (peer_cpu_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-            telemetry.wire_version != 14U ||
+            telemetry.wire_version != 15U ||
             !telemetry.peer_receipt_received ||
             !telemetry.peer_confirmation_sent ||
             !telemetry.peer_release_started ||
@@ -1436,7 +1450,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
         peak_report_snapshot_destroy(peer_cuda);
         if ((!cuda_schema_mismatch &&
              (peer_cuda_status != PEAK_SOCKET_REPORT_PEER_RELEASED ||
-              telemetry.wire_version != 14U ||
+              telemetry.wire_version != 15U ||
               !telemetry.peer_receipt_received ||
               !telemetry.peer_confirmation_sent ||
               !telemetry.peer_release_started ||
@@ -1461,7 +1475,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
     memset(&telemetry, 0, sizeof(telemetry));
     peak_socket_report_test_telemetry_get(&telemetry);
     if (cpu_status != PEAK_SOCKET_REPORT_ROOT_PREPARED || session == NULL ||
-        !aggregate_matches(aggregate) || telemetry.wire_version != 14U ||
+        !aggregate_matches(aggregate) || telemetry.wire_version != 15U ||
         telemetry.root_payload_count != 1U ||
         telemetry.root_receipt_count != 1U ||
         telemetry.root_confirmation_count != 1U ||
@@ -1517,7 +1531,7 @@ run_two_rank_sequential_channels(int port, bool cuda_schema_mismatch)
             }
         } else if (cuda_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
                    session == NULL || !aggregate_matches(aggregate) ||
-                   telemetry.wire_version != 14U ||
+                   telemetry.wire_version != 15U ||
                    telemetry.root_payload_count != 1U ||
                    telemetry.root_receipt_count != 1U ||
                    telemetry.root_confirmation_count != 1U ||
@@ -1878,7 +1892,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
                 &peer_aggregate);
             memset(&telemetry, 0, sizeof(telemetry));
             peak_socket_report_test_telemetry_get(&telemetry);
-            if (telemetry.wire_version != 14U ||
+            if (telemetry.wire_version != 15U ||
                 !telemetry.peer_receipt_received ||
                 !telemetry.peer_confirmation_sent ||
                 !telemetry.peer_release_started ||
@@ -1908,7 +1922,7 @@ run_many_rank_case(int port, int size, bool exercise_concurrency)
         peak_socket_report_test_telemetry_get(&root_telemetry);
         if (root_status != PEAK_SOCKET_REPORT_ROOT_PREPARED ||
             session == NULL || aggregate == NULL ||
-            root_telemetry.wire_version != 14U ||
+            root_telemetry.wire_version != 15U ||
             root_telemetry.root_payload_count != (uint32_t)(size - 1) ||
             root_telemetry.root_receipt_count != (uint32_t)(size - 1) ||
             root_telemetry.root_confirmation_count !=
@@ -2067,7 +2081,7 @@ run_duplicate_rank_case(int port)
         peak_socket_report_test_telemetry_get(&telemetry);
         if (status != PEAK_SOCKET_REPORT_FAILED ||
             session != NULL || aggregate != NULL ||
-            telemetry.wire_version != 14U ||
+            telemetry.wire_version != 15U ||
             telemetry.root_payload_count > 1U ||
             telemetry.root_receipt_count >
                 telemetry.root_payload_count ||
