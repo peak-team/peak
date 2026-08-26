@@ -19,7 +19,8 @@ PeakDynamicAttachResult peak_general_listener_dynamic_attach_symbol(
     const char* symbol_name,
     gpointer symbol_address,
     gsize symbol_size,
-    const char* provider_name);
+    const char* provider_name,
+    uint64_t provider_generation);
 
 gboolean peak_general_listener_dynamic_symbol_matches_any_target(
     const char* symbol_name,

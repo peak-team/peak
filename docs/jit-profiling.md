@@ -68,14 +68,29 @@ Trace rows show provider enablement and each processed perf-map record with an
 result. Complete lines that exceed PEAK's bounded read buffer are skipped with
 `overlong-record`; true EOF partial rows are retained as `partial-record`.
 String fields are emitted as CSV fields, so names containing commas or quotes
-remain parseable.
+remain parseable. The final field is the provider generation that owned the
+event.
 
 `partial-record` is the only normal result that leaves the reader offset at the
 current record, because it means the runtime is still appending that line.
 `not-executable-retry` and `attach-retry` are stored as pending retry records
-keyed by address, size, and name while the reader continues scanning later
-metadata. This prevents a stale or temporarily refused target row from hiding a
-later executable generation of the same JIT function.
+keyed by provider generation, address, size, and name while the reader continues
+scanning later metadata. This prevents a stale or temporarily refused target row
+from hiding a later executable generation of the same JIT function.
+
+Pending state is a fixed-capacity array allocated outside the attach mutation
+path. `PEAK_JIT_PENDING_CAPACITY` selects the capacity (default `4096`, hard
+maximum `65536`). Once full, PEAK drops the newest pending record but continues
+consuming the perf map, so a later executable record can still attach without
+entering the queue. `PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS` bounds controller attach
+retries (default `1000`). `PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS` independently
+bounds records whose ranges are not executable yet (default `1000`). Zero makes
+the corresponding retry expire on its next drain.
+
+Final text and CSV reports publish queue-full, non-executable-timeout,
+attach-retry-timeout, and allocation-failure counts together with the current
+generation, pending count, and pending high-water mark. MPI and socket reports
+aggregate the counters, so a fail-open drop on any rank remains visible.
 
 The provider also bounds each controller-thread drain pass. The default budget
 is 1024 perf-map or pending records per pass and can be adjusted with:
@@ -83,6 +98,12 @@ is 1024 perf-map or pending records per pass and can be adjusted with:
 ```bash
 PEAK_JIT_DRAIN_RECORD_BUDGET=4096
 ```
+
+When pending retries and unread metadata coexist, at least half of each
+multi-record pass is reserved for unread metadata. A one-record pass always
+consumes metadata first. Once the source reaches EOF or is temporarily
+unavailable, the remaining budget services pending retries. This keeps queue
+saturation from starving later valid rows while still aging pending records.
 
 When the budget is exhausted, the provider reports pending work and lets the
 controller loop process detach/reattach requests before resuming JIT metadata
@@ -95,8 +116,8 @@ general listener controller thread and publishes a matching symbol through a
 private controller-only attach bridge. That bridge:
 
 1. requires the current thread to be the general listener controller;
-2. matches a `PEAK_TARGET` slot and ignores duplicate rows for an already
-   attached code address;
+2. matches a `PEAK_TARGET` slot and ignores same-generation duplicate rows for
+   an already attached code address;
 3. prepares the attach through the existing strict detach controller;
 4. attaches Gum to the JIT entry address;
 5. publishes `hook_address`, listener state, and demangled display name only
@@ -135,8 +156,9 @@ provider failure.
 
 ## Lifetime Boundary
 
-Perf-map metadata is load-only. It does not provide a reliable unload, move, or
-generation record. PEAK therefore treats perf-map JIT attach as valid only while
+Perf-map metadata is load-only. An unload-aware perf-map backend is not
+available: the format does not provide a reliable unload or move record. PEAK
+therefore treats perf-map JIT attach as valid only while
 the JIT code mapping remains executable and alive through PEAK teardown. A row
 whose range is not executable at drain time is ignored unless it matches a
 configured target; matching non-executable rows are retried because many JITs
@@ -148,13 +170,15 @@ interface is required before PEAK can safely support long-running code-cache GC,
 unload, or move events with reattach.
 
 The provider processes the perf-map file as append-only metadata and remembers
-the last drained offset. If the file is truncated, the offset resets and PEAK
-drains from the start; if the path is replaced by a different inode, PEAK also
-resets its offset and pending retry records. During shutdown, the controller
+the last drained offset. When it observes truncation or replacement by a
+different inode, it increments the provider generation, resets the offset and
+pending retries, and treats a repeated address/name as a new metadata lifetime.
+This generation models the metadata source lifetime only; it does not claim that
+perf-map can identify individual code unloads. During shutdown, the controller
 drains until no retry is pending or the shutdown drain deadline expires so
 records emitted shortly before process exit are not missed after one transient
-retry. At the shutdown deadline, PEAK performs one final drain that treats
-matching non-executable pending rows as timed out.
+retry. At the shutdown deadline, PEAK performs one final drain that expires both
+non-executable and attach-retry pending rows.
 
 Duplicate rows for the same logical target and code address are treated as
 metadata repeats and do not create another listener. If a JIT unmaps a code
@@ -199,6 +223,11 @@ The default test suite includes:
   is skipped instead of being mistaken for an append-in-progress partial row;
 - retry coverage proving transient attach refusals do not consume perf-map
   records;
+- bounded-queue coverage proving saturation is reported without blocking a later
+  executable row, plus a full-queue shutdown bound;
+- finite attach-retry timeout and allocation-failure fail-open coverage;
+- truncation and inode-replacement coverage proving the same address/name is
+  processed under a new provider generation;
 - V8 optimized-name alias coverage for both `JS:*name` and
   `LazyCompile:*name`;
 - CSV trace coverage for V8-style names containing commas and quotes;

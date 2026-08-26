@@ -7,6 +7,7 @@
  */
 
 #include "internal/general_listener/report_model.h"
+#include "internal/jit_provider_diagnostics.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -150,6 +151,7 @@ typedef struct {
     /** Non-critical profiler facilities disabled without mutating user code. */
     uint32_t degraded_mask;
     PeakProfilerCapabilityManifest capabilities;
+    PeakJitProviderDiagnostics jit;
     double overhead_per_call;
     int rank_count;
     PeakReportOverhead overhead;

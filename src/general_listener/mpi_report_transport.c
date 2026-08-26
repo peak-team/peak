@@ -1028,6 +1028,10 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
     uint64_t mpi_dropped_threads = 0;
     uint64_t mpi_max_dropped_calls = 0;
     uint64_t mpi_max_dropped_threads = 0;
+    uint64_t local_jit_sum[6];
+    uint64_t mpi_jit_sum[6] = {0};
+    uint64_t mpi_jit_sum_max[6] = {0};
+    uint64_t mpi_jit_generation = 0;
     int local_elapsed_valid;
     int all_elapsed_valid = 0;
     int local_accounting_valid;
@@ -1114,6 +1118,12 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
         peak_mpi_report_positive_finite(local_elapsed_seconds) ? 1 : 0;
     local_accounting_valid = local->overhead.accounting_valid ? 1 : 0;
     local_hook_count = (unsigned long)local->hook_count;
+    local_jit_sum[0] = local->jit.pending_queue_full;
+    local_jit_sum[1] = local->jit.non_executable_timeout;
+    local_jit_sum[2] = local->jit.attach_retry_timeout;
+    local_jit_sum[3] = local->jit.allocation_failure;
+    local_jit_sum[4] = local->jit.pending_count;
+    local_jit_sum[5] = local->jit.pending_high_water;
 
     if (!peak_mpi_allreduce_checked(&local_elapsed_valid,
                                     &all_elapsed_valid,
@@ -1148,6 +1158,35 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
                                     MPI_MAX,
                                     "hook-count-max")) {
         return peak_mpi_report_transport_collective_failure();
+    }
+    if (!peak_mpi_allreduce_checked(local_jit_sum,
+                                    mpi_jit_sum_max,
+                                    6,
+                                    PEAK_MPI_UINT64_DATATYPE,
+                                    MPI_MAX,
+                                    "jit-diagnostics-max") ||
+        !peak_mpi_allreduce_checked(&local->jit.provider_generation,
+                                    &mpi_jit_generation,
+                                    1,
+                                    PEAK_MPI_UINT64_DATATYPE,
+                                    MPI_MAX,
+                                    "jit-generation-max")) {
+        return peak_mpi_report_transport_collective_failure();
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (mpi_jit_sum_max[i] >
+            (UINT64_MAX - 1) / (uint64_t)size) {
+            mpi_jit_sum[i] = UINT64_MAX - 1;
+        } else if (!peak_mpi_reduce_checked(&local_jit_sum[i],
+                                            &mpi_jit_sum[i],
+                                            1,
+                                            PEAK_MPI_UINT64_DATATYPE,
+                                            MPI_SUM,
+                                            0,
+                                            rank == 0,
+                                            "jit-diagnostic-sum")) {
+            return peak_mpi_report_transport_collective_failure();
+        }
     }
 
     local_duplicate_names =
@@ -1446,6 +1485,13 @@ peak_mpi_report_transport_reduce(PeakReportSnapshot* local,
     aggregate->rank_count = size;
     aggregate->dropped_calls = mpi_dropped_calls;
     aggregate->dropped_threads = mpi_dropped_threads;
+    aggregate->jit.pending_queue_full = mpi_jit_sum[0];
+    aggregate->jit.non_executable_timeout = mpi_jit_sum[1];
+    aggregate->jit.attach_retry_timeout = mpi_jit_sum[2];
+    aggregate->jit.allocation_failure = mpi_jit_sum[3];
+    aggregate->jit.pending_count = mpi_jit_sum[4];
+    aggregate->jit.pending_high_water = mpi_jit_sum[5];
+    aggregate->jit.provider_generation = mpi_jit_generation;
     aggregate->degraded_mask = aggregate_degraded_mask;
     aggregate->capabilities.requested = aggregate_capability_any[0];
     aggregate->capabilities.compiled = aggregate_capability_all[0];

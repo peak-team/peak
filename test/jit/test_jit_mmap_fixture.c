@@ -25,7 +25,10 @@ typedef enum {
     PEAK_JIT_WITH_STALE_THEN_VALID,
     PEAK_JIT_WITH_DUPLICATE_PERF_MAP,
     PEAK_JIT_WITH_MALFORMED_THEN_VALID,
-    PEAK_JIT_WITH_OVERLONG_THEN_VALID
+    PEAK_JIT_WITH_OVERLONG_THEN_VALID,
+    PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID,
+    PEAK_JIT_WITH_TRUNCATED_GENERATION,
+    PEAK_JIT_WITH_REPLACED_GENERATION
 } PeakJitMode;
 
 static int
@@ -95,7 +98,8 @@ print_usage(const char* argv0)
             "usage: %s (--with-perf-map|--without-metadata|--with-partial-perf-map|"
             "--with-pre-exec-perf-map|--with-two-generations|--with-stale-then-valid|"
             "--with-duplicate-perf-map|--with-malformed-then-valid|"
-            "--with-overlong-then-valid) "
+            "--with-overlong-then-valid|--with-bounded-queue-then-valid|"
+            "--with-truncated-generation|--with-replaced-generation) "
             "[--iterations N] [--metadata-sleep-us N] [--symbol NAME]\n",
             argv0);
 }
@@ -162,6 +166,15 @@ parse_args(int argc,
             saw_mode++;
         } else if (strcmp(argv[i], "--with-overlong-then-valid") == 0) {
             *mode = PEAK_JIT_WITH_OVERLONG_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-bounded-queue-then-valid") == 0) {
+            *mode = PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-truncated-generation") == 0) {
+            *mode = PEAK_JIT_WITH_TRUNCATED_GENERATION;
+            saw_mode++;
+        } else if (strcmp(argv[i], "--with-replaced-generation") == 0) {
+            *mode = PEAK_JIT_WITH_REPLACED_GENERATION;
             saw_mode++;
         } else if (strcmp(argv[i], "--iterations") == 0) {
             if (i + 1 >= argc ||
@@ -253,6 +266,48 @@ write_perf_map_row(void* code, size_t code_size, const char* symbol_name)
         return -1;
     }
 
+    return 0;
+}
+
+static int
+truncate_perf_map(void)
+{
+    char path[256];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    fp = fopen(path, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+    return fclose(fp) == 0 ? 0 : -1;
+}
+
+static int
+replace_perf_map(void)
+{
+    char path[256];
+    char replacement[288];
+    FILE* fp;
+
+    if (perf_map_path(path, sizeof(path)) != 0 ||
+        snprintf(replacement,
+                 sizeof(replacement),
+                 "%s.replacement-%ld",
+                 path,
+                 (long)getpid()) >= (int)sizeof(replacement)) {
+        return -1;
+    }
+    fp = fopen(replacement, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fclose(fp) != 0 || rename(replacement, path) != 0) {
+        unlink(replacement);
+        return -1;
+    }
     return 0;
 }
 
@@ -495,6 +550,12 @@ mode_name(PeakJitMode mode)
             return "with-malformed-then-valid";
         case PEAK_JIT_WITH_OVERLONG_THEN_VALID:
             return "with-overlong-then-valid";
+        case PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID:
+            return "with-bounded-queue-then-valid";
+        case PEAK_JIT_WITH_TRUNCATED_GENERATION:
+            return "with-truncated-generation";
+        case PEAK_JIT_WITH_REPLACED_GENERATION:
+            return "with-replaced-generation";
         case PEAK_JIT_WITHOUT_METADATA:
         default:
             return "without-metadata";
@@ -534,7 +595,8 @@ main(int argc, char** argv)
     unlink_stale_perf_map();
 
     rc = (mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
-          mode == PEAK_JIT_WITH_STALE_THEN_VALID) ?
+          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
+          mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID) ?
              allocate_jit_code_with_mode(&code, &code_size, 0) :
              allocate_jit_code(&code, &code_size);
     if (rc != 0) {
@@ -545,7 +607,9 @@ main(int argc, char** argv)
          mode == PEAK_JIT_WITH_PRE_EXEC_PERF_MAP ||
          mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
-         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP) &&
+         mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
+         mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
+         mode == PEAK_JIT_WITH_REPLACED_GENERATION) &&
         write_perf_map_row(code, code_size, symbol_name) != 0) {
         munmap(code, (size_t)sysconf(_SC_PAGESIZE));
         return PEAK_JIT_SKIP;
@@ -631,12 +695,71 @@ main(int argc, char** argv)
         code = second_code;
         code_size = second_code_size;
     }
+    if (mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID) {
+        void* second_code = NULL;
+        size_t second_code_size = 0;
+        for (size_t i = 1; i < 4; i++) {
+            if (write_perf_map_row((unsigned char*)code + i * 8,
+                                   1,
+                                   symbol_name) != 0) {
+                munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+                return PEAK_JIT_SKIP;
+            }
+        }
+        rc = allocate_jit_code(&second_code, &second_code_size);
+        if (rc != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return rc;
+        }
+        if (write_perf_map_row(second_code, second_code_size, symbol_name) != 0) {
+            munmap(second_code, (size_t)sysconf(_SC_PAGESIZE));
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        code = second_code;
+        code_size = second_code_size;
+    }
+    if (mode == PEAK_JIT_WITH_TRUNCATED_GENERATION) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (truncate_perf_map() != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (write_perf_map_row(code, code_size, symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+    }
+    if (mode == PEAK_JIT_WITH_REPLACED_GENERATION) {
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (replace_perf_map() != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+        if (metadata_sleep_us > 0) {
+            usleep(metadata_sleep_us);
+        }
+        if (write_perf_map_row(code, code_size, symbol_name) != 0) {
+            munmap(code, (size_t)sysconf(_SC_PAGESIZE));
+            return PEAK_JIT_SKIP;
+        }
+    }
     if ((mode == PEAK_JIT_WITH_PERF_MAP ||
          mode == PEAK_JIT_WITH_TWO_GENERATIONS ||
          mode == PEAK_JIT_WITH_STALE_THEN_VALID ||
          mode == PEAK_JIT_WITH_DUPLICATE_PERF_MAP ||
          mode == PEAK_JIT_WITH_MALFORMED_THEN_VALID ||
-         mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID) &&
+         mode == PEAK_JIT_WITH_OVERLONG_THEN_VALID ||
+         mode == PEAK_JIT_WITH_BOUNDED_QUEUE_THEN_VALID ||
+         mode == PEAK_JIT_WITH_TRUNCATED_GENERATION ||
+         mode == PEAK_JIT_WITH_REPLACED_GENERATION) &&
         metadata_sleep_us > 0) {
         usleep(metadata_sleep_us);
     }

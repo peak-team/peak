@@ -490,6 +490,7 @@ peak_report_snapshot_clone(
     copy->dropped_threads = source->dropped_threads;
     copy->degraded_mask = source->degraded_mask;
     copy->capabilities = source->capabilities;
+    copy->jit = source->jit;
     copy->rank_count = source->rank_count;
     copy->overhead = source->overhead;
     return copy;

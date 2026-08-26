@@ -273,6 +273,43 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
             PASS_REGULAR_EXPRESSION "jit_profiling_check_ok"
             TIMEOUT 45)
 
+    foreach(jit_bounded_mode IN ITEMS
+            bounded-queue
+            allocation-failure
+            attach-retry-timeout
+            truncated-generation
+            replaced-generation)
+        string(REPLACE "-" "_" jit_bounded_suffix "${jit_bounded_mode}")
+        add_test(NAME test_jit_profiling_mmap_perfmap_${jit_bounded_suffix}
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/run_jit_profiling_check.py
+                    --exe $<TARGET_FILE:test_jit_mmap_fixture>
+                    --libpeak $<TARGET_FILE:peak>
+                    --mode ${jit_bounded_mode}
+                    --iterations 1000000
+                    --timeout 30)
+        set_tests_properties(test_jit_profiling_mmap_perfmap_${jit_bounded_suffix}
+            PROPERTIES
+                SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "jit_profiling_check_ok"
+                TIMEOUT 45)
+    endforeach()
+
+    add_test(NAME test_jit_profiling_mmap_perfmap_shutdown_full_queue
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/run_jit_profiling_check.py
+                --exe $<TARGET_FILE:test_jit_mmap_fixture>
+                --libpeak $<TARGET_FILE:peak>
+                --mode shutdown-full-queue
+                --iterations 1
+                --metadata-sleep-us 0
+                --timeout 5)
+    set_tests_properties(test_jit_profiling_mmap_perfmap_shutdown_full_queue
+        PROPERTIES
+            SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "jit_profiling_check_ok"
+            TIMEOUT 10)
+
     add_test(NAME test_jit_framework_metadata_v8_name_patterns
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/run_jit_framework_metadata_check.py

@@ -77,6 +77,14 @@ def mode_flag(mode):
         return "--with-malformed-then-valid"
     if mode == "overlong-then-valid":
         return "--with-overlong-then-valid"
+    if mode in ("bounded-queue", "allocation-failure", "shutdown-full-queue"):
+        return "--with-bounded-queue-then-valid"
+    if mode == "truncated-generation":
+        return "--with-truncated-generation"
+    if mode == "replaced-generation":
+        return "--with-replaced-generation"
+    if mode == "attach-retry-timeout":
+        return "--with-perf-map"
     if mode == "negative":
         return "--without-metadata"
     raise ValueError(f"unknown mode: {mode}")
@@ -111,6 +119,11 @@ def expects_attached_record(mode):
         "v8-js-csv-name",
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
+        "bounded-queue",
+        "allocation-failure",
+        "shutdown-full-queue",
+        "truncated-generation",
+        "replaced-generation",
     )
 
 
@@ -130,6 +143,10 @@ def expects_positive_count(mode):
         "v8-js-csv-name",
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
+        "bounded-queue",
+        "allocation-failure",
+        "truncated-generation",
+        "replaced-generation",
     )
 
 
@@ -147,11 +164,29 @@ def extra_env_for_mode(mode):
             "PEAK_COST": "0",
             "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
         }
+    if mode in ("bounded-queue", "shutdown-full-queue"):
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "2",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
+    if mode == "allocation-failure":
+        return {"PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION": "1"}
+    if mode == "attach-retry-timeout":
+        return {
+            "PEAK_JIT_TEST_ATTACH_SEQUENCE": "always-retry",
+            "PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS": "20",
+        }
     return {}
 
 
 def expected_attached_records(mode):
-    if mode in ("two-generations", "two-generations-heartbeat"):
+    if mode in (
+        "two-generations",
+        "two-generations-heartbeat",
+        "truncated-generation",
+        "replaced-generation",
+    ):
         return 2
     return 1
 
@@ -190,6 +225,20 @@ def symbol_count(rows, symbol):
         except ValueError:
             raise AssertionError(f"invalid count in stats row: {row}") from None
     return total
+
+
+def jit_diagnostics(rows):
+    matches = [row for row in rows if row.get("function") == "PEAK_JIT_DIAGNOSTICS"]
+    if len(matches) != 1:
+        raise AssertionError(f"expected exactly one JIT diagnostics row, got {matches}")
+    return matches[0]
+
+
+def diagnostic_int(row, name):
+    try:
+        return int(row.get(name, ""))
+    except ValueError:
+        raise AssertionError(f"invalid {name} in JIT diagnostics: {row}") from None
 
 
 def read_text(path):
@@ -290,6 +339,7 @@ def run_one(args, tmpdir, mode):
     stats_csv = find_stats_csv(stats_prefix, pid)
     rows = parse_stats_csv(stats_csv)
     count = symbol_count(rows, JIT_SYMBOL)
+    diagnostics = jit_diagnostics(rows)
     cleanup_perf_map(pid)
     try:
         os.unlink(map_path)
@@ -359,6 +409,41 @@ def run_one(args, tmpdir, mode):
                     f"symbol as one CSV field\nexpected={expected}\n"
                     f"rows={trace_rows}\ntrace={trace}\n{output}"
                 )
+        if mode in ("truncated-generation", "replaced-generation"):
+            generations = {row[7] for row in attached_records if len(row) >= 8}
+            if len(generations) != 2:
+                raise AssertionError(
+                    f"{mode} did not process the repeated address/name "
+                    f"as a new provider lifetime\nrows={attached_records}\ntrace={trace}"
+                )
+    if mode == "attach-retry-timeout":
+        trace, trace_rows = read_trace(trace_path)
+        if trace_has_result(trace_rows, "attached") or not trace_has_result(
+            trace_rows, "attach-retry-timeout"
+        ):
+            raise AssertionError(
+                "attach retry did not expire without attaching\n"
+                f"trace={trace}\n{output}"
+            )
+        if diagnostic_int(diagnostics, "jit_attach_retry_timeout") != 1:
+            raise AssertionError(f"missing attach retry timeout diagnostic: {diagnostics}")
+    if mode in ("bounded-queue", "shutdown-full-queue"):
+        if diagnostic_int(diagnostics, "jit_pending_queue_full") < 1:
+            raise AssertionError(f"missing queue-full diagnostic: {diagnostics}")
+        if diagnostic_int(diagnostics, "jit_pending_high_water") != 2:
+            raise AssertionError(f"pending queue exceeded configured bound: {diagnostics}")
+    if mode in ("stale-then-valid", "final-drain-stale-then-valid") and diagnostic_int(
+        diagnostics, "jit_non_executable_timeout"
+    ) < 1:
+        raise AssertionError(f"missing non-executable timeout diagnostic: {diagnostics}")
+    if mode == "allocation-failure" and diagnostic_int(
+        diagnostics, "jit_allocation_failure"
+    ) != 1:
+        raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
+    if mode in ("truncated-generation", "replaced-generation") and diagnostic_int(
+        diagnostics, "jit_provider_generation"
+    ) < 2:
+        raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
         if stats_csv is None:
             raise AssertionError(
@@ -417,6 +502,12 @@ def main():
             "v8-js-csv-name",
             "v8-lazycompile-optimized",
             "two-generations-heartbeat",
+            "bounded-queue",
+            "allocation-failure",
+            "attach-retry-timeout",
+            "shutdown-full-queue",
+            "truncated-generation",
+            "replaced-generation",
         ),
         default="both",
     )

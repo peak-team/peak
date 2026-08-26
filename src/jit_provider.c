@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,10 +22,18 @@
 #define PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV \
     "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS"
 #define PEAK_JIT_DRAIN_RECORD_BUDGET_ENV "PEAK_JIT_DRAIN_RECORD_BUDGET"
+#define PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS_ENV \
+    "PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS"
+#define PEAK_JIT_PENDING_CAPACITY_ENV "PEAK_JIT_PENDING_CAPACITY"
 #define PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS 1000UL
+#define PEAK_JIT_DEFAULT_ATTACH_RETRY_TIMEOUT_MS 1000UL
 #define PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET 1024UL
+#define PEAK_JIT_DEFAULT_PENDING_CAPACITY 4096UL
+#define PEAK_JIT_MAX_PENDING_CAPACITY 65536UL
 #ifdef PEAK_ENABLE_TEST_HOOKS
 #define PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV "PEAK_JIT_TEST_ATTACH_SEQUENCE"
+#define PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION_ENV \
+    "PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION"
 #endif
 
 static gboolean peak_jit_provider_enabled = FALSE;
@@ -36,20 +45,26 @@ static char* configured_jit_map_path = NULL;
 static char* configured_jit_trace_path = NULL;
 static unsigned long configured_jit_not_exec_retry_timeout_ms =
     PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS;
+static unsigned long configured_jit_attach_retry_timeout_ms =
+    PEAK_JIT_DEFAULT_ATTACH_RETRY_TIMEOUT_MS;
 static unsigned long configured_jit_drain_record_budget =
     PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET;
+static unsigned long configured_jit_pending_capacity =
+    PEAK_JIT_DEFAULT_PENDING_CAPACITY;
 static PeakEnvWarningState peak_jit_retry_timeout_warning_emitted;
+static PeakEnvWarningState peak_jit_attach_retry_timeout_warning_emitted;
 static PeakEnvWarningState peak_jit_drain_budget_warning_emitted;
+static PeakEnvWarningState peak_jit_pending_capacity_warning_emitted;
 static char* peak_jit_perfmap_path = NULL;
 static off_t peak_jit_perfmap_offset = 0;
 static gboolean peak_jit_perfmap_identity_known = FALSE;
 static dev_t peak_jit_perfmap_dev = 0;
 static ino_t peak_jit_perfmap_ino = 0;
 static off_t peak_jit_perfmap_last_size = 0;
-static GPtrArray* peak_jit_pending_records = NULL;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static unsigned int peak_jit_test_attach_sequence_index = 0;
 static char* configured_jit_test_attach_sequence = NULL;
+static unsigned long peak_jit_test_fail_pending_allocation_remaining = 0;
 #endif
 
 typedef enum {
@@ -58,11 +73,31 @@ typedef enum {
 } PeakJitPendingKind;
 
 typedef struct {
+    uint64_t provider_generation;
     uintptr_t address;
     size_t size;
     char* name;
-    double not_exec_started_at;
+    double created_at;
+    double last_attempt_at;
+    uint64_t attempt_count;
+    PeakJitPendingKind pending_kind;
 } PeakJitPendingRecord;
+
+typedef enum {
+    PEAK_JIT_PENDING_ADD_OK = 0,
+    PEAK_JIT_PENDING_ADD_DUPLICATE,
+    PEAK_JIT_PENDING_ADD_QUEUE_FULL,
+    PEAK_JIT_PENDING_ADD_ALLOCATION_FAILED
+} PeakJitPendingAddResult;
+
+static PeakJitPendingRecord** peak_jit_pending_records = NULL;
+static size_t peak_jit_pending_record_count = 0;
+static uint64_t peak_jit_provider_generation = 0;
+static _Atomic uint64_t peak_jit_pending_queue_full = 0;
+static _Atomic uint64_t peak_jit_non_executable_timeout = 0;
+static _Atomic uint64_t peak_jit_attach_retry_timeout = 0;
+static _Atomic uint64_t peak_jit_allocation_failure = 0;
+static _Atomic uint64_t peak_jit_pending_high_water = 0;
 
 static gboolean
 peak_jit_env_truthy(const char* value)
@@ -108,11 +143,12 @@ static unsigned long
 peak_jit_parse_ulong_env(const char* name,
                          const char* unit,
                          unsigned long fallback,
+                         unsigned long maximum,
                          bool zero_allowed,
                          PeakEnvWarningState* warning_emitted)
 {
     PeakEnvUnsignedSchema schema = {
-        name, unit, fallback, zero_allowed ? 0UL : 1UL, ULONG_MAX,
+        name, unit, fallback, zero_allowed ? 0UL : 1UL, maximum,
         zero_allowed, warning_emitted, false,
     };
 
@@ -183,6 +219,7 @@ peak_jit_trace(const char* event,
     peak_jit_trace_csv_field(fp, name);
     fprintf(fp, ",0x%" PRIxPTR ",%zu,", address, size);
     peak_jit_trace_csv_field(fp, result);
+    fprintf(fp, ",%" PRIu64, peak_jit_provider_generation);
     fputc('\n', fp);
     fclose(fp);
 }
@@ -346,6 +383,32 @@ peak_jit_drain_record_budget(void)
     return configured_jit_drain_record_budget;
 }
 
+static unsigned long
+peak_jit_attach_retry_timeout_ms(void)
+{
+    return configured_jit_attach_retry_timeout_ms;
+}
+
+static void
+peak_jit_provider_reset_diagnostics(void)
+{
+    atomic_store_explicit(&peak_jit_pending_queue_full,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_jit_non_executable_timeout,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_jit_attach_retry_timeout,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_jit_allocation_failure,
+                          0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&peak_jit_pending_high_water,
+                          0,
+                          memory_order_relaxed);
+}
+
 static void
 peak_jit_pending_record_free(gpointer data)
 {
@@ -359,37 +422,73 @@ peak_jit_pending_record_free(gpointer data)
     g_free(record);
 }
 
-static GPtrArray*
+static gboolean
 peak_jit_pending_records_ensure(void)
 {
     if (peak_jit_pending_records == NULL) {
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        if (peak_jit_test_fail_pending_allocation_remaining > 0) {
+            peak_jit_test_fail_pending_allocation_remaining--;
+            atomic_fetch_add_explicit(&peak_jit_allocation_failure,
+                                      1,
+                                      memory_order_relaxed);
+            return FALSE;
+        }
+#endif
         peak_jit_pending_records =
-            g_ptr_array_new_with_free_func(peak_jit_pending_record_free);
+            g_try_new0(PeakJitPendingRecord*, configured_jit_pending_capacity);
+        if (peak_jit_pending_records == NULL) {
+            atomic_fetch_add_explicit(&peak_jit_allocation_failure,
+                                      1,
+                                      memory_order_relaxed);
+            return FALSE;
+        }
     }
 
-    return peak_jit_pending_records;
+    return TRUE;
 }
 
 static void
 peak_jit_pending_records_clear(void)
 {
-    if (peak_jit_pending_records != NULL) {
-        g_ptr_array_set_size(peak_jit_pending_records, 0);
+    for (size_t i = 0; i < peak_jit_pending_record_count; i++) {
+        peak_jit_pending_record_free(peak_jit_pending_records[i]);
+        peak_jit_pending_records[i] = NULL;
     }
+    peak_jit_pending_record_count = 0;
+}
+
+static void
+peak_jit_provider_advance_generation(const char* reason)
+{
+    peak_jit_pending_records_clear();
+    peak_jit_provider_generation++;
+    if (peak_jit_provider_generation == 0) {
+        peak_jit_provider_generation = 1;
+    }
+    peak_jit_trace("provider-generation",
+                   "perfmap",
+                   peak_jit_perfmap_path,
+                   0,
+                   0,
+                   reason);
 }
 
 static PeakJitPendingRecord*
-peak_jit_pending_record_find(uintptr_t address, size_t size, const char* name)
+peak_jit_pending_record_find(uint64_t provider_generation,
+                             uintptr_t address,
+                             size_t size,
+                             const char* name)
 {
     if (peak_jit_pending_records == NULL || name == NULL) {
         return NULL;
     }
 
-    for (guint i = 0; i < peak_jit_pending_records->len; i++) {
-        PeakJitPendingRecord* record =
-            g_ptr_array_index(peak_jit_pending_records, i);
+    for (size_t i = 0; i < peak_jit_pending_record_count; i++) {
+        PeakJitPendingRecord* record = peak_jit_pending_records[i];
 
-        if (record->address == address &&
+        if (record->provider_generation == provider_generation &&
+            record->address == address &&
             record->size == size &&
             strcmp(record->name, name) == 0) {
             return record;
@@ -399,7 +498,7 @@ peak_jit_pending_record_find(uintptr_t address, size_t size, const char* name)
     return NULL;
 }
 
-static void
+static PeakJitPendingAddResult
 peak_jit_pending_record_add(PeakJitPendingKind kind,
                             uintptr_t address,
                             size_t size,
@@ -408,35 +507,121 @@ peak_jit_pending_record_add(PeakJitPendingKind kind,
     PeakJitPendingRecord* record;
 
     if (name == NULL || name[0] == '\0') {
-        return;
+        return PEAK_JIT_PENDING_ADD_ALLOCATION_FAILED;
     }
 
-    record = peak_jit_pending_record_find(address, size, name);
+    record = peak_jit_pending_record_find(peak_jit_provider_generation,
+                                          address,
+                                          size,
+                                          name);
     if (record != NULL) {
-        if (kind == PEAK_JIT_PENDING_NOT_EXECUTABLE &&
-            record->not_exec_started_at <= 0.0) {
-            record->not_exec_started_at = peak_second();
-        }
-        return;
+        return PEAK_JIT_PENDING_ADD_DUPLICATE;
     }
 
-    record = g_new0(PeakJitPendingRecord, 1);
+    if (peak_jit_pending_record_count >= configured_jit_pending_capacity) {
+        atomic_fetch_add_explicit(&peak_jit_pending_queue_full,
+                                  1,
+                                  memory_order_relaxed);
+        return PEAK_JIT_PENDING_ADD_QUEUE_FULL;
+    }
+    if (!peak_jit_pending_records_ensure()) {
+        return PEAK_JIT_PENDING_ADD_ALLOCATION_FAILED;
+    }
+
+    record = g_try_new0(PeakJitPendingRecord, 1);
+    if (record == NULL) {
+        atomic_fetch_add_explicit(&peak_jit_allocation_failure,
+                                  1,
+                                  memory_order_relaxed);
+        return PEAK_JIT_PENDING_ADD_ALLOCATION_FAILED;
+    }
+    size_t name_size = strlen(name) + 1;
+    record->name = g_try_malloc(name_size);
+    if (record->name == NULL) {
+        g_free(record);
+        atomic_fetch_add_explicit(&peak_jit_allocation_failure,
+                                  1,
+                                  memory_order_relaxed);
+        return PEAK_JIT_PENDING_ADD_ALLOCATION_FAILED;
+    }
+    memcpy(record->name, name, name_size);
+    record->provider_generation = peak_jit_provider_generation;
     record->address = address;
     record->size = size;
-    record->name = g_strdup(name);
-    record->not_exec_started_at =
-        kind == PEAK_JIT_PENDING_NOT_EXECUTABLE ? peak_second() : 0.0;
+    record->created_at = peak_second();
+    record->last_attempt_at = record->created_at;
+    record->attempt_count = 1;
+    record->pending_kind = kind;
 
-    g_ptr_array_add(peak_jit_pending_records_ensure(), record);
+    peak_jit_pending_records[peak_jit_pending_record_count++] = record;
+    uint64_t previous_high_water =
+        atomic_load_explicit(&peak_jit_pending_high_water,
+                             memory_order_relaxed);
+    while (previous_high_water < peak_jit_pending_record_count &&
+           !atomic_compare_exchange_weak_explicit(
+               &peak_jit_pending_high_water,
+               &previous_high_water,
+               peak_jit_pending_record_count,
+               memory_order_relaxed,
+               memory_order_relaxed)) {
+    }
+    return PEAK_JIT_PENDING_ADD_OK;
 }
 
 static void
-peak_jit_pending_record_remove_index(guint index)
+peak_jit_pending_record_remove_index(size_t index)
 {
     if (peak_jit_pending_records != NULL &&
-        index < peak_jit_pending_records->len) {
-        g_ptr_array_remove_index(peak_jit_pending_records, index);
+        index < peak_jit_pending_record_count) {
+        peak_jit_pending_record_free(peak_jit_pending_records[index]);
+        peak_jit_pending_record_count--;
+        if (index < peak_jit_pending_record_count) {
+            memmove(&peak_jit_pending_records[index],
+                    &peak_jit_pending_records[index + 1],
+                    (peak_jit_pending_record_count - index) *
+                        sizeof(*peak_jit_pending_records));
+        }
+        peak_jit_pending_records[peak_jit_pending_record_count] = NULL;
     }
+}
+
+static void
+peak_jit_pending_records_expire(void)
+{
+    uint64_t non_executable = 0;
+    uint64_t attach_retry = 0;
+
+    for (size_t i = 0; i < peak_jit_pending_record_count; i++) {
+        if (peak_jit_pending_records[i]->pending_kind ==
+            PEAK_JIT_PENDING_ATTACH_RETRY) {
+            attach_retry++;
+        } else {
+            non_executable++;
+        }
+    }
+    if (non_executable != 0) {
+        atomic_fetch_add_explicit(&peak_jit_non_executable_timeout,
+                                  non_executable,
+                                  memory_order_relaxed);
+        peak_jit_trace("perfmap-record",
+                       "perfmap",
+                       "<pending>",
+                       0,
+                       (size_t)non_executable,
+                       "not-executable-timeout");
+    }
+    if (attach_retry != 0) {
+        atomic_fetch_add_explicit(&peak_jit_attach_retry_timeout,
+                                  attach_retry,
+                                  memory_order_relaxed);
+        peak_jit_trace("perfmap-record",
+                       "perfmap",
+                       "<pending>",
+                       0,
+                       (size_t)attach_retry,
+                       "attach-retry-timeout");
+    }
+    peak_jit_pending_records_clear();
 }
 
 static gboolean
@@ -471,6 +656,11 @@ peak_jit_test_forced_attach_result(PeakDynamicAttachResult* result_out)
 
     if (sequence == NULL || sequence[0] == '\0') {
         return FALSE;
+    }
+    if (g_ascii_strcasecmp(sequence, "always-retry") == 0) {
+        peak_jit_test_attach_sequence_index++;
+        *result_out = PEAK_DYNAMIC_ATTACH_RETRY;
+        return TRUE;
     }
 
     parts = g_strsplit(sequence, ",", -1);
@@ -528,20 +718,47 @@ peak_jit_init_runtime_config_once(void)
         peak_jit_parse_ulong_env(PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS_ENV,
                                  "milliseconds",
                                  PEAK_JIT_DEFAULT_NOT_EXEC_RETRY_TIMEOUT_MS,
+                                 ULONG_MAX,
                                  true,
                                  &peak_jit_retry_timeout_warning_emitted);
+    configured_jit_attach_retry_timeout_ms =
+        peak_jit_parse_ulong_env(PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS_ENV,
+                                 "milliseconds",
+                                 PEAK_JIT_DEFAULT_ATTACH_RETRY_TIMEOUT_MS,
+                                 ULONG_MAX,
+                                 true,
+                                 &peak_jit_attach_retry_timeout_warning_emitted);
     budget =
         peak_jit_parse_ulong_env(PEAK_JIT_DRAIN_RECORD_BUDGET_ENV,
                                  "records",
                                  PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET,
+                                 ULONG_MAX,
                                  false,
                                  &peak_jit_drain_budget_warning_emitted);
     configured_jit_drain_record_budget = budget;
+    configured_jit_pending_capacity =
+        peak_jit_parse_ulong_env(PEAK_JIT_PENDING_CAPACITY_ENV,
+                                 "records",
+                                 PEAK_JIT_DEFAULT_PENDING_CAPACITY,
+                                 PEAK_JIT_MAX_PENDING_CAPACITY,
+                                 false,
+                                 &peak_jit_pending_capacity_warning_emitted);
 #ifdef PEAK_ENABLE_TEST_HOOKS
     const char* attach_sequence =
         g_getenv(PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV);
     if (attach_sequence != NULL && attach_sequence[0] != '\0') {
         configured_jit_test_attach_sequence = g_strdup(attach_sequence);
+    }
+    const char* fail_pending_allocation =
+        g_getenv(PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION_ENV);
+    if (fail_pending_allocation != NULL &&
+        fail_pending_allocation[0] != '\0') {
+        char* end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(fail_pending_allocation, &end, 10);
+        if (errno == 0 && end != fail_pending_allocation && *end == '\0') {
+            peak_jit_test_fail_pending_allocation_remaining = parsed;
+        }
     }
 #endif
 }
@@ -569,7 +786,8 @@ peak_jit_attach_perfmap_symbol(const char* name, uintptr_t address, size_t size)
     return peak_general_listener_dynamic_attach_symbol(name,
                                                        (gpointer)address,
                                                        size,
-                                                       "perfmap");
+                                                       "perfmap",
+                                                       peak_jit_provider_generation);
 }
 
 static const char*
@@ -590,24 +808,19 @@ peak_jit_attach_result_string(PeakDynamicAttachResult result)
 }
 
 static gboolean
-peak_jit_pending_not_exec_timed_out(PeakJitPendingRecord* record,
-                                    gboolean force_not_exec_timeout)
+peak_jit_pending_record_timed_out(const PeakJitPendingRecord* record,
+                                  gboolean force_not_exec_timeout)
 {
-    double now;
     unsigned long timeout_ms;
 
     if (force_not_exec_timeout) {
         return TRUE;
     }
 
-    if (record->not_exec_started_at <= 0.0) {
-        record->not_exec_started_at = peak_second();
-        return FALSE;
-    }
-
-    now = peak_second();
-    timeout_ms = peak_jit_not_exec_retry_timeout_ms();
-    return (now - record->not_exec_started_at) * 1000.0 >=
+    timeout_ms = record->pending_kind == PEAK_JIT_PENDING_NOT_EXECUTABLE
+                     ? peak_jit_not_exec_retry_timeout_ms()
+                     : peak_jit_attach_retry_timeout_ms();
+    return (peak_second() - record->created_at) * 1000.0 >=
            (double)timeout_ms;
 }
 
@@ -618,13 +831,12 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
     gboolean pending = FALSE;
 
     if (peak_jit_pending_records == NULL ||
-        peak_jit_pending_records->len == 0) {
+        peak_jit_pending_record_count == 0) {
         return FALSE;
     }
 
-    for (guint i = 0; i < peak_jit_pending_records->len;) {
-        PeakJitPendingRecord* record =
-            g_ptr_array_index(peak_jit_pending_records, i);
+    for (size_t i = 0; i < peak_jit_pending_record_count;) {
+        PeakJitPendingRecord* record = peak_jit_pending_records[i];
         PeakDynamicAttachResult attach_result;
 
         if (budget != NULL) {
@@ -634,20 +846,33 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
             }
             (*budget)--;
         }
+        record->last_attempt_at = peak_second();
+        record->attempt_count++;
 
         if (!peak_jit_range_is_executable(record->address, record->size)) {
-            gboolean timed_out =
-                peak_jit_pending_not_exec_timed_out(record,
-                                                    force_not_exec_timeout);
+            gboolean timed_out = peak_jit_pending_record_timed_out(
+                record,
+                force_not_exec_timeout);
 
+            const char* timeout_result =
+                record->pending_kind == PEAK_JIT_PENDING_ATTACH_RETRY
+                    ? "attach-retry-timeout"
+                    : "not-executable-timeout";
             peak_jit_trace("perfmap-record",
                            "perfmap",
                            record->name,
                            record->address,
                            record->size,
-                           timed_out ? "not-executable-timeout" :
+                           timed_out ? timeout_result :
                                        "not-executable-retry");
             if (timed_out) {
+                _Atomic uint64_t* timeout_counter =
+                    record->pending_kind == PEAK_JIT_PENDING_ATTACH_RETRY
+                        ? &peak_jit_attach_retry_timeout
+                        : &peak_jit_non_executable_timeout;
+                atomic_fetch_add_explicit(timeout_counter,
+                                          1,
+                                          memory_order_relaxed);
                 peak_jit_pending_record_remove_index(i);
                 continue;
             }
@@ -667,6 +892,25 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
                        record->size,
                        peak_jit_attach_result_string(attach_result));
         if (attach_result == PEAK_DYNAMIC_ATTACH_RETRY) {
+            if (record->pending_kind == PEAK_JIT_PENDING_NOT_EXECUTABLE) {
+                record->pending_kind = PEAK_JIT_PENDING_ATTACH_RETRY;
+                record->created_at = peak_second();
+            }
+            if (peak_jit_pending_record_timed_out(
+                    record,
+                    force_not_exec_timeout)) {
+                atomic_fetch_add_explicit(&peak_jit_attach_retry_timeout,
+                                          1,
+                                          memory_order_relaxed);
+                peak_jit_trace("perfmap-record",
+                               "perfmap",
+                               record->name,
+                               record->address,
+                               record->size,
+                               "attach-retry-timeout");
+                peak_jit_pending_record_remove_index(i);
+                continue;
+            }
             pending = TRUE;
             i++;
             continue;
@@ -686,38 +930,49 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
     off_t committed_offset;
     gboolean pending = FALSE;
     unsigned long budget = peak_jit_drain_record_budget();
+    unsigned long retry_budget = budget > 1 ? budget / 2 : 0;
+    unsigned long initial_retry_budget = retry_budget;
     struct stat st;
 
     pending |= peak_jit_provider_retry_pending_records(force_not_exec_timeout,
-                                                       &budget);
-    if (budget == 0) {
-        return TRUE;
-    }
+                                                       &retry_budget);
+    budget -= initial_retry_budget - retry_budget;
 
     if (peak_jit_perfmap_path == NULL) {
-        return pending;
+        pending |= peak_jit_provider_retry_pending_records(
+            force_not_exec_timeout,
+            &budget);
+        return pending || peak_jit_pending_record_count != 0;
     }
 
     fp = fopen(peak_jit_perfmap_path, "r");
     if (fp == NULL) {
-        return pending;
+        pending |= peak_jit_provider_retry_pending_records(
+            force_not_exec_timeout,
+            &budget);
+        return pending || peak_jit_pending_record_count != 0;
     }
 
     if (fstat(fileno(fp), &st) == 0) {
-        if (peak_jit_perfmap_identity_known &&
+        gboolean source_replaced =
+            peak_jit_perfmap_identity_known &&
             (st.st_dev != peak_jit_perfmap_dev ||
-             st.st_ino != peak_jit_perfmap_ino)) {
+             st.st_ino != peak_jit_perfmap_ino);
+        gboolean source_truncated =
+            peak_jit_perfmap_identity_known && !source_replaced &&
+            (peak_jit_perfmap_offset > st.st_size ||
+             st.st_size < peak_jit_perfmap_last_size);
+
+        if (source_replaced) {
             peak_jit_perfmap_offset = 0;
-            peak_jit_pending_records_clear();
+            peak_jit_provider_advance_generation("source-replaced");
+        } else if (source_truncated) {
+            peak_jit_perfmap_offset = 0;
+            peak_jit_provider_advance_generation("source-truncated");
         }
         peak_jit_perfmap_identity_known = TRUE;
         peak_jit_perfmap_dev = st.st_dev;
         peak_jit_perfmap_ino = st.st_ino;
-        if (peak_jit_perfmap_offset > st.st_size ||
-            st.st_size < peak_jit_perfmap_last_size) {
-            peak_jit_perfmap_offset = 0;
-            peak_jit_pending_records_clear();
-        }
         peak_jit_perfmap_last_size = st.st_size;
     }
 
@@ -725,12 +980,12 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
         off_t end = ftello(fp);
         if (end >= 0 && peak_jit_perfmap_offset > end) {
             peak_jit_perfmap_offset = 0;
-            peak_jit_pending_records_clear();
+            peak_jit_provider_advance_generation("source-rewound");
         }
     }
     if (fseeko(fp, peak_jit_perfmap_offset, SEEK_SET) != 0) {
         peak_jit_perfmap_offset = 0;
-        peak_jit_pending_records_clear();
+        peak_jit_provider_advance_generation("source-seek-reset");
         (void)fseeko(fp, 0, SEEK_SET);
     }
 
@@ -793,11 +1048,18 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
                                matches_target ? "not-executable-retry" :
                                                 "not-executable");
             if (matches_target && !force_not_exec_timeout) {
-                peak_jit_pending_record_add(PEAK_JIT_PENDING_NOT_EXECUTABLE,
-                                            address,
-                                            size,
-                                            name);
-                pending = TRUE;
+                PeakJitPendingAddResult add_result =
+                    peak_jit_pending_record_add(
+                        PEAK_JIT_PENDING_NOT_EXECUTABLE,
+                        address,
+                        size,
+                        name);
+                pending |= add_result == PEAK_JIT_PENDING_ADD_OK ||
+                           add_result == PEAK_JIT_PENDING_ADD_DUPLICATE;
+            } else if (matches_target && force_not_exec_timeout) {
+                atomic_fetch_add_explicit(&peak_jit_non_executable_timeout,
+                                          1,
+                                          memory_order_relaxed);
             }
             if (next_offset >= 0) {
                 committed_offset = next_offset;
@@ -813,11 +1075,26 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
                        size,
                        peak_jit_attach_result_string(attach_result));
         if (attach_result == PEAK_DYNAMIC_ATTACH_RETRY) {
-            peak_jit_pending_record_add(PEAK_JIT_PENDING_ATTACH_RETRY,
-                                        address,
-                                        size,
-                                        name);
-            pending = TRUE;
+            if (force_not_exec_timeout) {
+                atomic_fetch_add_explicit(&peak_jit_attach_retry_timeout,
+                                          1,
+                                          memory_order_relaxed);
+                peak_jit_trace("perfmap-record",
+                               "perfmap",
+                               name,
+                               address,
+                               size,
+                               "attach-retry-timeout");
+            } else {
+                PeakJitPendingAddResult add_result =
+                    peak_jit_pending_record_add(
+                        PEAK_JIT_PENDING_ATTACH_RETRY,
+                        address,
+                        size,
+                        name);
+                pending |= add_result == PEAK_JIT_PENDING_ADD_OK ||
+                           add_result == PEAK_JIT_PENDING_ADD_DUPLICATE;
+            }
         }
         if (next_offset >= 0) {
             committed_offset = next_offset;
@@ -826,7 +1103,12 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
 
     peak_jit_perfmap_offset = committed_offset;
     fclose(fp);
-    return pending;
+    if (budget > 0) {
+        pending |= peak_jit_provider_retry_pending_records(
+            force_not_exec_timeout,
+            &budget);
+    }
+    return pending || peak_jit_pending_record_count != 0;
 }
 
 void
@@ -837,6 +1119,7 @@ peak_jit_provider_enable(void)
     const char* map_path = configured_jit_map_path;
 
     peak_jit_provider_disable();
+    peak_jit_provider_reset_diagnostics();
 #ifdef PEAK_ENABLE_TEST_HOOKS
     peak_jit_test_attach_sequence_index = 0;
 #endif
@@ -868,7 +1151,7 @@ peak_jit_provider_enable(void)
     peak_jit_perfmap_dev = 0;
     peak_jit_perfmap_ino = 0;
     peak_jit_perfmap_last_size = 0;
-    peak_jit_pending_records_clear();
+    peak_jit_provider_advance_generation("provider-enabled");
 
     peak_jit_trace("provider-enable",
                    "perfmap",
@@ -899,6 +1182,32 @@ peak_jit_provider_is_active(void)
 }
 
 void
+peak_jit_provider_get_diagnostics(PeakJitProviderDiagnostics* diagnostics)
+{
+    if (diagnostics == NULL) {
+        return;
+    }
+
+    diagnostics->pending_queue_full =
+        atomic_load_explicit(&peak_jit_pending_queue_full,
+                             memory_order_relaxed);
+    diagnostics->non_executable_timeout =
+        atomic_load_explicit(&peak_jit_non_executable_timeout,
+                             memory_order_relaxed);
+    diagnostics->attach_retry_timeout =
+        atomic_load_explicit(&peak_jit_attach_retry_timeout,
+                             memory_order_relaxed);
+    diagnostics->allocation_failure =
+        atomic_load_explicit(&peak_jit_allocation_failure,
+                             memory_order_relaxed);
+    diagnostics->provider_generation = peak_jit_provider_generation;
+    diagnostics->pending_count = peak_jit_pending_record_count;
+    diagnostics->pending_high_water =
+        atomic_load_explicit(&peak_jit_pending_high_water,
+                             memory_order_relaxed);
+}
+
+void
 peak_jit_provider_disable(void)
 {
     peak_jit_provider_enabled = FALSE;
@@ -909,6 +1218,8 @@ peak_jit_provider_disable(void)
     peak_jit_perfmap_ino = 0;
     peak_jit_perfmap_last_size = 0;
     peak_jit_pending_records_clear();
+    g_free(peak_jit_pending_records);
+    peak_jit_pending_records = NULL;
     g_free(peak_jit_perfmap_path);
     peak_jit_perfmap_path = NULL;
 }
@@ -937,5 +1248,6 @@ peak_jit_provider_drain_pending(void)
 gboolean
 peak_jit_provider_drain_pending_force_not_exec_timeout(void)
 {
+    peak_jit_pending_records_expire();
     return peak_jit_provider_drain_pending_with_mode(TRUE);
 }
