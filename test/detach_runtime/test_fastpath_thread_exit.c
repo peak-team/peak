@@ -38,6 +38,9 @@ static atomic_int detached_worker_done;
 static atomic_int detached_worker_release;
 static atomic_int detached_pending_ready;
 static int (*mark_current_thread_final_destructor)(void);
+static void (*join_detach_race_enable)(void);
+static unsigned int (*join_detach_race_paused)(void);
+static void (*join_detach_race_release)(void);
 static atomic_int aba_worker_ready;
 static atomic_int aba_worker_release;
 typedef unsigned long (*CountFunction)(size_t);
@@ -45,6 +48,14 @@ typedef uint64_t (*DroppedFunction)(void);
 
 typedef void (*ReclamationDiagnosticsFunction)(
     PeakPthreadReclamationDiagnostics*);
+
+typedef struct {
+    pthread_t target;
+    atomic_int target_ready;
+    atomic_int target_release;
+    int join_status;
+    int detach_status;
+} JoinDetachRace;
 
 static int
 checkpoint_name_matches(const char* name, long pid)
@@ -275,6 +286,39 @@ one_call_worker(void* arg)
     return NULL;
 }
 
+static void*
+join_detach_race_target(void* data)
+{
+    JoinDetachRace* race = data;
+
+    (void)pthread_setspecific(user_destructor_key, (void*)1);
+    (void)peak_fastpath_thread_exit_target(0);
+    atomic_store_explicit(&race->target_ready, 1, memory_order_release);
+    while (!atomic_load_explicit(&race->target_release,
+                                 memory_order_acquire)) {
+        sched_yield();
+    }
+    return NULL;
+}
+
+static void*
+join_detach_race_joiner(void* data)
+{
+    JoinDetachRace* race = data;
+
+    race->join_status = pthread_join(race->target, NULL);
+    return NULL;
+}
+
+static void*
+join_detach_race_detacher(void* data)
+{
+    JoinDetachRace* race = data;
+
+    race->detach_status = pthread_detach(race->target);
+    return NULL;
+}
+
 static int
 wait_for_detached_reclamation(ReclamationDiagnosticsFunction get_diagnostics,
                               uint64_t expected_reclaimed)
@@ -327,6 +371,130 @@ wait_for_alive_detached_deferral(
             (unsigned long long)diagnostics.reclaimed,
             (unsigned long)diagnostics.pending);
     return 1;
+}
+
+static int
+run_join_detach_race_regression(
+    CountFunction call_count,
+    DroppedFunction dropped_calls,
+    DroppedFunction dropped_threads,
+    ReclamationDiagnosticsFunction get_diagnostics)
+{
+#if defined(__linux__)
+    enum { RACE_ROUNDS = 16 };
+    PeakPthreadReclamationDiagnostics diagnostics;
+
+    if (join_detach_race_enable == NULL || join_detach_race_paused == NULL ||
+        join_detach_race_release == NULL || get_diagnostics == NULL) {
+        fputs("missing join/detach race test hooks\n", stderr);
+        return 1;
+    }
+    get_diagnostics(&diagnostics);
+    uint64_t expected_reclaimed = diagnostics.reclaimed;
+
+    for (int round = 0; round < RACE_ROUNDS; round++) {
+        JoinDetachRace race = {
+            .join_status = -1,
+            .detach_status = -1,
+        };
+        pthread_t joiner;
+        pthread_t detacher;
+
+        atomic_init(&race.target_ready, 0);
+        atomic_init(&race.target_release, 0);
+        if (pthread_create(&race.target, NULL, join_detach_race_target,
+                           &race) != 0) {
+            fputs("join/detach race target create failed\n", stderr);
+            return 1;
+        }
+        while (!atomic_load_explicit(&race.target_ready,
+                                     memory_order_acquire)) {
+            sched_yield();
+        }
+
+        join_detach_race_enable();
+        if (pthread_create(&joiner, NULL, join_detach_race_joiner, &race) !=
+                0 ||
+            pthread_create(&detacher, NULL, join_detach_race_detacher, &race) !=
+                0) {
+            atomic_store_explicit(&race.target_release, 1,
+                                  memory_order_release);
+            join_detach_race_release();
+            fputs("join/detach race caller create failed\n", stderr);
+            return 1;
+        }
+        for (unsigned int attempt = 0;
+             attempt < 500 && join_detach_race_paused() != 2; attempt++) {
+            usleep(10000);
+        }
+        if (join_detach_race_paused() != 2) {
+            atomic_store_explicit(&race.target_release, 1,
+                                  memory_order_release);
+            join_detach_race_release();
+            (void)pthread_join(joiner, NULL);
+            (void)pthread_join(detacher, NULL);
+            fputs("join/detach callers did not capture one generation\n",
+                  stderr);
+            return 1;
+        }
+
+        atomic_store_explicit(&race.target_release, 1, memory_order_release);
+        join_detach_race_release();
+        if (pthread_join(joiner, NULL) != 0 ||
+            pthread_join(detacher, NULL) != 0) {
+            fputs("join/detach race caller cleanup failed\n", stderr);
+            return 1;
+        }
+        if (race.join_status != 0 && race.detach_status != 0) {
+            fprintf(stderr,
+                    "join/detach race had no native winner: join=%d detach=%d\n",
+                    race.join_status, race.detach_status);
+            return 1;
+        }
+        if (race.join_status != 0) {
+            expected_reclaimed++;
+            if (wait_for_detached_reclamation(get_diagnostics,
+                                              expected_reclaimed) != 0) {
+                fputs("join/detach race detached winner was not reclaimed\n",
+                      stderr);
+                return 1;
+            }
+        }
+
+        unsigned long expected_calls = 1UL + (unsigned long)(round + 1) * 5UL;
+        int expected_destructors = (round + 1) * 4;
+        if (call_count(0) != expected_calls || dropped_calls() != 0 ||
+            dropped_threads() != 0 ||
+            atomic_load_explicit(&user_destructor_calls,
+                                 memory_order_relaxed) !=
+                expected_destructors) {
+            fprintf(stderr,
+                    "join/detach race accounting mismatch at round %d: "
+                    "calls=%lu expected=%lu dropped=%llu/%llu destructors=%d\n",
+                    round, call_count(0), expected_calls,
+                    (unsigned long long)dropped_calls(),
+                    (unsigned long long)dropped_threads(),
+                    atomic_load_explicit(&user_destructor_calls,
+                                         memory_order_relaxed));
+            return 1;
+        }
+    }
+
+    get_diagnostics(&diagnostics);
+    if (diagnostics.pending != 0 || diagnostics.retire_failures != 0) {
+        fputs("join/detach race left retirement state pending\n", stderr);
+        return 1;
+    }
+    puts("fastpath_thread_exit_ok");
+    return 0;
+#else
+    (void)call_count;
+    (void)dropped_calls;
+    (void)dropped_threads;
+    (void)get_diagnostics;
+    puts("fastpath_thread_exit_ok");
+    return 0;
+#endif
 }
 
 static int
@@ -444,6 +612,21 @@ run_detached_reclamation_regression(
             return 1;
         }
     }
+    unsigned long expected_detached_calls =
+        1UL + DETACHED_ITERATIONS * 5UL;
+    if (call_count(0) != expected_detached_calls ||
+        atomic_load_explicit(&user_destructor_calls,
+                             memory_order_relaxed) !=
+            DETACHED_ITERATIONS * 4) {
+        fprintf(stderr,
+                "detached exact-once mismatch: calls=%lu expected=%lu "
+                "destructors=%d expected_destructors=%d\n",
+                call_count(0), expected_detached_calls,
+                atomic_load_explicit(&user_destructor_calls,
+                                     memory_order_relaxed),
+                DETACHED_ITERATIONS * 4);
+        return 1;
+    }
 
     /* Cancellation runs all PEAK cleanup/destructor paths but has no join
      * handoff once detach succeeds. It must reach the same conservative path. */
@@ -467,6 +650,7 @@ run_detached_reclamation_regression(
         fputs("canceled detached worker slot was not reclaimed\n", stderr);
         return 1;
     }
+    unsigned long calls_after_cancellation = call_count(0);
 
     /* The successful-join fast path remains available after repeated reuse of
      * the single non-main profiling slot. */
@@ -490,7 +674,7 @@ run_detached_reclamation_regression(
         dropped_threads() != 0 ||
         atomic_load_explicit(&destructor_tracking_failed,
                              memory_order_acquire) != 0 ||
-        call_count(0) < 1 + DETACHED_ITERATIONS * 5 + 1) {
+        call_count(0) != calls_after_cancellation + 1) {
         fprintf(stderr,
                 "detached reclamation mismatch: calls=%lu dropped=%llu/%llu "
                 "scans=%llu examined=%llu reclaimed=%llu pending=%lu "
@@ -780,6 +964,12 @@ main(void)
     mark_current_thread_final_destructor = (int (*)(void))dlsym(
         RTLD_DEFAULT,
         "pthread_listener_test_mark_current_thread_final_destructor");
+    join_detach_race_enable = (void (*)(void))dlsym(
+        RTLD_DEFAULT, "pthread_listener_test_join_detach_race_enable");
+    join_detach_race_paused = (unsigned int (*)(void))dlsym(
+        RTLD_DEFAULT, "pthread_listener_test_join_detach_race_paused");
+    join_detach_race_release = (void (*)(void))dlsym(
+        RTLD_DEFAULT, "pthread_listener_test_join_detach_race_release");
     if (call_count == NULL || thread_count == NULL || dropped_calls == NULL ||
         dropped_threads == NULL || thread_is_tracked == NULL) {
         fputs("missing accounting test hooks\n", stderr);
@@ -808,6 +998,11 @@ main(void)
     }
     if (getenv("PEAK_TEST_DETACHED_RECLAMATION") != NULL) {
         return run_detached_reclamation_regression(
+            call_count, dropped_calls, dropped_threads,
+            get_reclamation_diagnostics);
+    }
+    if (getenv("PEAK_TEST_PTHREAD_JOIN_DETACH_RACE") != NULL) {
+        return run_join_detach_race_regression(
             call_count, dropped_calls, dropped_threads,
             get_reclamation_diagnostics);
     }

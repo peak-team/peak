@@ -78,6 +78,9 @@ static gboolean pthread_slot_key_created = FALSE;
 static _Atomic unsigned int pthread_test_fail_slot_publish = 0;
 static _Atomic int pthread_test_pause_start_publication;
 static _Atomic int pthread_test_release_start_publication;
+static _Atomic int pthread_test_join_detach_race_enabled;
+static _Atomic unsigned int pthread_test_join_detach_race_paused;
+static _Atomic int pthread_test_join_detach_race_release;
 #endif
 
 static void peak_pthread_slot_destructor(void* data);
@@ -488,6 +491,25 @@ pthread_listener_init(PthreadListener* self)
 static int (*original_pthread_join)(pthread_t thread, void **retval);
 static int (*original_pthread_detach)(pthread_t thread);
 
+static void
+pthread_listener_test_pause_join_detach_after_capture(gboolean captured)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (captured &&
+        atomic_load_explicit(&pthread_test_join_detach_race_enabled,
+                             memory_order_acquire) != 0) {
+        atomic_fetch_add_explicit(&pthread_test_join_detach_race_paused, 1,
+                                  memory_order_acq_rel);
+        while (atomic_load_explicit(&pthread_test_join_detach_race_release,
+                                    memory_order_acquire) == 0) {
+            sched_yield();
+        }
+    }
+#else
+    (void)captured;
+#endif
+}
+
 static gboolean
 pthread_listener_capture_thread_token(pthread_t thread,
                                       size_t* slot_out,
@@ -524,6 +546,7 @@ peak_pthread_join(pthread_t thread, void **retval)
     uint64_t generation = 0;
     gboolean captured =
         pthread_listener_capture_thread_token(thread, &slot, &generation);
+    pthread_listener_test_pause_join_detach_after_capture(captured);
     int ret = original_pthread_join(thread, retval);
     if (ret == 0 && captured) {
         PeakPthreadSlotToken token = {
@@ -554,6 +577,7 @@ peak_pthread_detach(pthread_t thread)
         peak_pthread_slot_registry_capture(&pthread_slot_registry,
                                             thread,
                                             &token);
+    pthread_listener_test_pause_join_detach_after_capture(captured);
     int ret = original_pthread_detach(thread);
 
     if (ret == 0 && captured) {
@@ -1007,6 +1031,33 @@ pthread_listener_test_mark_current_thread_final_destructor(void)
         &pthread_slot_registry, token, &became_exit_pending);
     pthread_listener_wake_reclaimer_if_pending(became_exit_pending);
     return marked;
+}
+
+void
+pthread_listener_test_join_detach_race_enable(void)
+{
+    atomic_store_explicit(&pthread_test_join_detach_race_paused, 0,
+                          memory_order_release);
+    atomic_store_explicit(&pthread_test_join_detach_race_release, 0,
+                          memory_order_release);
+    atomic_store_explicit(&pthread_test_join_detach_race_enabled, 1,
+                          memory_order_release);
+}
+
+unsigned int
+pthread_listener_test_join_detach_race_paused(void)
+{
+    return atomic_load_explicit(&pthread_test_join_detach_race_paused,
+                                memory_order_acquire);
+}
+
+void
+pthread_listener_test_join_detach_race_release(void)
+{
+    atomic_store_explicit(&pthread_test_join_detach_race_enabled, 0,
+                          memory_order_release);
+    atomic_store_explicit(&pthread_test_join_detach_race_release, 1,
+                          memory_order_release);
 }
 #endif
 

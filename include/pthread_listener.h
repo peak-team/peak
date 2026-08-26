@@ -134,6 +134,12 @@ PEAK_PTHREAD_LISTENER_API int
 pthread_listener_test_current_thread_has_slot(void);
 PEAK_PTHREAD_LISTENER_API int
 pthread_listener_test_mark_current_thread_final_destructor(void);
+PEAK_PTHREAD_LISTENER_API void
+pthread_listener_test_join_detach_race_enable(void);
+PEAK_PTHREAD_LISTENER_API unsigned int
+pthread_listener_test_join_detach_race_paused(void);
+PEAK_PTHREAD_LISTENER_API void
+pthread_listener_test_join_detach_race_release(void);
 #endif
 
 /**

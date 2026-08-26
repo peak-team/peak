@@ -932,6 +932,15 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "fatal|detached .* failed|detached .* mismatch|slot was not reclaimed|fast path regressed|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
+        add_test(NAME test_pthread_join_detach_slot_race
+            COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
+        set_tests_properties(test_pthread_join_detach_slot_race
+            PROPERTIES
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=4;PEAK_TEST_PTHREAD_JOIN_DETACH_RACE=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
+                FAIL_REGULAR_EXPRESSION "fatal|join/detach race .* failed|join/detach race .* mismatch|no native winner|did not capture|not reclaimed|retirement state pending|Gum [^\\r\\n]* failed"
+                TIMEOUT 30)
+
         add_test(NAME test_fastpath_thread_exit_helper_silent
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
         set_tests_properties(test_fastpath_thread_exit_helper_silent
