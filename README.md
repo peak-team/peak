@@ -281,9 +281,14 @@ in detail.
 | `PEAK_TEXT_OUTPUT` | Force or suppress the human-readable stderr report. |
 | `PEAK_VERBOSITY` | `silent`, `report`/`quiet`, `warn`, `info`, or `debug`; numeric levels `0` through `4` are also accepted. |
 | `PEAK_NAME_TRUNCATE` | Truncate long function and kernel names in text output. |
-| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. |
+| `PEAK_MAX_NUM_THREADS` | Tracked-thread capacity. Default: twice the online CPU count; `0` uses one slot and values above `4096` clamp. A successful `pthread_join()` immediately releases a completed slot. On Linux, detached slots are reclaimed by a bounded controller slow path only after PEAK's final TLS-destructor pass and proof that the generation's kernel TID is absent from `/proc/self/task`; ambiguous cases remain quarantined. |
 | `PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS` | Maximum wait for another thread to finish deferred runtime activation. On timeout, dependent teardown/report work is skipped. Default: `5000`. |
 | `PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS` | Maximum wait for a `pthread_create()` caller to publish child slot metadata. On timeout, the child runs untracked and late metadata is discarded safely. Default: `5000`. |
+
+At `info` verbosity, detached-thread cleanup reports its scan count, examined
+entries, reclaimed/deferred totals, pending high-water mark, fixed 64-entry
+budget, and 100 ms minimum scan interval. These scans run only on the controller
+slow path; target callbacks do not perform registry searches or `/proc` access.
 
 Every text and stats CSV report includes a capability manifest for CPU targets,
 strict mutation, CUDA, memory tracking, JIT input, dynamic DSO discovery, and

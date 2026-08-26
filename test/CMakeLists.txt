@@ -923,13 +923,13 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
-        add_test(NAME test_fastpath_thread_exit_detached_slot_quarantine
+        add_test(NAME test_fastpath_thread_exit_detached_slot_reclamation
             COMMAND ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_thread_exit)
-        set_tests_properties(test_fastpath_thread_exit_detached_slot_quarantine
+        set_tests_properties(test_fastpath_thread_exit_detached_slot_reclamation
             PROPERTIES
-                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_DETACHED_QUARANTINE=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
+                ENVIRONMENT "PEAK_TARGET=peak_fastpath_thread_exit_target;PEAK_MAX_NUM_THREADS=2;PEAK_TEST_DETACHED_RECLAMATION=1;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;${PRELOAD_VAR}"
                 PASS_REGULAR_EXPRESSION "fastpath_thread_exit_ok"
-                FAIL_REGULAR_EXPRESSION "fatal|detached thread slot was reused|Gum [^\\r\\n]* failed"
+                FAIL_REGULAR_EXPRESSION "fatal|detached .* failed|detached .* mismatch|slot was not reclaimed|fast path regressed|Gum [^\\r\\n]* failed"
                 TIMEOUT 30)
 
         add_test(NAME test_fastpath_thread_exit_helper_silent

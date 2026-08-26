@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+#include "pthread_listener.h"
+
 #include <pthread.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -33,10 +35,16 @@ static atomic_int threshold_holder_release;
 static atomic_int retired_active_ready;
 static atomic_int retired_active_release;
 static atomic_int detached_worker_done;
+static atomic_int detached_worker_release;
+static atomic_int detached_pending_ready;
+static int (*mark_current_thread_final_destructor)(void);
 static atomic_int aba_worker_ready;
 static atomic_int aba_worker_release;
 typedef unsigned long (*CountFunction)(size_t);
 typedef uint64_t (*DroppedFunction)(void);
+
+typedef void (*ReclamationDiagnosticsFunction)(
+    PeakPthreadReclamationDiagnostics*);
 
 static int
 checkpoint_name_matches(const char* name, long pid)
@@ -60,7 +68,6 @@ checkpoint_name_matches(const char* name, long pid)
 }
 typedef void (*MarkNextHelperFunction)(void);
 typedef int (*StaleGenerationRemoveFunction)(pthread_t);
-typedef int (*RemoveAmbiguousMappingFunction)(pthread_t);
 
 __attribute__((noinline, used, externally_visible, visibility("default")))
 PEAK_TEST_TARGET_NOIPA
@@ -238,9 +245,25 @@ reused_active_five_worker(void* arg)
 static void*
 detached_worker(void* arg)
 {
-    (void)arg;
+    intptr_t mode = (intptr_t)arg;
+
+    (void)pthread_setspecific(user_destructor_key, (void*)1);
     (void)peak_fastpath_thread_exit_target(0);
     atomic_store_explicit(&detached_worker_done, 1, memory_order_release);
+    if (mode == 2) {
+        if (mark_current_thread_final_destructor == NULL ||
+            !mark_current_thread_final_destructor()) {
+            atomic_store_explicit(&destructor_tracking_failed, 1,
+                                  memory_order_release);
+        }
+        atomic_store_explicit(&detached_pending_ready, 1,
+                              memory_order_release);
+    }
+    while (mode != 0 &&
+           !atomic_load_explicit(&detached_worker_release,
+                                 memory_order_acquire)) {
+        sched_yield();
+    }
     return NULL;
 }
 
@@ -253,39 +276,245 @@ one_call_worker(void* arg)
 }
 
 static int
-run_detached_quarantine_regression(CountFunction call_count,
-                                   DroppedFunction dropped_calls,
-                                   DroppedFunction dropped_threads,
-                                   RemoveAmbiguousMappingFunction remove_ambiguous)
+wait_for_detached_reclamation(ReclamationDiagnosticsFunction get_diagnostics,
+                              uint64_t expected_reclaimed)
 {
-    pthread_t detached;
-    pthread_t later;
+    for (unsigned int attempt = 0; attempt < 500; attempt++) {
+        PeakPthreadReclamationDiagnostics diagnostics;
 
-    atomic_store_explicit(&detached_worker_done, 0, memory_order_relaxed);
-    if (pthread_create(&detached, NULL, detached_worker, NULL) != 0 ||
-        pthread_detach(detached) != 0) {
-        fputs("detached worker setup failed\n", stderr);
+        get_diagnostics(&diagnostics);
+        if (diagnostics.reclaimed >= expected_reclaimed) {
+            return 0;
+        }
+        usleep(10000);
+    }
+    return 1;
+}
+
+static int
+wait_for_alive_detached_deferral(
+    ReclamationDiagnosticsFunction get_diagnostics,
+    uint64_t initial_deferred_alive,
+    uint64_t expected_reclaimed)
+{
+    for (unsigned int attempt = 0; attempt < 500; attempt++) {
+        PeakPthreadReclamationDiagnostics diagnostics;
+
+        get_diagnostics(&diagnostics);
+        if (diagnostics.deferred_alive > initial_deferred_alive) {
+            if (diagnostics.reclaimed == expected_reclaimed &&
+                diagnostics.pending == 1) {
+                return 0;
+            }
+            fprintf(stderr,
+                    "live deferral mismatch: deferred=%llu reclaimed=%llu "
+                    "pending=%lu\n",
+                    (unsigned long long)diagnostics.deferred_alive,
+                    (unsigned long long)diagnostics.reclaimed,
+                    (unsigned long)diagnostics.pending);
+            return 1;
+        }
+        usleep(10000);
+    }
+    PeakPthreadReclamationDiagnostics diagnostics;
+    get_diagnostics(&diagnostics);
+    fprintf(stderr,
+            "live deferral timeout: scans=%llu candidates=%llu deferred=%llu "
+            "reclaimed=%llu pending=%lu\n",
+            (unsigned long long)diagnostics.scans,
+            (unsigned long long)diagnostics.candidates_checked,
+            (unsigned long long)diagnostics.deferred_alive,
+            (unsigned long long)diagnostics.reclaimed,
+            (unsigned long)diagnostics.pending);
+    return 1;
+}
+
+static int
+run_detached_reclamation_regression(
+    CountFunction call_count,
+    DroppedFunction dropped_calls,
+    DroppedFunction dropped_threads,
+    ReclamationDiagnosticsFunction get_diagnostics)
+{
+#if defined(__linux__)
+    enum { DETACHED_ITERATIONS = 12 };
+    uint64_t expected_reclaimed = 0;
+    PeakPthreadReclamationDiagnostics initial_diagnostics;
+
+    if (get_diagnostics == NULL ||
+        mark_current_thread_final_destructor == NULL) {
+        fputs("missing detached reclamation test hooks\n", stderr);
         return 1;
     }
-    while (!atomic_load_explicit(&detached_worker_done, memory_order_acquire)) {
+    get_diagnostics(&initial_diagnostics);
+
+    for (int iteration = 0; iteration < DETACHED_ITERATIONS; iteration++) {
+        pthread_t detached;
+        pthread_attr_t attr;
+        pthread_attr_t* attr_pointer = NULL;
+        int destructor_count_before = atomic_load_explicit(
+            &user_destructor_calls, memory_order_relaxed);
+
+        atomic_store_explicit(&detached_worker_done, 0, memory_order_relaxed);
+        atomic_store_explicit(&detached_worker_release, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&detached_pending_ready, 0,
+                              memory_order_relaxed);
+        if (iteration % 3 == 0) {
+            if (pthread_attr_init(&attr) != 0 ||
+                pthread_attr_setdetachstate(&attr,
+                                            PTHREAD_CREATE_DETACHED) != 0) {
+                fputs("detached worker attribute setup failed\n", stderr);
+                return 1;
+            }
+            attr_pointer = &attr;
+        }
+        void* worker_argument = iteration == 0 ? (void*)2 :
+                                iteration == 1 ? (void*)1 : NULL;
+        if (pthread_create(&detached, attr_pointer, detached_worker,
+                           worker_argument) != 0) {
+            if (attr_pointer != NULL) {
+                (void)pthread_attr_destroy(&attr);
+            }
+            fputs("detached worker create failed\n", stderr);
+            return 1;
+        }
+        if (attr_pointer != NULL) {
+            (void)pthread_attr_destroy(&attr);
+        } else if (iteration % 3 == 1) {
+            if (iteration == 1) {
+                while (!atomic_load_explicit(&detached_worker_done,
+                                             memory_order_acquire)) {
+                    sched_yield();
+                }
+            }
+            if (pthread_detach(detached) != 0) {
+                fputs("running worker detach failed\n", stderr);
+                return 1;
+            }
+            if (iteration == 1) {
+                void* unexpected_result = NULL;
+                if (pthread_join(detached, &unexpected_result) == 0) {
+                    fputs("detached worker unexpectedly joined\n", stderr);
+                    return 1;
+                }
+                if (pthread_detach(detached) == 0) {
+                    fputs("failed detach changed detached state\n", stderr);
+                    return 1;
+                }
+            }
+            atomic_store_explicit(&detached_worker_release, 1,
+                                  memory_order_release);
+        }
+        while (!atomic_load_explicit(&detached_worker_done,
+                                     memory_order_acquire)) {
+            sched_yield();
+        }
+        if (iteration == 0) {
+            while (!atomic_load_explicit(&detached_pending_ready,
+                                         memory_order_acquire)) {
+                sched_yield();
+            }
+            if (wait_for_alive_detached_deferral(
+                    get_diagnostics, initial_diagnostics.deferred_alive,
+                    expected_reclaimed) != 0) {
+                fputs("live detached destructor slot was reclaimed\n", stderr);
+                return 1;
+            }
+            atomic_store_explicit(&detached_worker_release, 1,
+                                  memory_order_release);
+        }
+        if (iteration % 3 == 2) {
+            /* Exercise a successful detach after all four adversarial
+             * application TLS destructor passes have completed. */
+            while (atomic_load_explicit(&user_destructor_calls,
+                                        memory_order_acquire) <
+                   destructor_count_before + 4) {
+                sched_yield();
+            }
+            if (pthread_detach(detached) != 0) {
+                fputs("late detached worker detach failed\n", stderr);
+                return 1;
+            }
+        }
+        expected_reclaimed++;
+        if (wait_for_detached_reclamation(get_diagnostics,
+                                          expected_reclaimed) != 0) {
+            fputs("detached worker slot was not reclaimed\n", stderr);
+            return 1;
+        }
+    }
+
+    /* Cancellation runs all PEAK cleanup/destructor paths but has no join
+     * handoff once detach succeeds. It must reach the same conservative path. */
+    atomic_store_explicit(&cancel_target_entered, 0, memory_order_relaxed);
+    pthread_t canceled;
+    if (pthread_create(&canceled, NULL, cancel_worker, NULL) != 0) {
+        fputs("detached cancel worker create failed\n", stderr);
+        return 1;
+    }
+    while (!atomic_load_explicit(&cancel_target_entered,
+                                 memory_order_acquire)) {
         sched_yield();
     }
-    /* A detached thread has no join handoff. Its completed slot must remain
-     * quarantined, so the later user thread is explicitly dropped rather than
-     * reusing potentially live TLS-destructor state. */
-    if (!thread_is_tracked(detached) || remove_ambiguous == NULL ||
-        !remove_ambiguous(detached) || thread_is_tracked(detached)) {
-        fputs("untracked create did not clear ambiguous detached identity\n", stderr);
+    if (pthread_detach(canceled) != 0 || pthread_cancel(canceled) != 0) {
+        fputs("detached cancel worker setup failed\n", stderr);
         return 1;
     }
-    if (pthread_create(&later, NULL, one_call_worker, NULL) != 0 ||
-        pthread_join(later, NULL) != 0 || thread_is_tracked(later) ||
-        call_count(0) != 2 || dropped_calls() != 1 || dropped_threads() != 1) {
-        fputs("detached thread slot was reused or silently excluded\n", stderr);
+    expected_reclaimed++;
+    if (wait_for_detached_reclamation(get_diagnostics,
+                                      expected_reclaimed) != 0) {
+        fputs("canceled detached worker slot was not reclaimed\n", stderr);
+        return 1;
+    }
+
+    /* The successful-join fast path remains available after repeated reuse of
+     * the single non-main profiling slot. */
+    pthread_t joined;
+    if (pthread_create(&joined, NULL, one_call_worker, NULL) != 0 ||
+        pthread_join(joined, NULL) != 0 || thread_is_tracked(joined)) {
+        fputs("joined worker fast path regressed after detached reuse\n",
+              stderr);
+        return 1;
+    }
+
+    PeakPthreadReclamationDiagnostics diagnostics;
+    get_diagnostics(&diagnostics);
+    if (diagnostics.reclaimed != expected_reclaimed ||
+        diagnostics.pending != 0 || diagnostics.max_pending > 1 ||
+        diagnostics.scan_budget != 64 ||
+        diagnostics.scan_interval_ms != 100 ||
+        diagnostics.entries_examined >
+            diagnostics.scans * diagnostics.scan_budget ||
+        diagnostics.retire_failures != 0 || dropped_calls() != 0 ||
+        dropped_threads() != 0 ||
+        atomic_load_explicit(&destructor_tracking_failed,
+                             memory_order_acquire) != 0 ||
+        call_count(0) < 1 + DETACHED_ITERATIONS * 5 + 1) {
+        fprintf(stderr,
+                "detached reclamation mismatch: calls=%lu dropped=%llu/%llu "
+                "scans=%llu examined=%llu reclaimed=%llu pending=%lu "
+                "max_pending=%lu failures=%llu\n",
+                call_count(0), (unsigned long long)dropped_calls(),
+                (unsigned long long)dropped_threads(),
+                (unsigned long long)diagnostics.scans,
+                (unsigned long long)diagnostics.entries_examined,
+                (unsigned long long)diagnostics.reclaimed,
+                (unsigned long)diagnostics.pending,
+                (unsigned long)diagnostics.max_pending,
+                (unsigned long long)diagnostics.retire_failures);
         return 1;
     }
     puts("fastpath_thread_exit_ok");
     return 0;
+#else
+    (void)call_count;
+    (void)dropped_calls;
+    (void)dropped_threads;
+    (void)get_diagnostics;
+    puts("fastpath_thread_exit_ok");
+    return 0;
+#endif
 }
 
 static int
@@ -529,10 +758,10 @@ main(void)
         (StaleGenerationRemoveFunction)dlsym(
             RTLD_DEFAULT,
             "pthread_listener_test_stale_generation_remove_preserves_mapping");
-    RemoveAmbiguousMappingFunction remove_ambiguous =
-        (RemoveAmbiguousMappingFunction)dlsym(
+    ReclamationDiagnosticsFunction get_reclamation_diagnostics =
+        (ReclamationDiagnosticsFunction)dlsym(
             RTLD_DEFAULT,
-            "pthread_listener_test_untracked_create_removes_ambiguous_mapping");
+            "pthread_listener_get_reclamation_diagnostics");
     typedef void (*FailPublishFunction)(unsigned int);
     FailPublishFunction fail_slot_publish = (FailPublishFunction)dlsym(
         RTLD_DEFAULT, "pthread_listener_test_fail_slot_publish");
@@ -548,6 +777,9 @@ main(void)
     release_start_publication = (void (*)(void))dlsym(
         RTLD_DEFAULT,
         "pthread_listener_test_release_start_publication");
+    mark_current_thread_final_destructor = (int (*)(void))dlsym(
+        RTLD_DEFAULT,
+        "pthread_listener_test_mark_current_thread_final_destructor");
     if (call_count == NULL || thread_count == NULL || dropped_calls == NULL ||
         dropped_threads == NULL || thread_is_tracked == NULL) {
         fputs("missing accounting test hooks\n", stderr);
@@ -574,10 +806,10 @@ main(void)
     if (getenv("PEAK_TEST_RETIRED_DETACH_THRESHOLD") != NULL) {
         return run_retired_detach_threshold_regression();
     }
-    if (getenv("PEAK_TEST_DETACHED_QUARANTINE") != NULL) {
-        return run_detached_quarantine_regression(call_count, dropped_calls,
-                                                  dropped_threads,
-                                                  remove_ambiguous);
+    if (getenv("PEAK_TEST_DETACHED_RECLAMATION") != NULL) {
+        return run_detached_reclamation_regression(
+            call_count, dropped_calls, dropped_threads,
+            get_reclamation_diagnostics);
     }
     if (getenv("PEAK_TEST_HELPER_SILENT") != NULL) {
         return run_helper_silent_regression(call_count, dropped_calls,

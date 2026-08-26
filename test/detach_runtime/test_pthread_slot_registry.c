@@ -280,6 +280,140 @@ run_lifecycle_checks(void)
     return 0;
 }
 
+static int
+run_detached_reclamation_checks(void)
+{
+    PeakPthreadSlotToken late_detach_token;
+    PeakPthreadSlotToken detached_at_create_token;
+    PeakPthreadSlotToken reused_token;
+    PeakPthreadDetachedCandidate candidate;
+    pthread_t holder_threads[3];
+    KeyHolder holders[3] = {0};
+    bool became_exit_pending = false;
+    size_t entries_examined = 0;
+    size_t max_pending = 0;
+
+    for (int holder = 0; holder < 3; holder++) {
+        CHECK(pthread_create(&holder_threads[holder], NULL, key_holder,
+                             &holders[holder]) == 0);
+        CHECK(peak_pthread_slot_registry_wait_ready(
+                  &holders[holder].ready, HANDSHAKE_TIMEOUT_MS) ==
+              PEAK_PTHREAD_START_READY);
+    }
+
+    /* A thread that exits before pthread_detach remains quarantined until the
+     * successful late detach publishes the missing half of EXIT_PENDING. */
+    CHECK(peak_pthread_slot_registry_reserve_insert(
+        &registry, holder_threads[0], &late_detach_token));
+    CHECK(peak_pthread_slot_registry_mark_kernel_tid(
+        &registry, late_detach_token, 1001));
+    CHECK(peak_pthread_slot_registry_mark_final_destructor(
+        &registry, late_detach_token, &became_exit_pending));
+    CHECK(!became_exit_pending);
+    CHECK(peak_pthread_slot_registry_exit_pending_count(
+              &registry, &max_pending) == 0);
+    CHECK(!peak_pthread_slot_registry_mark_detached(
+        &registry, holder_threads[0], late_detach_token.generation + 1,
+        &became_exit_pending));
+    CHECK(!became_exit_pending);
+    CHECK(peak_pthread_slot_registry_mark_detached(
+        &registry, holder_threads[0], late_detach_token.generation,
+        &became_exit_pending));
+    CHECK(became_exit_pending);
+    CHECK(peak_pthread_slot_registry_exit_pending_count(
+              &registry, &max_pending) == 1);
+    CHECK(max_pending == 1);
+    CHECK(peak_pthread_slot_registry_snapshot_exit_pending(
+              &registry, &candidate, 1, &entries_examined) == 1);
+    CHECK(entries_examined == 1);
+    CHECK(candidate.token.slot == late_detach_token.slot);
+    CHECK(candidate.token.generation == late_detach_token.generation);
+    CHECK(candidate.kernel_tid == 1001);
+    PeakPthreadDetachedCandidate stale_candidate = candidate;
+
+    /* Retirement owns one generation before its physical slot is cleared.
+     * Capture/snapshot cannot hand the same generation to a competing join or
+     * controller pass, and a failed retire can restore pending eligibility. */
+    CHECK(peak_pthread_slot_registry_begin_retire(
+        &registry, late_detach_token));
+    CHECK(!peak_pthread_slot_registry_capture(
+        &registry, holder_threads[0], &reused_token));
+    CHECK(!peak_pthread_slot_registry_begin_retire(
+        &registry, late_detach_token));
+    CHECK(peak_pthread_slot_registry_snapshot_exit_pending(
+              &registry, &candidate, 4, &entries_examined) == 0);
+    CHECK(entries_examined == 4);
+    CHECK(peak_pthread_slot_registry_defer_retire(
+        &registry, late_detach_token));
+    CHECK(peak_pthread_slot_registry_capture(
+        &registry, holder_threads[0], &reused_token));
+    CHECK(reused_token.generation == late_detach_token.generation);
+    CHECK(peak_pthread_slot_registry_begin_retire(
+        &registry, late_detach_token));
+
+    /* A stale /proc candidate must not remove a replacement generation even
+     * when the physical slot and pthread_t are reused. */
+    CHECK(peak_pthread_slot_registry_complete_retire(
+        &registry, late_detach_token, true));
+    CHECK(peak_pthread_slot_registry_exit_pending_count(
+              &registry, NULL) == 0);
+    CHECK(peak_pthread_slot_registry_reserve_insert(
+        &registry, holder_threads[1], &reused_token));
+    CHECK(reused_token.slot == late_detach_token.slot);
+    CHECK(reused_token.generation != late_detach_token.generation);
+    CHECK(!peak_pthread_slot_registry_compare_remove_token(
+        &registry, stale_candidate.token, true));
+    CHECK(peak_pthread_slot_registry_contains(&registry, holder_threads[1]));
+    CHECK(peak_pthread_slot_registry_compare_remove_token(
+        &registry, reused_token, true));
+
+    /* Create-time detached state is recorded before the child's kernel TID
+     * and final destructor pass arrive. Only the complete triple is eligible. */
+    CHECK(peak_pthread_slot_registry_reserve_insert(
+        &registry, holder_threads[2], &detached_at_create_token));
+    CHECK(peak_pthread_slot_registry_mark_detached(
+        &registry, holder_threads[2], detached_at_create_token.generation,
+        &became_exit_pending));
+    CHECK(!became_exit_pending);
+    CHECK(peak_pthread_slot_registry_mark_kernel_tid(
+        &registry, detached_at_create_token, 1002));
+    CHECK(peak_pthread_slot_registry_exit_pending_count(
+              &registry, NULL) == 0);
+    CHECK(peak_pthread_slot_registry_mark_final_destructor(
+        &registry, detached_at_create_token, &became_exit_pending));
+    CHECK(became_exit_pending);
+
+    /* Every snapshot is bounded by its caller-supplied scan budget and the
+     * round-robin cursor eventually reaches the pending entry. */
+    bool found = false;
+    for (size_t scan = 0; scan < 4; scan++) {
+        size_t count = peak_pthread_slot_registry_snapshot_exit_pending(
+            &registry, &candidate, 1, &entries_examined);
+        CHECK(entries_examined == 1);
+        CHECK(count <= 1);
+        if (count == 1) {
+            CHECK(candidate.token.slot == detached_at_create_token.slot);
+            CHECK(candidate.token.generation ==
+                  detached_at_create_token.generation);
+            CHECK(candidate.kernel_tid == 1002);
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+    CHECK(peak_pthread_slot_registry_compare_remove_token(
+        &registry, detached_at_create_token, false));
+    CHECK(peak_pthread_slot_registry_exit_pending_count(
+              &registry, NULL) == 0);
+
+    for (int holder = 0; holder < 3; holder++) {
+        atomic_store_explicit(&holders[holder].release, 1,
+                              memory_order_release);
+        CHECK(pthread_join(holder_threads[holder], NULL) == 0);
+    }
+    return 0;
+}
+
 int
 main(void)
 {
@@ -291,6 +425,9 @@ main(void)
     peak_pthread_slot_registry_destroy(&registry);
     CHECK(peak_pthread_slot_registry_init(&registry, 4));
     CHECK(run_lifecycle_checks() == 0);
+    peak_pthread_slot_registry_destroy(&registry);
+    CHECK(peak_pthread_slot_registry_init(&registry, 4));
+    CHECK(run_detached_reclamation_checks() == 0);
     peak_pthread_slot_registry_destroy(&registry);
     puts("pthread_slot_registry_ok");
     return 0;

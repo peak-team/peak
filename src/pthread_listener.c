@@ -7,13 +7,22 @@
 #include "internal/signal_policy_internal.h"
 #include "utils/env_parser.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#if defined(__linux__)
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#endif
 #include <time.h>
 
 #define PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_ENV \
     "PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS"
 #define PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_DEFAULT 5000U
+#define PEAK_PTHREAD_RECLAIM_SCAN_BUDGET 64U
+#define PEAK_PTHREAD_RECLAIM_SCAN_INTERVAL_MS 100U
 
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
@@ -28,12 +37,18 @@ static gboolean tid_mapping_initialized = FALSE;
 static PeakPthreadSlotRegistry pthread_slot_registry;
 static gpointer pthread_create_hook_address;
 static gpointer pthread_join_hook_address;
+static gpointer pthread_detach_hook_address;
 extern pthread_t heartbeat_thread;
 extern gulong peak_max_num_threads;
 static unsigned int pthread_start_handshake_timeout_ms =
     PEAK_PTHREAD_START_HANDSHAKE_TIMEOUT_MS_DEFAULT;
 static PeakEnvWarningState pthread_start_timeout_config_warning;
 static _Atomic int pthread_start_timeout_warning_emitted;
+static int pthread_task_directory_fd = -1;
+static pthread_mutex_t pthread_reclaim_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct timespec pthread_reclaim_last_scan;
+static gboolean pthread_reclaim_last_scan_valid;
+static PeakPthreadReclamationDiagnostics pthread_reclaim_diagnostics;
 
 static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 static gboolean pthread_listener_insert_thread_unlocked(pthread_t tid);
@@ -111,11 +126,30 @@ typedef struct {
     void* start_arg;
     gboolean skip_tracking;
     gboolean tracked;
+    gboolean detached;
     size_t slot;
     uint64_t generation;
     _Atomic int handshake_state;
     _Atomic unsigned int references;
 } PeakPthreadStartContext;
+
+static pid_t
+pthread_listener_current_kernel_tid(void)
+{
+#if defined(__linux__) && defined(SYS_gettid)
+    return (pid_t)syscall(SYS_gettid);
+#else
+    return 0;
+#endif
+}
+
+static void
+pthread_listener_wake_reclaimer_if_pending(gboolean became_exit_pending)
+{
+    if (became_exit_pending) {
+        peak_general_listener_controller_wake();
+    }
+}
 
 static void
 peak_pthread_start_context_release(PeakPthreadStartContext* context)
@@ -177,8 +211,8 @@ peak_pthread_slot_destructor(void* data)
      * POSIX does not order key destructors.  Re-publish through all available
      * iterations so application destructors keep their slot.  Crucially, this
      * destructor never clears, retires, or reuses the slot: an implementation
-     * may run PEAK before an application key in its final iteration.  Only a
-     * successful pthread_join below proves all destructors have completed.
+     * may run PEAK before an application key in its final iteration. A join
+     * handoff or later Linux kernel-TID absence proof is still required.
      */
     identity->destructor_passes++;
 #ifdef PTHREAD_DESTRUCTOR_ITERATIONS
@@ -192,8 +226,20 @@ peak_pthread_slot_destructor(void* data)
 
     /* Do not remove or mark this map entry dead here.  POSIX may run an
      * application destructor after PEAK in this final iteration, and that
-     * destructor may still enter a target.  Successful pthread_join is the
-     * only proof that every destructor has finished. */
+     * destructor may still enter a target.  A detached slot becomes pending,
+     * but cannot be retired until the controller proves that its kernel TID
+     * has left /proc/self/task. */
+    if (tid_mapping_initialized) {
+        PeakPthreadSlotToken token = {
+            .slot = identity->slot,
+            .generation = identity->generation,
+        };
+        bool became_exit_pending = false;
+
+        (void)peak_pthread_slot_registry_mark_final_destructor(
+            &pthread_slot_registry, token, &became_exit_pending);
+        pthread_listener_wake_reclaimer_if_pending(became_exit_pending);
+    }
 }
 
 static void
@@ -233,6 +279,15 @@ peak_pthread_start(void* data)
                  * identity invalid so callbacks are explicitly counted as
                  * dropped rather than silently excluded. */
                 pthread_thread_excluded = FALSE;
+            } else if (tid_mapping_initialized) {
+                PeakPthreadSlotToken token = {
+                    .slot = context->slot,
+                    .generation = context->generation,
+                };
+                (void)peak_pthread_slot_registry_mark_kernel_tid(
+                    &pthread_slot_registry,
+                    token,
+                    pthread_listener_current_kernel_tid());
             }
         }
     } else {
@@ -317,6 +372,13 @@ pthread_listener_on_enter(GumInvocationListener* listener,
     start_context->start_arg = gum_invocation_context_get_nth_argument(ic, 3);
     start_context->skip_tracking =
         (tid == &heartbeat_thread) || pthread_next_create_is_helper;
+    const pthread_attr_t* attr =
+        gum_invocation_context_get_nth_argument(ic, 1);
+    int detach_state = PTHREAD_CREATE_JOINABLE;
+    start_context->detached =
+        attr != NULL &&
+        pthread_attr_getdetachstate(attr, &detach_state) == 0 &&
+        detach_state == PTHREAD_CREATE_DETACHED;
     atomic_init(&start_context->handshake_state,
                 PEAK_PTHREAD_START_PENDING);
     atomic_init(&start_context->references, 2);
@@ -358,13 +420,21 @@ pthread_listener_on_leave(GumInvocationListener* listener,
                     context->slot = token.slot;
                     context->generation = token.generation;
                     context->tracked = TRUE;
+                    if (context->detached) {
+                        (void)peak_pthread_slot_registry_mark_detached(
+                            &pthread_slot_registry,
+                            *thread_state->child_tid,
+                            context->generation,
+                            NULL);
+                    }
                 } else {
                     /* A detached/unjoined thread may have exited and its
                      * pthread_t can already be reused by this untracked
                      * child.  Delete the stale identity to ensure a later
                      * pthread_join cannot retire or recycle that old slot.
-                     * Deliberately do not queue its slot: without its join
-                     * handoff it remains permanently quarantined. */
+                     * Deliberately do not queue its slot: the stale identity
+                     * prevents a generation-safe kernel-TID proof, so the old
+                     * slot remains quarantined. */
                     (void)pthread_listener_quarantine_ambiguous_tid_unlocked(
                         *thread_state->child_tid);
                 }
@@ -416,6 +486,7 @@ pthread_listener_init(PthreadListener* self)
 }
 
 static int (*original_pthread_join)(pthread_t thread, void **retval);
+static int (*original_pthread_detach)(pthread_t thread);
 
 static gboolean
 pthread_listener_capture_thread_token(pthread_t thread,
@@ -446,15 +517,6 @@ pthread_listener_remove_thread_if_token_unlocked(pthread_t thread,
     }
 }
 
-static void
-pthread_listener_remove_thread_if_token(pthread_t thread,
-                                        uint64_t generation,
-                                        gboolean reusable)
-{
-    pthread_listener_remove_thread_if_token_unlocked(thread, generation,
-                                                      reusable);
-}
-
 static int
 peak_pthread_join(pthread_t thread, void **retval)
 {
@@ -464,12 +526,171 @@ peak_pthread_join(pthread_t thread, void **retval)
         pthread_listener_capture_thread_token(thread, &slot, &generation);
     int ret = original_pthread_join(thread, retval);
     if (ret == 0 && captured) {
-            /* pthread_join returning is the post-termination handoff: the
-             * joined thread and every TLS destructor are now complete. */
-        gboolean reusable = peak_general_listener_retire_current_thread_slot(slot);
-        pthread_listener_remove_thread_if_token(thread, generation, reusable);
+        PeakPthreadSlotToken token = {
+            .slot = slot,
+            .generation = generation,
+        };
+
+        /* pthread_join returning is the post-termination handoff: the joined
+         * thread and every TLS destructor are complete. Claim the generation
+         * before touching its physical slot so a detach/join race cannot
+         * release and reuse that slot underneath retirement. */
+        if (peak_pthread_slot_registry_begin_retire(&pthread_slot_registry,
+                                                    token)) {
+            gboolean reusable =
+                peak_general_listener_retire_current_thread_slot(slot);
+            (void)peak_pthread_slot_registry_complete_retire(
+                &pthread_slot_registry, token, reusable);
+        }
     }
     return ret;
+}
+
+static int
+peak_pthread_detach(pthread_t thread)
+{
+    PeakPthreadSlotToken token;
+    gboolean captured = tid_mapping_initialized &&
+        peak_pthread_slot_registry_capture(&pthread_slot_registry,
+                                            thread,
+                                            &token);
+    int ret = original_pthread_detach(thread);
+
+    if (ret == 0 && captured) {
+        bool became_exit_pending = false;
+
+        (void)peak_pthread_slot_registry_mark_detached(
+            &pthread_slot_registry,
+            thread,
+            token.generation,
+            &became_exit_pending);
+        pthread_listener_wake_reclaimer_if_pending(became_exit_pending);
+    }
+    return ret;
+}
+
+static gboolean
+pthread_listener_reclaim_interval_elapsed(const struct timespec* now)
+{
+    if (!pthread_reclaim_last_scan_valid) {
+        return TRUE;
+    }
+
+    int64_t elapsed_ns =
+        (int64_t)(now->tv_sec - pthread_reclaim_last_scan.tv_sec) *
+            1000000000LL +
+        (int64_t)(now->tv_nsec - pthread_reclaim_last_scan.tv_nsec);
+    return elapsed_ns >=
+        (int64_t)PEAK_PTHREAD_RECLAIM_SCAN_INTERVAL_MS * 1000000LL;
+}
+
+gboolean
+pthread_listener_reclaim_detached_slots(void)
+{
+#if defined(__linux__)
+    PeakPthreadDetachedCandidate
+        candidates[PEAK_PTHREAD_RECLAIM_SCAN_BUDGET];
+    struct timespec now;
+    size_t entries_examined = 0;
+    size_t candidate_count;
+    gboolean did_work = FALSE;
+
+    if (!tid_mapping_initialized || pthread_task_directory_fd < 0 ||
+        peak_pthread_slot_registry_exit_pending_count(
+            &pthread_slot_registry, NULL) == 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return FALSE;
+    }
+
+    (void)pthread_mutex_lock(&pthread_reclaim_mutex);
+    if (!pthread_listener_reclaim_interval_elapsed(&now)) {
+        (void)pthread_mutex_unlock(&pthread_reclaim_mutex);
+        return FALSE;
+    }
+    pthread_reclaim_last_scan = now;
+    pthread_reclaim_last_scan_valid = TRUE;
+    candidate_count = peak_pthread_slot_registry_snapshot_exit_pending(
+        &pthread_slot_registry,
+        candidates,
+        PEAK_PTHREAD_RECLAIM_SCAN_BUDGET,
+        &entries_examined);
+    pthread_reclaim_diagnostics.scans++;
+    pthread_reclaim_diagnostics.entries_examined += entries_examined;
+    pthread_reclaim_diagnostics.candidates_checked += candidate_count;
+
+    for (size_t index = 0; index < candidate_count; index++) {
+        char tid_name[32];
+        struct stat task_stat;
+        int written = snprintf(tid_name, sizeof(tid_name), "%ld",
+                               (long)candidates[index].kernel_tid);
+
+        if (written <= 0 || (size_t)written >= sizeof(tid_name)) {
+            pthread_reclaim_diagnostics.ambiguous_checks++;
+            continue;
+        }
+        errno = 0;
+        if (fstatat(pthread_task_directory_fd, tid_name, &task_stat,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            pthread_reclaim_diagnostics.deferred_alive++;
+            continue;
+        }
+        if (errno != ENOENT) {
+            pthread_reclaim_diagnostics.ambiguous_checks++;
+            continue;
+        }
+
+        if (!peak_pthread_slot_registry_begin_retire(
+                &pthread_slot_registry, candidates[index].token)) {
+            pthread_reclaim_diagnostics.ambiguous_checks++;
+            continue;
+        }
+        gboolean reusable = peak_general_listener_retire_current_thread_slot(
+            candidates[index].token.slot);
+        if (!reusable) {
+            pthread_reclaim_diagnostics.retire_failures++;
+            (void)peak_pthread_slot_registry_defer_retire(
+                &pthread_slot_registry, candidates[index].token);
+            continue;
+        }
+        if (peak_pthread_slot_registry_complete_retire(
+                &pthread_slot_registry, candidates[index].token, true)) {
+            pthread_reclaim_diagnostics.reclaimed++;
+            did_work = TRUE;
+        } else {
+            pthread_reclaim_diagnostics.ambiguous_checks++;
+        }
+    }
+
+    pthread_reclaim_diagnostics.pending =
+        peak_pthread_slot_registry_exit_pending_count(
+            &pthread_slot_registry,
+            &pthread_reclaim_diagnostics.max_pending);
+    (void)pthread_mutex_unlock(&pthread_reclaim_mutex);
+    return did_work;
+#else
+    return FALSE;
+#endif
+}
+
+void
+pthread_listener_get_reclamation_diagnostics(
+    PeakPthreadReclamationDiagnostics* diagnostics)
+{
+    if (diagnostics == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&pthread_reclaim_mutex);
+    pthread_reclaim_diagnostics.pending =
+        peak_pthread_slot_registry_exit_pending_count(
+            &pthread_slot_registry,
+            &pthread_reclaim_diagnostics.max_pending);
+    pthread_reclaim_diagnostics.scan_budget =
+        PEAK_PTHREAD_RECLAIM_SCAN_BUDGET;
+    pthread_reclaim_diagnostics.scan_interval_ms =
+        PEAK_PTHREAD_RECLAIM_SCAN_INTERVAL_MS;
+    *diagnostics = pthread_reclaim_diagnostics;
+    (void)pthread_mutex_unlock(&pthread_reclaim_mutex);
 }
 
 void pthread_listener_attach()
@@ -518,7 +739,23 @@ void pthread_listener_attach()
                                     (gpointer*)(&original_pthread_join),
                                     NULL);
     }
+    pthread_detach_hook_address =
+        peak_general_listener_find_function("pthread_detach");
+    if (pthread_detach_hook_address) {
+        gum_interceptor_replace_fast(pthread_create_interceptor,
+                                    pthread_detach_hook_address,
+                                    &peak_pthread_detach,
+                                    (gpointer*)(&original_pthread_detach),
+                                    NULL);
+    }
     gum_interceptor_end_transaction(pthread_create_interceptor);
+
+#if defined(__linux__)
+    if (pthread_task_directory_fd < 0) {
+        pthread_task_directory_fd = open("/proc/self/task",
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    }
+#endif
 }
 
 static gboolean
@@ -540,11 +777,40 @@ pthread_listener_flush_teardown(void)
     return gum_interceptor_flush(pthread_create_interceptor);
 }
 
+static void
+pthread_listener_log_reclamation_diagnostics(void)
+{
+    PeakPthreadReclamationDiagnostics diagnostics;
+
+    pthread_listener_get_reclamation_diagnostics(&diagnostics);
+    if (diagnostics.scans == 0 && diagnostics.pending == 0) {
+        return;
+    }
+    peak_log_info(
+        "[peak] detached thread slot reclamation: scans=%llu "
+        "entries_examined=%llu candidates=%llu reclaimed=%llu "
+        "deferred_alive=%llu ambiguous=%llu retire_failures=%llu "
+        "pending=%lu max_pending=%lu budget=%u interval_ms=%u\n",
+        (unsigned long long)diagnostics.scans,
+        (unsigned long long)diagnostics.entries_examined,
+        (unsigned long long)diagnostics.candidates_checked,
+        (unsigned long long)diagnostics.reclaimed,
+        (unsigned long long)diagnostics.deferred_alive,
+        (unsigned long long)diagnostics.ambiguous_checks,
+        (unsigned long long)diagnostics.retire_failures,
+        (unsigned long)diagnostics.pending,
+        (unsigned long)diagnostics.max_pending,
+        diagnostics.scan_budget,
+        diagnostics.scan_interval_ms);
+}
+
 gboolean pthread_listener_dettach()
 {
     if (pthread_create_interceptor == NULL) {
         return TRUE;
     }
+
+    pthread_listener_log_reclamation_diagnostics();
 
     gum_interceptor_begin_transaction(pthread_create_interceptor);
     if (pthread_create_listener != NULL) {
@@ -552,6 +818,10 @@ gboolean pthread_listener_dettach()
     }
     if (pthread_join_hook_address != NULL) {
         gum_interceptor_revert(pthread_create_interceptor, pthread_join_hook_address);
+    }
+    if (pthread_detach_hook_address != NULL) {
+        gum_interceptor_revert(pthread_create_interceptor,
+                               pthread_detach_hook_address);
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
 
@@ -576,6 +846,7 @@ gboolean pthread_listener_dettach()
     pthread_create_interceptor = NULL;
     pthread_create_hook_address = NULL;
     pthread_join_hook_address = NULL;
+    pthread_detach_hook_address = NULL;
 
     return TRUE;
 }
@@ -718,6 +989,24 @@ int
 pthread_listener_test_current_thread_has_slot(void)
 {
     return pthread_slot_identity.valid ? 1 : 0;
+}
+
+PEAK_API int
+pthread_listener_test_mark_current_thread_final_destructor(void)
+{
+    bool became_exit_pending = false;
+
+    if (!tid_mapping_initialized || !pthread_slot_identity.valid) {
+        return 0;
+    }
+    PeakPthreadSlotToken token = {
+        .slot = pthread_slot_identity.slot,
+        .generation = pthread_slot_identity.generation,
+    };
+    int marked = peak_pthread_slot_registry_mark_final_destructor(
+        &pthread_slot_registry, token, &became_exit_pending);
+    pthread_listener_wake_reclaimer_if_pending(became_exit_pending);
+    return marked;
 }
 #endif
 

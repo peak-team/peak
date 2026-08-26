@@ -9,6 +9,8 @@
 #include "frida-gum.h"
 
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -34,11 +36,26 @@ struct _PthreadListener {
  */
 typedef struct _PthreadState PthreadState;
 
+typedef struct {
+    uint64_t scans;
+    uint64_t entries_examined;
+    uint64_t candidates_checked;
+    uint64_t reclaimed;
+    uint64_t deferred_alive;
+    uint64_t ambiguous_checks;
+    uint64_t retire_failures;
+    size_t pending;
+    size_t max_pending;
+    unsigned int scan_budget;
+    unsigned int scan_interval_ms;
+} PeakPthreadReclamationDiagnostics;
+
 /**
  * Tracks the child ID argument and wrapper context until pthread_create
- * returns.  Only successful joins release slots for reuse; detached or
- * otherwise unjoined threads retain quarantined slots because POSIX does not
- * provide a post-destructor notification with a safe ordering guarantee.
+ * returns. Successful joins release slots immediately. On Linux, detached
+ * slots become reusable only after PEAK's final TLS-destructor pass and a
+ * slow-path proof that the original kernel TID is absent from /proc/self/task.
+ * Ambiguous or unsupported cases remain quarantined.
  */
 struct _PthreadState {
     pthread_t* child_tid;
@@ -50,9 +67,11 @@ struct _PthreadState {
  * @brief Attaches pthread creation/join hooks and starts thread-ID tracking.
  *
  * The function initializes the thread-ID map, registers the main thread, and
- * installs Gum hooks for pthread_create and pthread_join. Created threads
+ * installs Gum hooks for pthread_create, pthread_join, and pthread_detach.
+ * Created threads
  * receive compact PEAK IDs when their wrapped start routine begins; IDs are
- * reused only after a successful join. The hooks are removed by
+ * are reused after a successful join or conservative Linux detached-thread
+ * exit proof. The hooks are removed by
  * pthread_listener_dettach(), but the mapping remains available because
  * wrapped start routines may finish after interception has stopped.
  */
@@ -92,6 +111,13 @@ PEAK_PTHREAD_LISTENER_API void pthread_listener_mark_next_created_thread_helper(
 /** Returns TRUE for a PEAK helper thread that must silently bypass accounting. */
 gboolean pthread_listener_current_thread_excluded(void);
 
+/** Runs one bounded Linux detached-thread reclamation pass on a slow path. */
+gboolean pthread_listener_reclaim_detached_slots(void);
+
+/** Copies detached-thread reclamation counters and configured scan bounds. */
+PEAK_PTHREAD_LISTENER_API void pthread_listener_get_reclamation_diagnostics(
+    PeakPthreadReclamationDiagnostics* diagnostics);
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 void pthread_listener_test_fail_slot_publish(unsigned int count);
 void pthread_listener_test_clear_current_thread_slot(void);
@@ -106,6 +132,8 @@ PEAK_PTHREAD_LISTENER_API void
 pthread_listener_test_release_start_publication(void);
 PEAK_PTHREAD_LISTENER_API int
 pthread_listener_test_current_thread_has_slot(void);
+PEAK_PTHREAD_LISTENER_API int
+pthread_listener_test_mark_current_thread_final_destructor(void);
 #endif
 
 /**
