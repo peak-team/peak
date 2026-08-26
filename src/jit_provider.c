@@ -1052,6 +1052,7 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
     unsigned long budget = peak_jit_drain_record_budget();
     gboolean single_budget = budget == 1;
     gboolean metadata_consumed = FALSE;
+    gboolean source_reset_pending = FALSE;
     struct stat st;
 
     if (peak_jit_perfmap_path == NULL) {
@@ -1268,16 +1269,25 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
         peak_jit_test_wait_before_final_stat();
     }
 #endif
-    if (fstat(fileno(fp), &st) == 0) {
-        if (peak_jit_perfmap_identity_known &&
-            st.st_dev == peak_jit_perfmap_dev &&
-            st.st_ino == peak_jit_perfmap_ino &&
+    if (stat(peak_jit_perfmap_path, &st) == 0) {
+        gboolean source_replaced =
+            peak_jit_perfmap_identity_known &&
+            (st.st_dev != peak_jit_perfmap_dev ||
+             st.st_ino != peak_jit_perfmap_ino);
+        gboolean source_truncated =
+            peak_jit_perfmap_identity_known && !source_replaced &&
             (peak_jit_perfmap_offset > st.st_size ||
-             st.st_size < peak_jit_perfmap_last_size)) {
+             st.st_size < peak_jit_perfmap_last_size);
+        if (source_replaced || source_truncated) {
             peak_jit_perfmap_offset = 0;
             peak_jit_provider_advance_generation(
-                "source-truncated-during-drain");
+                source_replaced ? "source-replaced-during-drain" :
+                                  "source-truncated-during-drain");
+            source_reset_pending = TRUE;
         }
+        peak_jit_perfmap_identity_known = TRUE;
+        peak_jit_perfmap_dev = st.st_dev;
+        peak_jit_perfmap_ino = st.st_ino;
         peak_jit_perfmap_last_size = st.st_size;
     }
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -1298,7 +1308,8 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
             peak_jit_single_budget_retry_turn = FALSE;
         }
     }
-    return pending || peak_jit_pending_record_count != 0;
+    return source_reset_pending || pending ||
+           peak_jit_pending_record_count != 0;
 }
 
 void

@@ -289,7 +289,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
             truncated-generation
             truncated-during-drain-generation
             replaced-generation
-            pending-replaced-generation)
+            pending-replaced-generation
+            pending-replaced-during-drain
+            shutdown-truncate-rewrite)
         string(REPLACE "-" "_" jit_bounded_suffix "${jit_bounded_mode}")
         add_test(NAME test_jit_profiling_mmap_perfmap_${jit_bounded_suffix}
             COMMAND ${Python3_EXECUTABLE}

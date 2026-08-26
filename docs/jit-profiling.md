@@ -180,7 +180,10 @@ unload, or move events with reattach.
 The provider processes the perf-map file as append-only metadata and remembers
 the last drained offset. An observed size regression or inode replacement
 increments the provider generation, resets the offset and pending retries, and
-treats a repeated address/name as a new metadata lifetime. A same-inode
+treats a repeated address/name as a new metadata lifetime. The source check is
+repeated against the current pathname before post-read retries;
+an observed reset schedules another drain so rewritten metadata is not lost at
+shutdown. A same-inode
 truncate-and-rewrite that completes between observations without exposing a
 smaller size is indistinguishable from an append without rescanning unbounded
 history, so it is outside this bounded perf-map contract. Runtimes requiring an

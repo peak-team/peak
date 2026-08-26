@@ -91,6 +91,10 @@ def mode_flag(mode):
         return "--with-replaced-generation"
     if mode == "pending-replaced-generation":
         return "--with-pending-replaced-generation"
+    if mode == "pending-replaced-during-drain":
+        return "--with-pending-replaced-during-drain"
+    if mode == "shutdown-truncate-rewrite":
+        return "--with-shutdown-truncate-rewrite"
     if mode == "attach-retry-timeout":
         return "--with-perf-map"
     if mode == "negative":
@@ -135,6 +139,8 @@ def expects_attached_record(mode):
         "truncated-during-drain-generation",
         "replaced-generation",
         "pending-replaced-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
     )
 
 
@@ -161,6 +167,7 @@ def expects_positive_count(mode):
         "truncated-during-drain-generation",
         "replaced-generation",
         "pending-replaced-generation",
+        "pending-replaced-during-drain",
     )
 
 
@@ -305,7 +312,11 @@ def run_one(args, tmpdir, mode):
     map_path = os.path.join(tmpdir, f"perf-{mode}.map")
     trace_path = os.path.join(tmpdir, f"jit-{mode}-trace.csv")
     extra_env = extra_env_for_mode(mode)
-    if mode == "truncated-during-drain-generation":
+    if mode in (
+        "truncated-during-drain-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
+    ):
         extra_env = dict(extra_env)
         extra_env["PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"] = os.path.join(
             tmpdir, "pre-final-stat.barrier"
@@ -325,7 +336,7 @@ def run_one(args, tmpdir, mode):
         "--iterations",
         str(args.iterations),
         "--metadata-sleep-us",
-        "0" if mode in ("final-drain", "final-drain-retry", "final-drain-stale-then-valid") else str(args.metadata_sleep_us),
+        "0" if mode in ("final-drain", "final-drain-retry", "final-drain-stale-then-valid", "shutdown-truncate-rewrite") else str(args.metadata_sleep_us),
         "--symbol",
         metadata_symbol(mode),
     ]
@@ -464,6 +475,42 @@ def run_one(args, tmpdir, mode):
                     f"{mode} did not process the repeated address/name "
                     f"as a new provider lifetime\nrows={trace_rows}\ntrace={trace}"
                 )
+        if mode == "pending-replaced-during-drain":
+            retry_records = trace_rows_with_result(
+                trace_rows, "not-executable-retry"
+            )
+            if not retry_records or retry_records[0][4] == attached_records[0][4]:
+                raise AssertionError(
+                    "replacement during final validation attached the stale "
+                    f"generation address\nrows={trace_rows}\ntrace={trace}"
+                )
+        if mode == "shutdown-truncate-rewrite":
+            reset_rows = [
+                row
+                for row in trace_rows
+                if len(row) >= 7
+                and row[1] == "provider-generation"
+                and row[6] == "source-truncated-during-drain"
+            ]
+            generation_two_results = [
+                row
+                for row in trace_rows
+                if len(row) >= 8
+                and row[1] == "perfmap-record"
+                and row[3] == JIT_SYMBOL
+                and row[7] == "2"
+                and row[6] in ("attached", "generation-refreshed")
+            ]
+            if (
+                len(reset_rows) != 1
+                or len(generation_two_results) != 1
+                or trace_rows.index(reset_rows[0])
+                >= trace_rows.index(generation_two_results[0])
+            ):
+                raise AssertionError(
+                    "shutdown source reset did not trigger a second drain of "
+                    f"the rewritten metadata\nrows={trace_rows}\ntrace={trace}"
+                )
     if mode == "attach-retry-timeout":
         trace, trace_rows = read_trace(trace_path)
         if trace_has_result(trace_rows, "attached") or not trace_has_result(
@@ -526,6 +573,8 @@ def run_one(args, tmpdir, mode):
         "truncated-during-drain-generation",
         "replaced-generation",
         "pending-replaced-generation",
+        "pending-replaced-during-drain",
+        "shutdown-truncate-rewrite",
     ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
         raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
@@ -595,6 +644,8 @@ def main():
             "truncated-during-drain-generation",
             "replaced-generation",
             "pending-replaced-generation",
+            "pending-replaced-during-drain",
+            "shutdown-truncate-rewrite",
             "pending-timeout-backlog",
         ),
         default="both",
