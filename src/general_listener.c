@@ -4452,6 +4452,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     for (;;) {
         gboolean pending;
 
+        (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
                                                                tid_keys,
@@ -4527,6 +4528,7 @@ peak_general_controller_thread_main(void* arg)
             atomic_load_explicit(&general_controller_wake_sequence,
                                  memory_order_acquire);
 
+        (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
                                                                tid_keys,

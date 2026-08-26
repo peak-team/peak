@@ -53,6 +53,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 add_executable(test_fastpath_thread_exit test_fastpath_thread_exit.c)
+target_include_directories(test_fastpath_thread_exit
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${FRIDA_GUM_INCLUDE_DIRS}
+)
 target_link_libraries(test_fastpath_thread_exit
     PRIVATE Threads::Threads ${DL_LIBRARY})
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")

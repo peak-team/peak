@@ -62,14 +62,14 @@ EXPECTED = {
         "attach": 1,
         "begin_transaction": 1,
         "end_transaction": 1,
-        "replace_fast": 1,
+        "replace_fast": 2,
     },
     ("support-shutdown-debt", "src/pthread_listener.c"): {
         "begin_transaction": 1,
         "detach": 1,
         "end_transaction": 1,
         "flush": 2,
-        "revert": 1,
+        "revert": 2,
     },
     ("support-init", "src/cuda_interceptor.cpp"): {
         "begin_transaction": 1,

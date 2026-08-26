@@ -139,6 +139,68 @@ peak_pthread_slot_registry_find_unlocked(PeakPthreadSlotRegistry* registry,
     return NULL;
 }
 
+static PeakPthreadSlotRegistryEntry*
+peak_pthread_slot_registry_find_token_unlocked(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token)
+{
+    if (token.slot >= registry->capacity) {
+        return NULL;
+    }
+
+    PeakPthreadSlotRegistryEntry* entry = &registry->entries[token.slot];
+    if (!entry->occupied || entry->token.generation != token.generation) {
+        return NULL;
+    }
+    return entry;
+}
+
+static void
+peak_pthread_slot_registry_discard_unlocked(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotRegistryEntry* entry)
+{
+    if (entry->exit_pending && registry->exit_pending_count != 0) {
+        registry->exit_pending_count--;
+    }
+    entry->occupied = false;
+    entry->detached = false;
+    entry->final_destructor_pass = false;
+    entry->exit_pending = false;
+    entry->retiring = false;
+    entry->kernel_tid = 0;
+}
+
+static bool
+peak_pthread_slot_registry_update_exit_pending_unlocked(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotRegistryEntry* entry)
+{
+    if (entry->exit_pending || entry->retiring || !entry->detached ||
+        !entry->final_destructor_pass || entry->kernel_tid <= 0) {
+        return false;
+    }
+
+    entry->exit_pending = true;
+    registry->exit_pending_count++;
+    if (registry->exit_pending_count > registry->max_exit_pending_count) {
+        registry->max_exit_pending_count = registry->exit_pending_count;
+    }
+    return true;
+}
+
+static void
+peak_pthread_slot_registry_enqueue_reusable_unlocked(
+    PeakPthreadSlotRegistry* registry,
+    size_t slot)
+{
+    size_t reusable_tail =
+        (registry->reusable_head + registry->reusable_count) %
+        registry->capacity;
+    registry->reusable[reusable_tail] = slot;
+    registry->reusable_count++;
+}
+
 bool
 peak_pthread_slot_registry_init(PeakPthreadSlotRegistry* registry,
                                 size_t capacity)
@@ -192,16 +254,17 @@ peak_pthread_slot_registry_reserve_insert(PeakPthreadSlotRegistry* registry,
         /* A newly created thread can receive a pthread_t held by an unjoined
          * predecessor. Drop that ambiguous mapping, but never recycle it. */
         if (old_entry != NULL) {
-            old_entry->occupied = false;
+            peak_pthread_slot_registry_discard_unlocked(registry, old_entry);
         }
         (void)pthread_mutex_unlock(&registry->mutex);
         return false;
     }
 
     if (old_entry != NULL) {
-        old_entry->occupied = false;
+        peak_pthread_slot_registry_discard_unlocked(registry, old_entry);
     }
     PeakPthreadSlotRegistryEntry* entry = &registry->entries[slot];
+    memset(entry, 0, sizeof(*entry));
     entry->tid = tid;
     entry->token.slot = slot;
     entry->token.generation = ++registry->next_generation;
@@ -227,8 +290,10 @@ peak_pthread_slot_registry_capture(PeakPthreadSlotRegistry* registry,
 
     (void)pthread_mutex_lock(&registry->mutex);
     entry = peak_pthread_slot_registry_find_unlocked(registry, tid);
-    if (entry != NULL) {
+    if (entry != NULL && !entry->retiring) {
         *token = entry->token;
+    } else {
+        entry = NULL;
     }
     (void)pthread_mutex_unlock(&registry->mutex);
     return entry != NULL;
@@ -248,19 +313,271 @@ peak_pthread_slot_registry_compare_remove(PeakPthreadSlotRegistry* registry,
 
     (void)pthread_mutex_lock(&registry->mutex);
     entry = peak_pthread_slot_registry_find_unlocked(registry, tid);
-    if (entry == NULL || entry->token.generation != generation) {
+    if (entry == NULL || entry->retiring ||
+        entry->token.generation != generation) {
         (void)pthread_mutex_unlock(&registry->mutex);
         return false;
     }
     if (reusable) {
-        size_t reusable_tail =
-            (registry->reusable_head + registry->reusable_count) % registry->capacity;
-        registry->reusable[reusable_tail] = entry->token.slot;
-        registry->reusable_count++;
+        peak_pthread_slot_registry_enqueue_reusable_unlocked(
+            registry, entry->token.slot);
     }
-    entry->occupied = false;
+    peak_pthread_slot_registry_discard_unlocked(registry, entry);
     (void)pthread_mutex_unlock(&registry->mutex);
     return true;
+}
+
+bool
+peak_pthread_slot_registry_compare_remove_token(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token,
+    bool reusable)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry == NULL || entry->retiring) {
+        (void)pthread_mutex_unlock(&registry->mutex);
+        return false;
+    }
+    if (reusable) {
+        peak_pthread_slot_registry_enqueue_reusable_unlocked(
+            registry, entry->token.slot);
+    }
+    peak_pthread_slot_registry_discard_unlocked(registry, entry);
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return true;
+}
+
+bool
+peak_pthread_slot_registry_begin_retire(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry == NULL || entry->retiring) {
+        (void)pthread_mutex_unlock(&registry->mutex);
+        return false;
+    }
+    entry->retiring = true;
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return true;
+}
+
+bool
+peak_pthread_slot_registry_complete_retire(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token,
+    bool reusable)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry == NULL || !entry->retiring) {
+        (void)pthread_mutex_unlock(&registry->mutex);
+        return false;
+    }
+    if (reusable) {
+        peak_pthread_slot_registry_enqueue_reusable_unlocked(
+            registry, entry->token.slot);
+    }
+    peak_pthread_slot_registry_discard_unlocked(registry, entry);
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return true;
+}
+
+bool
+peak_pthread_slot_registry_defer_retire(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry == NULL || !entry->retiring) {
+        (void)pthread_mutex_unlock(&registry->mutex);
+        return false;
+    }
+    entry->retiring = false;
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return true;
+}
+
+bool
+peak_pthread_slot_registry_mark_kernel_tid(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token,
+    pid_t kernel_tid)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+    bool became_exit_pending = false;
+
+    if (registry == NULL || !registry->initialized || kernel_tid <= 0) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry != NULL) {
+        entry->kernel_tid = kernel_tid;
+        became_exit_pending =
+            peak_pthread_slot_registry_update_exit_pending_unlocked(
+                registry, entry);
+    }
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return entry != NULL || became_exit_pending;
+}
+
+bool
+peak_pthread_slot_registry_mark_detached(
+    PeakPthreadSlotRegistry* registry,
+    pthread_t tid,
+    uint64_t generation,
+    bool* became_exit_pending)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+    bool became_pending = false;
+
+    if (became_exit_pending != NULL) {
+        *became_exit_pending = false;
+    }
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_unlocked(registry, tid);
+    if (entry != NULL && entry->token.generation == generation) {
+        entry->detached = true;
+        became_pending =
+            peak_pthread_slot_registry_update_exit_pending_unlocked(
+                registry, entry);
+    } else {
+        entry = NULL;
+    }
+    (void)pthread_mutex_unlock(&registry->mutex);
+    if (became_exit_pending != NULL) {
+        *became_exit_pending = became_pending;
+    }
+    return entry != NULL;
+}
+
+bool
+peak_pthread_slot_registry_mark_final_destructor(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadSlotToken token,
+    bool* became_exit_pending)
+{
+    PeakPthreadSlotRegistryEntry* entry;
+    bool became_pending = false;
+
+    if (became_exit_pending != NULL) {
+        *became_exit_pending = false;
+    }
+    if (registry == NULL || !registry->initialized) {
+        return false;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    entry = peak_pthread_slot_registry_find_token_unlocked(registry, token);
+    if (entry != NULL) {
+        entry->final_destructor_pass = true;
+        became_pending =
+            peak_pthread_slot_registry_update_exit_pending_unlocked(
+                registry, entry);
+    }
+    (void)pthread_mutex_unlock(&registry->mutex);
+    if (became_exit_pending != NULL) {
+        *became_exit_pending = became_pending;
+    }
+    return entry != NULL;
+}
+
+size_t
+peak_pthread_slot_registry_snapshot_exit_pending(
+    PeakPthreadSlotRegistry* registry,
+    PeakPthreadDetachedCandidate* candidates,
+    size_t budget,
+    size_t* entries_examined)
+{
+    size_t count = 0;
+    size_t examined = 0;
+
+    if (entries_examined != NULL) {
+        *entries_examined = 0;
+    }
+    if (registry == NULL || !registry->initialized || candidates == NULL ||
+        budget == 0 || registry->capacity == 0) {
+        return 0;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    size_t limit = budget < registry->capacity ? budget : registry->capacity;
+    while (examined < limit) {
+        size_t index = (registry->reclaim_cursor + examined) %
+                       registry->capacity;
+        PeakPthreadSlotRegistryEntry* entry = &registry->entries[index];
+
+        if (entry->occupied && entry->exit_pending && !entry->retiring) {
+            candidates[count].token = entry->token;
+            candidates[count].kernel_tid = entry->kernel_tid;
+            count++;
+        }
+        examined++;
+    }
+    registry->reclaim_cursor =
+        (registry->reclaim_cursor + examined) % registry->capacity;
+    (void)pthread_mutex_unlock(&registry->mutex);
+
+    if (entries_examined != NULL) {
+        *entries_examined = examined;
+    }
+    return count;
+}
+
+size_t
+peak_pthread_slot_registry_exit_pending_count(
+    PeakPthreadSlotRegistry* registry,
+    size_t* max_count)
+{
+    size_t count = 0;
+
+    if (max_count != NULL) {
+        *max_count = 0;
+    }
+    if (registry == NULL || !registry->initialized) {
+        return 0;
+    }
+
+    (void)pthread_mutex_lock(&registry->mutex);
+    count = registry->exit_pending_count;
+    if (max_count != NULL) {
+        *max_count = registry->max_exit_pending_count;
+    }
+    (void)pthread_mutex_unlock(&registry->mutex);
+    return count;
 }
 
 bool
@@ -276,7 +593,7 @@ peak_pthread_slot_registry_quarantine(PeakPthreadSlotRegistry* registry,
     (void)pthread_mutex_lock(&registry->mutex);
     entry = peak_pthread_slot_registry_find_unlocked(registry, tid);
     if (entry != NULL) {
-        entry->occupied = false;
+        peak_pthread_slot_registry_discard_unlocked(registry, entry);
     }
     (void)pthread_mutex_unlock(&registry->mutex);
     return entry != NULL;
