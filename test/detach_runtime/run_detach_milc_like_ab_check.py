@@ -29,6 +29,13 @@ STATS_CSV_FIELDS = (
     "overhead_s",
     "dropped_calls",
     "dropped_threads",
+    "jit_pending_queue_full",
+    "jit_non_executable_timeout",
+    "jit_attach_retry_timeout",
+    "jit_allocation_failure",
+    "jit_provider_generation",
+    "jit_pending_count",
+    "jit_pending_high_water",
     "capability_requested",
     "capability_compiled",
     "capability_active",
@@ -47,7 +54,8 @@ PEAK_STATS_NAME_RE = re.compile(
 )
 STATS_CSV_METRIC_FIELDS = STATS_CSV_FIELDS[4:11]
 STATS_CSV_DIAGNOSTIC_FIELDS = ("dropped_calls", "dropped_threads")
-STATS_CSV_CAPABILITY_FIELDS = STATS_CSV_FIELDS[13:]
+STATS_CSV_JIT_FIELDS = STATS_CSV_FIELDS[13:20]
+STATS_CSV_CAPABILITY_FIELDS = STATS_CSV_FIELDS[20:]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
 CAPABILITY_METADATA_FUNCTION_RE = re.compile(
     r"^PEAK_CAPABILITY_[a-z-]+$"
@@ -957,6 +965,11 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
                     raise AssertionError(
                         f"invalid metadata metric {field}: {row}"
                     ) from exc
+            for field in STATS_CSV_JIT_FIELDS:
+                if row[field] != "0":
+                    raise AssertionError(
+                        f"nonzero capability JIT diagnostic {field}: {row}"
+                    )
             for field in STATS_CSV_CAPABILITY_FIELDS:
                 if not re.fullmatch(r"[0-9]+", row[field]):
                     raise AssertionError(
@@ -981,6 +994,11 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
                 if not re.fullmatch(r"[0-9]+", row[field]):
                     raise AssertionError(
                         f"invalid accounting diagnostic {field}: {row}"
+                    )
+            for field in STATS_CSV_JIT_FIELDS:
+                if row[field] != "0":
+                    raise AssertionError(
+                        f"nonzero accounting JIT diagnostic {field}: {row}"
                     )
             diagnostics = tuple(
                 int(row[field]) for field in STATS_CSV_DIAGNOSTIC_FIELDS
@@ -1026,6 +1044,11 @@ def validated_profiled_stats_rows(handle, allowed_targets, rank_count=1):
             if not re.fullmatch(r"[0-9]+", row[field]):
                 raise AssertionError(
                     f"invalid accounting diagnostic {field}: {row}"
+                )
+        for field in STATS_CSV_JIT_FIELDS:
+            if row[field] != "0":
+                raise AssertionError(
+                    f"nonzero target JIT diagnostic {field}: {row}"
                 )
         row_diagnostics = tuple(
             int(row[field]) for field in STATS_CSV_DIAGNOSTIC_FIELDS

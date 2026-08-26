@@ -275,9 +275,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 
     foreach(jit_bounded_mode IN ITEMS
             bounded-queue
+            pending-round-robin
             allocation-failure
             attach-retry-timeout
             truncated-generation
+            truncated-larger-generation
             replaced-generation)
         string(REPLACE "-" "_" jit_bounded_suffix "${jit_bounded_mode}")
         add_test(NAME test_jit_profiling_mmap_perfmap_${jit_bounded_suffix}

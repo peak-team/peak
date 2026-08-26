@@ -79,8 +79,12 @@ def mode_flag(mode):
         return "--with-overlong-then-valid"
     if mode in ("bounded-queue", "allocation-failure", "shutdown-full-queue"):
         return "--with-bounded-queue-then-valid"
+    if mode == "pending-round-robin":
+        return "--with-pending-round-robin"
     if mode == "truncated-generation":
         return "--with-truncated-generation"
+    if mode == "truncated-larger-generation":
+        return "--with-truncated-larger-generation"
     if mode == "replaced-generation":
         return "--with-replaced-generation"
     if mode == "attach-retry-timeout":
@@ -120,9 +124,11 @@ def expects_attached_record(mode):
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
         "bounded-queue",
+        "pending-round-robin",
         "allocation-failure",
         "shutdown-full-queue",
         "truncated-generation",
+        "truncated-larger-generation",
         "replaced-generation",
     )
 
@@ -144,8 +150,10 @@ def expects_positive_count(mode):
         "v8-lazycompile-optimized",
         "two-generations-heartbeat",
         "bounded-queue",
+        "pending-round-robin",
         "allocation-failure",
         "truncated-generation",
+        "truncated-larger-generation",
         "replaced-generation",
     )
 
@@ -170,6 +178,12 @@ def extra_env_for_mode(mode):
             "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
             "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
         }
+    if mode == "pending-round-robin":
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "2",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
     if mode == "allocation-failure":
         return {"PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION": "1"}
     if mode == "attach-retry-timeout":
@@ -185,6 +199,7 @@ def expected_attached_records(mode):
         "two-generations",
         "two-generations-heartbeat",
         "truncated-generation",
+        "truncated-larger-generation",
         "replaced-generation",
     ):
         return 2
@@ -409,7 +424,11 @@ def run_one(args, tmpdir, mode):
                     f"symbol as one CSV field\nexpected={expected}\n"
                     f"rows={trace_rows}\ntrace={trace}\n{output}"
                 )
-        if mode in ("truncated-generation", "replaced-generation"):
+        if mode in (
+            "truncated-generation",
+            "truncated-larger-generation",
+            "replaced-generation",
+        ):
             generations = {row[7] for row in attached_records if len(row) >= 8}
             if len(generations) != 2:
                 raise AssertionError(
@@ -432,6 +451,10 @@ def run_one(args, tmpdir, mode):
             raise AssertionError(f"missing queue-full diagnostic: {diagnostics}")
         if diagnostic_int(diagnostics, "jit_pending_high_water") != 2:
             raise AssertionError(f"pending queue exceeded configured bound: {diagnostics}")
+    if mode == "pending-round-robin" and diagnostic_int(
+        diagnostics, "jit_pending_high_water"
+    ) != 2:
+        raise AssertionError(f"round-robin fixture did not fill both slots: {diagnostics}")
     if mode in ("stale-then-valid", "final-drain-stale-then-valid") and diagnostic_int(
         diagnostics, "jit_non_executable_timeout"
     ) < 1:
@@ -440,9 +463,11 @@ def run_one(args, tmpdir, mode):
         diagnostics, "jit_allocation_failure"
     ) != 1:
         raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
-    if mode in ("truncated-generation", "replaced-generation") and diagnostic_int(
-        diagnostics, "jit_provider_generation"
-    ) < 2:
+    if mode in (
+        "truncated-generation",
+        "truncated-larger-generation",
+        "replaced-generation",
+    ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
         raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
         if stats_csv is None:
@@ -503,10 +528,12 @@ def main():
             "v8-lazycompile-optimized",
             "two-generations-heartbeat",
             "bounded-queue",
+            "pending-round-robin",
             "allocation-failure",
             "attach-retry-timeout",
             "shutdown-full-queue",
             "truncated-generation",
+            "truncated-larger-generation",
             "replaced-generation",
         ),
         default="both",

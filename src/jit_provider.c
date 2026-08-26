@@ -30,6 +30,7 @@
 #define PEAK_JIT_DEFAULT_DRAIN_RECORD_BUDGET 1024UL
 #define PEAK_JIT_DEFAULT_PENDING_CAPACITY 4096UL
 #define PEAK_JIT_MAX_PENDING_CAPACITY 65536UL
+#define PEAK_JIT_PREFIX_PROBE_BYTES 512U
 #ifdef PEAK_ENABLE_TEST_HOOKS
 #define PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV "PEAK_JIT_TEST_ATTACH_SEQUENCE"
 #define PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION_ENV \
@@ -61,6 +62,13 @@ static gboolean peak_jit_perfmap_identity_known = FALSE;
 static dev_t peak_jit_perfmap_dev = 0;
 static ino_t peak_jit_perfmap_ino = 0;
 static off_t peak_jit_perfmap_last_size = 0;
+static time_t peak_jit_perfmap_mtime_seconds = 0;
+static long peak_jit_perfmap_mtime_nanoseconds = 0;
+static time_t peak_jit_perfmap_ctime_seconds = 0;
+static long peak_jit_perfmap_ctime_nanoseconds = 0;
+static gboolean peak_jit_perfmap_prefix_signature_known = FALSE;
+static off_t peak_jit_perfmap_prefix_signature_length = 0;
+static uint64_t peak_jit_perfmap_prefix_signature = 0;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static unsigned int peak_jit_test_attach_sequence_index = 0;
 static char* configured_jit_test_attach_sequence = NULL;
@@ -92,6 +100,7 @@ typedef enum {
 
 static PeakJitPendingRecord** peak_jit_pending_records = NULL;
 static size_t peak_jit_pending_record_count = 0;
+static size_t peak_jit_pending_retry_cursor = 0;
 static uint64_t peak_jit_provider_generation = 0;
 static _Atomic uint64_t peak_jit_pending_queue_full = 0;
 static _Atomic uint64_t peak_jit_non_executable_timeout = 0;
@@ -456,12 +465,146 @@ peak_jit_pending_records_clear(void)
         peak_jit_pending_records[i] = NULL;
     }
     peak_jit_pending_record_count = 0;
+    peak_jit_pending_retry_cursor = 0;
+}
+
+static void
+peak_jit_stat_timestamps(const struct stat* st,
+                         time_t* mtime_seconds,
+                         long* mtime_nanoseconds,
+                         time_t* ctime_seconds,
+                         long* ctime_nanoseconds)
+{
+#if defined(__APPLE__)
+    *mtime_seconds = st->st_mtimespec.tv_sec;
+    *mtime_nanoseconds = st->st_mtimespec.tv_nsec;
+    *ctime_seconds = st->st_ctimespec.tv_sec;
+    *ctime_nanoseconds = st->st_ctimespec.tv_nsec;
+#else
+    *mtime_seconds = st->st_mtim.tv_sec;
+    *mtime_nanoseconds = st->st_mtim.tv_nsec;
+    *ctime_seconds = st->st_ctim.tv_sec;
+    *ctime_nanoseconds = st->st_ctim.tv_nsec;
+#endif
+}
+
+static gboolean
+peak_jit_perfmap_timestamps_changed(const struct stat* st)
+{
+    time_t mtime_seconds;
+    long mtime_nanoseconds;
+    time_t ctime_seconds;
+    long ctime_nanoseconds;
+
+    peak_jit_stat_timestamps(st,
+                             &mtime_seconds,
+                             &mtime_nanoseconds,
+                             &ctime_seconds,
+                             &ctime_nanoseconds);
+    return mtime_seconds != peak_jit_perfmap_mtime_seconds ||
+           mtime_nanoseconds != peak_jit_perfmap_mtime_nanoseconds ||
+           ctime_seconds != peak_jit_perfmap_ctime_seconds ||
+           ctime_nanoseconds != peak_jit_perfmap_ctime_nanoseconds;
+}
+
+static void
+peak_jit_perfmap_remember_stat(const struct stat* st)
+{
+    peak_jit_perfmap_last_size = st->st_size;
+    peak_jit_stat_timestamps(st,
+                             &peak_jit_perfmap_mtime_seconds,
+                             &peak_jit_perfmap_mtime_nanoseconds,
+                             &peak_jit_perfmap_ctime_seconds,
+                             &peak_jit_perfmap_ctime_nanoseconds);
+}
+
+static gboolean
+peak_jit_hash_file_range(int fd,
+                         off_t offset,
+                         size_t size,
+                         uint64_t* hash)
+{
+    unsigned char buffer[PEAK_JIT_PREFIX_PROBE_BYTES];
+    size_t consumed = 0;
+
+    while (consumed < size) {
+        ssize_t count = pread(fd,
+                              buffer + consumed,
+                              size - consumed,
+                              offset + (off_t)consumed);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return FALSE;
+        }
+        consumed += (size_t)count;
+    }
+    for (size_t i = 0; i < size; i++) {
+        *hash ^= buffer[i];
+        *hash *= UINT64_C(1099511628211);
+    }
+    return TRUE;
+}
+
+static gboolean
+peak_jit_perfmap_compute_prefix_signature(int fd,
+                                          off_t length,
+                                          uint64_t* signature)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t first_size;
+    size_t last_size;
+
+    if (length < 0 || signature == NULL) {
+        return FALSE;
+    }
+    first_size = (size_t)(length < (off_t)PEAK_JIT_PREFIX_PROBE_BYTES
+                              ? length
+                              : (off_t)PEAK_JIT_PREFIX_PROBE_BYTES);
+    last_size = length > (off_t)first_size
+                    ? (size_t)((length - (off_t)first_size) <
+                                       (off_t)PEAK_JIT_PREFIX_PROBE_BYTES
+                                   ? length - (off_t)first_size
+                                   : (off_t)PEAK_JIT_PREFIX_PROBE_BYTES)
+                    : 0;
+    hash ^= (uint64_t)length;
+    hash *= UINT64_C(1099511628211);
+    if (!peak_jit_hash_file_range(fd, 0, first_size, &hash) ||
+        (last_size != 0 &&
+         !peak_jit_hash_file_range(fd,
+                                   length - (off_t)last_size,
+                                   last_size,
+                                   &hash))) {
+        return FALSE;
+    }
+    *signature = hash;
+    return TRUE;
+}
+
+static void
+peak_jit_perfmap_remember_prefix(int fd, off_t length)
+{
+    uint64_t signature;
+
+    if (peak_jit_perfmap_compute_prefix_signature(fd, length, &signature)) {
+        peak_jit_perfmap_prefix_signature = signature;
+        peak_jit_perfmap_prefix_signature_length = length;
+        peak_jit_perfmap_prefix_signature_known = TRUE;
+    } else {
+        peak_jit_perfmap_prefix_signature_known = FALSE;
+        peak_jit_perfmap_prefix_signature_length = 0;
+        peak_jit_perfmap_prefix_signature = 0;
+    }
 }
 
 static void
 peak_jit_provider_advance_generation(const char* reason)
 {
     peak_jit_pending_records_clear();
+    peak_jit_perfmap_prefix_signature_known = FALSE;
+    peak_jit_perfmap_prefix_signature_length = 0;
+    peak_jit_perfmap_prefix_signature = 0;
     peak_jit_provider_generation++;
     if (peak_jit_provider_generation == 0) {
         peak_jit_provider_generation = 1;
@@ -582,6 +725,14 @@ peak_jit_pending_record_remove_index(size_t index)
                         sizeof(*peak_jit_pending_records));
         }
         peak_jit_pending_records[peak_jit_pending_record_count] = NULL;
+        if (peak_jit_pending_record_count == 0) {
+            peak_jit_pending_retry_cursor = 0;
+        } else if (index < peak_jit_pending_retry_cursor) {
+            peak_jit_pending_retry_cursor--;
+        } else if (peak_jit_pending_retry_cursor >=
+                   peak_jit_pending_record_count) {
+            peak_jit_pending_retry_cursor = 0;
+        }
     }
 }
 
@@ -829,13 +980,19 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
                                         unsigned long* budget)
 {
     gboolean pending = FALSE;
+    size_t remaining;
 
     if (peak_jit_pending_records == NULL ||
         peak_jit_pending_record_count == 0) {
         return FALSE;
     }
 
-    for (size_t i = 0; i < peak_jit_pending_record_count;) {
+    remaining = peak_jit_pending_record_count;
+    while (peak_jit_pending_record_count != 0 && remaining != 0) {
+        if (peak_jit_pending_retry_cursor >= peak_jit_pending_record_count) {
+            peak_jit_pending_retry_cursor = 0;
+        }
+        size_t i = peak_jit_pending_retry_cursor;
         PeakJitPendingRecord* record = peak_jit_pending_records[i];
         PeakDynamicAttachResult attach_result;
 
@@ -846,6 +1003,7 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
             }
             (*budget)--;
         }
+        remaining--;
         record->last_attempt_at = peak_second();
         record->attempt_count++;
 
@@ -878,7 +1036,8 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
             }
 
             pending = TRUE;
-            i++;
+            peak_jit_pending_retry_cursor =
+                (i + 1) % peak_jit_pending_record_count;
             continue;
         }
 
@@ -912,7 +1071,8 @@ peak_jit_provider_retry_pending_records(gboolean force_not_exec_timeout,
                 continue;
             }
             pending = TRUE;
-            i++;
+            peak_jit_pending_retry_cursor =
+                (i + 1) % peak_jit_pending_record_count;
             continue;
         }
 
@@ -962,6 +1122,27 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
             peak_jit_perfmap_identity_known && !source_replaced &&
             (peak_jit_perfmap_offset > st.st_size ||
              st.st_size < peak_jit_perfmap_last_size);
+        gboolean source_reset = FALSE;
+
+        if (peak_jit_perfmap_identity_known && !source_replaced &&
+            !source_truncated && peak_jit_perfmap_offset > 0 &&
+            st.st_size >= peak_jit_perfmap_offset &&
+            peak_jit_perfmap_prefix_signature_known &&
+            peak_jit_perfmap_prefix_signature_length ==
+                peak_jit_perfmap_offset) {
+            uint64_t signature;
+            source_reset =
+                !peak_jit_perfmap_compute_prefix_signature(fileno(fp),
+                                                            peak_jit_perfmap_offset,
+                                                            &signature) ||
+                signature != peak_jit_perfmap_prefix_signature;
+        }
+        if (peak_jit_perfmap_identity_known && !source_replaced &&
+            !source_truncated && !source_reset &&
+            st.st_size == peak_jit_perfmap_last_size &&
+            peak_jit_perfmap_timestamps_changed(&st)) {
+            source_reset = TRUE;
+        }
 
         if (source_replaced) {
             peak_jit_perfmap_offset = 0;
@@ -969,11 +1150,14 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
         } else if (source_truncated) {
             peak_jit_perfmap_offset = 0;
             peak_jit_provider_advance_generation("source-truncated");
+        } else if (source_reset) {
+            peak_jit_perfmap_offset = 0;
+            peak_jit_provider_advance_generation("source-reset");
         }
         peak_jit_perfmap_identity_known = TRUE;
         peak_jit_perfmap_dev = st.st_dev;
         peak_jit_perfmap_ino = st.st_ino;
-        peak_jit_perfmap_last_size = st.st_size;
+        peak_jit_perfmap_remember_stat(&st);
     }
 
     if (fseeko(fp, 0, SEEK_END) == 0) {
@@ -1102,6 +1286,10 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
     }
 
     peak_jit_perfmap_offset = committed_offset;
+    peak_jit_perfmap_remember_prefix(fileno(fp), committed_offset);
+    if (fstat(fileno(fp), &st) == 0) {
+        peak_jit_perfmap_remember_stat(&st);
+    }
     fclose(fp);
     if (budget > 0) {
         pending |= peak_jit_provider_retry_pending_records(
@@ -1151,6 +1339,13 @@ peak_jit_provider_enable(void)
     peak_jit_perfmap_dev = 0;
     peak_jit_perfmap_ino = 0;
     peak_jit_perfmap_last_size = 0;
+    peak_jit_perfmap_mtime_seconds = 0;
+    peak_jit_perfmap_mtime_nanoseconds = 0;
+    peak_jit_perfmap_ctime_seconds = 0;
+    peak_jit_perfmap_ctime_nanoseconds = 0;
+    peak_jit_perfmap_prefix_signature_known = FALSE;
+    peak_jit_perfmap_prefix_signature_length = 0;
+    peak_jit_perfmap_prefix_signature = 0;
     peak_jit_provider_advance_generation("provider-enabled");
 
     peak_jit_trace("provider-enable",
@@ -1217,6 +1412,13 @@ peak_jit_provider_disable(void)
     peak_jit_perfmap_dev = 0;
     peak_jit_perfmap_ino = 0;
     peak_jit_perfmap_last_size = 0;
+    peak_jit_perfmap_mtime_seconds = 0;
+    peak_jit_perfmap_mtime_nanoseconds = 0;
+    peak_jit_perfmap_ctime_seconds = 0;
+    peak_jit_perfmap_ctime_nanoseconds = 0;
+    peak_jit_perfmap_prefix_signature_known = FALSE;
+    peak_jit_perfmap_prefix_signature_length = 0;
+    peak_jit_perfmap_prefix_signature = 0;
     peak_jit_pending_records_clear();
     g_free(peak_jit_pending_records);
     peak_jit_pending_records = NULL;

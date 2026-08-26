@@ -104,6 +104,8 @@ multi-record pass is reserved for unread metadata. A one-record pass always
 consumes metadata first. Once the source reaches EOF or is temporarily
 unavailable, the remaining budget services pending retries. This keeps queue
 saturation from starving later valid rows while still aging pending records.
+Pending retries use a rotating cursor, so a persistent head record cannot
+starve later pending entries under a small budget.
 
 When the budget is exhausted, the provider reports pending work and lets the
 controller loop process detach/reattach requests before resuming JIT metadata
@@ -170,9 +172,11 @@ interface is required before PEAK can safely support long-running code-cache GC,
 unload, or move events with reattach.
 
 The provider processes the perf-map file as append-only metadata and remembers
-the last drained offset. When it observes truncation or replacement by a
-different inode, it increments the provider generation, resets the offset and
-pending retries, and treats a repeated address/name as a new metadata lifetime.
+the last drained offset. It detects source reset through size regression,
+same-size metadata timestamp changes, and bounded head/tail signatures of the
+committed prefix; inode replacement is detected separately. An observed reset
+increments the provider generation, resets the offset and pending retries, and
+treats a repeated address/name as a new metadata lifetime.
 This generation models the metadata source lifetime only; it does not claim that
 perf-map can identify individual code unloads. During shutdown, the controller
 drains until no retry is pending or the shutdown drain deadline expires so
@@ -226,8 +230,9 @@ The default test suite includes:
 - bounded-queue coverage proving saturation is reported without blocking a later
   executable row, plus a full-queue shutdown bound;
 - finite attach-retry timeout and allocation-failure fail-open coverage;
-- truncation and inode-replacement coverage proving the same address/name is
-  processed under a new provider generation;
+- immediate same-size truncation, larger prefix replacement, and inode
+  replacement coverage proving the same address/name is processed under a new
+  provider generation;
 - V8 optimized-name alias coverage for both `JS:*name` and
   `LazyCompile:*name`;
 - CSV trace coverage for V8-style names containing commas and quotes;

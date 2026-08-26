@@ -86,6 +86,13 @@ STATS_FIELDS = [
     "overhead_s",
     "dropped_calls",
     "dropped_threads",
+    "jit_pending_queue_full",
+    "jit_non_executable_timeout",
+    "jit_attach_retry_timeout",
+    "jit_allocation_failure",
+    "jit_provider_generation",
+    "jit_pending_count",
+    "jit_pending_high_water",
     "capability_requested",
     "capability_compiled",
     "capability_active",
@@ -99,6 +106,7 @@ STATS_FIELDS = [
     "degraded_mask",
 ]
 STATS_ACCOUNTING_FIELDS = ["dropped_calls", "dropped_threads"]
+STATS_JIT_FIELDS = STATS_FIELDS[13:20]
 ACCOUNTING_DIAGNOSTICS_FUNCTION = "PEAK_ACCOUNTING_DIAGNOSTICS"
 CAPABILITY_METADATA_FUNCTION_RE = re.compile(r"^PEAK_CAPABILITY_[a-z-]+$")
 CAPABILITY_METADATA_FUNCTIONS = {
@@ -211,6 +219,11 @@ def require_valid_accounting_diagnostics(name, rows):
                 raise AssertionError(
                     f"invalid accounting diagnostic {field}: {name}"
                 )
+        for field in STATS_JIT_FIELDS:
+            if row.get(field, "") != "0":
+                raise AssertionError(
+                    f"nonzero accounting JIT diagnostic {field}: {name}"
+                )
         diagnostics_values = tuple(
             int(row[field]) for field in STATS_ACCOUNTING_FIELDS
         )
@@ -224,6 +237,11 @@ def require_valid_accounting_diagnostics(name, rows):
                 function in CAPABILITY_METADATA_FUNCTIONS):
             continue
         values = []
+        for field in STATS_JIT_FIELDS:
+            if row.get(field, "") != "0":
+                raise AssertionError(
+                    f"nonzero target JIT diagnostic {field}: {name}"
+                )
         for field in STATS_ACCOUNTING_FIELDS:
             value = row.get(field, "") or ""
             if not re.fullmatch(r"[0-9]+", value):
