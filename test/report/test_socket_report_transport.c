@@ -571,7 +571,7 @@ aggregate_matches(const PeakReportSnapshot* aggregate)
         aggregate->jit.allocation_failure != 44U ||
         aggregate->jit.provider_generation != 9U ||
         aggregate->jit.pending_count != 66U ||
-        aggregate->jit.pending_high_water != 77U) {
+        aggregate->jit.pending_high_water != 70U) {
         return false;
     }
 

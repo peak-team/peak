@@ -3079,7 +3079,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             peak_hook_provider_generation != NULL &&
             peak_hook_provider_generation[i] != provider_generation) {
             peak_hook_provider_generation[i] = provider_generation;
-            result = PEAK_DYNAMIC_ATTACH_ATTACHED;
+            result = PEAK_DYNAMIC_ATTACH_GENERATION_REFRESHED;
             duplicate_address = TRUE;
             break;
         }

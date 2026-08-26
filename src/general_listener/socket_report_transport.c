@@ -2400,9 +2400,11 @@ peak_socket_gather_prepare_receipt(
     aggregate->jit->pending_count = peak_socket_add_uint64_saturated(
         aggregate->jit->pending_count,
         connection->header.jit_pending_count);
-    aggregate->jit->pending_high_water = peak_socket_add_uint64_saturated(
-        aggregate->jit->pending_high_water,
-        connection->header.jit_pending_high_water);
+    if (connection->header.jit_pending_high_water >
+        aggregate->jit->pending_high_water) {
+        aggregate->jit->pending_high_water =
+            connection->header.jit_pending_high_water;
+    }
     if (connection->header.jit_provider_generation >
         aggregate->jit->provider_generation) {
         aggregate->jit->provider_generation =

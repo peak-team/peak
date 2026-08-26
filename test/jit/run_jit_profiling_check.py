@@ -81,12 +81,16 @@ def mode_flag(mode):
         return "--with-bounded-queue-then-valid"
     if mode == "pending-round-robin":
         return "--with-pending-round-robin"
+    if mode == "pending-timeout-backlog":
+        return "--with-pending-timeout-backlog"
     if mode == "truncated-generation":
         return "--with-truncated-generation"
     if mode == "truncated-during-drain-generation":
         return "--with-truncated-during-drain-generation"
     if mode == "replaced-generation":
         return "--with-replaced-generation"
+    if mode == "pending-replaced-generation":
+        return "--with-pending-replaced-generation"
     if mode == "attach-retry-timeout":
         return "--with-perf-map"
     if mode == "negative":
@@ -130,6 +134,7 @@ def expects_attached_record(mode):
         "truncated-generation",
         "truncated-during-drain-generation",
         "replaced-generation",
+        "pending-replaced-generation",
     )
 
 
@@ -155,6 +160,7 @@ def expects_positive_count(mode):
         "truncated-generation",
         "truncated-during-drain-generation",
         "replaced-generation",
+        "pending-replaced-generation",
     )
 
 
@@ -184,6 +190,12 @@ def extra_env_for_mode(mode):
             "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "10000",
             "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
         }
+    if mode == "pending-timeout-backlog":
+        return {
+            "PEAK_JIT_PENDING_CAPACITY": "4",
+            "PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS": "20",
+            "PEAK_JIT_DRAIN_RECORD_BUDGET": "1",
+        }
     if mode == "allocation-failure":
         return {"PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION": "1"}
     if mode == "attach-retry-timeout":
@@ -195,13 +207,7 @@ def extra_env_for_mode(mode):
 
 
 def expected_attached_records(mode):
-    if mode in (
-        "two-generations",
-        "two-generations-heartbeat",
-        "truncated-generation",
-        "truncated-during-drain-generation",
-        "replaced-generation",
-    ):
+    if mode in ("two-generations", "two-generations-heartbeat"):
         return 2
     return 1
 
@@ -303,6 +309,11 @@ def run_one(args, tmpdir, mode):
         extra_env = dict(extra_env)
         extra_env["PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"] = os.path.join(
             tmpdir, "pre-final-stat.barrier"
+        )
+    if mode == "pending-replaced-generation":
+        extra_env = dict(extra_env)
+        extra_env["PEAK_JIT_TEST_PRE_SOURCE_OBSERVE_BARRIER"] = os.path.join(
+            tmpdir, "pre-source-observe.barrier"
         )
     try:
         os.unlink(map_path)
@@ -435,11 +446,23 @@ def run_one(args, tmpdir, mode):
             "truncated-during-drain-generation",
             "replaced-generation",
         ):
-            generations = {row[7] for row in attached_records if len(row) >= 8}
+            refreshed_records = trace_rows_with_result(
+                trace_rows, "generation-refreshed"
+            )
+            generations = {
+                row[7]
+                for row in attached_records + refreshed_records
+                if len(row) >= 8
+            }
+            if len(refreshed_records) != 1:
+                raise AssertionError(
+                    f"{mode} did not report exactly one same-address generation "
+                    f"refresh\nrows={trace_rows}\ntrace={trace}"
+                )
             if len(generations) != 2:
                 raise AssertionError(
                     f"{mode} did not process the repeated address/name "
-                    f"as a new provider lifetime\nrows={attached_records}\ntrace={trace}"
+                    f"as a new provider lifetime\nrows={trace_rows}\ntrace={trace}"
                 )
     if mode == "attach-retry-timeout":
         trace, trace_rows = read_trace(trace_path)
@@ -452,11 +475,33 @@ def run_one(args, tmpdir, mode):
             )
         if diagnostic_int(diagnostics, "jit_attach_retry_timeout") != 1:
             raise AssertionError(f"missing attach retry timeout diagnostic: {diagnostics}")
+    if mode == "pending-timeout-backlog":
+        trace, trace_rows = read_trace(trace_path)
+        timeout_rows = trace_rows_with_result(
+            trace_rows, "not-executable-timeout"
+        )
+        backlog_end_rows = [
+            row
+            for row in trace_rows
+            if len(row) >= 7 and row[3] == "peak_jit_backlog_63"
+        ]
+        if len(timeout_rows) != 1 or len(backlog_end_rows) != 1 or not (
+            trace_rows.index(timeout_rows[0]) < trace_rows.index(backlog_end_rows[0])
+        ):
+            raise AssertionError(
+                "budget-1 pending timeout did not make progress before the "
+                f"metadata backlog reached EOF\ntrace={trace}\n{output}"
+            )
     if mode in ("bounded-queue", "shutdown-full-queue"):
         if diagnostic_int(diagnostics, "jit_pending_queue_full") < 1:
             raise AssertionError(f"missing queue-full diagnostic: {diagnostics}")
         if diagnostic_int(diagnostics, "jit_pending_high_water") != 2:
             raise AssertionError(f"pending queue exceeded configured bound: {diagnostics}")
+        trace, trace_rows = read_trace(trace_path)
+        if not trace_has_result(trace_rows, "pending-queue-full"):
+            raise AssertionError(
+                f"queue-full record did not report its final drop outcome\n{trace}"
+            )
     if mode == "pending-round-robin" and diagnostic_int(
         diagnostics, "jit_pending_high_water"
     ) != 2:
@@ -469,10 +514,18 @@ def run_one(args, tmpdir, mode):
         diagnostics, "jit_allocation_failure"
     ) != 1:
         raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
+    if mode == "allocation-failure":
+        trace, trace_rows = read_trace(trace_path)
+        if not trace_has_result(trace_rows, "pending-allocation-failure"):
+            raise AssertionError(
+                "allocation-failure record did not report its final drop "
+                f"outcome\n{trace}"
+            )
     if mode in (
         "truncated-generation",
         "truncated-during-drain-generation",
         "replaced-generation",
+        "pending-replaced-generation",
     ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
         raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
@@ -541,6 +594,8 @@ def main():
             "truncated-generation",
             "truncated-during-drain-generation",
             "replaced-generation",
+            "pending-replaced-generation",
+            "pending-timeout-backlog",
         ),
         default="both",
     )

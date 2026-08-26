@@ -5,6 +5,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     add_executable(test_jit_mmap_fixture test_jit_mmap_fixture.c)
     target_compile_features(test_jit_mmap_fixture PRIVATE c_std_11)
 
+    add_test(NAME test_jit_bounded_work_invariants
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/check_jit_bounded_work.py
+                ${PROJECT_SOURCE_DIR}/src/jit_provider.c)
+    set_tests_properties(test_jit_bounded_work_invariants
+        PROPERTIES PASS_REGULAR_EXPRESSION "jit_bounded_work_ok")
+
     add_test(NAME test_jit_profiling_mmap_perfmap
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/run_jit_profiling_check.py
@@ -276,11 +283,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     foreach(jit_bounded_mode IN ITEMS
             bounded-queue
             pending-round-robin
+            pending-timeout-backlog
             allocation-failure
             attach-retry-timeout
             truncated-generation
             truncated-during-drain-generation
-            replaced-generation)
+            replaced-generation
+            pending-replaced-generation)
         string(REPLACE "-" "_" jit_bounded_suffix "${jit_bounded_mode}")
         add_test(NAME test_jit_profiling_mmap_perfmap_${jit_bounded_suffix}
             COMMAND ${Python3_EXECUTABLE}

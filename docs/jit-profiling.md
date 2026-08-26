@@ -64,9 +64,11 @@ PEAK_JIT_TRACE_PATH=/path/to/jit-trace.csv
 
 Trace rows show provider enablement and each processed perf-map record with an
 `attached`, `not-matched`, `not-executable`, `not-executable-retry`,
-`not-executable-timeout`, `partial-record`, `attach-retry`, or `attach-failed`
-result. Complete lines that exceed PEAK's bounded read buffer are skipped with
-`overlong-record`; true EOF partial rows are retained as `partial-record`.
+`not-executable-timeout`, `partial-record`, `attach-retry`, `attach-failed`,
+`generation-refreshed`, `already-pending`, `pending-queue-full`, or
+`pending-allocation-failure` result. Complete lines that exceed PEAK's bounded
+read buffer are skipped with `overlong-record`; true EOF partial rows are
+retained as `partial-record`.
 String fields are emitted as CSV fields, so names containing commas or quotes
 remain parseable. The final field is the provider generation that owned the
 event.
@@ -90,7 +92,9 @@ the corresponding retry expire on its next drain.
 Final text and CSV reports publish queue-full, non-executable-timeout,
 attach-retry-timeout, and allocation-failure counts together with the current
 generation, pending count, and pending high-water mark. MPI and socket reports
-aggregate the counters, so a fail-open drop on any rank remains visible.
+sum event counters and final pending counts, while pending high-water and
+provider generation are rank maxima. MPI skips JIT diagnostic collectives when
+no rank requested JIT; a JIT report uses one vector maximum and one vector sum.
 
 The provider also bounds each controller-thread drain pass. The default budget
 is 1024 perf-map or pending records per pass and can be adjusted with:
@@ -100,10 +104,11 @@ PEAK_JIT_DRAIN_RECORD_BUDGET=4096
 ```
 
 When pending retries and unread metadata coexist, at least half of each
-multi-record pass is reserved for unread metadata. A one-record pass always
-consumes metadata first. Once the source reaches EOF or is temporarily
-unavailable, the remaining budget services pending retries. This keeps queue
-saturation from starving later valid rows while still aging pending records.
+multi-record pass is reserved for unread metadata. A one-record pass alternates
+metadata and one pending retry while both exist. Once the source reaches EOF or
+is temporarily unavailable, the remaining budget services pending retries.
+This keeps queue saturation from starving later valid rows while preserving a
+finite retry lifetime under a sustained metadata backlog.
 Pending retries use a rotating cursor, so a persistent head record cannot
 starve later pending entries under a small budget.
 
@@ -118,8 +123,9 @@ general listener controller thread and publishes a matching symbol through a
 private controller-only attach bridge. That bridge:
 
 1. requires the current thread to be the general listener controller;
-2. matches a `PEAK_TARGET` slot and ignores same-generation duplicate rows for
-   an already attached code address;
+2. matches a `PEAK_TARGET` slot, ignores same-generation duplicate rows, and
+   reports a same-address source-generation update as metadata refresh rather
+   than a second Gum attachment;
 3. prepares the attach through the existing strict detach controller;
 4. attaches Gum to the JIT entry address;
 5. publishes `hook_address`, listener state, and demangled display name only

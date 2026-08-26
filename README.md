@@ -445,7 +445,7 @@ See [Physical detach controller](docs/physical-detach-controller.md) and
 | `PEAK_JIT_NOT_EXEC_RETRY_TIMEOUT_MS` | Retry lifetime for matching code that is not executable yet. Default: `1000`. |
 | `PEAK_JIT_ATTACH_RETRY_TIMEOUT_MS` | Maximum age of a controller attach retry before it is dropped. Default: `1000`. |
 | `PEAK_JIT_PENDING_CAPACITY` | Maximum pending non-executable and attach-retry records. Default: `4096`; maximum: `65536`. |
-| `PEAK_JIT_DRAIN_RECORD_BUDGET` | Maximum records handled by one controller drain pass. Default: `1024`. |
+| `PEAK_JIT_DRAIN_RECORD_BUDGET` | Maximum records handled by one controller drain pass. Default: `1024`; a budget of one alternates metadata and pending retry work while both exist. |
 
 See [JIT profiling](docs/jit-profiling.md) for provider guarantees and code
 lifetime requirements.

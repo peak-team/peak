@@ -273,25 +273,25 @@ check_csv_golden(const char* csv_path)
     static const char expected[] =
         "function,count,per_thread,per_rank,call_max_s,call_min_s,"
         "total_s,exclusive_s,thread_max_s,thread_min_s,overhead_s,"
-        "dropped_calls,dropped_threads,jit_pending_queue_full,"
-        "jit_non_executable_timeout,jit_attach_retry_timeout,"
-        "jit_allocation_failure,jit_provider_generation,jit_pending_count,"
-        "jit_pending_high_water,capability_requested,"
+        "dropped_calls,dropped_threads,capability_requested,"
         "capability_compiled,capability_active,capability_partial,"
         "capability_retained,capability_failed,cuda_compiled_apis,"
         "cuda_found_apis,cuda_installed_apis,cuda_failed_apis,"
-        "degraded_mask\n"
+        "degraded_mask,jit_pending_queue_full,"
+        "jit_non_executable_timeout,jit_attach_retry_timeout,"
+        "jit_allocation_failure,jit_provider_generation,jit_pending_count,"
+        "jit_pending_high_water\n"
         "\"alpha\",5,3,2.5,5.000000000e-01,1.250000000e-01,"
         "1.250000000e+00,1.250000000e+00,7.500000000e-01,"
         "2.500000000e-01,5.000000000e-02,7,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,7,3,"
         "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
-        "\"PEAK_CAPABILITY_cpu-target\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "1,1,1,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_cpu-target\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_strict-mutation\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
         "0,0,0,0,0,0,0,0,0,0,0\n"
-        "\"PEAK_CAPABILITY_cuda\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "1,1,0,1,0,1,0,0,0,0,0\n"
+        "\"PEAK_CAPABILITY_cuda\",0,0,0,0,0,0,0,0,0,0,0,0,"
+        "1,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_memory\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
         "0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
@@ -304,10 +304,10 @@ check_csv_golden(const char* csv_path)
         "0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_local-report\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
         "0,0,0,0,0,0,0,0,0,0,0\n"
-        "\"PEAK_CUDA_API_COVERAGE\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,7,3,1,2,0\n"
-        "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,16\n";
+        "\"PEAK_CUDA_API_COVERAGE\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+        "7,3,1,2,0,0,0,0,0,0,0,0\n"
+        "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+        "0,0,0,0,16,0,0,0,0,0,0,0\n";
     PeakReportSnapshot* snapshot = create_fixture("alpha");
     PeakReportSnapshot* prepared = peak_report_snapshot_clone(snapshot);
     char* actual;
@@ -617,13 +617,13 @@ check_capability_only_output(const char* csv_path)
     contents = read_file(csv_path);
     assert(strstr(contents,
                   "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,"
-                  "0,0,0,0,0,0,0,1,1,0,0,0,1,0,0,0,0,0\n") != NULL);
+                  "1,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0\n") != NULL);
     assert(strstr(contents,
                   "\"PEAK_JIT_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,0,0,"
-                  "2,3,5,7,11,13,17,0,0,0,0,0,0,0,0,0,0,0\n") != NULL);
+                  "0,0,0,0,0,0,0,0,0,0,0,2,3,5,7,11,13,17\n") != NULL);
     assert(strstr(contents,
                   "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,"
-                  "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,32\n") != NULL);
+                  "0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0\n") != NULL);
     free(contents);
     assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);

@@ -15,8 +15,9 @@ enum {
     TEST_COLLECTIVE_ALLREDUCE = 0,
     TEST_COLLECTIVE_REDUCE = 1,
     TEST_COLLECTIVE_BCAST = 2,
-    TEST_COLLECTIVE_COUNT = 69,
-    TEST_UNIQUE_LABEL_COUNT = 39,
+    TEST_COLLECTIVE_COUNT = 63,
+    TEST_NON_JIT_COLLECTIVE_COUNT = 61,
+    TEST_UNIQUE_LABEL_COUNT = 38,
 };
 
 typedef enum {
@@ -388,7 +389,8 @@ fixture_snapshot(void)
     snapshot->dropped_threads = 3;
     snapshot->degraded_mask = PEAK_PROFILER_DEGRADED_CUDA;
     snapshot->capabilities.requested =
-        PEAK_CAPABILITY_CPU_TARGET | PEAK_CAPABILITY_CUDA;
+        PEAK_CAPABILITY_CPU_TARGET | PEAK_CAPABILITY_CUDA |
+        PEAK_CAPABILITY_JIT;
     snapshot->capabilities.compiled = snapshot->capabilities.requested;
     snapshot->capabilities.active = PEAK_CAPABILITY_CPU_TARGET;
     snapshot->capabilities.partial = PEAK_CAPABILITY_CUDA;
@@ -485,17 +487,14 @@ validate_golden_trace(void)
     EXPECT(5, "accounting-valid", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MIN, -1);
     EXPECT(6, "hook-count-min", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MIN, -1);
     EXPECT(7, "hook-count-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UNSIGNED_LONG, MPI_MAX, -1);
-    EXPECT(8, "jit-diagnostics-max", TEST_COLLECTIVE_ALLREDUCE, 6, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(9, "jit-generation-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    for (int ordinal = 10; ordinal <= 15; ordinal++) {
-        EXPECT(ordinal, "jit-diagnostic-sum", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    }
-    EXPECT(16, "duplicate-hook-name-check", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MAX, -1);
-    EXPECT(17, "hook-slot-min-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MIN, -1);
-    EXPECT(18, "hook-slot-max-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(19, "profile-control-ratio-maxloc", TEST_COLLECTIVE_REDUCE, 6, MPI_DOUBLE_INT, MPI_MAXLOC, 0);
-    for (int ordinal = 20; ordinal <= 49; ordinal++) {
-        int field = (ordinal - 20) % 5;
+    EXPECT(8, "jit-diagnostics-max", TEST_COLLECTIVE_ALLREDUCE, 7, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(9, "jit-diagnostics-sum", TEST_COLLECTIVE_REDUCE, 5, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(10, "duplicate-hook-name-check", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_INT, MPI_MAX, -1);
+    EXPECT(11, "hook-slot-min-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MIN, -1);
+    EXPECT(12, "hook-slot-max-hash", TEST_COLLECTIVE_ALLREDUCE, 2, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(13, "profile-control-ratio-maxloc", TEST_COLLECTIVE_REDUCE, 6, MPI_DOUBLE_INT, MPI_MAXLOC, 0);
+    for (int ordinal = 14; ordinal <= 43; ordinal++) {
+        int field = (ordinal - 14) % 5;
         EXPECT(ordinal,
                bcast_labels[field],
                TEST_COLLECTIVE_BCAST,
@@ -504,26 +503,26 @@ validate_golden_trace(void)
                MPI_OP_NULL,
                0);
     }
-    EXPECT(50, "profile-seconds", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(51, "failed-stop-window-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(52, "failed-stop-window-count", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(53, "dropped-calls-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(54, "dropped-threads-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
-    EXPECT(55, "dropped-calls", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(56, "dropped-threads", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
-    EXPECT(57, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(58, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(59, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(60, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(61, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
-    EXPECT(62, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
-    EXPECT(63, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
-    EXPECT(64, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
-    EXPECT(65, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
-    EXPECT(66, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
-    EXPECT(67, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(68, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
-    EXPECT(69, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(44, "profile-seconds", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(45, "failed-stop-window-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(46, "failed-stop-window-count", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(47, "dropped-calls-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(48, "dropped-threads-max", TEST_COLLECTIVE_ALLREDUCE, 1, MPI_UINT64_T, MPI_MAX, -1);
+    EXPECT(49, "dropped-calls", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(50, "dropped-threads", TEST_COLLECTIVE_REDUCE, 1, MPI_UINT64_T, MPI_SUM, 0);
+    EXPECT(51, "elapsed-min", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(52, "elapsed-max", TEST_COLLECTIVE_REDUCE, 1, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(53, "sum-num-calls", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(54, "sum-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(55, "max-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MAX, 0);
+    EXPECT(56, "min-total-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_MIN, 0);
+    EXPECT(57, "sum-exclusive-time", TEST_COLLECTIVE_REDUCE, 2, MPI_DOUBLE, MPI_SUM, 0);
+    EXPECT(58, "sum-max-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MAX, 0);
+    EXPECT(59, "sum-min-time", TEST_COLLECTIVE_REDUCE, 2, MPI_FLOAT, MPI_MIN, 0);
+    EXPECT(60, "thread-count", TEST_COLLECTIVE_REDUCE, 2, MPI_UNSIGNED_LONG, MPI_SUM, 0);
+    EXPECT(61, "detached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(62, "reattached-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
+    EXPECT(63, "revisited-marker", TEST_COLLECTIVE_REDUCE, 2, MPI_INT, MPI_MAX, 0);
 
 #undef EXPECT
 
@@ -591,6 +590,41 @@ run_success_case(int rank, int size)
         failures++;
     }
     failures += validate_golden_trace();
+    peak_report_snapshot_destroy(aggregate);
+    peak_report_snapshot_destroy(local);
+    return failures;
+}
+
+static int
+run_non_jit_success_case(void)
+{
+    PeakReportSnapshot* local;
+    PeakReportSnapshot* aggregate = NULL;
+    PeakMpiReportTransportResult result;
+    int failures = 0;
+
+    fake_reset(0, TEST_REQUEST_COMPLETE, 0, 1);
+    peak_mpi_report_transport_reset_failed_closed();
+    local = fixture_snapshot();
+    if (local == NULL) {
+        return 1;
+    }
+    local->capabilities.requested &= ~PEAK_CAPABILITY_JIT;
+    local->capabilities.compiled &= ~PEAK_CAPABILITY_JIT;
+    memset(&local->jit, 0, sizeof(local->jit));
+    result = peak_mpi_report_transport_reduce(local, &aggregate);
+    if (result != PEAK_MPI_REPORT_TRANSPORT_ROOT_READY ||
+        aggregate == NULL ||
+        fake_operation_count != TEST_NON_JIT_COLLECTIVE_COUNT ||
+        trace_count != TEST_NON_JIT_COLLECTIVE_COUNT ||
+        memcmp(&aggregate->jit, &local->jit, sizeof(local->jit)) != 0) {
+        failures++;
+    }
+    for (int i = 0; i < trace_count; i++) {
+        if (strncmp(trace_records[i].label, "jit-", 4) == 0) {
+            failures++;
+        }
+    }
     peak_report_snapshot_destroy(aggregate);
     peak_report_snapshot_destroy(local);
     return failures;
@@ -796,6 +830,7 @@ main(void)
     (void)setenv("PEAK_VERBOSITY", "silent", 1);
     failures += run_success_case(0, 1);
     failures += run_success_case(1, 2);
+    failures += run_non_jit_success_case();
     /* pending struct, staged send buffer, and staged receive buffer each
      * coordinate local fallback before any payload collective is issued. */
     failures += run_staged_allocation_failure_case(0);
@@ -819,6 +854,6 @@ main(void)
                 failures);
         return EXIT_FAILURE;
     }
-    puts("mpi_report_request_lifetime_ok operations=69 labels=39 failures=138");
+    puts("mpi_report_request_lifetime_ok operations=63 labels=38 failures=126 non_jit_operations=61");
     return EXIT_SUCCESS;
 }
