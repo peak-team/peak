@@ -232,8 +232,9 @@ The default test suite includes:
 - bounded-queue coverage proving saturation is reported without blocking a later
   executable row, plus a full-queue shutdown bound;
 - finite attach-retry timeout and allocation-failure fail-open coverage;
-- observed truncation and inode-replacement coverage proving the same
-  address/name is processed under a new provider generation;
+- observed truncation before and during a drain, plus inode-replacement
+  coverage proving the same address/name is processed under a new provider
+  generation;
 - V8 optimized-name alias coverage for both `JS:*name` and
   `LazyCompile:*name`;
 - CSV trace coverage for V8-style names containing commas and quotes;

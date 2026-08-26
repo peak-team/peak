@@ -34,6 +34,8 @@
 #define PEAK_JIT_TEST_ATTACH_SEQUENCE_ENV "PEAK_JIT_TEST_ATTACH_SEQUENCE"
 #define PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION_ENV \
     "PEAK_JIT_TEST_FAIL_PENDING_ALLOCATION"
+#define PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER_ENV \
+    "PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"
 #endif
 
 static gboolean peak_jit_provider_enabled = FALSE;
@@ -65,6 +67,8 @@ static off_t peak_jit_perfmap_last_size = 0;
 static unsigned int peak_jit_test_attach_sequence_index = 0;
 static char* configured_jit_test_attach_sequence = NULL;
 static unsigned long peak_jit_test_fail_pending_allocation_remaining = 0;
+static gboolean peak_jit_test_final_stat_barrier_used = FALSE;
+static gboolean peak_jit_test_final_stat_signal_pending = FALSE;
 #endif
 
 typedef enum {
@@ -459,6 +463,56 @@ peak_jit_pending_records_clear(void)
     peak_jit_pending_record_count = 0;
     peak_jit_pending_retry_cursor = 0;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static void
+peak_jit_test_wait_before_final_stat(void)
+{
+    const char* path;
+    FILE* marker;
+
+    if (peak_jit_test_final_stat_barrier_used) {
+        return;
+    }
+    path = g_getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER_ENV);
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    peak_jit_test_final_stat_barrier_used = TRUE;
+    marker = fopen(path, "w");
+    if (marker == NULL) {
+        return;
+    }
+    fclose(marker);
+    for (unsigned int i = 0; i < 10000 && access(path, F_OK) == 0; i++) {
+        usleep(100);
+    }
+    peak_jit_test_final_stat_signal_pending = TRUE;
+}
+
+static void
+peak_jit_test_signal_after_final_stat(void)
+{
+    const char* path;
+    char* done_path;
+    FILE* marker;
+
+    if (!peak_jit_test_final_stat_signal_pending) {
+        return;
+    }
+    peak_jit_test_final_stat_signal_pending = FALSE;
+    path = g_getenv(PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER_ENV);
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    done_path = g_strdup_printf("%s.done", path);
+    marker = fopen(done_path, "w");
+    if (marker != NULL) {
+        fclose(marker);
+    }
+    g_free(done_path);
+}
+#endif
 
 static void
 peak_jit_provider_advance_generation(const char* reason)
@@ -993,7 +1047,6 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
         peak_jit_perfmap_ino = st.st_ino;
         peak_jit_perfmap_last_size = st.st_size;
     }
-
     if (fseeko(fp, 0, SEEK_END) == 0) {
         off_t end = ftello(fp);
         if (end >= 0 && peak_jit_perfmap_offset > end) {
@@ -1120,9 +1173,26 @@ peak_jit_provider_drain_perfmap(gboolean force_not_exec_timeout)
     }
 
     peak_jit_perfmap_offset = committed_offset;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_jit_perfmap_offset > 0) {
+        peak_jit_test_wait_before_final_stat();
+    }
+#endif
     if (fstat(fileno(fp), &st) == 0) {
+        if (peak_jit_perfmap_identity_known &&
+            st.st_dev == peak_jit_perfmap_dev &&
+            st.st_ino == peak_jit_perfmap_ino &&
+            (peak_jit_perfmap_offset > st.st_size ||
+             st.st_size < peak_jit_perfmap_last_size)) {
+            peak_jit_perfmap_offset = 0;
+            peak_jit_provider_advance_generation(
+                "source-truncated-during-drain");
+        }
         peak_jit_perfmap_last_size = st.st_size;
     }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_jit_test_signal_after_final_stat();
+#endif
     fclose(fp);
     if (budget > 0) {
         pending |= peak_jit_provider_retry_pending_records(
@@ -1143,6 +1213,8 @@ peak_jit_provider_enable(void)
     peak_jit_provider_reset_diagnostics();
 #ifdef PEAK_ENABLE_TEST_HOOKS
     peak_jit_test_attach_sequence_index = 0;
+    peak_jit_test_final_stat_barrier_used = FALSE;
+    peak_jit_test_final_stat_signal_pending = FALSE;
 #endif
 
     if (!configured_jit_enabled) {

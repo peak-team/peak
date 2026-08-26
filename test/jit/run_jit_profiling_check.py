@@ -83,6 +83,8 @@ def mode_flag(mode):
         return "--with-pending-round-robin"
     if mode == "truncated-generation":
         return "--with-truncated-generation"
+    if mode == "truncated-during-drain-generation":
+        return "--with-truncated-during-drain-generation"
     if mode == "replaced-generation":
         return "--with-replaced-generation"
     if mode == "attach-retry-timeout":
@@ -126,6 +128,7 @@ def expects_attached_record(mode):
         "allocation-failure",
         "shutdown-full-queue",
         "truncated-generation",
+        "truncated-during-drain-generation",
         "replaced-generation",
     )
 
@@ -150,6 +153,7 @@ def expects_positive_count(mode):
         "pending-round-robin",
         "allocation-failure",
         "truncated-generation",
+        "truncated-during-drain-generation",
         "replaced-generation",
     )
 
@@ -195,6 +199,7 @@ def expected_attached_records(mode):
         "two-generations",
         "two-generations-heartbeat",
         "truncated-generation",
+        "truncated-during-drain-generation",
         "replaced-generation",
     ):
         return 2
@@ -293,6 +298,12 @@ def run_one(args, tmpdir, mode):
     stats_prefix = os.path.join(tmpdir, f"peak-jit-{mode}")
     map_path = os.path.join(tmpdir, f"perf-{mode}.map")
     trace_path = os.path.join(tmpdir, f"jit-{mode}-trace.csv")
+    extra_env = extra_env_for_mode(mode)
+    if mode == "truncated-during-drain-generation":
+        extra_env = dict(extra_env)
+        extra_env["PEAK_JIT_TEST_PRE_FINAL_STAT_BARRIER"] = os.path.join(
+            tmpdir, "pre-final-stat.barrier"
+        )
     try:
         os.unlink(map_path)
     except FileNotFoundError:
@@ -314,7 +325,7 @@ def run_one(args, tmpdir, mode):
             stats_prefix,
             map_path,
             trace_path,
-            extra_env_for_mode(mode),
+            extra_env,
         ),
         cwd=tmpdir,
         text=True,
@@ -419,7 +430,11 @@ def run_one(args, tmpdir, mode):
                     f"symbol as one CSV field\nexpected={expected}\n"
                     f"rows={trace_rows}\ntrace={trace}\n{output}"
                 )
-        if mode in ("truncated-generation", "replaced-generation"):
+        if mode in (
+            "truncated-generation",
+            "truncated-during-drain-generation",
+            "replaced-generation",
+        ):
             generations = {row[7] for row in attached_records if len(row) >= 8}
             if len(generations) != 2:
                 raise AssertionError(
@@ -454,9 +469,11 @@ def run_one(args, tmpdir, mode):
         diagnostics, "jit_allocation_failure"
     ) != 1:
         raise AssertionError(f"missing allocation-failure diagnostic: {diagnostics}")
-    if mode in ("truncated-generation", "replaced-generation") and diagnostic_int(
-        diagnostics, "jit_provider_generation"
-    ) < 2:
+    if mode in (
+        "truncated-generation",
+        "truncated-during-drain-generation",
+        "replaced-generation",
+    ) and diagnostic_int(diagnostics, "jit_provider_generation") < 2:
         raise AssertionError(f"provider generation did not advance: {diagnostics}")
     if expects_positive_count(mode):
         if stats_csv is None:
@@ -522,6 +539,7 @@ def main():
             "attach-retry-timeout",
             "shutdown-full-queue",
             "truncated-generation",
+            "truncated-during-drain-generation",
             "replaced-generation",
         ),
         default="both",
