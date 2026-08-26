@@ -491,10 +491,10 @@ pthread_listener_init(PthreadListener* self)
 static int (*original_pthread_join)(pthread_t thread, void **retval);
 static int (*original_pthread_detach)(pthread_t thread);
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
 static void
 pthread_listener_test_pause_join_detach_after_capture(gboolean captured)
 {
-#ifdef PEAK_ENABLE_TEST_HOOKS
     if (captured &&
         atomic_load_explicit(&pthread_test_join_detach_race_enabled,
                              memory_order_acquire) != 0) {
@@ -505,10 +505,8 @@ pthread_listener_test_pause_join_detach_after_capture(gboolean captured)
             sched_yield();
         }
     }
-#else
-    (void)captured;
-#endif
 }
+#endif
 
 static gboolean
 pthread_listener_capture_thread_token(pthread_t thread,
@@ -546,7 +544,9 @@ peak_pthread_join(pthread_t thread, void **retval)
     uint64_t generation = 0;
     gboolean captured =
         pthread_listener_capture_thread_token(thread, &slot, &generation);
+#ifdef PEAK_ENABLE_TEST_HOOKS
     pthread_listener_test_pause_join_detach_after_capture(captured);
+#endif
     int ret = original_pthread_join(thread, retval);
     if (ret == 0 && captured) {
         PeakPthreadSlotToken token = {
@@ -577,7 +577,9 @@ peak_pthread_detach(pthread_t thread)
         peak_pthread_slot_registry_capture(&pthread_slot_registry,
                                             thread,
                                             &token);
+#ifdef PEAK_ENABLE_TEST_HOOKS
     pthread_listener_test_pause_join_detach_after_capture(captured);
+#endif
     int ret = original_pthread_detach(thread);
 
     if (ret == 0 && captured) {
