@@ -29,6 +29,10 @@ foreach(line IN LISTS symbol_lines)
         message(FATAL_ERROR
             "installed PEAK DSO exports private Frida Gum symbol ${symbol}")
     endif()
+    if(symbol MATCHES "^(OTF2_|otf2_)")
+        message(FATAL_ERROR
+            "installed PEAK DSO exports private OTF2 symbol ${symbol}")
+    endif()
     if(symbol MATCHES
        "^(peak_.*_test_|peak_test_|pthread_listener_test_|dlopen_interceptor_test_|mpi_interceptor_test_)")
         message(FATAL_ERROR

@@ -171,13 +171,23 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
 else()
     target_link_libraries(peak PRIVATE ${FRIDA_GUM_LIBRARIES})
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
-        foreach(_peak_gum_archive IN LISTS FRIDA_GUM_LIBRARIES)
-            get_filename_component(
-                _peak_gum_archive_name "${_peak_gum_archive}" NAME)
-            target_link_options(peak PRIVATE
-                "LINKER:--exclude-libs,${_peak_gum_archive_name}")
-        endforeach()
+        # Static archives are private implementation dependencies of this
+        # preloaded DSO and must not become part of its dynamic ABI.
+        target_link_options(peak PRIVATE "LINKER:--exclude-libs,ALL")
     endif()
+endif()
+
+set(_peak_otf2_link_libraries ${OTF2_LIBRARIES})
+if(NOT (BUILD_TESTS OR BUILD_TESTING) AND
+   CMAKE_SYSTEM_NAME MATCHES "Darwin")
+    foreach(_peak_otf2_library IN LISTS OTF2_LIBRARIES)
+        if(_peak_otf2_library MATCHES "\\.a$")
+            target_link_options(peak PRIVATE
+                "LINKER:-load_hidden,${_peak_otf2_library}")
+            list(REMOVE_ITEM _peak_otf2_link_libraries
+                "${_peak_otf2_library}")
+        endif()
+    endforeach()
 endif()
 
 target_link_libraries(peak
@@ -187,7 +197,7 @@ target_link_libraries(peak
         ${RT_LIBRARY}
         ${RESOLV_LIBRARY}
         ${M_LIBRARY}
-        ${OTF2_LIBRARIES}
+        ${_peak_otf2_link_libraries}
 )
 
 if(PEAK_CUDA_ENABLED)
