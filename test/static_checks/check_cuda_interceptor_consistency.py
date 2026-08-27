@@ -1081,9 +1081,11 @@ def main():
             "missing epoch-based lifecycle reader gate")
     require("static gboolean peak_cuda_hooks_reverted" in cuda,
             "missing physical-detach state flag")
+    mapping_factory = function_body(cuda, "peak_cuda_create_kernel_mapping")
     require(re.search(
                 r'g_hash_table_new_full\(\s*g_str_hash,\s*str_equal_function,'
-                r'\s*g_free,\s*g_free\)', attach) is not None and
+                r'\s*g_free,\s*g_free\)', mapping_factory) is not None and
+            "peak_cuda_create_kernel_mapping()" in attach and
             re.search(
                 r'g_hash_table_new_full\(\s*peak_cuda_graph_key_hash,'
                 r'\s*peak_cuda_graph_key_equal,\s*g_free,\s*g_free\)',
@@ -1168,13 +1170,13 @@ def main():
     require("set(PEAK_CUDA_TOOLKIT_FOUND OFF)" in root_cmake and
             "peak_cuda_evaluate_capability(" in root_cmake and
             "add_compile_definitions(HAVE_CUDA=1)" in root_cmake and
-            "find_dependency(CUDAToolkit 11.2)" in package_config and
             'set(PEAK_CUDA_ENABLED "@PEAK_CUDA_ENABLED@")' in
             package_config and
+            "find_dependency(CUDAToolkit" not in package_config and
             "CUDA_FOUND" not in package_config and
             "CUDAToolkit_FOUND" not in package_config,
-            "configured and installed CUDA metadata must use the validated "
-            "capability instead of stale package finder results")
+            "installed CUDA metadata must report the validated private "
+            "capability without exporting toolkit discovery")
     cpu_capture = function_body(
         general_source, "peak_general_listener_print_with_mpi_job_policy")
     require_order(cpu_capture,

@@ -407,6 +407,29 @@ test_slot_allocator_rejects_stale_and_double_release()
 }
 
 static int
+test_slot_allocator_large_pool_release_is_bounded()
+{
+    constexpr std::size_t kCapacity = 65536;
+    PeakCudaSlotAllocator allocator(kCapacity);
+    std::vector<PeakCudaSlotLease> leases(kCapacity);
+
+    for (std::size_t index = 0; index < kCapacity; ++index) {
+        if (!allocator.acquire(7, index, &leases[index])) {
+            return 1;
+        }
+    }
+    for (const PeakCudaSlotLease& lease : leases) {
+        if (!allocator.release(lease)) {
+            return 1;
+        }
+    }
+    PeakCudaSlotAllocatorCounters counters = allocator.counters();
+    return counters.capacity != kCapacity ||
+           counters.active_slots != 0 ||
+           counters.high_water_slots != kCapacity;
+}
+
+static int
 test_slot_allocator_admission_close_is_fail_open()
 {
     PeakCudaSlotAllocator allocator(1);
@@ -576,6 +599,7 @@ main()
         test_slot_allocator_partitions_contexts_and_reuses_slots() != 0 ||
         test_slot_allocator_bounds_exhaustion_and_reset() != 0 ||
         test_slot_allocator_rejects_stale_and_double_release() != 0 ||
+        test_slot_allocator_large_pool_release_is_bounded() != 0 ||
         test_slot_allocator_admission_close_is_fail_open() != 0 ||
         test_explicit_lifecycle_counters() != 0 ||
         test_concurrent_counters_are_exact() != 0 ||

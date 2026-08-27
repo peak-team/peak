@@ -42,7 +42,17 @@ def main() -> int:
     module_dir = root / "src" / "general_listener"
     module_headers = root / "include" / "internal" / "general_listener"
     source_text = source.read_text(encoding="utf-8")
+    peak_source_text = (root / "src" / "peak.c").read_text(encoding="utf-8")
+    listener_header_text = (
+        root / "include" / "general_listener.h"
+    ).read_text(encoding="utf-8")
     errors = []
+
+    if ("peak_target_thread_called" in peak_source_text or
+            "target_thread_called" in source_text or
+            "target_thread_called" in listener_header_text):
+        errors.append(
+            "dead target-by-thread storage was restored")
 
     misplaced_headers = sorted(
         path.relative_to(root)

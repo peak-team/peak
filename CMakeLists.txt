@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(peak LANGUAGES C CXX)
+project(peak VERSION 1.0.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CheckIncludeFile)
@@ -277,9 +277,9 @@ endif()
 
 include(CMakePackageConfigHelpers)
 set(PEAK_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/PEAK")
-set(PEAK_CUDA_PACKAGE_REQUIRES_CUDATOOLKIT OFF)
-if(PEAK_CUDA_ENABLED AND TARGET CUDA::cudart)
-    set(PEAK_CUDA_PACKAGE_REQUIRES_CUDATOOLKIT ON)
+set(PEAK_MPI_PACKAGE_ENABLED OFF)
+if(MPI_FOUND)
+    set(PEAK_MPI_PACKAGE_ENABLED ON)
 endif()
 install(EXPORT PEAKTargets
     FILE PEAKTargets.cmake
@@ -289,6 +289,20 @@ configure_package_config_file(
     ${PROJECT_SOURCE_DIR}/cmake/PEAKConfig.cmake.in
     ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
     INSTALL_DESTINATION ${PEAK_CMAKE_INSTALL_DIR})
+write_basic_package_version_file(
+    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
 install(FILES
     ${PROJECT_BINARY_DIR}/PEAKConfig.cmake
+    ${PROJECT_BINARY_DIR}/PEAKConfigVersion.cmake
     DESTINATION ${PEAK_CMAKE_INSTALL_DIR})
+install(FILES
+    ${PROJECT_SOURCE_DIR}/README.md
+    ${PROJECT_SOURCE_DIR}/LICENSE
+    DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES
+    ${PROJECT_SOURCE_DIR}/docs/package-contract.md
+    ${PROJECT_SOURCE_DIR}/docs/patched-frida-gum.md
+    ${PROJECT_SOURCE_DIR}/docs/releasing.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs)

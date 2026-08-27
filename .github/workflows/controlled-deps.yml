@@ -48,6 +48,9 @@ jobs:
           export all_proxy="$ALL_PROXY"
           export http_proxy="$HTTP_PROXY"
           export https_proxy="$HTTPS_PROXY"
+          cmake -E copy \
+            ${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a \
+            ${{ github.workspace }}/bootstrap/frida-gum-peak-patched/peak-private-gum.a
           cmake -S . -B offline \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed \
             -DCMAKE_INSTALL_BINDIR=libexec \
@@ -57,7 +60,7 @@ jobs:
             -DBUILD_CUDA_PROFILE=OFF \
             -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
             -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
-            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/peak-private-gum.a
           cmake --build offline
       - name: Install and consume the CMake package
         run: |
@@ -65,22 +68,118 @@ jobs:
           test -x installed/libexec/peak_detach_helper
           installed/libexec/peak_detach_helper --self-test
           strings installed/lib*/libpeak.so | grep -F "${{ github.workspace }}/installed/libexec/peak_detach_helper"
-          cmake -S test/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed -DPEAK_SOURCE_DIR=${{ github.workspace }}
+          test -f installed/lib*/cmake/PEAK/PEAKConfigVersion.cmake
+          test -f installed/share/doc/peak/docs/package-contract.md
+          readelf -d installed/lib*/libpeak.so.1.0.0 | \
+            grep -E 'SONAME.*\[libpeak.so.1\]'
+          cmake -S test/package_consumer -B package-consumer \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed \
+            -DPEAK_EXPECT_MPI_ENABLED=OFF \
+            -DPEAK_EXPECT_OTF2_ENABLED=OFF \
+            -DPEAK_EXPECT_CUDA_ENABLED=OFF
           cmake --build package-consumer
+          ctest --test-dir package-consumer --output-on-failure
+          if cmake -S test/package_consumer \
+            -B package-consumer-incompatible-newer \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed \
+            -DPEAK_REQUIRED_VERSION=2; then
+            echo "PEAK 1 package unexpectedly accepted a 2.x request"
+            exit 1
+          fi
+          if cmake -S test/package_consumer \
+            -B package-consumer-incompatible-older \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed \
+            -DPEAK_REQUIRED_VERSION=0.9; then
+            echo "PEAK 1 package unexpectedly accepted a 0.x request"
+            exit 1
+          fi
+          if cmake -S test/package_consumer \
+            -B package-consumer-unsupported-component \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed \
+            -DPEAK_REQUIRED_COMPONENTS=CUDA; then
+            echo "PEAK package unexpectedly accepted an unsupported component"
+            exit 1
+          fi
       - name: Build with the controlled system OTF2 prefix
-        run: >
-          cmake -S . -B system-otf2
-          -DPEAK_FETCH_DEPS=OFF
-          -DPEAK_ENABLE_OTF2=ON
-          -DPEAK_USE_SYSTEM_OTF2=ON
-          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/bootstrap/otf2
-          -DPEAK_ENABLE_MPI=OFF
-          -DBUILD_CUDA_PROFILE=OFF
-          -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit
-          -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched
-          -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
-      - run: cmake --build system-otf2
+        run: |
+          cmake -S . -B system-otf2 \
+            -DPEAK_FETCH_DEPS=OFF \
+            -DPEAK_ENABLE_OTF2=ON \
+            -DPEAK_USE_SYSTEM_OTF2=ON \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/bootstrap/otf2 \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DBUILD_CUDA_PROFILE=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=${{ github.workspace }}/bootstrap/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=${{ github.workspace }}/bootstrap/frida-gum-peak-patched/libfrida-gum.a
+          cmake --build system-otf2
       - name: Assert system OTF2 came from the controlled prefix
         run: |
           grep -F "OTF2_LIBRARY:FILEPATH=${{ github.workspace }}/bootstrap/otf2/lib/libotf2.a" system-otf2/CMakeCache.txt
           grep -F "OTF2_INCLUDE_DIR:PATH=${{ github.workspace }}/bootstrap/otf2/include" system-otf2/CMakeCache.txt
+          cmake --install system-otf2 --prefix ${{ github.workspace }}/installed-otf2
+          cmake -S test/package_consumer -B package-consumer-otf2 \
+            -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed-otf2 \
+            -DPEAK_EXPECT_MPI_ENABLED=OFF \
+            -DPEAK_EXPECT_OTF2_ENABLED=ON \
+            -DPEAK_EXPECT_CUDA_ENABLED=OFF
+          cmake --build package-consumer-otf2
+          ctest --test-dir package-consumer-otf2 --output-on-failure
+
+  cuda-production-package:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+            build-essential ca-certificates cmake git libopenblas-dev \
+            python3
+      - uses: actions/checkout@v4
+      - name: Build and install production CUDA package
+        run: |
+          cmake -S . -B cuda-package \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$PWD/installed-cuda \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DPEAK_ENABLE_OTF2=OFF \
+            -DBUILD_CUDA_PROFILE=ON
+          cmake --build cuda-package --parallel
+          cmake --install cuda-package
+          grep -F 'set(PEAK_CUDA_ENABLED "ON")' \
+            installed-cuda/lib*/cmake/PEAK/PEAKConfig.cmake
+      - name: Execute installed CUDA package contract without Toolkit discovery
+        run: |
+          cmake -S test/package_consumer -B package-consumer-cuda \
+            -DCMAKE_PREFIX_PATH=$PWD/installed-cuda \
+            -DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=TRUE \
+            -DPEAK_EXPECT_MPI_ENABLED=OFF \
+            -DPEAK_EXPECT_OTF2_ENABLED=OFF \
+            -DPEAK_EXPECT_CUDA_ENABLED=ON
+          cmake --build package-consumer-cuda
+          ctest --test-dir package-consumer-cuda --output-on-failure
+      - name: Verify CUDA aggregate key lifetime under ASan and LSan
+        run: |
+          cmake -S . -B cuda-sanitizer \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS=-fsanitize=address \
+            -DCMAKE_CXX_FLAGS=-fsanitize=address \
+            -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address \
+            -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address \
+            -DBUILD_TESTING=ON \
+            -DPEAK_BUILD_DYNAMIC_LIB_TESTS=OFF \
+            -DPEAK_FETCH_DEPS=OFF \
+            -DPEAK_FRIDA_GUM_PROVIDER=patched-devkit \
+            -DPEAK_PATCHED_GUM_INCLUDE_DIR=$PWD/cuda-package/frida-gum-peak-patched \
+            -DPEAK_PATCHED_GUM_LIBRARY=$PWD/cuda-package/frida-gum-peak-patched/libfrida-gum.a \
+            -DPEAK_ENABLE_MPI=OFF \
+            -DPEAK_ENABLE_OTF2=OFF \
+            -DBUILD_CUDA_PROFILE=ON
+          cmake --build cuda-sanitizer --parallel 2 \
+            --target peak test_cuda_key_lifetime
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+            ctest --test-dir cuda-sanitizer \
+              -R '^test_cuda_key_lifetime$' --output-on-failure
