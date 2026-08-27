@@ -190,8 +190,15 @@ configured `${CMAKE_INSTALL_BINDIR}/peak_detach_helper` path (by default,
 `bin/peak_detach_helper`). Set `PEAK_DETACH_HELPER` when a package layout
 requires a different helper path.
 
-Installed CMake consumers can use `find_package(PEAK CONFIG REQUIRED)` and link
-`PEAK::peak`.
+Installed CMake consumers can use `find_package(PEAK 1 CONFIG REQUIRED)` and
+resolve the production DSO as `$<TARGET_FILE:PEAK::peak>` for
+`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`. `PEAK::peak` is intentionally an
+artifact-only preload target; consumers must not rely on ordinary linking to
+retain a DSO whose symbols they do not reference. PEAK does not install a
+general public C/C++ header API, and its MPI, CUDA, OTF2, and Frida Gum
+dependencies remain private. PEAK 1.x package compatibility follows the
+stable major release series. See
+[the installed package contract](docs/package-contract.md).
 
 ## Essential Usage
 

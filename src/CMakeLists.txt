@@ -83,6 +83,9 @@ list(APPEND sources_peak
 )
 
 add_library(peak SHARED ${sources_peak})
+set_target_properties(peak PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR})
 
 add_executable(peak_inspect_symbols
     peak_inspect_symbols.c
@@ -155,9 +158,30 @@ target_compile_definitions(cuda_interceptor_obj PRIVATE
     $<$<BOOL:${PEAK_CUDA_HAS_DRIVER_LAUNCH_EX}>:PEAK_CUDA_COMPILE_DRIVER_LAUNCH_EX=1>)
 endif()
 
+if(BUILD_TESTS OR BUILD_TESTING)
+    # Internal integration tests share the test-enabled DSO's Gum runtime.
+    # This artifact also exports PEAK test hooks and is never installed as a
+    # production package by the package-contract jobs below.
+    target_link_libraries(peak PRIVATE ${FRIDA_GUM_LIBRARIES})
+elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+    foreach(_peak_gum_archive IN LISTS FRIDA_GUM_LIBRARIES)
+        target_link_options(peak PRIVATE
+            "LINKER:-load_hidden,${_peak_gum_archive}")
+    endforeach()
+else()
+    target_link_libraries(peak PRIVATE ${FRIDA_GUM_LIBRARIES})
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        foreach(_peak_gum_archive IN LISTS FRIDA_GUM_LIBRARIES)
+            get_filename_component(
+                _peak_gum_archive_name "${_peak_gum_archive}" NAME)
+            target_link_options(peak PRIVATE
+                "LINKER:--exclude-libs,${_peak_gum_archive_name}")
+        endforeach()
+    endif()
+endif()
+
 target_link_libraries(peak
     PRIVATE
-        ${FRIDA_GUM_LIBRARIES}
         Threads::Threads
         ${DL_LIBRARY}
         ${RT_LIBRARY}

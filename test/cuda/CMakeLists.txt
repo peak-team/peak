@@ -86,6 +86,12 @@ add_executable(test_optional_backend_gating
     test_optional_backend_gating.c)
 set_target_properties(test_optional_backend_gating PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(test_optional_backend_gating PRIVATE ${CMAKE_DL_LIBS})
+add_executable(test_cuda_key_lifetime test_key_lifetime.c)
+target_link_libraries(test_cuda_key_lifetime PRIVATE peak)
+add_test(NAME test_cuda_key_lifetime COMMAND test_cuda_key_lifetime)
+set_tests_properties(test_cuda_key_lifetime PROPERTIES
+    PASS_REGULAR_EXPRESSION "cuda_key_lifetime_ok"
+    TIMEOUT 15)
 if (PEAK_CUDA_DRIVER_TEST_LIBRARY)
     peak_add_cuda_fixture(benchmark_cuda_launch_overhead
         benchmark_launch_overhead.cu

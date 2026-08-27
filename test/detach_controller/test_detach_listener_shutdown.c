@@ -15,7 +15,6 @@
 gboolean* peak_need_detach;
 gboolean* peak_detached;
 gdouble* heartbeat_overhead;
-gboolean** peak_target_thread_called;
 size_t peak_hook_address_count;
 char** peak_hook_strings;
 gulong peak_max_num_threads;
@@ -359,12 +358,6 @@ print_rank_local_mpi_fixture_report(gboolean active_mpi_job,
 static void
 cleanup_public_listener_globals(void)
 {
-    if (peak_target_thread_called != NULL) {
-        for (size_t i = 0; i < peak_hook_address_count; i++) {
-            g_free(peak_target_thread_called[i]);
-        }
-        g_free(peak_target_thread_called);
-    }
     g_free(peak_need_detach);
     g_free(peak_detached);
     if (peak_hook_strings != NULL) {
@@ -374,7 +367,6 @@ cleanup_public_listener_globals(void)
         g_free(peak_hook_strings);
     }
 
-    peak_target_thread_called = NULL;
     peak_need_detach = NULL;
     peak_detached = NULL;
     peak_hook_strings = NULL;
@@ -414,8 +406,6 @@ setup_public_listener_fixture(char* log_template,
     peak_hook_strings[0] = g_strdup("strict_helper_target");
     peak_need_detach = g_new0(gboolean, 1);
     peak_detached = g_new0(gboolean, 1);
-    peak_target_thread_called = g_new0(gboolean*, 1);
-    peak_target_thread_called[0] = g_new0(gboolean, peak_max_num_threads);
     peak_main_time = 0.0;
     peak_detach_cost = 0.0f;
     heartbeat_time = 0;
@@ -982,8 +972,7 @@ run_general_listener_mapping_lifecycle(void)
                listener->fast_stats_errno == ENOMEM);
     check_true("first mapping failure has no aliases",
                listener->num_calls == NULL &&
-                   listener->checkpoint_shadow == NULL &&
-                   listener->target_thread_called == NULL);
+                   listener->checkpoint_shadow == NULL);
     peak_general_listener_free(listener);
     g_object_unref(base);
 

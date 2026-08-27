@@ -125,7 +125,9 @@ if(BUILD_TESTING)
     target_link_libraries(test_cuda_profiler_state PRIVATE Threads::Threads)
     add_test(NAME test_cuda_profiler_state COMMAND test_cuda_profiler_state)
     set_tests_properties(test_cuda_profiler_state
-        PROPERTIES PASS_REGULAR_EXPRESSION "cuda_profiler_state_test_ok")
+        PROPERTIES
+            PASS_REGULAR_EXPRESSION "cuda_profiler_state_test_ok"
+            TIMEOUT 10)
 
     add_executable(test_cuda_identity_cache_benchmark
         cuda_identity_cache_benchmark.cpp

@@ -59,3 +59,40 @@ jobs:
       # Execute tests defined by the CMake configuration. Note that --build-config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
       run: ctest --build-config ${{ matrix.build_type }} -LE "(benchmark|stress)" -V
+
+
+  production-package:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup MPICH
+      uses: mpi4py/setup-mpi@v1
+      with:
+        mpi: mpich
+    - name: Configure production MPI package
+      run: >
+        cmake -S . -B mpi-package
+        -DCMAKE_C_COMPILER=mpicc
+        -DCMAKE_CXX_COMPILER=mpicxx
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/installed-mpi
+        -DBUILD_TESTS=OFF
+        -DBUILD_TESTING=OFF
+        -DPEAK_ENABLE_MPI=ON
+        -DPEAK_ENABLE_OTF2=OFF
+        -DBUILD_CUDA_PROFILE=OFF
+    - name: Build and install production MPI package
+      run: |
+        cmake --build mpi-package --parallel
+        cmake --install mpi-package
+    - name: Execute installed MPI package contract
+      run: |
+        cmake -S test/package_consumer -B package-consumer-mpi \
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed-mpi \
+          -DCMAKE_DISABLE_FIND_PACKAGE_MPI=TRUE \
+          -DPEAK_EXPECT_MPI_ENABLED=ON \
+          -DPEAK_EXPECT_OTF2_ENABLED=OFF \
+          -DPEAK_EXPECT_CUDA_ENABLED=OFF
+        cmake --build package-consumer-mpi
+        ctest --test-dir package-consumer-mpi --output-on-failure

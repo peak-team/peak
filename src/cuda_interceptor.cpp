@@ -1135,6 +1135,13 @@ gboolean str_equal_function(gconstpointer a, gconstpointer b) {
     return g_strcmp0((const gchar *)a, (const gchar *)b) == 0;
 }
 
+static GHashTable*
+peak_cuda_create_kernel_mapping()
+{
+    return g_hash_table_new_full(
+        g_str_hash, str_equal_function, g_free, g_free);
+}
+
 char* cu_demangle(char* mangled_name);
 
 static const PeakCudaKernelIdentity*
@@ -3405,8 +3412,7 @@ extern "C" int cuda_interceptor_attach()
     if (!peak_cuda_destroy_event_pool()) {
         return -1;
     }
-    cuda_kernel_local_dim_mapping = g_hash_table_new_full(
-        g_str_hash, str_equal_function, g_free, g_free);
+    cuda_kernel_local_dim_mapping = peak_cuda_create_kernel_mapping();
     g_mutex_init(&cuda_kernel_local_dim_mapping_mutex);
     cuda_graph_local_mapping = g_hash_table_new_full(
         peak_cuda_graph_key_hash, peak_cuda_graph_key_equal, g_free, g_free);
@@ -4368,6 +4374,33 @@ peak_cuda_render_report_snapshot(const PeakReportSnapshot* snapshot)
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_CUDA_WRAPPER_EXPORT int
+peak_cuda_test_kernel_mapping_lifetime(size_t count)
+{
+    gum_init_embedded();
+    GHashTable* mapping = peak_cuda_create_kernel_mapping();
+    if (mapping == NULL) {
+        gum_deinit_embedded();
+        return 1;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        gchar* key = g_strdup_printf("peak_cuda_test_kernel_%zu", index);
+        KernelDimInfo* value = g_try_new0(KernelDimInfo, 1);
+        if (key == NULL || value == NULL) {
+            g_free(key);
+            g_free(value);
+            g_hash_table_destroy(mapping);
+            gum_deinit_embedded();
+            return 1;
+        }
+        g_hash_table_insert(mapping, key, value);
+    }
+    const gboolean complete = g_hash_table_size(mapping) == count;
+    g_hash_table_destroy(mapping);
+    gum_deinit_embedded();
+    return complete ? 0 : 1;
+}
+
 PEAK_CUDA_WRAPPER_EXPORT void
 peak_cuda_test_force_incomplete_events(int enabled)
 {

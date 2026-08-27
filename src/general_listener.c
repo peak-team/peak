@@ -4744,9 +4744,6 @@ peak_general_listener_retire_listener_slot(PeakGeneralListener* listener,
     *peak_general_listener_exclusive_time_slot(listener, slot) = 0.0;
     *peak_general_listener_max_time_slot(listener, slot) = 0.0f;
     *peak_general_listener_min_time_slot(listener, slot) = 0.0f;
-    if (listener->target_thread_called != NULL) {
-        listener->target_thread_called[slot] = FALSE;
-    }
     gboolean checkpoint_reset_safe = TRUE;
     if (listener->checkpoint_shadow != NULL) {
         PeakGeneralListenerCheckpointShadow* shadow =
@@ -6857,7 +6854,6 @@ peak_general_listener_init(PeakGeneralListener* self)
         self->min_time = NULL;
         self->checkpoint_shadow = NULL;
         self->checkpoint_shadow_mapping_size = 0;
-        self->target_thread_called = NULL;
         return;
     }
     self->checkpoint_shadow = NULL;
@@ -6880,7 +6876,6 @@ peak_general_listener_init(PeakGeneralListener* self)
             }
         }
     }
-    self->target_thread_called = g_new0(gboolean, total_count);
 }
 
 void
@@ -6905,8 +6900,6 @@ peak_general_listener_free(PeakGeneralListener* self)
     }
     self->checkpoint_shadow = NULL;
     self->checkpoint_shadow_mapping_size = 0;
-    g_free(self->target_thread_called);
-    self->target_thread_called = NULL;
     if (self->retired_mutex_initialized) {
         g_mutex_clear(&self->retired_mutex);
         self->retired_mutex_initialized = FALSE;

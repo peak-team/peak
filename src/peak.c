@@ -77,8 +77,6 @@
 gboolean* peak_need_detach;
 gboolean* peak_detached;
 gdouble* heartbeat_overhead;
-gboolean** peak_target_thread_called;
-static size_t peak_target_thread_called_count;
 PeakHeartbeatArgs* args;
 extern _Atomic gboolean heartbeat_running;
 pthread_t heartbeat_thread;
@@ -452,9 +450,7 @@ static _Atomic int peak_test_fail_heartbeat_create = 0;
 PEAK_API int
 peak_test_cpu_target_storage_allocated(void)
 {
-    return peak_target_thread_called != NULL ||
-           peak_target_thread_called_count != 0 ||
-           peak_need_detach != NULL || peak_detached != NULL;
+    return peak_need_detach != NULL || peak_detached != NULL;
 }
 
 void
@@ -1409,13 +1405,6 @@ peak_activate_runtime(void)
 #endif
     /* General-listener hooks depend on pthread and MPI interception setup. */
     if (peak_requested_work.cpu) {
-        peak_target_thread_called =
-            g_new0(gboolean*, peak_hook_address_count);
-        peak_target_thread_called_count = peak_hook_address_count;
-        for (gint i = 0; i < peak_hook_address_count; i++) {
-            peak_target_thread_called[i] =
-                g_new0(gboolean, peak_max_num_threads);
-        }
         peak_need_detach = g_new0(gboolean, peak_hook_address_count);
         peak_detached = g_new0(gboolean, peak_hook_address_count);
     }
@@ -2277,12 +2266,6 @@ peak_fini_impl(void)
     }
     free_parsed_result(peak_hook_strings, peak_hook_address_count);
     if (general_listener_shutdown_flushed) {
-        for (size_t i = 0; i < peak_target_thread_called_count; i++) {
-            g_free(peak_target_thread_called[i]);
-        }
-        g_free(peak_target_thread_called);
-        peak_target_thread_called = NULL;
-        peak_target_thread_called_count = 0;
         g_free(peak_need_detach);
         g_free(peak_detached);
     } else {

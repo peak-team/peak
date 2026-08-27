@@ -88,6 +88,18 @@ jobs:
     - name: Install
       run: cmake --install ${{ github.workspace }}/build
 
+    - name: Verify installed package and Mach-O identity
+      run: |
+        otool -D installed/lib/libpeak.1.0.0.dylib | \
+          grep -E '(^|/)libpeak\.1\.dylib$'
+        cmake -S test/package_consumer -B package-consumer \
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/installed \
+          -DPEAK_EXPECT_MPI_ENABLED=OFF \
+          -DPEAK_EXPECT_OTF2_ENABLED=OFF \
+          -DPEAK_EXPECT_CUDA_ENABLED=OFF
+        cmake --build package-consumer
+        ctest --test-dir package-consumer --output-on-failure
+
     - name: Test DYLD injection
       run: |
         cc -dynamiclib test/macos/smoke_target.c \
