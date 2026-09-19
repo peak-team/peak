@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "internal/general_listener/socket_report_transport.h"
 
+#include "internal/exec_raw_syscall.h"
 #include "internal/general_listener/report_maxima.h"
 #include "internal/general_listener/report_model.h"
 #include "internal/general_listener/runtime_config.h"
@@ -20,8 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#if PEAK_HAVE_SYS_RANDOM_H
-#include <sys/random.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
 #endif
 #include <sys/resource.h>
 #include <sys/time.h>
@@ -430,11 +431,18 @@ peak_socket_reduce_session_nonce(uint64_t* nonce_out)
         return false;
     }
 #endif
-#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)
+#if defined(__linux__) && defined(SYS_getrandom)
     while (remaining != 0) {
-        ssize_t read_bytes;
+        long read_bytes;
         do {
-            read_bytes = getrandom(cursor, remaining, GRND_NONBLOCK);
+            read_bytes = peak_exec_raw_syscall6(
+                SYS_getrandom,
+                (long)(uintptr_t)cursor,
+                (long)remaining,
+                0x0001u /* GRND_NONBLOCK */,
+                0,
+                0,
+                0);
         } while (read_bytes < 0 && errno == EINTR);
         if (read_bytes <= 0) {
             break;

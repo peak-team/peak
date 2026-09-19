@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "internal/general_listener/output_identity.h"
+#include "internal/exec_raw_syscall.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,8 +16,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#if PEAK_HAVE_SYS_RANDOM_H
-#include <sys/random.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
 #endif
 
 enum { PEAK_OUTPUT_HOST_CAPACITY = 256, PEAK_OUTPUT_SESSION_CAPACITY = 17 };
@@ -73,12 +74,19 @@ peak_output_identity_session_once(void)
         remaining = sizeof(peak_output_session);
     } else {
 #endif
-#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)
+#if defined(__linux__) && defined(SYS_getrandom)
     while (remaining != 0) {
-        ssize_t read_bytes;
+        long read_bytes;
 
         do {
-            read_bytes = getrandom(cursor, remaining, GRND_NONBLOCK);
+            read_bytes = peak_exec_raw_syscall6(
+                SYS_getrandom,
+                (long)(uintptr_t)cursor,
+                (long)remaining,
+                0x0001u /* GRND_NONBLOCK */,
+                0,
+                0,
+                0);
         } while (read_bytes < 0 && errno == EINTR);
         if (read_bytes <= 0) {
             break;
@@ -86,8 +94,6 @@ peak_output_identity_session_once(void)
         cursor += read_bytes;
         remaining -= (size_t)read_bytes;
     }
-#else
-    (void)cursor;
 #endif
 #ifdef PEAK_ENABLE_TEST_HOOKS
     }

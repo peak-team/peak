@@ -17,7 +17,6 @@ def main():
     parser.add_argument("repo_root", type=pathlib.Path)
     parser.add_argument("--library", type=pathlib.Path, required=True)
     parser.add_argument("--nm", required=True)
-    parser.add_argument("--expect-getrandom", action="store_true")
     args = parser.parse_args()
 
     for relative in (
@@ -26,23 +25,35 @@ def main():
     ):
         source = (args.repo_root / relative).read_text(encoding="utf-8")
         require(
-            re.search(
-                r"#if PEAK_HAVE_SYS_RANDOM_H\s*\n"
-                r"#include <sys/random\.h>\s*\n#endif",
-                source,
-            ),
-            f"{relative} must include sys/random.h before testing GRND_NONBLOCK",
+            '#include "internal/exec_raw_syscall.h"' in source,
+            f"{relative} must use PEAK's raw syscall primitive for entropy",
         )
         require(
-            "#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)\n"
-            in source,
-            f"{relative} getrandom call must retain the GRND_NONBLOCK guard",
+            "#include <sys/syscall.h>" in source,
+            f"{relative} must include Linux syscall numbers",
         )
         require(
-            "#if PEAK_HAVE_SYS_RANDOM_H && defined(GRND_NONBLOCK)\n"
-            "#include <sys/random.h>" not in source,
-            f"{relative} must not test a header-provided macro before inclusion",
+            "#if defined(__linux__) && defined(SYS_getrandom)\n" in source,
+            f"{relative} must guard the getrandom syscall for old kernel headers",
         )
+        require(
+            "peak_exec_raw_syscall6(" in source,
+            f"{relative} must issue getrandom without a libc wrapper",
+        )
+        require(
+            re.search(r"\bgetrandom\s*\(", source) is None,
+            f"{relative} must not call libc getrandom()",
+        )
+        require(
+            "PEAK_HAVE_SYS_RANDOM_H" not in source,
+            f"{relative} must not restore the libc-header getrandom probe",
+        )
+
+    root_cmake = (args.repo_root / "CMakeLists.txt").read_text(encoding="utf-8")
+    require(
+        "PEAK_HAVE_SYS_RANDOM_H" not in root_cmake,
+        "root CMake must not gate runtime compatibility on sys/random.h",
+    )
 
     cmake = (args.repo_root / "src/CMakeLists.txt").read_text(encoding="utf-8")
     require(
@@ -74,18 +85,17 @@ def main():
         "Linux must retain its original linux/limits.h include",
     )
 
-    if args.expect_getrandom:
-        symbols = subprocess.run(
-            [args.nm, "-D", str(args.library)],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ).stdout
-        require(
-            re.search(r"\bU\s+getrandom(?:@|\s|$)", symbols),
-            "built Linux libpeak must retain the getrandom fast path",
-        )
+    symbols = subprocess.run(
+        [args.nm, "-D", str(args.library)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+    require(
+        re.search(r"\bU\s+getrandom(?:@|\s|$)", symbols) is None,
+        "built Linux libpeak must not depend on libc getrandom",
+    )
 
     print("linux_behavior_contract_ok")
 

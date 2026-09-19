@@ -570,10 +570,6 @@ if(BUILD_TESTING)
             ${PROJECT_SOURCE_DIR}
             --library $<TARGET_FILE:peak>
             --nm ${CMAKE_NM})
-        if(PEAK_HAVE_SYS_RANDOM_H)
-            list(APPEND _peak_linux_behavior_contract_args
-                --expect-getrandom)
-        endif()
         add_test(NAME test_linux_behavior_contract
             COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/static_checks/check_linux_behavior_contract.py
