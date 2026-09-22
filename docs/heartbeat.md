@@ -514,7 +514,7 @@ The defaults below describe the current implementation.
 | `PEAK_GLOBAL_DETACH_FACTOR` | `1.2` | Global detach hysteresis multiplier. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | `0.85` | Reattach spent-risk gate multiplier. |
 | `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | `false` | Enables per-target heartbeat detach and per-target reattach eligibility. |
-| `PEAK_ENABLE_GLOBAL_HEARTBEAT` | `false` | Enables global heartbeat detach and global reattach eligibility. |
+| `PEAK_ENABLE_GLOBAL_HEARTBEAT` | `true` | Enables global heartbeat detach and global reattach eligibility. Set `0` or `false` to disable. |
 | `PEAK_ENABLE_REATTACH` | enabled when unset | Enables heartbeat reattach when other cadence/policy gates are satisfied. Set false/0 to disable. |
 | `PEAK_REATTACH_COOLDOWN_MS` | `60000` | Minimum time after successful detach before heartbeat may reattach that hook. `0` disables cooldown. |
 | `PEAK_HB_MIN_US` | `10000` | Lower bound for adaptive heartbeat sleep. |
