@@ -366,8 +366,8 @@ full output and teardown behavior.
 | `PEAK_HIBERNATION_CYCLE` | Heartbeat cycles between reattach checks. Default: `50`; `0` disables reattach checks. |
 | `PEAK_OVERHEAD_RATIO` | Per-target profiling-overhead ratio. Default: `0.1`. |
 | `PEAK_GLOBAL_OVERHEAD_RATIO` | Global profiling-overhead ratio. Default: `0.1`. |
-| `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. |
-| `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. |
+| `PEAK_ENABLE_PER_TARGET_HEARTBEAT` | Enable per-target heartbeat detach decisions. Default: disabled. |
+| `PEAK_ENABLE_GLOBAL_HEARTBEAT` | Enable global heartbeat detach decisions. Default: enabled; set `0` or `false` to disable. |
 | `PEAK_GLOBAL_DETACH_FACTOR` | Global detach hysteresis factor. Default: `1.2`. |
 | `PEAK_GLOBAL_REATTACH_FACTOR` | Global reattach hysteresis factor. Default: `0.85`. |
 | `PEAK_ENABLE_REATTACH` | Allow physical reattach. Default: enabled, but reattach also requires a running heartbeat, a nonzero hibernation cycle, and at least one enabled heartbeat policy. |

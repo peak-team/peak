@@ -1711,7 +1711,11 @@ void peak_init()
     peak_global_detach_factor = numeric_config.global_detach_factor;
     peak_global_reattach_factor = numeric_config.global_reattach_factor;
     enable_per_target_heartbeat = parse_env_to_bool(PEAK_ENABLE_PER_TARGET_HEARTBEAT_ENV);
-    enable_global_heartbeat = parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
+    const char* enable_global_heartbeat_env =
+        getenv(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
+    enable_global_heartbeat =
+        (enable_global_heartbeat_env == NULL) ||
+        parse_env_to_bool(PEAK_ENABLE_GLOBAL_HEARTBEAT_ENV);
     const char* enable_reattach_env = getenv(PEAK_ENABLE_REATTACH_ENV);
     enable_reattach =
         (enable_reattach_env == NULL) || parse_env_to_bool(PEAK_ENABLE_REATTACH_ENV);
