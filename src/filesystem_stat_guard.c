@@ -37,35 +37,56 @@ _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "filesystem-stat TLS reservations require lock-free atomics");
 static _Atomic uint64_t regions;
-typedef struct RegionToken
+/* Four stable 8-byte records and one 8-byte control word keep this module's
+ * TLS footprint at 40 bytes, including application-handler-safe bookkeeping.
+ * Record: generation[0:31], previous index[32:34], used[35], admitted[36].
+ * Control: head index[0:2], resolving[3], writer[4], poison[5], saturated[6],
+ * controller depth[7:31], shared writer/poison generation[32:63]. Index 0 is
+ * the empty-list/overflow sentinel; valid record indices are 1 through 4.
+ * Permanent poison excludes writer admission, so their epochs can share bits.
+ */
+#define TOKEN_CAPACITY 4
+#define INDEX_MASK UINT64_C(7)
+#define TOKEN_PREVIOUS_SHIFT 32
+#define TOKEN_USED (UINT64_C(1) << 35)
+#define TOKEN_ADMITTED (UINT64_C(1) << 36)
+#define TOKEN_GENERATION_MASK UINT64_C(0xffffffff)
+#define CONTROL_RESOLVING (UINT64_C(1) << 3)
+#define CONTROL_WRITER (UINT64_C(1) << 4)
+#define CONTROL_POISON (UINT64_C(1) << 5)
+#define CONTROL_SATURATED (UINT64_C(1) << 6)
+#define CONTROL_DEPTH_SHIFT 7
+#define CONTROL_DEPTH_MASK UINT64_C(0xffffff80)
+#define CONTROL_GENERATION_MASK UINT64_C(0xffffffff00000000)
+_Static_assert(TOKEN_CAPACITY <= INDEX_MASK, "filesystem-stat token index range");
+static _Thread_local _Atomic uint64_t tokens[TOKEN_CAPACITY];
+static _Thread_local _Atomic uint64_t control;
+static _Atomic unsigned long deferred_stops;
+static uint64_t
+update_control(uint64_t mask, uint64_t value)
 {
-    _Atomic unsigned generation;
-    _Atomic int admitted;
-    _Atomic int used;
-    _Atomic(struct RegionToken *) previous;
-} RegionToken;
-/* TLS storage remains valid after siglongjmp abandons a wrapper stack frame.
- * Exhaustion establishes a reusable permanent reader: later stops safely defer
- * without allocating memory or changing application query return semantics. */
-/* Existing initial-exec TLS also constrains dlopen of the whole DSO. Keep the
- * inline nesting quota small; deeper nesting uses the safe poison fallback. */
-#define TOKEN_CAPACITY 8
-static _Thread_local RegionToken tokens[TOKEN_CAPACITY];
-static _Thread_local _Atomic(RegionToken *) active_tokens;
-static _Thread_local _Atomic uint64_t overflow_poison;
-static RegionToken *
+    uint64_t old = atomic_load_explicit(&control, memory_order_seq_cst);
+    while (!atomic_compare_exchange_weak_explicit(
+        &control, &old, (old & ~mask) | (value & mask), memory_order_seq_cst,
+        memory_order_seq_cst))
+    {
+    }
+    return old;
+}
+static unsigned
 reserve_token(void)
 {
     for (unsigned i = 0; i < TOKEN_CAPACITY; ++i)
-        if (!atomic_exchange_explicit(&tokens[i].used, 1, memory_order_seq_cst))
-            return &tokens[i];
-    return NULL;
+    {
+        uint64_t old = atomic_load_explicit(&tokens[i], memory_order_seq_cst);
+        while (!(old & TOKEN_USED))
+            if (atomic_compare_exchange_weak_explicit(
+                    &tokens[i], &old, TOKEN_USED, memory_order_seq_cst,
+                    memory_order_seq_cst))
+                return i + 1;
+    }
+    return 0;
 }
-static _Thread_local _Atomic unsigned writer_generation;
-static _Thread_local _Atomic int writer_owned;
-static _Atomic unsigned long deferred_stops;
-static _Thread_local _Atomic unsigned controller_depth;
-static _Thread_local _Atomic int resolving;
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
 static _Atomic int resolved;
 static int fork_safe;
@@ -87,7 +108,7 @@ uint64_t peak_filesystem_stat_guard_test_state(void)
 static void
 resolve_functions(void)
 {
-    resolving = 1;
+    update_control(CONTROL_RESOLVING, CONTROL_RESOLVING);
     next_statfs = dlsym(RTLD_NEXT, "statfs");
     next_fstatfs = dlsym(RTLD_NEXT, "fstatfs");
     next_statfs64 = dlsym(RTLD_NEXT, "statfs64");
@@ -96,13 +117,13 @@ resolve_functions(void)
     fork_safe =
         pthread_atfork(NULL, NULL, peak_filesystem_stat_guard_after_fork_child) == 0;
     atomic_store_explicit(&resolved, 1, memory_order_release);
-    resolving = 0;
+    update_control(CONTROL_RESOLVING, 0);
 }
 static void
 initialize(void)
 {
     int saved = errno;
-    if (!atomic_load_explicit(&resolved, memory_order_acquire) && !resolving)
+    if (!atomic_load_explicit(&resolved, memory_order_acquire) && !(atomic_load_explicit(&control, memory_order_seq_cst) & CONTROL_RESOLVING))
         (void)pthread_once(&resolve_once, resolve_functions);
     errno = saved;
 }
@@ -112,65 +133,73 @@ word_generation(uint64_t word)
     return (unsigned)(word >> GENERATION_SHIFT);
 }
 static int
-enter_region(RegionToken *token)
+enter_region(unsigned index)
 {
-    if (controller_depth)
+    uint64_t state = atomic_load_explicit(&control, memory_order_seq_cst);
+    if ((state & CONTROL_DEPTH_MASK) &&
+        (!(state & CONTROL_SATURATED) || (state & CONTROL_WRITER)))
         return 0;
     for (;;)
     {
         uint64_t old = atomic_load_explicit(&regions, memory_order_seq_cst);
-        unsigned current_generation = word_generation(old);
-        if (!token && overflow_poison == ((uint64_t)current_generation << GENERATION_SHIFT | 1))
+        unsigned generation = word_generation(old);
+        state = atomic_load_explicit(&control, memory_order_seq_cst);
+        if (!index && (state & CONTROL_POISON) && word_generation(state) == generation)
             return 1;
-        RegionToken *head = atomic_load_explicit(&active_tokens, memory_order_seq_cst);
-        int nested = head && head->admitted &&
-                     head->generation == current_generation;
+        unsigned head = (unsigned)(state & INDEX_MASK);
+        uint64_t head_token = head ? atomic_load_explicit(
+            &tokens[head - 1], memory_order_seq_cst) : 0;
+        int nested = (head_token & TOKEN_ADMITTED) &&
+                     (unsigned)(head_token & TOKEN_GENERATION_MASK) == generation;
         if (((old & STOP_BIT) && !nested) || (old & COUNT_MASK) == COUNT_MASK)
         {
             (void)sched_yield();
             continue;
         }
-        if (atomic_compare_exchange_weak_explicit(
+        if (!atomic_compare_exchange_weak_explicit(
                 &regions, &old, old + 1, memory_order_seq_cst, memory_order_seq_cst))
+            continue;
+        if (!index)
         {
-            if (!token)
-            {
-                /* Nonlocal exits can exhaust stable TLS slots. Preserve query
-                 * semantics with a permanently held reader, not an unguarded
-                 * syscall or an allocation inside a user's signal handler. */
-                overflow_poison = ((uint64_t)current_generation << GENERATION_SHIFT) | 1;
-                if (current_generation != word_generation(
-                        atomic_load_explicit(&regions, memory_order_seq_cst)))
-                    continue;
-                return 1;
-            }
-            token->generation = current_generation;
-            token->admitted = 1;
-            token->previous = active_tokens;
-            active_tokens = token;
-            /* A child fork preserves published current-thread tokens. If fork
-             * occurred before publication, its reset invalidates this CAS. */
-            if (token->generation != word_generation(
+            /* A permanent reader preserves query semantics after nonlocal exits
+             * exhaust records. Later calls reuse it instead of growing count. */
+            update_control(CONTROL_GENERATION_MASK | CONTROL_POISON,
+                           ((uint64_t)generation << GENERATION_SHIFT) | CONTROL_POISON);
+            state = atomic_load_explicit(&control, memory_order_seq_cst);
+            if ((state & CONTROL_POISON) && word_generation(state) == word_generation(
                     atomic_load_explicit(&regions, memory_order_seq_cst)))
-            {
-                active_tokens = token->previous;
-                token->admitted = 0;
-                continue;
-            }
-            return 1;
+                return 1;
+            continue;
         }
+        state = atomic_load_explicit(&control, memory_order_seq_cst);
+        uint64_t metadata = generation | TOKEN_USED | TOKEN_ADMITTED |
+                            ((state & INDEX_MASK) << TOKEN_PREVIOUS_SHIFT);
+        atomic_store_explicit(&tokens[index - 1], metadata, memory_order_seq_cst);
+        update_control(INDEX_MASK, index);
+        /* Child reset preserves published live records; a fork before head
+         * publication invalidates this admission and requires readmission. */
+        metadata = atomic_load_explicit(&tokens[index - 1], memory_order_seq_cst);
+        if ((unsigned)(metadata & TOKEN_GENERATION_MASK) != word_generation(
+                atomic_load_explicit(&regions, memory_order_seq_cst)))
+        {
+            update_control(INDEX_MASK, (metadata >> TOKEN_PREVIOUS_SHIFT) & INDEX_MASK);
+            atomic_fetch_and_explicit(&tokens[index - 1], ~TOKEN_ADMITTED, memory_order_seq_cst);
+            continue;
+        }
+        return 1;
     }
 }
 static void
-leave_region(RegionToken *token)
+leave_region(unsigned index)
 {
-    if (!token->admitted)
+    uint64_t metadata = atomic_load_explicit(&tokens[index - 1], memory_order_seq_cst);
+    if (!(metadata & TOKEN_ADMITTED))
         return;
-    /* Revoke nested eligibility BEFORE dropping the last held reader. A user
-     * handler in this gap can wait only until the bounded writer reopens entry. */
-    active_tokens = token->previous;
-    token->admitted = 0;
-    unsigned generation = token->generation;
+    /* Revoke nested eligibility before dropping the last reader. */
+    update_control(INDEX_MASK, (metadata >> TOKEN_PREVIOUS_SHIFT) & INDEX_MASK);
+    atomic_fetch_and_explicit(&tokens[index - 1], ~TOKEN_ADMITTED, memory_order_seq_cst);
+    unsigned generation = (unsigned)(atomic_load_explicit(
+        &tokens[index - 1], memory_order_seq_cst) & TOKEN_GENERATION_MASK);
     uint64_t current = atomic_load_explicit(&regions, memory_order_seq_cst);
     while (word_generation(current) == generation && (current & COUNT_MASK))
     {
@@ -184,14 +213,19 @@ int
 peak_filesystem_stat_guard_try_stop(void)
 {
     int saved = errno;
-    int ok = 0;
     initialize();
     uint64_t current = atomic_load_explicit(&regions, memory_order_seq_cst);
     unsigned generation = word_generation(current);
+    int gate_closed = 0;
     struct timespec start, now;
-    RegionToken *head = atomic_load_explicit(&active_tokens, memory_order_seq_cst);
-    if (!atomic_load_explicit(&resolved, memory_order_acquire) || !fork_safe || writer_owned ||
-        (head && head->admitted && head->generation == generation) ||
+    uint64_t state = atomic_load_explicit(&control, memory_order_seq_cst);
+    unsigned head = (unsigned)(state & INDEX_MASK);
+    uint64_t head_token = head ? atomic_load_explicit(
+        &tokens[head - 1], memory_order_seq_cst) : 0;
+    if (!atomic_load_explicit(&resolved, memory_order_acquire) || !fork_safe ||
+        (state & (CONTROL_WRITER | CONTROL_POISON | CONTROL_SATURATED)) ||
+        ((head_token & TOKEN_ADMITTED) &&
+         (unsigned)(head_token & TOKEN_GENERATION_MASK) == generation) ||
         clock_gettime(CLOCK_MONOTONIC, &start) != 0)
         goto deferred;
     for (;;)
@@ -201,14 +235,33 @@ peak_filesystem_stat_guard_try_stop(void)
         if (atomic_compare_exchange_weak_explicit(
                 &regions, &current, current | STOP_BIT, memory_order_seq_cst,
                 memory_order_seq_cst))
+        {
+            gate_closed = 1;
+            break;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            (now.tv_sec - start.tv_sec) * 1000000000LL +
+                now.tv_nsec - start.tv_nsec >= DRAIN_BUDGET_NS)
+            goto deferred;
+    }
+    /* Fork can occur between global gate closure and ownership publication.
+     * Do not overwrite a child's poison epoch with stale writer ownership. */
+    for (;;)
+    {
+        state = atomic_load_explicit(&control, memory_order_seq_cst);
+        if ((state & CONTROL_POISON) || word_generation(
+                atomic_load_explicit(&regions, memory_order_seq_cst)) != generation)
+            goto deferred;
+        uint64_t next = (state & ~CONTROL_GENERATION_MASK) |
+                        ((uint64_t)generation << GENERATION_SHIFT) | CONTROL_WRITER;
+        if (atomic_compare_exchange_weak_explicit(
+                &control, &state, next, memory_order_seq_cst, memory_order_seq_cst))
             break;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
             (now.tv_sec - start.tv_sec) * 1000000000LL +
                 now.tv_nsec - start.tv_nsec >= DRAIN_BUDGET_NS)
             goto deferred;
     }
-    writer_generation = generation;
-    writer_owned = 1;
     for (;;)
     {
         current = atomic_load_explicit(&regions, memory_order_seq_cst);
@@ -219,21 +272,33 @@ peak_filesystem_stat_guard_try_stop(void)
                 now.tv_nsec - start.tv_nsec >= DRAIN_BUDGET_NS)
         {
             peak_filesystem_stat_guard_resume();
+            gate_closed = 0;
             goto deferred;
         }
         if (!(current & COUNT_MASK))
         {
-            ok = 1;
-            break;
+            errno = saved;
+            return 1;
         }
         (void)sched_yield();
     }
-    errno = saved;
-    return ok;
 deferred:
-    if (writer_owned && writer_generation == generation &&
-        word_generation(atomic_load_explicit(&regions, memory_order_seq_cst)) != generation)
-        writer_owned = 0;
+    if (gate_closed)
+    {
+        current = atomic_load_explicit(&regions, memory_order_seq_cst);
+        while (word_generation(current) == generation && (current & STOP_BIT))
+            if (atomic_compare_exchange_weak_explicit(
+                    &regions, &current, current & ~STOP_BIT, memory_order_seq_cst,
+                    memory_order_seq_cst))
+                break;
+    }
+    state = atomic_load_explicit(&control, memory_order_seq_cst);
+    while ((state & CONTROL_WRITER) && word_generation(state) == generation &&
+           word_generation(atomic_load_explicit(&regions, memory_order_seq_cst)) != generation)
+        if (atomic_compare_exchange_weak_explicit(
+                &control, &state, state & ~CONTROL_WRITER, memory_order_seq_cst,
+                memory_order_seq_cst))
+            break;
     atomic_fetch_add_explicit(&deferred_stops, 1, memory_order_relaxed);
     errno = saved;
     return 0;
@@ -246,58 +311,77 @@ peak_filesystem_stat_guard_deferred_stop_count(void)
 void
 peak_filesystem_stat_guard_resume(void)
 {
-    if (!writer_owned)
+    uint64_t state = atomic_fetch_and_explicit(&control, ~CONTROL_WRITER, memory_order_seq_cst);
+    if (!(state & CONTROL_WRITER))
         return;
-    unsigned generation = writer_generation;
-    writer_owned = 0;
+    unsigned generation = word_generation(state);
     uint64_t current = atomic_load_explicit(&regions, memory_order_seq_cst);
     while (word_generation(current) == generation && (current & STOP_BIT))
-    {
         if (atomic_compare_exchange_weak_explicit(
                 &regions, &current, current & ~STOP_BIT, memory_order_seq_cst,
                 memory_order_seq_cst))
             break;
-    }
 }
 void
 peak_filesystem_stat_guard_controller_enter(void)
 {
-    ++controller_depth;
+    uint64_t state = atomic_load_explicit(&control, memory_order_seq_cst);
+    for (;;)
+    {
+        uint64_t next = state;
+        if ((state & CONTROL_DEPTH_MASK) == CONTROL_DEPTH_MASK)
+            next |= CONTROL_SATURATED;
+        else if (!(state & CONTROL_SATURATED))
+            next += UINT64_C(1) << CONTROL_DEPTH_SHIFT;
+        if (atomic_compare_exchange_weak_explicit(
+                &control, &state, next, memory_order_seq_cst, memory_order_seq_cst))
+            break;
+    }
 }
 void
 peak_filesystem_stat_guard_controller_leave(void)
 {
-    if (controller_depth)
-        --controller_depth;
+    uint64_t state = atomic_load_explicit(&control, memory_order_seq_cst);
+    while ((state & CONTROL_DEPTH_MASK) && !(state & CONTROL_SATURATED))
+        if (atomic_compare_exchange_weak_explicit(
+                &control, &state, state - (UINT64_C(1) << CONTROL_DEPTH_SHIFT),
+                memory_order_seq_cst, memory_order_seq_cst))
+            break;
+    /* Saturation never carries into flags/epoch. Future stops fail closed and
+     * ordinary queries cannot bypass admission after current ownership ends. */
 }
 void
 peak_filesystem_stat_guard_after_fork_child(void)
 {
-    writer_owned = 0;
-    controller_depth = 0;
-    /* Open inherited entry before retagging TLS tokens. A nested application
-     * handler must not wait behind a writer thread that disappeared at fork. */
+    update_control(CONTROL_WRITER | CONTROL_DEPTH_MASK | CONTROL_SATURATED, 0);
     atomic_fetch_and_explicit(&regions, ~STOP_BIT, memory_order_seq_cst);
     for (;;)
     {
         uint64_t previous = atomic_load_explicit(&regions, memory_order_seq_cst);
         unsigned generation = word_generation(previous) + 1U;
-        uint64_t live_readers = overflow_poison ? 1 : 0;
-        if (overflow_poison)
-            overflow_poison = ((uint64_t)generation << GENERATION_SHIFT) | 1;
-        for (RegionToken *token = active_tokens; token; token = token->previous)
+        uint64_t state = update_control(CONTROL_GENERATION_MASK,
+                                       (uint64_t)generation << GENERATION_SHIFT);
+        uint64_t live_readers = (state & CONTROL_POISON) ? 1 : 0;
+        unsigned index = (unsigned)(state & INDEX_MASK);
+        while (index)
         {
-            if (token->admitted)
+            uint64_t metadata = atomic_load_explicit(&tokens[index - 1], memory_order_seq_cst);
+            if (metadata & TOKEN_ADMITTED)
             {
-                token->generation = generation;
+                while (!atomic_compare_exchange_weak_explicit(
+                    &tokens[index - 1], &metadata,
+                    (metadata & ~TOKEN_GENERATION_MASK) | generation,
+                    memory_order_seq_cst, memory_order_seq_cst))
+                {
+                }
                 ++live_readers;
             }
+            index = (unsigned)((metadata >> TOKEN_PREVIOUS_SHIFT) & INDEX_MASK);
         }
 #ifdef PEAK_FILESYSTEM_STAT_GUARD_TESTING
         if (child_reset_hook)
             child_reset_hook();
 #endif
-        /* CAS also avoids rewinding an epoch if a nested handler forks again. */
         if (atomic_compare_exchange_weak_explicit(
                 &regions, &previous,
                 ((uint64_t)generation << GENERATION_SHIFT) | live_readers,
@@ -305,7 +389,7 @@ peak_filesystem_stat_guard_after_fork_child(void)
             break;
     }
 }
-/* Bootstrap recursion uses the kernel ABI only where native and64 layouts match.
+/* Bootstrap recursion uses the kernel ABI only where native and 64-bit layouts match.
  * Normal published calls always use libc, preserving its ABI and signal semantics. */
 #if defined(__x86_64__) || defined(__aarch64__)
 _Static_assert(sizeof(struct statfs) == sizeof(struct statfs64),
@@ -319,32 +403,33 @@ _Static_assert(sizeof(struct statfs) == sizeof(struct statfs64),
 static void
 cleanup_region(void *data)
 {
-    RegionToken *token = data;
-    if (!token)
+    unsigned index = *(unsigned *)data;
+    if (!index)
         return;
-    leave_region(token);
-    token->admitted = 0;
-    atomic_store_explicit(&token->used, 0, memory_order_seq_cst);
+    leave_region(index);
+    atomic_store_explicit(&tokens[index - 1], 0, memory_order_seq_cst);
 }
 #define WRAP(name, argtype, buftype, raw)                                         \
     __attribute__((visibility("default"))) int name(argtype arg, buftype *buf)    \
     {                                                                             \
         int incoming = errno;                                                     \
-        if (resolving && !atomic_load_explicit(&resolved, memory_order_acquire))  \
+        if ((atomic_load_explicit(&control, memory_order_seq_cst) &                \
+             CONTROL_RESOLVING) &&                                                \
+            !atomic_load_explicit(&resolved, memory_order_acquire))               \
             return raw(arg, buf);                                                 \
         int old_cancel, end_cancel;                                               \
         (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);        \
         initialize();                                                             \
-        RegionToken *token = reserve_token();                                     \
+        unsigned token = reserve_token();                                        \
         (void)enter_region(token);                                                \
         int rc, outgoing;                                                         \
-        pthread_cleanup_push(cleanup_region, token);                              \
+        pthread_cleanup_push(cleanup_region, &token);                              \
         (void)pthread_setcancelstate(old_cancel, NULL);                           \
         errno = incoming;                                                         \
         rc = next_##name ? next_##name(arg, buf) : raw(arg, buf);                 \
         outgoing = errno;                                                         \
         (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &end_cancel);        \
-        cleanup_region(token);                                                    \
+        cleanup_region(&token);                                                    \
         pthread_cleanup_pop(0);                                                   \
         (void)pthread_setcancelstate(end_cancel, NULL);                           \
         errno = outgoing;                                                         \
