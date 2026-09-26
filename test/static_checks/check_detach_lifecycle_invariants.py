@@ -2855,9 +2855,20 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_temp_breakpoint = extract_function(
         controller, "peak_detach_controller_signal_temp_breakpoint_out_of_range"
     )
-    signal_stop = extract_function(
+    signal_stop_wrapper = extract_function(
         controller, "peak_detach_controller_signal_stop_threads"
     )
+    signal_stop = extract_function(
+        controller, "peak_detach_controller_signal_stop_threads_impl"
+    )
+    require("peak_filesystem_stat_guard_try_stop" in signal_stop_wrapper and
+            "PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY" in signal_stop_wrapper and
+            "peak_detach_controller_signal_stop_threads_impl" in signal_stop_wrapper and
+            "if (!ok) peak_filesystem_stat_guard_resume()" in signal_stop_wrapper,
+            "signal stop wrapper must guard admission, delegate, and release on failure")
+    require(signal_stop_wrapper.find("peak_filesystem_stat_guard_try_stop") <
+            signal_stop_wrapper.find("gboolean ok = peak_detach_controller_signal_stop_threads_impl"),
+            "signal stop must not delegate before filesystem-stat guard admission")
     signal_evacuate = extract_function(
         controller, "peak_detach_controller_signal_evacuate"
     )
