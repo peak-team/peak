@@ -34,7 +34,6 @@ set(sources_peak
     malloc_interceptor.c
     peak.c
     ${PEAK_DETACH_CONTROLLER_SOURCE}
-    filesystem_stat_guard.c
     jit_provider.c
     ${PEAK_SIGNAL_POLICY_SOURCE}
     pthread_listener.c
@@ -44,6 +43,7 @@ set(sources_peak
     exec_interceptor.c
     exec_raw_syscall.c
     ${PEAK_DARWIN_GUM_PATCH_SOURCE}
+    filesystem_stat_guard.c
 )
 
 if(PEAK_ENABLE_OTF2)

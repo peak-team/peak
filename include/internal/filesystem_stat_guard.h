@@ -21,4 +21,4 @@ void peak_filesystem_stat_guard_controller_leave(void);
 /* Registered by initialization before any query is admitted. */
 void peak_filesystem_stat_guard_after_fork_child(void);
 
-#endif
+#endif /* PEAK_FILESYSTEM_STAT_GUARD_H */
