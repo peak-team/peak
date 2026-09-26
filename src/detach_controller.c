@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/filesystem_stat_guard.h"
 #include "detach_controller.h"
 #include "detach_helper_protocol.h"
 #include "internal/exec_raw_syscall.h"
@@ -342,11 +343,13 @@ peak_detach_controller_lock_mutation_guard(void)
                        peak_detach_controller_init_mutation_guard);
     (void)pthread_mutex_lock(&mutation_guard_mutex);
     peak_signal_policy_push_migration_disabled();
+    peak_filesystem_stat_guard_controller_enter();
 }
 
 static void
 peak_detach_controller_unlock_mutation_guard(void)
 {
+    peak_filesystem_stat_guard_controller_leave();
     peak_signal_policy_pop_migration_disabled();
     (void)pthread_mutex_unlock(&mutation_guard_mutex);
 }
@@ -809,6 +812,8 @@ peak_detach_controller_status_string(PeakDetachStatus status)
             return "classify-failed";
         case PEAK_DETACH_STATUS_ERROR:
             return "error";
+        case PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY:
+            return "filesystem-stat-busy";
         default:
             return "unknown";
     }
@@ -1514,7 +1519,7 @@ peak_detach_controller_send_shutdown(gboolean close_on_io_failure,
 }
 
 static gboolean
-peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
+peak_detach_controller_stop_threads_impl(PeakDetachHelperThreadSnapshot* snapshots,
                                     uint32_t* snapshot_count_out,
                                     PeakDetachStatus* status_out)
 {
@@ -1588,6 +1593,20 @@ peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
 
     *snapshot_count_out = response.thread_count;
     return TRUE;
+}
+
+static gboolean
+peak_detach_controller_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
+                                    uint32_t* snapshot_count_out,
+                                    PeakDetachStatus* status_out)
+{
+    if (!peak_filesystem_stat_guard_try_stop()) {
+        if (status_out != NULL) *status_out = PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY;
+        return FALSE;
+    }
+    gboolean ok = peak_detach_controller_stop_threads_impl(snapshots, snapshot_count_out, status_out);
+    if (!ok) peak_filesystem_stat_guard_resume();
+    return ok;
 }
 
 static gboolean
@@ -2527,6 +2546,9 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
         return TRUE;
     }
 
+    /* Mutation/rollback is complete. Open before handlers can run nested user
+     * handlers while we wait for their release acknowledgements. */
+    peak_filesystem_stat_guard_resume();
     atomic_store_explicit(&signal_release_epoch, epoch, memory_order_release);
     peak_detach_controller_signal_wake_release_waiters();
 
@@ -2599,7 +2621,7 @@ peak_detach_controller_signal_release_or_fatal(const char* context)
 }
 
 static gboolean
-peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
+peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* snapshots,
                                            uint32_t* snapshot_count_out,
                                            PeakDetachStatus* status_out)
 {
@@ -2777,6 +2799,20 @@ peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snaps
         *status_out = PEAK_DETACH_STATUS_SAFE;
     }
     return TRUE;
+}
+
+static gboolean
+peak_detach_controller_signal_stop_threads(PeakDetachHelperThreadSnapshot* snapshots,
+                                           uint32_t* snapshot_count_out,
+                                           PeakDetachStatus* status_out)
+{
+    if (!peak_filesystem_stat_guard_try_stop()) {
+        if (status_out != NULL) *status_out = PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY;
+        return FALSE;
+    }
+    gboolean ok = peak_detach_controller_signal_stop_threads_impl(snapshots, snapshot_count_out, status_out);
+    if (!ok) peak_filesystem_stat_guard_resume();
+    return ok;
 }
 
 static int
@@ -3102,10 +3138,14 @@ static gboolean
 peak_detach_controller_resume_backend(PeakDetachHoldBackend backend,
                                       PeakDetachStatus* status_out)
 {
-    if (backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-        return peak_detach_controller_signal_release(status_out);
-    }
-    return peak_detach_controller_send_resume(status_out);
+    /* No more code mutation follows this point; do not hold the gate while
+     * resumed application signal handlers can enter filesystem-stat calls. */
+    peak_filesystem_stat_guard_resume();
+    gboolean ok = backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL ?
+        peak_detach_controller_signal_release(status_out) :
+        peak_detach_controller_send_resume(status_out);
+    if (ok) peak_filesystem_stat_guard_resume();
+    return ok;
 }
 
 static gboolean

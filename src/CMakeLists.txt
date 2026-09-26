@@ -34,6 +34,7 @@ set(sources_peak
     malloc_interceptor.c
     peak.c
     ${PEAK_DETACH_CONTROLLER_SOURCE}
+    filesystem_stat_guard.c
     jit_provider.c
     ${PEAK_SIGNAL_POLICY_SOURCE}
     pthread_listener.c

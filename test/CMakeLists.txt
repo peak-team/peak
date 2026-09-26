@@ -1,5 +1,11 @@
 include(CTest)
 if(BUILD_TESTING)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_test(NAME test_filesystem_stat_stop_guard
+            COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
+                bash ${CMAKE_CURRENT_SOURCE_DIR}/filesystem_stat_guard/run.sh)
+        set_tests_properties(test_filesystem_stat_stop_guard PROPERTIES TIMEOUT 30)
+    endif()
     include(CheckCCompilerFlag)
     option(PEAK_BUILD_DYNAMIC_LIB_TESTS "Build dynamic dlopen/Python extension tests" ON)
 
