@@ -47,7 +47,9 @@ typedef struct RegionToken
 /* TLS storage remains valid after siglongjmp abandons a wrapper stack frame.
  * Exhaustion establishes a reusable permanent reader: later stops safely defer
  * without allocating memory or changing application query return semantics. */
-#define TOKEN_CAPACITY 64
+/* Existing initial-exec TLS also constrains dlopen of the whole DSO. Keep the
+ * inline nesting quota small; deeper nesting uses the safe poison fallback. */
+#define TOKEN_CAPACITY 8
 static _Thread_local RegionToken tokens[TOKEN_CAPACITY];
 static _Thread_local _Atomic(RegionToken *) active_tokens;
 static _Thread_local _Atomic uint64_t overflow_poison;

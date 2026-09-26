@@ -31,7 +31,7 @@ stop until that surviving query unwinds. The 1 ms drain budget bounds writer
 preference; scheduling and slow filesystem calls may still cause safe deferral.
 
 Stable TLS admission records also cover nonlocal exits: an isolated child
-abandons 80 queries with siglongjmp, exceeding the 64 record slots, then checks
+abandons 80 queries with siglongjmp, exceeding the eight record slots, then checks
 new queries and fork. Overflow reuses one permanent poison reader, keeping
 application return/errno semantics while later physical stops defer safely.
 A test-only callback exercises a nested query during child reset under an
