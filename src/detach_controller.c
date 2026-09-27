@@ -1470,6 +1470,25 @@ peak_detach_controller_send_helper_command(PeakDetachHelperCommand command,
             peak_detach_controller_mark_helper_fatal("stop cleanup failure",
                                                      PEAK_DETACH_STATUS_ERROR);
         }
+        if (command == PEAK_DETACH_HELPER_CMD_EVACUATE) {
+            /* These valid pre-mutation errors are returned only after the
+             * helper has released every stopped peer. Reopen query admission
+             * as well; both single and batch callers discard this hold. */
+            switch ((PeakDetachHelperStatus)response.status) {
+                case PEAK_DETACH_HELPER_STATUS_UNSUPPORTED:
+                case PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED:
+                case PEAK_DETACH_HELPER_STATUS_THREAD_LIMIT:
+                case PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR:
+                case PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR:
+                case PEAK_DETACH_HELPER_STATUS_TIMEOUT:
+                    peak_filesystem_stat_guard_resume();
+                    break;
+                default:
+                    /* Protocol/unknown replies do not prove peer release. */
+                    peak_detach_controller_mark_helper_fatal(
+                        "evacuate cleanup unproven", PEAK_DETACH_STATUS_ERROR);
+            }
+        }
         if (close_on_io_failure) {
             peak_detach_controller_close_helper();
         }

@@ -1,4 +1,6 @@
 #include "detach_controller.h"
+#include "internal/filesystem_stat_guard.h"
+#include <sys/vfs.h>
 #include "detach_helper_protocol.h"
 #include "internal/signal_policy_internal.h"
 #include "internal/unsafe_gum_prologue.h"
@@ -19,6 +21,42 @@
 #include <unistd.h>
 
 static int failures = 0;
+
+/* An application query must be admitted after recoverable helper cleanup.
+ * Reopen only on test failure so the worker can always be joined. */
+static atomic_int cleanup_query_returned;
+static int cleanup_query_result;
+static void* cleanup_query_worker(void* unused)
+{
+    struct statfs info;
+    (void)unused;
+    cleanup_query_result = statfs("/tmp", &info);
+    atomic_store(&cleanup_query_returned, 1);
+    return NULL;
+}
+static void check_cleanup_query(void)
+{
+    pthread_t worker;
+    atomic_store(&cleanup_query_returned, 0);
+    if (pthread_create(&worker, NULL, cleanup_query_worker, NULL) != 0) {
+        fprintf(stderr, "cleanup query thread creation failed\n");
+        failures++;
+        return;
+    }
+    for (unsigned i = 0; i < 200 && !atomic_load(&cleanup_query_returned); i++)
+        usleep(1000);
+    if (!atomic_load(&cleanup_query_returned)) {
+        fprintf(stderr, "recoverable EVACUATE left filesystem query blocked\n");
+        failures++;
+        peak_filesystem_stat_guard_resume();
+    }
+    pthread_join(worker, NULL);
+    if (cleanup_query_result != 0) {
+        fprintf(stderr, "cleanup filesystem query failed: %d\n",
+                cleanup_query_result);
+        failures++;
+    }
+}
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 typedef struct {
@@ -1742,6 +1780,14 @@ run_fake_helper_batch_abort_rolls_back_records(void)
     check_true("rollback batch leaves no held mutation",
                peak_detach_controller_threads_are_held() == FALSE);
 
+    check_cleanup_query();
+    prepared_count = 99;
+    check_true("subsequent batch STOP and recoverable EVACUATE",
+               peak_detach_controller_prepare_hook_mutation_batch(
+                   requests, 2, results, &prepared_count, &status) == FALSE);
+    check_int("subsequent batch prepared count", (int)prepared_count, 0);
+    check_cleanup_query();
+
     requests[0].operation = PEAK_DETACH_OPERATION_REATTACH;
     prepared_count = 99;
     memset(reattach_result, 0xff, sizeof(reattach_result));
@@ -1770,8 +1816,8 @@ run_fake_helper_batch_abort_rolls_back_records(void)
                peak_detach_controller_shutdown_helper(&status) == TRUE);
 
     check_helper_log_count(log_template, "START", 1);
-    check_helper_log_count(log_template, "STOP", 1);
-    check_helper_log_count(log_template, "EVACUATE", 1);
+    check_helper_log_count(log_template, "STOP", 2);
+    check_helper_log_count(log_template, "EVACUATE", 2);
     check_helper_log_count(log_template, "RESUME", 0);
     check_helper_log_count(log_template, "SHUTDOWN", 1);
 
@@ -3520,7 +3566,9 @@ run_fake_helper_fail_closed(void)
     } else if (strcmp(scenario, "blocked-pc") == 0) {
         expected = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
     } else if (strcmp(scenario, "evacuate-error") == 0 ||
-               strcmp(scenario, "evacuate-release-failed") == 0) {
+               strcmp(scenario, "evacuate-release-failed") == 0 ||
+               strcmp(scenario, "evacuate-protocol-error") == 0 ||
+               strcmp(scenario, "evacuate-unknown-status") == 0) {
         expected = PEAK_DETACH_STATUS_ERROR;
     } else {
         fprintf(stderr, "unknown fake helper scenario: %s\n", scenario);
@@ -3578,6 +3626,13 @@ run_fake_helper_fail_closed(void)
                peak_detach_controller_last_stop_window_us() == last_success_us);
     check_true("fake helper failure leaves no held mutation",
                peak_detach_controller_threads_are_held() == FALSE);
+
+    if (strcmp(scenario, "evacuate-error") == 0) {
+        check_cleanup_query();
+        check_prepare("subsequent STOP and recoverable EVACUATE", &request,
+                      FALSE, expected);
+        check_cleanup_query();
+    }
 
     PeakDetachStatus shutdown_status = PEAK_DETACH_STATUS_ERROR;
     check_true("fake helper shutdown",
