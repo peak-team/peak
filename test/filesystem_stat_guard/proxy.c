@@ -4,6 +4,23 @@
 #include <stdatomic.h>
 #include <sys/vfs.h>
 #include <time.h>
+/* Guard-test builds rename only the guard's clock_gettime calls to this
+ * delegate. Delay after capturing the start time to model writer descheduling. */
+static _Thread_local int writer_clock_delay;
+void proxy_delay_writer_clock(void)
+{
+    writer_clock_delay = 1;
+}
+int peak_guard_test_clock_gettime(clockid_t clock, struct timespec *value)
+{
+    int rc = clock_gettime(clock, value);
+    if (writer_clock_delay) {
+        writer_clock_delay = 0;
+        struct timespec delay = {.tv_nsec = 20000000};
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) { }
+    }
+    return rc;
+}
 static _Atomic int entered, mode;
 static _Atomic unsigned long calls;
 static void (*query_hook)(void);

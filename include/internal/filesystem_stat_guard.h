@@ -5,8 +5,9 @@
  * Readers never acquire the controller mutation mutex. Internal controller
  * scopes alone may bypass admission; normal application calls may not. */
 
-/* Close admission and drain existing queries for at most 1 ms. Return success
- * only after the reader count reaches zero; timeout reopens entry and defers. */
+/* Close admission with a 16 ms active-reader wait deadline. Return success only
+ * after the reader count reaches zero, including after writer scheduling delay;
+ * timeout with active readers reopens entry and defers. */
 int peak_filesystem_stat_guard_try_stop(void);
 
 /* Open before releasing stopped threads and waiting for acknowledgements. */

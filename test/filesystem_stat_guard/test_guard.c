@@ -20,6 +20,7 @@ extern unsigned long
 proxy_calls(void);
 extern uint64_t peak_filesystem_stat_guard_test_state(void);
 extern void peak_filesystem_stat_guard_test_child_hook(void (*)(void));
+extern void proxy_delay_writer_clock(void);
 static int child_hook_called;
 static void reset_interruption_hook(void)
 {
@@ -237,6 +238,19 @@ main(void)
     assert(pthread_kill(worker, SIGUSR1) == 0);
     assert(pthread_join(worker, NULL) == 0);
     assert((peak_filesystem_stat_guard_test_state() & UINT64_C(0xffffffff)) == 0);
+
+    assert(peak_filesystem_stat_guard_try_stop());
+    peak_filesystem_stat_guard_resume(); /* next writer succeeds after timeout */
+
+    /* Scheduling delay beyond the bounded reader-wait budget does not invalidate a proven
+     * zero-reader, same-generation gate. Before the fix this call deferred. */
+    proxy_delay_writer_clock();
+    errno = EDOM;
+    assert(peak_filesystem_stat_guard_try_stop() && errno == EDOM);
+    assert((peak_filesystem_stat_guard_test_state() & UINT64_C(0xffffffff)) ==
+           (UINT64_C(1) << 31));
+    peak_filesystem_stat_guard_resume();
+    assert(statfs("/after-delayed-writer", &native) == 0);
 
     /* Nested user handler must enter while its own outer query is draining. */
     action.sa_handler = nested_handler;

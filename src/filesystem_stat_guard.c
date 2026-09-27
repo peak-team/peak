@@ -16,8 +16,9 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 /* One atomic word contains fork generation, reader count and closed admission.
- * Closing entry preserves existing readers; the writer drains for at most 1 ms
- * before deferring without sending a signal or ptrace stop. Nested queries on
+ * Closing entry preserves existing readers; active-reader wait has a 16 ms
+ * deadline before deferring without a signal or ptrace stop. A completed drain
+ * remains safe after writer scheduling delay. Nested queries on
  * an admitted thread retain that thread's outer reader, preventing self-wait.
  * Gate reopening still precedes backend release acknowledgements.
  *
@@ -29,7 +30,7 @@
 #define STOP_BIT (UINT64_C(1) << 31)
 #define COUNT_MASK (STOP_BIT - 1)
 #define GENERATION_SHIFT 32
-#define DRAIN_BUDGET_NS 1000000L
+#define DRAIN_BUDGET_NS 16000000L
 _Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0),
                "filesystem-stat admission requires lock-free 64-bit atomics");
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
@@ -273,6 +274,13 @@ peak_filesystem_stat_guard_try_stop(void)
         current = atomic_load_explicit(&regions, memory_order_seq_cst);
         if (word_generation(current) != generation)
             goto deferred;
+        /* A descheduled writer may observe completed drain after its budget.
+         * The closed, same-generation zero-reader gate is already safe. */
+        if (!(current & COUNT_MASK))
+        {
+            errno = saved;
+            return 1;
+        }
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
             (now.tv_sec - start.tv_sec) * 1000000000LL +
                 now.tv_nsec - start.tv_nsec >= DRAIN_BUDGET_NS)
@@ -280,11 +288,6 @@ peak_filesystem_stat_guard_try_stop(void)
             peak_filesystem_stat_guard_resume();
             gate_closed = 0;
             goto deferred;
-        }
-        if (!(current & COUNT_MASK))
-        {
-            errno = saved;
-            return 1;
         }
         (void)sched_yield();
     }
