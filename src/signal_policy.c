@@ -34,7 +34,20 @@ static _Atomic int migration_releasing_signal;
 static _Atomic int unexpected_delivery_count;
 static _Atomic(uintptr_t) last_conflict_api;
 static _Atomic(unsigned long) cookie_base;
+/*
+ * sigaction may be called by an asynchronous application signal handler while
+ * another thread owns the dynamic-loader lock. A general-dynamic TLS access
+ * can enter __tls_get_addr's loader slow path even after real symbols resolve.
+ * Linux libpeak already uses initial-exec callback TLS, so this existing
+ * four-byte guard uses the same preload/static-TLS contract without growing
+ * its TLS payload. Other platforms retain their existing access model.
+ */
+#if defined(__linux__) && defined(__GNUC__)
+static __thread int internal_depth
+    __attribute__((tls_model("initial-exec")));
+#else
 static __thread int internal_depth;
+#endif
 static pthread_once_t cookie_once = PTHREAD_ONCE_INIT;
 static pthread_once_t signal_configuration_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t migration_mutex = PTHREAD_MUTEX_INITIALIZER;
