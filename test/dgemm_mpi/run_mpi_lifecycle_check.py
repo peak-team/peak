@@ -181,8 +181,8 @@ def writer_destination_failure_observed(output):
     return WRITER_DESTINATION_FAILURE_DIAGNOSTIC in output
 
 
-def require_interrupted_peer_temporary_stats(path):
-    """Allow only a canonical non-root CSV with the atomic writer's suffix."""
+def interrupted_temporary_stats_match(path):
+    """Recognize the atomic writer suffix and matching canonical owner PID."""
     temporary_match = re.fullmatch(
         r"(?P<final>.+\.csv)\.tmp\.p(?P<pid>\d+)\.\d+", path.name
     )
@@ -190,14 +190,49 @@ def require_interrupted_peer_temporary_stats(path):
         STATS_CSV_NAME_RE.fullmatch(temporary_match["final"])
         if temporary_match is not None else None
     )
-    if (final_match is None or
-            not final_match["rank"].isdigit() or
-            int(final_match["rank"]) == 0 or
+    if (final_match is None or not final_match["rank"].isdigit() or
             final_match["pid"] != temporary_match["pid"]):
+        return None
+    return final_match
+
+
+def require_interrupted_peer_temporary_stats(path):
+    """Allow only a canonical non-root CSV with the atomic writer's suffix."""
+    match = interrupted_temporary_stats_match(path)
+    if match is None or int(match["rank"]) == 0:
         raise AssertionError(
             "subset-finalize handoff left an unexpected temporary CSV: "
             + path.name
         )
+
+
+def intel_no_finalize_temporary_stats_allowed(
+    mode, returncode, output, timed_out, nprocs, is_intel_mpi, paths,
+):
+    """SIGKILL cannot complete an interrupted rank-local atomic writer."""
+    if (mode not in {"no-finalize-nonzero", "no-finalize-return-nonzero"} or
+            returncode == 0 or timed_out or not is_intel_mpi or not paths or
+            nprocs <= 0 or FAIL_RE.search(output)):
+        return False
+    blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
+    if not blocks or LAUNCHER_ABNORMAL_RE.search(
+            INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.sub("", output)):
+        return False
+    victims = set()
+    for block in blocks:
+        identity = re.search(r"RANK (\d+) PID (\d+) RUNNING AT ", block[0])
+        if identity is None:
+            return False
+        rank, pid = map(int, identity.groups())
+        if rank >= nprocs or pid <= 0:
+            return False
+        victims.add((rank, pid))
+    for path in paths:
+        match = interrupted_temporary_stats_match(path)
+        if (match is None or match["fallback"] is None or
+                (int(match["rank"]), int(match["pid"])) not in victims):
+            return False
+    return True
 
 
 def compact_temporary_stats_files(stats_dir):
@@ -1487,9 +1522,26 @@ def main():
     if require_complete_stats_files:
         for name, evidence in stats_file_evidence.items():
             require_complete_stats_evidence(name, evidence)
+    intel_interrupted_writer_allowed = (
+        bool(temporary_stats_files) and
+        intel_no_finalize_temporary_stats_allowed(
+            args.mode, returncode, output, timed_out, nprocs,
+            args.mode in {"no-finalize-nonzero", "no-finalize-return-nonzero"}
+            and launcher_looks_like_intel_mpi(args.mpiexec),
+            temporary_stats_files,
+        )
+    )
+    if intel_interrupted_writer_allowed:
+        for name, evidence in stats_file_evidence.items():
+            require_complete_stats_evidence(name, evidence)
+        print(
+            "mpi_lifecycle_expected_hydra_writer_interruption "
+            f"mode={args.mode} temporary_csvs={len(temporary_stats_files)}"
+        )
     if (temporary_stats_files and
             not report_signal_requested and
-            not allow_interrupted_peer_temporary_stats):
+            not allow_interrupted_peer_temporary_stats and
+            not intel_interrupted_writer_allowed):
         raise AssertionError(
             "PEAK CSV temporary file remained after launcher return: "
             + ", ".join(path.name for path in temporary_stats_files)
