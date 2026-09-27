@@ -12,10 +12,10 @@ cleanup() {
 trap cleanup EXIT
 cc=${CC:-cc}
 processor=${PEAK_GUARD_SYSTEM_PROCESSOR:-$(uname -m)}
-extra_sources=()
+sources=("$root/test/filesystem_stat_guard/test_review.c")
 case "$processor" in
   aarch64|arm64|ARM64)
-    extra_sources+=("$root/cmake/peak-gum/peak_aarch64_raw_syscall.S")
+    sources+=("$root/cmake/peak-gum/peak_aarch64_raw_syscall.S")
     ;;
 esac
 "$cc" -c -O1 -ffunction-sections -fdata-sections -DPEAK_ENABLE_TEST_HOOKS=1 -DPEAK_HAVE_GUM_PEAK_PC_API=1 -I"$root/include" -I"$PEAK_GUARD_GUM_INCLUDE" "$root/src/detach_controller.c" -o "$build/controller.o"
@@ -28,7 +28,7 @@ cat > "$build/process-policy.c" <<'C'
 int peak_process_profile_enabled(void) { return 1; }
 int peak_process_requests_work(void) { return 1; }
 C
-"$cc" -std=gnu11 -Wall -Wextra -Werror -DREVIEW_ACTUAL_CONTROLLER -I"$root/include" "$root/test/filesystem_stat_guard/test_review.c" "$build/controller.o" "$build/signal.o" "$build/process-policy.c" "${extra_sources[@]}" -Wl,--gc-sections -L"$build" -lguard -lproxy -pthread -ldl -Wl,-rpath,"$build" -o "$build/test"
+"$cc" -std=gnu11 -Wall -Wextra -Werror -DREVIEW_ACTUAL_CONTROLLER -I"$root/include" "$build/controller.o" "$build/signal.o" "$build/process-policy.c" "${sources[@]}" -Wl,--gc-sections -L"$build" -lguard -lproxy -pthread -ldl -Wl,-rpath,"$build" -o "$build/test"
 for scenario in cold cold-warm-before cold-warm-after; do
   timeout --kill-after=2s 5s "$build/test" "$scenario"
 done
