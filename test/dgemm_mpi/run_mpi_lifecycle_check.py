@@ -134,7 +134,7 @@ WRITER_DESTINATION_FAILURE_DIAGNOSTIC = (
 )
 STATS_CSV_NAME_RE = re.compile(
     r"^peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
-    r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p\d+-"
+    r"h[A-Za-z0-9_.-]+-r(?P<rank>[A-Za-z0-9_-]+)-p(?P<pid>\d+)-"
     r"q[0-9a-f]{16}(?P<fallback>-ranklocal-h[A-Za-z0-9_.-]+)?\.csv$"
 )
 
@@ -179,6 +179,25 @@ def require_socket_release_fallback_layout(stats_names, nprocs):
 def writer_destination_failure_observed(output):
     """The dirfd writer rejects a non-directory parent before temp creation."""
     return WRITER_DESTINATION_FAILURE_DIAGNOSTIC in output
+
+
+def require_interrupted_peer_temporary_stats(path):
+    """Allow only a canonical non-root CSV with the atomic writer's suffix."""
+    temporary_match = re.fullmatch(
+        r"(?P<final>.+\.csv)\.tmp\.p(?P<pid>\d+)\.\d+", path.name
+    )
+    final_match = (
+        STATS_CSV_NAME_RE.fullmatch(temporary_match["final"])
+        if temporary_match is not None else None
+    )
+    if (final_match is None or
+            not final_match["rank"].isdigit() or
+            int(final_match["rank"]) == 0 or
+            final_match["pid"] != temporary_match["pid"]):
+        raise AssertionError(
+            "subset-finalize handoff left an unexpected temporary CSV: "
+            + path.name
+        )
 
 
 def compact_temporary_stats_files(stats_dir):
@@ -1484,16 +1503,7 @@ def main():
         for name, evidence in stats_file_evidence.items():
             require_complete_stats_evidence(name, evidence)
         for path in temporary_stats_files:
-            rank_match = re.fullmatch(
-                r"peak-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"
-                r"h[A-Za-z0-9_.-]+-r(\d+)-p\d+-q[0-9a-f]{16}\.csv\.tmp\..+",
-                path.name,
-            )
-            if rank_match is None or int(rank_match.group(1)) == 0:
-                raise AssertionError(
-                    "subset-finalize handoff left an unexpected temporary CSV: "
-                    + path.name
-                )
+            require_interrupted_peer_temporary_stats(path)
     if report_signal_requested:
         if args.report_signal == "KILL" and returncode == 0:
             raise AssertionError(

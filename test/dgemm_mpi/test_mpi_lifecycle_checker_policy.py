@@ -330,6 +330,37 @@ class StatsArtifactNameTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "each rank exactly once"):
             CHECKER.require_socket_release_fallback_layout(duplicate, 4)
 
+    def test_handoff_accepts_observed_interrupted_nonroot_fallback(self) -> None:
+        observed = (
+            "peak-stats-jnone-snone-hrunnervm3p1d5-r1-p309637-"
+            "qef41930c45a002ae-ranklocal-hrunnervm3p1d5.csv.tmp.p309637.0"
+        )
+        CHECKER.require_interrupted_peer_temporary_stats(Path(observed))
+        CHECKER.require_interrupted_peer_temporary_stats(
+            Path(observed.replace("-ranklocal-hrunnervm3p1d5", ""))
+        )
+
+    def test_handoff_rejects_root_or_malformed_temporary_identity(self) -> None:
+        valid = (
+            "peak-stats-j42-s7-hnode0-r1-p123-q0123456789abcdef-"
+            "ranklocal-hnode0.csv.tmp.p123.0"
+        )
+        invalid = [
+            valid.replace("-r1-", "-r0-"),
+            valid.replace("-r1-", "-runknown-"),
+            valid.replace("q0123456789abcdef", "qBAD"),
+            valid.replace(".tmp.p123.0", ".tmp.p999.0"),
+            valid.replace(".tmp.p123.0", ".tmp.unknown"),
+            valid + ".extra",
+            ".peak-tmp.p123.0",
+        ]
+        for name in invalid:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    AssertionError, "unexpected temporary CSV"
+                ):
+                    CHECKER.require_interrupted_peer_temporary_stats(Path(name))
+
     def test_compact_temporary_artifact_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(CHECKER.compact_temporary_stats_files(directory), [])
