@@ -27,8 +27,10 @@ real 200 us waits, then requires at least 50 successful drained windows out of 1
 requests. Additional cases retain an in-flight reader across timeout/reopening,
 run a nested user signal handler while entry is closed, cancel a closed-gate
 reader, and fork from a user handler inside a query. The child must reject a
-stop until that surviving query unwinds. The 1 ms drain budget bounds writer
-preference; scheduling and slow filesystem calls may still cause safe deferral.
+stop until that surviving query unwinds. The 16 ms active-reader deadline bounds
+waiting for admitted readers; slow filesystem calls may still cause safe deferral.
+It is not a hard limit on the full stop window: writer scheduling delays and
+subsequent backend stop work can extend that window.
 
 Stable TLS admission records also cover nonlocal exits: an isolated child
 abandons 80 queries with siglongjmp, exceeding the four record slots, then checks
