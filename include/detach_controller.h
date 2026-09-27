@@ -127,6 +127,9 @@ PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_register_atfork(void);
+
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_wait_sequence(void);
 

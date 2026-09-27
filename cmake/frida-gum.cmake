@@ -136,10 +136,12 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_near_processor)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        _peak_near_processor MATCHES "^(x86_64|amd64)$")
+        # Bind auxiliary-vector/Gum imports at load, avoiding first-call lazy
+        # loader resolution while the mutation controller has stopped threads.
         set(_near_object "${_output_dir}/peak_gum_low_gap.c.o")
         execute_process(
             COMMAND "${CMAKE_C_COMPILER}" ${_peak_overlay_toolchain_flags}
-                -std=c11 -fPIC -O2 ${_peak_overlay_c_flags_list}
+                -std=c11 -fPIC -O2 ${_peak_overlay_c_flags_list} -fno-plt
                 "-I${_output_dir}" "-I${_source_dir}/../include"
                 -c "${_source_dir}/peak-gum/peak_gum_low_gap.c"
                 -o "${_near_object}"

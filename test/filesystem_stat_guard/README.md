@@ -32,7 +32,31 @@ preference; scheduling and slow filesystem calls may still cause safe deferral.
 
 Stable TLS admission records also cover nonlocal exits: an isolated child
 abandons 80 queries with siglongjmp, exceeding the four record slots, then checks
-new queries and fork. Overflow reuses one permanent poison reader, keeping
-application return/errno semantics while later physical stops defer safely.
+new queries and fork. If exhaustion has a generation-valid admitted outer record, further queries
+borrow that counted reader without permanent poisoning. An abandoned outer
+record stays counted and therefore remains conservative across later calls and
+fork. Exhaustion without an admitted outer reader retains the permanent poison
+fallback, keeping application return/errno semantics while stops defer safely.
 A test-only callback exercises a nested query during child reset under an
 inherited closed gate; it is absent from production builds.
+
+Cold controller fork and normal nested overflow regressions run as separate
+fresh processes: four, five and 32 normally returning nested queries must leave
+zero readers and allow a subsequent stop. A 32-deep cancellation must unwind all
+counted readers; a fork at that depth must preserve them until child unwind.
+A nonlocal exit at that depth must instead keep stops safely deferred in both
+parent and child. The cold fixture checks the controller scope contract before
+lazy resolver initialization, plus both child-callback registration orders. Its
+stop probe runs in a separate joined thread, so a query-local TLS head cannot
+mask missing global reader admission.
+
+For an actual-controller lifecycle check, run
+`PEAK_GUARD_GUM_INCLUDE=/path/to/devkit bash run_controller_integration.sh`.
+It compiles production controller and signal-policy code and runs their actual
+mutex/atfork callbacks. Only the standalone process-filter decisions are
+supplied by the fixture; section garbage collection excludes unrelated Gum
+backend paths. On AArch64 it links the existing raw-syscall assembly dependency;
+`PEAK_GUARD_SYSTEM_PROCESSOR` accepts the CMake target processor and defaults to
+`uname -m` for standalone use. This is a local lifecycle regression, not physical MPI/backend
+coverage. The child reset discards the inherited bypass depth without requiring
+symbol resolution or changing the guard's separate reader-generation reset.

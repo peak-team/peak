@@ -11,3 +11,8 @@ trap cleanup EXIT
 "${CC:-cc}" -shared -fPIC -std=gnu11 -Wall -Wextra -Werror -DPEAK_FILESYSTEM_STAT_GUARD_TESTING -I"$root/include" "$root/src/filesystem_stat_guard.c" -ldl -pthread -o "$build/libguard.so"
 "${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -I"$root/include" "$root/test/filesystem_stat_guard/test_guard.c" -L"$build" -lguard -lproxy -pthread -Wl,-rpath,"$build" -o "$build/test"
 timeout --kill-after=2s 15s "$build/test"
+
+"${CC:-cc}" -std=gnu11 -Wall -Wextra -Werror -DREVIEW_FIXED -I"$root/include" "$root/test/filesystem_stat_guard/test_review.c" -L"$build" -lguard -lproxy -pthread -Wl,-rpath,"$build" -o "$build/test-review"
+for scenario in cold cold-warm-before cold-warm-after four five deep nested-fork nested-cancel nested-abandon; do
+  timeout --kill-after=2s 5s "$build/test-review" "$scenario"
+done

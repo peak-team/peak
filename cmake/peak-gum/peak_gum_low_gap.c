@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -263,6 +264,75 @@ peak_near_snapshot(uintptr_t target, gsize page_size, uintptr_t* first)
     return snapshot.main_matches == 1 ? 1 : 0;
 }
 
+/* The kernel auxiliary vector names the immutable main-image program table.
+ * Reading it needs no loader lock, once state, allocation, or procfs snapshot.
+ * Unusual layouts retain the original conservative file/maps classifier. */
+static int
+peak_near_main_image(uintptr_t target)
+{
+    uintptr_t table = (uintptr_t)getauxval(AT_PHDR);
+    unsigned long count = getauxval(AT_PHNUM);
+    if (table == 0 || count == 0 || count >= PN_XNUM ||
+        getauxval(AT_PHENT) != sizeof(Elf64_Phdr) ||
+        count > (UINTPTR_MAX - table) / sizeof(Elf64_Phdr)) {
+        return -1;
+    }
+    const Elf64_Phdr* phdr = (const Elf64_Phdr*)table;
+    uintptr_t bias = 0;
+    unsigned int found = 0;
+    for (unsigned long i = 0; i < count; i++) {
+        if (phdr[i].p_type == PT_PHDR) {
+            if (++found != 1 || phdr[i].p_vaddr > table ||
+                phdr[i].p_filesz < count * sizeof(Elf64_Phdr)) {
+                return -1;
+            }
+            bias = table - phdr[i].p_vaddr;
+        }
+    }
+    if (found != 1) {
+        return -1;
+    }
+    const Elf64_Ehdr* header = NULL;
+    int main_image = 0;
+    for (unsigned long i = 0; i < count; i++) {
+        if (phdr[i].p_type != PT_LOAD) {
+            continue;
+        }
+        if (phdr[i].p_vaddr > UINTPTR_MAX - bias ||
+            phdr[i].p_memsz > UINTPTR_MAX - (bias + phdr[i].p_vaddr) ||
+            phdr[i].p_filesz > phdr[i].p_memsz) {
+            return -1;
+        }
+        uintptr_t start = bias + phdr[i].p_vaddr;
+        uintptr_t end = start + phdr[i].p_memsz;
+        if (phdr[i].p_offset == 0 && (phdr[i].p_flags & PF_R) &&
+            phdr[i].p_filesz >= sizeof(Elf64_Ehdr)) {
+            if (header != NULL) {
+                return -1;
+            }
+            header = (const Elf64_Ehdr*)start;
+        }
+        if (start <= target && target < end) {
+            main_image = 1;
+        }
+    }
+    if (header == NULL || memcmp(header->e_ident, ELFMAG, SELFMAG) != 0 ||
+        header->e_ident[EI_CLASS] != ELFCLASS64 ||
+        header->e_ident[EI_DATA] != ELFDATA2LSB ||
+        header->e_ident[EI_VERSION] != EV_CURRENT ||
+        header->e_version != EV_CURRENT || header->e_machine != EM_X86_64 ||
+        header->e_ehsize != sizeof(*header) ||
+        header->e_phentsize != sizeof(*phdr) || header->e_phnum != count ||
+        header->e_phoff > UINTPTR_MAX - (uintptr_t)header ||
+        (uintptr_t)header + header->e_phoff != table) {
+        return -1;
+    }
+    if (header->e_type == ET_DYN) {
+        return 0;
+    }
+    return header->e_type == ET_EXEC ? main_image : -1;
+}
+
 static int
 peak_near_layout(guint n_pages, gsize page_size, uintptr_t gap_end,
                  const GumAddressSpec* spec, uintptr_t* hint, gsize* size)
@@ -315,6 +385,10 @@ peak_gum_try_alloc_n_pages_near_main_low_gap(guint n_pages, GumPageProtection pr
         return gum_try_alloc_n_pages_near(n_pages, prot, spec);
     }
     int saved_errno = errno;
+    if (peak_near_main_image((uintptr_t)spec->near_address) == 0) {
+        errno = saved_errno;
+        return gum_try_alloc_n_pages_near(n_pages, prot, spec);
+    }
     gsize page_size = gum_query_page_size();
     uintptr_t first, hint;
     gsize size;

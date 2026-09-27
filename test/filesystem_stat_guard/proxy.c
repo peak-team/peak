@@ -6,6 +6,8 @@
 #include <time.h>
 static _Atomic int entered, mode;
 static _Atomic unsigned long calls;
+static void (*query_hook)(void);
+void proxy_set_hook(void (*hook)(void)) { query_hook = hook; }
 void
 proxy_set_mode(int value)
 {
@@ -29,6 +31,7 @@ statfs(const char *path, struct statfs *buf)
     (void)buf;
     atomic_fetch_add(&calls, 1);
     atomic_store(&entered, 1);
+    if (query_hook) query_hook();
     if (atomic_load(&mode) == 1)
     {
         struct timespec delay = {.tv_sec = 10};

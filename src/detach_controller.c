@@ -531,6 +531,7 @@ peak_detach_controller_atfork_child(void)
     held_mutation = (PeakDetachHeldMutation){ 0 };
     memset(physical_patch_records, 0, sizeof(physical_patch_records));
     peak_detach_controller_init_mutation_guard();
+    peak_filesystem_stat_guard_controller_after_fork_child();
 }
 
 static void
@@ -547,6 +548,14 @@ peak_detach_controller_init_atfork_once(void)
     (void)pthread_once(&atfork_initialized,
                        peak_detach_controller_register_atfork);
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+void
+peak_detach_controller_test_register_atfork(void)
+{
+    peak_detach_controller_init_atfork_once();
+}
+#endif
 
 static void
 peak_detach_controller_reset_inherited_helper_if_needed(void)

@@ -151,6 +151,12 @@ enter_region(unsigned index)
             &tokens[head - 1], memory_order_seq_cst) : 0;
         int nested = (head_token & TOKEN_ADMITTED) &&
                      (unsigned)(head_token & TOKEN_GENERATION_MASK) == generation;
+        /* Exhaustion during normal nesting borrows the counted outer query.
+         * Cancellation unwinds it last; a nonlocal exit leaves its stable
+         * admitted record counted, so even a stale head remains fail closed.
+         * Fork preserves and retags that record before returning to this call. */
+        if (!index && nested)
+            return 1;
         if (((old & STOP_BIT) && !nested) || (old & COUNT_MASK) == COUNT_MASK)
         {
             (void)sched_yield();
@@ -351,6 +357,15 @@ peak_filesystem_stat_guard_controller_leave(void)
      * ordinary queries cannot bypass admission after current ownership ends. */
 }
 void
+peak_filesystem_stat_guard_controller_after_fork_child(void)
+{
+    /* The controller's atfork registration can precede lazy query resolution.
+     * Its child mutex is reset rather than unlocked: discard the matching
+     * inherited bypass scope without resolving symbols inside the callback.
+     * Reader generations remain owned by the guard's separate child callback. */
+    update_control(CONTROL_DEPTH_MASK | CONTROL_SATURATED, 0);
+}
+void
 peak_filesystem_stat_guard_after_fork_child(void)
 {
     update_control(CONTROL_WRITER | CONTROL_DEPTH_MASK | CONTROL_SATURATED, 0);
@@ -460,6 +475,10 @@ peak_filesystem_stat_guard_controller_enter(void)
 }
 void
 peak_filesystem_stat_guard_controller_leave(void)
+{
+}
+void
+peak_filesystem_stat_guard_controller_after_fork_child(void)
 {
 }
 void
