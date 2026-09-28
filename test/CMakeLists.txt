@@ -1,5 +1,25 @@
 include(CTest)
 if(BUILD_TESTING)
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_test(NAME test_filesystem_stat_stop_guard
+            COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
+                bash ${CMAKE_CURRENT_SOURCE_DIR}/filesystem_stat_guard/run.sh)
+        set_tests_properties(test_filesystem_stat_stop_guard PROPERTIES TIMEOUT 30)
+        if(PEAK_GUM_PEAK_PC_API_AVAILABLE)
+            find_path(_peak_guard_gum_include frida-gum.h
+                HINTS ${FRIDA_GUM_INCLUDE_DIRS} NO_DEFAULT_PATH)
+            if(NOT _peak_guard_gum_include)
+                message(FATAL_ERROR "The guard lifecycle test requires the configured Gum header")
+            endif()
+            add_test(NAME test_filesystem_stat_controller_fork
+                COMMAND ${CMAKE_COMMAND} -E env
+                    CC=${CMAKE_C_COMPILER}
+                    PEAK_GUARD_GUM_INCLUDE=${_peak_guard_gum_include}
+                    PEAK_GUARD_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}
+                    bash ${CMAKE_CURRENT_SOURCE_DIR}/filesystem_stat_guard/run_controller_integration.sh)
+            set_tests_properties(test_filesystem_stat_controller_fork PROPERTIES TIMEOUT 60)
+        endif()
+    endif()
     include(CheckCCompilerFlag)
     option(PEAK_BUILD_DYNAMIC_LIB_TESTS "Build dynamic dlopen/Python extension tests" ON)
 
@@ -43,6 +63,15 @@ if(BUILD_TESTING)
     find_package(OpenMP)
     find_package(MPI)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        add_test(NAME test_gum_low_gap_classifier
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/gum_low_gap/run_classifier.py
+                --cc ${CMAKE_C_COMPILER}
+                --build-dir ${CMAKE_CURRENT_BINARY_DIR}/gum_low_gap_classifier)
+        set_tests_properties(test_gum_low_gap_classifier PROPERTIES TIMEOUT 150)
+    endif()
     if(PEAK_CUDA_ENABLED)
         include_directories(${PEAK_CUDA_INCLUDE_DIRS})
     endif()

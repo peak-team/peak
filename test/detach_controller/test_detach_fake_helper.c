@@ -643,6 +643,8 @@ main(int argc, char** argv)
                 strcmp(scenario, "synthetic-stop-once") == 0 ||
                 strcmp(scenario, "synthetic-stop-file-once") == 0 ||
                 strcmp(scenario, "evacuate-error") == 0 ||
+                strcmp(scenario, "evacuate-protocol-error") == 0 ||
+                strcmp(scenario, "evacuate-unknown-status") == 0 ||
                 strcmp(scenario, "evacuate-release-failed") == 0 ||
                 strcmp(scenario, "resume-release-failed") == 0 ||
                 strcmp(scenario, "shutdown-missing-response") == 0) {
@@ -768,7 +770,16 @@ main(int argc, char** argv)
             }
             if (strcmp(scenario, "evacuate-error") == 0) {
                 (void)send_response((int)fd,
-                                    PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR,
+                                    PEAK_DETACH_HELPER_STATUS_REGISTER_ERROR,
+                                    EIO,
+                                    0);
+                continue;
+            }
+            if (strcmp(scenario, "evacuate-protocol-error") == 0 ||
+                strcmp(scenario, "evacuate-unknown-status") == 0) {
+                (void)send_response((int)fd,
+                                    strcmp(scenario, "evacuate-protocol-error") == 0 ?
+                                        PEAK_DETACH_HELPER_STATUS_PROTOCOL_ERROR : 999,
                                     EPROTO,
                                     0);
                 continue;

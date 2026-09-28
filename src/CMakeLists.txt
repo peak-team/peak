@@ -43,6 +43,7 @@ set(sources_peak
     exec_interceptor.c
     exec_raw_syscall.c
     ${PEAK_DARWIN_GUM_PATCH_SOURCE}
+    filesystem_stat_guard.c
 )
 
 if(PEAK_ENABLE_OTF2)

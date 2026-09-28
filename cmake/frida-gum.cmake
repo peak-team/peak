@@ -132,6 +132,46 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
         list(APPEND _peak_overlay_toolchain_flags
              "--sysroot=${CMAKE_SYSROOT}")
     endif()
+    # Route only the code allocator's near-page call on Linux x86-64.
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _peak_near_processor)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       _peak_near_processor MATCHES "^(x86_64|amd64)$")
+        # Bind auxiliary-vector/Gum imports at load, avoiding first-call lazy
+        # loader resolution while the mutation controller has stopped threads.
+        set(_near_object "${_output_dir}/peak_gum_low_gap.c.o")
+        execute_process(
+            COMMAND "${CMAKE_C_COMPILER}" ${_peak_overlay_toolchain_flags}
+                -std=c11 -fPIC -O2 ${_peak_overlay_c_flags_list} -fno-plt
+                "-I${_output_dir}" "-I${_source_dir}/../include"
+                -c "${_source_dir}/peak-gum/peak_gum_low_gap.c"
+                -o "${_near_object}"
+            RESULT_VARIABLE _near_compile_result
+            OUTPUT_VARIABLE _near_compile_stdout
+            ERROR_VARIABLE _near_compile_stderr)
+        if(NOT _near_compile_result EQUAL 0)
+            message(FATAL_ERROR "Failed to compile PEAK near-page overlay:\n${_near_compile_stdout}\n${_near_compile_stderr}")
+        endif()
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}"
+                "${_source_dir}/peak-gum/patch_gum_codeallocator_near.py"
+                --library "${_output_dir}/libfrida-gum.a"
+                --helper "${_near_object}"
+                --work-dir "${_output_dir}/near-page-member-patch"
+                --ar "${CMAKE_AR}" --nm "${CMAKE_NM}"
+                --objcopy "${CMAKE_OBJCOPY}"
+            RESULT_VARIABLE _near_patch_result
+            OUTPUT_VARIABLE _near_patch_stdout
+            ERROR_VARIABLE _near_patch_stderr)
+        if(NOT _near_patch_result EQUAL 0)
+            message(FATAL_ERROR "Failed near-page member route:\n${_near_patch_stdout}\n${_near_patch_stderr}")
+        endif()
+        string(STRIP "${_near_patch_stdout}" _near_patch_stdout_stripped)
+        if(_near_patch_stdout_stripped)
+            message(STATUS "${_near_patch_stdout_stripped}")
+        endif()
+    endif()
+
     execute_process(
         COMMAND "${CMAKE_C_COMPILER}"
             ${_peak_overlay_toolchain_flags}

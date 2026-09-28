@@ -35,7 +35,8 @@ typedef enum {
     PEAK_DETACH_STATUS_PERMISSION_DENIED,
     PEAK_DETACH_STATUS_TIMEOUT,
     PEAK_DETACH_STATUS_CLASSIFY_FAILED,
-    PEAK_DETACH_STATUS_ERROR
+    PEAK_DETACH_STATUS_ERROR,
+    PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY
 } PeakDetachStatus;
 
 typedef struct {
@@ -126,6 +127,9 @@ PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_backend_signum(void);
 
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
+PEAK_DETACH_CONTROLLER_TEST_API void
+peak_detach_controller_test_register_atfork(void);
+
 PEAK_DETACH_CONTROLLER_TEST_API int
 peak_detach_controller_test_signal_wait_sequence(void);
 

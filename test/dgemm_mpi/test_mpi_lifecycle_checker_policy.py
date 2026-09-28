@@ -330,6 +330,37 @@ class StatsArtifactNameTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "each rank exactly once"):
             CHECKER.require_socket_release_fallback_layout(duplicate, 4)
 
+    def test_handoff_accepts_observed_interrupted_nonroot_fallback(self) -> None:
+        observed = (
+            "peak-stats-jnone-snone-hrunnervm3p1d5-r1-p309637-"
+            "qef41930c45a002ae-ranklocal-hrunnervm3p1d5.csv.tmp.p309637.0"
+        )
+        CHECKER.require_interrupted_peer_temporary_stats(Path(observed))
+        CHECKER.require_interrupted_peer_temporary_stats(
+            Path(observed.replace("-ranklocal-hrunnervm3p1d5", ""))
+        )
+
+    def test_handoff_rejects_root_or_malformed_temporary_identity(self) -> None:
+        valid = (
+            "peak-stats-j42-s7-hnode0-r1-p123-q0123456789abcdef-"
+            "ranklocal-hnode0.csv.tmp.p123.0"
+        )
+        invalid = [
+            valid.replace("-r1-", "-r0-"),
+            valid.replace("-r1-", "-runknown-"),
+            valid.replace("q0123456789abcdef", "qBAD"),
+            valid.replace(".tmp.p123.0", ".tmp.p999.0"),
+            valid.replace(".tmp.p123.0", ".tmp.unknown"),
+            valid + ".extra",
+            ".peak-tmp.p123.0",
+        ]
+        for name in invalid:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    AssertionError, "unexpected temporary CSV"
+                ):
+                    CHECKER.require_interrupted_peer_temporary_stats(Path(name))
+
     def test_compact_temporary_artifact_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(CHECKER.compact_temporary_stats_files(directory), [])
@@ -340,6 +371,69 @@ class StatsArtifactNameTest(unittest.TestCase):
             self.assertEqual(artifacts, [artifact])
             with self.assertRaisesRegex(AssertionError, "compact CSV temporary"):
                 CHECKER.reject_compact_temporary_stats_files(artifacts)
+
+
+class IntelNoFinalizeInterruptedWriterTest(unittest.TestCase):
+    observed = (
+        "peak-stats-jnone-snone-hrunnervm3p1d5-r0-p599939-"
+        "q68f72079efa756aa-ranklocal-hrunnervm3p1d5.csv.tmp.p599939.0"
+    )
+    output = HYDRA_BLOCK.replace("RANK 3 PID 1234", "RANK 0 PID 599939")
+
+    def allowed(self, **overrides: object) -> bool:
+        arguments = dict(
+            mode="no-finalize-nonzero", returncode=255, output=self.output,
+            timed_out=False, nprocs=2, is_intel_mpi=True,
+            paths=[Path(self.observed)],
+        )
+        arguments.update(overrides)
+        return CHECKER.intel_no_finalize_temporary_stats_allowed(**arguments)
+
+    def test_exact_ci_killed_owner_is_allowed(self) -> None:
+        self.assertTrue(self.allowed())
+        self.assertTrue(self.allowed(mode="no-finalize-return-nonzero"))
+
+    def test_orderly_or_unproven_termination_stays_strict(self) -> None:
+        for overrides in [
+                {"mode": "no-finalize"}, {"mode": "finalize-clean"},
+                {"returncode": 0}, {"timed_out": True},
+                {"is_intel_mpi": False}, {"paths": []},
+                {"nprocs": 0}, {"output": ""},
+                {"output": self.output.replace("SIGNAL: 9", "SIGNAL: 15")},
+                {"output": self.output + "Caught signal 11\n"},
+                {"output": self.output + "MPI_Abort\n"},
+                {"output": self.output + "BAD TERMINATION\n"},
+                {"output": self.output.replace("RANK 0", "RANK 2")},
+        ]:
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self.allowed(**overrides))
+
+    def test_only_canonical_exact_killed_rank_pid_is_allowed(self) -> None:
+        invalid = [
+            self.observed.replace("-r0-", "-r1-"),
+            self.observed.replace("p599939", "p599940"),
+            self.observed.replace(".tmp.p599939.0", ".tmp.p599940.0"),
+            self.observed.replace("-ranklocal-hrunnervm3p1d5", ""),
+            self.observed.replace("q68f72079efa756aa", "qBAD"),
+            self.observed + ".extra", ".peak-tmp.p599939.0",
+        ]
+        for name in invalid:
+            with self.subTest(name=name):
+                self.assertFalse(self.allowed(paths=[Path(name)]))
+                self.assertFalse(self.allowed(
+                    paths=[Path(self.observed), Path(name)]))
+
+    def test_published_final_csv_must_still_be_complete(self) -> None:
+        self.assertTrue(self.allowed())
+        for evidence in [
+                {"size": 0, "fields": CHECKER.STATS_FIELDS, "rows": []},
+                {"size": 100, "fields": ["function", "count"], "rows": []},
+                {"size": 100, "fields": CHECKER.STATS_FIELDS,
+                 "rows": [{"function": "peak_mpi_exit_target", "count": None}]},
+        ]:
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(AssertionError):
+                    CHECKER.require_complete_stats_evidence("final.csv", evidence)
 
 
 if __name__ == "__main__":

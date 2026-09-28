@@ -1,6 +1,7 @@
 add_executable(test_detach_controller
   test_detach_controller.c
   ${PROJECT_SOURCE_DIR}/src/detach_controller.c
+  ${PROJECT_SOURCE_DIR}/src/filesystem_stat_guard.c
   ${PROJECT_SOURCE_DIR}/src/signal_policy.c
   ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
   ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall.c
@@ -27,6 +28,7 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     ${PROJECT_SOURCE_DIR}/src/pthread_listener.c
     ${PROJECT_SOURCE_DIR}/src/pthread_slot_registry.c
     ${PROJECT_SOURCE_DIR}/src/detach_controller.c
+    ${PROJECT_SOURCE_DIR}/src/filesystem_stat_guard.c
     ${PROJECT_SOURCE_DIR}/src/signal_policy.c
     ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall.c
     $<TARGET_OBJECTS:utils_c>
@@ -411,6 +413,14 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
   set_tests_properties(test_detach_controller_fake_helper_evacuate-error
     PROPERTIES
       ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=helper;PEAK_DETACH_HELPER=$<TARGET_FILE:test_detach_fake_helper>;FAKE_DETACH_HELPER_SCENARIO=evacuate-error")
+
+  foreach(scenario evacuate-protocol-error evacuate-unknown-status)
+    add_fatal_safe_detach_test(
+      test_detach_controller_fake_helper_${scenario}
+      fake-helper-fail-closed
+      ${scenario}
+      -DEXPECTED_FATAL_DETAIL=evacuate.cleanup.unproven)
+  endforeach()
 
   add_fatal_safe_detach_test(
     test_detach_controller_fake_helper_evacuate-release-failed

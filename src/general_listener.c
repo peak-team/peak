@@ -1827,6 +1827,7 @@ static gboolean
 peak_general_controller_status_is_retryable(PeakDetachStatus status)
 {
     switch (status) {
+        case PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY:
         case PEAK_DETACH_STATUS_TIMEOUT:
         case PEAK_DETACH_STATUS_CLASSIFY_FAILED:
         case PEAK_DETACH_STATUS_ERROR:
