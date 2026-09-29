@@ -39,6 +39,7 @@ def main():
     platform_cmake = read(root, "cmake/exec-platform.cmake")
     source_cmake = read(root, "src/CMakeLists.txt")
     tests_cmake = read(root, "test/CMakeLists.txt")
+    mpi_tests_cmake = read(root, "test/dgemm_mpi/CMakeLists.txt")
     detach_tests_cmake = read(root, "test/detach_controller/CMakeLists.txt")
     detach_runtime_cmake = read(root, "test/detach_runtime/CMakeLists.txt")
     dlopen_tests_cmake = read(root, "test/dlopen_controller/CMakeLists.txt")
@@ -150,11 +151,28 @@ def main():
             "peak_aarch64_raw_syscall.S" in detach_tests_cmake,
             "patched Gum, libpeak, checkpoint-writer tests, and standalone "
             "controller tests must all link the raw-syscall stub")
+    raw_syscall_tests = re.search(
+        r"foreach\(_peak_raw_syscall_test IN ITEMS([\s\S]*?)\)"
+        r"[\s\S]*?target_sources\(\$\{_peak_raw_syscall_test\} PRIVATE"
+        r"[\s\S]*?peak_aarch64_raw_syscall\.S",
+        tests_cmake,
+    )
+    require(raw_syscall_tests is not None and all(
+                target in raw_syscall_tests.group(1).split()
+                for target in (
+                    "test_report_formatter",
+                    "test_socket_report_transport",
+                    "test_mpi_report_request_lifetime",
+                    "test_exec_checkpoint_writer",
+                    "test_output_identity",
+                )),
+            "standalone report, socket, and checkpoint tests must link the "
+            "AArch64 raw-syscall stub")
     require(re.search(
-                r"target_sources\(test_exec_checkpoint_writer\s+PRIVATE"
+                r"target_sources\(test_mpi_report_transport\s+PRIVATE"
                 r"[\s\S]{0,180}peak_aarch64_raw_syscall\.S",
-                tests_cmake),
-            "the standalone checkpoint-writer test must link the AArch64 "
+                mpi_tests_cmake),
+            "standalone MPI report transport must link the AArch64 "
             "raw-syscall stub")
     require("test_gum_raw_syscall_aarch64" in dlopen_tests_cmake and
             "test_gum_module_sync_idle_quiesce" in dlopen_tests_cmake,

@@ -498,11 +498,6 @@ if(BUILD_TESTING)
         report/test_exec_checkpoint_writer.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
-    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-        target_sources(test_exec_checkpoint_writer PRIVATE
-            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
-    endif()
     target_include_directories(test_exec_checkpoint_writer PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(test_exec_checkpoint_writer PRIVATE
@@ -517,16 +512,28 @@ if(BUILD_TESTING)
         report/test_output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/exec_checkpoint_writer.c)
-    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
-       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-        target_sources(test_output_identity PRIVATE
-            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
-    endif()
     target_include_directories(test_output_identity PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_compile_definitions(test_output_identity PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_options(test_output_identity PRIVATE -UNDEBUG)
     target_link_libraries(test_output_identity PRIVATE Threads::Threads ${RT_LIBRARY})
+
+    # These standalone tests compile output_identity.c or
+    # socket_report_transport.c directly. On Linux AArch64 their inline raw
+    # syscalls need the same assembly primitive linked into libpeak.
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        foreach(_peak_raw_syscall_test IN ITEMS
+                test_report_formatter
+                test_socket_report_transport
+                test_mpi_report_request_lifetime
+                test_exec_checkpoint_writer
+                test_output_identity)
+            target_sources(${_peak_raw_syscall_test} PRIVATE
+                ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+        endforeach()
+    endif()
+
     foreach(_output_identity_case IN ITEMS preinit default template-csv template-bare invalid template-overlong template-expanded-overlong template-raw-overlong-renderable concurrent snapshot entropy-fallback)
         add_test(NAME test_output_identity_${_output_identity_case}
             COMMAND test_output_identity ${_output_identity_case})

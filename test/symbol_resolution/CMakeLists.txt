@@ -79,6 +79,10 @@ add_executable(test_symbol_resolution_dynamic
 target_include_directories(test_symbol_resolution_dynamic PRIVATE
     ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(test_symbol_resolution_dynamic PRIVATE peak ${CMAKE_DL_LIBS})
+if(MPI_FOUND)
+    # general_listener.h includes mpi.h when PEAK is configured with MPI.
+    target_link_libraries(test_symbol_resolution_dynamic PRIVATE MPI::MPI_C)
+endif()
 target_compile_definitions(test_symbol_resolution_dynamic PRIVATE
     PEAK_ENABLE_TEST_HOOKS=1
     PEAK_TARGET_RESOLVER_TESTING=1
