@@ -11,3 +11,9 @@ add_executable(test_allocation_lifetime test_allocation_lifetime.c)
 target_include_directories(test_allocation_lifetime PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_definitions(test_allocation_lifetime PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
 target_link_libraries(test_allocation_lifetime PRIVATE peak Threads::Threads)
+
+# malloc_interceptor.h includes mpi.h when MPI support is enabled.
+if(MPI_FOUND)
+    target_link_libraries(test_memlog_safety PRIVATE MPI::MPI_C)
+    target_link_libraries(test_allocation_lifetime PRIVATE MPI::MPI_C)
+endif()

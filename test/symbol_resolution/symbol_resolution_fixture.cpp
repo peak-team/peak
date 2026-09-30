@@ -558,8 +558,15 @@ int same(int value)
 
 namespace alias_b {
 #if defined(__ELF__)
+#if defined(__NVCOMPILER)
+/* NVHPC rejects a C++ alias attribute with a mangled target name. Emit the
+ * equivalent ELF symbol alias so both names retain the same address. */
+__asm__(".globl _ZN7alias_b4sameEi\n"
+        ".set _ZN7alias_b4sameEi, _ZN7alias_a4sameEi");
+#else
 int same(int value)
     __attribute__((used, alias("_ZN7alias_a4sameEi"), visibility("default")));
+#endif
 #else
 __attribute__((noinline, used, visibility("default")))
 int same(int value)
