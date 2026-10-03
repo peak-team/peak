@@ -1,22 +1,24 @@
 """Independent production late raw-name regression; no test-hook library needed."""
-import argparse,os,re,subprocess,tempfile
+import argparse,os,re,subprocess,tempfile,shlex
 from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('--lib',required=True);p.add_argument('--logs',type=Path);a=p.parse_args()
 root=Path(__file__).resolve().parent
+compiler=shlex.split(os.environ.get("CC","cc"))
+assert compiler,"CC must name a compiler"
 def run(args,env=None):
     result=subprocess.run(args,env=env,capture_output=True,text=True,timeout=30)
     assert result.returncode==0,result.stdout+result.stderr
     return result.stdout+result.stderr
 with tempfile.TemporaryDirectory(prefix='peak-ordinary-late-') as directory:
     directory=Path(directory);exe=directory/'application'
-    run(['cc','-O2','-UNDEBUG',str(root/'ordinary_late_application.c'),'-ldl','-o',str(exe)])
+    run(compiler+['-std=c11','-O2','-UNDEBUG',str(root/'ordinary_late_application.c'),'-ldl','-o',str(exe)])
     env={k:v for k,v in os.environ.items() if not k.startswith(('PEAK_','FLAME_')) and k!='LD_PRELOAD'}
     env.update(LD_PRELOAD=str(Path(a.lib).resolve()),PEAK_TARGET='cblas_sdot',PEAK_HEARTBEAT_INTERVAL='0',PEAK_ENABLE_GLOBAL_HEARTBEAT='false',PEAK_ENABLE_PER_TARGET_HEARTBEAT='false',PEAK_DETACH_BACKEND='signal',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1')
     for kind,flags in [('dynamic',['-DEXPORTED_SYMBOL']),('hidden',[]),('local',['-DLOCAL_SYMBOL']),('duplicate',['-DLOCAL_SYMBOL']),('stripped',['-DLOCAL_SYMBOL'])]:
         module=directory/(kind+'.so')
         sources=[str(root/'ordinary_late_provider.c')]
         if kind=='duplicate':sources.append(str(root/'ordinary_late_duplicate.c'))
-        run(['cc','-O2','-shared','-fPIC',*flags,*sources,'-o',str(module)])
+        run(compiler+['-std=c11','-O2','-shared','-fPIC',*flags,*sources,'-o',str(module)])
         if kind=='stripped':run(['objcopy','--strip-all',str(module)])
         symbols=run(['readelf','--dyn-syms','-W',str(module)])
         assert ('cblas_sdot' in symbols)==(kind=='dynamic')
