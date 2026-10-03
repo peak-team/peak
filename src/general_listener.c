@@ -928,11 +928,31 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     accounting_wall_s = (double)accounting_wall_ns / 1e9;
     accounting_ratio = accounting_wall_s / trace_elapsed_time;
 
+    /* Success rows are emitted only after finish_hook_mutation succeeds.
+     * The raw-patch flag describes the controller implementation, not whether
+     * Gum changed entry bytes. Seal the existing successful Gum paths too;
+     * an unflushed detach remains unverified and cannot prove a cycle. */
+    const char* committed_physical_kind = "unverified";
+    if (result != NULL && strcmp(result, "success") == 0 &&
+        status == PEAK_DETACH_STATUS_SAFE &&
+        (operation == PEAK_DETACH_OPERATION_DETACH ||
+         operation == PEAK_DETACH_OPERATION_REATTACH)) {
+        if (physical) committed_physical_kind = "raw-entry-bytes";
+        else if (operation == PEAK_DETACH_OPERATION_DETACH &&
+                 hook_id < peak_hook_address_count &&
+                 array_listener_gum_detach_flushed != NULL &&
+                 array_listener_gum_detach_flushed[hook_id])
+            committed_physical_kind = "gum-flushed-detach";
+        else if (operation == PEAK_DETACH_OPERATION_REATTACH)
+            /* Both reattach success call sites check GUM_ATTACH_OK after the
+             * completed Gum transaction and successful mutation finish. */
+            committed_physical_kind = "gum-transaction-attach";
+    }
     pthread_mutex_lock(&detach_trace_mutex);
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
-                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.12f,%.9f,%.9f,%.9f,%llu,%.9f,%.9f,%d,%llu\n",
+                "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.12f,%.9f,%.9f,%.9f,%llu,%.9f,%.9f,%d,%llu,%s\n",
                 trace_now,
                 (unsigned long)hook_id,
                 hook_id < peak_hook_address_count && peak_hook_strings != NULL &&
@@ -967,7 +987,8 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
                 accounting_valid ? 1 : 0,
                 (unsigned long long)
                     peak_general_listener_failed_window_count_since_heartbeat(
-                        &detach_accounting));
+                        &detach_accounting),
+                committed_physical_kind);
         fclose(fp);
     }
     pthread_mutex_unlock(&detach_trace_mutex);
