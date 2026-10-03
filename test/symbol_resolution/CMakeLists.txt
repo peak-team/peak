@@ -181,3 +181,8 @@ set_tests_properties(
     test_symbol_resolution_startup_selectors
     test_symbol_resolution_startup_plain_c_fast_path
     PROPERTIES TIMEOUT 30)
+
+add_test(NAME test_symbol_resolution_ordinary_late
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ordinary_late.py
+            --lib $<TARGET_FILE:peak>)
+set_tests_properties(test_symbol_resolution_ordinary_late PROPERTIES TIMEOUT 150)
