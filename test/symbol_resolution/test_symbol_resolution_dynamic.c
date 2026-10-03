@@ -207,6 +207,9 @@ main(int argc, char** argv)
     dlopen_interceptor_test_set_manual_drain(TRUE);
     dlopen_interceptor_test_reset_selector_diagnostics();
     if (plain_c_unrelated_first) {
+        /* A dynamic miss now checks retained local symbols once. The unrelated
+         * DSO must remain unresolved and unretained; the later dynamic hit
+         * must add no further resolver work. */
         if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING, &module_a) ||
             !enqueue_and_drain_fixture(PEAK_TEST_SYMBOL_MODULE_MISSING,
                                        module_a)) {
@@ -215,9 +218,9 @@ main(int argc, char** argv)
         dlopen_interceptor_get_dynamic_attach_diagnostics(&diagnostics);
         dlopen_interceptor_test_get_selector_diagnostics(&selector_diagnostics);
         if (diagnostics.retained_handles != 0 ||
-            selector_diagnostics.deferred_module_sync_drains != 0 ||
-            selector_diagnostics.selector_resolver_batches != 0) {
-            fprintf(stderr, "not ok - unrelated DSO made ordinary C miss terminal or expensive\n");
+            selector_diagnostics.deferred_module_sync_drains != 1 ||
+            selector_diagnostics.selector_resolver_batches != 1) {
+            fprintf(stderr, "not ok - unrelated DSO made ordinary C miss retained ownership or exceeded one symbol batch\n");
             return 1;
         }
         if (!load_fixture(PEAK_TEST_SYMBOL_MODULE_A, &module_b) ||
@@ -231,8 +234,8 @@ main(int argc, char** argv)
         if (invoke == NULL || invoke() == 0 ||
             peak_general_listener_test_call_count(0) == 0 ||
             diagnostics.retained_handles == 0 ||
-            selector_diagnostics.deferred_module_sync_drains != 0 ||
-            selector_diagnostics.selector_resolver_batches != 0) {
+            selector_diagnostics.deferred_module_sync_drains != 1 ||
+            selector_diagnostics.selector_resolver_batches != 1) {
             fprintf(stderr, "not ok - ordinary C target did not survive unrelated dlopen miss\n");
             return 1;
         }

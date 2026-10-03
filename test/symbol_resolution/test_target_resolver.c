@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "internal/target_resolver.h"
 
 #include <dlfcn.h>
@@ -5,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 bool peak_truncate_function_name = false;
 
@@ -235,6 +241,36 @@ main(int argc, char** argv)
     expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL) != NULL,
                 "load module b");
     test_batch_scaling();
+    {
+        PeakTargetResolveRequest ordinary = {
+            .selector = "_ZN9peak_test6Widget4funcEid",
+            .ordinary_first_match = TRUE,
+        };
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                    ((PeakTargetSymbolCandidate*)g_ptr_array_index(ordinary.resolution.candidates, 0))->address ==
+                        gum_find_function(ordinary.selector),
+                    "ordinary duplicate raw name preserves first Gum record");
+        peak_target_resolution_clear(&ordinary.resolution);
+#if defined(__linux__)
+        void* owner_handle = dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_NOLOAD);
+        struct link_map* owner = NULL;
+        expect_true(owner_handle != NULL && dlinfo(owner_handle, RTLD_DI_LINKMAP, &owner) == 0,
+                    "obtain owned module for exact-instance resolver test");
+        ordinary.module_path = PEAK_TEST_SYMBOL_MODULE_A;
+        ordinary.owned_module = owner;
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_NONE && !ordinary.module_seen,
+                    "ordinary fallback excludes a different owned link-map");
+        peak_target_resolution_clear(&ordinary.resolution);
+        ordinary.module_path = PEAK_TEST_SYMBOL_MODULE_B;
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_UNIQUE && ordinary.module_seen,
+                    "ordinary fallback accepts only the owned loaded module");
+        peak_target_resolution_clear(&ordinary.resolution);
+        if (owner_handle != NULL) dlclose(owner_handle);
+#endif
+    }
 
     temporary_directory = g_dir_make_tmp("peak-symbol-resolution-XXXXXX", NULL);
     expect_true(temporary_directory != NULL, "create temporary directory");

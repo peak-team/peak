@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "internal/target_resolver.h"
 
 #include "utils/cxx_utils.h"
@@ -9,6 +12,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 typedef struct {
     gchar* module;
@@ -24,6 +31,9 @@ typedef struct {
     gboolean current_module_range_valid;
     GPtrArray* candidates;
     gboolean cxx_selector;
+    gboolean ordinary_first_match;
+    gpointer owned_module;
+    gboolean* module_seen;
 } PeakTargetCollectContext;
 
 typedef struct {
@@ -783,6 +793,20 @@ peak_target_without_final_parameters(const char* demangled)
     return g_strdup(demangled);
 }
 
+static gboolean
+peak_target_owned_module_matches(gpointer address, gpointer owned_module)
+{
+    if (owned_module == NULL) return TRUE;
+#if defined(__linux__)
+    Dl_info details = {0};
+    struct link_map* map = NULL;
+    return dladdr1(address, &details, (void**)&map, RTLD_DL_LINKMAP) != 0 &&
+        map == (struct link_map*)owned_module;
+#else
+    return FALSE;
+#endif
+}
+
 static void
 peak_target_collect_candidate(const GumSymbolDetails* details,
                               PeakTargetCollectContext* context,
@@ -800,6 +824,11 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
         return;
     }
 
+    if (!peak_target_owned_module_matches((gpointer)details->address, context->owned_module)) return;
+    if (context->ordinary_first_match &&
+        (tier != PEAK_TARGET_MATCH_EXACT || context->candidates->len != 0)) {
+        return;
+    }
     candidate = g_new0(PeakTargetSymbolCandidate, 1);
     candidate->address = (gpointer)details->address;
     candidate->symbol_address = (gpointer)details->address;
@@ -1120,6 +1149,14 @@ peak_target_collect_batch_module(GumModule* module, gpointer user_data)
     if (!peak_target_batch_module_is_applicable(batch, path)) {
         return TRUE;
     }
+    for (size_t i = 0; i < batch->count; i++) {
+        PeakTargetCollectContext* context = &batch->contexts[i];
+        if (context->selector != NULL && context->module_seen != NULL &&
+            peak_target_resolver_module_matches(context->selector->module, path) &&
+            peak_target_resolver_module_matches(context->module_path, path) &&
+            peak_target_owned_module_matches(GSIZE_TO_POINTER(gum_module_get_range(module)->base_address), context->owned_module))
+            *context->module_seen = TRUE;
+    }
     batch->current_module = path != NULL ? path : "<unknown>";
     PEAK_RESOLVER_DIAG_ADD(module_symbol_enumerations, 1);
     gum_module_enumerate_symbols(module, peak_target_collect_batch_symbol,
@@ -1209,6 +1246,7 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
     for (size_t i = 0; i < count; i++) {
         peak_target_resolution_clear(&requests[i].resolution);
         requests[i].result = PEAK_TARGET_RESOLVE_INVALID;
+        requests[i].module_seen = FALSE;
         if (!peak_target_parse_selector(requests[i].selector, &selectors[i])) {
             continue;
         }
@@ -1226,6 +1264,9 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
             .module_path = requests[i].module_path,
             .candidates = requests[i].resolution.candidates,
             .cxx_selector = human_signature || requests[i].allow_legacy_short,
+            .ordinary_first_match = requests[i].ordinary_first_match,
+            .owned_module = requests[i].owned_module,
+            .module_seen = &requests[i].module_seen,
         };
         active++;
         peak_target_batch_add(batch.exact, g_strdup(selectors[i].symbol),

@@ -104,6 +104,7 @@ typedef struct {
     gpointer address;
     char* demangled;
     gboolean selector_applicable;
+    gboolean ordinary_symbol_fallback;
     gboolean terminal;
 } PeakDlopenResolvedTarget;
 
@@ -2646,6 +2647,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     gboolean resolved_fftw_from_handle = FALSE;
     gboolean needs_resolution = FALSE;
     gboolean needs_selector_resolution = FALSE;
+    gboolean needs_explicit_selector_resolution = FALSE;
     gboolean use_batch = FALSE;
     GumInterceptor* target_interceptor;
     PeakDlopenResolvedTarget* resolved_targets;
@@ -2745,6 +2747,11 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             if (!explicit_selector) {
                 resolved_targets[i].address = dlsym(request->handle,
                                                     resolved_targets[i].name);
+                if (resolved_targets[i].address == NULL) {
+                    resolved_targets[i].ordinary_symbol_fallback = TRUE;
+                    resolved_targets[i].selector_applicable = TRUE;
+                    needs_selector_resolution = TRUE;
+                }
                 continue;
             }
 
@@ -2758,7 +2765,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                 continue;
             }
             /* Dynamic C++ resolution is deliberately explicit. An
-             * unqualified ordinary C miss stays unresolved for later DSOs;
+             * ordinary raw-name misses use the exact owned-module batch;
              * C++ selectors must name the DSO whose completed dlopen request
              * is allowed to trigger a resolver scan. */
             if (selector_module == NULL ||
@@ -2774,6 +2781,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                                                     request->filename)) {
                 resolved_targets[i].selector_applicable = TRUE;
                 needs_selector_resolution = TRUE;
+                needs_explicit_selector_resolution = TRUE;
             }
             g_free(selector_module);
         }
@@ -2790,7 +2798,10 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             }
             selector_resolutions[i] = (PeakTargetResolveRequest){
                 .selector = resolved_targets[i].name,
-                .allow_legacy_short = configured_cxx_symbol_scan_enabled,
+                .module_path = resolved_targets[i].ordinary_symbol_fallback ? request->filename : NULL,
+                .allow_legacy_short = !resolved_targets[i].ordinary_symbol_fallback && configured_cxx_symbol_scan_enabled,
+                .ordinary_first_match = resolved_targets[i].ordinary_symbol_fallback,
+                .owned_module = resolved_targets[i].ordinary_symbol_fallback ? request->module_token : NULL,
             };
         }
     }
@@ -2806,6 +2817,7 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
         if (!gum_interceptor_peak_drain_deferred_module_sync()) {
             break;
         }
+        if (!needs_explicit_selector_resolution) break;
     }
 #endif
     for (size_t i = 0; selector_resolutions != NULL && i < target_count; i++) {
@@ -2824,6 +2836,13 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             selector_resolutions[i].selector != NULL) {
             PeakTargetResolution* resolution = &selector_resolutions[i].resolution;
             PeakTargetResolveResult result = selector_resolutions[i].result;
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+            if (resolved_targets[i].ordinary_symbol_fallback &&
+                !selector_resolutions[i].module_seen &&
+                gum_interceptor_peak_deferred_module_sync_available())
+                retry_later = TRUE;
+#endif
 
             if (result == PEAK_TARGET_RESOLVE_UNIQUE) {
                 PeakTargetSymbolCandidate* candidate =
@@ -2833,10 +2852,11 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                     if (dlopen_interceptor_symbol_matches_candidate_module(
                             candidate->symbol_address, candidate, request)) {
                         resolved_targets[i].address = candidate->address;
-                        resolved_targets[i].demangled =
-                            peak_target_resolver_format_display_name(
-                                resolved_targets[i].name,
-                                candidate->demangled);
+                        if (!resolved_targets[i].ordinary_symbol_fallback)
+                            resolved_targets[i].demangled =
+                                peak_target_resolver_format_display_name(
+                                    resolved_targets[i].name,
+                                    candidate->demangled);
                     }
                 }
             } else if (result == PEAK_TARGET_RESOLVE_AMBIGUOUS) {
