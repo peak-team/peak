@@ -2836,10 +2836,13 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             selector_resolutions[i].selector != NULL) {
             PeakTargetResolution* resolution = &selector_resolutions[i].resolution;
             PeakTargetResolveResult result = selector_resolutions[i].result;
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
             if (resolved_targets[i].ordinary_symbol_fallback &&
                 !selector_resolutions[i].module_seen &&
                 gum_interceptor_peak_deferred_module_sync_available())
                 retry_later = TRUE;
+#endif
 
             if (result == PEAK_TARGET_RESOLVE_UNIQUE) {
                 PeakTargetSymbolCandidate* candidate =
