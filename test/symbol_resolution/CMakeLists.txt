@@ -182,7 +182,42 @@ set_tests_properties(
     test_symbol_resolution_startup_plain_c_fast_path
     PROPERTIES TIMEOUT 30)
 
+add_executable(test_symbol_resolution_ordinary_late_application
+    ordinary_late_application.c)
+target_link_libraries(test_symbol_resolution_ordinary_late_application PRIVATE
+    ${CMAKE_DL_LIBS})
+target_compile_options(test_symbol_resolution_ordinary_late_application PRIVATE
+    -UNDEBUG)
+
+foreach(kind IN ITEMS dynamic hidden local duplicate)
+    add_library(test_symbol_resolution_ordinary_late_${kind} MODULE
+        ordinary_late_provider.c)
+    set_target_properties(test_symbol_resolution_ordinary_late_${kind} PROPERTIES
+        PREFIX ""
+        C_VISIBILITY_PRESET default
+        INTERPROCEDURAL_OPTIMIZATION OFF)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        # The MPI wrapper may enable LTO itself and rename duplicate local symbols.
+        target_compile_options(test_symbol_resolution_ordinary_late_${kind} PRIVATE
+            -fno-lto)
+    endif()
+endforeach()
+target_compile_definitions(test_symbol_resolution_ordinary_late_dynamic PRIVATE
+    EXPORTED_SYMBOL)
+target_compile_definitions(test_symbol_resolution_ordinary_late_local PRIVATE
+    LOCAL_SYMBOL)
+target_compile_definitions(test_symbol_resolution_ordinary_late_duplicate PRIVATE
+    LOCAL_SYMBOL)
+target_sources(test_symbol_resolution_ordinary_late_duplicate PRIVATE
+    ordinary_late_duplicate.c)
+
 add_test(NAME test_symbol_resolution_ordinary_late
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ordinary_late.py
-            --lib $<TARGET_FILE:peak>)
+            --lib $<TARGET_FILE:peak>
+            --application $<TARGET_FILE:test_symbol_resolution_ordinary_late_application>
+            --dynamic $<TARGET_FILE:test_symbol_resolution_ordinary_late_dynamic>
+            --hidden $<TARGET_FILE:test_symbol_resolution_ordinary_late_hidden>
+            --local $<TARGET_FILE:test_symbol_resolution_ordinary_late_local>
+            --duplicate $<TARGET_FILE:test_symbol_resolution_ordinary_late_duplicate>
+            --objcopy ${CMAKE_OBJCOPY})
 set_tests_properties(test_symbol_resolution_ordinary_late PROPERTIES TIMEOUT 150)
