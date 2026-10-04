@@ -60,7 +60,16 @@ if(PEAK_GUM_PEAK_API_AVAILABLE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
         COMMAND $<TARGET_FILE:test_dlopen_loader_ownership> namespace)
     set_tests_properties(test_dlopen_namespace_identity
         PROPERTIES
-            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_intentionally_missing;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_static;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            FAIL_REGULAR_EXPRESSION "not ok -"
+            TIMEOUT 30)
+
+    add_test(NAME test_dlopen_namespace_dynamic_hit
+        COMMAND $<TARGET_FILE:test_dlopen_loader_ownership> namespace-dynamic)
+    set_tests_properties(test_dlopen_namespace_dynamic_hit
+        PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_dlopen_owned_fixture_value;PEAK_TARGET_FILE=;PEAK_TARGET_GROUP=;${HEARTBEAT_OFF_ENV};${PRELOAD_VAR}"
+            PASS_REGULAR_EXPRESSION "dlopen_namespace_dynamic_hit_ok originals=17 recorded=8 released=2"
             FAIL_REGULAR_EXPRESSION "not ok -"
             TIMEOUT 30)
 

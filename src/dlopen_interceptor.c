@@ -2748,6 +2748,20 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                 resolved_targets[i].address = dlsym(request->handle,
                                                     resolved_targets[i].name);
                 if (resolved_targets[i].address == NULL) {
+#if defined(__linux__)
+                    Lmid_t namespace_id;
+
+                    /* Gum's Linux registry enumerates the base namespace.
+                     * An isolated dlmopen owner can never appear there, so
+                     * requeueing its ordinary miss would retain it forever.
+                     * Keep handle-scoped dynamic hits above unchanged, and
+                     * leave this target unresolved for another provider. */
+                    if (dlinfo(request->handle, RTLD_DI_LMID,
+                               &namespace_id) != 0 ||
+                        namespace_id != LM_ID_BASE) {
+                        continue;
+                    }
+#endif
                     resolved_targets[i].ordinary_symbol_fallback = TRUE;
                     resolved_targets[i].selector_applicable = TRUE;
                     needs_selector_resolution = TRUE;
