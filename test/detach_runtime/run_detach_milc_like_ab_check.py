@@ -47,6 +47,8 @@ STATS_CSV_FIELDS = (
     "jit_provider_generation",
     "jit_pending_count",
     "jit_pending_high_water",
+    "ever_detached",
+    "ever_reattached",
 )
 PEAK_STATS_NAME_RE = re.compile(
     r"^milc-like-stats-j[A-Za-z0-9_-]+-s[A-Za-z0-9_-]+-"

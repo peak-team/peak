@@ -104,6 +104,8 @@ STATS_FIELDS = [
     "jit_provider_generation",
     "jit_pending_count",
     "jit_pending_high_water",
+    "ever_detached",
+    "ever_reattached",
 ]
 STATS_ACCOUNTING_FIELDS = ["dropped_calls", "dropped_threads"]
 STATS_JIT_FIELDS = STATS_FIELDS[24:31]
