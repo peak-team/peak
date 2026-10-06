@@ -31,9 +31,9 @@ target_compile_definitions(test_symbol_resolution_a PRIVATE PEAK_FIXTURE_VALUE=1
 target_compile_definitions(test_symbol_resolution_b PRIVATE PEAK_FIXTURE_VALUE=2)
 target_compile_definitions(test_symbol_resolution_rich PRIVATE PEAK_SYMBOL_RICH=1)
 
+# The test includes the resolver to exercise private compaction without exports.
 add_executable(test_target_resolver
     test_target_resolver.c
-    ${PROJECT_SOURCE_DIR}/src/general_listener/target_resolver.c
     ${PROJECT_SOURCE_DIR}/src/utils/target_selector_syntax.c
     $<TARGET_OBJECTS:utils_cxx>)
 target_include_directories(test_target_resolver PRIVATE

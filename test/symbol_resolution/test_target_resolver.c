@@ -14,6 +14,49 @@
 
 bool peak_truncate_function_name = false;
 
+/* Include the implementation to test its private compaction without a new API.
+ * Instrument only this test translation unit's owner checks and frees. */
+static gpointer compaction_allocations[16];
+static guint compaction_frees[16];
+static guint compaction_watch_count;
+static void (*const resolver_real_free)(gpointer) = g_free;
+
+static void
+resolver_test_free(gpointer allocation)
+{
+    for (guint i = 0; i < compaction_watch_count; i++) {
+        if (compaction_allocations[i] == allocation)
+            compaction_frees[i]++;
+    }
+    resolver_real_free(allocation);
+}
+
+#if defined(__linux__)
+static gboolean compaction_owner_mock;
+static guint compaction_owner_queries;
+static int (*const resolver_real_dladdr1)(const void*, Dl_info*, void**, int) =
+    dladdr1;
+
+static int
+resolver_test_dladdr1(const void* address, Dl_info* details,
+                     void** extra_info, int flags)
+{
+    if (!compaction_owner_mock)
+        return resolver_real_dladdr1(address, details, extra_info, flags);
+    compaction_owner_queries++;
+    if (address != GSIZE_TO_POINTER(2)) return 0;
+    *extra_info = GSIZE_TO_POINTER(1);
+    return 1;
+}
+#define dladdr1 resolver_test_dladdr1
+#endif
+#undef g_free
+#define g_free resolver_test_free
+#include "../../src/general_listener/target_resolver.c"
+#if defined(__linux__)
+#undef dladdr1
+#endif
+
 static int failures;
 
 static void
@@ -23,6 +66,67 @@ expect_true(gboolean condition, const char* message)
         fprintf(stderr, "not ok - %s\n", message);
         failures++;
     }
+}
+
+static void
+test_candidate_compaction(void)
+{
+#if defined(__linux__)
+    /* All rejected; interleaved selector matches; first valid ordinary match. */
+    for (guint scenario = 0; scenario < 3; scenario++) {
+        PeakTargetCollectContext context = {
+            .owned_module = GSIZE_TO_POINTER(1),
+            .ordinary_first_match = scenario != 1,
+            .candidates = g_ptr_array_new_with_free_func(
+                peak_target_symbol_candidate_free),
+        };
+        PeakTargetSymbolCandidate* input[4];
+        memset(compaction_frees, 0, sizeof(compaction_frees));
+        for (guint i = 0; i < G_N_ELEMENTS(input); i++) {
+            input[i] = g_new0(PeakTargetSymbolCandidate, 1);
+            input[i]->address = GSIZE_TO_POINTER(
+                scenario != 0 && i % 2 != 0 ? 2 : 3);
+            input[i]->module = g_strdup("unit-module");
+            input[i]->mangled = g_strdup("unit-symbol");
+            input[i]->demangled = g_strdup("unit-symbol");
+            compaction_allocations[i * 4] = input[i];
+            compaction_allocations[i * 4 + 1] = input[i]->module;
+            compaction_allocations[i * 4 + 2] = input[i]->mangled;
+            compaction_allocations[i * 4 + 3] = input[i]->demangled;
+            g_ptr_array_add(context.candidates, input[i]);
+        }
+        compaction_watch_count = G_N_ELEMENTS(compaction_allocations);
+        compaction_owner_queries = 0;
+        compaction_owner_mock = TRUE;
+        peak_target_validate_owned_candidates(&context);
+        compaction_owner_mock = FALSE;
+
+        guint expected = scenario == 0 ? 0 : scenario == 1 ? 2 : 1;
+        expect_true(context.candidates->len == expected,
+                    "compaction retains the expected candidate count");
+        if (context.candidates->len == expected && expected != 0) {
+            expect_true(g_ptr_array_index(context.candidates, 0) == input[1],
+                        "compaction preserves the first valid record");
+            if (expected == 2)
+                expect_true(g_ptr_array_index(context.candidates, 1) == input[3],
+                            "interleaved retained records preserve order");
+        }
+        expect_true(compaction_owner_queries == (scenario == 2 ? 2 : 4),
+                    "ordinary selection stops owner checks at its first valid record");
+        for (guint i = 0; i < G_N_ELEMENTS(input); i++) {
+            gboolean retained = scenario != 0 &&
+                (i == 1 || (scenario == 1 && i == 3));
+            for (guint part = 0; part < 4; part++)
+                expect_true(compaction_frees[i * 4 + part] == (retained ? 0 : 1),
+                            "compaction frees each rejected record and string once");
+        }
+        g_ptr_array_unref(context.candidates);
+        for (guint i = 0; i < compaction_watch_count; i++)
+            expect_true(compaction_frees[i] == 1,
+                        "array destruction frees each retained allocation once");
+        compaction_watch_count = 0;
+    }
+#endif
 }
 
 static PeakTargetResolveResult
@@ -231,16 +335,18 @@ main(int argc, char** argv)
         print_symbol_count_stats(g_getenv("PEAK_TEST_LOAD_RICH") != NULL);
         return failures == 0 ? 0 : 1;
     }
-    if (argc != 1) {
+    gboolean owned_stable = argc == 2 && strcmp(argv[1], "--owned-stable") == 0;
+    if (argc != 1 && !owned_stable) {
         return 2;
     }
 
     gum_init_embedded();
-    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL) != NULL,
-                "load module a");
-    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL) != NULL,
-                "load module b");
-    test_batch_scaling();
+    test_candidate_compaction();
+    void* module_a = dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL);
+    void* module_b = dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL);
+    expect_true(module_a != NULL, "load module a");
+    expect_true(module_b != NULL, "load module b");
+    if (!owned_stable) test_batch_scaling();
     {
         PeakTargetResolveRequest ordinary = {
             .selector = "_ZN9peak_test6Widget4funcEid",
@@ -264,6 +370,7 @@ main(int argc, char** argv)
         peak_target_resolver_resolve_many(&ordinary, 1);
         peak_target_resolver_get_diagnostics(&wrong_owner_stats);
         expect_true(ordinary.result == PEAK_TARGET_RESOLVE_NONE && !ordinary.module_seen &&
+                    ordinary.owned_module_seen &&
                     wrong_owner_stats.module_symbol_enumerations == 0,
                     "ordinary fallback skips enumeration of a different owned link-map");
         peak_target_resolution_clear(&ordinary.resolution);
@@ -281,19 +388,49 @@ main(int argc, char** argv)
         };
         peak_target_resolver_resolve_many(mixed_owner, G_N_ELEMENTS(mixed_owner));
         expect_true(mixed_owner[0].result == PEAK_TARGET_RESOLVE_NONE &&
-                    !mixed_owner[0].module_seen &&
+                    !mixed_owner[0].module_seen && mixed_owner[0].owned_module_seen &&
                     mixed_owner[1].result == PEAK_TARGET_RESOLVE_UNIQUE &&
-                    mixed_owner[1].module_seen,
+                    mixed_owner[1].module_seen && !mixed_owner[1].owned_module_seen,
                     "wrong owner does not exclude an ownerless selector in the batch");
+        peak_target_resolution_clear(&mixed_owner[0].resolution);
+        peak_target_resolution_clear(&mixed_owner[1].resolution);
+        mixed_owner[0].module_path = NULL;
+        peak_target_resolver_resolve_many(mixed_owner, G_N_ELEMENTS(mixed_owner));
+        expect_true(mixed_owner[0].result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                    mixed_owner[0].module_seen && mixed_owner[0].owned_module_seen &&
+                    ((PeakTargetSymbolCandidate*)g_ptr_array_index(
+                        mixed_owner[0].resolution.candidates, 0))->address ==
+                        dlsym(owner_handle, ordinary.selector),
+                    "owned raw name validates the first eligible record before sorting");
         peak_target_resolution_clear(&mixed_owner[0].resolution);
         peak_target_resolution_clear(&mixed_owner[1].resolution);
         ordinary.module_path = PEAK_TEST_SYMBOL_MODULE_B;
         peak_target_resolver_resolve_many(&ordinary, 1);
-        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_UNIQUE && ordinary.module_seen,
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_UNIQUE && ordinary.module_seen &&
+                    ordinary.owned_module_seen,
                     "ordinary fallback accepts only the owned loaded module");
+        peak_target_resolution_clear(&ordinary.resolution);
+        ordinary.selector = "peak_missing_owned_stable_symbol";
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_NONE && ordinary.module_seen &&
+                    ordinary.owned_module_seen,
+                    "missing symbol does not hide a visible eligible owner");
+        peak_target_resolution_clear(&ordinary.resolution);
+        ordinary.selector = "";
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_INVALID && !ordinary.module_seen &&
+                    !ordinary.owned_module_seen,
+                    "a reused invalid request resets both module observations");
         peak_target_resolution_clear(&ordinary.resolution);
         if (owner_handle != NULL) dlclose(owner_handle);
 #endif
+    }
+    if (owned_stable) {
+        if (module_b != NULL) dlclose(module_b);
+        if (module_a != NULL) dlclose(module_a);
+        gum_deinit_embedded();
+        if (failures == 0) puts("OWNED_STABLE_MODULES_PASS");
+        return failures == 0 ? 0 : 1;
     }
 
     temporary_directory = g_dir_make_tmp("peak-symbol-resolution-XXXXXX", NULL);
