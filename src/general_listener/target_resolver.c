@@ -833,10 +833,10 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
         return;
     }
 
-    /* Owned candidates are provisional until the Gum callback has returned. */
+    if (!peak_target_owned_module_matches((gpointer)details->address,
+                                          context->owned_module)) return;
     if (context->ordinary_first_match &&
-        (tier != PEAK_TARGET_MATCH_EXACT ||
-         (context->owned_module == NULL && context->candidates->len != 0))) {
+        (tier != PEAK_TARGET_MATCH_EXACT || context->candidates->len != 0)) {
         return;
     }
     candidate = g_new0(PeakTargetSymbolCandidate, 1);
@@ -847,11 +847,6 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
     candidate->mangled = g_strdup(mangled);
     candidate->demangled = g_strdup(demangled != NULL ? demangled : mangled);
     candidate->match_tier = (unsigned int)tier;
-    /* Ordinary matches preserve enumeration order without ambiguity deduplication. */
-    if (context->ordinary_first_match) {
-        g_ptr_array_add(context->candidates, candidate);
-        return;
-    }
     for (gsize i = 0; i < context->candidates->len; i++) {
         PeakTargetSymbolCandidate* existing =
             g_ptr_array_index(context->candidates, i);
@@ -1162,15 +1157,7 @@ peak_target_batch_module_is_applicable(PeakTargetBatchCollectContext* batch,
 static gboolean
 peak_target_collect_batch_module(GumModule* module, gpointer user_data)
 {
-    /* Keep the Gum object alive without entering the loader from its callback. */
-    g_ptr_array_add(user_data, g_object_ref(module));
-    return TRUE;
-}
-
-static void
-peak_target_collect_module_symbols(GumModule* module,
-                                   PeakTargetBatchCollectContext* batch)
-{
+    PeakTargetBatchCollectContext* batch = user_data;
     const char* path = gum_module_get_path(module);
     gpointer module_owner = batch->needs_module_owner
         ? peak_target_module_owner(
@@ -1184,7 +1171,7 @@ peak_target_collect_module_symbols(GumModule* module,
             *context->owned_module_seen = TRUE;
     }
     if (!peak_target_batch_module_is_applicable(batch, path, module_owner)) {
-        return;
+        return TRUE;
     }
     for (size_t i = 0; i < batch->count; i++) {
         PeakTargetCollectContext* context = &batch->contexts[i];
@@ -1199,31 +1186,19 @@ peak_target_collect_module_symbols(GumModule* module,
     gum_module_enumerate_symbols(module, peak_target_collect_batch_symbol,
                                  batch);
     batch->current_module = NULL;
+    return TRUE;
 }
 
-static void
-peak_target_validate_owned_candidates(PeakTargetCollectContext* context)
+static gboolean
+peak_target_owned_resolution_available(void)
 {
-    if (context->owned_module == NULL) {
-        return;
-    }
-    /* Strings and symbol fields were copied while their callback data was live.
-     * Compact in one pass, preserving the first valid ordinary exact record. */
-    guint kept = 0;
-    for (guint i = 0; i < context->candidates->len; i++) {
-        PeakTargetSymbolCandidate* candidate =
-            g_ptr_array_index(context->candidates, i);
-        g_ptr_array_index(context->candidates, i) = NULL;
-        if ((context->ordinary_first_match && kept != 0) ||
-            !peak_target_owned_module_matches(candidate->address,
-                                              context->owned_module)) {
-            peak_target_symbol_candidate_free(candidate);
-        } else {
-            g_ptr_array_index(context->candidates, kept++) = candidate;
-        }
-    }
-    /* Cleared tail slots make shrinking release no retained candidate twice. */
-    g_ptr_array_set_size(context->candidates, kept);
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+    /* ACTIVE enables this feature; it does not prove registry freshness. */
+    return gum_interceptor_peak_deferred_module_sync_available();
+#else
+    return FALSE;
+#endif
 }
 
 static gint
@@ -1278,7 +1253,6 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
     PeakTargetSelector* selectors;
     PeakTargetCollectContext* contexts;
     PeakTargetBatchCollectContext batch = {0};
-    GPtrArray* modules;
     size_t active = 0;
 
     if (requests == NULL || count == 0) {
@@ -1312,6 +1286,11 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
         requests[i].result = PEAK_TARGET_RESOLVE_INVALID;
         requests[i].module_seen = FALSE;
         requests[i].owned_module_seen = FALSE;
+        if (requests[i].owned_module != NULL &&
+            !peak_target_owned_resolution_available()) {
+            requests[i].result = PEAK_TARGET_RESOLVE_NONE;
+            continue;
+        }
         if (!peak_target_parse_selector(requests[i].selector, &selectors[i])) {
             continue;
         }
@@ -1383,15 +1362,9 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
         return;
     }
     PEAK_RESOLVER_DIAG_ADD(module_passes, 1);
-    modules = g_ptr_array_new_with_free_func(g_object_unref);
-    gum_process_enumerate_modules(peak_target_collect_batch_module, modules);
-    for (guint i = 0; i < modules->len; i++) {
-        peak_target_collect_module_symbols(g_ptr_array_index(modules, i), &batch);
-    }
-    g_ptr_array_unref(modules);
+    gum_process_enumerate_modules(peak_target_collect_batch_module, &batch);
     for (size_t i = 0; i < count; i++) {
         if (contexts[i].selector != NULL) {
-            peak_target_validate_owned_candidates(&contexts[i]);
             requests[i].result = peak_target_resolution_finalize(
                 &requests[i].resolution);
             peak_target_selector_clear(&selectors[i]);
