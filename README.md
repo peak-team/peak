@@ -353,6 +353,16 @@ published no-clobber by default; replacement requires the explicit
 In both CSV and text reports, `count` is the exact total call count,
 `per_thread` is the ceiling over active threads, and `per_rank`/`avg/rank` is
 the non-truncated arithmetic mean over all ranks represented by the report.
+Statistics CSVs append `ever_detached` and `ever_reattached` as 0/1 target
+history flags, matching the text report's `*` and `**` markers. A flag becomes
+1 after the corresponding successful controller transition, rather than when
+a request is made. It remains 1 across later transitions; these flags are not
+event counts or the current attached state. In an MPI or socket aggregate,
+1 means any represented rank observed that transition; rank-local reports
+describe only that process. Diagnostic rows have 0 in both columns. Targets
+with transition history remain in the CSV even if `count` is zero.
+The existing column names/order and unmarked function names are preserved;
+CSV readers should select columns by header name and allow appended columns.
 See [Physical detach controller](docs/physical-detach-controller.md) for the
 full output and teardown behavior.
 

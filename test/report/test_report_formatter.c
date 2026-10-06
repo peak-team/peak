@@ -280,34 +280,34 @@ check_csv_golden(const char* csv_path)
         "degraded_mask,jit_pending_queue_full,"
         "jit_non_executable_timeout,jit_attach_retry_timeout,"
         "jit_allocation_failure,jit_provider_generation,jit_pending_count,"
-        "jit_pending_high_water\n"
+        "jit_pending_high_water,ever_detached,ever_reattached\n"
         "\"alpha\",5,3,2.5,5.000000000e-01,1.250000000e-01,"
         "1.250000000e+00,1.250000000e+00,7.500000000e-01,"
-        "2.500000000e-01,5.000000000e-02,7,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
+        "2.500000000e-01,5.000000000e-02,7,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_ACCOUNTING_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,7,3,"
-        "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_cpu-target\",0,0,0,0,0,0,0,0,0,0,0,0,"
-        "1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
+        "1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_strict-mutation\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_cuda\",0,0,0,0,0,0,0,0,0,0,0,0,"
-        "1,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0\n"
+        "1,1,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_memory\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_dynamic-dso\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_mpi-report\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_socket-report\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CAPABILITY_local-report\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,0,0,0,0,0,0,0\n"
+        "0,0,0,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_CUDA_API_COVERAGE\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "7,3,1,2,0,0,0,0,0,0,0,0\n"
+        "7,3,1,2,0,0,0,0,0,0,0,0,0,0\n"
         "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-        "0,0,0,0,16,0,0,0,0,0,0,0\n";
+        "0,0,0,0,16,0,0,0,0,0,0,0,0,0\n";
     PeakReportSnapshot* snapshot = create_fixture("alpha");
     PeakReportSnapshot* prepared = peak_report_snapshot_clone(snapshot);
     char* actual;
@@ -328,6 +328,40 @@ check_csv_golden(const char* csv_path)
     assert(unlink(csv_path) != 0 && errno == ENOENT);
     peak_report_snapshot_destroy(prepared);
     peak_report_snapshot_destroy(snapshot);
+}
+
+static void
+check_csv_transition_history(const char* csv_path)
+{
+    for (int phase = 0; phase < 3; phase++) {
+        PeakReportSnapshot* snapshot = create_fixture("history");
+        char* actual;
+        char* row;
+        char* end;
+        const char* suffix = phase == 0 ? ",0,0\n" :
+                             phase == 1 ? ",1,0\n" : ",1,1\n";
+
+        snapshot->detached[0] = phase != 0;
+        snapshot->reattached[0] = phase == 2;
+        /* A completed detach can precede the first sampled call. */
+        if (phase == 1) {
+            snapshot->num_calls[0] = 0;
+            snapshot->dropped_calls = snapshot->dropped_threads = 0;
+            snapshot->degraded_mask = 0;
+            memset(&snapshot->capabilities, 0, sizeof(snapshot->capabilities));
+        }
+        peak_report_snapshot_prepare_for_render(snapshot);
+        assert(peak_report_formatter_write_csv(snapshot));
+        actual = read_file(csv_path);
+        row = strstr(actual, "\"history\",");
+        assert(row != NULL);
+        end = strchr(row, '\n');
+        assert(end != NULL && end - row >= 4);
+        assert(strncmp(end - 4, suffix, 5) == 0);
+        free(actual);
+        assert(unlink(csv_path) == 0);
+        peak_report_snapshot_destroy(snapshot);
+    }
 }
 
 static void
@@ -617,13 +651,13 @@ check_capability_only_output(const char* csv_path)
     contents = read_file(csv_path);
     assert(strstr(contents,
                   "\"PEAK_CAPABILITY_jit\",0,0,0,0,0,0,0,0,0,0,0,0,"
-                  "1,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0\n") != NULL);
+                  "1,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n") != NULL);
     assert(strstr(contents,
                   "\"PEAK_JIT_DIAGNOSTICS\",0,0,0,0,0,0,0,0,0,0,0,0,"
-                  "0,0,0,0,0,0,0,0,0,0,0,2,3,5,7,11,13,17\n") != NULL);
+                  "0,0,0,0,0,0,0,0,0,0,0,2,3,5,7,11,13,17,0,0\n") != NULL);
     assert(strstr(contents,
                   "\"PEAK_DEGRADED_CAPABILITIES\",0,0,0,0,0,0,0,0,0,"
-                  "0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0\n") != NULL);
+                  "0,0,0,0,0,0,0,0,0,0,0,0,0,32,0,0,0,0,0,0,0,0,0\n") != NULL);
     free(contents);
     assert(unlink(csv_path) == 0);
     peak_report_snapshot_destroy(snapshot);
@@ -1165,6 +1199,7 @@ main(void)
     assert(setenv("PEAK_STATSLOG_TEMPLATE", csv_path, 1) == 0);
 
     check_csv_golden(csv_path);
+    check_csv_transition_history(csv_path);
     check_csv_quoted_name(csv_path);
     check_per_rank_average_precision(csv_path);
     check_rank_local_csv_names(stats_base, csv_path);
