@@ -7,9 +7,11 @@
 
 #include <mpi.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS \
     "PEAK_MPI_FINALIZE_REQUEST_TIMEOUT_MS"
@@ -205,6 +207,24 @@ peak_mpi_teardown_report_release_timeout_ms(
     return timeout_ms;
 }
 
+static void
+peak_mpi_teardown_failure_context(char* context,
+                                  size_t context_size,
+                                  const char* phase,
+                                  unsigned int test_calls,
+                                  double started,
+                                  int mpi_result)
+{
+    long rank = -1;
+    long size = -1;
+
+    (void)peak_general_listener_mpi_env_rank_size(&rank, &size);
+    (void)snprintf(context, context_size,
+                   "rank=%ld size=%ld pid=%ld phase=%s mpi_test_calls=%u elapsed_ms=%.3f mpi_result=%d",
+                   rank, size, (long)getpid(), phase, test_calls,
+                   (peak_second() - started) * 1000.0, mpi_result);
+}
+
 static bool
 peak_mpi_teardown_all_ranks_min(const int* local_values,
                                 int value_count,
@@ -217,6 +237,9 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
     int done = 0;
     int mpi_result;
     double deadline;
+    double started;
+    unsigned int test_calls = 0;
+    char failure_context[192];
     const struct timespec poll_pause = { .tv_sec = 0, .tv_nsec = 1000000L };
 
     if (peak_mpi_teardown_collectives_failed_closed()) {
@@ -233,6 +256,7 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
         return false;
     }
     peak_mpi_teardown_observe_request(pending);
+    started = peak_second();
     mpi_result = MPI_Iallreduce(pending->local_values,
                                 pending->all_values,
                                 pending->value_count,
@@ -241,8 +265,11 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
                                 MPI_COMM_WORLD,
                                 &pending->request);
     if (mpi_result != MPI_SUCCESS) {
-        peak_log_warn("[peak] MPI_Iallreduce for %s failed; disabling later MPI teardown calls\n",
-                      operation);
+        peak_mpi_teardown_failure_context(failure_context, sizeof(failure_context),
+                                          "iallreduce-init", test_calls,
+                                          started, mpi_result);
+        peak_log_warn("[peak] MPI_Iallreduce for %s failed; disabling later MPI teardown calls (%s)\n",
+                      operation, failure_context);
         peak_mpi_teardown_request_abandon(pending);
         return false;
     }
@@ -255,10 +282,14 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
 #endif
     deadline = peak_second() + (double)timeout_ms / 1000.0;
     while (1) {
+        test_calls++;
         mpi_result = MPI_Test(&pending->request, &done, &status);
         if (mpi_result != MPI_SUCCESS) {
-            peak_log_warn("[peak] MPI_Test for %s failed; disabling later MPI teardown calls\n",
-                          operation);
+            peak_mpi_teardown_failure_context(failure_context, sizeof(failure_context),
+                                              "mpi-test", test_calls,
+                                              started, mpi_result);
+            peak_log_warn("[peak] MPI_Test for %s failed; disabling later MPI teardown calls (%s)\n",
+                          operation, failure_context);
             peak_mpi_teardown_request_abandon(pending);
             return false;
         }
@@ -273,9 +304,11 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
             return true;
         }
         if (peak_second() >= deadline) {
-            peak_log_warn("[peak] MPI %s timed out after %u ms; disabling later MPI teardown calls\n",
-                          operation,
-                          timeout_ms);
+            peak_mpi_teardown_failure_context(failure_context, sizeof(failure_context),
+                                              "poll-timeout", test_calls,
+                                              started, mpi_result);
+            peak_log_warn("[peak] MPI %s timed out after %u ms; disabling later MPI teardown calls (%s)\n",
+                          operation, timeout_ms, failure_context);
             /*
              * Nonblocking collectives have no portable cancellation path.
              * Keep the request and both buffers alive, and prohibit every

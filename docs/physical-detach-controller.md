@@ -837,6 +837,14 @@ timeout to at least the peer release budget plus two socket-phase intervals.
 The extra intervals reserve separate margin for rank-local fallback
 publication and collective arrival/progress. MPI and explicitly rank-local
 paths retain the configured/default baseline.
+
+Collective initiation errors, `MPI_Test` errors, and poll timeouts include
+launcher rank/size read from the environment at failure time, PID, phase, local
+`MPI_Test` call count, elapsed time, and MPI result. Unknown launcher rank/size
+is printed as `-1`; allocation failures do not carry these fields. Local
+polling does not prove global MPI progress, and a peer killed before it logs or
+publishes output remains unobserved.
+
 The socket payload reducer
 does not use MPI reductions for the profile payload itself: rank 0 accepts a
 bounded set of framed per-rank payloads, validates a Slurm/PMI-derived reducer

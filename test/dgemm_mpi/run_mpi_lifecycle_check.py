@@ -1449,6 +1449,17 @@ def main():
             ):
                 continue
             raise AssertionError(f"missing expected PEAK diagnostic: {extra}")
+    if args.mode == "subset-finalize-handoff":
+        failure_context = re.search(
+            rf"MPI finalize participation proof timed out after 250 ms; "
+            rf"disabling later MPI teardown calls \(rank=0 size={nprocs} "
+            rf"pid=[1-9]\d* phase=poll-timeout "
+            rf"mpi_test_calls=[1-9]\d* elapsed_ms=[0-9]+\.[0-9]+ "
+            rf"mpi_result=0\)",
+            output,
+        )
+        if failure_context is None:
+            raise AssertionError("missing rank 0 finalize-proof failure context")
     for message, count in expected_exact_messages.items():
         observed = output.count(message)
         if observed != count:
