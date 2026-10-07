@@ -17,6 +17,7 @@
 #endif
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/types.h>
 #if defined(__x86_64__) || defined(__amd64__)
 #include <sys/user.h>
@@ -35,6 +36,86 @@ typedef struct {
 
 static PeakHeldThread held_threads[PEAK_DETACH_HELPER_MAX_THREADS];
 static size_t held_thread_count = 0;
+
+typedef struct {
+    int enabled;
+    int active;
+    const char* stage;
+    pid_t tid;
+    long started_ms;
+    long failed_ms;
+    long ptrace_request;
+    long ptrace_result;
+    int ptrace_errno;
+    pid_t wait_result;
+    int wait_status;
+    int wait_errno;
+    char proc_state;
+    long proc_tracer_pid;
+    int proc_errno;
+} PeakStopDiagnostic;
+
+static PeakStopDiagnostic stop_diagnostic;
+static int stop_diagnostic_fd = -1;
+
+static void
+stop_diagnostic_stage(const char* stage, pid_t tid)
+{
+    if (!stop_diagnostic.enabled || !stop_diagnostic.active) return;
+    if (tid != stop_diagnostic.tid) {
+        stop_diagnostic.ptrace_request = 0;
+        stop_diagnostic.ptrace_result = 0;
+        stop_diagnostic.ptrace_errno = 0;
+        stop_diagnostic.wait_result = -1;
+        stop_diagnostic.wait_status = 0;
+        stop_diagnostic.wait_errno = 0;
+    }
+    stop_diagnostic.stage = stage;
+    stop_diagnostic.tid = tid;
+    stop_diagnostic.failed_ms = 0;
+    stop_diagnostic.proc_state = '?';
+    stop_diagnostic.proc_tracer_pid = -1;
+    stop_diagnostic.proc_errno = 0;
+}
+
+static void
+stop_diagnostic_ptrace(long request, long result, int error_number)
+{
+    if (!stop_diagnostic.enabled || !stop_diagnostic.active) return;
+    stop_diagnostic.ptrace_request = request;
+    stop_diagnostic.ptrace_result = result;
+    stop_diagnostic.ptrace_errno = error_number;
+}
+
+static void
+stop_diagnostic_wait(pid_t result, int status, int error_number)
+{
+    if (!stop_diagnostic.enabled || !stop_diagnostic.active) return;
+    stop_diagnostic.wait_result = result;
+    stop_diagnostic.wait_status = status;
+    stop_diagnostic.wait_errno = error_number;
+}
+
+#if !defined(PEAK_DETACH_HELPER_PTRACE_STOP_WAIT_UNIT_TEST)
+static void
+stop_diagnostic_connect(const char* path)
+{
+    struct sockaddr_un address = {0};
+    int fd;
+
+    if (path == NULL || path[0] == '\0' ||
+        strlen(path) >= sizeof(address.sun_path)) return;
+    fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1u);
+    if (connect(fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
+        close(fd);
+        return;
+    }
+    stop_diagnostic_fd = fd;
+}
+#endif
 
 #if defined(PEAK_DETACH_HELPER_ENABLE_TEST_HOOKS)
 static int test_stop_retry_injected = 0;
@@ -131,6 +212,91 @@ monotonic_milliseconds(void)
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
+static void
+stop_diagnostic_capture_proc(void)
+{
+    char path[64];
+    char digits[24];
+    size_t used = sizeof("/proc/") - 1u;
+    size_t digit_count = 0;
+    unsigned long value_tid;
+    char buffer[1024] = {0};
+    char* value;
+    ssize_t count;
+    int fd;
+    int saved_errno = errno;
+
+    if (!stop_diagnostic.enabled || !stop_diagnostic.active ||
+        stop_diagnostic.tid <= 0) return;
+    stop_diagnostic.failed_ms = monotonic_milliseconds();
+    memcpy(path, "/proc/", used);
+    value_tid = (unsigned long)stop_diagnostic.tid;
+    do {
+        digits[digit_count++] = (char)('0' + (value_tid % 10u));
+        value_tid /= 10u;
+    } while (value_tid != 0 && digit_count < sizeof(digits));
+    while (digit_count > 0) path[used++] = digits[--digit_count];
+    memcpy(path + used, "/status", sizeof("/status"));
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        stop_diagnostic.proc_errno = errno;
+        errno = saved_errno;
+        return;
+    }
+    count = read(fd, buffer, sizeof(buffer) - 1u);
+    if (count < 0) stop_diagnostic.proc_errno = errno;
+    close(fd);
+    if (count > 0) {
+        value = strstr(buffer, "State:");
+        if (value != NULL) {
+            value += sizeof("State:") - 1u;
+            while (*value == ' ' || *value == '\t') value++;
+            if (*value != '\0') stop_diagnostic.proc_state = *value;
+        }
+        value = strstr(buffer, "TracerPid:");
+        if (value != NULL)
+            stop_diagnostic.proc_tracer_pid =
+                strtol(value + sizeof("TracerPid:") - 1u, NULL, 10);
+    }
+    errno = saved_errno;
+}
+
+static void
+stop_diagnostic_report(PeakDetachHelperStatus status, int error_number)
+{
+    char line[512];
+    int length;
+    long elapsed_ms;
+
+    if (!stop_diagnostic.enabled || !stop_diagnostic.active ||
+        stop_diagnostic_fd < 0 ||
+        status == PEAK_DETACH_HELPER_STATUS_OK)
+        return;
+    elapsed_ms = (stop_diagnostic.failed_ms > 0 ?
+                  stop_diagnostic.failed_ms : monotonic_milliseconds()) -
+                 stop_diagnostic.started_ms;
+    length = snprintf(line, sizeof(line),
+                      "[peak-helper] stop-failed stage=%s tid=%ld status=%u errno=%d "
+                      "elapsed_ms=%ld ptrace_request=%ld ptrace_ret=%ld ptrace_errno=%d "
+                      "waitpid_ret=%ld wait_status=0x%x wait_errno=%d "
+                      "pre_cleanup_snapshot_ms=%ld pre_cleanup_state=%c "
+                      "pre_cleanup_tracer_pid=%ld proc_errno=%d\n",
+                      stop_diagnostic.stage != NULL ? stop_diagnostic.stage : "unknown",
+                      (long)stop_diagnostic.tid, (unsigned int)status, error_number,
+                      elapsed_ms, stop_diagnostic.ptrace_request,
+                      stop_diagnostic.ptrace_result, stop_diagnostic.ptrace_errno,
+                      (long)stop_diagnostic.wait_result, stop_diagnostic.wait_status,
+                      stop_diagnostic.wait_errno, stop_diagnostic.failed_ms > 0 ?
+                      stop_diagnostic.failed_ms : -1L,
+                      stop_diagnostic.proc_state,
+                      stop_diagnostic.proc_tracer_pid,
+                      stop_diagnostic.proc_errno);
+    if (length > 0) {
+        size_t size = (size_t)length < sizeof(line) ? (size_t)length : sizeof(line) - 1u;
+        (void)send(stop_diagnostic_fd, line, size, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+}
+
 static PeakDetachHelperStatus
 detach_held_threads(int* errno_out)
 {
@@ -181,11 +347,15 @@ detach_held_threads(int* errno_out)
 }
 
 static PeakDetachHelperStatus
-cleanup_held_threads_or_release_failed(PeakDetachHelperStatus intended_status,
-                                       int* errno_out)
+cleanup_held_threads_or_release_failed_impl(PeakDetachHelperStatus intended_status,
+                                            int* errno_out,
+                                            int capture_diagnostic)
 {
     int cleanup_errno = 0;
     PeakDetachHelperStatus cleanup_status;
+
+    if (capture_diagnostic && intended_status != PEAK_DETACH_HELPER_STATUS_OK)
+        stop_diagnostic_capture_proc();
 
     if (held_thread_count == 0) {
         return intended_status;
@@ -200,6 +370,14 @@ cleanup_held_threads_or_release_failed(PeakDetachHelperStatus intended_status,
     }
 
     return intended_status;
+}
+
+static PeakDetachHelperStatus
+cleanup_held_threads_or_release_failed(PeakDetachHelperStatus intended_status,
+                                       int* errno_out)
+{
+    return cleanup_held_threads_or_release_failed_impl(intended_status,
+                                                       errno_out, 1);
 }
 
 static int
@@ -221,22 +399,30 @@ cleanup_or_retry_stop_snapshot(PeakDetachHelperStatus intended_status,
                                int* retry_out)
 {
     int original_errno = errno_out != NULL ? *errno_out : 0;
+    int retryable = stop_snapshot_error_is_retryable(intended_status,
+                                                    original_errno);
+    int terminal_before_cleanup =
+        !retryable || monotonic_milliseconds() >= deadline;
     PeakDetachHelperStatus status;
 
     if (retry_out != NULL) {
         *retry_out = 0;
     }
 
-    status = cleanup_held_threads_or_release_failed(intended_status, errno_out);
+    status = cleanup_held_threads_or_release_failed_impl(intended_status,
+                                                         errno_out,
+                                                         terminal_before_cleanup);
     if (status != intended_status) {
         return status;
     }
 
-    if (!stop_snapshot_error_is_retryable(intended_status, original_errno)) {
+    if (!retryable) {
         return status;
     }
 
     if (monotonic_milliseconds() >= deadline) {
+        if (stop_diagnostic.enabled)
+            stop_diagnostic.stage = "transient-retry";
         if (errno_out != NULL) {
             *errno_out = ETIMEDOUT;
         }
@@ -285,6 +471,8 @@ wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
     for (;;) {
         int status = 0;
         pid_t waited = waitpid(tid, &status, __WALL | WNOHANG);
+        int wait_errno = waited < 0 ? errno : 0;
+        stop_diagnostic_wait(waited, status, wait_errno);
 
         if (waited < 0) {
             if (errno == EINTR) {
@@ -494,6 +682,7 @@ verify_no_unstopped_threads(pid_t pid, pid_t controller_tid, int* errno_out)
         }
 
         if (!tid_is_held(tid)) {
+            stop_diagnostic_stage("enrollment", tid);
             closedir(task_dir);
             *errno_out = EAGAIN;
             return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
@@ -536,6 +725,12 @@ stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
     long deadline =
         monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
 
+    if (stop_diagnostic.enabled) {
+        stop_diagnostic = (PeakStopDiagnostic){.enabled = 1, .active = 1,
+            .stage = "enumerate", .started_ms = deadline - PEAK_DETACH_HELPER_STOP_TIMEOUT_MS,
+            .wait_result = -1, .proc_state = '?', .proc_tracer_pid = -1};
+    }
+
 restart_stop_snapshot:
     snapshot_count = 0;
     *errno_out = 0;
@@ -550,6 +745,7 @@ restart_stop_snapshot:
     for (;;) {
         DIR* task_dir = opendir(task_path);
         if (task_dir == NULL) {
+            stop_diagnostic_stage("enumerate", 0);
             *errno_out = errno;
             return errno == EACCES || errno == EPERM ?
                 PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
@@ -574,6 +770,7 @@ restart_stop_snapshot:
 
             if (snapshot_count >= PEAK_DETACH_HELPER_MAX_THREADS ||
                 held_thread_count >= PEAK_DETACH_HELPER_MAX_THREADS) {
+                stop_diagnostic_stage("thread-limit", tid);
                 closedir(task_dir);
                 *errno_out = E2BIG;
                 return cleanup_held_threads_or_release_failed(
@@ -587,7 +784,11 @@ restart_stop_snapshot:
             snapshot->pc = 0;
 
 #if defined(PTRACE_SEIZE) && defined(PTRACE_INTERRUPT)
-            if (ptrace(PTRACE_SEIZE, tid, NULL, (void*)0) != 0) {
+            stop_diagnostic_stage("seize", tid);
+            long ptrace_result = ptrace(PTRACE_SEIZE, tid, NULL, (void*)0);
+            stop_diagnostic_ptrace(PTRACE_SEIZE, ptrace_result,
+                                   ptrace_result != 0 ? errno : 0);
+            if (ptrace_result != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
                 closedir(task_dir);
@@ -612,7 +813,11 @@ restart_stop_snapshot:
             held_thread->detach_signal = 0;
             held_thread_count++;
 
-            if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
+            stop_diagnostic_stage("interrupt", tid);
+            ptrace_result = ptrace(PTRACE_INTERRUPT, tid, NULL, NULL);
+            stop_diagnostic_ptrace(PTRACE_INTERRUPT, ptrace_result,
+                                   ptrace_result != 0 ? errno : 0);
+            if (ptrace_result != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
                 closedir(task_dir);
@@ -631,6 +836,7 @@ restart_stop_snapshot:
                 return status;
             }
 
+            stop_diagnostic_stage("wait-stop", tid);
             if (wait_for_ptrace_stop(tid, &held_thread->detach_signal) != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
@@ -658,7 +864,15 @@ restart_stop_snapshot:
 #endif
 
             PeakRegs regs;
-            if (peak_regs_get(tid, &regs) != 0) {
+            stop_diagnostic_stage("getregs", tid);
+            int regs_result = peak_regs_get(tid, &regs);
+#if defined(__aarch64__) && defined(PTRACE_GETREGSET)
+            stop_diagnostic_ptrace(PTRACE_GETREGSET, regs_result,
+#else
+            stop_diagnostic_ptrace(PTRACE_GETREGS, regs_result,
+#endif
+                                   regs_result != 0 ? errno : 0);
+            if (regs_result != 0) {
                 *errno_out = errno;
                 closedir(task_dir);
                 int retry_snapshot = 0;
@@ -675,6 +889,7 @@ restart_stop_snapshot:
 
 #if defined(PEAK_DETACH_HELPER_ENABLE_TEST_HOOKS)
             if (test_should_inject_stop_snapshot_retry()) {
+                stop_diagnostic_stage("transient-retry", tid);
                 *errno_out = ESRCH;
                 closedir(task_dir);
                 int retry_snapshot = 0;
@@ -705,6 +920,7 @@ restart_stop_snapshot:
 
         closedir(task_dir);
 
+        stop_diagnostic_stage("enrollment", 0);
         PeakDetachHelperStatus verify_status =
             verify_no_unstopped_threads(pid, controller_tid, errno_out);
         if (verify_status == PEAK_DETACH_HELPER_STATUS_OK) {
@@ -1292,13 +1508,16 @@ serve_protocol(int fd)
                                     (pid_t)request.controller_tid,
                                     &errno_value);
             if (status != PEAK_DETACH_HELPER_STATUS_OK) {
+                stop_diagnostic_report(status, errno_value);
                 (void)send_response(fd, status, errno_value, 0);
                 /* Exiting the tracer releases a live tracee that could not
                  * be detached. The parent treats RELEASE_FAILED as fatal. */
                 if (status == PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED) {
+                    stop_diagnostic.active = 0;
                     return 1;
                 }
             }
+            stop_diagnostic.active = 0;
         } else if (request.command == PEAK_DETACH_HELPER_CMD_EVACUATE) {
             PeakDetachHelperInstruction instructions[PEAK_DETACH_HELPER_MAX_INSTRUCTIONS];
             PeakDetachHelperStatus status;
@@ -1377,6 +1596,16 @@ main(int argc, char** argv)
     sigset_t empty_mask;
     sigset_t sigchld_mask;
     struct sigaction sigchld_action;
+    const char* diagnostic_option =
+        getenv("DETACH_HELPER_STOP_DIAGNOSTICS");
+
+    stop_diagnostic.enabled = diagnostic_option != NULL &&
+        strcmp(diagnostic_option, "1") == 0;
+    if (stop_diagnostic.enabled)
+        stop_diagnostic_connect(
+            getenv("DETACH_HELPER_STOP_DIAGNOSTIC_SOCKET"));
+    if (stop_diagnostic_fd < 0)
+        stop_diagnostic.enabled = 0;
 
     signal(SIGPIPE, SIG_IGN);
     sigemptyset(&empty_mask);

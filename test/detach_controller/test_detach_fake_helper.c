@@ -77,8 +77,20 @@ environment_is_sanitized(void)
 {
     extern char** environ;
     int saw_exec_chain_disabled = 0;
+    int expect_diagnostics = getenv("FAKE_EXPECT_DIAGNOSTIC_ENV") != NULL;
+    int saw_diagnostic_flag = 0;
+    int saw_diagnostic_socket = 0;
 
     for (size_t i = 0; environ != NULL && environ[i] != NULL; i++) {
+        if (strcmp(environ[i], "DETACH_HELPER_STOP_DIAGNOSTICS=1") == 0) {
+            saw_diagnostic_flag = 1;
+            continue;
+        }
+        if (strcmp(environ[i],
+                   "DETACH_HELPER_STOP_DIAGNOSTIC_SOCKET=/tmp/peak-test-diagnostics.sock") == 0) {
+            saw_diagnostic_socket = 1;
+            continue;
+        }
         if (strcmp(environ[i], "PEAK_EXEC_CHAIN=0") == 0) {
             saw_exec_chain_disabled = 1;
             continue;
@@ -90,7 +102,8 @@ environment_is_sanitized(void)
         }
     }
 
-    return saw_exec_chain_disabled;
+    return saw_exec_chain_disabled &&
+        (!expect_diagnostics || (saw_diagnostic_flag && saw_diagnostic_socket));
 }
 
 static void
