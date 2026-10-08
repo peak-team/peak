@@ -11,6 +11,22 @@
 #include <time.h>
 #include <unistd.h>
 #include <frida-gum.h>
+#include <sys/syscall.h>
+#include "internal/exec_raw_syscall.h"
+
+/* Limit regular-file reads to exercise short-read exhaustion independently
+ * of the byte, line-length, and line-count guards. */
+static int maps_test_fd = -1;
+static size_t maps_test_chunk;
+static unsigned maps_test_reads;
+static long test_raw_syscall(long nr, long a1, long a2, long a3,
+                             long a4, long a5, long a6) {
+    if (nr == SYS_read && a1 == maps_test_fd) {
+        maps_test_reads++;
+        if ((size_t)a3 > maps_test_chunk) a3 = (long)maps_test_chunk;
+    }
+    return peak_exec_raw_syscall6(nr, a1, a2, a3, a4, a5, a6);
+}
 
 static unsigned long fallback_calls;
 static gpointer expected_target;
@@ -38,8 +54,40 @@ static __attribute__((unused)) unsigned long test_getauxval(unsigned long type) 
     return missing_phdr && type == AT_PHDR ? 0 : getauxval(type);
 }
 #define getauxval test_getauxval
+#define peak_exec_raw_syscall6 test_raw_syscall
 #include OVERLAY_SOURCE
+#undef peak_exec_raw_syscall6
 #undef getauxval
+
+static void check_maps_limit(size_t bytes, size_t chunk, int expected,
+                             unsigned reads) {
+    FILE *f = tmpfile(); assert(f);
+    /* Sixty-four sorted mappings; padding is a pathname, not more VMAs. */
+    for (unsigned i=0; i<64; i++) {
+        char line[4096];
+        size_t length = bytes / 64 + (i < bytes % 64);
+        int prefix = snprintf(line, sizeof(line),
+            "%08x-%08x r-xp 00000000 00:00 0 /",
+            0x400000+i*4096, 0x401000+i*4096);
+        assert(prefix > 0 && (size_t)prefix < length && length < sizeof(line));
+        memset(line+prefix, 'x', length-(size_t)prefix-1);
+        line[length-1] = '\n';
+        assert(fwrite(line, 1, length, f) == length);
+    }
+    assert(fflush(f)==0 && fseek(f,0,SEEK_SET)==0);
+    maps_test_fd = fileno(f);
+    maps_test_chunk = chunk;
+    maps_test_reads = 0;
+    PeakNearSnapshot snapshot = {.target=0x400000, .first=UINTPTR_MAX,
+                                .page_size=4096};
+    assert(peak_near_read_maps(maps_test_fd, &snapshot)==expected);
+    assert(maps_test_reads==reads);
+    if (expected) assert(snapshot.target_matches==1 && snapshot.main_matches==1);
+    printf("maps-limit bytes=%zu chunk=%zu accepted=%d reads=%u\n",
+           bytes, chunk, expected, maps_test_reads);
+    maps_test_fd = -1;
+    assert(fclose(f)==0);
+}
 
 static double elapsed(struct timespec a, struct timespec b) {
     return (b.tv_sec-a.tv_sec) + (b.tv_nsec-a.tv_nsec)*1e-9;
@@ -77,6 +125,15 @@ static void benchmark(const char *name, void *target) {
            name,maps_size(),elapsed(a,b)*1e9/2000,fallback_calls-before);
 }
 int main(void) {
+#ifdef EXPECT_OLD
+    check_maps_limit(65536, 4096, 1, 17);
+    check_maps_limit(65537, 4096, 0, 17);
+#else
+    check_maps_limit(258048, 4096, 1, 64); /* Full reads, then confirmed EOF. */
+    check_maps_limit(258049, 4096, 0, 64); /* Byte cap, only 64 valid lines. */
+#endif
+    check_maps_limit(64512, 1024, 1, 64); /* Short reads, EOF on read 64. */
+    check_maps_limit(64513, 1024, 0, 64); /* Short reads, EOF needs read 65. */
     void *shared = dlsym(RTLD_DEFAULT,"getpid"); assert(shared);
     int pie = 0;
 #if defined(__PIE__)
@@ -106,20 +163,38 @@ int main(void) {
         assert(gum_memory_free((char *)code-page,size));
         assert(mprotect(main_data,page,PROT_READ|PROT_WRITE)==0);
     } else { assert(call((void *)&main)==&sentinel); }
-    size_t page=gum_query_page_size(), size=4096*page;
+    size_t page=gum_query_page_size(), mid_size=1536*page;
+    char *mid=mmap(NULL,mid_size,PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    assert(mid!=MAP_FAILED);
+    for(size_t i=0;i<1536;i+=2) assert(mprotect(mid+i*page,page,PROT_READ)==0);
+    long mid_maps_bytes=maps_size();
+    assert(mid_maps_bytes>65536 && mid_maps_bytes<4096*63);
+    unsigned long before=fallback_calls;
+    if(!pie) {
+        before=fallback_calls;
+        void *code=call((void *)&main);
+#ifdef EXPECT_OLD
+        assert(code==NULL);
+#else
+        assert(code && code!=&sentinel);
+        assert(gum_memory_free((char *)code-page,*((gsize *)((char *)code-page))));
+#endif
+        assert(fallback_calls==before);
+    }
+    printf("main-mid maps_bytes=%ld fallback_calls=%lu\n",
+           mid_maps_bytes,fallback_calls);
+    assert(munmap(mid,mid_size)==0);
+    size_t size=6144*page;
     char *many=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     assert(many!=MAP_FAILED);
-    for(size_t i=0;i<4096;i+=2) assert(mprotect(many+i*page,page,PROT_READ)==0);
-    assert(maps_size()>65536);
-    unsigned long before=fallback_calls;
+    for(size_t i=0;i<6144;i+=2) assert(mprotect(many+i*page,page,PROT_READ)==0);
+    assert(maps_size()>4096*63);
+    before=fallback_calls;
     void *result=call(shared);
-#ifdef EXPECT_OLD
-    if(!pie) { assert(result==NULL && fallback_calls==before); }
-    else { assert(result==&sentinel && fallback_calls==before+1); }
-#else
     assert(result==&sentinel && fallback_calls==before+1);
-#endif
-    benchmark("shared-large",shared);
+    printf("shared-large maps_bytes=%ld fallback_calls=%lu\n",
+           maps_size(),fallback_calls-before);
     missing_phdr=1;
     if(!pie) { before=fallback_calls; assert(call(shared)==NULL); assert(fallback_calls==before); }
     else { assert(call(shared)==&sentinel); }
