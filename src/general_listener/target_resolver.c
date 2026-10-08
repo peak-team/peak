@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "internal/target_resolver.h"
 
 #include "utils/cxx_utils.h"
@@ -9,6 +12,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 typedef struct {
     gchar* module;
@@ -24,12 +31,17 @@ typedef struct {
     gboolean current_module_range_valid;
     GPtrArray* candidates;
     gboolean cxx_selector;
+    gboolean ordinary_first_match;
+    gpointer owned_module;
+    gboolean* module_seen;
+    gboolean* owned_module_seen;
 } PeakTargetCollectContext;
 
 typedef struct {
     PeakTargetCollectContext* contexts;
     size_t count;
     const char* current_module;
+    gboolean needs_module_owner;
     GHashTable* exact;
     GHashTable* full;
     GHashTable* full_by_name;
@@ -783,6 +795,27 @@ peak_target_without_final_parameters(const char* demangled)
     return g_strdup(demangled);
 }
 
+static gpointer
+peak_target_module_owner(gpointer address)
+{
+#if defined(__linux__)
+    Dl_info details = {0};
+    struct link_map* map = NULL;
+    if (dladdr1(address, &details, (void**)&map, RTLD_DL_LINKMAP) != 0)
+        return map;
+#else
+    (void)address;
+#endif
+    return NULL;
+}
+
+static gboolean
+peak_target_owned_module_matches(gpointer address, gpointer owned_module)
+{
+    return owned_module == NULL ||
+        peak_target_module_owner(address) == owned_module;
+}
+
 static void
 peak_target_collect_candidate(const GumSymbolDetails* details,
                               PeakTargetCollectContext* context,
@@ -800,6 +833,12 @@ peak_target_collect_candidate(const GumSymbolDetails* details,
         return;
     }
 
+    if (!peak_target_owned_module_matches((gpointer)details->address,
+                                          context->owned_module)) return;
+    if (context->ordinary_first_match &&
+        (tier != PEAK_TARGET_MATCH_EXACT || context->candidates->len != 0)) {
+        return;
+    }
     candidate = g_new0(PeakTargetSymbolCandidate, 1);
     candidate->address = (gpointer)details->address;
     candidate->symbol_address = (gpointer)details->address;
@@ -1095,11 +1134,15 @@ peak_target_collect_batch_symbol(const GumSymbolDetails* details,
 
 static gboolean
 peak_target_batch_module_is_applicable(PeakTargetBatchCollectContext* batch,
-                                       const char* module_path)
+                                       const char* module_path,
+                                       gpointer module_owner)
 {
     for (size_t i = 0; i < batch->count; i++) {
         PeakTargetCollectContext* context = &batch->contexts[i];
 
+        /* Reject known wrong owners before canonicalizing each target path. */
+        if (module_owner != NULL && context->owned_module != NULL &&
+            context->owned_module != module_owner) continue;
         if (context->selector != NULL &&
             peak_target_resolver_module_matches(context->selector->module,
                                                 module_path) &&
@@ -1116,9 +1159,27 @@ peak_target_collect_batch_module(GumModule* module, gpointer user_data)
 {
     PeakTargetBatchCollectContext* batch = user_data;
     const char* path = gum_module_get_path(module);
+    gpointer module_owner = batch->needs_module_owner
+        ? peak_target_module_owner(
+            GSIZE_TO_POINTER(gum_module_get_range(module)->base_address))
+        : NULL;
 
-    if (!peak_target_batch_module_is_applicable(batch, path)) {
+    for (size_t i = 0; i < batch->count; i++) {
+        PeakTargetCollectContext* context = &batch->contexts[i];
+        if (context->selector != NULL && context->owned_module != NULL &&
+            context->owned_module == module_owner)
+            *context->owned_module_seen = TRUE;
+    }
+    if (!peak_target_batch_module_is_applicable(batch, path, module_owner)) {
         return TRUE;
+    }
+    for (size_t i = 0; i < batch->count; i++) {
+        PeakTargetCollectContext* context = &batch->contexts[i];
+        if (context->selector != NULL && context->module_seen != NULL &&
+            (context->owned_module == NULL || context->owned_module == module_owner) &&
+            peak_target_resolver_module_matches(context->selector->module, path) &&
+            peak_target_resolver_module_matches(context->module_path, path))
+            *context->module_seen = TRUE;
     }
     batch->current_module = path != NULL ? path : "<unknown>";
     PEAK_RESOLVER_DIAG_ADD(module_symbol_enumerations, 1);
@@ -1126,6 +1187,18 @@ peak_target_collect_batch_module(GumModule* module, gpointer user_data)
                                  batch);
     batch->current_module = NULL;
     return TRUE;
+}
+
+static gboolean
+peak_target_owned_resolution_available(void)
+{
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+    /* ACTIVE enables this feature; it does not prove registry freshness. */
+    return gum_interceptor_peak_deferred_module_sync_available();
+#else
+    return FALSE;
+#endif
 }
 
 static gint
@@ -1179,7 +1252,7 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
 {
     PeakTargetSelector* selectors;
     PeakTargetCollectContext* contexts;
-    PeakTargetBatchCollectContext batch;
+    PeakTargetBatchCollectContext batch = {0};
     size_t active = 0;
 
     if (requests == NULL || count == 0) {
@@ -1193,6 +1266,8 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
         for (size_t i = 0; i < count; i++) {
             peak_target_resolution_clear(&requests[i].resolution);
             requests[i].result = PEAK_TARGET_RESOLVE_NONE;
+            requests[i].module_seen = FALSE;
+            requests[i].owned_module_seen = FALSE;
         }
         return;
     }
@@ -1209,6 +1284,13 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
     for (size_t i = 0; i < count; i++) {
         peak_target_resolution_clear(&requests[i].resolution);
         requests[i].result = PEAK_TARGET_RESOLVE_INVALID;
+        requests[i].module_seen = FALSE;
+        requests[i].owned_module_seen = FALSE;
+        if (requests[i].owned_module != NULL &&
+            !peak_target_owned_resolution_available()) {
+            requests[i].result = PEAK_TARGET_RESOLVE_NONE;
+            continue;
+        }
         if (!peak_target_parse_selector(requests[i].selector, &selectors[i])) {
             continue;
         }
@@ -1226,7 +1308,13 @@ peak_target_resolver_resolve_many(PeakTargetResolveRequest* requests,
             .module_path = requests[i].module_path,
             .candidates = requests[i].resolution.candidates,
             .cxx_selector = human_signature || requests[i].allow_legacy_short,
+            .ordinary_first_match = requests[i].ordinary_first_match,
+            .owned_module = requests[i].owned_module,
+            .module_seen = &requests[i].module_seen,
+            .owned_module_seen = &requests[i].owned_module_seen,
         };
+        if (requests[i].owned_module != NULL)
+            batch.needs_module_owner = TRUE;
         active++;
         peak_target_batch_add(batch.exact, g_strdup(selectors[i].symbol),
                               &contexts[i]);

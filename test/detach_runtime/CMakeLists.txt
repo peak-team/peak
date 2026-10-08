@@ -44,6 +44,13 @@ if(TARGET peak_detach_helper)
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include
   )
+
+  add_executable(test_detach_helper_release
+    test_detach_helper_release.c)
+  target_include_directories(test_detach_helper_release
+    PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+  )
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)

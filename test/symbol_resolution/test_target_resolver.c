@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include "internal/target_resolver.h"
 
 #include <dlfcn.h>
@@ -5,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 bool peak_truncate_function_name = false;
 
@@ -220,21 +226,123 @@ main(int argc, char** argv)
     PeakTargetResolution resolution = {0};
     gpointer weak_address;
     gpointer strong_address;
+    gboolean owned_available = FALSE;
 
     if (argc == 2 && strcmp(argv[1], "--symbol-count") == 0) {
         print_symbol_count_stats(g_getenv("PEAK_TEST_LOAD_RICH") != NULL);
         return failures == 0 ? 0 : 1;
     }
-    if (argc != 1) {
+    gboolean owned_stable = argc == 2 && strcmp(argv[1], "--owned-stable") == 0;
+    if (argc != 1 && !owned_stable) {
         return 2;
     }
 
     gum_init_embedded();
-    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL) != NULL,
-                "load module a");
-    expect_true(dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL) != NULL,
-                "load module b");
-    test_batch_scaling();
+    void* module_a = dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_LOCAL);
+    void* module_b = dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_LOCAL);
+    expect_true(module_a != NULL, "load module a");
+    expect_true(module_b != NULL, "load module b");
+    if (!owned_stable) test_batch_scaling();
+    {
+        PeakTargetResolveRequest ordinary = {
+            .selector = "_ZN9peak_test6Widget4funcEid",
+            .ordinary_first_match = TRUE,
+        };
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                    ((PeakTargetSymbolCandidate*)g_ptr_array_index(ordinary.resolution.candidates, 0))->address ==
+                        gum_find_function(ordinary.selector),
+                    "ordinary duplicate raw name preserves first Gum record");
+        peak_target_resolution_clear(&ordinary.resolution);
+#if defined(__linux__)
+        void* owner_handle = dlopen(PEAK_TEST_SYMBOL_MODULE_B, RTLD_NOW | RTLD_NOLOAD);
+        struct link_map* owner = NULL;
+        expect_true(owner_handle != NULL && dlinfo(owner_handle, RTLD_DI_LINKMAP, &owner) == 0,
+                    "obtain owned module for exact-instance resolver test");
+#if defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) && \
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION >= 5
+        owned_available = gum_interceptor_peak_deferred_module_sync_available();
+#endif
+        if (owned_stable)
+            printf("OWNED_PROVIDER_ACTIVE=%d\n", owned_available);
+        ordinary.module_path = PEAK_TEST_SYMBOL_MODULE_A;
+        ordinary.owned_module = owner;
+        PeakTargetResolverDiagnostics wrong_owner_stats;
+        peak_target_resolver_reset_diagnostics();
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        peak_target_resolver_get_diagnostics(&wrong_owner_stats);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_NONE && !ordinary.module_seen &&
+                    ordinary.owned_module_seen == owned_available &&
+                    wrong_owner_stats.module_symbol_enumerations == 0,
+                    "ordinary fallback skips enumeration of a different owned link-map");
+        peak_target_resolution_clear(&ordinary.resolution);
+        PeakTargetResolveRequest mixed_owner[2] = {
+            {
+                .selector = ordinary.selector,
+                .module_path = PEAK_TEST_SYMBOL_MODULE_A,
+                .ordinary_first_match = TRUE,
+                .owned_module = owner,
+            },
+            {
+                .selector = ordinary.selector,
+                .module_path = PEAK_TEST_SYMBOL_MODULE_A,
+            },
+        };
+        peak_target_resolver_resolve_many(mixed_owner, G_N_ELEMENTS(mixed_owner));
+        expect_true(mixed_owner[0].result == PEAK_TARGET_RESOLVE_NONE &&
+                    !mixed_owner[0].module_seen &&
+                    mixed_owner[0].owned_module_seen == owned_available &&
+                    mixed_owner[1].result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                    mixed_owner[1].module_seen && !mixed_owner[1].owned_module_seen,
+                    "wrong owner does not exclude an ownerless selector in the batch");
+        peak_target_resolution_clear(&mixed_owner[0].resolution);
+        peak_target_resolution_clear(&mixed_owner[1].resolution);
+        mixed_owner[0].module_path = NULL;
+        peak_target_resolver_resolve_many(mixed_owner, G_N_ELEMENTS(mixed_owner));
+        expect_true(owned_available
+                    ? (mixed_owner[0].result == PEAK_TARGET_RESOLVE_UNIQUE &&
+                       mixed_owner[0].module_seen && mixed_owner[0].owned_module_seen &&
+                       ((PeakTargetSymbolCandidate*)g_ptr_array_index(
+                           mixed_owner[0].resolution.candidates, 0))->address ==
+                           dlsym(owner_handle, ordinary.selector))
+                    : (mixed_owner[0].result == PEAK_TARGET_RESOLVE_NONE &&
+                       !mixed_owner[0].module_seen && !mixed_owner[0].owned_module_seen),
+                    "owned raw name validates the first eligible record before sorting");
+        peak_target_resolution_clear(&mixed_owner[0].resolution);
+        peak_target_resolution_clear(&mixed_owner[1].resolution);
+        ordinary.module_path = PEAK_TEST_SYMBOL_MODULE_B;
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == (owned_available ? PEAK_TARGET_RESOLVE_UNIQUE
+                                                          : PEAK_TARGET_RESOLVE_NONE) &&
+                    ordinary.module_seen == owned_available &&
+                    ordinary.owned_module_seen == owned_available,
+                    "ordinary fallback accepts only the owned loaded module");
+        peak_target_resolution_clear(&ordinary.resolution);
+        ordinary.selector = "peak_missing_owned_stable_symbol";
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == PEAK_TARGET_RESOLVE_NONE &&
+                    ordinary.module_seen == owned_available &&
+                    ordinary.owned_module_seen == owned_available,
+                    "missing symbol does not hide a visible eligible owner");
+        peak_target_resolution_clear(&ordinary.resolution);
+        ordinary.selector = "";
+        peak_target_resolver_resolve_many(&ordinary, 1);
+        expect_true(ordinary.result == (owned_available ? PEAK_TARGET_RESOLVE_INVALID
+                                                          : PEAK_TARGET_RESOLVE_NONE) &&
+                    !ordinary.module_seen &&
+                    !ordinary.owned_module_seen,
+                    "a reused invalid request resets both module observations");
+        peak_target_resolution_clear(&ordinary.resolution);
+        if (owner_handle != NULL) dlclose(owner_handle);
+#endif
+    }
+    if (owned_stable) {
+        if (module_b != NULL) dlclose(module_b);
+        if (module_a != NULL) dlclose(module_a);
+        gum_deinit_embedded();
+        if (failures == 0) puts("OWNED_STABLE_MODULES_PASS");
+        return failures == 0 ? 0 : 1;
+    }
 
     temporary_directory = g_dir_make_tmp("peak-symbol-resolution-XXXXXX", NULL);
     expect_true(temporary_directory != NULL, "create temporary directory");
@@ -247,6 +355,42 @@ main(int argc, char** argv)
         expect_true(peak_target_resolver_module_matches(symlink_path,
                                                          PEAK_TEST_SYMBOL_MODULE_A),
                     "module path accepts canonical-equivalent symlink");
+#if defined(__linux__)
+        void* alias_handle = dlopen(PEAK_TEST_SYMBOL_MODULE_A, RTLD_NOW | RTLD_NOLOAD);
+        struct link_map* alias_owner = NULL;
+        expect_true(alias_handle != NULL &&
+                    dlinfo(alias_handle, RTLD_DI_LINKMAP, &alias_owner) == 0,
+                    "obtain owner for live module alias");
+        PeakTargetResolveRequest alias = {
+            .selector = "_ZN9peak_test6Widget4funcEid",
+            .module_path = symlink_path,
+            .ordinary_first_match = TRUE,
+            .owned_module = alias_owner,
+        };
+        peak_target_resolver_resolve_many(&alias, 1);
+        expect_true(alias.result == (owned_available ? PEAK_TARGET_RESOLVE_UNIQUE
+                                                      : PEAK_TARGET_RESOLVE_NONE) &&
+                    alias.module_seen == owned_available,
+                    "owned alias resolves its current module");
+        peak_target_resolution_clear(&alias.resolution);
+        expect_true(unlink(symlink_path) == 0 &&
+                    symlink(PEAK_TEST_SYMBOL_MODULE_B, symlink_path) == 0,
+                    "retarget module alias to the other owner");
+        peak_target_resolver_resolve_many(&alias, 1);
+        expect_true(alias.result == PEAK_TARGET_RESOLVE_NONE && !alias.module_seen,
+                    "retargeted alias cannot admit the original owner");
+        peak_target_resolution_clear(&alias.resolution);
+        expect_true(unlink(symlink_path) == 0 &&
+                    symlink(PEAK_TEST_SYMBOL_MODULE_A, symlink_path) == 0,
+                    "restore module alias");
+        peak_target_resolver_resolve_many(&alias, 1);
+        expect_true(alias.result == (owned_available ? PEAK_TARGET_RESOLVE_UNIQUE
+                                                      : PEAK_TARGET_RESOLVE_NONE) &&
+                    alias.module_seen == owned_available,
+                    "restored alias is resolved without stale path state");
+        peak_target_resolution_clear(&alias.resolution);
+        if (alias_handle != NULL) dlclose(alias_handle);
+#endif
     }
     module_basename = strrchr(PEAK_TEST_SYMBOL_MODULE_A, '/');
     module_b_basename = strrchr(PEAK_TEST_SYMBOL_MODULE_B, '/');

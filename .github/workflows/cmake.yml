@@ -221,5 +221,21 @@ jobs:
           build/macos-detach-concurrent.log
         ! grep -F '"PEAK_ACCOUNTING_DIAGNOSTICS"' \
           build/macos-detach-concurrent-*.csv
-        grep -E '^"peak_macos_smoke_target",.*,0,0$' \
-          build/macos-detach-concurrent-*.csv
+        python3 - <<'PY'
+        import csv
+        import glob
+
+        paths = glob.glob("build/macos-detach-concurrent-*.csv")
+        assert paths, "missing concurrent lifecycle statistics CSV"
+        for path in paths:
+            with open(path, newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            targets = [row for row in rows
+                       if row["function"] == "peak_macos_smoke_target"]
+            assert len(targets) == 1, (path, targets)
+            row = targets[0]
+            for field in ("dropped_calls", "dropped_threads"):
+                assert int(row[field]) == 0, (path, field, row[field])
+            for field in ("ever_detached", "ever_reattached"):
+                assert int(row[field]) == 1, (path, field, row[field])
+        PY

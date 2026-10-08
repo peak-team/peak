@@ -159,11 +159,26 @@ main(int argc, char** argv)
             fputs("immediate-close setup failed\n", stderr);
             return EXIT_FAILURE;
         }
-        drain_after_ownership(explicit_drain, pending_ownership_count);
-        get_diagnostics(&after);
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        do {
+            struct timespec now;
+            drain_after_ownership(explicit_drain, pending_ownership_count);
+            get_diagnostics(&after);
+            if (after.queue_length == 0) break;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec - start.tv_sec > 5 ||
+                (now.tv_sec - start.tv_sec == 5 && now.tv_nsec >= start.tv_nsec))
+                break;
+            sched_yield();
+        } while (1);
         if (after.enqueued != before.enqueued + 1 ||
-            after.drained != before.drained + 1 ||
+            after.drained - before.drained != 1 + after.requeued - before.requeued ||
+            after.dropped_full != before.dropped_full ||
+            after.dropped_closed != before.dropped_closed ||
             after.dropped_noload != before.dropped_noload ||
+            after.dropped_requeue != before.dropped_requeue ||
+            after.retained_handles != before.retained_handles ||
             after.queue_length != 0) {
             fputs("queue-owned module reference did not survive immediate dlclose\n",
                   stderr);
