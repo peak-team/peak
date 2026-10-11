@@ -429,6 +429,8 @@ setup_public_listener_fixture(char* log_template,
                hook_address != NULL && hook_address[0] != NULL);
     check_true("public listener fixture attached listener",
                array_listener != NULL && array_listener[0] != NULL);
+    check_true("public listener fixture published attached state",
+               peak_general_listener_hook_state(0) == PEAK_HOOK_ATTACHED);
 
     return failures == 0 ? 0 : -1;
 }
@@ -502,6 +504,8 @@ run_shutdown_prepare_fail_closed(void)
                hook_address != NULL && hook_address[0] != NULL);
     check_true("public shutdown prepare failure retains listener state",
                array_listener != NULL && array_listener[0] != NULL);
+    check_true("public shutdown prepare failure retains published state",
+               peak_general_listener_hook_state(0) == PEAK_HOOK_ATTACHED);
     check_true("public shutdown prepare failure does not hold helper threads",
                peak_detach_controller_threads_are_held() == FALSE);
     before_count = listener_call_count();
@@ -524,6 +528,8 @@ run_shutdown_prepare_fail_closed(void)
 
     check_true("public shutdown prepare failure later cleanup succeeds",
                peak_general_listener_dettach() == TRUE);
+    check_true("public shutdown cleanup unpublishes state",
+               peak_general_listener_hook_state(0) == PEAK_HOOK_UNRESOLVED);
     check_true("public shutdown prepare cleanup frees hook addresses",
                hook_address == NULL);
     check_true("public shutdown prepare cleanup frees listener array",

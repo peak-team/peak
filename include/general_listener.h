@@ -408,7 +408,13 @@ PEAK_API gboolean peak_general_listener_request_detach(size_t hook_id);
 PEAK_API gboolean peak_general_listener_request_reattach(size_t hook_id);
 
 /**
- * @brief Returns the current controller-facing state for a hooked function.
+ * @brief Reads the atomically published controller-facing scalar state.
+ *
+ * This read does not acquire the controller lock. A concurrent transition may
+ * still be in progress; the result reflects one published state, not a
+ * coherent snapshot of the hook address, listener, or owner. A call spanning
+ * cleanup and reinitialization may return a state from either instance of the
+ * same numeric hook ID.
  *
  * @param hook_id Index of the hooked function.
  * @return Current hook state, or PEAK_HOOK_UNRESOLVED for invalid/unpublished hooks.
