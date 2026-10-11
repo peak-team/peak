@@ -140,8 +140,18 @@ On Linux with `RTLD_NOLOAD`, PEAK obtains a second, unobserved reference using
 the application's original binding mode and verifies that it identifies the
 same `link_map` in the same loader namespace. This runs on the ownership
 thread, outside the Gum callback and PEAK controller locks. Resolution later
-uses ordinary handle-scoped `dlsym()` for plain C names; PEAK does not
-construct a second dependency graph or choose providers by filename. A dynamic
+uses ordinary handle-scoped `dlsym()` first for plain raw names. On a miss,
+PEAK checks retained static/local symbols in the exact owned base-namespace
+module through Gum's batched resolver. If that module is not yet visible and
+registry synchronization is active, the request retains its owner and retries;
+a drain attempt is not necessarily a completed request. PEAK does not construct
+a second dependency graph or choose providers by filename. Gum's Linux registry
+does not enumerate isolated `dlmopen()` namespaces. An ordinary miss for such an
+owner therefore completes without a static lookup or retry, leaving the target
+unresolved for a later provider and releasing the queued reference. Handle-scoped
+dynamic hits still take the existing exact-owner path. The namespace ownership
+tests exercise this lower-level behavior through explicit queue admission; they
+do not extend public `dlopen()` discovery to `dlmopen()`. A dynamic
 C++ selector instead requires a slash-containing `path!symbol` scope. After
 the resolver proves that the candidate belongs to this exact `link_map`, PEAK
 attaches the resolved address directly, including local symbols that `dlsym()`
@@ -332,8 +342,9 @@ loads a module. An unrelated `dlopen()` does not synchronize or scan symbols
 for a path-qualified selector; the selector's module must first match that
 request. `PEAK_ENABLE_CXX_SYMBOL_SCAN=1` permits startup legacy fallback after
 an ordinary exact lookup misses. In the dynamic path it permits legacy matching
-only for an explicit slash-containing `path!symbol`; an unqualified C miss
-always stays unresolved for a later DSO. Once a matching DSO request arrives,
+only for an explicit slash-containing `path!symbol`; an ordinary raw miss uses
+only exact-name static/local fallback, without enabling C++ overload matching.
+If no owned candidate exists, it stays unresolved for a later DSO. Once a matching DSO request arrives,
 the resolver enumerates symbols only in modules applicable to that selector.
 The report name retains the module spelling supplied in `path!symbol`.
 

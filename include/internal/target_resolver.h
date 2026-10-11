@@ -33,6 +33,14 @@ typedef struct {
     const char* selector;
     const char* module_path;
     gboolean allow_legacy_short;
+    /* Ordinary raw names retain the first valid exact Gum record,
+     * unlike selectors. */
+    gboolean ordinary_first_match;
+    /* The caller keeps the owning loader handle alive through resolution. */
+    gpointer owned_module;
+    gboolean module_seen;
+    /* Owner-address presence before path eligibility; not metadata freshness. */
+    gboolean owned_module_seen;
     PeakTargetResolution resolution;
     PeakTargetResolveResult result;
 } PeakTargetResolveRequest;

@@ -669,6 +669,13 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 2
                 PASS_REGULAR_EXPRESSION "detach_helper_ptrace_stop_wait_unit_ok")
+
+        add_test(NAME test_detach_helper_release_unit
+            COMMAND $<TARGET_FILE:test_detach_helper_release>)
+        set_tests_properties(test_detach_helper_release_unit
+            PROPERTIES
+                TIMEOUT 2
+                PASS_REGULAR_EXPRESSION "detach_helper_release_ok")
     endif()
 
     configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)

@@ -147,14 +147,31 @@ detach_held_threads(int* errno_out)
                        held_threads[i].tid,
                        NULL,
                        (void*)(intptr_t)held_threads[i].detach_signal) != 0) {
-                if (errno != ESRCH) {
-                    if (errno_out != NULL && *errno_out == 0) {
-                        *errno_out = errno;
+                int detach_errno = errno;
+                if (detach_errno == ESRCH) {
+                    char status_path[64];
+                    int status_fd;
+
+                    /* ESRCH also means that a seized thread is still
+                     * running rather than in ptrace-stop. In that case it
+                     * remains owned by this helper and a later SEIZE will
+                     * fail with EPERM. Only a vanished /proc task proves
+                     * that there is no thread left to release. */
+                    snprintf(status_path, sizeof(status_path),
+                             "/proc/%ld/status", (long)held_threads[i].tid);
+                    status_fd = open(status_path, O_RDONLY | O_CLOEXEC);
+                    if (status_fd >= 0) {
+                        close(status_fd);
+                    } else if (errno == ENOENT) {
+                        continue;
                     }
-                    status = PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
-                    held_threads[retained_count++] = held_threads[i];
-                    continue;
                 }
+                if (errno_out != NULL && *errno_out == 0) {
+                    *errno_out = detach_errno;
+                }
+                status = PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+                held_threads[retained_count++] = held_threads[i];
+                continue;
             }
         }
     }
@@ -1276,6 +1293,11 @@ serve_protocol(int fd)
                                     &errno_value);
             if (status != PEAK_DETACH_HELPER_STATUS_OK) {
                 (void)send_response(fd, status, errno_value, 0);
+                /* Exiting the tracer releases a live tracee that could not
+                 * be detached. The parent treats RELEASE_FAILED as fatal. */
+                if (status == PEAK_DETACH_HELPER_STATUS_RELEASE_FAILED) {
+                    return 1;
+                }
             }
         } else if (request.command == PEAK_DETACH_HELPER_CMD_EVACUATE) {
             PeakDetachHelperInstruction instructions[PEAK_DETACH_HELPER_MAX_INSTRUCTIONS];

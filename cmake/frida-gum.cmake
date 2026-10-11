@@ -312,7 +312,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK Gum arm64 private-layout ABI fingerprint
 #endif
 #if !defined(GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION) || \
-    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 4
+    GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 5
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 #if !defined(GUM_PEAK_FAST_LISTENER_VERSION) || \
@@ -400,6 +400,9 @@ int main(void)
     (void) get_function_patch;
     (void) get_pc_diagnostics;
     (void) drain_deferred_module_sync;
+    PeakDrainDeferredModuleSyncFunc sync_available =
+        gum_interceptor_peak_deferred_module_sync_available;
+    (void) sync_available;
     (void) invocation_stack_entry_matches;
     gum_interceptor_peak_begin_module_mutation();
     gum_interceptor_peak_end_module_mutation();

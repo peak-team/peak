@@ -462,6 +462,13 @@ gum_interceptor_peak_drain_deferred_module_sync(void)
     return peak_gum_module_sync_try_drain(FALSE);
 }
 
+gboolean
+gum_interceptor_peak_deferred_module_sync_available(void)
+{
+    return __atomic_load_n(&peak_gum_module_sync_state, __ATOMIC_ACQUIRE) ==
+        PEAK_GUM_MODULE_SYNC_ACTIVE;
+}
+
 G_GNUC_INTERNAL __attribute__((no_sanitize_address)) void
 _gum_module_registry_activate(GumModuleRegistry * registry)
 {

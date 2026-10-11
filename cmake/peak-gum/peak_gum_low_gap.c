@@ -16,8 +16,10 @@
 
 #define PEAK_MAP_CHUNK_SIZE 4096
 #define PEAK_MAP_LINE_SIZE 4096
-#define PEAK_MAP_TOTAL_LIMIT 65536
 #define PEAK_MAP_READ_LIMIT 64
+/* Ceiling for full reads plus EOF; short reads may exhaust the call budget
+ * sooner. Both limits still require a complete snapshot. */
+#define PEAK_MAP_TOTAL_LIMIT (PEAK_MAP_CHUNK_SIZE * (PEAK_MAP_READ_LIMIT - 1))
 #define PEAK_MAP_LINE_LIMIT 2048
 #define PEAK_EINTR_LIMIT 8
 /* Conservative low-address admission floor, not a kernel-policy guarantee.

@@ -14,13 +14,14 @@ typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
 
-#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 4
+#define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 5
 
 /*
  * Test/diagnostic helper. Production synchronization is owned by Gum's
  * wrapped module-registry lifecycle and its dedicated worker.
  */
 GUM_API gboolean gum_interceptor_peak_drain_deferred_module_sync(void);
+GUM_API gboolean gum_interceptor_peak_deferred_module_sync_available(void);
 
 /*
  * Stops deferred module synchronization before PEAK starts mutating Gum
