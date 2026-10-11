@@ -1110,15 +1110,17 @@ def check_mpi_finalize_trampoline_default(repo_root):
     require("PEAK_MPI_REAL_FINALIZE_ENV" in guard and
             "peak_env_value_truthy(value)" in guard,
             "real MPI finalizer policy must preserve explicit env override")
-    require("peak_mpi_runtime_is_intel_2019()" in guard and
-            "return FALSE;" in guard,
-            "Intel MPI 2019 must skip its unsafe real finalizer by default")
-    vendor = extract_function(peak_source, "peak_mpi_runtime_is_intel_2019")
-    require("MPI_Get_library_version" in vendor and
-            "Intel(R) MPI" in vendor and
-            "Intel MPI" in vendor and
-            'strstr(text, "2019")' in vendor,
-            "Intel MPI 2019 containment must inspect the MPI library version")
+    require("value != NULL && value[0] != '\\0'" in guard and
+            "return TRUE;" in guard and
+            "peak_mpi_runtime_is_intel_2019" not in peak_source and
+            "PEAK_TEST_MPI_LIBRARY_VERSION" not in peak_source,
+            "unset/empty real finalizer policy must default on without vendor bypass")
+    original = extract_function(source, "mpi_interceptor_call_original_finalize_once")
+    require("state != PEAK_MPI_FINALIZE_REQUESTED" in original and
+            "peak_real_finalize_allowed" in original and
+            "original_pmpi_finalize == NULL" in original and
+            "mpi_interceptor_finalize_publish_done(0)" in original,
+            "real finalizer must still fail closed for missing state, permission, or original PMPI")
     fini = extract_function(peak_source, "peak_fini_impl")
     completion = (
         'peak_log_report("[peak] PEAK output is complete; '
