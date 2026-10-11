@@ -1,4 +1,10 @@
 add_executable(test_detach_hotloop test_detach_hotloop.c)
+add_executable(test_hook_state_independent test_hook_state_independent.c)
+target_include_directories(test_hook_state_independent PRIVATE ${PROJECT_SOURCE_DIR}/include ${FRIDA_GUM_INCLUDE_DIRS})
+target_link_libraries(test_hook_state_independent PRIVATE Threads::Threads ${DL_LIBRARY})
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+  target_link_options(test_hook_state_independent PRIVATE -Wl,--export-dynamic)
+endif()
 target_include_directories(test_detach_hotloop
   PRIVATE
     ${PROJECT_SOURCE_DIR}/include
