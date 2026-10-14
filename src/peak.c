@@ -67,9 +67,6 @@
 #define PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_ENV \
     "PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS"
 #define PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT_MS_DEFAULT 5000U
-#ifdef PEAK_ENABLE_TEST_HOOKS
-#define PEAK_TEST_MPI_LIBRARY_VERSION_ENV      "PEAK_TEST_MPI_LIBRARY_VERSION"
-#endif
 #undef g_printerr
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
@@ -1180,54 +1177,12 @@ peak_output_aggregation_mode_from_value(const char* name,
 }
 
 static gboolean
-peak_mpi_runtime_is_intel_2019(void)
-{
-    char version[MPI_MAX_LIBRARY_VERSION_STRING] = { 0 };
-    int version_len = 0;
-    const char* text = NULL;
-
-#ifdef PEAK_ENABLE_TEST_HOOKS
-    text = getenv(PEAK_TEST_MPI_LIBRARY_VERSION_ENV);
-    if (text != NULL && text[0] == '\0') {
-        text = NULL;
-    }
-#endif
-    if (text == NULL) {
-        if (MPI_Get_library_version(version, &version_len) != MPI_SUCCESS) {
-            return FALSE;
-        }
-        if (version_len < 0) {
-            version_len = 0;
-        }
-        if (version_len >= (int)sizeof(version)) {
-            version_len = (int)sizeof(version) - 1;
-        }
-        version[version_len] = '\0';
-        text = version;
-    }
-
-    return (strstr(text, "Intel(R) MPI") != NULL ||
-            strstr(text, "Intel MPI") != NULL) &&
-           strstr(text, "2019") != NULL;
-}
-
-static gboolean
-peak_mpi_real_finalize_config_allowed(
-    gboolean* intel_2019_workaround)
+peak_mpi_real_finalize_config_allowed(void)
 {
     const char* value = getenv(PEAK_MPI_REAL_FINALIZE_ENV);
 
-    if (intel_2019_workaround != NULL) {
-        *intel_2019_workaround = FALSE;
-    }
     if (value != NULL && value[0] != '\0') {
         return peak_env_value_truthy(value);
-    }
-    if (peak_mpi_runtime_is_intel_2019()) {
-        if (intel_2019_workaround != NULL) {
-            *intel_2019_workaround = TRUE;
-        }
-        return FALSE;
     }
     return TRUE;
 }
@@ -2036,11 +1991,9 @@ peak_fini_impl(void)
         !mpi_collectives_failed_closed &&
         (publish_before_finalize_proof ||
          all_ranks_requested_mpi_finalize);
-    gboolean intel_2019_finalize_workaround = FALSE;
     int real_mpi_finalize_config_allowed =
         report_release_gate_allowed ?
-            peak_mpi_real_finalize_config_allowed(
-                &intel_2019_finalize_workaround) : 0;
+            peak_mpi_real_finalize_config_allowed() : 0;
     int allow_real_mpi_finalize = 0;
     if (!report_published) {
         if (found_MPI && abnormal_exit &&
@@ -2211,8 +2164,6 @@ peak_fini_impl(void)
                 g_printerr("[peak] Real PMPI_Finalize is not proven all-rank safe; skipping real MPI finalizer\n");
             } else if (!report_release_protocol_completed) {
                 g_printerr("[peak] Real PMPI_Finalize is not safe after report-release protocol failure; skipping real MPI finalizer\n");
-            } else if (intel_2019_finalize_workaround) {
-                peak_log_info("[peak] PEAK output release is complete; skipping real PMPI_Finalize for Intel MPI 2019 compatibility; set PEAK_MPI_REAL_FINALIZE=1 to override\n");
             } else if (!real_mpi_finalize_config_allowed) {
                 g_printerr("[peak] PEAK report release succeeded; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
             } else if (!all_real_mpi_finalize_config_allowed) {
