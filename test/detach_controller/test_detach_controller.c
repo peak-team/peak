@@ -498,6 +498,10 @@ peak_test_after_signal_mask_preflight(int epoch)
     if (!signal_late_enabled || signal_late_mode == 3)
         return;
     if (signal_late_mode == 2 && atomic_load(&signal_late_phase) == 6) {
+        if (g_getenv("PEAK_TEST_FORWARD_CONTAMINATION") != NULL ||
+            g_getenv("PEAK_TEST_AFTER_FORWARD_CONTAMINATION") != NULL ||
+            g_getenv("PEAK_TEST_REAL_SIGNAL_EFFECT") != NULL)
+            return;
         int before = peak_signal_policy_unexpected_delivery_count();
         int rc = peak_signal_policy_send_thread_signal(
             atomic_load(&signal_late_tid),
@@ -648,6 +652,20 @@ strict_helper_stale_worker(void* arg)
     return NULL;
 }
 
+static atomic_int signal_effect_spin_flag = 1;
+#if defined(__x86_64__)
+extern const unsigned char peak_test_spin_begin[], peak_test_spin_end[];
+__attribute__((naked, noinline, noclone)) static void
+signal_effect_spin_target(atomic_int *flag __attribute__((unused)))
+{
+    asm volatile(".global peak_test_spin_begin\n"
+                 "peak_test_spin_begin: cmpb $0,(%rdi)\n"
+                 "jne peak_test_spin_begin\n"
+                 ".global peak_test_spin_end\n"
+                 "peak_test_spin_end: ret\n");
+}
+#endif
+
 static void*
 strict_helper_signal_blocked_worker(void* arg)
 {
@@ -709,16 +727,136 @@ strict_helper_signal_blocked_worker(void* arg)
     fprintf(stderr, "late-own-signal worker-unblock rc=%d unexpected=%d\n", rc,
             peak_signal_policy_unexpected_delivery_count());
     atomic_store(&signal_late_phase, 6);
+#if defined(__x86_64__)
+    if (g_getenv("PEAK_TEST_REAL_SIGNAL_EFFECT") != NULL)
+        signal_effect_spin_target(&signal_effect_spin_flag);
+#endif
     while (worker_running)
         usleep(1000);
     return NULL;
 }
+
+static guint8 signal_oracle_before_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+static guint signal_oracle_prologue_length;
+
+int
+peak_test_after_signal_memory_write(uint64_t address, size_t size)
+{
+#if defined(__x86_64__)
+    if (g_getenv("PEAK_TEST_TEMP_WRITE_ERROR") != NULL &&
+        address == (uint64_t)(uintptr_t)peak_test_spin_end) {
+        gboolean actual_trap = size == 1 && *peak_test_spin_end == 0xcc;
+        fprintf(stderr,
+                "test-only post-write error actual_trap_present=%d "
+                "unexpected=%d injected_errno=%d phase=before_rx_restore\n",
+                actual_trap, peak_signal_policy_unexpected_delivery_count(), EACCES);
+        if (!actual_trap) {
+            fprintf(stderr, "FAIL: post-write error missing actual trap byte\n");
+            _exit(1);
+        }
+        return EACCES;
+    }
+#else
+    (void)address;
+    (void)size;
+#endif
+    return 0;
+}
+
+void
+peak_test_after_signal_temp_restore(void)
+{
+#if defined(__x86_64__)
+    if (g_getenv("PEAK_TEST_REAL_SIGNAL_EFFECT") != NULL) {
+        gboolean restored = *peak_test_spin_end == 0xc3;
+        fprintf(stderr,
+                "real-signal-temp actual_exit_byte_restored=%d "
+                "unexpected=%d\n",
+                restored, peak_signal_policy_unexpected_delivery_count());
+        if (!restored) {
+            fprintf(stderr, "FAIL: temp restoration observer missing original byte\n");
+            _exit(1);
+        }
+    }
+#endif
+}
+
+extern gboolean peak_detach_controller_test_signal_pc_published(long tid);
+extern gboolean peak_detach_controller_test_signal_effect(long tid, int action,
+                                                          uintptr_t begin, size_t size,
+                                                          uintptr_t *sampled_pc_out,
+                                                          gboolean *published_out);
+
+void
+peak_test_after_signal_forward_effect(int action)
+{
+#if defined(__x86_64__)
+    const char *real_effect = g_getenv("PEAK_TEST_REAL_SIGNAL_EFFECT");
+    if (real_effect != NULL) {
+        gboolean pc_case = strncmp(real_effect, "pc", 2) == 0;
+        int wanted = pc_case ? PEAK_DETACH_HELPER_INSTRUCTION_SET_PC
+                             : PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE;
+        if (action != wanted)
+            return;
+        gboolean observed = pc_case ? peak_detach_controller_test_signal_pc_published(
+                                          atomic_load(&signal_late_tid))
+                                    : *peak_test_spin_end == 0xcc;
+        fprintf(stderr,
+                "real-signal-effect action=%d pc_publication=%d "
+                "trap_byte_present=%d observed=%d\n",
+                action, pc_case && observed, !pc_case && observed, observed);
+        if (!observed) {
+            fprintf(stderr, "FAIL: real signal forward effect not observed\n");
+            _exit(1);
+        }
+        if (strstr(real_effect, "fatal") != NULL &&
+            g_getenv("PEAK_TEST_MULTI_TEMP_FAILURE") == NULL)
+            peak_signal_policy_note_unexpected_delivery();
+        else if (!pc_case)
+            atomic_store(&signal_effect_spin_flag, 0);
+        return;
+    }
+#endif
+    if (g_getenv("PEAK_TEST_AFTER_FORWARD_CONTAMINATION") != NULL) {
+        gboolean changed =
+            signal_oracle_prologue_length > 0 &&
+            memcmp(signal_oracle_before_bytes, (gpointer)strict_helper_target,
+                   signal_oracle_prologue_length) != 0;
+        fprintf(stderr,
+                "test-only AFTER forward effect action=%d measured_entry_changed=%d "
+                "held=%d gate=%d\n",
+                action, changed, peak_detach_controller_threads_are_held(),
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        if (!changed) {
+            fprintf(stderr,
+                    "FAIL: after-write oracle did not observe actual byte change\n");
+            _exit(1);
+        }
+        peak_signal_policy_note_unexpected_delivery();
+    }
+}
+
+extern size_t peak_detach_controller_test_physical_record_snapshot(size_t hook_id,
+                                                                   unsigned char *bytes,
+                                                                   size_t capacity);
+
+void
+peak_test_before_signal_forward_effect(void)
+{
+    if (g_getenv("PEAK_TEST_FORWARD_CONTAMINATION") != NULL) {
+        fprintf(stderr, "test-only contamination at forward-effect boundary\n");
+        peak_signal_policy_note_unexpected_delivery();
+    }
+}
+
+static atomic_ulong strict_helper_listener_calls;
 
 static void
 strict_helper_on_enter(GumInvocationContext* context, gpointer user_data)
 {
     (void)context;
     (void)user_data;
+    atomic_fetch_add(&strict_helper_listener_calls, 1);
 }
 
 static void
@@ -3481,6 +3619,53 @@ run_signal_backend_blocked_thread(int late_mode)
     gum_interceptor_flush(interceptor);
     peak_detach_controller_note_thread_creation_gate_installed(TRUE);
 
+    gboolean reattach_oracle =
+        late_mode == 2 && g_getenv("PEAK_TEST_CONTAMINATE_REATTACH") != NULL;
+    if (reattach_oracle) {
+        PeakDetachRequest seed = {.hook_id = 127,
+                                  .symbol_name = "strict_helper_target",
+                                  .function_address = (gpointer)strict_helper_target,
+                                  .interceptor = interceptor,
+                                  .listener = listener,
+                                  .operation = PEAK_DETACH_OPERATION_DETACH};
+        signal_late_enabled = FALSE;
+        check_prepare("reattach oracle seed actual detach", &seed, TRUE,
+                      PEAK_DETACH_STATUS_SAFE);
+        check_finish("reattach oracle seed detach finish", &seed,
+                     PEAK_DETACH_STATUS_SAFE);
+        signal_late_enabled = late_delivery;
+    }
+    GumInvocationListener *spin_listener = NULL;
+    const char *real_effect = g_getenv("PEAK_TEST_REAL_SIGNAL_EFFECT");
+#if defined(__x86_64__)
+    if (real_effect != NULL) {
+        atomic_store(&signal_effect_spin_flag, 1);
+        spin_listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
+        check_true("real spin target Gum attach",
+                   gum_interceptor_attach(interceptor,
+                                          (gpointer)signal_effect_spin_target,
+                                          spin_listener, NULL) == GUM_ATTACH_OK);
+        gum_interceptor_flush(interceptor);
+        PeakDetachRequest spin_seed = {.hook_id = 128,
+                                       .symbol_name = "signal_effect_spin_target",
+                                       .function_address =
+                                           (gpointer)signal_effect_spin_target,
+                                       .interceptor = interceptor,
+                                       .listener = spin_listener,
+                                       .operation = PEAK_DETACH_OPERATION_DETACH};
+        signal_late_enabled = FALSE;
+        check_prepare("real spin physical detach seed", &spin_seed, TRUE,
+                      PEAK_DETACH_STATUS_SAFE);
+        check_finish("real spin physical detach finish", &spin_seed,
+                     PEAK_DETACH_STATUS_SAFE);
+        signal_late_enabled = late_delivery;
+        check_true("real spin prologue original cmp/jne",
+                   peak_test_spin_begin[0] == 0x80);
+    }
+#else
+    if (real_effect != NULL)
+        return 77;
+#endif
     signal_blocked_worker_ready = 0;
     if (pthread_create(&worker, NULL, strict_helper_signal_blocked_worker, NULL) != 0) {
         perror("pthread_create");
@@ -3636,7 +3821,7 @@ run_signal_backend_blocked_thread(int late_mode)
                 peak_detach_controller_prepare_hook_mutation(&request, &clean_status);
             fprintf(stderr,
                     "fixed-handler-retirement next_prepare prepared=%d status=%s "
-                    "actual_gum_mutation=0\n",
+                    "explicit_gum_transaction=0\n",
                     clean_prepared, peak_detach_controller_status_string(clean_status));
             check_true(
                 "next generation safely prepares after canceled handler quiescence",
@@ -3695,7 +3880,7 @@ run_signal_backend_blocked_thread(int late_mode)
                 peak_detach_controller_prepare_hook_mutation(&request, &recovered);
             fprintf(stderr,
                     "handler-before-publish after_return prepared=%d status=%s "
-                    "actual_gum_mutation=0\n",
+                    "explicit_gum_transaction=0\n",
                     prepared_after, peak_detach_controller_status_string(recovered));
             if (prepared_after)
                 check_finish("handler after-return cleanup", &request,
@@ -3751,7 +3936,34 @@ run_signal_backend_blocked_thread(int late_mode)
                                peak_signal_policy_unexpected_delivery_count() ==
                                    initial_unexpected);
                 }
-                request.operation = PEAK_DETACH_OPERATION_DETACH;
+                unsigned char record_before[512] = {0};
+                unsigned char record_after[512] = {0};
+                size_t record_size = peak_detach_controller_test_physical_record_snapshot(
+                    127, record_before, sizeof(record_before));
+                check_true("physical record exact snapshot fits", record_size > 0);
+                GumPeakPcDiagnostics before_diagnostics = {0};
+                gboolean before_context = gum_interceptor_peak_get_pc_diagnostics(
+                    interceptor, request.function_address, listener, &before_diagnostics);
+                guint8 before_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+                guint8 before_patch[GUM_PEAK_MAX_PROLOGUE_SIZE] = {0};
+                guint8 before_original[GUM_PEAK_MAX_PROLOGUE_SIZE] = {0};
+                guint before_length = 0;
+                gboolean before_attached = gum_interceptor_peak_get_function_patch(
+                    interceptor, request.function_address, listener, before_patch,
+                    before_original, &before_length);
+                check_true("contamination oracle attached patch available",
+                           before_attached && before_length > 0 &&
+                               before_length <= sizeof(before_bytes));
+                memcpy(before_bytes, request.function_address, before_length);
+                memcpy(signal_oracle_before_bytes, before_bytes, before_length);
+                signal_oracle_prologue_length = before_length;
+                unsigned long calls_before = atomic_load(&strict_helper_listener_calls);
+                strict_helper_target();
+                check_true("contamination oracle listener initially active",
+                           atomic_load(&strict_helper_listener_calls) ==
+                               calls_before + (reattach_oracle ? 0 : 1));
+                request.operation = reattach_oracle ? PEAK_DETACH_OPERATION_REATTACH
+                                                    : PEAK_DETACH_OPERATION_DETACH;
                 PeakDetachStatus next_status = PEAK_DETACH_STATUS_ERROR;
                 gboolean next_prepared;
                 if (g_getenv("PEAK_TEST_CONTAMINATE_BATCH") != NULL) {
@@ -3778,13 +3990,106 @@ run_signal_backend_blocked_thread(int late_mode)
                     next_prepared = peak_detach_controller_prepare_hook_mutation(
                         &request, &next_status);
                 }
+#if defined(__x86_64__)
+                if (real_effect != NULL) {
+                    check_true("real signal effect actual prepare holds worker",
+                               next_prepared);
+                    uintptr_t actual_pc = 0;
+                    gboolean pc_published = FALSE;
+                    unsigned char exit_before = *peak_test_spin_end;
+                    int action =
+                        strncmp(real_effect, "pc", 2) == 0
+                            ? PEAK_DETACH_HELPER_INSTRUCTION_SET_PC
+                            : PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE;
+                    gboolean effect_ok = peak_detach_controller_test_signal_effect(
+                        atomic_load(&signal_late_tid), action,
+                        (uintptr_t)peak_test_spin_begin,
+                        (size_t)(peak_test_spin_end - peak_test_spin_begin), &actual_pc,
+                        &pc_published);
+                    fprintf(stderr,
+                            "real-signal-effect result=%d actual_sampled_pc=0x%lx "
+                            "range_begin=0x%lx range_end=0x%lx publication=%d "
+                            "exit_byte_restored=%d\n",
+                            effect_ok, (unsigned long)actual_pc,
+                            (unsigned long)(uintptr_t)peak_test_spin_begin,
+                            (unsigned long)(uintptr_t)peak_test_spin_end, pc_published,
+                            *peak_test_spin_end == exit_before);
+                    check_true("real signal effect protocol succeeds", effect_ok);
+                    check_true("real temp breakpoint exit byte restored",
+                               *peak_test_spin_end == exit_before);
+                    if (action == PEAK_DETACH_HELPER_INSTRUCTION_SET_PC)
+                        check_true("real identity PC publication observed", pc_published);
+                    atomic_store(&signal_effect_spin_flag, 0);
+                    check_finish("real signal effect held finish", &request,
+                                 PEAK_DETACH_STATUS_SAFE);
+                    check_true(
+                        "real signal effect gate and hold released",
+                        !peak_detach_controller_threads_are_held() &&
+                            peak_detach_controller_test_thread_creation_gate_epoch() ==
+                                0);
+                    goto late_case_cleanup;
+                }
+#endif
+                gboolean bytes_unchanged =
+                    memcmp(before_bytes, request.function_address, before_length) == 0;
+                guint8 after_patch[GUM_PEAK_MAX_PROLOGUE_SIZE] = {0};
+                guint8 after_original[GUM_PEAK_MAX_PROLOGUE_SIZE] = {0};
+                guint after_length = 0;
+                gboolean after_attached = gum_interceptor_peak_get_function_patch(
+                    interceptor, request.function_address, listener, after_patch,
+                    after_original, &after_length);
+                GumPeakPcDiagnostics after_diagnostics = {0};
+                gboolean after_context = gum_interceptor_peak_get_pc_diagnostics(
+                    interceptor, request.function_address, listener, &after_diagnostics);
+                gboolean diagnostics_unchanged =
+                    before_context == after_context &&
+                    memcmp(&before_diagnostics, &after_diagnostics,
+                           sizeof(before_diagnostics)) == 0;
+                gboolean metadata_unchanged =
+                    diagnostics_unchanged && after_attached == before_attached &&
+                    after_length == before_length &&
+                    memcmp(before_patch, after_patch, before_length) == 0 &&
+                    memcmp(before_original, after_original, before_length) == 0;
+                calls_before = atomic_load(&strict_helper_listener_calls);
+                if (!peak_detach_controller_threads_are_held())
+                    strict_helper_target();
+                gboolean listener_active =
+                    atomic_load(&strict_helper_listener_calls) == calls_before + 1;
+                gboolean listener_unchanged =
+                    atomic_load(&strict_helper_listener_calls) ==
+                    calls_before + (reattach_oracle ? 0 : 1);
+                size_t after_record_size =
+                    peak_detach_controller_test_physical_record_snapshot(
+                        127, record_after, sizeof(record_after));
+                gboolean record_unchanged =
+                    record_size == after_record_size &&
+                    memcmp(record_before, record_after, record_size) == 0;
                 fprintf(stderr,
-                        "retired-own-cookie new_prepare prepared=%d status=%s "
-                        "unexpected=%d held=%d physical_ready=%d actual_gum_mutation=0\n",
-                        next_prepared, peak_detach_controller_status_string(next_status),
-                        peak_signal_policy_unexpected_delivery_count(),
-                        peak_detach_controller_threads_are_held(),
-                        peak_detach_controller_current_mutation_uses_physical_patch());
+                        "contamination-real-gum bytes_unchanged=%d metadata_unchanged=%d "
+                        "listener_active=%d prologue_length=%u actual_entry_mutation=%d "
+                        "record_unchanged=%d reattach=%d\n",
+                        bytes_unchanged, metadata_unchanged, listener_active,
+                        before_length, !bytes_unchanged, record_unchanged,
+                        reattach_oracle);
+                if (signal_expect_retired_clean && !next_prepared) {
+                    check_true("refused prepare preserves exact attached entry bytes",
+                               bytes_unchanged);
+                    check_true("refused prepare preserves Gum patch metadata",
+                               metadata_unchanged);
+                    check_true("refused prepare preserves actual listener invocation",
+                               listener_unchanged);
+                    check_true("refused prepare preserves controller physical record",
+                               record_unchanged);
+                }
+                fprintf(
+                    stderr,
+                    "retired-own-cookie new_prepare prepared=%d status=%s "
+                    "unexpected=%d held=%d physical_ready=%d actual_entry_mutation=%d\n",
+                    next_prepared, peak_detach_controller_status_string(next_status),
+                    peak_signal_policy_unexpected_delivery_count(),
+                    peak_detach_controller_threads_are_held(),
+                    peak_detach_controller_current_mutation_uses_physical_patch(),
+                    !bytes_unchanged);
                 check_true("retired own cookie requeued during new hold",
                            atomic_load(&signal_retired_replayed) == 1);
                 check_true("retired own cookie new epoch unexpected",
@@ -3809,7 +4114,7 @@ run_signal_backend_blocked_thread(int late_mode)
                     peak_detach_controller_prepare_hook_mutation(&request, &clean_status);
                 fprintf(stderr,
                         "fixed-owned-late next_prepare prepared=%d status=%s "
-                        "unexpected=%d actual_gum_mutation=0\n",
+                        "unexpected=%d explicit_gum_transaction=0\n",
                         clean_prepared,
                         peak_detach_controller_status_string(clean_status),
                         peak_signal_policy_unexpected_delivery_count());
@@ -3841,9 +4146,16 @@ run_signal_backend_blocked_thread(int late_mode)
         }
     }
 
+late_case_cleanup:
+    signal_late_enabled = FALSE;
+    atomic_store(&signal_effect_spin_flag, 0);
     worker_running = 0;
     if (!worker_joined)
         pthread_join(worker, NULL);
+    if (spin_listener != NULL) {
+        gum_interceptor_detach(interceptor, spin_listener);
+        g_object_unref(spin_listener);
+    }
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
     g_object_unref(listener);

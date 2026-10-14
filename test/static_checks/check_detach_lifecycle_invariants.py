@@ -2926,6 +2926,62 @@ def check_signal_backend_strict_invariants(repo_root):
         controller, "peak_detach_controller_test_delay_after_gate_begin"
     )
 
+    contamination_check = extract_function(
+        controller, "peak_detach_controller_signal_check_contamination")
+    forward_begin = extract_function(
+        controller, "peak_detach_controller_signal_begin_forward_effect")
+    signal_evacuate = extract_function(
+        controller, "peak_detach_controller_signal_evacuate")
+    guard = "peak_detach_controller_signal_check_contamination"
+    begin = "peak_detach_controller_signal_begin_forward_effect()"
+    require("peak_signal_policy_unexpected_delivery_count() == 0" in contamination_check
+            and "if (signal_forward_effect_started)" in contamination_check
+            and "peak_detach_controller_mark_helper_fatal" in contamination_check,
+            "contamination after the forward boundary must terminate, not resume")
+    require("signal_forward_effect_started = TRUE" in forward_begin,
+            "forward boundary must precede its test rendezvous and possible effect")
+    for body, classify in (
+            (prepare_mutation, "peak_detach_controller_classify_stopped_threads"),
+            (prepare_batch, "peak_detach_controller_classify_stopped_threads")):
+        require(guard in body and classify in body and
+                body.index(guard) < body.index(classify),
+                "scalar and batch contamination guards must precede planning")
+    # The validation loop contains the same action tests. Select each actual
+    # execution branch, and keep WRITE's assertions out of the later PC branch.
+    write_start = signal_evacuate.rindex(
+        "if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY)")
+    pc_start = signal_evacuate.rindex(
+        "if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_SET_PC)")
+    write_block = signal_evacuate[write_start:pc_start]
+    pc_block = signal_evacuate[pc_start:]
+    for body, effect in ((write_block, "peak_detach_controller_signal_write_memory"),
+                         (pc_block, "atomic_store_explicit(&slot->new_pc"),
+                         (signal_temp_breakpoint, "memcpy(original")):
+        require(guard in body and begin in body and effect in body and
+                body.index(guard) < body.index(begin) < body.index(effect) and
+                body.index(guard, body.index(begin)) < body.index(effect),
+                "every forward write, breakpoint and PC publication needs the boundary")
+    evacuate_backend = extract_function(controller,
+        "peak_detach_controller_evacuate_backend")
+    require("if (!ok && signal_forward_effect_started)" in evacuate_backend and
+            "peak_detach_controller_mark_helper_fatal" in evacuate_backend,
+            "failed signal evacuation after an effect must terminate before caller abort")
+    trap_install = signal_temp_breakpoint[
+        signal_temp_breakpoint.index("if (peak_detach_controller_signal_write_memory"):
+        signal_temp_breakpoint.index("peak_detach_controller_signal_observe_forward_effect")]
+    require("peak_detach_controller_mark_helper_fatal" in trap_install,
+            "unproved trap installation must not return and resume partial bytes")
+    require(guard in signal_release and
+            signal_release.index(guard) < signal_release.index(
+                "peak_filesystem_stat_guard_resume()"),
+            "contamination safety must precede every signal release")
+    require("*scalar_record = scalar_record_before" in prepare_mutation,
+            "recoverable scalar refusal must restore its planning record")
+    require("memcmp(before_bytes, request.function_address, before_length)" in controller_tests
+            and "refused prepare preserves actual listener invocation" in controller_tests
+            and "refused prepare preserves controller physical record" in controller_tests,
+            "contamination tests must measure bytes, listener calls and record state")
+
     require("PEAK_SAFE_DETACH_MODE_STRICT" in controller_mode and
             "getenv" not in controller_mode and
             '"compatibility"' not in controller_mode and

@@ -250,6 +250,19 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
       ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_CONTAMINATE_BATCH=1"
       TIMEOUT 35)
 
+  foreach(variant IN ITEMS reattach reattach-batch)
+    add_test(NAME test_detach_controller_signal_cancellation_${variant}
+      COMMAND test_detach_controller signal-backend-retired-own-cookie)
+    set(extra_env "PEAK_TEST_CONTAMINATE_REATTACH=1")
+    if(variant STREQUAL "reattach-batch")
+      list(APPEND extra_env "PEAK_TEST_CONTAMINATE_BATCH=1")
+    endif()
+    set_tests_properties(test_detach_controller_signal_cancellation_${variant}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;${extra_env}"
+        TIMEOUT 35)
+  endforeach()
+
   add_test(NAME test_detach_controller_signal_event_futex
     COMMAND test_detach_controller signal-event-futex
   )
@@ -301,6 +314,69 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
               ${ARGN}
               -P ${CMAKE_CURRENT_SOURCE_DIR}/assert_fatal_failure.cmake)
   endfunction()
+
+  add_fatal_safe_detach_test(
+    test_detach_controller_signal_cancellation_forward-effect-fatal
+    signal-backend-retired-own-cookie success-zero
+    -DDETACH_BACKEND=signal
+    -DEXPECTED_EXIT_CODE=128
+    -DEXPECTED_FATAL_DETAIL=signal.contamination.after.forward.effect)
+  set_tests_properties(test_detach_controller_signal_cancellation_forward-effect-fatal
+    PROPERTIES
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_FORWARD_CONTAMINATION=1"
+      TIMEOUT 35)
+
+  add_fatal_safe_detach_test(
+    test_detach_controller_signal_cancellation_after-forward-effect-fatal
+    signal-backend-retired-own-cookie success-zero
+    -DDETACH_BACKEND=signal
+    -DEXPECTED_EXIT_CODE=128
+    -DEXPECTED_FATAL_DETAIL=signal.contamination.after.forward.effect)
+  set_tests_properties(test_detach_controller_signal_cancellation_after-forward-effect-fatal
+    PROPERTIES
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_AFTER_FORWARD_CONTAMINATION=1"
+      TIMEOUT 35)
+
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    add_fatal_safe_detach_test(
+      test_detach_controller_signal_cancellation_temp-post-write-error
+      signal-backend-retired-own-cookie success-zero
+      -DDETACH_BACKEND=signal
+      -DEXPECTED_EXIT_CODE=128
+      -DEXPECTED_FATAL_DETAIL=signal.breakpoint.install)
+    set_tests_properties(test_detach_controller_signal_cancellation_temp-post-write-error
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_REAL_SIGNAL_EFFECT=temp-error;PEAK_TEST_TEMP_WRITE_ERROR=1"
+        TIMEOUT 35)
+    add_fatal_safe_detach_test(
+      test_detach_controller_signal_cancellation_multi-temp-failure
+      signal-backend-retired-own-cookie success-zero
+      -DDETACH_BACKEND=signal
+      -DEXPECTED_EXIT_CODE=128
+      -DEXPECTED_FATAL_DETAIL=signal.evacuation.incomplete.after.forward.effect)
+    set_tests_properties(test_detach_controller_signal_cancellation_multi-temp-failure
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_REAL_SIGNAL_EFFECT=temp-multi-fatal;PEAK_TEST_MULTI_TEMP_FAILURE=1"
+        TIMEOUT 35)
+    foreach(effect IN ITEMS pc temp)
+      add_test(NAME test_detach_controller_signal_cancellation_real-${effect}-positive
+        COMMAND test_detach_controller signal-backend-retired-own-cookie)
+      set_tests_properties(test_detach_controller_signal_cancellation_real-${effect}-positive
+        PROPERTIES
+          ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_REAL_SIGNAL_EFFECT=${effect}-positive"
+          TIMEOUT 35)
+      add_fatal_safe_detach_test(
+        test_detach_controller_signal_cancellation_real-${effect}-fatal
+        signal-backend-retired-own-cookie success-zero
+        -DDETACH_BACKEND=signal
+        -DEXPECTED_EXIT_CODE=128
+        -DEXPECTED_FATAL_DETAIL=signal.contamination.after.forward.effect)
+      set_tests_properties(test_detach_controller_signal_cancellation_real-${effect}-fatal
+        PROPERTIES
+          ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_REAL_SIGNAL_EFFECT=${effect}-fatal"
+          TIMEOUT 35)
+    endforeach()
+  endif()
 
   add_test(NAME test_detach_controller_batch_guards
     COMMAND test_detach_controller batch-guards)

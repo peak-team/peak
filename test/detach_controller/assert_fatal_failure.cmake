@@ -38,6 +38,10 @@ if("${result}" STREQUAL "0")
           "expected ${TEST_ARG}/${FAKE_SCENARIO} to fail, but it exited 0\n${output}")
 endif()
 
+if(DEFINED EXPECTED_EXIT_CODE AND NOT "${result}" STREQUAL "${EXPECTED_EXIT_CODE}")
+  message(FATAL_ERROR "expected exit ${EXPECTED_EXIT_CODE}, got ${result}\n${output}")
+endif()
+
 if(NOT output MATCHES "fatal safe-detach (helper failure|finish failure)")
   message(FATAL_ERROR
           "expected fatal safe-detach log for ${TEST_ARG}/${FAKE_SCENARIO}; result=${result}\n${output}")
@@ -51,4 +55,8 @@ endif()
 if(output MATCHES "FAIL:|unknown fake helper scenario|gum_interceptor_attach failed|requires PEAK_HAVE_GUM_PEAK_PC_API")
   message(FATAL_ERROR
           "unexpected harness failure while checking ${TEST_ARG}/${FAKE_SCENARIO}; result=${result}\n${output}")
+endif()
+
+if(DEFINED EXPECTED_EXIT_CODE)
+  message(STATUS "verified expected fatal exit ${result}\n${output}")
 endif()
