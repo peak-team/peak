@@ -1,6 +1,7 @@
 # Keep the runtime utility boundary explicit so new or stale files cannot enter
 # the PEAK library merely by appearing in this directory.
 set(sources_utils_c
+    cancel_scope.c
     env_parser.c
     ../logging.c
     mpi_utils.c

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/cancel_scope.h"
 #include "internal/filesystem_stat_guard.h"
 #include "detach_controller.h"
 #include "detach_helper_protocol.h"
@@ -665,6 +666,7 @@ peak_detach_controller_init_backend_configuration_once(void)
         const char* scope_value = override;
 
         if (scope_value == NULL || scope_value[0] == '\0') {
+            peak_cancel_scope_mark();
             FILE* fp =
                 fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
 
@@ -889,6 +891,7 @@ peak_detach_controller_read_exact(int fd, void* buffer, size_t size)
         if (!peak_detach_controller_wait_fd(fd, POLLIN)) {
             return FALSE;
         }
+        peak_cancel_scope_mark();
         ssize_t n = read(fd, cursor + done, size - done);
         if (n == 0) {
             return FALSE;
@@ -915,12 +918,14 @@ peak_detach_controller_write_exact(int fd, const void* buffer, size_t size)
         if (!peak_detach_controller_wait_fd(fd, POLLOUT)) {
             return FALSE;
         }
+        peak_cancel_scope_mark();
         ssize_t n = send(fd, cursor + done, size - done, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
             if (errno == EPERM || errno == ENOTSOCK) {
+                peak_cancel_scope_mark();
                 n = write(fd, cursor + done, size - done);
                 if (n < 0) {
                     if (errno == EINTR) {
@@ -949,6 +954,7 @@ peak_detach_controller_wait_fd(int fd, short events)
     };
 
     for (;;) {
+        peak_cancel_scope_mark();
         int ret = poll(&pfd, 1, PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS);
 
         if (ret > 0) {
@@ -1271,25 +1277,30 @@ peak_detach_controller_close_helper(void)
         int status = 0;
 
         for (unsigned int attempt = 0; attempt < 50; attempt++) {
+            peak_cancel_scope_mark();
             pid_t waited = waitpid(pid, &status, WNOHANG);
             if (waited == pid || (waited < 0 && errno == ECHILD)) {
                 helper_pid = -1;
                 return;
             }
+            peak_cancel_scope_mark();
             usleep(1000);
         }
 
         kill(pid, SIGTERM);
         for (unsigned int attempt = 0; attempt < 100; attempt++) {
+            peak_cancel_scope_mark();
             pid_t waited = waitpid(pid, &status, WNOHANG);
             if (waited == pid || (waited < 0 && errno == ECHILD)) {
                 helper_pid = -1;
                 return;
             }
+            peak_cancel_scope_mark();
             usleep(1000);
         }
 
         kill(pid, SIGKILL);
+        peak_cancel_scope_mark();
         (void)waitpid(pid, &status, 0);
         helper_pid = -1;
     }
@@ -1427,8 +1438,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         PeakDetachStatus status = peak_detach_controller_errno_status();
         int child_status = 0;
         uintptr_t child_detail = (uintptr_t)errno;
-        pid_t waited = helper_pid > 0 ?
-            waitpid(helper_pid, &child_status, WNOHANG) : -1;
+        pid_t waited = -1;
+        if (helper_pid > 0) {
+            peak_cancel_scope_mark();
+            waited = waitpid(helper_pid, &child_status, WNOHANG);
+        }
         if (waited == helper_pid) {
             child_detail = (uintptr_t)child_status;
         }
@@ -1857,6 +1871,7 @@ peak_detach_controller_signal_tid_blocks_reserved(pid_t tid)
         if (blocked <= 0) {
             return blocked;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
     return 1;
@@ -1878,6 +1893,7 @@ peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid)
 
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/task/%ld/status", (long)tid);
+    peak_cancel_scope_mark();
     FILE* fp = fopen(path, "r");
     if (fp == NULL) {
         return errno == ENOENT || errno == ESRCH ||
@@ -2523,6 +2539,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
             }
             return FALSE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 }
@@ -2630,6 +2647,7 @@ peak_detach_controller_signal_verify_no_unheld_threads(pid_t controller_tid,
             }
             return FALSE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 }
@@ -2719,6 +2737,8 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             }
             return FALSE;
         }
+        /* The original usleep cancellation site is reached in both arms. */
+        peak_cancel_scope_mark();
 #if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
         if (release_started_at <= 0.0 || now <= 0.0 ||
             !peak_detach_controller_signal_wait_release_done(
@@ -2881,6 +2901,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
             }
             return FALSE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -3090,6 +3111,7 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
             }
             return FALSE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 

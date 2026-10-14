@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/cancel_scope.h"
 #include "general_listener.h"
 #include "dlopen_interceptor.h"
 #include "internal/target_resolver.h"
@@ -1150,6 +1151,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     accounting_ratio = accounting_wall_s / trace_elapsed_time;
 
     pthread_mutex_lock(&detach_trace_mutex);
+    peak_cancel_scope_mark();
     fp = fopen(path, "a");
     if (fp != NULL) {
         fprintf(fp,
@@ -1727,6 +1729,7 @@ static int pthread_pause_wait_for_ack(int session_id, const struct timespec* dea
 
     for (;;) {
         int ack_session_id = -1;
+        peak_cancel_scope_mark();
         ssize_t nread = read(pthread_pause_ack_pipe[0],
                              &ack_session_id,
                              sizeof(ack_session_id));
@@ -1752,6 +1755,7 @@ static int pthread_pause_wait_for_ack(int session_id, const struct timespec* dea
             pfd.fd = pthread_pause_ack_pipe[0];
             pfd.events = POLLIN;
             pfd.revents = 0;
+            peak_cancel_scope_mark();
             poll_ret = poll(&pfd, 1, timeout_ms);
             if (poll_ret > 0) {
                 continue;
@@ -1921,6 +1925,7 @@ static int pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session
         if (errno != EAGAIN) {
             return -1;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -1965,6 +1970,7 @@ int pthread_unpause(pthread_t thread, int session_id)
         if (errno != EAGAIN) {
             return -1;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -4211,6 +4217,7 @@ static gboolean peak_general_controller_flush_teardown(void)
         if (gum_interceptor_flush(interceptor)) {
             return TRUE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -4706,7 +4713,7 @@ peak_general_listener_restore_cancel_type(void* data)
 
 /* Entry contract: cancellation is currently disabled; state is its saved caller state. */
 static void
-peak_general_listener_restore_cancel_state(int state)
+peak_general_listener_restore_cancel_state(int state, gboolean check_cancel)
 {
     if (state == PTHREAD_CANCEL_DISABLE) {
         return;
@@ -4717,7 +4724,9 @@ peak_general_listener_restore_cancel_state(int state)
     (void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &original_type);
     pthread_cleanup_push(peak_general_listener_restore_cancel_type, &original_type);
     (void)pthread_setcancelstate(state, NULL);
-    pthread_testcancel();
+    if (check_cancel || original_type == PTHREAD_CANCEL_ASYNCHRONOUS) {
+        pthread_testcancel();
+    }
     (void)pthread_setcanceltype(original_type, NULL);
     pthread_cleanup_pop(0);
 }
@@ -4771,7 +4780,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
     gum_interceptor_ignore_current_thread(cleanup.interceptor);
     cleanup.gum_ignored = TRUE;
     pthread_cleanup_push(peak_general_listener_drain_cleanup, &cleanup);
-    peak_general_listener_restore_cancel_state(caller_cancel_state);
+    peak_general_listener_restore_cancel_state(caller_cancel_state, FALSE);
 
     for (;;) {
         gboolean pending;
@@ -4779,6 +4788,8 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
         /* Reclaim also owns PEAK locks; protect it before taking the controller
          * lock and until mutation release and state publication have finished. */
         (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iteration_cancel_state);
+        PeakCancelScope cp_scope;
+        peak_cancel_scope_enter(&cp_scope);
         (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
@@ -4788,10 +4799,8 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
                                                                cleanup.pause_status);
         pending = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
-        /* This is an explicit new safe cancellation boundary, even when the
-         * iteration needed no ACK wait. The caller's type is restored before
-         * normal return or outer cancellation cleanup. */
-        peak_general_listener_restore_cancel_state(iteration_cancel_state);
+        gboolean old_cp_seen = peak_cancel_scope_leave(&cp_scope);
+        peak_general_listener_restore_cancel_state(iteration_cancel_state, old_cp_seen);
 
         if (!pending) {
             drained = TRUE;
@@ -4807,7 +4816,7 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
 
     (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cleanup_cancel_state);
     pthread_cleanup_pop(1);
-    peak_general_listener_restore_cancel_state(cleanup_cancel_state);
+    peak_general_listener_restore_cancel_state(cleanup_cancel_state, FALSE);
     return drained;
 }
 

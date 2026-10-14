@@ -1,3 +1,4 @@
+#include "internal/cancel_scope.h"
 #include "detach_controller.h"
 #include "internal/gum_peak_darwin_patch_api.h"
 
@@ -889,6 +890,7 @@ peak_detach_controller_wait_for_mutation_window(void)
                                       memory_order_acq_rel);
             published = TRUE;
         }
+        peak_cancel_scope_mark();
         (void)usleep(PEAK_DARWIN_GATE_WAIT_US);
     }
     if (published) {
