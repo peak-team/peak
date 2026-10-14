@@ -234,6 +234,22 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND TARGET peak_detach_helper)
       TIMEOUT 15
   )
 
+  foreach(case IN ITEMS late-own-delivery retired-own-cookie handler-before-publish owned-target-exit)
+    add_test(NAME test_detach_controller_signal_cancellation_${case}
+      COMMAND test_detach_controller signal-backend-${case})
+    set_tests_properties(test_detach_controller_signal_cancellation_${case}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_EXPECT_RETIRED_CLEAN=1"
+        TIMEOUT 35)
+  endforeach()
+
+  add_test(NAME test_detach_controller_signal_cancellation_retired-own-cookie-batch
+    COMMAND test_detach_controller signal-backend-retired-own-cookie)
+  set_tests_properties(test_detach_controller_signal_cancellation_retired-own-cookie-batch
+    PROPERTIES
+      ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_EXPECT_RETIRED_CLEAN=1;PEAK_TEST_CONTAMINATE_BATCH=1"
+      TIMEOUT 35)
+
   add_test(NAME test_detach_controller_signal_event_futex
     COMMAND test_detach_controller signal-event-futex
   )

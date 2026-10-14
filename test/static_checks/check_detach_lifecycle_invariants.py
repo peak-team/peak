@@ -2852,6 +2852,18 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_clear_slots = extract_function(
         controller, "peak_detach_controller_signal_clear_slots"
     )
+    signal_reclaim = extract_function(
+        controller, "peak_detach_controller_signal_reclaim"
+    )
+    signal_claim_owned = extract_function(
+        controller, "peak_detach_controller_signal_claim_owned"
+    )
+    signal_queue_owned = extract_function(
+        controller, "peak_detach_controller_signal_queue_owned"
+    )
+    signal_test_wake = extract_function(
+        controller, "peak_detach_controller_test_wake_signal_waiters"
+    )
     signal_temp_breakpoint = extract_function(
         controller, "peak_detach_controller_signal_temp_breakpoint_out_of_range"
     )
@@ -3049,15 +3061,50 @@ def check_signal_backend_strict_invariants(repo_root):
     require(signal_release.find("atomic_store_explicit(&signal_release_epoch, epoch") <
             signal_release.find("peak_detach_controller_signal_wake_release_waiters"),
             "release publication must wake signal waiters")
-    require(signal_clear_slots.find("atomic_store_explicit(&signal_release_epoch, 0") <
-            signal_clear_slots.find("peak_detach_controller_signal_wake_release_waiters"),
-            "release reset must wake signal waiters")
+    require("peak_detach_controller_signal_reclaim()" in signal_clear_slots,
+            "slot-clear wrapper must delegate to guarded reclaim")
+    reset_tokens = (
+        "signal_owned_pending",
+        "PEAK_SIGNAL_ADMISSION_CLOSED",
+        "peak_detach_controller_signal_readers_quiescent()",
+        "memset(signal_slots",
+        "atomic_store_explicit(&signal_release_epoch, 0",
+        "peak_detach_controller_signal_wake_release_waiters()",
+        "peak_signal_policy_release_delivery_lease()",
+        "atomic_store_explicit(&signal_handler_admission, 0",
+    )
+    reset_positions = [signal_reclaim.find(token) for token in reset_tokens]
+    require(all(position >= 0 for position in reset_positions) and
+            reset_positions == sorted(reset_positions),
+            "reclaim must prove pending-free closed/quiescent admission before reset, wake, acknowledged lease release and reopening")
+    require(signal_reclaim.count("signal_owned_pending") >= 2 and
+            "if (!peak_signal_policy_release_delivery_lease())" in signal_reclaim,
+            "reclaim must recheck pending ownership after quiescence and retain admission if lease release is unproved")
+    retire_tokens = (
+        "atomic_store_explicit(&signal_slots[i].retired, 1",
+        "atomic_store_explicit(&signal_hold_epoch, 0",
+        "peak_detach_controller_signal_wake_release_waiters()",
+        "peak_detach_controller_signal_readers_quiescent()",
+    )
+    retire_start = signal_release.find(retire_tokens[0])
+    retirement = signal_release[retire_start:] if retire_start >= 0 else ""
+    retire_positions = [retirement.find(token) for token in retire_tokens]
+    require(all(position >= 0 for position in retire_positions) and
+            retire_positions == sorted(retire_positions),
+            "retirement must publish canceled ownership and hold-zero, wake waiters, then prove handler quiescence")
     require(signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
             signal_temp_breakpoint.find("peak_detach_controller_signal_wake_release_waiters"),
             "evacuation publication must wake signal waiters")
-    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 4 and
-            "peak_detach_controller_test_wake_signal_waiters" in controller,
-            "production signal futex wake-all must occur only after release, reset, and evacuation publications")
+    wake_call = "peak_detach_controller_signal_wake_release_waiters()"
+    allowed_wakes = (
+        signal_release.count(wake_call),
+        signal_reclaim.count(wake_call),
+        signal_temp_breakpoint.count(wake_call),
+        signal_test_wake.count(wake_call),
+    )
+    require(allowed_wakes == (2, 1, 1, 1) and
+            controller.count(wake_call) == sum(allowed_wakes),
+            "signal wake sites must be exactly release publication, retirement, guarded reset, evacuation publication and the explicit test hook")
     require(signal_wait_for_release.find("rewrite_epoch") <
             signal_wait_for_release.find("done_epoch"),
             "signal PC rewrite must remain ordered before done publication")
@@ -3080,11 +3127,22 @@ def check_signal_backend_strict_invariants(repo_root):
     require("pthread_create interception is not installed" in controller,
             "signal backend must fail closed when pthread_create gate is unavailable")
     require("peak_signal_policy_choose_reserved_signal" in controller and
-            "peak_signal_policy_cookie_matches_async" in signal_handler and
-            "peak_signal_policy_send_thread_signal" in signal_stop and
+            "peak_detach_controller_signal_claim_owned" in signal_handler and
+            "peak_detach_controller_signal_reader_enter()" in signal_handler and
+            signal_handler.find("peak_detach_controller_signal_reader_enter()") <
+            signal_handler.find("peak_detach_controller_signal_claim_owned") and
+            "peak_signal_policy_cookie_matches_async" in signal_claim_owned and
+            signal_claim_owned.find("peak_signal_policy_cookie_matches_async") <
+            signal_claim_owned.find("atomic_compare_exchange_weak_explicit") and
+            "peak_detach_controller_signal_queue_owned" in signal_stop and
+            "peak_signal_policy_send_thread_signal" in signal_queue_owned and
+            signal_queue_owned.find("PEAK_OWN_INTENT") <
+            signal_queue_owned.find("peak_signal_policy_send_thread_signal") and
+            controller.count("peak_signal_policy_send_thread_signal(") == 1 and
             "SYS_rt_tgsigqueueinfo" in signal_policy,
-            "signal backend must reserve a signal and authenticate stop delivery with rt_tgsigqueueinfo cookies")
+            "signal delivery must acquire a reader before ownership lookup, authenticate the exact queued cookie before claiming, and publish owned intent before the sole queue syscall path")
     require("peak_signal_policy_cookie_matches(" not in signal_handler and
+            "peak_signal_policy_cookie_matches(" not in signal_claim_owned and
             "peak_signal_policy_cookie_for_preinitialized" in signal_policy and
             "base == 0" in signal_policy,
             "signal handler cookie authentication must use only preinitialized async-safe state")

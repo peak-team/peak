@@ -9,15 +9,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -438,6 +440,122 @@ run_strict(void)
 #ifdef PEAK_HAVE_GUM_PEAK_PC_API
 static volatile int worker_running = 0;
 static volatile int signal_blocked_worker_ready = 0;
+static atomic_int signal_late_phase;
+static atomic_int signal_late_tid;
+static atomic_int signal_late_pending;
+static gboolean signal_late_enabled;
+static gboolean signal_expect_retired_clean;
+static int signal_late_mode;
+static siginfo_t signal_retired_info;
+static atomic_int signal_retired_replayed;
+static atomic_int signal_first_epoch;
+static atomic_int signal_pause_epoch, signal_pause_active, signal_pause_arrived,
+    signal_pause_done, signal_pause_hold;
+static atomic_uintptr_t signal_pause_slot;
+static atomic_int signal_pause_once;
+void
+peak_test_signal_handler_before_publish(int epoch, void *slot)
+{
+    if (signal_late_mode != 3 || !atomic_exchange(&signal_pause_once, 0))
+        return;
+    atomic_store(&signal_pause_epoch, epoch);
+    atomic_store(&signal_pause_slot, (uintptr_t)slot);
+    atomic_store(&signal_late_phase, 2);
+    while (atomic_load(&signal_late_phase) != 5) {
+    }
+}
+void
+peak_test_signal_handler_after_wait(int epoch, int active, int arrived, int done,
+                                    int held)
+{
+    if (signal_late_mode != 3 || epoch != atomic_load(&signal_pause_epoch))
+        return;
+    atomic_store(&signal_pause_epoch, epoch);
+    atomic_store(&signal_pause_active, active);
+    atomic_store(&signal_pause_arrived, arrived);
+    atomic_store(&signal_pause_done, done);
+    atomic_store(&signal_pause_hold, held);
+    atomic_store(&signal_late_phase, 6);
+}
+
+static double
+signal_late_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+void
+peak_test_signal_retirement_entered(void)
+{
+    if (signal_expect_retired_clean && signal_late_mode == 3 &&
+        atomic_load(&signal_late_phase) == 2)
+        atomic_store(&signal_late_phase, 5);
+}
+void
+peak_test_after_signal_mask_preflight(int epoch)
+{
+    if (!signal_late_enabled || signal_late_mode == 3)
+        return;
+    if (signal_late_mode == 2 && atomic_load(&signal_late_phase) == 6) {
+        int before = peak_signal_policy_unexpected_delivery_count();
+        int rc = peak_signal_policy_send_thread_signal(
+            atomic_load(&signal_late_tid),
+            peak_detach_controller_test_signal_backend_signum(),
+            (unsigned long)(uintptr_t)signal_retired_info.si_value.sival_ptr);
+        fprintf(stderr,
+                "retired-own-cookie replay rc=%d source_pid=%d uid=%d si_code=%d "
+                "cookie=0x%lx new_window=1\n",
+                rc, signal_retired_info.si_pid, signal_retired_info.si_uid,
+                signal_retired_info.si_code,
+                (unsigned long)(uintptr_t)signal_retired_info.si_value.sival_ptr);
+        fprintf(stderr,
+                "retired-own-cookie first_epoch=%d new_epoch=%d first_cookie_matches=%d "
+                "signum=%d\n",
+                atomic_load(&signal_first_epoch), epoch,
+                peak_signal_policy_cookie_matches_async(&signal_retired_info,
+                                                        atomic_load(&signal_first_epoch),
+                                                        atomic_load(&signal_late_tid)),
+                peak_detach_controller_test_signal_backend_signum());
+        atomic_store(&signal_retired_replayed, rc == 0);
+        if (rc == 0)
+            while (peak_signal_policy_unexpected_delivery_count() == before)
+                usleep(1000);
+        return;
+    }
+    atomic_store(&signal_first_epoch, epoch);
+    atomic_store(&signal_late_phase, 1);
+    while (atomic_load(&signal_late_phase) != 2)
+        usleep(1000);
+    fprintf(stderr,
+            "late-own-signal preflight-complete worker_tid=%d blocked-after-preflight=1 "
+            "signum=%d\n",
+            atomic_load(&signal_late_tid),
+            peak_detach_controller_test_signal_backend_signum());
+}
+void
+peak_test_after_signal_queue(int epoch)
+{
+    if (!signal_late_enabled ||
+        (signal_late_mode == 2 && atomic_load(&signal_late_phase) == 6))
+        return;
+    if (signal_late_mode == 3) {
+        while (atomic_load(&signal_late_phase) != 2)
+            usleep(1000);
+        fprintf(stderr, "handler-before-publish paused epoch=%d slot=0x%lx\n",
+                atomic_load(&signal_pause_epoch),
+                (unsigned long)atomic_load(&signal_pause_slot));
+        return;
+    }
+    atomic_store(&signal_late_phase, 3);
+    while (atomic_load(&signal_late_phase) != 4)
+        usleep(1000);
+    fprintf(stderr,
+            "late-own-signal normal-own-cookie-queue-complete pending=%d unexpected=%d\n",
+            atomic_load(&signal_late_pending),
+            peak_signal_policy_unexpected_delivery_count());
+}
+
 static pthread_mutex_t stale_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stale_worker_cond = PTHREAD_COND_INITIALIZER;
 static int stale_worker_parked = 0;
@@ -534,13 +652,65 @@ static void*
 strict_helper_signal_blocked_worker(void* arg)
 {
     (void)arg;
+    if (!signal_late_enabled) {
+        signal_blocked_worker_ready =
+            peak_signal_policy_test_block_reserved_for_current_thread() == 0;
+        worker_running = 1;
+        while (worker_running)
+            strict_helper_target();
+        return NULL;
+    }
+    atomic_store(&signal_late_tid, (int)syscall(SYS_gettid));
+    worker_running = 1;
+    if (signal_late_mode == 3) {
+        while (worker_running) {
+            usleep(1000);
+            if (atomic_load(&signal_late_phase) == 6)
+                atomic_store(&signal_late_phase, 7);
+        }
+        return NULL;
+    }
+    while (atomic_load(&signal_late_phase) != 1)
+        usleep(1000);
     signal_blocked_worker_ready =
         peak_signal_policy_test_block_reserved_for_current_thread() == 0;
-
-    worker_running = 1;
-    while (worker_running) {
-        strict_helper_target();
+    atomic_store(&signal_late_phase, 2);
+    while (atomic_load(&signal_late_phase) != 3)
+        usleep(1000);
+    sigset_t pending;
+    sigpending(&pending);
+    atomic_store(
+        &signal_late_pending,
+        sigismember(&pending, peak_detach_controller_test_signal_backend_signum()));
+    atomic_store(&signal_late_phase, 4);
+    while (atomic_load(&signal_late_phase) != 5)
+        usleep(1000);
+    if (signal_late_mode == 2) {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, peak_detach_controller_test_signal_backend_signum());
+        struct timespec timeout = {.tv_sec = 0, .tv_nsec = 0};
+        peak_signal_policy_enter_internal();
+        int got = syscall(SYS_rt_sigtimedwait, &set, &signal_retired_info, &timeout,
+                          sizeof(uint64_t));
+        peak_signal_policy_leave_internal();
+        fprintf(stderr,
+                "retired-own-cookie captured signum=%d source_pid=%d uid=%d si_code=%d "
+                "cookie=0x%lx\n",
+                got, signal_retired_info.si_pid, signal_retired_info.si_uid,
+                signal_retired_info.si_code,
+                (unsigned long)(uintptr_t)signal_retired_info.si_value.sival_ptr);
     }
+    if (signal_late_mode == 4) {
+        atomic_store(&signal_late_phase, 6);
+        return NULL; /* Linux discards this exiting thread's pending signals. */
+    }
+    int rc = peak_signal_policy_unblock_reserved_for_current_thread();
+    fprintf(stderr, "late-own-signal worker-unblock rc=%d unexpected=%d\n", rc,
+            peak_signal_policy_unexpected_delivery_count());
+    atomic_store(&signal_late_phase, 6);
+    while (worker_running)
+        usleep(1000);
     return NULL;
 }
 
@@ -3272,20 +3442,27 @@ run_fake_helper_reattach_patch_entry(void)
 #endif
 }
 
-
 static int
-run_signal_backend_blocked_thread(void)
+run_signal_backend_blocked_thread(int late_mode)
 {
 #ifndef PEAK_HAVE_GUM_PEAK_PC_API
     fprintf(stderr, "signal-backend-blocked-thread requires PEAK_HAVE_GUM_PEAK_PC_API\n");
     return 77;
 #else
     pthread_t worker;
+    gboolean worker_joined = FALSE;
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
     GumAttachReturn attach_status;
 
     worker_running = 0;
+    gboolean late_delivery = late_mode != 0;
+    signal_late_mode = late_mode;
+    signal_expect_retired_clean = g_getenv("PEAK_TEST_EXPECT_RETIRED_CLEAN") != NULL;
+    atomic_store(&signal_pause_once, 1);
+    signal_late_enabled = late_delivery;
+    atomic_store(&signal_retired_replayed, 0);
+    atomic_store(&signal_late_phase, 0);
     gum_init_embedded();
     interceptor = gum_interceptor_obtain();
     listener = gum_make_call_listener(strict_helper_on_enter, NULL, NULL, NULL);
@@ -3317,8 +3494,9 @@ run_signal_backend_blocked_thread(void)
     while (!worker_running) {
         usleep(1000);
     }
-    check_true("signal backend blocked worker actually blocked reserved signal",
-               signal_blocked_worker_ready == 1);
+    if (!late_delivery)
+        check_true("signal backend blocked worker actually blocked reserved signal",
+                   signal_blocked_worker_ready == 1);
 
     PeakDetachRequest request = {
         .hook_id = 127,
@@ -3329,23 +3507,343 @@ run_signal_backend_blocked_thread(void)
         .operation = PEAK_DETACH_OPERATION_DETACH
     };
 
-    check_prepare("signal backend blocked thread fast fail",
-                  &request,
-                  FALSE,
-                  PEAK_DETACH_STATUS_UNSUPPORTED);
-    const PeakDetachFailureDetail* detail =
-        peak_detach_controller_last_failure_detail();
-    check_true("signal backend blocked thread reports reserved-signal reason",
-               detail != NULL &&
-               detail->reason != NULL &&
-               strcmp(detail->reason, "signal-reserved-blocked") == 0);
-    check_true("signal backend blocked thread leaves no held mutation",
-               peak_detach_controller_threads_are_held() == FALSE);
-    check_true("signal backend blocked thread leaves no physical mutation",
-               peak_detach_controller_current_mutation_uses_physical_patch() == FALSE);
+    if (late_delivery) {
+        /* Reuse the fixture canonical Gum target and reattach preparation path. */
+        request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    }
+
+    if (!late_delivery) {
+        check_prepare("signal backend blocked thread fast fail", &request, FALSE,
+                      PEAK_DETACH_STATUS_UNSUPPORTED);
+        const PeakDetachFailureDetail *detail =
+            peak_detach_controller_last_failure_detail();
+        check_true("signal backend blocked thread reports reserved-signal reason",
+                   detail != NULL && detail->reason != NULL &&
+                       strcmp(detail->reason, "signal-reserved-blocked") == 0);
+        check_true("signal backend blocked thread leaves no held mutation",
+                   peak_detach_controller_threads_are_held() == FALSE);
+        check_true("signal backend blocked thread leaves no physical mutation",
+                   peak_detach_controller_current_mutation_uses_physical_patch() ==
+                       FALSE);
+
+    } else {
+        PeakDetachAccountingSnapshot before, after;
+        peak_detach_controller_accounting_snapshot(&before);
+        int initial_unexpected = peak_signal_policy_unexpected_delivery_count();
+        double begin = signal_late_now();
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+        gboolean prepared =
+            peak_detach_controller_prepare_hook_mutation(&request, &status);
+        double elapsed = signal_late_now() - begin;
+        peak_detach_controller_accounting_snapshot(&after);
+        fprintf(
+            stderr,
+            "late-own-signal timeout prepared=%d status=%s elapsed=%.9f blocked=%d "
+            "pending=%d held=%d physical=%d failed_delta=%llu wall_delta_ns=%llu "
+            "unexpected_before_unblock=%d\n",
+            prepared, peak_detach_controller_status_string(status), elapsed,
+            signal_blocked_worker_ready, atomic_load(&signal_late_pending),
+            peak_detach_controller_threads_are_held(),
+            peak_detach_controller_current_mutation_uses_physical_patch(),
+            (unsigned long long)(after.failed_stop_window_count -
+                                 before.failed_stop_window_count),
+            (unsigned long long)(after.stop_window_wall_ns - before.stop_window_wall_ns),
+            peak_signal_policy_unexpected_delivery_count());
+        if (late_mode != 3)
+            check_true("late own signal pending before timeout",
+                       atomic_load(&signal_late_pending) == 1);
+        check_true("late own signal prepare times out without mutation",
+                   !prepared && status == PEAK_DETACH_STATUS_TIMEOUT &&
+                       !peak_detach_controller_threads_are_held() &&
+                       !peak_detach_controller_current_mutation_uses_physical_patch());
+        check_true("late own signal failure accounting",
+                   after.failed_stop_window_count == before.failed_stop_window_count + 1);
+        check_true("late own signal not unexpected until delivered",
+                   peak_signal_policy_unexpected_delivery_count() == initial_unexpected);
+        check_true("late timeout thread creation gate epoch is zero",
+                   peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+        fprintf(stderr, "late-own-signal cleanup gate_epoch=%d\n",
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        check_cleanup_query();
+        if (late_mode == 1 && signal_expect_retired_clean) {
+            PeakDetachRequest pending_request = request;
+            pending_request.operation = PEAK_DETACH_OPERATION_DETACH;
+            PeakDetachStatus pending_status = PEAK_DETACH_STATUS_ERROR;
+            gboolean pending_prepared = peak_detach_controller_prepare_hook_mutation(
+                &pending_request, &pending_status);
+            const PeakDetachFailureDetail *pending_detail =
+                peak_detach_controller_last_failure_detail();
+            fprintf(stderr,
+                    "owned-retirement pending_prepare prepared=%d status=%s reason=%s "
+                    "held=%d physical=%d\n",
+                    pending_prepared,
+                    peak_detach_controller_status_string(pending_status),
+                    pending_detail->reason, peak_detach_controller_threads_are_held(),
+                    peak_detach_controller_current_mutation_uses_physical_patch());
+            check_true(
+                "unconsumed owned retirement temporarily blocks new mutation",
+                !pending_prepared && pending_status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                    strcmp(pending_detail->reason, "signal-retired-owned-pending") == 0 &&
+                    !peak_detach_controller_threads_are_held() &&
+                    !peak_detach_controller_current_mutation_uses_physical_patch());
+            PeakDetachStatus shutdown_status = PEAK_DETACH_STATUS_ERROR;
+            gboolean shutdown_ready =
+                peak_detach_controller_shutdown_helper(&shutdown_status);
+            int reserved_before = peak_signal_policy_reserved_signal();
+            peak_signal_policy_clear_reserved_signal();
+            int reserved_after = peak_signal_policy_reserved_signal();
+            fprintf(stderr,
+                    "owned-retirement pending_shutdown ready=%d status=%s "
+                    "reserved_before=%d reserved_after_clear=%d\n",
+                    shutdown_ready, peak_detach_controller_status_string(shutdown_status),
+                    reserved_before, reserved_after);
+            check_true("pending ownership prevents support shutdown",
+                       !shutdown_ready &&
+                           shutdown_status == PEAK_DETACH_STATUS_UNSUPPORTED);
+            check_true("pending ownership pins signal reservation",
+                       reserved_before > 0 && reserved_before == reserved_after);
+        }
+        if (late_mode != 3 && !atomic_load(&signal_late_pending)) {
+            /* Setup failure: unblock fixture worker from the first rendezvous and join.
+             */
+            atomic_store(&signal_late_phase, 1);
+            while (atomic_load(&signal_late_phase) != 2)
+                usleep(1000);
+            atomic_store(&signal_late_phase, 3);
+            while (atomic_load(&signal_late_phase) != 4)
+                usleep(1000);
+        }
+        if (late_mode == 3 && signal_expect_retired_clean) {
+            check_true("retirement acknowledged canceled handler before return",
+                       atomic_load(&signal_late_phase) >= 6);
+            fprintf(stderr,
+                    "fixed-handler-retirement old_epoch=%d active=%d arrived=%d done=%d "
+                    "hold=%d unexpected=%d\n",
+                    atomic_load(&signal_pause_epoch), atomic_load(&signal_pause_active),
+                    atomic_load(&signal_pause_arrived), atomic_load(&signal_pause_done),
+                    atomic_load(&signal_pause_hold),
+                    peak_signal_policy_unexpected_delivery_count());
+            check_true("canceled old handler never publishes arrival",
+                       atomic_load(&signal_pause_arrived) == 0 &&
+                           atomic_load(&signal_pause_done) == 0 &&
+                           atomic_load(&signal_pause_hold) == 0);
+            while (atomic_load(&signal_late_phase) < 7)
+                usleep(1000);
+            signal_late_enabled = FALSE;
+            request.operation = PEAK_DETACH_OPERATION_DETACH;
+            PeakDetachStatus clean_status = PEAK_DETACH_STATUS_ERROR;
+            gboolean clean_prepared =
+                peak_detach_controller_prepare_hook_mutation(&request, &clean_status);
+            fprintf(stderr,
+                    "fixed-handler-retirement next_prepare prepared=%d status=%s "
+                    "actual_gum_mutation=0\n",
+                    clean_prepared, peak_detach_controller_status_string(clean_status));
+            check_true(
+                "next generation safely prepares after canceled handler quiescence",
+                clean_prepared);
+            if (clean_prepared)
+                check_finish("fixed handler next generation cleanup", &request,
+                             PEAK_DETACH_STATUS_SAFE);
+            check_true("fixed handler final gate open",
+                       peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+            fprintf(stderr, "fixed-handler-retirement-check-complete failures=%d\n",
+                    failures);
+        } else if (late_mode == 3) {
+            check_true("handler entered and paused before arrived publish",
+                       atomic_load(&signal_late_phase) == 2);
+            request.operation = PEAK_DETACH_OPERATION_DETACH;
+            PeakDetachStatus reuse_status = PEAK_DETACH_STATUS_ERROR;
+            gboolean reuse_prepared =
+                peak_detach_controller_prepare_hook_mutation(&request, &reuse_status);
+            const PeakDetachFailureDetail *reuse_detail =
+                peak_detach_controller_last_failure_detail();
+            fprintf(stderr,
+                    "handler-before-publish new_probe prepared=%d status=%s reason=%s "
+                    "held=%d physical=%d\n",
+                    reuse_prepared, peak_detach_controller_status_string(reuse_status),
+                    reuse_detail->reason, peak_detach_controller_threads_are_held(),
+                    peak_detach_controller_current_mutation_uses_physical_patch());
+            check_true("automatic handler signal mask prevents concurrent new window",
+                       !reuse_prepared &&
+                           reuse_status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                           strcmp(reuse_detail->reason, "signal-reserved-blocked") == 0);
+            atomic_store(&signal_late_phase, 5);
+            while (atomic_load(&signal_late_phase) < 6)
+                usleep(1000);
+            fprintf(stderr,
+                    "handler-before-publish resumed old_epoch=%d active=%d arrived=%d "
+                    "done=%d hold=%d unexpected=%d\n",
+                    atomic_load(&signal_pause_epoch), atomic_load(&signal_pause_active),
+                    atomic_load(&signal_pause_arrived), atomic_load(&signal_pause_done),
+                    atomic_load(&signal_pause_hold),
+                    peak_signal_policy_unexpected_delivery_count());
+            check_true("canceled handler published old epoch into cleared slot",
+                       atomic_load(&signal_pause_active) == 0 &&
+                           atomic_load(&signal_pause_arrived) ==
+                               atomic_load(&signal_pause_epoch) &&
+                           atomic_load(&signal_pause_done) ==
+                               atomic_load(&signal_pause_epoch) &&
+                           atomic_load(&signal_pause_hold) == 0);
+            check_true("authenticated prior handler does not count unexpected",
+                       peak_signal_policy_unexpected_delivery_count() ==
+                           initial_unexpected);
+            while (atomic_load(&signal_late_phase) < 7)
+                usleep(1000);
+            signal_late_enabled = FALSE;
+            PeakDetachStatus recovered = PEAK_DETACH_STATUS_ERROR;
+            gboolean prepared_after =
+                peak_detach_controller_prepare_hook_mutation(&request, &recovered);
+            fprintf(stderr,
+                    "handler-before-publish after_return prepared=%d status=%s "
+                    "actual_gum_mutation=0\n",
+                    prepared_after, peak_detach_controller_status_string(recovered));
+            if (prepared_after)
+                check_finish("handler after-return cleanup", &request,
+                             PEAK_DETACH_STATUS_SAFE);
+            check_true("handler cancellation final thread creation gate zero",
+                       peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+            fprintf(stderr, "handler-before-publish-check-complete failures=%d\n",
+                    failures);
+        } else {
+            atomic_store(&signal_late_phase, 5);
+            while (atomic_load(&signal_late_phase) != 6)
+                usleep(1000);
+            if (late_mode == 4) {
+                pthread_join(worker, NULL);
+                worker_joined = TRUE;
+                errno = 0;
+                long absent_rc =
+                    syscall(SYS_tgkill, getpid(), atomic_load(&signal_late_tid), 0);
+                int absent_errno = errno;
+                fprintf(
+                    stderr,
+                    "owned-target-exit absence_probe rc=%ld errno=%d expected_ESRCH=%d\n",
+                    absent_rc, absent_errno, ESRCH);
+                check_true("joined owned target is positively absent",
+                           absent_rc == -1 && absent_errno == ESRCH);
+                fprintf(
+                    stderr,
+                    "owned-target-exit tid=%d joined=1 pending-discarded-by-Linux=1\n",
+                    atomic_load(&signal_late_tid));
+            }
+            if (late_mode == 1 || late_mode == 4) {
+                check_true(
+                    "late own queued signal classified according to retirement contract",
+                    peak_signal_policy_unexpected_delivery_count() ==
+                        initial_unexpected + (signal_expect_retired_clean ? 0 : 1));
+            } else {
+                check_true("captured retired cookie does not deliver yet",
+                           peak_signal_policy_unexpected_delivery_count() ==
+                               initial_unexpected);
+                if (signal_expect_retired_clean) {
+                    int drain_rc = peak_signal_policy_send_thread_signal(
+                        atomic_load(&signal_late_tid),
+                        peak_detach_controller_test_signal_backend_signum(),
+                        (unsigned long)(uintptr_t)signal_retired_info.si_value.sival_ptr);
+                    fprintf(stderr,
+                            "fixed-retired-cookie synthetic-retired-drain rc=%d "
+                            "(original kernel message consumed by fixture)\n",
+                            drain_rc);
+                    check_true("synthetic retired owned record drain queued",
+                               drain_rc == 0);
+                    usleep(10000);
+                    check_true("synthetic owned retirement does not poison counter",
+                               peak_signal_policy_unexpected_delivery_count() ==
+                                   initial_unexpected);
+                }
+                request.operation = PEAK_DETACH_OPERATION_DETACH;
+                PeakDetachStatus next_status = PEAK_DETACH_STATUS_ERROR;
+                gboolean next_prepared;
+                if (g_getenv("PEAK_TEST_CONTAMINATE_BATCH") != NULL) {
+                    PeakDetachBatchResult batch_result = {0};
+                    size_t batch_prepared = SIZE_MAX;
+                    next_prepared = peak_detach_controller_prepare_hook_mutation_batch(
+                        &request, 1, &batch_result, &batch_prepared, &next_status);
+                    fprintf(stderr,
+                            "retired-own-cookie batch prepared=%d status=%s count=%zu "
+                            "result_prepared=%d result_physical=%d gate=%d\n",
+                            next_prepared,
+                            peak_detach_controller_status_string(next_status),
+                            batch_prepared, batch_result.prepared,
+                            batch_result.uses_physical_patch,
+                            peak_detach_controller_test_thread_creation_gate_epoch());
+                    check_true(
+                        "contaminated batch denies all mutation permission",
+                        !next_prepared && next_status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                            batch_prepared == 0 && !batch_result.prepared &&
+                            !batch_result.uses_physical_patch &&
+                            peak_detach_controller_test_thread_creation_gate_epoch() ==
+                                0);
+                } else {
+                    next_prepared = peak_detach_controller_prepare_hook_mutation(
+                        &request, &next_status);
+                }
+                fprintf(stderr,
+                        "retired-own-cookie new_prepare prepared=%d status=%s "
+                        "unexpected=%d held=%d physical_ready=%d actual_gum_mutation=0\n",
+                        next_prepared, peak_detach_controller_status_string(next_status),
+                        peak_signal_policy_unexpected_delivery_count(),
+                        peak_detach_controller_threads_are_held(),
+                        peak_detach_controller_current_mutation_uses_physical_patch());
+                check_true("retired own cookie requeued during new hold",
+                           atomic_load(&signal_retired_replayed) == 1);
+                check_true("retired own cookie new epoch unexpected",
+                           peak_signal_policy_unexpected_delivery_count() ==
+                               initial_unexpected + 1);
+                if (signal_expect_retired_clean)
+                    check_true(
+                        "consumed old-cookie contamination denied before mutation",
+                        !next_prepared && next_status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                            !peak_detach_controller_current_mutation_uses_physical_patch());
+                if (next_prepared)
+                    check_finish("retired cookie new prepare cleanup without mutation",
+                                 &request, PEAK_DETACH_STATUS_SAFE);
+                check_true("retired cookie prepare cleanup leaves gate open",
+                           peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+            }
+            signal_late_enabled = FALSE;
+            if (signal_expect_retired_clean && (late_mode == 1 || late_mode == 4)) {
+                request.operation = PEAK_DETACH_OPERATION_DETACH;
+                PeakDetachStatus clean_status = PEAK_DETACH_STATUS_ERROR;
+                gboolean clean_prepared =
+                    peak_detach_controller_prepare_hook_mutation(&request, &clean_status);
+                fprintf(stderr,
+                        "fixed-owned-late next_prepare prepared=%d status=%s "
+                        "unexpected=%d actual_gum_mutation=0\n",
+                        clean_prepared,
+                        peak_detach_controller_status_string(clean_status),
+                        peak_signal_policy_unexpected_delivery_count());
+                check_true("owned retired delivery allows a clean subsequent generation",
+                           clean_prepared);
+                if (clean_prepared)
+                    check_finish("fixed owned late cleanup", &request,
+                                 PEAK_DETACH_STATUS_SAFE);
+                check_true("fixed owned late final gate open",
+                           peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+            } else {
+                check_prepare("late own signal latches future unsupported", &request,
+                              FALSE, PEAK_DETACH_STATUS_UNSUPPORTED);
+                const PeakDetachFailureDetail *detail =
+                    peak_detach_controller_last_failure_detail();
+                fprintf(stderr,
+                        "late-own-signal subsequent reason=%s signum_field=0x%llx "
+                        "unexpected_field=0x%llx held=%d physical=%d\n",
+                        detail->reason, (unsigned long long)detail->pc,
+                        (unsigned long long)detail->aux,
+                        peak_detach_controller_threads_are_held(),
+                        peak_detach_controller_current_mutation_uses_physical_patch());
+                check_true("late own signal persistent reason",
+                           strcmp(detail->reason, "signal-unexpected-delivery") == 0);
+                check_true("late own signal current thread gate remains open",
+                           !peak_detach_controller_threads_are_held());
+            }
+            fprintf(stderr, "late-own-signal-check-complete failures=%d\n", failures);
+        }
+    }
 
     worker_running = 0;
-    pthread_join(worker, NULL);
+    if (!worker_joined)
+        pthread_join(worker, NULL);
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
     g_object_unref(listener);
@@ -4086,8 +4584,20 @@ main(int argc, char** argv)
     if (strcmp(argv[1], "signal-event-futex") == 0) {
         return run_signal_event_futex();
     }
+    if (strcmp(argv[1], "signal-backend-owned-target-exit") == 0) {
+        return run_signal_backend_blocked_thread(4);
+    }
+    if (strcmp(argv[1], "signal-backend-handler-before-publish") == 0) {
+        return run_signal_backend_blocked_thread(3);
+    }
+    if (strcmp(argv[1], "signal-backend-retired-own-cookie") == 0) {
+        return run_signal_backend_blocked_thread(2);
+    }
+    if (strcmp(argv[1], "signal-backend-late-own-delivery") == 0) {
+        return run_signal_backend_blocked_thread(1);
+    }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
-        return run_signal_backend_blocked_thread();
+        return run_signal_backend_blocked_thread(0);
     }
     if (strcmp(argv[1], "signal-backend-missing-thread-gate") == 0) {
         return run_signal_backend_missing_thread_gate();

@@ -32,6 +32,7 @@ static _Atomic int migration_disabled_depth;
 static _Atomic int migration_candidate_signal;
 static _Atomic int migration_releasing_signal;
 static _Atomic int unexpected_delivery_count;
+static _Atomic int owned_delivery_lease_depth;
 static _Atomic(uintptr_t) last_conflict_api;
 static _Atomic(unsigned long) cookie_base;
 /*
@@ -1124,14 +1125,18 @@ peak_signal_policy_set_reserved_signal(int signum)
 void
 peak_signal_policy_clear_reserved_signal(void)
 {
-    int signum = atomic_exchange_explicit(&reserved_signal,
-                                          0,
-                                          memory_order_acq_rel);
-    if (signum <= 0) {
+    if (pthread_mutex_lock(&migration_mutex) != 0) {
         return;
     }
-
-    (void)peak_signal_policy_restore_default_handler(signum);
+    if (atomic_load_explicit(&owned_delivery_lease_depth, memory_order_acquire) != 0) {
+        pthread_mutex_unlock(&migration_mutex);
+        return;
+    }
+    int signum = atomic_exchange_explicit(&reserved_signal, 0, memory_order_acq_rel);
+    if (signum > 0) {
+        (void)peak_signal_policy_restore_default_handler(signum);
+    }
+    pthread_mutex_unlock(&migration_mutex);
 }
 
 static int
@@ -1392,6 +1397,44 @@ peak_signal_policy_last_conflict_api(void)
 {
     return (const char*)atomic_load_explicit(&last_conflict_api,
                                              memory_order_acquire);
+}
+
+int
+peak_signal_policy_acquire_delivery_lease(void)
+{
+    if (pthread_mutex_lock(&migration_mutex) != 0)
+        return 0;
+    atomic_fetch_add_explicit(&migration_disabled_depth, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&owned_delivery_lease_depth, 1, memory_order_release);
+    pthread_mutex_unlock(&migration_mutex);
+    return 1;
+}
+
+int
+peak_signal_policy_release_delivery_lease(void)
+{
+    if (pthread_mutex_lock(&migration_mutex) != 0) {
+        return 0;
+    }
+    int depth = atomic_load_explicit(&owned_delivery_lease_depth, memory_order_acquire);
+    if (depth <= 0) {
+        pthread_mutex_unlock(&migration_mutex);
+        return 0;
+    }
+    atomic_fetch_sub_explicit(&owned_delivery_lease_depth, 1, memory_order_release);
+    peak_signal_policy_pop_migration_disabled();
+    pthread_mutex_unlock(&migration_mutex);
+    return 1;
+}
+
+void
+peak_signal_policy_delivery_after_fork_child(int keep_lease)
+{
+    migration_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+    atomic_store_explicit(&owned_delivery_lease_depth, keep_lease ? 1 : 0,
+                          memory_order_release);
+    atomic_store_explicit(&migration_disabled_depth, keep_lease ? 1 : 0,
+                          memory_order_release);
 }
 
 void

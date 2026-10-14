@@ -136,3 +136,19 @@ peak_signal_policy_test_send_bad_cookie_to_current_thread(void)
     return -1;
 }
 #endif
+
+int
+peak_signal_policy_acquire_delivery_lease(void)
+{
+    return 0;
+}
+int
+peak_signal_policy_release_delivery_lease(void)
+{
+    return 1;
+}
+void
+peak_signal_policy_delivery_after_fork_child(int keep_lease)
+{
+    (void)keep_lease;
+}
