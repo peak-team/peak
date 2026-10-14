@@ -36,6 +36,13 @@
 #define PEAK_RELEASE_ACK_WAIT_MODE "usleep"
 #endif
 
+#ifndef PEAK_RELEASE_ACK_RENDEZVOUS
+#define PEAK_RELEASE_ACK_RENDEZVOUS 1
+#endif
+#if PEAK_RELEASE_ACK_RENDEZVOUS != 0 && PEAK_RELEASE_ACK_RENDEZVOUS != 1
+#error "release ACK rendezvous supports only 0 or 1"
+#endif
+
 #define PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS 10000
 #define PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS 8192u
 #define PEAK_DETACH_HELPER_PROTOCOL_FD 3
@@ -215,6 +222,9 @@ static _Atomic int signal_epoch_counter = 1;
 static _Atomic int signal_hold_epoch = 0;
 static _Atomic int signal_release_epoch = 0;
 static _Atomic int signal_wait_sequence = 0;
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+static _Atomic int signal_release_cohort_epoch = 0;
+#endif
 #if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
 static _Atomic int signal_release_done_sequence = 0;
 #endif
@@ -240,6 +250,12 @@ static double strict_gate_wait_timeout_s =
  * This same-address futex access is an explicit supported Linux compiler ABI
  * contract for _Atomic int, not a universal C11 representation proof.
  */
+#if PEAK_RELEASE_ACK_RENDEZVOUS
+_Static_assert(sizeof(signal_release_cohort_epoch) == sizeof(int),
+               "release cohort epoch must match int storage");
+_Static_assert(_Alignof(_Atomic int) >= 4,
+               "release cohort epoch must be four-byte aligned");
+#endif
 #if PEAK_RELEASE_ACK_EVENT
 _Static_assert(sizeof(signal_release_done_sequence) == sizeof(int),
                "release ACK futex word must match int storage");
@@ -1680,6 +1696,9 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_hold_epoch) &&
            atomic_is_lock_free(&signal_release_epoch) &&
            atomic_is_lock_free(&signal_wait_sequence) &&
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+           atomic_is_lock_free(&signal_release_cohort_epoch) &&
+#endif
 #if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
            atomic_is_lock_free(&signal_release_done_sequence) &&
 #endif
@@ -2032,6 +2051,30 @@ peak_detach_controller_signal_wake_release_waiters(void)
 #endif
 }
 
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+static void
+peak_detach_controller_signal_wait_release_cohort(int epoch)
+{
+    /* ACK is published. Only global state may be accessed from this point. */
+    for (;;) {
+        int expected_sequence = atomic_load_explicit(
+            &signal_wait_sequence, memory_order_acquire);
+        if (atomic_load_explicit(&signal_release_cohort_epoch,
+                                 memory_order_acquire) != epoch) {
+            return;
+        }
+        peak_detach_controller_signal_wait_event(expected_sequence);
+    }
+}
+
+static void
+peak_detach_controller_signal_open_release_cohort(void)
+{
+    atomic_store_explicit(&signal_release_cohort_epoch, 0, memory_order_release);
+    peak_detach_controller_signal_wake_release_waiters();
+}
+#endif
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 int
 peak_detach_controller_test_signal_wait_sequence(void)
@@ -2144,6 +2187,9 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
     atomic_store_explicit(&slot->done_epoch, epoch, memory_order_release);
 #if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
     peak_detach_controller_signal_notify_release_done();
+#endif
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+    peak_detach_controller_signal_wait_release_cohort(epoch);
 #endif
     return TRUE;
 }
@@ -2427,6 +2473,9 @@ peak_detach_controller_signal_clear_slots(void)
     atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
     atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
     atomic_store_explicit(&signal_release_epoch, 0, memory_order_release);
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+    atomic_store_explicit(&signal_release_cohort_epoch, 0, memory_order_release);
+#endif
     peak_detach_controller_signal_wake_release_waiters();
 }
 
@@ -2666,6 +2715,9 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     /* Mutation/rollback is complete. Open before handlers can run nested user
      * handlers while we wait for their release acknowledgements. */
     peak_filesystem_stat_guard_resume();
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+    atomic_store_explicit(&signal_release_cohort_epoch, epoch, memory_order_release);
+#endif
     atomic_store_explicit(&signal_release_epoch, epoch, memory_order_release);
     peak_detach_controller_signal_wake_release_waiters();
 
@@ -2714,6 +2766,9 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             } else {
                 atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
                 atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+                peak_detach_controller_signal_open_release_cohort();
+#endif
             }
             if (!rewrite_ok) {
                 if (status_out != NULL) {
@@ -2731,6 +2786,10 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
         if (now >= deadline) {
 #else
         if (peak_detach_controller_monotonic_second() >= deadline) {
+#endif
+#if defined(__linux__) && PEAK_RELEASE_ACK_RENDEZVOUS
+            /* Preserve old slot/hold failure state; release only the new gate. */
+            peak_detach_controller_signal_open_release_cohort();
 #endif
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_TIMEOUT;
