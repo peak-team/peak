@@ -63,15 +63,6 @@ EXPECTED_NONZERO_RETURN_MODES = {
     "finalize-nonzero",
     "finalize-return-nonzero",
 }
-INTEL_MPI_ONLY_MODES = {
-    "finalize-clean-output-mpi-intel-default",
-    "finalize-clean-output-mpi-intel-real-finalize",
-}
-NON_INTEL_MPI_ONLY_MODES = {
-    "finalize-clean-output-mpi-real-finalize-default",
-    "finalize-clean-output-mpi-completion-warn",
-    "finalize-clean-output-mpi-writer-fail",
-}
 STATS_FIELDS = [
     "function",
     "count",
@@ -104,6 +95,8 @@ STATS_FIELDS = [
     "jit_provider_generation",
     "jit_pending_count",
     "jit_pending_high_water",
+    "ever_detached",
+    "ever_reattached",
 ]
 STATS_ACCOUNTING_FIELDS = ["dropped_calls", "dropped_threads"]
 STATS_JIT_FIELDS = STATS_FIELDS[24:31]
@@ -462,10 +455,6 @@ REPORT_COMPLETION_DIAGNOSTIC = (
 REPORT_REAL_FINALIZE_DIAGNOSTIC = (
     "Returning to real PMPI_Finalize after successful PEAK report release"
 )
-REPORT_INTEL_SKIP_DIAGNOSTIC = (
-    "PEAK output release is complete; skipping real PMPI_Finalize "
-    "for Intel MPI 2019 compatibility"
-)
 REPORT_COMPLETION_DIAGNOSTICS = (
     REPORT_COMPLETION_DIAGNOSTIC,
     "All-rank report publication release completed:",
@@ -577,21 +566,6 @@ def launcher_looks_like_intel_mpi(mpiexec):
     )
 
 
-def intel_default_launcher_outcome_allowed(mode, returncode, output, timed_out):
-    if mode != "finalize-clean-output-mpi-intel-default" or timed_out:
-        return False
-
-    blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
-    if returncode == 0:
-        return not blocks and LAUNCHER_ABNORMAL_RE.search(output) is None
-    if len(blocks) != 1:
-        return False
-
-    block = blocks[0]
-    remaining_output = output[:block.start()] + output[block.end():]
-    return LAUNCHER_ABNORMAL_RE.search(remaining_output) is None
-
-
 def intel_reducer_fallback_launcher_outcome_allowed(
     mode,
     returncode,
@@ -657,23 +631,12 @@ def require_complete_stats_evidence(name, evidence):
 
 
 def report_clean_completion_policy(output):
-    continued_real = (
+    return "real-finalize" if (
         output.count(REPORT_COMPLETION_DIAGNOSTIC) == 1 and
         REPORT_RELEASE_REAL_DIAGNOSTIC in output and
         REPORT_REAL_FINALIZE_DIAGNOSTIC in output and
-        REPORT_RELEASE_SKIP_DIAGNOSTIC not in output and
-        REPORT_INTEL_SKIP_DIAGNOSTIC not in output
-    )
-    continued_intel_skip = (
-        output.count(REPORT_COMPLETION_DIAGNOSTIC) == 1 and
-        REPORT_RELEASE_SKIP_DIAGNOSTIC in output and
-        REPORT_INTEL_SKIP_DIAGNOSTIC in output and
-        REPORT_RELEASE_REAL_DIAGNOSTIC not in output and
-        REPORT_REAL_FINALIZE_DIAGNOSTIC not in output
-    )
-    if continued_real == continued_intel_skip:
-        return None
-    return "real-finalize" if continued_real else "intel-2019-skip"
+        REPORT_RELEASE_SKIP_DIAGNOSTIC not in output
+    ) else None
 
 
 def report_release_was_interrupted(output):
@@ -761,8 +724,8 @@ def parse_args():
             "finalize-clean-output-mpi-publish-before-root-return",
             "finalize-clean-output-mpi-reducer-fail",
             "finalize-clean-output-mpi-writer-fail",
-            "finalize-clean-output-mpi-intel-default",
-            "finalize-clean-output-mpi-intel-real-finalize",
+            "finalize-clean-output-mpi-real-finalize-empty",
+            "finalize-clean-output-mpi-real-finalize-opt-out",
             "finalize-clean-output-mpi-real-finalize-default",
             "finalize-clean-output-mpi-completion-warn",
             "finalize-clean-output-mpi-real-finalize-explicit",
@@ -822,20 +785,6 @@ def main():
         raise AssertionError(
             "report publication signals require finalize-clean-output-local"
         )
-    if args.mode in INTEL_MPI_ONLY_MODES:
-        if not launcher_looks_like_intel_mpi(args.mpiexec):
-            print(
-                f"mpi_lifecycle_check_ok mode={args.mode} "
-                "skipped=needs-intel-mpi"
-            )
-            return 0
-    elif args.mode in NON_INTEL_MPI_ONLY_MODES:
-        if launcher_looks_like_intel_mpi(args.mpiexec):
-            print(
-                f"mpi_lifecycle_check_ok mode={args.mode} "
-                "skipped=needs-non-intel-mpi"
-            )
-            return 0
     if args.mode.startswith("subset-") and nprocs < 2:
         print(f"mpi_lifecycle_check_ok mode={args.mode} skipped=needs-2-ranks")
         return 0
@@ -887,6 +836,7 @@ def main():
     forbidden_output = []
     done_file = None
     verify_finalize_return_publication = False
+    verify_native_opt_out = False
     force_stats_path_failure = False
     allow_interrupted_peer_temporary_stats = False
     if args.mode == "no-finalize-nonzero":
@@ -985,7 +935,6 @@ def main():
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
-        env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
         app_args.append("finalize-then-exit0")
         expected = WRITER_DESTINATION_FAILURE_DIAGNOSTIC
         expected_extra.append(
@@ -1006,31 +955,9 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 0
         force_stats_path_failure = True
-    elif args.mode == "finalize-clean-output-mpi-intel-default":
+    elif args.mode == "finalize-clean-output-mpi-real-finalize-empty":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
-        env.pop("PEAK_MPI_REAL_FINALIZE", None)
-        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
-        app_args.append("finalize-then-exit0")
-        expected = (
-            "skipping real PMPI_Finalize for Intel MPI 2019 compatibility"
-        )
-        expected_extra.append(
-            "All-rank report publication release completed: "
-            "all_reports_succeeded=1"
-        )
-        expected_extra.append("PMPI_Finalize was observed on every rank")
-        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
-        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
-        forbidden_output.append(
-            REPORT_REAL_FINALIZE_DIAGNOSTIC
-        )
-        expected_peak_tables = 0
-        expected_stats_files = 1
-    elif args.mode == "finalize-clean-output-mpi-intel-real-finalize":
-        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_TEST_MPI_LIBRARY_VERSION"] = "Intel(R) MPI Library 2019"
-        env["PEAK_MPI_REAL_FINALIZE"] = "1"
+        env["PEAK_MPI_REAL_FINALIZE"] = ""
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
         app_args.append("finalize-then-exit0")
         expected = REPORT_REAL_FINALIZE_DIAGNOSTIC
@@ -1041,6 +968,23 @@ def main():
         expected_extra.append("PMPI_Finalize was observed on every rank")
         expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
         expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
+        expected_peak_tables = 0
+        expected_stats_files = 1
+    elif args.mode == "finalize-clean-output-mpi-real-finalize-opt-out":
+        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
+        env["PEAK_MPI_REAL_FINALIZE"] = "0"
+        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
+        app_args.append("finalize-opt-out-prove-no-native")
+        verify_native_opt_out = True
+        expected = "PEAK report release succeeded; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0"
+        expected_extra.append(
+            "All-rank report publication release completed: "
+            "all_reports_succeeded=1"
+        )
+        expected_extra.append("PMPI_Finalize was observed on every rank")
+        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
+        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
+        forbidden_output.append(REPORT_REAL_FINALIZE_DIAGNOSTIC)
         expected_peak_tables = 0
         expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-real-finalize-default":
@@ -1253,7 +1197,6 @@ def main():
         }[args.report_signal]
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
         env.pop("PEAK_MPI_FINALIZE_POLICY", None)
-        env.pop("PEAK_TEST_MPI_LIBRARY_VERSION", None)
         env["PEAK_TEST_REPORT_SIGNAL_PHASE"] = args.report_signal_phase
         env["PEAK_TEST_REPORT_SIGNAL"] = args.report_signal
         env["PEAK_TEST_REPORT_SIGNAL_RANK"] = "0"
@@ -1311,6 +1254,10 @@ def main():
             env["PEAK_MPI_FINALIZE_RETURN_MARKER_PREFIX"] = str(
                 Path(stats_dir) / "finalize-return"
             )
+        if verify_native_opt_out:
+            env["PEAK_MPI_NATIVE_SKIP_MARKER_PREFIX"] = str(
+                Path(stats_dir) / "native-skip"
+            )
         configure_lifecycle_socket_ports(args.mode, env)
         returncode, output, timed_out = run_mpi_command(
             command,
@@ -1348,6 +1295,14 @@ def main():
             path.name: path.read_text(encoding="utf-8", errors="replace")
             for path in finalize_return_markers
         }
+        native_skip_markers = sorted(Path(stats_dir).glob("native-skip-r*.txt"))
+        native_skip_proven = verify_native_opt_out and len(native_skip_markers) == nprocs
+        if verify_native_opt_out:
+            for rank in range(nprocs):
+                path = Path(stats_dir) / f"native-skip-r{rank}.txt"
+                if (not path.is_file() or path.read_text(encoding="ascii") !=
+                        f"rank={rank} native_stub_calls=0 MPI_Finalized=0\n"):
+                    raise AssertionError(f"rank {rank} did not prove native PMPI_Finalize skipped")
         stats_text = "\n".join(
             path.read_text(encoding="utf-8", errors="replace")
             for path in stats_files
@@ -1398,12 +1353,6 @@ def main():
         except OSError:
             pass
 
-    intel_default_launcher_allowed = intel_default_launcher_outcome_allowed(
-        args.mode,
-        returncode,
-        output,
-        timed_out,
-    )
     intel_reducer_fallback_launcher_allowed = (
         intel_reducer_fallback_launcher_outcome_allowed(
             args.mode,
@@ -1466,6 +1415,15 @@ def main():
         if f'"{function_name}",' in stats_text:
             raise AssertionError(f"unexpected stats row for {function_name}")
     fatal_scan_output = output
+    native_skip_launcher_outcome_allowed = False
+    if native_skip_proven:
+        abnormal_blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
+        abnormal_blocks += list(OPENMPI_IMPROPER_EXIT_BLOCK_RE.finditer(output))
+        native_skip_launcher_outcome_allowed = (
+            returncode == 0 or len(abnormal_blocks) == 1
+        )
+        fatal_scan_output = INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.sub("", fatal_scan_output)
+        fatal_scan_output = OPENMPI_IMPROPER_EXIT_BLOCK_RE.sub("", fatal_scan_output)
     if args.mode in EXPECTED_LAUNCHER_ABNORMAL_MODES:
         fatal_scan_output = OPENMPI_IMPROPER_EXIT_BLOCK_RE.sub(
             "",
@@ -1479,8 +1437,7 @@ def main():
         raise AssertionError("MPI lifecycle run produced a crash/fatal MPI diagnostic")
     if (not report_signal_requested and
             args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
-            not intel_default_launcher_allowed and
-            LAUNCHER_ABNORMAL_RE.search(output)):
+            LAUNCHER_ABNORMAL_RE.search(fatal_scan_output)):
         raise AssertionError(
             "MPI lifecycle run produced an unexpected launcher-abnormal diagnostic"
         )
@@ -1735,8 +1692,7 @@ def main():
     if (not report_signal_requested and
             args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
-            not intel_default_launcher_allowed and
-            returncode != 0):
+            not native_skip_launcher_outcome_allowed and returncode != 0):
         raise AssertionError(f"{args.mode} run returned {returncode}")
 
     if report_signal_requested:

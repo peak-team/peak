@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef void* (*DlopenFunction)(const char*, int);
@@ -292,6 +293,36 @@ check_ull(const char* label,
     }
 }
 
+/* A registry visibility retry is an attempt, not another completed owner. */
+static void
+check_completed_requests(const char* label,
+                         PeakDlopenDynamicAttachDiagnostics before,
+                         PeakDlopenDynamicAttachDiagnostics after,
+                         unsigned long long completed)
+{
+    check_ull(label, after.drained - before.drained,
+              completed + after.requeued - before.requeued);
+    check_ull("no ownership request dropped at capacity",
+              after.dropped_full, before.dropped_full);
+    check_ull("no ownership request dropped at shutdown",
+              after.dropped_closed, before.dropped_closed);
+    check_ull("no ownership reference acquisition failed",
+              after.dropped_noload, before.dropped_noload);
+    check_ull("no ownership retry was lost",
+              after.dropped_requeue, before.dropped_requeue);
+    check_ull("missing target retained no hook reference",
+              after.retained_handles, before.retained_handles);
+}
+
+static gboolean
+drain_deadline_expired(const struct timespec* start)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec - start->tv_sec > 5 ||
+        (now.tv_sec - start->tv_sec == 5 && now.tv_nsec >= start->tv_nsec);
+}
+
 static void
 check_size(const char* label, size_t actual, size_t expected)
 {
@@ -462,14 +493,17 @@ drain_until_empty(const PeakTestHooks* hooks)
 {
     PeakDlopenDynamicAttachDiagnostics diagnostics = { 0 };
 
-    for (unsigned int attempt = 0; attempt < 1000000; attempt++) {
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    do {
         drain_once(hooks);
         diagnostics = get_diagnostics(hooks);
         if (diagnostics.queue_length == 0) {
-            break;
+            return diagnostics;
         }
         sched_yield();
-    }
+    } while (!drain_deadline_expired(&start));
+    check_true("owned queue completed before monotonic deadline", FALSE);
     return diagnostics;
 }
 
@@ -553,9 +587,7 @@ test_callback_owned_handle(const PeakTestHooks* hooks, const char* module_path)
 
     PeakDlopenDynamicAttachDiagnostics after_transfer =
         drain_until_empty(hooks);
-    check_ull("transferred request drained",
-              after_transfer.drained,
-              before.drained + 1);
+    check_completed_requests("transferred request drained", before, after_transfer, 1);
     check_true("drain released transferred module handle",
                atomic_load_explicit(&fixture_unloads,
                                     memory_order_relaxed) == 1);
@@ -585,9 +617,7 @@ test_callback_owned_handle(const PeakTestHooks* hooks, const char* module_path)
 
     PeakDlopenDynamicAttachDiagnostics after =
         drain_until_empty(hooks);
-    check_ull("broker-owned request drained",
-              after.drained,
-              before.drained + 2);
+    check_completed_requests("broker-owned request drained", before, after, 2);
     check_size("owned queue empty after drain", after.queue_length, 0);
     check_ull("owned requests did not report RTLD_NOLOAD drop",
               after.dropped_noload,
@@ -633,9 +663,7 @@ test_callback_owned_handle(const PeakTestHooks* hooks, const char* module_path)
 
     PeakDlopenDynamicAttachDiagnostics after_pinning =
         drain_until_empty(hooks);
-    check_ull("PINNING-transferred request drained",
-              after_pinning.drained,
-              before.drained + 3);
+    check_completed_requests("PINNING-transferred request drained", before, after_pinning, 3);
     check_true("PINNING drain released exactly one final reference",
                atomic_load_explicit(&fixture_unloads,
                                     memory_order_relaxed) == 3);
@@ -686,7 +714,16 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
     atomic_store_explicit(&destructor_loader_enabled,
                           1,
                           memory_order_release);
-    drain_once(hooks);
+    /* Stop immediately after this owner's destructor, preserving its newly
+     * enqueued loader work for the separate next-drain assertion below. */
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    do {
+        drain_once(hooks);
+        if (atomic_load_explicit(&fixture_unloads, memory_order_relaxed) != 0)
+            break;
+        sched_yield();
+    } while (!drain_deadline_expired(&start));
     atomic_store_explicit(&destructor_loader_enabled,
                           0,
                           memory_order_release);
@@ -714,9 +751,7 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
               atomic_load_explicit(&drain_loader_calls,
                                    memory_order_relaxed),
               0);
-    check_ull("original fixture request drained before destructor request",
-              after_first.drained,
-              before.drained + 1);
+    check_completed_requests("original fixture request drained before destructor request", before, after_first, 1);
     check_size("destructor loader work remained queued for next drain",
                after_first.queue_length,
                before.queue_length + 1);
@@ -725,9 +760,7 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
                wait_for_ownership_idle(hooks));
     PeakDlopenDynamicAttachDiagnostics after_second =
         drain_until_empty(hooks);
-    check_ull("destructor-created request drained separately",
-              after_second.drained,
-              before.drained + 2);
+    check_completed_requests("destructor-created request drained separately", before, after_second, 2);
     check_size("destructor reentrant queue empty after second drain",
                after_second.queue_length,
                before.queue_length);
@@ -744,6 +777,85 @@ test_destructor_reentrant_loader(const PeakTestHooks* hooks,
                atomic_load_explicit(&drain_loader_calls,
                                     memory_order_relaxed));
     }
+    return failures == 0 ? 0 : 1;
+}
+
+static atomic_uint namespace_fixture_unloads[2];
+
+static void
+namespace_fixture_unloaded(unsigned int id)
+{
+    if (id < 2)
+        atomic_fetch_add_explicit(&namespace_fixture_unloads[id], 1,
+                                  memory_order_relaxed);
+}
+
+static int
+test_namespace_dynamic_hit(const PeakTestHooks* hooks, const char* module_path)
+{
+    typedef int (*ValueFunction)(void);
+    typedef gulong (*CountFunction)(size_t);
+    typedef void (*SetObserverFunction)(void (*)(unsigned int), unsigned int);
+    CountFunction count;
+    DrainFunction fini;
+    ValueFunction values[2] = { NULL, NULL };
+    void* handles[2] = { NULL, NULL };
+    PeakDlopenDynamicAttachDiagnostics before = get_diagnostics(hooks);
+
+    resolve_hook("peak_general_listener_test_call_count", &count, sizeof(count));
+    resolve_hook("peak_test_fini", &fini, sizeof(fini));
+    for (size_t i = 0; i < 2; i++) {
+        handles[i] = dlmopen(LM_ID_NEWLM, module_path, RTLD_NOW | RTLD_LOCAL);
+        check_true("dynamic namespace fixture loaded", handles[i] != NULL);
+        if (handles[i] == NULL) return 1;
+        void* address = dlsym(handles[i], "peak_dlopen_owned_fixture_value");
+        memcpy(&values[i], &address, sizeof(address));
+        check_true("namespace dynamic symbol exported", values[i] != NULL);
+        if (values[i] == NULL) return 1;
+        SetObserverFunction set_observer;
+        address = dlsym(handles[i], "peak_dlopen_owned_fixture_set_unload_observer");
+        memcpy(&set_observer, &address, sizeof(address));
+        check_true("namespace unload observer setter exported", set_observer != NULL);
+        if (set_observer == NULL) return 1;
+        set_observer(namespace_fixture_unloaded, (unsigned int)i);
+        check_true("namespace dynamic ownership request accepted",
+                   hooks->enqueue_loaded(module_path, handles[i]));
+    }
+    check_true("dynamic namespaces have different exact addresses",
+               values[0] != values[1]);
+    check_true("dynamic namespace pins completed", wait_for_ownership_idle(hooks));
+    PeakDlopenDynamicAttachDiagnostics after = drain_until_empty(hooks);
+    check_size("dynamic namespace queue empty", after.queue_length, 0);
+    check_ull("first namespace dynamic target installed one retained owner",
+              after.retained_handles, before.retained_handles + 1);
+    gulong calls_before = count(0);
+    for (unsigned int i = 0; i < 5; i++)
+        check_true("first namespace original result", values[0]() == 42);
+    check_ull("first namespace owns the installed listener",
+              count(0), calls_before + 5);
+    for (unsigned int i = 0; i < 9; i++)
+        check_true("second namespace original result", values[1]() == 42);
+    check_ull("second same-name namespace never hits the first owner's listener",
+              count(0), calls_before + 5);
+    for (size_t i = 0; i < 2; i++)
+        check_true("dynamic namespace application handle closed", dlclose(handles[i]) == 0);
+    check_ull("installed owner stays mapped after application dlclose",
+              atomic_load_explicit(&namespace_fixture_unloads[0], memory_order_relaxed), 0);
+    check_ull("unselected namespace releases its final owner exactly once",
+              atomic_load_explicit(&namespace_fixture_unloads[1], memory_order_relaxed), 1);
+    for (unsigned int i = 0; i < 3; i++)
+        check_true("retained owner is callable after application dlclose", values[0]() == 42);
+    check_ull("retained exact owner is still profiled after application dlclose",
+              count(0), calls_before + 8);
+    hooks->set_manual_drain(FALSE);
+    /* Normal finalization must detach and flush the listener before releasing
+     * its retained owner. Never touch either fixture address after this. */
+    fini();
+    check_ull("normal finalization releases the installed owner exactly once",
+              atomic_load_explicit(&namespace_fixture_unloads[0], memory_order_relaxed), 1);
+    check_ull("normal finalization does not release the other owner twice",
+              atomic_load_explicit(&namespace_fixture_unloads[1], memory_order_relaxed), 1);
+    if (failures == 0) puts("dlopen_namespace_dynamic_hit_ok originals=17 recorded=8 released=2");
     return failures == 0 ? 0 : 1;
 }
 
@@ -768,6 +880,21 @@ test_namespace_identity(const PeakTestHooks* hooks, const char* module_path)
                    dlinfo(application_handles[i],
                           RTLD_DI_LMID,
                           &namespace_ids[i]) == 0);
+        typedef void* (*StaticAddressFunction)(void);
+        typedef int (*StaticValueFunction)(void);
+        StaticAddressFunction static_address;
+        StaticValueFunction static_value;
+        void* exported_address = dlsym(application_handles[i],
+                                       "peak_dlopen_owned_fixture_static_address");
+        memcpy(&static_address, &exported_address, sizeof(exported_address));
+        check_true("namespace static address getter exported", static_address != NULL);
+        if (static_address != NULL) {
+            void* address = static_address();
+            memcpy(&static_value, &address, sizeof(address));
+            check_true("namespace static original exists and runs", static_value() == 99);
+        }
+        check_true("namespace static target has no dynamic export",
+                   dlsym(application_handles[i], "peak_dlopen_owned_fixture_static") == NULL);
         loader_phase = LOADER_PHASE_CALLBACK;
         enqueued = hooks->enqueue_loaded(module_path,
                                          application_handles[i]);
@@ -808,9 +935,9 @@ test_namespace_identity(const PeakTestHooks* hooks, const char* module_path)
         atomic_load_explicit(&drain_loader_calls, memory_order_relaxed);
     PeakDlopenDynamicAttachDiagnostics after =
         drain_until_empty(hooks);
-    check_ull("both namespace requests drained",
-              after.drained,
-              before.drained + 2);
+    check_completed_requests("both namespace requests drained", before, after, 2);
+    check_ull("invisible namespace owners are never requeued",
+              after.requeued, before.requeued);
     check_size("namespace queue empty after drain", after.queue_length, 0);
     check_ull("namespace drain made no loader open call",
               atomic_load_explicit(&drain_loader_calls,
@@ -1213,12 +1340,13 @@ main(int argc, char** argv)
         (strcmp(argv[1], "ownership") != 0 &&
          strcmp(argv[1], "destructor") != 0 &&
          strcmp(argv[1], "namespace") != 0 &&
+         strcmp(argv[1], "namespace-dynamic") != 0 &&
          strcmp(argv[1], "stress") != 0 &&
          strcmp(argv[1], "fork") != 0 &&
          strcmp(argv[1], "shutdown") != 0 &&
          strcmp(argv[1], "guard-revert") != 0)) {
         fprintf(stderr,
-                "usage: %s ownership|destructor|namespace|stress|fork|shutdown|guard-revert\n",
+                "usage: %s ownership|destructor|namespace|namespace-dynamic|stress|fork|shutdown|guard-revert\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
@@ -1237,6 +1365,8 @@ main(int argc, char** argv)
         result = test_destructor_reentrant_loader(
             &hooks,
             PEAK_TEST_OWNED_MODULE);
+    } else if (strcmp(argv[1], "namespace-dynamic") == 0) {
+        result = test_namespace_dynamic_hit(&hooks, PEAK_TEST_OWNED_MODULE);
     } else if (strcmp(argv[1], "namespace") == 0) {
         result = test_namespace_identity(&hooks,
                                          PEAK_TEST_OWNED_MODULE);
@@ -1255,6 +1385,7 @@ main(int argc, char** argv)
             PEAK_TEST_OWNED_MODULE);
     }
 
-    hooks.set_manual_drain(FALSE);
+    if (strcmp(argv[1], "namespace-dynamic") != 0)
+        hooks.set_manual_drain(FALSE);
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

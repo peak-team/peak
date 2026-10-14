@@ -134,8 +134,8 @@ def main():
                 r"[^}]{0,600}peak_aarch64_raw_syscall6_raw",
                 exec_header),
             "AArch64 raw-syscall assembly declaration must retain C linkage for C++ users")
-    require("GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 4" in peak_api and
-            "GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 4" in frida_cmake,
+    require("GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 5" in peak_api and
+            "GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION != 5" in frida_cmake,
             "patched-devkit validation must reject pre-fix module-sync overlays")
     for rel, source in [
         ("cmake/peak-gum/gum_peak_pc_api.c", gum_overlay),

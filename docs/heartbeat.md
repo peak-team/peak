@@ -587,12 +587,12 @@ MPI enters the picture during teardown/reporting:
   reduced real-finalizer policy, but a local collective error or timeout cannot
   prove that every peer observed the same failure; that path is locally
   fail-closed rather than distributed failure consensus.
-- Healthy runtimes other than Intel MPI 2019 normally return to the real
-  `PMPI_Finalize()` after the release gate. Intel MPI 2019 skips its observed
-  crash-prone finalizer by default; `PEAK_MPI_REAL_FINALIZE=1` explicitly opts
-  back in. Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` calls the real finalizer
-  before this compatibility policy and therefore bypasses it. Skipping the
-  finalizer is non-conforming and still requires launcher-scale validation.
+- Healthy all-rank jobs return to the real `PMPI_Finalize()` by default on
+  every runtime after the release gate. `PEAK_MPI_REAL_FINALIZE=0` explicitly
+  opts out. Unless disabled, `defer` calls the real finalizer before PEAK's
+  report-path release gate. Historical Intel MPI 2019 teardown faults remain
+  unresolved; changing the default policy is not a provider repair. Skipping
+  the finalizer is non-conforming and requires launcher-scale validation.
 - An abnormal exit uses rank-local output without making teardown MPI calls.
   Missing all-rank participation rejects MPI aggregation. A local/socket report
   already published before a failed or timed-out combined gate is retained;

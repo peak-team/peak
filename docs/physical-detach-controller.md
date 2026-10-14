@@ -720,12 +720,13 @@ observed the same failure; a peer may complete the collective and make a
 different finalizer decision. This is a bounded local fail-closed mechanism,
 not distributed failure consensus.
 
-Healthy all-rank jobs normally hand completion to the real finalizer and
-launcher. Intel MPI 2019 is a compatibility exception: 1024-node validation
-found its real finalizer repeatedly crashing in `hwloc_topology_destroy()`
-after complete PEAK report publication, so PEAK skips that finalizer by default.
-`PEAK_MPI_REAL_FINALIZE=1` explicitly opts back in; `0` disables the handoff on
-other runtimes. Neither value can override a failed release protocol. Skipping
+Healthy all-rank jobs hand completion to the real finalizer and launcher by
+default on every runtime after the safety gates complete. Earlier 1024-node
+Intel MPI 2019 validation observed real-finalizer crashes in
+`hwloc_topology_destroy()` after complete PEAK report publication; this policy
+change does not repair or requalify that provider path.
+`PEAK_MPI_REAL_FINALIZE=0` disables the handoff on any runtime. Explicit `1`
+cannot override a failed release protocol. Skipping
 the real finalizer is non-conforming and cannot by itself guarantee clean
 launcher termination. `MPI_Finalize()` is not a barrier, so PEAK does not claim
 simultaneous return.
@@ -742,10 +743,9 @@ output cannot use MPI collectives in this mode;
 socket output uses launcher rank metadata, while local output writes one file per
 rank. `defer` is not a subset-rank failure-recovery mode: if only some ranks
 call the real MPI finalizer, the MPI runtime itself may still hang or abort.
-Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` also bypasses the Intel MPI 2019
-compatibility skip by calling the real finalizer before PEAK's report-path
-runtime policy executes.
-Do not use `defer` as Intel MPI 2019 crash containment.
+Unless `PEAK_MPI_REAL_FINALIZE=0`, `defer` also calls the real finalizer before
+PEAK's report-path release gate; it does not establish distributed failure
+recovery or resolve the historical Intel MPI 2019 teardown fault.
 
 The practical choice is: use default `report` with either the MPI or socket
 reducer for ordinary MPI jobs that finalize at the end; use `defer` for
@@ -1260,11 +1260,10 @@ Completed in this branch:
     common release gate covers aggregate and local/fallback publication. Ranks
     that complete the gate observe one reduced finalizer-policy value; a local
     error or timeout may not be observed by every peer and therefore remains a
-    best-effort failure path. Healthy runtimes other than Intel MPI 2019 then
-    use the real `PMPI_Finalize()`; Intel MPI 2019
-    skips its observed crash-prone finalizer unless explicitly opted in with
-    `PEAK_MPI_REAL_FINALIZE=1`. Unless real finalization is explicitly disabled
-    with `PEAK_MPI_REAL_FINALIZE=0`, `defer` bypasses that compatibility check.
+    best-effort failure path. Every runtime then uses the real
+    `PMPI_Finalize()` by default after the unchanged safety gates; explicit
+    `PEAK_MPI_REAL_FINALIZE=0` disables it. `defer` calls the real finalizer
+    earlier when permitted, before PEAK's report-path gate.
     Finalizer skip, timeout, and partial-fallback paths remain explicitly best
     effort and require launcher-scale validation.
     Nonzero exit paths that reach process teardown before MPI finalization skip

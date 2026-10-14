@@ -604,7 +604,9 @@ peak_report_formatter_has_csv_output(const PeakReportSnapshot* snapshot)
     }
     for (size_t i = 0; i < snapshot->hook_count; i++) {
         if (peak_report_formatter_slot_is_instrumented(snapshot, i) &&
-            snapshot->num_calls[i] != 0) {
+            (snapshot->num_calls[i] != 0 ||
+             (snapshot->detached != NULL && snapshot->detached[i] != 0) ||
+             (snapshot->reattached != NULL && snapshot->reattached[i] != 0))) {
             return true;
         }
     }
@@ -784,7 +786,8 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         "cuda_failed_apis,degraded_mask,"
         "jit_pending_queue_full,jit_non_executable_timeout,"
         "jit_attach_retry_timeout,jit_allocation_failure,"
-        "jit_provider_generation,jit_pending_count,jit_pending_high_water\n";
+        "jit_provider_generation,jit_pending_count,jit_pending_high_water,"
+        "ever_detached,ever_reattached\n";
     char* temp_csv;
     PeakReportCsvDestination destination = {.dirfd = -1};
     FILE* csv;
@@ -847,7 +850,9 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
         double hook_profile_overhead;
 
         if (!peak_report_formatter_slot_is_instrumented(snapshot, i) ||
-            snapshot->num_calls[i] == 0) {
+            (snapshot->num_calls[i] == 0 &&
+             (snapshot->detached == NULL || snapshot->detached[i] == 0) &&
+             (snapshot->reattached == NULL || snapshot->reattached[i] == 0))) {
             continue;
         }
         hook_profile_overhead =
@@ -857,7 +862,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                   fprintf(
                       csv,
                       ",%lu,%lu,%.12Lg,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,"
-                      "%llu,%llu,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
+                      "%llu,%llu,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,%d,%d\n",
                       snapshot->num_calls[i],
                       peak_report_calls_per_active_thread(
                           snapshot->num_calls[i], snapshot->thread_count[i]),
@@ -871,7 +876,9 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       snapshot->min_total_time[i],
                       hook_profile_overhead,
                       (unsigned long long)snapshot->dropped_calls,
-                      (unsigned long long)snapshot->dropped_threads) >= 0;
+                      (unsigned long long)snapshot->dropped_threads,
+                      snapshot->detached != NULL && snapshot->detached[i] != 0,
+                      snapshot->reattached != NULL && snapshot->reattached[i] != 0) >= 0;
     }
     if (success && (snapshot->dropped_calls != 0 ||
                     snapshot->dropped_threads != 0)) {
@@ -879,7 +886,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_ACCOUNTING_DIAGNOSTICS") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,%llu,%llu,"
-                          "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
+                          "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
                           (unsigned long long)snapshot->dropped_calls,
                           (unsigned long long)snapshot->dropped_threads) >= 0;
     }
@@ -898,7 +905,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv,
                       ",0,0,0,0,0,0,0,0,0,0,0,0,"
                       "0,0,0,0,0,0,0,0,0,0,0,"
-                      "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                      "%llu,%llu,%llu,%llu,%llu,%llu,%llu,0,0\n",
                       (unsigned long long)snapshot->jit.pending_queue_full,
                       (unsigned long long)snapshot->jit.non_executable_timeout,
                       (unsigned long long)snapshot->jit.attach_retry_timeout,
@@ -924,7 +931,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                   fprintf(
                       csv,
                       ",0,0,0,0,0,0,0,0,0,0,0,0,%d,%d,%d,%d,%d,%d,"
-                      "0,0,0,0,0,0,0,0,0,0,0,0\n",
+                      "0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
                       (snapshot->capabilities.requested & mask) != 0,
                       (snapshot->capabilities.compiled & mask) != 0,
                       (snapshot->capabilities.active & mask) != 0,
@@ -937,7 +944,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_CUDA_API_COVERAGE") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                          "%u,%u,%u,%u,0,0,0,0,0,0,0,0\n",
+                          "%u,%u,%u,%u,0,0,0,0,0,0,0,0,0,0\n",
                           snapshot->capabilities.cuda_compiled_apis,
                           snapshot->capabilities.cuda_found_apis,
                           snapshot->capabilities.cuda_installed_apis,
@@ -948,7 +955,7 @@ peak_report_formatter_write_csv_scoped(const PeakReportSnapshot* snapshot,
                       csv, "PEAK_DEGRADED_CAPABILITIES") &&
                   fprintf(csv,
                           ",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                          "0,0,0,0,%u,0,0,0,0,0,0,0\n",
+                          "0,0,0,0,%u,0,0,0,0,0,0,0,0,0\n",
                           snapshot->degraded_mask) >= 0;
     }
     if (!success || ferror(csv)) {
