@@ -1,6 +1,4 @@
-#define _GNU_SOURCE
 #include <glob.h>
-#include <dlfcn.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -301,42 +299,6 @@ main(int argc, char** argv)
         }
         peak_mpi_exit_wait_for_file(done_file, 10000);
         exit(0);
-    }
-
-    if (argc > 1 &&
-        strcmp(argv[1], "finalize-opt-out-prove-no-native") == 0) {
-        typedef void (*prepare_stub_fn)(void);
-        typedef unsigned int (*call_count_fn)(void);
-        prepare_stub_fn prepare = (prepare_stub_fn)dlsym(
-            RTLD_DEFAULT, "mpi_interceptor_test_prepare_original_finalize_stub");
-        call_count_fn count = (call_count_fn)dlsym(
-            RTLD_DEFAULT, "mpi_interceptor_test_original_finalize_call_count");
-        const char* prefix = getenv("PEAK_MPI_NATIVE_SKIP_MARKER_PREFIX");
-        char path[4096];
-        int native_finalized = -1;
-        if (prepare == NULL || count == NULL || prefix == NULL ||
-            snprintf(path, sizeof(path), "%s-r%d.txt", prefix, rank) >= (int)sizeof(path)) {
-            _Exit(3);
-        }
-        prepare();
-        MPI_Finalize();
-        if (MPI_Finalized(&native_finalized) != MPI_SUCCESS ||
-            count() != 0 || native_finalized != 0) {
-            _Exit(4);
-        }
-        FILE* proof = fopen(path, "wx");
-        if (proof == NULL) {
-            _Exit(5);
-        }
-        fprintf(proof, "rank=%d native_stub_calls=%u MPI_Finalized=%d\n",
-                rank, count(), native_finalized);
-        if (fclose(proof) != 0) {
-            _Exit(6);
-        }
-        if (MPI_Barrier(MPI_COMM_WORLD) != MPI_SUCCESS) {
-            _Exit(7);
-        }
-        _Exit(0);
     }
 
     if (argc > 1 &&

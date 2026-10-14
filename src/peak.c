@@ -2044,8 +2044,6 @@ peak_fini_impl(void)
         found_MPI && peak_general_listener_mpi_reducer_failed_closed();
     if (mpi_reducer_failed_closed) {
         peak_mpi_teardown_collectives_mark_failed_closed();
-        use_mpi_collective_output = 0;
-        allow_real_mpi_finalize = 0;
         if (mpi_log_rank) {
             g_printerr("[peak] MPI output reducer failed or timed out; skipping real PMPI_Finalize and avoiding further MPI teardown calls\n");
         }
@@ -2062,8 +2060,6 @@ peak_fini_impl(void)
             peak_general_listener_mpi_reducer_failed_closed();
         if (mpi_reducer_failed_closed) {
             peak_mpi_teardown_collectives_mark_failed_closed();
-            allow_real_mpi_finalize = 0;
-            use_mpi_collective_output = 0;
             if (mpi_log_rank) {
                 g_printerr("[peak] CUDA MPI reducer failed or timed out; skipping real PMPI_Finalize\n");
             }
@@ -2168,8 +2164,6 @@ peak_fini_impl(void)
                 g_printerr("[peak] PEAK report release succeeded; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0\n");
             } else if (!all_real_mpi_finalize_config_allowed) {
                 g_printerr("[peak] At least one rank disabled real PMPI_Finalize by runtime or environment policy; all ranks are skipping it\n");
-            } else {
-                g_printerr("[peak] Real PMPI_Finalize is disabled by policy; skipping real MPI finalizer\n");
             }
         }
     }

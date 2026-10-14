@@ -435,15 +435,6 @@ mpi_interceptor_direct_finalize_enabled(void)
         return 0;
     }
 
-    if (g_ascii_strcasecmp(value, "trampoline") == 0 ||
-        g_ascii_strcasecmp(value, "gum") == 0 ||
-        g_ascii_strcasecmp(value, "0") == 0 ||
-        g_ascii_strcasecmp(value, "false") == 0 ||
-        g_ascii_strcasecmp(value, "no") == 0 ||
-        g_ascii_strcasecmp(value, "off") == 0) {
-        return 0;
-    }
-
     return g_ascii_strcasecmp(value, "direct") == 0 ||
            mpi_interceptor_env_truthy(value);
 }
