@@ -23,6 +23,18 @@
 #include <linux/futex.h>
 #endif
 
+#ifndef PEAK_RELEASE_ACK_EVENT
+#define PEAK_RELEASE_ACK_EVENT 1
+#endif
+#if PEAK_RELEASE_ACK_EVENT != 0 && PEAK_RELEASE_ACK_EVENT != 1
+#error "release ACK event experiment supports only 0 or 1"
+#endif
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+#define PEAK_RELEASE_ACK_WAIT_MODE "ack_futex_or_usleep_fallback"
+#else
+#define PEAK_RELEASE_ACK_WAIT_MODE "usleep"
+#endif
+
 #define PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS 10000
 #define PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS 8192u
 #define PEAK_DETACH_HELPER_PROTOCOL_FD 3
@@ -202,6 +214,9 @@ static _Atomic int signal_epoch_counter = 1;
 static _Atomic int signal_hold_epoch = 0;
 static _Atomic int signal_release_epoch = 0;
 static _Atomic int signal_wait_sequence = 0;
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+static _Atomic int signal_release_done_sequence = 0;
+#endif
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int signal_test_wait_count = 0;
 #endif
@@ -224,6 +239,12 @@ static double strict_gate_wait_timeout_s =
  * This same-address futex access is an explicit supported Linux compiler ABI
  * contract for _Atomic int, not a universal C11 representation proof.
  */
+#if PEAK_RELEASE_ACK_EVENT
+_Static_assert(sizeof(signal_release_done_sequence) == sizeof(int),
+               "release ACK futex word must match int storage");
+_Static_assert(_Alignof(_Atomic int) >= 4,
+               "release ACK futex word must be four-byte aligned");
+#endif
 _Static_assert(sizeof(signal_wait_sequence) == sizeof(int),
                "futex wait word must match int storage");
 _Static_assert(sizeof(int) * CHAR_BIT == 32,
@@ -1645,6 +1666,9 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_hold_epoch) &&
            atomic_is_lock_free(&signal_release_epoch) &&
            atomic_is_lock_free(&signal_wait_sequence) &&
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+           atomic_is_lock_free(&signal_release_done_sequence) &&
+#endif
            atomic_is_lock_free(&signal_slot_count) &&
            atomic_is_lock_free(&signal_slots[0].active_epoch) &&
            atomic_is_lock_free(&signal_slots[0].arrived_epoch) &&
@@ -2021,6 +2045,50 @@ peak_detach_controller_test_wake_signal_waiters(void)
 }
 #endif
 
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+/* Never reset: a late older-epoch ACK may only cause a predicate rescan. */
+static void
+peak_detach_controller_signal_notify_release_done(void)
+{
+    int saved_errno = errno;
+    (void)atomic_fetch_add_explicit(&signal_release_done_sequence,
+                                    1, memory_order_release);
+    (void)peak_exec_raw_syscall6(
+        SYS_futex,
+        (long)(uintptr_t)&signal_release_done_sequence,
+        FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    errno = saved_errno;
+}
+
+static gboolean
+peak_detach_controller_signal_wait_release_done(int expected_sequence,
+                                                double remaining_seconds)
+{
+    /* A lost/delayed wake must not turn this into an IO-timeout-long wait. */
+    if (remaining_seconds <= 0.0) {
+        return FALSE;
+    }
+    long timeout_ns = remaining_seconds < 0.001 ?
+        (long)(remaining_seconds * 1000000000.0) : 1000000L;
+    if (timeout_ns < 1) {
+        timeout_ns = 1;
+    }
+    const struct timespec failsafe_timeout = { .tv_sec = 0, .tv_nsec = timeout_ns };
+    int saved_errno = errno;
+    long result = peak_exec_raw_syscall6(
+        SYS_futex,
+        (long)(uintptr_t)&signal_release_done_sequence,
+        FUTEX_WAIT | FUTEX_PRIVATE_FLAG, expected_sequence,
+        (long)(uintptr_t)&failsafe_timeout, 0, 0);
+    int wait_errno = errno;
+    errno = saved_errno;
+    /* Only the caller's original acquire predicate can establish completion. */
+    return result >= 0 || (result == -1 &&
+        (wait_errno == EAGAIN || wait_errno == EINTR ||
+         wait_errno == ETIMEDOUT));
+}
+#endif
+
 static gboolean
 peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                                                int epoch,
@@ -2058,6 +2126,9 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                               memory_order_release);
     }
     atomic_store_explicit(&slot->done_epoch, epoch, memory_order_release);
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+    peak_detach_controller_signal_notify_release_done();
+#endif
     return TRUE;
 }
 
@@ -2580,9 +2651,18 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     atomic_store_explicit(&signal_release_epoch, epoch, memory_order_release);
     peak_detach_controller_signal_wake_release_waiters();
 
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+    double release_started_at = peak_detach_controller_monotonic_second();
+    double deadline = release_started_at +
+#else
     double deadline = peak_detach_controller_monotonic_second() +
+#endif
         ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     for (;;) {
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+        int expected_done_sequence = atomic_load_explicit(
+            &signal_release_done_sequence, memory_order_acquire);
+#endif
         gboolean all_done = TRUE;
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
             PeakDetachSignalSlot* slot = &signal_slots[i];
@@ -2628,13 +2708,26 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             }
             return TRUE;
         }
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+        double now = peak_detach_controller_monotonic_second();
+        if (now >= deadline) {
+#else
         if (peak_detach_controller_monotonic_second() >= deadline) {
+#endif
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_TIMEOUT;
             }
             return FALSE;
         }
+#if defined(__linux__) && PEAK_RELEASE_ACK_EVENT
+        if (release_started_at <= 0.0 || now <= 0.0 ||
+            !peak_detach_controller_signal_wait_release_done(
+                expected_done_sequence, deadline - now)) {
+            usleep(1000);
+        }
+#else
         usleep(1000);
+#endif
     }
 }
 

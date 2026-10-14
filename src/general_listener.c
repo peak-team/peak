@@ -4686,6 +4686,60 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
     return did_work;
 }
 
+typedef struct {
+    pthread_t* tid_keys;
+    size_t* mapped_ids;
+    int* pause_session_ids;
+    int* pause_status;
+    GumInterceptor* interceptor;
+    gboolean fast_ignored;
+    gboolean gum_ignored;
+} PeakGeneralDrainCleanup;
+
+static void
+peak_general_listener_restore_cancel_type(void* data)
+{
+    int original_type = *(int*)data;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    (void)pthread_setcanceltype(original_type, NULL);
+}
+
+/* Entry contract: cancellation is currently disabled; state is its saved caller state. */
+static void
+peak_general_listener_restore_cancel_state(int state)
+{
+    if (state == PTHREAD_CANCEL_DISABLE) {
+        return;
+    }
+    /* The caller is currently disabled. Deliver pending cancellation at an
+     * explicit deferred boundary, while preserving its type for outer cleanup. */
+    int original_type;
+    (void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &original_type);
+    pthread_cleanup_push(peak_general_listener_restore_cancel_type, &original_type);
+    (void)pthread_setcancelstate(state, NULL);
+    pthread_testcancel();
+    (void)pthread_setcanceltype(original_type, NULL);
+    pthread_cleanup_pop(0);
+}
+
+static void
+peak_general_listener_drain_cleanup(void* data)
+{
+    PeakGeneralDrainCleanup* cleanup = data;
+    /* Both normal cleanup and cancellation unwind run without re-cancellation. */
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    g_free(cleanup->pause_status);
+    g_free(cleanup->pause_session_ids);
+    g_free(cleanup->mapped_ids);
+    g_free(cleanup->tid_keys);
+    if (cleanup->gum_ignored) {
+        gum_interceptor_unignore_current_thread(cleanup->interceptor);
+    }
+    if (cleanup->fast_ignored) {
+        peak_general_listener_fast_unignore_current_thread();
+    }
+}
+
 gboolean
 peak_general_listener_controller_drain(unsigned int timeout_ms)
 {
@@ -4699,29 +4753,45 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
         return TRUE;
     }
 
+    int caller_cancel_state;
+    int cleanup_cancel_state;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &caller_cancel_state);
+    PeakGeneralDrainCleanup cleanup = { .interceptor = interceptor };
     pthread_t controller_tid = pthread_self();
-    pthread_t* tid_keys = g_new0(pthread_t, peak_max_num_threads);
-    size_t* mapped_ids = g_new0(size_t, peak_max_num_threads);
-    int* pause_session_ids = g_new0(int, peak_max_num_threads);
-    int* pause_status = g_new0(int, peak_max_num_threads);
-    double deadline = peak_second() + ((double)timeout_ms / 1000.0);
+    double deadline;
     gboolean drained = FALSE;
 
+    cleanup.tid_keys = g_new0(pthread_t, peak_max_num_threads);
+    cleanup.mapped_ids = g_new0(size_t, peak_max_num_threads);
+    cleanup.pause_session_ids = g_new0(int, peak_max_num_threads);
+    cleanup.pause_status = g_new0(int, peak_max_num_threads);
+    deadline = peak_second() + ((double)timeout_ms / 1000.0);
     peak_general_listener_fast_ignore_current_thread();
-    gum_interceptor_ignore_current_thread(interceptor);
+    cleanup.fast_ignored = TRUE;
+    gum_interceptor_ignore_current_thread(cleanup.interceptor);
+    cleanup.gum_ignored = TRUE;
+    pthread_cleanup_push(peak_general_listener_drain_cleanup, &cleanup);
+    peak_general_listener_restore_cancel_state(caller_cancel_state);
 
     for (;;) {
         gboolean pending;
-
+        int iteration_cancel_state;
+        /* Reclaim also owns PEAK locks; protect it before taking the controller
+         * lock and until mutation release and state publication have finished. */
+        (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iteration_cancel_state);
         (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
-                                                               tid_keys,
-                                                               mapped_ids,
-                                                               pause_session_ids,
-                                                               pause_status);
+                                                               cleanup.tid_keys,
+                                                               cleanup.mapped_ids,
+                                                               cleanup.pause_session_ids,
+                                                               cleanup.pause_status);
         pending = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
+        /* This is an explicit new safe cancellation boundary, even when the
+         * iteration needed no ACK wait. The caller's type is restored before
+         * normal return or outer cancellation cleanup. */
+        peak_general_listener_restore_cancel_state(iteration_cancel_state);
 
         if (!pending) {
             drained = TRUE;
@@ -4735,20 +4805,18 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
         usleep(1000);
     }
 
-    g_free(pause_status);
-    g_free(pause_session_ids);
-    g_free(mapped_ids);
-    g_free(tid_keys);
-
-    gum_interceptor_unignore_current_thread(interceptor);
-    peak_general_listener_fast_unignore_current_thread();
-
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cleanup_cancel_state);
+    pthread_cleanup_pop(1);
+    peak_general_listener_restore_cancel_state(cleanup_cancel_state);
     return drained;
 }
 
 static void*
 peak_general_controller_thread_main(void* arg)
 {
+    /* This PEAK-owned thread stops cooperatively; cancellation must not strand
+     * controller, loader/JIT, or peer-quiescence state. */
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     (void)arg;
     peak_general_listener_exclude_current_thread();
 
