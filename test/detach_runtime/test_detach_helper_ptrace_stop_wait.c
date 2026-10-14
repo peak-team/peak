@@ -42,6 +42,7 @@ static size_t clock_value_count;
 static size_t clock_value_index;
 static int waitpid_calls;
 static int sigtimedwait_calls;
+static long last_requested_ns;
 static char call_sequence[8];
 static size_t call_sequence_length;
 
@@ -93,7 +94,7 @@ sigtimedwait_for_test(const sigset_t* set,
 
     (void)set;
     (void)info;
-    (void)timeout;
+    last_requested_ns=timeout->tv_sec*1000000000L+timeout->tv_nsec;
     call_sequence[call_sequence_length++] = 'S';
     sigtimedwait_calls++;
     if (signal_step_index >= signal_step_count) {
@@ -226,16 +227,52 @@ test_unrelated_sigchld_wake_precedes_target_progress(void)
     return 0;
 }
 
+
+static int test_absolute_expired_ready(void) {
+ int signal=-1;reset_fixture();wait_steps[wait_step_count++]=(WaitStep){1234,(SIGUSR1<<8)|0x7f,0};
+ clock_values[clock_value_count++]=9000;
+ CHECK(wait_for_ptrace_stop_until(1234,&signal,100)==0);CHECK(signal==SIGUSR1);
+ CHECK(clock_value_index==0);CHECK(sigtimedwait_calls==0);return 0;
+}
+static int test_absolute_expired_not_ready(void) {
+ int signal=-1;reset_fixture();wait_steps[wait_step_count++]=(WaitStep){0,0,0};clock_values[clock_value_count++]=100;
+ CHECK(wait_for_ptrace_stop_until(1234,&signal,100)==-1);CHECK(errno==ETIMEDOUT);CHECK(sigtimedwait_calls==0);return 0;
+}
+static int test_eagain_ready_status_first(void) {
+ int signal=-1;reset_fixture();wait_steps[wait_step_count++]=(WaitStep){0,0,0};
+ wait_steps[wait_step_count++]=(WaitStep){1234,(SIGSTOP<<8)|0x7f,0};
+ signal_steps[signal_step_count++]=(SignalStep){-1,EAGAIN};clock_values[clock_value_count++]=99;
+ CHECK(wait_for_ptrace_stop_until(1234,&signal,100)==-1);CHECK(errno==ETIMEDOUT);CHECK(signal==0);
+ CHECK(waitpid_calls==1&&sigtimedwait_calls==1);CHECK(call_sequence[0]=='W'&&call_sequence[1]=='S');CHECK(last_requested_ns==1000000L);return 0;
+}
+static int test_eagain_notready_status_first(void) {
+ int signal=-1;reset_fixture();wait_steps[wait_step_count++]=(WaitStep){0,0,0};wait_steps[wait_step_count++]=(WaitStep){0,0,0};
+ signal_steps[signal_step_count++]=(SignalStep){-1,EAGAIN};clock_values[clock_value_count++]=99;clock_values[clock_value_count++]=100;
+ CHECK(wait_for_ptrace_stop_until(1234,&signal,100)==-1);CHECK(errno==ETIMEDOUT);
+ CHECK(waitpid_calls==1&&sigtimedwait_calls==1);CHECK(last_requested_ns==1000000L);return 0;
+}
+
+static int test_normal_wrapper_eagain_legacy(void) {
+ int signal=-1;reset_fixture();wait_steps[wait_step_count++]=(WaitStep){0,0,0};
+ wait_steps[wait_step_count++]=(WaitStep){1234,(SIGSTOP<<8)|0x7f,0};
+ signal_steps[signal_step_count++]=(SignalStep){-1,EAGAIN};
+ clock_values[clock_value_count++]=100;clock_values[clock_value_count++]=101;
+ CHECK(wait_for_ptrace_stop(1234,&signal)==-1);CHECK(errno==ETIMEDOUT);
+ CHECK(waitpid_calls==1&&wait_step_index==1&&sigtimedwait_calls==1);
+ CHECK(signal==0&&last_requested_ns==4999000000L);return 0;
+}
 int
 main(void)
 {
-    if (test_deadline_times_out() != 0 ||
+    if (test_normal_wrapper_eagain_legacy()!=0 || test_absolute_expired_ready()!=0 || test_absolute_expired_not_ready()!=0 ||
+        test_eagain_ready_status_first()!=0 || test_eagain_notready_status_first()!=0 ||
+        test_deadline_times_out() != 0 ||
         test_no_child_failure_propagates() != 0 ||
         test_coalesced_sigchld_wake_consumes_target_stop() != 0 ||
         test_unrelated_sigchld_wake_precedes_target_progress() != 0) {
         return 1;
     }
 
-    puts("detach_helper_ptrace_stop_wait_unit_ok");
+    puts("detach_helper_ptrace_stop_wait_unit_ok original4 plus_legacy5");
     return 0;
 }

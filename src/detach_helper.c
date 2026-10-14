@@ -31,6 +31,9 @@ typedef struct {
     pid_t tid;
     int attached;
     int detach_signal;
+    int interrupt_requested;
+    int stop_observed;
+    long pending_cleanup_deadline;
 } PeakHeldThread;
 
 static PeakHeldThread held_threads[PEAK_DETACH_HELPER_MAX_THREADS];
@@ -131,6 +134,9 @@ monotonic_milliseconds(void)
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
+static int wait_for_ptrace_stop_until(pid_t tid, int* detach_signal_out,
+                                      long deadline);
+
 static PeakDetachHelperStatus
 detach_held_threads(int* errno_out)
 {
@@ -143,6 +149,30 @@ detach_held_threads(int* errno_out)
 
     for (size_t i = 0; i < held_thread_count; i++) {
         if (held_threads[i].attached) {
+            if (held_threads[i].interrupt_requested &&
+                !held_threads[i].stop_observed) {
+                if (wait_for_ptrace_stop_until(held_threads[i].tid,
+                                              &held_threads[i].detach_signal,
+                                              held_threads[i].pending_cleanup_deadline) != 0) {
+                    int wait_errno = errno;
+                    /* Wait ESRCH alone does not prove disappearance. */
+                    if (wait_errno == ESRCH || wait_errno == ECHILD) {
+                        char path[64];
+                        snprintf(path, sizeof(path), "/proc/%ld/status",
+                                 (long)held_threads[i].tid);
+                        int fd = open(path, O_RDONLY | O_CLOEXEC);
+                        if (fd >= 0) close(fd);
+                        else if (errno == ENOENT) continue;
+                    }
+                    if (errno_out != NULL && *errno_out == 0) {
+                        *errno_out = wait_errno;
+                    }
+                    status = PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+                    held_threads[retained_count++] = held_threads[i];
+                    continue;
+                }
+                held_threads[i].stop_observed = 1;
+            }
             if (ptrace(PTRACE_DETACH,
                        held_threads[i].tid,
                        NULL,
@@ -270,10 +300,9 @@ parse_tid_name(const char* name, pid_t* tid_out)
 }
 
 static int
-wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
+wait_for_ptrace_stop_until(pid_t tid, int* detach_signal_out, long deadline)
 {
     sigset_t sigchld_mask;
-    long deadline = monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
 
     sigemptyset(&sigchld_mask);
     sigaddset(&sigchld_mask, SIGCHLD);
@@ -339,6 +368,15 @@ wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
             return -1;
         }
     }
+}
+
+/* Normal collection retains the original fresh per-wait deadline. */
+static int
+wait_for_ptrace_stop(pid_t tid, int* detach_signal_out)
+{
+    return wait_for_ptrace_stop_until(
+        tid, detach_signal_out,
+        monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS);
 }
 
 #if defined(__x86_64__) || defined(__amd64__)
@@ -556,6 +594,9 @@ restart_stop_snapshot:
                 PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
         }
 
+        size_t pending_base = held_thread_count;
+        uint32_t pending_count = 0;
+        int census_errno = 0;
         for (;;) {
             struct dirent* entry;
             pid_t tid;
@@ -564,6 +605,7 @@ restart_stop_snapshot:
             errno = 0;
             entry = readdir(task_dir);
             if (entry == NULL) {
+                census_errno = errno;
                 break;
             }
 
@@ -572,7 +614,7 @@ restart_stop_snapshot:
                 continue;
             }
 
-            if (snapshot_count >= PEAK_DETACH_HELPER_MAX_THREADS ||
+            if (snapshot_count + pending_count >= PEAK_DETACH_HELPER_MAX_THREADS ||
                 held_thread_count >= PEAK_DETACH_HELPER_MAX_THREADS) {
                 closedir(task_dir);
                 *errno_out = E2BIG;
@@ -581,7 +623,7 @@ restart_stop_snapshot:
                     errno_out);
             }
 
-            snapshot = &snapshots[snapshot_count];
+            snapshot = &snapshots[snapshot_count + pending_count];
             snapshot->tid = tid;
             snapshot->status = PEAK_DETACH_HELPER_THREAD_OK;
             snapshot->pc = 0;
@@ -610,6 +652,9 @@ restart_stop_snapshot:
             held_thread->tid = tid;
             held_thread->attached = 1;
             held_thread->detach_signal = 0;
+            held_thread->interrupt_requested = 0;
+            held_thread->stop_observed = 0;
+            held_thread->pending_cleanup_deadline = 0;
             held_thread_count++;
 
             if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
@@ -631,6 +676,24 @@ restart_stop_snapshot:
                 return status;
             }
 
+            held_thread->interrupt_requested = 1;
+            held_thread->pending_cleanup_deadline =
+                monotonic_milliseconds() + PEAK_DETACH_HELPER_STOP_TIMEOUT_MS;
+            pending_count++;
+#else
+            *errno_out = ENOTSUP;
+            closedir(task_dir);
+            return cleanup_held_threads_or_release_failed(
+                PEAK_DETACH_HELPER_STATUS_UNSUPPORTED,
+                errno_out);
+#endif
+
+        }
+
+        for (uint32_t i = 0; i < pending_count; i++) {
+            PeakHeldThread* held_thread = &held_threads[pending_base + i];
+            pid_t tid = held_thread->tid;
+            PeakDetachHelperThreadSnapshot* snapshot = &snapshots[snapshot_count];
             if (wait_for_ptrace_stop(tid, &held_thread->detach_signal) != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
@@ -649,13 +712,7 @@ restart_stop_snapshot:
                 }
                 return status;
             }
-#else
-            *errno_out = ENOTSUP;
-            closedir(task_dir);
-            return cleanup_held_threads_or_release_failed(
-                PEAK_DETACH_HELPER_STATUS_UNSUPPORTED,
-                errno_out);
-#endif
+            held_thread->stop_observed = 1;
 
             PeakRegs regs;
             if (peak_regs_get(tid, &regs) != 0) {
@@ -695,8 +752,8 @@ restart_stop_snapshot:
             snapshot_count++;
         }
 
-        if (errno != 0) {
-            *errno_out = errno;
+        if (census_errno != 0) {
+            *errno_out = census_errno;
             closedir(task_dir);
             return cleanup_held_threads_or_release_failed(
                 PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR,

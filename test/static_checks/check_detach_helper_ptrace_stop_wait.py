@@ -6,8 +6,10 @@ import sys
 
 
 def function_body(source: str, name: str) -> str:
-    start = source.index(f"{name}(")
-    open_brace = source.index("{", start)
+    definition = re.search(rf"(?m)^\s*{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{", source)
+    if definition is None:
+        raise ValueError(f"missing definition of {name}")
+    open_brace = source.index("{", definition.start())
     depth = 0
     for index in range(open_brace, len(source)):
         if source[index] == "{":
@@ -25,7 +27,7 @@ def main() -> int:
         return 2
 
     source = (pathlib.Path(sys.argv[1]) / "src" / "detach_helper.c").read_text()
-    body = function_body(source, "wait_for_ptrace_stop")
+    body = function_body(source, "wait_for_ptrace_stop_until")
     if "sigtimedwait(" not in body or "SIGCHLD" not in body:
         print("ptrace stop wait must wait for SIGCHLD", file=sys.stderr)
         return 1

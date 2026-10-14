@@ -676,6 +676,13 @@ if(BUILD_TESTING)
             PROPERTIES
                 TIMEOUT 2
                 PASS_REGULAR_EXPRESSION "detach_helper_release_ok")
+
+        add_test(NAME test_detach_helper_fanout_unit
+            COMMAND $<TARGET_FILE:test_detach_helper_fanout>)
+        set_tests_properties(test_detach_helper_fanout_unit
+            PROPERTIES
+                TIMEOUT 5
+                PASS_REGULAR_EXPRESSION "full_fanout_11_mock_paths_ok")
     endif()
 
     configure_file(${PROJECT_SOURCE_DIR}/test/data/blas_symbols.conf ${PROJECT_BINARY_DIR}/test/data/blas_symbols.conf COPYONLY)

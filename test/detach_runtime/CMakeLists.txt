@@ -57,6 +57,13 @@ if(TARGET peak_detach_helper)
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include
   )
+
+  add_executable(test_detach_helper_fanout
+    test_detach_helper_fanout.c)
+  target_include_directories(test_detach_helper_fanout
+    PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+  )
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)
