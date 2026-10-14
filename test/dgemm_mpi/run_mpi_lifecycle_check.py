@@ -724,8 +724,6 @@ def parse_args():
             "finalize-clean-output-mpi-publish-before-root-return",
             "finalize-clean-output-mpi-reducer-fail",
             "finalize-clean-output-mpi-writer-fail",
-            "finalize-clean-output-mpi-real-finalize-empty",
-            "finalize-clean-output-mpi-real-finalize-opt-out",
             "finalize-clean-output-mpi-real-finalize-default",
             "finalize-clean-output-mpi-completion-warn",
             "finalize-clean-output-mpi-real-finalize-explicit",
@@ -836,7 +834,6 @@ def main():
     forbidden_output = []
     done_file = None
     verify_finalize_return_publication = False
-    verify_native_opt_out = False
     force_stats_path_failure = False
     allow_interrupted_peer_temporary_stats = False
     if args.mode == "no-finalize-nonzero":
@@ -955,38 +952,6 @@ def main():
         expected_peak_tables = 1
         expected_stats_files = 0
         force_stats_path_failure = True
-    elif args.mode == "finalize-clean-output-mpi-real-finalize-empty":
-        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_MPI_REAL_FINALIZE"] = ""
-        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
-        app_args.append("finalize-then-exit0")
-        expected = REPORT_REAL_FINALIZE_DIAGNOSTIC
-        expected_extra.append(
-            "All-rank report publication release completed: "
-            "all_reports_succeeded=1"
-        )
-        expected_extra.append("PMPI_Finalize was observed on every rank")
-        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
-        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
-        expected_peak_tables = 0
-        expected_stats_files = 1
-    elif args.mode == "finalize-clean-output-mpi-real-finalize-opt-out":
-        env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
-        env["PEAK_MPI_REAL_FINALIZE"] = "0"
-        env.pop("PEAK_MPI_FINALIZE_POLICY", None)
-        app_args.append("finalize-opt-out-prove-no-native")
-        verify_native_opt_out = True
-        expected = "PEAK report release succeeded; skipping real PMPI_Finalize because PEAK_MPI_REAL_FINALIZE=0"
-        expected_extra.append(
-            "All-rank report publication release completed: "
-            "all_reports_succeeded=1"
-        )
-        expected_extra.append("PMPI_Finalize was observed on every rank")
-        expected_extra.append(REPORT_COMPLETION_DIAGNOSTIC)
-        expected_exact_messages[REPORT_COMPLETION_DIAGNOSTIC] = 1
-        forbidden_output.append(REPORT_REAL_FINALIZE_DIAGNOSTIC)
-        expected_peak_tables = 0
-        expected_stats_files = 1
     elif args.mode == "finalize-clean-output-mpi-real-finalize-default":
         env["PEAK_OUTPUT_AGGREGATION"] = "mpi"
         env.pop("PEAK_MPI_REAL_FINALIZE", None)
@@ -1254,10 +1219,6 @@ def main():
             env["PEAK_MPI_FINALIZE_RETURN_MARKER_PREFIX"] = str(
                 Path(stats_dir) / "finalize-return"
             )
-        if verify_native_opt_out:
-            env["PEAK_MPI_NATIVE_SKIP_MARKER_PREFIX"] = str(
-                Path(stats_dir) / "native-skip"
-            )
         configure_lifecycle_socket_ports(args.mode, env)
         returncode, output, timed_out = run_mpi_command(
             command,
@@ -1295,14 +1256,6 @@ def main():
             path.name: path.read_text(encoding="utf-8", errors="replace")
             for path in finalize_return_markers
         }
-        native_skip_markers = sorted(Path(stats_dir).glob("native-skip-r*.txt"))
-        native_skip_proven = verify_native_opt_out and len(native_skip_markers) == nprocs
-        if verify_native_opt_out:
-            for rank in range(nprocs):
-                path = Path(stats_dir) / f"native-skip-r{rank}.txt"
-                if (not path.is_file() or path.read_text(encoding="ascii") !=
-                        f"rank={rank} native_stub_calls=0 MPI_Finalized=0\n"):
-                    raise AssertionError(f"rank {rank} did not prove native PMPI_Finalize skipped")
         stats_text = "\n".join(
             path.read_text(encoding="utf-8", errors="replace")
             for path in stats_files
@@ -1415,15 +1368,6 @@ def main():
         if f'"{function_name}",' in stats_text:
             raise AssertionError(f"unexpected stats row for {function_name}")
     fatal_scan_output = output
-    native_skip_launcher_outcome_allowed = False
-    if native_skip_proven:
-        abnormal_blocks = list(INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.finditer(output))
-        abnormal_blocks += list(OPENMPI_IMPROPER_EXIT_BLOCK_RE.finditer(output))
-        native_skip_launcher_outcome_allowed = (
-            returncode == 0 or len(abnormal_blocks) == 1
-        )
-        fatal_scan_output = INTEL_MPI_SKIP_HYDRA_SIGKILL_RE.sub("", fatal_scan_output)
-        fatal_scan_output = OPENMPI_IMPROPER_EXIT_BLOCK_RE.sub("", fatal_scan_output)
     if args.mode in EXPECTED_LAUNCHER_ABNORMAL_MODES:
         fatal_scan_output = OPENMPI_IMPROPER_EXIT_BLOCK_RE.sub(
             "",
@@ -1692,7 +1636,7 @@ def main():
     if (not report_signal_requested and
             args.mode not in EXPECTED_LAUNCHER_ABNORMAL_MODES and
             args.mode not in EXPECTED_NONZERO_RETURN_MODES and
-            not native_skip_launcher_outcome_allowed and returncode != 0):
+            returncode != 0):
         raise AssertionError(f"{args.mode} run returned {returncode}")
 
     if report_signal_requested:

@@ -62,7 +62,7 @@ if(OpenMP_FOUND)
 else()
     target_link_libraries(test_dgemm_mpi PRIVATE ${BLAS_LIBRARIES} MPI::MPI_C)
 endif()
-target_link_libraries(test_mpi_exit_before_finalize PRIVATE MPI::MPI_C ${CMAKE_DL_LIBS})
+target_link_libraries(test_mpi_exit_before_finalize PRIVATE MPI::MPI_C)
 target_link_libraries(test_mpi_report_reduction PRIVATE peak MPI::MPI_C m)
 target_compile_definitions(test_mpi_report_reduction
     PRIVATE PEAK_ENABLE_TEST_HOOKS=1 HAVE_MPI=1)
