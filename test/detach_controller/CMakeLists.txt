@@ -706,4 +706,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
   target_link_libraries(test_signal_nonrt_reentry PRIVATE Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY})
   add_test(NAME test_signal_nonrt_reentry COMMAND test_signal_nonrt_reentry)
   set_tests_properties(test_signal_nonrt_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
+  add_executable(test_signal_nonrt_event_reentry
+    test_signal_nonrt_event_reentry.c ${PROJECT_SOURCE_DIR}/src/signal_policy.c
+    ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall_trampoline.S)
+  target_include_directories(test_signal_nonrt_event_reentry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_options(test_signal_nonrt_event_reentry PRIVATE -Wl,--wrap=pthread_mutex_lock)
+  target_link_libraries(test_signal_nonrt_event_reentry PRIVATE Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY})
+  add_test(NAME test_signal_nonrt_event_reentry COMMAND test_signal_nonrt_event_reentry)
+  set_tests_properties(test_signal_nonrt_event_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
 endif()

@@ -761,10 +761,15 @@ peak_signal_policy_prepare_event_for_user_excluding(
     }
 
     int signum = 0;
-    if (!peak_signal_policy_event_signal(evp, &signum)) {
+    /* Best-effort event inspection must not leak its errno to the native API. */
+    int saved_errno = errno;
+    int decoded = peak_signal_policy_event_signal(evp, &signum);
+    errno = saved_errno;
+    if (!decoded) {
         return 1;
     }
-    if (signum <= 0) {
+    /* Reservations are RT-only; ordinary events cannot need migration. */
+    if (signum < SIGRTMIN || signum > SIGRTMAX) {
         return 1;
     }
 
