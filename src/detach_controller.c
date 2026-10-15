@@ -131,7 +131,12 @@ typedef struct {
     PeakDetachHeldMutation mutation;
 } PeakDetachBatchCandidate;
 
+#define PEAK_SIGNAL_SLOT_OPEN UINT64_C(1)
+#define PEAK_SIGNAL_SLOT_READER UINT64_C(2)
+#define PEAK_SIGNAL_SLOT_READERS UINT64_C(65534)
+
 typedef struct {
+    _Atomic uint64_t lifetime;
     _Atomic int active_epoch;
     _Atomic int arrived_epoch;
     _Atomic int done_epoch;
@@ -174,6 +179,8 @@ typedef struct {
 static gboolean peak_detach_controller_wait_fd(int fd, short events);
 static void peak_detach_controller_signal_release_or_fatal(const char* context);
 static void peak_detach_controller_signal_receipts_after_fork_child(void);
+static void peak_detach_controller_signal_slots_after_fork_child(void);
+static void peak_detach_controller_signal_wake_release_waiters(void);
 static void peak_detach_controller_signal_handler(int signo,
                                                   siginfo_t* info,
                                                   void* context);
@@ -232,6 +239,10 @@ static _Atomic int strict_mutation_thread_gate_installed = 0;
 static useconds_t configured_test_gate_delay_us = 0;
 #endif
 static PeakDetachSignalSlot signal_slots[PEAK_DETACH_HELPER_MAX_THREADS];
+static _Atomic uint32_t current_slot_indices[PEAK_DETACH_HELPER_MAX_THREADS];
+/* Controller-only, nonwrapping physical-slot allocation identity. */
+static uint64_t signal_slot_next_ticket = 1;
+static pid_t atfork_calling_tid;
 static PeakDetachSignalReceipt signal_receipts[PEAK_DETACH_HELPER_MAX_THREADS];
 /* Controller-owned, nonwrapping allocation tickets distinguish every reuse. */
 static uint64_t signal_receipt_next_ticket = 1;
@@ -536,6 +547,7 @@ static void
 peak_detach_controller_atfork_prepare(void)
 {
     peak_detach_controller_lock_mutation_guard();
+    atfork_calling_tid = (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
 }
 
 static void
@@ -557,6 +569,7 @@ peak_detach_controller_atfork_child(void)
     held_mutation = (PeakDetachHeldMutation){ 0 };
     memset(physical_patch_records, 0, sizeof(physical_patch_records));
     peak_detach_controller_signal_receipts_after_fork_child();
+    peak_detach_controller_signal_slots_after_fork_child();
     peak_detach_controller_init_mutation_guard();
     peak_filesystem_stat_guard_controller_after_fork_child();
 }
@@ -1677,6 +1690,8 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_receipts[0].epoch) &&
            atomic_is_lock_free(&signal_receipts[0].tid) &&
            atomic_is_lock_free(&signal_receipts[0].signum) &&
+           atomic_is_lock_free(&signal_slots[0].lifetime) &&
+           atomic_is_lock_free(&current_slot_indices[0]) &&
            atomic_is_lock_free(&signal_slots[0].active_epoch) &&
            atomic_is_lock_free(&signal_slots[0].arrived_epoch) &&
            atomic_is_lock_free(&signal_slots[0].done_epoch) &&
@@ -1920,15 +1935,108 @@ peak_detach_controller_signal_tid_blocks_reserved_once(pid_t tid)
 }
 
 static PeakDetachSignalSlot*
+peak_detach_controller_current_slot_at(uint32_t index)
+{
+    /* Only the controller publishes indices, always within the fixed pool. */
+    uint32_t physical = atomic_load_explicit(&current_slot_indices[index], memory_order_acquire);
+    return &signal_slots[physical];
+}
+
+static void
+peak_detach_controller_signal_slot_close(PeakDetachSignalSlot* slot)
+{
+    (void)atomic_fetch_and_explicit(&slot->lifetime, ~PEAK_SIGNAL_SLOT_OPEN,
+                                    memory_order_acq_rel);
+}
+
+static void
+peak_detach_controller_signal_slot_unpin(PeakDetachSignalSlot* slot)
+{
+    (void)atomic_fetch_sub_explicit(&slot->lifetime, PEAK_SIGNAL_SLOT_READER,
+                                   memory_order_release);
+    /* The caller must not access this slot again after dropping its pin. */
+}
+
+static void
+peak_detach_controller_signal_slots_after_fork_child(void)
+{
+    if (signal_slot_next_ticket == 1) {
+        return;
+    }
+    /* An application handler may fork while interrupting a pinned PEAK frame.
+     * Its calling thread's old frames survive in the child; close but retain
+     * their tags/readers. Other parent threads and their frames do not survive.
+     * Rebind only its closed copied owner TID so a nested repeated fork also
+     * preserves those frames. Pinned handlers never reread that identity. */
+    pid_t child_tid = (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
+        PeakDetachSignalSlot* slot = &signal_slots[i];
+        peak_detach_controller_signal_slot_close(slot);
+        if (atomic_load_explicit(&slot->tid, memory_order_relaxed) != atfork_calling_tid) {
+            atomic_store_explicit(&slot->lifetime, 0, memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&slot->tid, (int)child_tid, memory_order_relaxed);
+        }
+    }
+    atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
+    atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
+    atomic_store_explicit(&signal_release_epoch, 0, memory_order_release);
+    peak_detach_controller_signal_wake_release_waiters();
+}
+
+static PeakDetachSignalSlot*
 peak_detach_controller_signal_find_slot(pid_t tid, int epoch)
 {
     uint32_t count = atomic_load_explicit(&signal_slot_count, memory_order_acquire);
     for (uint32_t i = 0; i < count; i++) {
-        PeakDetachSignalSlot* slot = &signal_slots[i];
-        if (atomic_load_explicit(&slot->active_epoch, memory_order_acquire) == epoch &&
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
+        if ((atomic_load_explicit(&slot->lifetime, memory_order_acquire) & PEAK_SIGNAL_SLOT_OPEN) != 0 &&
+            atomic_load_explicit(&slot->active_epoch, memory_order_acquire) == epoch &&
             atomic_load_explicit(&slot->tid, memory_order_acquire) == (int)tid) {
             return slot;
         }
+    }
+    return NULL;
+}
+
+static PeakDetachSignalSlot*
+peak_detach_controller_signal_pin_slot(pid_t tid, int epoch)
+{
+    uint32_t count = atomic_load_explicit(&signal_slot_count, memory_order_acquire);
+    for (uint32_t i = 0; i < count; i++) {
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
+        uint64_t state = atomic_load_explicit(&slot->lifetime, memory_order_acquire);
+        if ((state & PEAK_SIGNAL_SLOT_OPEN) == 0 ||
+            (state & PEAK_SIGNAL_SLOT_READERS) == PEAK_SIGNAL_SLOT_READERS ||
+            atomic_load_explicit(&slot->active_epoch, memory_order_relaxed) != epoch ||
+            atomic_load_explicit(&slot->tid, memory_order_relaxed) != (int)tid) {
+            continue;
+        }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        extern void peak_test_signal_slot_before_pin(int, pid_t, void*) __attribute__((weak));
+        if (peak_test_signal_slot_before_pin != NULL) {
+            int saved_errno = errno;
+            peak_test_signal_slot_before_pin(epoch, tid, slot);
+            errno = saved_errno;
+        }
+#endif
+        /* One strong CAS only. A close/reuse or competing reader makes this
+         * attempt abandon the entry, never retry into a different allocation. */
+        if (!atomic_compare_exchange_strong_explicit(&slot->lifetime, &state,
+                                                     state + PEAK_SIGNAL_SLOT_READER,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            continue;
+        }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        extern void peak_test_signal_slot_after_pin(int, pid_t, void*) __attribute__((weak));
+        if (peak_test_signal_slot_after_pin != NULL) {
+            int saved_errno = errno;
+            peak_test_signal_slot_after_pin(epoch, tid, slot);
+            errno = saved_errno;
+        }
+#endif
+        return slot;
     }
     return NULL;
 }
@@ -1940,29 +2048,101 @@ peak_detach_controller_signal_alloc_slot(pid_t tid, int epoch)
     if (slot != NULL) {
         return slot;
     }
-
+    const char* failure_reason = "signal-slot-capacity";
+    if (signal_slot_next_ticket > (UINT64_MAX >> 16)) {
+        failure_reason = "signal-slot-ticket-exhausted";
+        goto fail;
+    }
     uint32_t count = atomic_load_explicit(&signal_slot_count, memory_order_acquire);
+    uint32_t position = count;
     for (uint32_t i = 0; i < count; i++) {
-        slot = &signal_slots[i];
-        if (atomic_load_explicit(&slot->active_epoch, memory_order_acquire) != epoch) {
-            memset(slot, 0, sizeof(*slot));
-            atomic_store_explicit(&slot->tid, (int)tid, memory_order_release);
-            atomic_store_explicit(&slot->active_epoch, epoch, memory_order_release);
-            return slot;
+        PeakDetachSignalSlot* current = peak_detach_controller_current_slot_at(i);
+        if ((atomic_load_explicit(&current->lifetime, memory_order_acquire) & PEAK_SIGNAL_SLOT_OPEN) == 0 ||
+            atomic_load_explicit(&current->active_epoch, memory_order_relaxed) != epoch) {
+            position = i;
+            break;
         }
     }
-
-    if (count >= PEAK_DETACH_HELPER_MAX_THREADS) {
-        return NULL;
+    if (position >= PEAK_DETACH_HELPER_MAX_THREADS) {
+        goto fail;
     }
-
-    slot = &signal_slots[count];
-    memset(slot, 0, sizeof(*slot));
-    atomic_store_explicit(&slot->tid, (int)tid, memory_order_release);
-    atomic_store_explicit(&slot->active_epoch, epoch, memory_order_release);
-    atomic_store_explicit(&signal_slot_count, count + 1, memory_order_release);
-    return slot;
+    for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
+        slot = &signal_slots[i];
+        uint64_t state = atomic_load_explicit(&slot->lifetime, memory_order_acquire);
+        if ((state & (PEAK_SIGNAL_SLOT_OPEN | PEAK_SIGNAL_SLOT_READERS)) != 0) {
+            continue;
+        }
+        /* Preserve an injective current map: a reusable physical slot may
+         * already occupy a different inactive map position. Reuse that entry. */
+        for (uint32_t j = 0; j < count; j++) {
+            if (atomic_load_explicit(&current_slot_indices[j], memory_order_relaxed) == i) {
+                position = j;
+                break;
+            }
+        }
+        /* Closed+unpinned storage may be reused. Identity remains atomic for
+         * a delayed pre-pin reader, whose old tagged CAS must now fail. */
+        atomic_store_explicit(&slot->arrived_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->done_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->rewrite_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->rewrite_status, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->evacuate_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->evacuate_started_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->evacuated_epoch, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->evacuate_status, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->pc, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->new_pc, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->evacuate_breakpoint_pc, 0, memory_order_relaxed);
+        atomic_store_explicit(&slot->tid, (int)tid, memory_order_relaxed);
+        atomic_store_explicit(&slot->active_epoch, epoch, memory_order_relaxed);
+        uint64_t tag = signal_slot_next_ticket++ << 16;
+        atomic_store_explicit(&slot->lifetime, tag | PEAK_SIGNAL_SLOT_OPEN, memory_order_release);
+        atomic_store_explicit(&current_slot_indices[position], i, memory_order_release);
+        if (position == count) {
+            atomic_store_explicit(&signal_slot_count, count + 1, memory_order_release);
+        }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        extern void peak_test_signal_slot_published(int, pid_t, uint32_t, void*) __attribute__((weak));
+        if (peak_test_signal_slot_published != NULL) {
+            int saved_errno = errno;
+            peak_test_signal_slot_published(epoch, tid, i, slot);
+            errno = saved_errno;
+        }
+#endif
+        return slot;
+    }
+fail:
+    peak_detach_controller_note_failure_detail(failure_reason, (long)tid,
+        (uintptr_t)peak_detach_controller_signal_backend_signum_load(), (uintptr_t)epoch);
+    return NULL;
 }
+
+
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Atomic diagnostic snapshot only; no allocation or slot state mutation. */
+int peak_detach_controller_test_slot_payload(void* address, uint64_t* values)
+{
+    PeakDetachSignalSlot* slot = address;
+    int index = (int)(slot - signal_slots);
+    if (index < 0 || index >= PEAK_DETACH_HELPER_MAX_THREADS) return -1;
+    if (values == NULL) return index;
+    values[0] = (uint64_t)atomic_load_explicit(&slot->active_epoch, memory_order_acquire);
+    values[1] = (uint64_t)atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire);
+    values[2] = (uint64_t)atomic_load_explicit(&slot->done_epoch, memory_order_acquire);
+    values[3] = (uint64_t)atomic_load_explicit(&slot->rewrite_epoch, memory_order_acquire);
+    values[4] = (uint64_t)atomic_load_explicit(&slot->rewrite_status, memory_order_acquire);
+    values[5] = (uint64_t)atomic_load_explicit(&slot->evacuate_epoch, memory_order_acquire);
+    values[6] = (uint64_t)atomic_load_explicit(&slot->evacuate_started_epoch, memory_order_acquire);
+    values[7] = (uint64_t)atomic_load_explicit(&slot->evacuated_epoch, memory_order_acquire);
+    values[8] = (uint64_t)atomic_load_explicit(&slot->evacuate_status, memory_order_acquire);
+    values[9] = (uint64_t)atomic_load_explicit(&slot->tid, memory_order_acquire);
+    values[10] = atomic_load_explicit(&slot->pc, memory_order_acquire);
+    values[11] = atomic_load_explicit(&slot->new_pc, memory_order_acquire);
+    values[12] = atomic_load_explicit(&slot->evacuate_breakpoint_pc, memory_order_acquire);
+    return index;
+}
+#endif
 
 static void
 peak_detach_controller_signal_wait_event(int expected_sequence)
@@ -2370,7 +2550,7 @@ peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
 
     (void)peak_detach_controller_signal_receipt_note_seen(signo, tid, info, FALSE);
     PeakDetachSignalSlot* slot =
-        peak_detach_controller_signal_find_slot(tid, epoch);
+        peak_detach_controller_signal_pin_slot(tid, epoch);
     if (slot == NULL) {
         errno = saved_errno;
         return;
@@ -2388,6 +2568,7 @@ peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
                                                          epoch,
                                                          context,
                                                          TRUE);
+    peak_detach_controller_signal_slot_unpin(slot);
     errno = saved_errno;
 }
 
@@ -2427,22 +2608,27 @@ peak_detach_controller_forward_unhandled_trap(int signo,
 static void
 peak_detach_controller_signal_trap_handler(int signo, siginfo_t* info, void* context)
 {
-    (void)info;
+    int saved_errno = errno;
     if (signo != SIGTRAP) {
         return;
     }
 
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
     if (epoch == 0) {
+        errno = saved_errno;
         peak_detach_controller_forward_unhandled_trap(signo, info, context);
         return;
     }
 
     pid_t tid = (pid_t)peak_exec_raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
     PeakDetachSignalSlot* slot =
-        peak_detach_controller_signal_find_slot(tid, epoch);
+        peak_detach_controller_signal_pin_slot(tid, epoch);
     if (slot == NULL ||
         atomic_load_explicit(&slot->evacuate_epoch, memory_order_acquire) != epoch) {
+        if (slot != NULL) {
+            peak_detach_controller_signal_slot_unpin(slot);
+        }
+        errno = saved_errno;
         peak_detach_controller_forward_unhandled_trap(signo, info, context);
         return;
     }
@@ -2454,6 +2640,8 @@ peak_detach_controller_signal_trap_handler(int signo, siginfo_t* info, void* con
         !peak_detach_controller_signal_breakpoint_pc_matches(pc, breakpoint_pc) ||
         !peak_detach_controller_signal_set_pc(context, breakpoint_pc)) {
         atomic_store_explicit(&slot->evacuate_status, -1, memory_order_release);
+        peak_detach_controller_signal_slot_unpin(slot);
+        errno = saved_errno;
         return;
     }
 
@@ -2464,6 +2652,8 @@ peak_detach_controller_signal_trap_handler(int signo, siginfo_t* info, void* con
                                                          epoch,
                                                          context,
                                                          FALSE);
+    peak_detach_controller_signal_slot_unpin(slot);
+    errno = saved_errno;
 }
 
 static gboolean
@@ -2623,13 +2813,17 @@ static gboolean
 peak_detach_controller_signal_slot_active(const PeakDetachSignalSlot* slot,
                                           int epoch)
 {
-    return atomic_load_explicit(&slot->active_epoch, memory_order_acquire) == epoch;
+    return (atomic_load_explicit(&slot->lifetime, memory_order_acquire) & PEAK_SIGNAL_SLOT_OPEN) != 0 &&
+           atomic_load_explicit(&slot->active_epoch, memory_order_acquire) == epoch;
 }
 
 static void
 peak_detach_controller_signal_clear_slots(void)
 {
-    memset(signal_slots, 0, sizeof(signal_slots));
+    uint32_t count = atomic_load_explicit(&signal_slot_count, memory_order_acquire);
+    for (uint32_t i = 0; i < count; i++) {
+        peak_detach_controller_signal_slot_close(peak_detach_controller_current_slot_at(i));
+    }
     atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
     atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
     atomic_store_explicit(&signal_release_epoch, 0, memory_order_release);
@@ -2642,13 +2836,13 @@ peak_detach_controller_signal_deactivate_exited_slots(int epoch)
     pid_t pid = getpid();
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-        PeakDetachSignalSlot* slot = &signal_slots[i];
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
         if (!peak_detach_controller_signal_slot_active(slot, epoch) ||
             atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) == epoch) {
             continue;
         }
         if (syscall(SYS_tgkill, pid, atomic_load_explicit(&slot->tid, memory_order_acquire), 0) != 0 && errno == ESRCH) {
-            atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
+            peak_detach_controller_signal_slot_close(slot);
         }
     }
 }
@@ -2657,9 +2851,9 @@ static gboolean
 peak_detach_controller_signal_tid_is_active(pid_t tid, int epoch)
 {
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-        const PeakDetachSignalSlot* slot = &signal_slots[i];
+        const PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
         if (atomic_load_explicit(&slot->tid, memory_order_acquire) == (int)tid &&
-            atomic_load_explicit(&slot->active_epoch, memory_order_acquire) == epoch &&
+            peak_detach_controller_signal_slot_active(slot, epoch) &&
             atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) == epoch) {
             return TRUE;
         }
@@ -2714,7 +2908,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
     if (peak_detach_controller_signal_send_owned(tid, backend_signum, epoch,
                                                 receipt) != 0) {
         if (errno == ESRCH) {
-            atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
+            peak_detach_controller_signal_slot_close(slot);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_SAFE;
             }
@@ -2736,7 +2930,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
             return TRUE;
         }
         if (syscall(SYS_tgkill, getpid(), tid, 0) != 0 && errno == ESRCH) {
-            atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
+            peak_detach_controller_signal_slot_close(slot);
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_SAFE;
             }
@@ -2885,7 +3079,7 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     for (;;) {
         gboolean all_done = TRUE;
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-            PeakDetachSignalSlot* slot = &signal_slots[i];
+            PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
             if (peak_detach_controller_signal_slot_active(slot, epoch) &&
                 atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) == epoch &&
                 atomic_load_explicit(&slot->done_epoch, memory_order_acquire) != epoch) {
@@ -2894,15 +3088,13 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             }
         }
         if (all_done) {
-            gboolean all_arrived = TRUE;
             gboolean rewrite_ok = TRUE;
             for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-                PeakDetachSignalSlot* slot = &signal_slots[i];
+                PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
                 if (!peak_detach_controller_signal_slot_active(slot, epoch)) {
                     continue;
                 }
                 if (atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) != epoch) {
-                    all_arrived = FALSE;
                     break;
                 }
                 if (atomic_load_explicit(&slot->rewrite_epoch, memory_order_acquire) == epoch &&
@@ -2911,12 +3103,9 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
                     break;
                 }
             }
-            if (all_arrived) {
-                peak_detach_controller_signal_clear_slots();
-            } else {
-                atomic_store_explicit(&signal_hold_epoch, 0, memory_order_release);
-                atomic_store_explicit(&signal_slot_count, 0, memory_order_release);
-            }
+            /* Close admission before hiding the map. Pinned old frames may
+             * finish on their retained physical slots after cancellation. */
+            peak_detach_controller_signal_clear_slots();
             if (!rewrite_ok) {
                 if (status_out != NULL) {
                     *status_out = PEAK_DETACH_STATUS_ERROR;
@@ -3025,7 +3214,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
     }
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-        PeakDetachSignalSlot* slot = &signal_slots[i];
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
         if (!peak_detach_controller_signal_slot_active(slot, epoch)) {
             continue;
         }
@@ -3057,28 +3246,37 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
 #endif
 
     PeakDetachSignalReceiptReference* receipts = signal_initial_receipts;
-    uint32_t reserved_count = 0;
     uint32_t count = atomic_load_explicit(&signal_slot_count, memory_order_acquire);
     for (uint32_t i = 0; i < count; i++) {
-        pid_t tid = (pid_t)atomic_load_explicit(&signal_slots[i].tid,
+        receipts[i].tag = 0;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!peak_detach_controller_signal_slot_active(
+                peak_detach_controller_current_slot_at(i), epoch)) {
+            continue;
+        }
+        pid_t tid = (pid_t)atomic_load_explicit(&peak_detach_controller_current_slot_at(i)->tid,
                                                memory_order_acquire);
         if (!peak_detach_controller_signal_receipt_reserve(
                 epoch, tid, backend_signum, &receipts[i], status_out)) {
-            for (uint32_t j = 0; j < reserved_count; j++) {
-                peak_detach_controller_signal_receipt_discard(receipts[j]);
+            for (uint32_t j = 0; j < count; j++) {
+                if (receipts[j].tag != 0) {
+                    peak_detach_controller_signal_receipt_discard(receipts[j]);
+                }
             }
             peak_detach_controller_signal_clear_slots();
             return FALSE;
         }
-        reserved_count++;
     }
     /* Mask inspection can run concurrently with an unexpected delivery. No
      * owned stop packet has been sent yet, so this failure discards unsent
      * reservations and clears slots. */
     int unexpected_deliveries = peak_signal_policy_unexpected_delivery_count();
     if (unexpected_deliveries != 0) {
-        for (uint32_t i = 0; i < reserved_count; i++) {
-            peak_detach_controller_signal_receipt_discard(receipts[i]);
+        for (uint32_t i = 0; i < count; i++) {
+            if (receipts[i].tag != 0) {
+                peak_detach_controller_signal_receipt_discard(receipts[i]);
+            }
         }
         peak_detach_controller_signal_clear_slots();
         peak_detach_controller_note_failure_detail(
@@ -3093,13 +3291,16 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
     }
 
     for (uint32_t i = 0; i < count; i++) {
-        PeakDetachSignalSlot* slot = &signal_slots[i];
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
+        if (!peak_detach_controller_signal_slot_active(slot, epoch)) {
+            continue;
+        }
         pid_t tid =
             (pid_t)atomic_load_explicit(&slot->tid, memory_order_acquire);
         if (peak_detach_controller_signal_send_owned(tid, backend_signum, epoch,
                                                     receipts[i]) != 0) {
             if (errno == ESRCH) {
-                atomic_store_explicit(&slot->active_epoch, 0, memory_order_release);
+                peak_detach_controller_signal_slot_close(slot);
                 continue;
             }
             peak_detach_controller_signal_release_or_fatal("signal stop send failure");
@@ -3117,7 +3318,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
         gboolean all_arrived = TRUE;
         peak_detach_controller_signal_deactivate_exited_slots(epoch);
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-            PeakDetachSignalSlot* slot = &signal_slots[i];
+            PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
             if (peak_detach_controller_signal_slot_active(slot, epoch) &&
                 atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) != epoch) {
                 all_arrived = FALSE;
@@ -3149,7 +3350,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
     }
 
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
-        PeakDetachSignalSlot* slot = &signal_slots[i];
+        PeakDetachSignalSlot* slot = peak_detach_controller_current_slot_at(i);
         if (!peak_detach_controller_signal_slot_active(slot, epoch) ||
             atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) != epoch) {
             continue;

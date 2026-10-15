@@ -269,12 +269,34 @@ because a numeric TID disappears. Fork children drop copied receipt debt while
 keeping counters monotonic. No application signal API, policy lease, handler
 reservation lifetime, or helper backend is changed.
 
-This is scoped canceled-packet recovery. It does not close native disposition
-handoff if an ordinary application action replaces the old PEAK action before
-kernel delivery, or prove safety of the existing active-slot reuse boundary
-when an old handler frame overlaps cancellation and a later generation. Those
-full-transparency requirements remain unresolved; this ledger alone does not
-justify merging the blocked recovery work.
+Active handler frames use a separate fixed pool of 4096 physical slots and an
+atomic map for the current cohort. Each slot has a nonwrapping 48-bit allocation
+ticket, an OPEN bit, and a 15-bit reader count. Signal and trap handlers acquire
+a pin with one strong CAS before accessing mutable payload and drop it after
+their last slot access. Cancellation closes admission and clears the current
+map without resetting payload. Allocation only resets closed, unpinned storage;
+a delayed pre-pin reader cannot acquire a reused tag, and an already pinned
+frame retains its old physical slot. The map stays injective when an inactive
+entry is reused. Pool or ticket exhaustion fails the profiler window with
+unsupported rather than waiting for an unarrived handler. On the current 64-bit
+ABI, lifetime words add 32 KiB and the map adds 16 KiB of fixed storage. Pool
+scans remain bounded by 4096; no performance claim is made.
+
+Fork children close copied slots, discard references belonging to vanished
+threads, and preserve pins belonging to the calling thread's inherited frames.
+Only those closed copied slots have their owner TID rebound to the child TID,
+so repeated nested forks preserve the same frames. Tags, reader counts and
+payload stay intact; ordinary clear and cancellation never reset live pins.
+This changes no application signal API, policy lease, helper backend or fatal
+path. Fixed before-pin and after-pin tests pause a genuine owned handler,
+observe timeout and a later allocation's payload, then qualify real physical
+detach/reattach after the old frame returns. They do not test kernel-selected
+pre-entry frames or native disposition handoff.
+
+These are scoped canceled-packet and active-slot lifetime changes. Native
+disposition handoff remains unresolved if an ordinary application action
+replaces the old PEAK action before kernel delivery. Full signal transparency
+and merge approval for the blocked recovery work remain unresolved.
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current

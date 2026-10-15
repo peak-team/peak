@@ -685,3 +685,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
         TIMEOUT 5)
   endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(slot_phase before_pin after_pin)
+    add_test(NAME test_detach_controller_active_slot_reuse_${slot_phase}
+      COMMAND test_detach_controller active-slot-reader-reuse)
+    set_tests_properties(test_detach_controller_active_slot_reuse_${slot_phase}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_SLOT_PHASE=${slot_phase}"
+        TIMEOUT 20)
+  endforeach()
+endif()

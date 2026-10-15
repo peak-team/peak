@@ -3284,6 +3284,7 @@ run_fake_helper_reattach_patch_entry(void)
  * controller's sends are counted; the seam calls __real_ directly. */
 static void supported_after_preflight(int epoch);
 static void supported_observe_send(pid_t, int, unsigned long, int, int);
+static void slot_reuse_observe_send(pid_t, int, unsigned long, int);
 static atomic_int receipt_consumed_count;
 static atomic_int receipt_consumed_epoch, receipt_consumed_tid, receipt_consumed_signum;
 static atomic_ulong receipt_consumed_cookie;
@@ -3343,6 +3344,7 @@ __wrap_peak_signal_policy_send_thread_signal(pid_t tid, int signo,
     int rc = __real_peak_signal_policy_send_thread_signal(tid, signo, cookie);
     int saved_errno = errno;
     supported_observe_send(tid, signo, cookie, rc, saved_errno);
+    slot_reuse_observe_send(tid, signo, cookie, rc);
     errno = saved_errno;
     return rc;
 }
@@ -4261,6 +4263,234 @@ cleanup:
 #endif
 }
 
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+/* This holds a real owned handler after lookup/before pin or after pin. It
+ * tests userspace slot lifetime, not kernel-selected/pre-entry disposition. */
+extern int peak_detach_controller_test_slot_payload(void*, uint64_t*);
+static atomic_int slot_reuse_enabled, slot_reuse_phase, slot_reuse_paused;
+static atomic_int slot_reuse_running, slot_reuse_tid, slot_reuse_release_requested;
+static atomic_int slot_reuse_returned, slot_reuse_old_epoch, slot_reuse_old_index;
+static atomic_int slot_reuse_latest_epoch, slot_reuse_latest_index;
+static _Atomic(void*) slot_reuse_latest_slot;
+static int slot_reuse_entered_pipe[2] = {-1, -1}, slot_reuse_release_pipe[2] = {-1, -1};
+static int slot_reuse_send_count, slot_reuse_send_S, slot_reuse_send_rc;
+static pid_t slot_reuse_send_tid;
+static unsigned long slot_reuse_send_cookie;
+
+static void slot_reuse_observe_send(pid_t tid, int signo, unsigned long cookie, int rc)
+{
+    if (!atomic_load(&slot_reuse_enabled)) return;
+    slot_reuse_send_count++;
+    slot_reuse_send_tid = tid; slot_reuse_send_S = signo;
+    slot_reuse_send_cookie = cookie; slot_reuse_send_rc = rc;
+}
+
+void peak_test_signal_slot_published(int epoch, pid_t tid, uint32_t index, void* slot)
+{
+    if (!atomic_load(&slot_reuse_enabled) || tid != atomic_load(&slot_reuse_tid)) return;
+    atomic_store(&slot_reuse_latest_epoch, epoch);
+    atomic_store(&slot_reuse_latest_index, (int)index);
+    atomic_store(&slot_reuse_latest_slot, slot);
+}
+
+static void slot_reuse_pause(int phase, int epoch, pid_t tid, void* slot)
+{
+    int saved_errno = errno;
+    if (atomic_load(&slot_reuse_enabled) && tid == atomic_load(&slot_reuse_tid) &&
+        phase == atomic_load(&slot_reuse_phase) &&
+        atomic_exchange(&slot_reuse_paused, 1) == 0) {
+        atomic_store(&slot_reuse_old_epoch, epoch);
+        atomic_store(&slot_reuse_old_index,
+                     peak_detach_controller_test_slot_payload(slot, NULL));
+        char byte = 'E';
+        ssize_t rc;
+        do { rc = write(slot_reuse_entered_pipe[1], &byte, 1); } while (rc < 0 && errno == EINTR);
+        if (rc == 1)
+            do { rc = read(slot_reuse_release_pipe[0], &byte, 1); } while (rc < 0 && errno == EINTR);
+    }
+    errno = saved_errno;
+}
+void peak_test_signal_slot_before_pin(int epoch, pid_t tid, void* slot)
+{ slot_reuse_pause(0, epoch, tid, slot); }
+void peak_test_signal_slot_after_pin(int epoch, pid_t tid, void* slot)
+{ slot_reuse_pause(1, epoch, tid, slot); }
+
+static void slot_reuse_release(void)
+{
+    atomic_store(&slot_reuse_release_requested, 1);
+    if (slot_reuse_release_pipe[1] >= 0) {
+        char byte = 'R';
+        ssize_t rc;
+        do { rc = write(slot_reuse_release_pipe[1], &byte, 1); } while (rc < 0 && errno == EINTR);
+    }
+}
+static void* slot_reuse_worker(void* unused)
+{
+    (void)unused;
+    atomic_store(&slot_reuse_tid, (int)syscall(SYS_gettid));
+    while (atomic_load(&slot_reuse_running)) {
+        if (atomic_load(&slot_reuse_paused) && atomic_load(&slot_reuse_release_requested))
+            atomic_store(&slot_reuse_returned, 1);
+        usleep(1000);
+    }
+    return NULL;
+}
+static void slot_reuse_dump(const char* label, const uint64_t* payload)
+{
+    fprintf(stderr, "slot-reuse-payload label=%s values=", label);
+    for (int i = 0; i < 13; i++) fprintf(stderr, "%s0x%" PRIx64, i ? "," : "", payload[i]);
+    fputc('\n', stderr);
+}
+#endif
+
+static int run_active_slot_reader_reuse(void)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    return 77;
+#else
+    pthread_t worker;
+    int worker_started = 0;
+    uint8_t original[GUM_PEAK_MAX_PROLOGUE_SIZE], active[sizeof(original)], after[sizeof(original)];
+    uint64_t payload_before[13] = {0}, payload_after[13] = {0};
+    GumPeakPcDiagnostics diagnostics = {0}, after_diagnostics = {0};
+    const char* phase = g_getenv("PEAK_TEST_SLOT_PHASE");
+    atomic_store(&slot_reuse_phase, phase != NULL && strcmp(phase, "after_pin") == 0);
+    atomic_store(&slot_reuse_old_index, -1);
+    atomic_store(&slot_reuse_latest_index, -1);
+    check_int("slot reuse entered pipe", pipe(slot_reuse_entered_pipe), 0);
+    check_int("slot reuse release pipe", pipe(slot_reuse_release_pipe), 0);
+    memcpy(original, (void*)strict_helper_target, sizeof(original));
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener = gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
+    check_int("slot reuse Gum attach", gum_interceptor_attach(interceptor,
+              (gpointer)strict_helper_target, listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("slot reuse initial Gum diagnostics", gum_interceptor_peak_get_pc_diagnostics(
+        interceptor, (gpointer)strict_helper_target, listener, &diagnostics));
+    guint length = diagnostics.overwritten_prologue_len;
+    if (failures || length == 0 || length > sizeof(active)) { failures++; goto cleanup; }
+    memcpy(active, (void*)strict_helper_target, length);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    atomic_store(&slot_reuse_enabled, 1);
+    atomic_store(&slot_reuse_running, 1);
+    if (pthread_create(&worker, NULL, slot_reuse_worker, NULL) != 0) { failures++; goto cleanup; }
+    worker_started = 1;
+    double deadline = preflight_now() + 2.0;
+    while (atomic_load(&slot_reuse_tid) == 0 && preflight_now() < deadline) usleep(1000);
+    check_true("slot reuse worker ready", atomic_load(&slot_reuse_tid) > 0);
+    if (failures) goto cleanup;
+    PeakDetachRequest request = { .hook_id = 132, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target, .interceptor = interceptor,
+        .listener = listener, .operation = PEAK_DETACH_OPERATION_REATTACH };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    double started = preflight_now();
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    double elapsed = preflight_now() - started;
+    int held = peak_detach_controller_threads_are_held();
+    int physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (prepared) check_true("slot reuse unexpected E1 finish",
+        peak_detach_controller_finish_hook_mutation(&request, &status));
+    int entered = supported_read_ack(slot_reuse_entered_pipe[0]) == 0;
+    memcpy(after, (void*)strict_helper_target, length);
+    int calls = atomic_load(&preflight_callback_count); strict_helper_target();
+    int delta = atomic_load(&preflight_callback_count) - calls;
+    check_true("slot reuse E1 Gum unchanged", gum_interceptor_peak_get_pc_diagnostics(
+        interceptor, (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+        memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
+    fprintf(stderr, "slot-reuse-E1 phase=%s entered=%d prepared=%d status=%s elapsed=%.9f "
+        "epoch=%d physical_index=%d normal_sends=%d tid=%d S=%d cookie=0x%lx rc=%d "
+        "held=%d physical=%d bytes_equal=%d callback_delta=%d unexpected=%d gate=%d\n",
+        phase, entered, prepared, peak_detach_controller_status_string(status), elapsed,
+        atomic_load(&slot_reuse_old_epoch), atomic_load(&slot_reuse_old_index),
+        slot_reuse_send_count, slot_reuse_send_tid, slot_reuse_send_S, slot_reuse_send_cookie,
+        slot_reuse_send_rc, held, physical, memcmp(active, after, length) == 0, delta,
+        peak_signal_policy_unexpected_delivery_count(), peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("real owned E1 times out before mutation", entered && !prepared &&
+        status == PEAK_DETACH_STATUS_TIMEOUT && elapsed >= 9 && elapsed < 13 &&
+        atomic_load(&slot_reuse_old_epoch) > 0 && slot_reuse_send_count == 1 &&
+        slot_reuse_send_rc == 0 && slot_reuse_send_tid == atomic_load(&slot_reuse_tid) &&
+        slot_reuse_send_cookie == peak_signal_policy_cookie_for(atomic_load(&slot_reuse_old_epoch), slot_reuse_send_tid) &&
+        !held && !physical && memcmp(active, after, length) == 0 && delta == 1 &&
+        peak_signal_policy_unexpected_delivery_count() == 0 &&
+        peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    if (!entered) goto cleanup;
+    atomic_store(&slot_reuse_latest_slot, NULL);
+    status = PEAK_DETACH_STATUS_ERROR;
+    prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+    int e2_held = peak_detach_controller_threads_are_held();
+    int e2_physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    fprintf(stderr, "slot-reuse-E2 phase=%s prepared=%d status=%s reason=%s epoch=%d "
+        "physical_index=%d normal_sends=%d held=%d physical=%d\n", phase, prepared,
+        peak_detach_controller_status_string(status), detail && detail->reason ? detail->reason : "<none>",
+        atomic_load(&slot_reuse_latest_epoch), atomic_load(&slot_reuse_latest_index),
+        slot_reuse_send_count, e2_held, e2_physical);
+    if (prepared) check_true("slot reuse unexpected E2 finish",
+        peak_detach_controller_finish_hook_mutation(&request, &status));
+    void* e2_slot = atomic_load(&slot_reuse_latest_slot);
+    check_true("E2 allocated and rejected before another owned send", e2_slot != NULL &&
+        atomic_load(&slot_reuse_latest_epoch) > atomic_load(&slot_reuse_old_epoch) &&
+        !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED && detail && detail->reason &&
+        strcmp(detail->reason, "signal-reserved-blocked") == 0 &&
+        slot_reuse_send_count == 1 && !e2_held && !e2_physical);
+    if (e2_slot != NULL) peak_detach_controller_test_slot_payload(e2_slot, payload_before);
+    slot_reuse_release();
+    deadline = preflight_now() + 2.0;
+    while (!atomic_load(&slot_reuse_returned) && preflight_now() < deadline) usleep(1000);
+    if (e2_slot != NULL) peak_detach_controller_test_slot_payload(e2_slot, payload_after);
+    slot_reuse_dump("E2-before-old-return", payload_before);
+    slot_reuse_dump("E2-after-old-return", payload_after);
+    fprintf(stderr, "slot-reuse-old-return phase=%s old_index=%d new_index=%d returned=%d "
+        "payload_equal=%d unexpected=%d gate=%d\n", phase, atomic_load(&slot_reuse_old_index),
+        atomic_load(&slot_reuse_latest_index), atomic_load(&slot_reuse_returned),
+        memcmp(payload_before, payload_after, sizeof(payload_before)) == 0,
+        peak_signal_policy_unexpected_delivery_count(), peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("old handler returned to ordinary worker code", atomic_load(&slot_reuse_returned));
+    check_true("old handler cannot modify reused generation payload", e2_slot != NULL &&
+        memcmp(payload_before, payload_after, sizeof(payload_before)) == 0);
+    /* Baseline failures are retained while both sides qualify real physical IO. */
+    for (int op = 0; op < 2; op++) {
+        request.operation = op ? PEAK_DETACH_OPERATION_REATTACH : PEAK_DETACH_OPERATION_DETACH;
+        status = PEAK_DETACH_STATUS_ERROR;
+        prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+        physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        fprintf(stderr, "slot-reuse-cycle-prepare operation=%d prepared=%d status=%s physical=%d\n",
+                op, prepared, peak_detach_controller_status_string(status), physical);
+        check_true("slot reuse real physical prepare", prepared && status == PEAK_DETACH_STATUS_SAFE && physical);
+        if (prepared) check_true("slot reuse real physical finish",
+            peak_detach_controller_finish_hook_mutation(&request, &status));
+        memcpy(after, (void*)strict_helper_target, length);
+        calls = atomic_load(&preflight_callback_count); strict_helper_target();
+        delta = atomic_load(&preflight_callback_count) - calls;
+        memset(&after_diagnostics, 0, sizeof(after_diagnostics));
+        check_true("slot reuse physical cycle Gum unchanged", gum_interceptor_peak_get_pc_diagnostics(
+            interceptor, (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+            memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
+        fprintf(stderr, "slot-reuse-cycle-entry operation=%d callback_delta=%d gate=%d len=%u hex=",
+            op, delta, peak_detach_controller_test_thread_creation_gate_epoch(), length);
+        for (guint i = 0; i < length; i++) fprintf(stderr, "%02x", after[i]);
+        fputc('\n', stderr);
+        check_true("slot reuse physical entry bytes", memcmp(op ? active : original, after, length) == 0);
+        check_int("slot reuse callback transition", delta, op);
+        check_int("slot reuse physical cycle gate open", peak_detach_controller_test_thread_creation_gate_epoch(), 0);
+    }
+    check_int("slot reuse final unexpected zero", peak_signal_policy_unexpected_delivery_count(), 0);
+cleanup:
+    slot_reuse_release();
+    if (worker_started) { atomic_store(&slot_reuse_running, 0); pthread_join(worker, NULL); }
+    atomic_store(&slot_reuse_enabled, 0);
+    gum_interceptor_detach(interceptor, listener); gum_interceptor_flush(interceptor);
+    g_object_unref(listener); g_object_unref(interceptor); gum_deinit_embedded();
+    for (int i = 0; i < 2; i++) {
+        if (slot_reuse_entered_pipe[i] >= 0) close(slot_reuse_entered_pipe[i]);
+        if (slot_reuse_release_pipe[i] >= 0) close(slot_reuse_release_pipe[i]);
+    }
+    fprintf(stderr, "slot-reuse-complete phase=%s failures=%d\n", phase, failures);
+    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+#endif
+}
+
 static int
 run_signal_backend_blocked_thread(void)
 {
@@ -5084,6 +5314,9 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "signal-receipt-control") == 0) {
         return run_signal_receipt_control(g_getenv("PEAK_TEST_RECEIPT_FAILED_SEND") != NULL);
+    }
+    if (strcmp(argv[1], "active-slot-reader-reuse") == 0) {
+        return run_active_slot_reader_reuse();
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();
