@@ -650,7 +650,7 @@ static int
 peak_signal_policy_prepare_reserved_set_for_user(const sigset_t* set,
                                                  const char* api)
 {
-    if (!peak_signal_policy_enabled_for_process() ||
+    if (set == NULL || !peak_signal_policy_enabled_for_process() ||
         peak_signal_policy_is_internal()) {
         return 1;
     }
@@ -869,7 +869,7 @@ peak_signal_policy_prepare_reserved_raw_set_for_user(const void* set,
                                                      size_t set_size,
                                                      const char* api)
 {
-    if (!peak_signal_policy_enabled_for_process() ||
+    if (set == NULL || !peak_signal_policy_enabled_for_process() ||
         peak_signal_policy_is_internal()) {
         return 1;
     }
