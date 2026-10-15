@@ -642,3 +642,34 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       PROPERTIES ENVIRONMENT "${preflight_env}" TIMEOUT 10)
   endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(recovery_case scalar batch consumed_replay)
+    set(recovery_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(recovery_case STREQUAL "batch")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_BATCH=1")
+    endif()
+    if(recovery_case STREQUAL "consumed_replay")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_REPLAY=1")
+    endif()
+    add_test(NAME test_detach_controller_supported_owned_recovery_${recovery_case}
+      COMMAND test_detach_controller supported-handler-owned-recovery)
+    set_tests_properties(test_detach_controller_supported_owned_recovery_${recovery_case}
+      PROPERTIES ENVIRONMENT "${recovery_env}" TIMEOUT 20)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(receipt_case capacity failed_send)
+    set(receipt_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(receipt_case STREQUAL "failed_send")
+      list(APPEND receipt_env "PEAK_TEST_RECEIPT_FAILED_SEND=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_receipt_control_${receipt_case}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_control_${receipt_case}
+      PROPERTIES ENVIRONMENT "${receipt_env}" TIMEOUT 10)
+  endforeach()
+endif()

@@ -240,9 +240,36 @@ unexpected-delivery count again after completing every target's mask preflight,
 before sending the first owned stop packet. If contamination arrived during
 preflight, it clears the unsent slots and returns unsupported with
 `signal-unexpected-delivery`; it grants no physical mutation permission and
-reopens the thread-creation gate. This check does not recover an owned packet
-that arrives after an earlier stop was cancelled: the existing sticky failure
-for that case remains unresolved. It does not change application signal APIs.
+reopens the thread-creation gate.
+
+The controller also keeps a fixed ledger of identities for its successfully
+sent stop packets. A canceled generation marks those identities retired before
+hiding its active slots. If its genuine packet later reaches the PEAK handler,
+an exact signal/TID/cookie match consumes that receipt once, without accessing
+old slots or incrementing the unexpected-delivery counter. The next generation
+can then physically detach and reattach. In the canceled/late fallback,
+never-sent identities, wrong cookies, and a duplicate of an already consumed
+identity receive no receipt exception and retain the contamination guard. The
+current active-generation path keeps main's existing matching rules; this does
+not impose a new per-send-credit condition on that path.
+
+The ledger has 4096 records and a controller-only static reservation mapping;
+on the current 64-bit ABI they occupy 98,304 and 65,536 bytes respectively
+(24-byte records, 16-byte references, 160 KiB total). Normal handling may scan
+up to 4096 records; no performance improvement is claimed. Atomic identities
+and nonwrapping allocation tickets distinguish reuse, and epochs stop before
+wrapping. Capacity or identity-budget exhaustion returns unsupported without
+sending the initial stop cohort. Unseen sent debt is not reclaimed merely
+because a numeric TID disappears. Fork children drop copied receipt debt while
+keeping counters monotonic. No application signal API, policy lease, handler
+reservation lifetime, or helper backend is changed.
+
+This is scoped canceled-packet recovery. It does not close native disposition
+handoff if an ordinary application action replaces the old PEAK action before
+kernel delivery, or prove safety of the existing active-slot reuse boundary
+when an old handler frame overlaps cancellation and a later generation. Those
+full-transparency requirements remain unresolved; this ledger alone does not
+justify merging the blocked recovery work.
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current
