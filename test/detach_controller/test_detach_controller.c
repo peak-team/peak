@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "detach_controller.h"
 #include "internal/filesystem_stat_guard.h"
 #include <sys/vfs.h>
@@ -19,6 +20,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 static int failures = 0;
 
@@ -3273,6 +3278,294 @@ run_fake_helper_reattach_patch_entry(void)
 }
 
 
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+/* The wrapper forwards every delivery to the real SI_QUEUE sender. Only the
+ * controller's sends are counted; the seam calls __real_ directly. */
+static atomic_int preflight_normal_sends;
+static atomic_int preflight_tracking;
+static atomic_int preflight_worker_tid;
+static atomic_int preflight_worker_running;
+static atomic_int preflight_handler_returned;
+static atomic_int preflight_callback_count;
+static int preflight_inject;
+static int preflight_unexpected_before;
+static int preflight_injection_rc;
+static int preflight_seen_epoch;
+
+extern int __real_peak_signal_policy_send_thread_signal(pid_t, int, unsigned long);
+int
+__wrap_peak_signal_policy_send_thread_signal(pid_t tid, int signo,
+                                            unsigned long cookie)
+{
+    if (atomic_load(&preflight_tracking))
+        atomic_fetch_add(&preflight_normal_sends, 1);
+    return __real_peak_signal_policy_send_thread_signal(tid, signo, cookie);
+}
+
+static double
+preflight_now(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec / 1e9;
+}
+
+void
+peak_test_after_signal_mask_preflight(int epoch)
+{
+    if (!preflight_inject)
+        return;
+    preflight_seen_epoch = epoch;
+    pid_t tid = atomic_load(&preflight_worker_tid);
+    int signo = peak_detach_controller_test_signal_backend_signum();
+    unsigned long cookie = peak_signal_policy_cookie_for(epoch - 1, tid);
+    preflight_injection_rc = __real_peak_signal_policy_send_thread_signal(
+        tid, signo, cookie);
+    double deadline = preflight_now() + 2.0;
+    /* The worker publishes this only after the real handler has returned to
+     * application code, so no temporary handler mask survives this seam. */
+    while (!atomic_load(&preflight_handler_returned) &&
+           preflight_now() < deadline)
+        usleep(1000);
+    fprintf(stderr,
+            "preflight-injection epoch=%d wrong_epoch=%d tid=%d signum=%d "
+            "si_code=%d cookie=0x%lx rc=%d unexpected_before=%d "
+            "unexpected_after=%d handler_returned=%d\n",
+            epoch, epoch - 1, tid, signo, SI_QUEUE, cookie,
+            preflight_injection_rc, preflight_unexpected_before,
+            peak_signal_policy_unexpected_delivery_count(),
+            atomic_load(&preflight_handler_returned));
+}
+
+static void*
+preflight_worker(void* unused)
+{
+    (void)unused;
+    atomic_store(&preflight_worker_tid, (int)syscall(SYS_gettid));
+    while (atomic_load(&preflight_worker_running)) {
+        if (peak_signal_policy_unexpected_delivery_count() ==
+            preflight_unexpected_before + 1)
+            atomic_store(&preflight_handler_returned, 1);
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void
+preflight_on_enter(GumInvocationContext* context, gpointer unused)
+{
+    (void)context;
+    (void)unused;
+    atomic_fetch_add(&preflight_callback_count, 1);
+}
+
+static void*
+preflight_gate_probe(void* unused)
+{
+    (void)unused;
+    peak_detach_controller_wait_for_mutation_window();
+    return NULL;
+}
+
+static void
+preflight_dump_bytes(const char* stage, const uint8_t* bytes, guint length)
+{
+    fprintf(stderr, "preflight-bytes stage=%s len=%u hex=", stage, length);
+    for (guint i = 0; i < length; i++)
+        fprintf(stderr, "%02x", bytes[i]);
+    fputc('\n', stderr);
+}
+#endif
+
+static int
+run_signal_preflight_contamination(int batch, int inject)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    (void)batch;
+    (void)inject;
+    return 77;
+#else
+    uint8_t original[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t active[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t after[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    GumPeakPcDiagnostics before_diag = {0}, after_diag = {0};
+    pthread_t worker;
+    preflight_inject = 0;
+    preflight_seen_epoch = 0;
+    preflight_injection_rc = -1;
+    atomic_store(&preflight_worker_tid, 0);
+    atomic_store(&preflight_handler_returned, 0);
+    atomic_store(&preflight_callback_count, 0);
+    preflight_unexpected_before = peak_signal_policy_unexpected_delivery_count();
+    memcpy(original, (void*)strict_helper_target, sizeof(original));
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener =
+        gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
+    check_int("preflight fixture Gum attach",
+              gum_interceptor_attach(interceptor, (gpointer)strict_helper_target,
+                                     listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("preflight fixture diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &before_diag));
+    guint length = before_diag.overwritten_prologue_len;
+    if (length == 0 || length > sizeof(active)) {
+        fprintf(stderr, "invalid preflight fixture prologue length=%u\n", length);
+        failures++;
+        goto cleanup_gum;
+    }
+    memcpy(active, (void*)strict_helper_target, length);
+    check_true("preflight fixture active entry differs from original",
+               memcmp(active, original, length) != 0);
+    strict_helper_target();
+    check_int("preflight fixture initial callback",
+              atomic_load(&preflight_callback_count), 1);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    /* Initialize reservation before the worker starts and before preflight. */
+    int signo = peak_detach_controller_test_signal_backend_signum();
+    check_true("preflight fixture reserved signal", signo > 0);
+    atomic_store(&preflight_worker_running, 1);
+    if (pthread_create(&worker, NULL, preflight_worker, NULL) != 0) {
+        failures++;
+        goto cleanup_gum;
+    }
+    double deadline = preflight_now() + 2.0;
+    while (atomic_load(&preflight_worker_tid) == 0 && preflight_now() < deadline)
+        usleep(1000);
+    check_true("preflight worker ready", atomic_load(&preflight_worker_tid) > 0);
+
+    PeakDetachRequest request = {
+        .hook_id = 129, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor, .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+    preflight_inject = inject;
+    for (int operation = 0; operation < (inject ? 1 : 2); operation++) {
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+        PeakDetachBatchResult result = {0};
+        size_t count = SIZE_MAX;
+        atomic_store(&preflight_normal_sends, 0);
+        atomic_store(&preflight_tracking, 1);
+        gboolean prepared = batch
+            ? peak_detach_controller_prepare_hook_mutation_batch(
+                &request, 1, &result, &count, &status)
+            : peak_detach_controller_prepare_hook_mutation(&request, &status);
+        atomic_store(&preflight_tracking, 0);
+        preflight_inject = 0;
+        gboolean held = peak_detach_controller_threads_are_held();
+        gboolean physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+        const char* reason = detail != NULL && detail->reason != NULL
+            ? detail->reason : "<none>";
+        memcpy(after, (void*)strict_helper_target, length);
+        preflight_dump_bytes("original", original, length);
+        preflight_dump_bytes("active-before", active, length);
+        preflight_dump_bytes(operation == 0 ? "after-detach-prepare" :
+                             "after-reattach-prepare", after, length);
+        fprintf(stderr,
+                "preflight-result batch=%d inject=%d operation=%d prepared=%d "
+                "status=%s reason=%s normal_sends=%d held=%d physical=%d "
+                "count=%zu result_prepared=%d result_physical=%d "
+                "entry_equal_active=%d\n",
+                batch, inject, operation, prepared,
+                peak_detach_controller_status_string(status), reason,
+                atomic_load(&preflight_normal_sends), held, physical, count,
+                result.prepared, result.uses_physical_patch,
+                memcmp(after, active, length) == 0);
+        if (inject) {
+            fprintf(stderr, "preflight-detail tid=%ld pc=%" PRIuPTR " aux=%" PRIuPTR "\n",
+                    detail != NULL ? detail->tid : -1,
+                    detail != NULL ? detail->pc : 0,
+                    detail != NULL ? detail->aux : 0);
+            check_true("contaminated preflight precise failure detail",
+                       detail != NULL && detail->tid == 0 &&
+                       detail->pc == (uintptr_t)signo &&
+                       detail->aux == (uintptr_t)(preflight_unexpected_before + 1));
+            check_true("preflight injection delivered and handler returned",
+                       preflight_seen_epoch > 0 && preflight_injection_rc == 0 &&
+                       atomic_load(&preflight_handler_returned) &&
+                       peak_signal_policy_unexpected_delivery_count() ==
+                           preflight_unexpected_before + 1);
+            check_true("contaminated preflight sends no owned stop packets",
+                       atomic_load(&preflight_normal_sends) == 0);
+            check_true("contaminated preflight refuses all permission",
+                       !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                       !held && !physical &&
+                       strcmp(reason, "signal-unexpected-delivery") == 0);
+            if (batch)
+                check_true("contaminated batch result refuses all permission",
+                           count == 0 && !result.prepared &&
+                           !result.uses_physical_patch &&
+                           result.status == PEAK_DETACH_STATUS_UNSUPPORTED);
+            check_true("contaminated preflight preserves entry bytes",
+                       memcmp(after, active, length) == 0);
+        } else {
+            check_true("clean signal prepare physical permission",
+                       prepared && status == PEAK_DETACH_STATUS_SAFE && held && physical &&
+                       atomic_load(&preflight_normal_sends) > 0);
+            if (batch)
+                check_true("clean batch result physical permission",
+                           count == 1 && result.prepared && result.uses_physical_patch);
+            check_true("clean physical entry bytes",
+                       memcmp(after, operation == 0 ? original : active, length) == 0);
+        }
+        /* Baseline may already have changed entry bytes and stopped workers.
+         * Always finish before callbacks, diagnostics or ordinary cleanup. */
+        if (prepared)
+            check_true("preflight successful prepare finish",
+                       batch ? peak_detach_controller_finish_hook_mutation_batch(&status)
+                             : peak_detach_controller_finish_hook_mutation(&request, &status));
+        memset(&after_diag, 0, sizeof(after_diag));
+        check_true("preflight post-prepare Gum diagnostics",
+                   gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                       (gpointer)strict_helper_target, listener, &after_diag));
+        int diag_equal = memcmp(&before_diag, &after_diag, sizeof(before_diag)) == 0;
+        check_true("preflight preserves Gum diagnostics", diag_equal);
+        int callbacks_before = atomic_load(&preflight_callback_count);
+        strict_helper_target();
+        int callback_delta = atomic_load(&preflight_callback_count) - callbacks_before;
+        fprintf(stderr, "preflight-after-finish batch=%d inject=%d operation=%d "
+                "diagnostics_equal=%d callback_delta=%d gate_epoch=%d\n",
+                batch, inject, operation, diag_equal, callback_delta,
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        check_int("preflight callback behavior", callback_delta,
+                  inject || operation == 1 ? 1 : 0);
+        check_int("preflight cleanup creation gate open",
+                  peak_detach_controller_test_thread_creation_gate_epoch(), 0);
+        request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    }
+    /* The original target remains alive through every prepare and assertion. */
+    check_int("preflight target still alive",
+              (int)syscall(SYS_tgkill, getpid(), atomic_load(&preflight_worker_tid), 0), 0);
+    pthread_t probe;
+    if (pthread_create(&probe, NULL, preflight_gate_probe, NULL) == 0)
+        pthread_join(probe, NULL);
+    else
+        failures++;
+    struct sigaction application_action = {0}, previous_action = {0};
+    sigemptyset(&application_action.sa_mask);
+    application_action.sa_handler = SIG_DFL;
+    errno = 0;
+    int action_rc = sigaction(signo, &application_action, &previous_action);
+    fprintf(stderr, "preflight-application-sigaction signum=%d rc=%d errno=%d\n",
+            signo, action_rc, errno);
+    check_int("ordinary application sigaction remains accepted", action_rc, 0);
+    atomic_store(&preflight_worker_running, 0);
+    pthread_join(worker, NULL);
+cleanup_gum:
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    fprintf(stderr, "preflight-complete batch=%d inject=%d failures=%d\n",
+            batch, inject, failures);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
 static int
 run_signal_backend_blocked_thread(void)
 {
@@ -4085,6 +4378,11 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "signal-event-futex") == 0) {
         return run_signal_event_futex();
+    }
+    if (strcmp(argv[1], "signal-preflight-contamination") == 0) {
+        return run_signal_preflight_contamination(
+            g_getenv("PEAK_TEST_PREFLIGHT_BATCH") != NULL,
+            g_getenv("PEAK_TEST_PREFLIGHT_CLEAN") == NULL);
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();

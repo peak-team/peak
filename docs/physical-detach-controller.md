@@ -235,7 +235,14 @@ delivery is treated as backend contamination and signal-backed mutation then
 fails closed with `signal-unexpected-delivery`, while helper-backed mutation
 remains independent. Before every signal-backed stop, PEAK revalidates that its
 handler still owns the current reserved signal and that no unexpected
-non-cookie delivery has contaminated the backend.
+non-cookie delivery has contaminated the backend. The controller checks the
+unexpected-delivery count again after completing every target's mask preflight,
+before sending the first owned stop packet. If contamination arrived during
+preflight, it clears the unsent slots and returns unsupported with
+`signal-unexpected-delivery`; it grants no physical mutation permission and
+reopens the thread-creation gate. This check does not recover an owned packet
+that arrives after an earlier stop was cancelled: the existing sticky failure
+for that case remains unresolved. It does not change application signal APIs.
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current

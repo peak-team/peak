@@ -620,3 +620,25 @@ set_tests_properties(test_detach_controller_invalid_request
   PROPERTIES
     ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict"
 )
+
+# Real signal delivery with a deterministic contamination between mask preflight
+# and the first owned stop send. The same fixture also checks clean physical IO.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  target_link_options(test_detach_controller PRIVATE
+    -Wl,--wrap=peak_signal_policy_send_thread_signal)
+  foreach(preflight_case scalar batch clean_scalar clean_batch)
+    set(preflight_env
+      "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(preflight_case MATCHES "batch")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_BATCH=1")
+    endif()
+    if(preflight_case MATCHES "clean")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_CLEAN=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_preflight_${preflight_case}
+      COMMAND test_detach_controller signal-preflight-contamination)
+    set_tests_properties(test_detach_controller_signal_preflight_${preflight_case}
+      PROPERTIES ENVIRONMENT "${preflight_env}" TIMEOUT 10)
+  endforeach()
+endif()

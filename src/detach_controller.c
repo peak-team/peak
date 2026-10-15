@@ -2744,6 +2744,31 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
         }
     }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    extern void peak_test_after_signal_mask_preflight(int) __attribute__((weak));
+    if (peak_test_after_signal_mask_preflight != NULL) {
+        int saved_errno = errno;
+        peak_test_after_signal_mask_preflight(epoch);
+        errno = saved_errno;
+    }
+#endif
+
+    /* Mask inspection can run concurrently with an unexpected delivery. No
+     * owned stop packet has been sent yet, so this failure only clears slots. */
+    int unexpected_deliveries = peak_signal_policy_unexpected_delivery_count();
+    if (unexpected_deliveries != 0) {
+        peak_detach_controller_signal_clear_slots();
+        peak_detach_controller_note_failure_detail(
+            "signal-unexpected-delivery",
+            0,
+            (uintptr_t)backend_signum,
+            unexpected_deliveries > 0 ? (uintptr_t)unexpected_deliveries : 0);
+        if (status_out != NULL) {
+            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+        }
+        return FALSE;
+    }
+
     for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
         PeakDetachSignalSlot* slot = &signal_slots[i];
         pid_t tid =
