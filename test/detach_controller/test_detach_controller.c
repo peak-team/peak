@@ -3292,6 +3292,12 @@ static int receipt_failed_tid, receipt_failed_signum;
 static unsigned long receipt_failed_cookie;
 static uint32_t receipt_test_capacity = PEAK_DETACH_HELPER_MAX_THREADS;
 static int receipt_control_replay, receipt_control_replay_rc;
+static int receipt_duplicate_mode, receipt_seed_index;
+static int receipt_seed_epoch, receipt_seed_signum;
+static pid_t receipt_seed_tid;
+static uint64_t receipt_seed_state;
+extern int peak_detach_controller_test_seed_pending_identity(
+    int, pid_t, int, gboolean, int*, pid_t*, int*, uint64_t*);
 static void receipt_control_after_preflight(int epoch);
 
 uint32_t peak_test_signal_receipt_capacity(void)
@@ -3381,6 +3387,18 @@ peak_test_after_signal_mask_preflight(int epoch)
 static void
 receipt_control_after_preflight(int epoch)
 {
+    if (receipt_duplicate_mode != 0) {
+        receipt_seed_index = peak_detach_controller_test_seed_pending_identity(
+            epoch, atomic_load(&preflight_worker_tid),
+            peak_detach_controller_test_signal_backend_signum(),
+            receipt_duplicate_mode == 2, &receipt_seed_epoch, &receipt_seed_tid,
+            &receipt_seed_signum, &receipt_seed_state);
+        fprintf(stderr, "receipt-wire-identity-simulation actual_TID_reuse=0 "
+                "prior_packet_sent=0 mode=%d index=%d epoch=%d T=%d S=%d state=0x%" PRIx64 "\n",
+                receipt_duplicate_mode, receipt_seed_index, receipt_seed_epoch,
+                receipt_seed_tid, receipt_seed_signum, receipt_seed_state);
+        return;
+    }
     if (!receipt_control_replay)
         return;
     receipt_control_replay_rc = __real_peak_signal_policy_send_thread_signal(
@@ -4086,7 +4104,11 @@ run_signal_receipt_control(int failed_send)
     pthread_t worker;
     int worker_started = 0;
     uint8_t before[GUM_PEAK_MAX_PROLOGUE_SIZE], after[GUM_PEAK_MAX_PROLOGUE_SIZE];
-    GumPeakPcDiagnostics diagnostics = {0};
+    GumPeakPcDiagnostics diagnostics = {0}, after_diagnostics = {0};
+    const char* duplicate_state = g_getenv("PEAK_TEST_RECEIPT_DUPLICATE_STATE");
+    receipt_duplicate_mode = duplicate_state == NULL ? 0 :
+        (strcmp(duplicate_state, "sent") == 0 ? 2 : 1);
+    receipt_seed_index = -1;
     gum_init_embedded();
     GumInterceptor* interceptor = gum_interceptor_obtain();
     GumInvocationListener* listener = gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
@@ -4117,7 +4139,8 @@ run_signal_receipt_control(int failed_send)
     while (atomic_load(&preflight_worker_tid) == 0 && preflight_now() < deadline)
         usleep(1000);
     check_true("receipt control worker ready", atomic_load(&preflight_worker_tid) > 0);
-    receipt_test_capacity = failed_send ? PEAK_DETACH_HELPER_MAX_THREADS : 0;
+    receipt_test_capacity = failed_send || receipt_duplicate_mode != 0
+        ? PEAK_DETACH_HELPER_MAX_THREADS : 0;
     atomic_store(&receipt_fail_next_send, failed_send);
     atomic_store(&preflight_normal_sends, 0);
     atomic_store(&preflight_tracking, 1);
@@ -4138,17 +4161,22 @@ run_signal_receipt_control(int failed_send)
     if (prepared)
         check_true("receipt control unexpected prepare finish",
                    peak_detach_controller_finish_hook_mutation(&request, &status));
+    check_true("receipt control full Gum state remains unchanged",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+               memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
     int callbacks_before = atomic_load(&preflight_callback_count);
     strict_helper_target();
     int callbacks = atomic_load(&preflight_callback_count) - callbacks_before;
     fprintf(stderr, "receipt-control failed_send=%d prepared=%d status=%s reason=%s "
             "normal_send_attempts=%d forced_failure_tid=%d forced_failure_S=%d "
-            "forced_failure_cookie=0x%lx real_sends=0 held=%d physical=%d "
+            "forced_failure_cookie=0x%lx real_sends=%d held=%d physical=%d "
             "entry_equal=%d callback_delta=%d unexpected=%d consume_count=%d gate=%d\n",
             failed_send, prepared, peak_detach_controller_status_string(status),
             detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
             atomic_load(&preflight_normal_sends), receipt_failed_tid, receipt_failed_signum,
-            receipt_failed_cookie, held, physical, memcmp(before, after, length) == 0,
+            receipt_failed_cookie, atomic_load(&preflight_normal_sends) - (failed_send ? 1 : 0),
+            held, physical, memcmp(before, after, length) == 0,
             callbacks, peak_signal_policy_unexpected_delivery_count(),
             atomic_load(&receipt_consumed_count),
             peak_detach_controller_test_thread_creation_gate_epoch());
@@ -4157,7 +4185,24 @@ run_signal_receipt_control(int failed_send)
                callbacks == 1 && peak_signal_policy_unexpected_delivery_count() == 0 &&
                atomic_load(&receipt_consumed_count) == 0 &&
                peak_detach_controller_test_thread_creation_gate_epoch() == 0);
-    if (!failed_send) {
+    if (receipt_duplicate_mode != 0) {
+        fprintf(stderr, "receipt-wire-identity-rejection mode=%d status=%s reason=%s "
+                "tid=%ld pc=%" PRIuPTR " aux=%" PRIuPTR " normal_sends=%d\n",
+                receipt_duplicate_mode, peak_detach_controller_status_string(status),
+                detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+                detail != NULL ? detail->tid : -1, detail != NULL ? detail->pc : 0,
+                detail != NULL ? detail->aux : 0, atomic_load(&preflight_normal_sends));
+        check_true("duplicate wire tuple rejected before new allocation or send",
+                   receipt_seed_index == PEAK_DETACH_HELPER_MAX_THREADS - 1 &&
+                   receipt_seed_epoch > 0 && receipt_seed_tid == atomic_load(&preflight_worker_tid) &&
+                   receipt_seed_signum == signo &&
+                   (receipt_seed_state & UINT64_C(15)) == (receipt_duplicate_mode == 2 ? 3 : 1) &&
+                   !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                   atomic_load(&preflight_normal_sends) == 0 && detail != NULL &&
+                   detail->reason != NULL && strcmp(detail->reason, "signal-receipt-identity-pending") == 0 &&
+                   detail->tid == receipt_seed_tid && detail->pc == (uintptr_t)signo &&
+                   detail->aux == (uintptr_t)receipt_seed_epoch);
+    } else if (!failed_send) {
         check_true("receipt capacity refuses before first send",
                    status == PEAK_DETACH_STATUS_UNSUPPORTED &&
                    atomic_load(&preflight_normal_sends) == 0 && detail != NULL &&
@@ -4202,6 +4247,7 @@ run_signal_receipt_control(int failed_send)
 cleanup:
     receipt_test_capacity = PEAK_DETACH_HELPER_MAX_THREADS;
     receipt_control_replay = 0;
+    receipt_duplicate_mode = 0;
     atomic_store(&receipt_fail_next_send, 0);
     if (worker_started) {
         atomic_store(&preflight_worker_running, 0);

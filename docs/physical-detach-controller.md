@@ -256,7 +256,12 @@ not impose a new per-send-credit condition on that path.
 The ledger has 4096 records and a controller-only static reservation mapping;
 on the current 64-bit ABI they occupy 98,304 and 65,536 bytes respectively
 (24-byte records, 16-byte references, 160 KiB total). Normal handling may scan
-up to 4096 records; no performance improvement is claimed. Atomic identities
+up to 4096 records; no performance improvement is claimed. Before selecting a
+free record, allocation rejects any outstanding unconsumed record with the same
+(epoch, TID, signal) wire identity across the entire ledger. Allocation tickets
+are not encoded in cookies, so distinct tickets alone cannot distinguish those
+packets; this rejection is a profiler-window failure and changes no application
+signal API. Atomic identities
 and nonwrapping allocation tickets distinguish reuse, and epochs stop before
 wrapping. Capacity or identity-budget exhaustion returns unsupported without
 sending the initial stop cohort. Unseen sent debt is not reclaimed merely

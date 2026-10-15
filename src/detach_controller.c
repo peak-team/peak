@@ -2170,6 +2170,20 @@ peak_detach_controller_signal_receipt_reserve(
     PeakDetachStatus* status_out)
 {
     const char* failure_reason = "signal-receipt-capacity";
+    /* Allocation tickets do not appear in the wire cookie. An unconsumed
+     * identity must remain unique across the whole ledger, including records
+     * beyond a free slot or the test-only allocation-capacity limit. */
+    for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
+        PeakDetachSignalReceipt* receipt = &signal_receipts[i];
+        uint64_t state = atomic_load_explicit(&receipt->state, memory_order_acquire);
+        if (state != 0 && (state & PEAK_SIGNAL_RECEIPT_SEEN) == 0 &&
+            atomic_load_explicit(&receipt->epoch, memory_order_relaxed) == epoch &&
+            atomic_load_explicit(&receipt->tid, memory_order_relaxed) == (int)tid &&
+            atomic_load_explicit(&receipt->signum, memory_order_relaxed) == signum) {
+            failure_reason = "signal-receipt-identity-pending";
+            goto fail;
+        }
+    }
     uint32_t capacity = peak_detach_controller_signal_receipt_capacity();
     if (signal_receipt_next_ticket > (UINT64_MAX >> 4)) {
         failure_reason = "signal-receipt-ticket-exhausted";
@@ -2211,6 +2225,36 @@ fail:
     }
     return FALSE;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Protocol-state simulation only: the controller already owns the mutation
+ * guard. This creates no packet and makes no claim of actual TID reuse. */
+int
+peak_detach_controller_test_seed_pending_identity(
+    int epoch, pid_t tid, int signum, gboolean sent,
+    int* epoch_out, pid_t* tid_out, int* signum_out, uint64_t* state_out)
+{
+    uint32_t index = PEAK_DETACH_HELPER_MAX_THREADS - 1;
+    PeakDetachSignalReceipt* receipt = &signal_receipts[index];
+    if (atomic_load_explicit(&receipt->state, memory_order_acquire) != 0 ||
+        signal_receipt_next_ticket > (UINT64_MAX >> 4)) {
+        return -1;
+    }
+    uint64_t tag = signal_receipt_next_ticket++ << 4;
+    atomic_store_explicit(&receipt->epoch, epoch, memory_order_relaxed);
+    atomic_store_explicit(&receipt->tid, (int)tid, memory_order_relaxed);
+    atomic_store_explicit(&receipt->signum, signum, memory_order_relaxed);
+    atomic_store_explicit(&receipt->state,
+                          tag | PEAK_SIGNAL_RECEIPT_PUBLISHED |
+                              (sent ? PEAK_SIGNAL_RECEIPT_SENT : 0),
+                          memory_order_release);
+    *epoch_out = atomic_load_explicit(&receipt->epoch, memory_order_relaxed);
+    *tid_out = (pid_t)atomic_load_explicit(&receipt->tid, memory_order_relaxed);
+    *signum_out = atomic_load_explicit(&receipt->signum, memory_order_relaxed);
+    *state_out = atomic_load_explicit(&receipt->state, memory_order_acquire);
+    return (int)index;
+}
+#endif
 
 static int
 peak_detach_controller_signal_send_owned(

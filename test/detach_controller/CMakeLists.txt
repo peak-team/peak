@@ -673,3 +673,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       PROPERTIES ENVIRONMENT "${receipt_env}" TIMEOUT 10)
   endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(identity_state published sent)
+    add_test(NAME test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_RECEIPT_DUPLICATE_STATE=${identity_state}"
+        TIMEOUT 5)
+  endforeach()
+endif()
