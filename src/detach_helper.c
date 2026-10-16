@@ -551,9 +551,12 @@ restart_stop_snapshot:
         DIR* task_dir = opendir(task_path);
         if (task_dir == NULL) {
             *errno_out = errno;
-            return errno == EACCES || errno == EPERM ?
-                PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
-                PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+            PeakDetachHelperStatus intended_status =
+                *errno_out == EACCES || *errno_out == EPERM ?
+                    PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
+                    PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
+            return cleanup_held_threads_or_release_failed(intended_status,
+                                                         errno_out);
         }
 
         for (;;) {

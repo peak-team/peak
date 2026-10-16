@@ -57,6 +57,19 @@ if(TARGET peak_detach_helper)
     PRIVATE
       ${PROJECT_SOURCE_DIR}/include
   )
+
+  add_executable(test_detach_helper_stop_failure
+    test_detach_helper_stop_failure.c)
+  target_include_directories(test_detach_helper_stop_failure
+    PRIVATE
+      ${PROJECT_SOURCE_DIR}/include
+  )
+  target_compile_definitions(test_detach_helper_stop_failure
+    PRIVATE TEST_RESCAN_CLEANUP_FAILURE=1)
+  add_test(NAME test_detach_helper_stop_failure
+    COMMAND $<TARGET_FILE:test_detach_helper_stop_failure>)
+  set_tests_properties(test_detach_helper_stop_failure PROPERTIES
+    PASS_REGULAR_EXPRESSION "stop_failure_7_mock_paths_ok")
 endif()
 
 add_executable(test_detach_stale_threads test_detach_stale_threads.c)
