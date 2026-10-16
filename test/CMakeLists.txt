@@ -1061,6 +1061,20 @@ if(BUILD_TESTING)
         set_tests_properties(test_cxx_throw_transparency_peak PROPERTIES
             ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
 
+        # Keep the discovered recursive gap visible as a failing test.
+        # Labels document the expected failure; they do not invert its result.
+        add_test(NAME test_cxx_throw_recursive_native
+            COMMAND $<TARGET_FILE:test_cxx_throw_recursive>)
+        add_test(NAME test_cxx_throw_recursive_peak_known_failure
+            COMMAND $<TARGET_FILE:test_cxx_throw_recursive>)
+        set_tests_properties(test_cxx_throw_recursive_native
+            test_cxx_throw_recursive_peak_known_failure PROPERTIES TIMEOUT 20)
+        set_tests_properties(test_cxx_throw_recursive_native PROPERTIES
+            PASS_REGULAR_EXPRESSION "cxx_throw_transparency_ok")
+        set_tests_properties(test_cxx_throw_recursive_peak_known_failure PROPERTIES
+            LABELS "known-failure;transparency;recursive-unwind"
+            ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner,peak_cxx_throw_recursive;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
+
         add_test(NAME test_fastpath_nonlocal_unwind
             COMMAND
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)
