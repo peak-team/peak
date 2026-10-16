@@ -1295,6 +1295,7 @@ run_controller_two_target_lifecycle_check(void)
         (PeakHookStateFn)required_symbol("peak_general_listener_hook_state");
     size_t* hook_count = (size_t*)required_symbol("peak_hook_address_count");
     const char* trace_path = getenv("PEAK_DETACH_TRACE_PATH");
+    const char* inject_failure = getenv("PEAK_TEST_DIAG_INJECT_FIRST_STOP");
     const unsigned int drain_deadline_ms = 2000;
 
     if (request_detach == NULL ||
@@ -1316,6 +1317,32 @@ run_controller_two_target_lifecycle_check(void)
         hook_state(1) != PEAK_HOOK_ATTACHED) {
         fprintf(stderr, "expected both hooks to start attached\n");
         return 2;
+    }
+
+    /* Test-only setup: make the existing fake helper reject exactly the first
+     * stop at an interior PC before the controller has any queued request. */
+    if (inject_failure != NULL && strcmp(inject_failure, "1") == 0) {
+        GumInterceptor** interceptor_slot =
+            (GumInterceptor**)required_symbol("interceptor");
+        GumInvocationListener*** listeners_slot =
+            (GumInvocationListener***)required_symbol("array_listener");
+        gpointer** hook_addresses_slot = (gpointer**)required_symbol("hook_address");
+        PeakGumGetPcDiagnosticsFn get_pc_diagnostics =
+            (PeakGumGetPcDiagnosticsFn)required_symbol(
+                "gum_interceptor_peak_get_pc_diagnostics");
+        const char* stop_pc_file = getenv("FAKE_DETACH_HELPER_STOP_PC_FILE");
+        GumPeakPcDiagnostics diagnostics;
+
+        if (interceptor_slot == NULL || listeners_slot == NULL ||
+            hook_addresses_slot == NULL || get_pc_diagnostics == NULL ||
+            stop_pc_file == NULL || stop_pc_file[0] == '\0' ||
+            !get_pc_diagnostics(*interceptor_slot, (*hook_addresses_slot)[0],
+                                (*listeners_slot)[0], &diagnostics) ||
+            write_pointer_file(stop_pc_file,
+                               (gpointer)((uintptr_t)diagnostics.function_address + 1u)) != 0) {
+            fprintf(stderr, "failed to arm one-shot pre-controller stop failure\n");
+            return 2;
+        }
     }
 
     if (!request_detach(0) || !request_detach(1)) {

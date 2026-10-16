@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "internal/general_listener/reattach_diagnostics.h"
 #include "general_listener.h"
 #include "internal/cancel_scope.h"
 #include "dlopen_interceptor.h"
@@ -436,6 +437,8 @@ static PeakEnvWarningState peak_controller_retry_count_warning_emitted;
 static unsigned int peak_controller_configured_shutdown_drain_ms = 1000;
 static gsize peak_controller_trace_config_initialized = 0;
 static gchar* peak_controller_trace_path = NULL;
+static gboolean peak_rd_control_enabled = FALSE;
+#define PEAK_RD(call) do { if (peak_rd_control_enabled) { call; } } while (0)
 static gboolean peak_controller_trace_enabled = FALSE;
 static gboolean peak_dynamic_attach_needed = FALSE;
 #define PEAK_GENERAL_CONTROLLER_MAX_BATCH_CANDIDATES 64U
@@ -775,6 +778,10 @@ peak_general_controller_init_trace_config_once(void)
     }
     peak_detach_controller_configure_trace_diagnostics(
         peak_controller_trace_enabled);
+    const char* diagnostic_flag = g_getenv("PEAK_REATTACH_DIAGNOSTICS");
+    if (diagnostic_flag != NULL && strcmp(diagnostic_flag, "1") == 0) {
+        peak_rd_control_enabled = peak_rd_init(diagnostic_flag, path);
+    }
 }
 
 static void
@@ -1110,6 +1117,11 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
     PeakDetachAccountingSnapshot detach_accounting;
     gboolean accounting_valid;
     FILE* fp;
+
+    PEAK_RD(peak_rd_event(hook_id, result,
+        peak_hook_states != NULL && hook_id < peak_hook_address_count
+            ? peak_hook_states[hook_id] : -1, operation,
+        0, 0.0, 0.0, 0.0, retry_count, stop_window_us, status));
 
     if (path == NULL || path[0] == '\0') {
         return;
@@ -2489,6 +2501,13 @@ peak_general_listener_note_detach_profile_seconds_unlocked(size_t hook_id)
             : peak_general_listener_saved_detach_profile_seconds_unlocked(
                   hook_id,
                   fallback_seconds);
+    PEAK_RD(peak_rd_event(hook_id, "seed",
+        peak_hook_states != NULL ? peak_hook_states[hook_id] : -1,
+        PEAK_DETACH_OPERATION_DETACH,
+        peak_hook_cached_sample_calls != NULL ? peak_hook_cached_sample_calls[hook_id] : 0,
+        detached_profile_seconds, peak_hook_detach_profile_seconds[hook_id],
+        0.0, have_detached_sample, 0.0, 0));
+
 }
 
 static void
@@ -2596,6 +2615,11 @@ peak_general_controller_note_retry_unlocked(size_t hook_id,
     if (peak_hook_last_retry_status != NULL) {
         peak_hook_last_retry_status[hook_id] = status;
     }
+    PEAK_RD(peak_rd_event(hook_id, "retry_scheduled",
+        peak_hook_states != NULL ? peak_hook_states[hook_id] : -1,
+        -1, 0, 0.0, 0.0, 0.0, peak_hook_next_retry_time[hook_id],
+        peak_hook_retry_count[hook_id], status));
+
 }
 
 static gboolean
@@ -2745,6 +2769,11 @@ peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookState state)
         return;
     }
 
+    PEAK_RD(peak_rd_event(hook_id,
+        state == PEAK_HOOK_REATTACHING || state == PEAK_HOOK_DETACHING
+            ? "prepare_success" : "state",
+        state, state == PEAK_HOOK_REATTACHING ? PEAK_DETACH_OPERATION_REATTACH :
+            state == PEAK_HOOK_DETACHING ? PEAK_DETACH_OPERATION_DETACH : -1, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0));
     peak_hook_states[hook_id] = state;
     gboolean detach_count_request_published = FALSE;
     if (array_listener != NULL && array_listener[hook_id] != NULL) {
@@ -2853,6 +2882,8 @@ peak_general_listener_request_reattach_with_context_unlocked(
                 !array_listener_gum_detach_flushed[hook_id]) {
                 return FALSE;
             }
+            PEAK_RD(peak_rd_event(hook_id, "request_accept", PEAK_HOOK_DETACHED,
+                PEAK_DETACH_OPERATION_REATTACH, calls, 0.0, 0.0, total_time, ratio, global_overhead, source));
             peak_general_controller_reset_retry_unlocked(hook_id);
             peak_general_controller_mark_pending_started_unlocked(hook_id,
                                                                   peak_second());
@@ -3571,6 +3602,12 @@ peak_general_controller_prepare_hook_mutation(size_t hook_id,
         request.blocked_pc_size = attach_plan->mutation_guard_size;
     }
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    PEAK_RD(peak_rd_event(hook_id, "controller_attempt",
+        peak_hook_states != NULL && hook_id < peak_hook_address_count
+            ? peak_hook_states[hook_id] : -1,
+        operation, 0, 0.0, 0.0, 0.0,
+        peak_hook_retry_count != NULL && hook_id < peak_hook_address_count
+            ? peak_hook_retry_count[hook_id] : 0, 0.0, 0));
     peak_gum_module_mutation_begin();
     gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
 
@@ -4384,6 +4421,14 @@ peak_general_controller_process_pending_batch_unlocked(void)
         attach_status[i] = GUM_ATTACH_OK;
     }
 
+    if (peak_rd_control_enabled) {
+        for (size_t i = 0; i < candidate_count; i++) {
+            size_t id = candidates[i].hook_id;
+            PEAK_RD(peak_rd_event(id, "controller_attempt", peak_hook_states[id],
+                candidates[i].operation, 0, 0.0, 0.0, 0.0,
+                candidates[i].retry_count, candidates[i].pending_age_s, 0));
+        }
+    }
     peak_gum_module_mutation_begin();
     (void)peak_detach_controller_prepare_hook_mutation_batch(requests,
                                                              candidate_count,
@@ -4943,6 +4988,7 @@ peak_general_listener_controller_stop(void)
         general_controller_thread_started = FALSE;
         pthread_mutex_unlock(&general_controller_wake_mutex);
     }
+    PEAK_RD(peak_rd_emit());
 }
 /* Heartbeat policy. */
 
@@ -5464,6 +5510,10 @@ void* peak_heartbeat_monitor(void* arg) {
             (double)hb_max_us / 1e6;
         gboolean detach_observation_ready =
             total_execution_time >= min_detach_observation_time;
+        PEAK_RD(peak_rd_round(heartbeat_capacity, total_execution_time,
+            detach_observation_ready, enable_reattach, check_interval,
+            heartbeat_counter, target_profile_ratio, global_target_ratio,
+            peak_global_reattach_factor));
 
         double profile_spent_seconds = 0.0;
         double control_spent_seconds = 0.0;
@@ -5505,6 +5555,8 @@ void* peak_heartbeat_monitor(void* arg) {
                     i,
                     &total_num_calls,
                     &hook_profile_spent_seconds);
+            gboolean cached_sample_hit = FALSE;
+            if (peak_rd_control_enabled) cached_sample_hit = have_sample;
             if (!have_sample) {
                 have_sample =
                     peak_general_listener_refresh_hook_sample_cache_unlocked(
@@ -5524,6 +5576,8 @@ void* peak_heartbeat_monitor(void* arg) {
                 continue;
             }
 
+            PEAK_RD(peak_rd_sample(i, cached_sample_hit,
+                           total_num_calls, hook_profile_spent_seconds));
             calls_snapshot[i] = total_num_calls;
             profile_seconds_snapshot[i] = hook_profile_spent_seconds;
             double ratio = hook_profile_spent_seconds / total_execution_time;
@@ -5784,6 +5838,11 @@ void* peak_heartbeat_monitor(void* arg) {
                     reattach_risk_spent_ratio <= reattach_gate_ratio;
             }
 
+            PEAK_RD(peak_rd_global(heartbeat_capacity, reattach_accounting_coherent,
+                reattach_budget_ok, total_execution_time, profile_spent_seconds,
+                reattach_control_risk_seconds, reattach_risk_spent_ratio,
+                reattach_gate_ratio, headroom_seconds, predicted_batch_stop_seconds));
+
             if (reattach_budget_ok) {
                 size_t pending_mutation_count = 0;
                 size_t detached_cnt = 0;
@@ -5833,14 +5892,16 @@ void* peak_heartbeat_monitor(void* arg) {
                             reattach_budget_ok = FALSE;
                         }
                     }
-                    if (!peak_detached[i]) continue;
-                    if (peak_need_detach[i]) continue;
+                    if (!peak_detached[i]) { PEAK_RD(peak_rd_reason(i, "state_filter")); continue; }
+                    if (peak_need_detach[i]) { PEAK_RD(peak_rd_reason(i, "state_filter")); continue; }
                     if (peak_hook_states[i] != PEAK_HOOK_DETACHED) {
+                        PEAK_RD(peak_rd_reason(i, "state_filter"));
                         continue;
                     }
                     if (!peak_general_listener_reattach_cooldown_ready_unlocked(
                             i,
                             now)) {
+                        PEAK_RD(peak_rd_reason(i, "cooldown_filter"));
                         continue;
                     }
 
@@ -5855,6 +5916,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         projected_ratio <= target_profile_ratio;
                     global_eligible = enable_global_heartbeat;
                     if (!per_target_eligible && !global_eligible) {
+                        PEAK_RD(peak_rd_reason(i, "per_target_filter"));
                         continue;
                     }
 
@@ -5887,6 +5949,9 @@ void* peak_heartbeat_monitor(void* arg) {
                         &headroom_seconds,
                         pending_stop_seconds) &&
                     headroom_seconds > 0.0;
+                if (!reattach_budget_ok) {
+                    PEAK_RD(peak_rd_pending_budget(heartbeat_capacity));
+                }
 
                 if (reattach_budget_ok && detached_cnt > 1) {
                     qsort(entries,
@@ -5912,10 +5977,11 @@ void* peak_heartbeat_monitor(void* arg) {
                         peak_detached[i] && !peak_need_detach[i] &&
                         peak_hook_states != NULL &&
                         peak_hook_states[i] == PEAK_HOOK_DETACHED;
-                    if (!still_detached) continue;
+                    if (!still_detached) { PEAK_RD(peak_rd_reason(i, "state_filter")); continue; }
                     if (!peak_general_listener_reattach_cooldown_ready_unlocked(
                             i,
                             now)) {
+                        PEAK_RD(peak_rd_reason(i, "cooldown_filter"));
                         continue;
                     }
 
@@ -5926,6 +5992,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         projected_ratio <= target_profile_ratio;
                     global_eligible = enable_global_heartbeat;
                     if (!per_target_eligible && !global_eligible) {
+                        PEAK_RD(peak_rd_reason(i, "per_target_filter"));
                         continue;
                     }
                     source = per_target_eligible
@@ -5969,6 +6036,7 @@ void* peak_heartbeat_monitor(void* arg) {
                         !peak_general_listener_subtract_nonnegative_finite(
                             &remaining_headroom_seconds,
                             candidate_seconds)) {
+                        PEAK_RD(peak_rd_reason(i, "candidate_headroom"));
                         continue;
                     }
 
@@ -5985,6 +6053,7 @@ void* peak_heartbeat_monitor(void* arg) {
                             total_execution_time,
                             request_rate);
                     if (!accepted) {
+                        PEAK_RD(peak_rd_reason(i, "queue_reject"));
                         continue;
                     }
 

@@ -1329,6 +1329,27 @@ if(BUILD_TESTING)
                 PROPERTIES
                     PASS_REGULAR_EXPRESSION "controller_two_target_lifecycle_trace_ok"
                     TIMEOUT 30)
+            add_test(NAME test_reattach_diagnostics_controller_lifecycle
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_reattach_diagnostics_check.py
+                        --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --helper $<TARGET_FILE:test_detach_fake_helper>
+                        --timeout 20)
+            set_tests_properties(test_reattach_diagnostics_controller_lifecycle
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "reattach_diagnostics_lifecycle_ok"
+                    TIMEOUT 50)
+            add_test(NAME test_reattach_diagnostics_heartbeat_observation
+                COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_reattach_heartbeat_diagnostics_check.py
+                        --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_detach_hotloop
+                        --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
+                        --timeout 15)
+            set_tests_properties(test_reattach_diagnostics_heartbeat_observation
+                PROPERTIES
+                    PASS_REGULAR_EXPRESSION "reattach_heartbeat_diagnostics_ok"
+                    TIMEOUT 25)
             add_test(NAME test_detach_hotloop_two_target_lifecycle_unsafe_shutdown_rejected
                 COMMAND ${Python3_EXECUTABLE}
                         ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_detach_hotloop_trace_check.py

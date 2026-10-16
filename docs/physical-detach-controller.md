@@ -639,6 +639,9 @@ an unprepared candidate carries the same nonzero window sample and `batch_id`
 as the successful candidates because its classification occurred inside that
 shared window. `batch_id` is `0` for single-row paths. Retry exhaustion emits
 `result=retry-abandoned` before the transition is returned to its stable state.
+The optional [reattach diagnostics sidecar](reattach-diagnostics.md) records
+cache seeds, heartbeat admission and request progress without changing this CSV.
+
 STOP-window accounting is always collected, including with tracing disabled;
 the trace only renders the already-published diagnostic. Existing hot-callback
 timing remains part of the legacy
