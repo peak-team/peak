@@ -42,9 +42,11 @@ A separately authorized partial7995452 qualification may evaluate the same
 MILC workload, heartbeat/active-slot behavior and real physical transitions
 without claiming full PR readiness. Absence of the global admission gate
 retains81's opportunity for physical mutation but also its inherited safety
-gap. No build/runtime/commit/deployment has been performed for this candidate.
+gap. At initial source preparation no build/runtime/commit/deployment had been
+performed. Current execution, commit and merge status is recorded in the
+outside-source-tree review/merge receipts, not asserted by this document.
 
-## PR-head invariant reconciliation (not merge ancestry)
+## PR-head invariant reconciliation
 
 - 7c canceled-window owned-delivery credit: retained exact81 whole-ledger
   receipts bind epoch/TID/signum before publication; only native rc0 grants
@@ -56,10 +58,22 @@ gap. No build/runtime/commit/deployment has been performed for this candidate.
   credit. Existing active-slot-reuse pre-pinned/selected/arrived tests remain;
   fork-child tagged-reader/receipt preservation remains unchanged. This is not
   proof against kernel-selected old frames not yet entered in userspace.
+- Availability difference, not equivalent reclamation: 7c's owned-target-exit
+  path probes ESRCH and reaps slot-bound pending ownership. Exact81 retains
+  native-SENT but not-SEEN receipt debt when that target exits; retirement
+  marks SENT receipts RETIRED and allocation reclaims only SENT+SEEN. Such
+  debt can consume ledger capacity and eventually refuse future windows. The
+  old owned-target-exit reclamation test is not claimed as covered by the13
+  regressions or20 effect cases; no safe dead-target receipt reaper is added.
 - a88 forward-effect boundary: the qualified C product guard delta is applied
   verbatim to81; the20 genuine-send tests replace obsolete slot-seeded effect
   setup, while preserving fatal-exit/detail and real-effect witness oracles.
-- The old PR head a88 is NOT an ancestor of this checkout. Before publication,
-  a separately reviewed genuine non-force merge must include its ancestry and
-  reconcile these invariants; no ours strategy, force push, or claim that this
-  source snapshot is already a merge is authorized here.
+- Initial source preparation had no a88 ancestry. A genuine non-force merge
+  was subsequently started for review; its completion/parents/tree belong in
+  outside-tree receipts. Resolution keeps the reviewed receipt/tagged-reader
+  controller and native API behavior rather than reinstating old7c delivery
+  leases, slot-owned state, policy clear locking or slot-seeded cancellation
+  fixtures. The20 genuine-send effects plus13 original81 regressions cover
+  the mapped boundaries above, not full native handoff or dead-target reaping.
+  No ours strategy or force push is permitted; publication requires a reviewed
+  actual merge commit, not merely this source snapshot or merge-in-progress.
