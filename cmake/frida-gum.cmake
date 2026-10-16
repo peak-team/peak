@@ -316,7 +316,7 @@ function(_peak_validate_frida_gum_peak_api)
 #error Missing PEAK deferred module-sync lifecycle API
 #endif
 #if !defined(GUM_PEAK_FAST_LISTENER_VERSION) || \
-    GUM_PEAK_FAST_LISTENER_VERSION != 9
+    GUM_PEAK_FAST_LISTENER_VERSION != 10
 #error Unsupported PEAK Gum fast-listener ABI
 #endif
 
@@ -351,6 +351,13 @@ int main(void)
         guint,
         gpointer,
         gpointer);
+    typedef gboolean (*PeakUnwindLifecycleInitFunc)(void);
+    typedef void (*PeakUnwindThreadJoinedFunc)(
+        guint64,
+        guintptr,
+        gboolean,
+        guint64,
+        guint64);
     PeakAbiFingerprintFunc abi_fingerprint =
         gum_interceptor_peak_abi_fingerprint;
     PeakClassifyPcFunc classify_pc = gum_interceptor_peak_classify_pc;
@@ -363,6 +370,10 @@ int main(void)
         gum_interceptor_peak_drain_deferred_module_sync;
     PeakInvocationStackEntryMatchesFunc invocation_stack_entry_matches =
         gum_interceptor_peak_invocation_stack_entry_matches;
+    PeakUnwindLifecycleInitFunc unwind_lifecycle_init =
+        gum_interceptor_peak_unwind_lifecycle_init;
+    PeakUnwindThreadJoinedFunc unwind_thread_joined =
+        gum_interceptor_peak_unwind_thread_joined;
 
     (void) GUM_PEAK_PC_API_VERSION;
     (void) GUM_PEAK_PC_ABI_FRIDA_GUM_17_15_3_LINUX_X86_64;
@@ -404,9 +415,22 @@ int main(void)
         gum_interceptor_peak_deferred_module_sync_available;
     (void) sync_available;
     (void) invocation_stack_entry_matches;
+    (void) unwind_thread_joined;
+#if !defined(GUM_PEAK_UNWIND_FRAME_API_VERSION) || GUM_PEAK_UNWIND_FRAME_API_VERSION != 4
+#error Missing PEAK unwind frame capability
+#endif
+    if (gum_interceptor_peak_unwind_frame_api_version() != GUM_PEAK_UNWIND_FRAME_API_VERSION) return 2;
+    (void) gum_interceptor_peak_unwind_reconcile_current_thread;
+    if (!unwind_lifecycle_init()) return 3;
+    gum_init_embedded();
+    GumInterceptor * interceptor = gum_interceptor_obtain();
+    gum_interceptor_ignore_current_thread(interceptor);
+    gum_interceptor_unignore_current_thread(interceptor);
     gum_interceptor_peak_begin_module_mutation();
     gum_interceptor_peak_end_module_mutation();
     gum_interceptor_peak_quiesce_deferred_module_sync();
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
     return 0;
 }
 ")

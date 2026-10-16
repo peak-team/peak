@@ -6188,8 +6188,10 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address)
             &thread_data.entries[thread_data.level - 1];
         if (entry->fast_dispatch) {
             if (entry->stack_address == NULL ||
-                (guint8*)entry->stack_address >=
-                    (guint8*)stack_address) {
+                (guint8*)entry->stack_address > (guint8*)stack_address ||
+                (entry->stack_address == stack_address &&
+                 gum_interceptor_peak_unwind_frame_is_live(
+                     entry->function_context, entry->stack_address))) {
                 break;
             }
         } else if (
@@ -6200,6 +6202,34 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address)
             break;
         }
 
+        thread_data.level--;
+        peak_general_listener_abandon_entry(
+            &thread_data,
+            &thread_data.entries[thread_data.level]);
+    }
+}
+
+static void
+peak_general_listener_reap_known_unwound(void)
+{
+    while (thread_data.level > 0) {
+        PeakGeneralInvocationEntry* entry =
+            &thread_data.entries[thread_data.level - 1];
+        gboolean live;
+
+        if (entry->fast_dispatch) {
+            live = entry->stack_address == NULL ||
+                gum_interceptor_peak_unwind_frame_is_live(
+                    entry->function_context, entry->stack_address);
+        } else {
+            live = gum_interceptor_peak_invocation_stack_entry_matches(
+                entry->gum_stack_depth,
+                entry->function_context,
+                entry->stack_address);
+        }
+        if (live) {
+            break;
+        }
         thread_data.level--;
         peak_general_listener_abandon_entry(
             &thread_data,
@@ -8908,6 +8938,9 @@ gboolean peak_general_listener_dettach()
     }
 
     peak_general_listener_controller_stop();
+    if (gum_interceptor_peak_unwind_reconcile_current_thread()) {
+        peak_general_listener_reap_known_unwound();
+    }
 
 #if defined(__APPLE__)
     /*

@@ -164,9 +164,13 @@ peak_gum_fast_unwind_ensure(GumUnwindBroker * broker,
     return ready;
 }
 
+static void peak_invoke_api_shutdown(void);
+static gboolean peak_invoke_api_ensure(GumInterceptor *interceptor);
+
 static void
 peak_gum_fast_unwind_shutdown(void)
 {
+    peak_invoke_api_shutdown();
     G_LOCK(peak_gum_fast_unwind);
     if (peak_gum_fast_unwind_translator != NULL) {
         /* Removal takes the broker lock, so any in-flight callback completes
@@ -1032,6 +1036,9 @@ _gum_function_context_end_invocation_peak_original(
 G_GNUC_INTERNAL PeakGumInterceptorThreadContext17 *
 peak_gum_get_interceptor_thread_context(void);
 
+G_GNUC_INTERNAL extern GumSpinlock peak_gum_interceptor_thread_context_lock;
+G_GNUC_INTERNAL extern GHashTable *peak_gum_interceptor_thread_contexts;
+
 
 G_STATIC_ASSERT(sizeof(PeakGumFunctionContextBackendData17) == 3 * GLIB_SIZEOF_VOID_P);
 #if defined(__x86_64__) || defined(__amd64__)
@@ -1127,8 +1134,10 @@ peak_gum_invocation_stack_reap_unwound(gpointer live_stack_address)
                            PeakGumInvocationStackEntry17,
                            stack->len - 1);
 
-        if ((guint8 *)entry->stack_address >=
-            (guint8 *)live_stack_address) {
+        if ((guint8 *)entry->stack_address > (guint8 *)live_stack_address ||
+            (entry->stack_address == live_stack_address &&
+             gum_interceptor_peak_unwind_frame_is_live(entry->function_ctx,
+                                                       entry->stack_address))) {
             break;
         }
         g_atomic_int_dec_and_test(
@@ -1520,8 +1529,12 @@ gum_interceptor_peak_enable_fast_listener(
         context->trampoline_usage_counter == 0 &&
         (context->write_redirect_data == NULL ||
          context->write_redirect_data == fast_listener) &&
+#if defined(__x86_64__)
+        peak_invoke_api_ensure(interceptor)) {
+#else
         peak_gum_fast_unwind_ensure(private_interceptor->unwind_broker,
                                     fast_listener->translate_return_address)) {
+#endif
         g_atomic_pointer_set(
             &fast_listener->listener_entries_cookie,
             g_atomic_pointer_get(&context->listener_entries));
@@ -1626,6 +1639,13 @@ gum_interceptor_peak_release_fast_invocation(
     }
 }
 
+guint gum_interceptor_peak_unwind_frame_api_version(void) { return GUM_PEAK_UNWIND_FRAME_API_VERSION; }
+
+static guintptr peak_invoke_normalize_address(guintptr pc);
+
+#include "peak_gum_unwind_frames.inc"
+#include "peak_gum_invoke_cfi.inc"
+
 gboolean PEAK_GUM_FAST_DISPATCH_SECTION
 _gum_function_context_begin_invocation(
     PeakGumFunctionContext17 * function_ctx,
@@ -1633,9 +1653,34 @@ _gum_function_context_begin_invocation(
     gpointer * caller_ret_addr,
     gpointer * next_hop)
 {
+    if (peak_uw_internal != 0)
+        return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
+    gpointer peak_original_return = *caller_ret_addr;
+    peak_uw_reap(caller_ret_addr);
+#if defined(__x86_64__)
+    peak_gum_invocation_stack_reap_unwound(caller_ret_addr);
+#endif
     GumPeakFastListener * fast_listener =
         peak_gum_context_fast_listener_for_enter(function_ctx);
-
+    PeakUwFrame *peak_reserved = NULL;
+#if defined(__x86_64__)
+    gboolean peak_needs_frame = function_ctx->function_address != (gpointer)_Unwind_Find_FDE &&
+        function_ctx->function_address != (gpointer)_Unwind_GetIP &&
+        function_ctx->function_address != (gpointer)_Unwind_GetIPInfo &&
+        function_ctx->function_address != (gpointer)_Unwind_GetRegionStart &&
+        function_ctx->function_address != (gpointer)_Unwind_GetLanguageSpecificData;
+    if (peak_needs_frame) {
+        peak_reserved = peak_uw_prepare();
+        if (peak_reserved == NULL) {
+            /* Preserve Gum replacement/listener semantics on resource failure.
+             * This is explicitly degraded admission, not a repaired EH path. */
+            if (peak_general_listener_note_dropped_current_thread)
+                peak_general_listener_note_dropped_current_thread();
+            return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
+        }
+        peak_uw_bind_gum_context();
+    }
+#endif
     if (G_LIKELY(fast_listener != NULL)) {
         gpointer stack_address;
         gpointer return_address = *caller_ret_addr;
@@ -1670,18 +1715,28 @@ _gum_function_context_begin_invocation(
                                          return_address,
                                          gum_stack_depth);
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
-            return _gum_function_context_begin_invocation_peak_original(
+            gboolean invoke = _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);
+            peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
+                          peak_original_return, invoke, TRUE);
+            return invoke || peak_reserved != NULL;
         }
         *next_hop = function_ctx->on_invoke_trampoline;
         if (result == GUM_PEAK_FAST_ENTER_INVOKE) {
             *caller_ret_addr = function_ctx->on_leave_trampoline;
+            peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
+                          peak_original_return, TRUE, FALSE);
         }
-        return result == GUM_PEAK_FAST_ENTER_INVOKE;
+        else peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
+                           peak_original_return, FALSE, FALSE);
+        return result == GUM_PEAK_FAST_ENTER_INVOKE || peak_reserved != NULL;
     }
 
-    return _gum_function_context_begin_invocation_peak_original(
+    gboolean invoke = _gum_function_context_begin_invocation_peak_original(
         function_ctx, cpu_context, caller_ret_addr, next_hop);
+    peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
+                  peak_original_return, invoke, TRUE);
+    return invoke || peak_reserved != NULL;
 }
 
 void PEAK_GUM_FAST_DISPATCH_SECTION
@@ -1700,6 +1755,11 @@ _gum_function_context_end_invocation(
      * at the same return-address slot reported by the entry thunk.
      */
     stack_address = (gpointer)(uintptr_t)cpu_context->rsp;
+    gpointer peak_caller = NULL;
+    if (peak_uw_leave(function_ctx, stack_address, &peak_caller)) {
+        *next_hop = peak_caller;
+        return;
+    }
 #elif defined(__aarch64__)
     /* AArch64 returns through LR without changing SP. */
     stack_address = (gpointer)(uintptr_t)cpu_context->sp;

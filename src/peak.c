@@ -129,9 +129,7 @@ typedef enum {
     PEAK_RUNTIME_ACTIVATION_IN_PROGRESS = 2,
     PEAK_RUNTIME_ACTIVATION_ACTIVE = 3,
     PEAK_RUNTIME_ACTIVATION_CANCELED = 4,
-#if defined(__APPLE__)
     PEAK_RUNTIME_ACTIVATION_REJECTED = 5,
-#endif
     PEAK_RUNTIME_ACTIVATION_WAIT_TIMEOUT = 6,
 } PeakRuntimeActivationState;
 static _Atomic int peak_runtime_activation_state =
@@ -1307,6 +1305,12 @@ peak_activate_runtime(void)
      * using PEAK_MPI_ACTIVATION_POLICY=post-init reaches it only after a
      * successful MPI_Init* return, with no earlier Gum state or code mutation.
      */
+    if (!gum_interceptor_peak_unwind_lifecycle_init()) {
+        peak_log_warn(
+            "[peak] refusing runtime activation because Gum thread-context cleanup was already initialized\n");
+        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
+        return;
+    }
     gum_init_embedded();
 
     atomic_store_explicit(&peak_runtime_owner_pid,

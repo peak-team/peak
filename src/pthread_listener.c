@@ -547,7 +547,16 @@ peak_pthread_join(pthread_t thread, void **retval)
 #ifdef PEAK_ENABLE_TEST_HOOKS
     pthread_listener_test_pause_join_detach_after_capture(captured);
 #endif
+    guint64 unwind_cookie = gum_interceptor_peak_unwind_thread_cookie((guintptr)thread);
     int ret = original_pthread_join(thread, retval);
+    int saved_errno = errno;
+    if (ret == 0) {
+        gum_interceptor_peak_unwind_thread_joined(unwind_cookie,
+                                                  (guintptr)thread,
+                                                  captured,
+                                                  slot,
+                                                  generation);
+    }
     if (ret == 0 && captured) {
         PeakPthreadSlotToken token = {
             .slot = slot,
@@ -566,6 +575,7 @@ peak_pthread_join(pthread_t thread, void **retval)
                 &pthread_slot_registry, token, reusable);
         }
     }
+    errno = saved_errno;
     return ret;
 }
 
@@ -613,6 +623,7 @@ pthread_listener_reclaim_interval_elapsed(const struct timespec* now)
 gboolean
 pthread_listener_reclaim_detached_slots(void)
 {
+    (void)gum_interceptor_peak_unwind_reap_threads();
 #if defined(__linux__)
     PeakPthreadDetachedCandidate
         candidates[PEAK_PTHREAD_RECLAIM_SCAN_BUDGET];
@@ -898,6 +909,22 @@ pthread_listener_current_thread_slot(size_t* slot_out)
     }
     if (slot_out != NULL) {
         *slot_out = pthread_slot_identity.slot;
+    }
+    return TRUE;
+}
+
+gboolean
+pthread_listener_current_thread_token(size_t* slot_out,
+                                      uint64_t* generation_out)
+{
+    if (!pthread_slot_identity.valid) {
+        return FALSE;
+    }
+    if (slot_out != NULL) {
+        *slot_out = pthread_slot_identity.slot;
+    }
+    if (generation_out != NULL) {
+        *generation_out = pthread_slot_identity.generation;
     }
     return TRUE;
 }
