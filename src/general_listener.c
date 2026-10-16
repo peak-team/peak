@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "general_listener.h"
+#include "internal/cancel_scope.h"
 #include "dlopen_interceptor.h"
 #include "internal/target_resolver.h"
 #include "internal/exec_raw_syscall.h"
@@ -1151,6 +1152,7 @@ peak_general_controller_trace_mutation_detail(size_t hook_id,
 
     pthread_mutex_lock(&detach_trace_mutex);
     fp = fopen(path, "a");
+    peak_cancel_scope_note_open_result(fp, errno);
     if (fp != NULL) {
         fprintf(fp,
                 "%.9f,%lu,%s,%s,%s,%d,%s,%u,%.9f,%u,%.3f,%u,%s,%s,%ld,0x%llx,0x%llx,%s,%lu,%.12f,%.9f,%.9f,%.9f,%llu,%.9f,%.9f,%d,%llu\n",
@@ -1727,6 +1729,7 @@ static int pthread_pause_wait_for_ack(int session_id, const struct timespec* dea
 
     for (;;) {
         int ack_session_id = -1;
+        peak_cancel_scope_mark();
         ssize_t nread = read(pthread_pause_ack_pipe[0],
                              &ack_session_id,
                              sizeof(ack_session_id));
@@ -1752,6 +1755,7 @@ static int pthread_pause_wait_for_ack(int session_id, const struct timespec* dea
             pfd.fd = pthread_pause_ack_pipe[0];
             pfd.events = POLLIN;
             pfd.revents = 0;
+            peak_cancel_scope_mark();
             poll_ret = poll(&pfd, 1, timeout_ms);
             if (poll_ret > 0) {
                 continue;
@@ -1921,6 +1925,7 @@ static int pthread_pause_mapped(pthread_t thread, size_t mapped_id, int* session
         if (errno != EAGAIN) {
             return -1;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -1965,6 +1970,7 @@ int pthread_unpause(pthread_t thread, int session_id)
         if (errno != EAGAIN) {
             return -1;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -4211,6 +4217,7 @@ static gboolean peak_general_controller_flush_teardown(void)
         if (gum_interceptor_flush(interceptor)) {
             return TRUE;
         }
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
@@ -4686,6 +4693,62 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
     return did_work;
 }
 
+typedef struct {
+    pthread_t* tid_keys;
+    size_t* mapped_ids;
+    int* pause_session_ids;
+    int* pause_status;
+    GumInterceptor* interceptor;
+    gboolean fast_ignored;
+    gboolean gum_ignored;
+} PeakGeneralDrainCleanup;
+
+static void
+peak_general_listener_restore_cancel_type(void* data)
+{
+    int original_type = *(int*)data;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    (void)pthread_setcanceltype(original_type, NULL);
+}
+
+/* Entry contract: cancellation is currently disabled; state is its saved caller state. */
+static void
+peak_general_listener_restore_cancel_state(int state, gboolean check_cancel)
+{
+    if (state == PTHREAD_CANCEL_DISABLE) {
+        return;
+    }
+    /* The caller is currently disabled. Deliver pending cancellation at an
+     * explicit deferred boundary, while preserving its type for outer cleanup. */
+    int original_type;
+    (void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &original_type);
+    pthread_cleanup_push(peak_general_listener_restore_cancel_type, &original_type);
+    (void)pthread_setcancelstate(state, NULL);
+    if (check_cancel || original_type == PTHREAD_CANCEL_ASYNCHRONOUS) {
+        pthread_testcancel();
+    }
+    (void)pthread_setcanceltype(original_type, NULL);
+    pthread_cleanup_pop(0);
+}
+
+static void
+peak_general_listener_drain_cleanup(void* data)
+{
+    PeakGeneralDrainCleanup* cleanup = data;
+    /* Both normal cleanup and cancellation unwind run without re-cancellation. */
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    g_free(cleanup->pause_status);
+    g_free(cleanup->pause_session_ids);
+    g_free(cleanup->mapped_ids);
+    g_free(cleanup->tid_keys);
+    if (cleanup->gum_ignored) {
+        gum_interceptor_unignore_current_thread(cleanup->interceptor);
+    }
+    if (cleanup->fast_ignored) {
+        peak_general_listener_fast_unignore_current_thread();
+    }
+}
+
 gboolean
 peak_general_listener_controller_drain(unsigned int timeout_ms)
 {
@@ -4699,29 +4762,45 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
         return TRUE;
     }
 
+    int caller_cancel_state;
+    int cleanup_cancel_state;
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &caller_cancel_state);
+    PeakGeneralDrainCleanup cleanup = { .interceptor = interceptor };
     pthread_t controller_tid = pthread_self();
-    pthread_t* tid_keys = g_new0(pthread_t, peak_max_num_threads);
-    size_t* mapped_ids = g_new0(size_t, peak_max_num_threads);
-    int* pause_session_ids = g_new0(int, peak_max_num_threads);
-    int* pause_status = g_new0(int, peak_max_num_threads);
-    double deadline = peak_second() + ((double)timeout_ms / 1000.0);
+    double deadline;
     gboolean drained = FALSE;
 
+    cleanup.tid_keys = g_new0(pthread_t, peak_max_num_threads);
+    cleanup.mapped_ids = g_new0(size_t, peak_max_num_threads);
+    cleanup.pause_session_ids = g_new0(int, peak_max_num_threads);
+    cleanup.pause_status = g_new0(int, peak_max_num_threads);
+    deadline = peak_second() + ((double)timeout_ms / 1000.0);
     peak_general_listener_fast_ignore_current_thread();
-    gum_interceptor_ignore_current_thread(interceptor);
+    cleanup.fast_ignored = TRUE;
+    gum_interceptor_ignore_current_thread(cleanup.interceptor);
+    cleanup.gum_ignored = TRUE;
+    pthread_cleanup_push(peak_general_listener_drain_cleanup, &cleanup);
+    peak_general_listener_restore_cancel_state(caller_cancel_state, FALSE);
 
     for (;;) {
         gboolean pending;
-
+        int iteration_cancel_state;
+        /* Reclaim also owns PEAK locks; protect it before taking the controller
+         * lock and until mutation release and state publication have finished. */
+        (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &iteration_cancel_state);
+        PeakCancelScope cp_scope;
+        peak_cancel_scope_enter(&cp_scope);
         (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
-                                                               tid_keys,
-                                                               mapped_ids,
-                                                               pause_session_ids,
-                                                               pause_status);
+                                                               cleanup.tid_keys,
+                                                               cleanup.mapped_ids,
+                                                               cleanup.pause_session_ids,
+                                                               cleanup.pause_status);
         pending = peak_general_controller_has_pending_unlocked();
         pthread_mutex_unlock(&lock);
+        gboolean old_cp_seen = peak_cancel_scope_leave(&cp_scope);
+        peak_general_listener_restore_cancel_state(iteration_cancel_state, old_cp_seen);
 
         if (!pending) {
             drained = TRUE;
@@ -4732,17 +4811,13 @@ peak_general_listener_controller_drain(unsigned int timeout_ms)
         }
 
         peak_general_listener_controller_wake();
+        peak_cancel_scope_mark();
         usleep(1000);
     }
 
-    g_free(pause_status);
-    g_free(pause_session_ids);
-    g_free(mapped_ids);
-    g_free(tid_keys);
-
-    gum_interceptor_unignore_current_thread(interceptor);
-    peak_general_listener_fast_unignore_current_thread();
-
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cleanup_cancel_state);
+    pthread_cleanup_pop(1);
+    peak_general_listener_restore_cancel_state(cleanup_cancel_state, FALSE);
     return drained;
 }
 

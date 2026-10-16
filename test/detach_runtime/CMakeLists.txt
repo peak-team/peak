@@ -195,3 +195,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       TIMEOUT 15
       PASS_REGULAR_EXPRESSION "gum_exact_attach_aarch64_ok")
 endif()
+
+# Pure cancellation-scope bookkeeping; independent of PEAK/Gum/MPI runtime.
+foreach(scope_test test_drain_cancel_scope test_drain_cancel_pending)
+  add_executable(${scope_test}
+    ${scope_test}.c
+    ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
+  target_include_directories(${scope_test} PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_compile_options(${scope_test} PRIVATE -UNDEBUG)
+  target_link_libraries(${scope_test} PRIVATE Threads::Threads)
+  add_test(NAME ${scope_test} COMMAND $<TARGET_FILE:${scope_test}>)
+  set_tests_properties(${scope_test} PROPERTIES TIMEOUT 10)
+endforeach()
