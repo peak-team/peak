@@ -44,7 +44,8 @@ add_executable(test_mpi_report_transport
     ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
     ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
     ${PROJECT_SOURCE_DIR}/src/utils/timing.c
-    ${PROJECT_SOURCE_DIR}/src/logging.c)
+    ${PROJECT_SOURCE_DIR}/src/logging.c
+    ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
 if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     target_sources(test_mpi_report_transport PRIVATE

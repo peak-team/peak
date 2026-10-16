@@ -208,7 +208,8 @@ if(BUILD_TESTING)
         report/test_report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_report_snapshot PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_compile_options(test_report_snapshot PRIVATE -UNDEBUG)
@@ -257,7 +258,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_snapshot.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_report_snapshot_cxx_link PRIVATE
         ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(test_report_snapshot_cxx_link PRIVATE Threads::Threads)
@@ -275,7 +277,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_model.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_report_formatter PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
@@ -295,7 +298,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/report_maxima.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_compile_definitions(test_socket_report_transport PRIVATE
         PEAK_ENABLE_TEST_HOOKS=1)
     target_include_directories(test_socket_report_transport PRIVATE
@@ -330,7 +334,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/utils/timing.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_compile_definitions(test_mpi_report_request_lifetime PRIVATE
         HAVE_MPI=1
         PEAK_ENABLE_TEST_HOOKS=1
@@ -362,7 +367,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/utils/timing.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_compile_definitions(test_mpi_teardown_guard PRIVATE
         HAVE_MPI=1
         PEAK_ENABLE_TEST_HOOKS=1)
@@ -384,7 +390,8 @@ if(BUILD_TESTING)
         report/test_runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_runtime_config PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
@@ -424,7 +431,8 @@ if(BUILD_TESTING)
     add_executable(test_numeric_env_parser
         utils/test_numeric_env_parser.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_numeric_env_parser PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils)
@@ -437,7 +445,8 @@ if(BUILD_TESTING)
         add_executable(test_numeric_env_parser_long_double_64
             utils/test_numeric_env_parser.c
             ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
-            ${PROJECT_SOURCE_DIR}/src/logging.c)
+            ${PROJECT_SOURCE_DIR}/src/logging.c
+            ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
         target_include_directories(test_numeric_env_parser_long_double_64 PRIVATE
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/include/utils)
@@ -506,7 +515,8 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/utils/env_parser.c
         ${PROJECT_SOURCE_DIR}/src/unsafe_gum_prologue.c
-        ${PROJECT_SOURCE_DIR}/src/logging.c)
+        ${PROJECT_SOURCE_DIR}/src/logging.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
     target_include_directories(test_attach_policy PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/include/utils
@@ -3572,5 +3582,20 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "performFree*\\|[ \t]+[0-9]+\\|.*performFree*\\|[ \t]+[0-9]+(\\.[0-9]+)?"
             PASS_REGULAR_EXPRESSION "Max usage \\(bytes\\):[ \t]*[0-9]+"
     )
+
+    # Pure owned-stream cancellation eligibility checks; no Gum, ptrace or MPI.
+    add_executable(test_logging_cancel_scope
+        utils/test_logging_cancel_scope.c
+        ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
+    target_include_directories(test_logging_cancel_scope PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_logging_cancel_scope PRIVATE -UNDEBUG)
+    target_link_libraries(test_logging_cancel_scope PRIVATE Threads::Threads)
+    foreach(_peak_log_mode positive empty filtered disabled fallback setvbuf-failed)
+        add_test(NAME test_logging_cancel_scope_${_peak_log_mode}
+            COMMAND test_logging_cancel_scope ${_peak_log_mode})
+        set_tests_properties(test_logging_cancel_scope_${_peak_log_mode}
+            PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "logging_cancel_scope_ok")
+    endforeach()
 
 endif()

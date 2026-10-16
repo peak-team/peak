@@ -9,6 +9,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(__linux__) && defined(__GLIBC__)
+#include "internal/cancel_scope.h"
+#endif
+
 #define PEAK_VERBOSITY_ENV "PEAK_VERBOSITY"
 
 static pthread_once_t peak_log_configuration_once = PTHREAD_ONCE_INIT;
@@ -17,6 +21,7 @@ static PeakVerbosity peak_log_cached_verbosity = PEAK_VERBOSITY_WARN;
 static FILE* peak_log_output;
 static int peak_log_output_initialized;
 static int peak_log_force_output_failure;
+static int peak_log_owned_unbuffered;
 
 static int
 peak_log_streq_ci(const char* left, const char* right)
@@ -146,7 +151,8 @@ peak_log_initialize_output_once(void)
                 strerror(error));
         return;
     }
-    (void)setvbuf(peak_log_output, NULL, _IONBF, 0);
+    peak_log_owned_unbuffered =
+        setvbuf(peak_log_output, NULL, _IONBF, 0) == 0;
 }
 
 void
@@ -182,7 +188,18 @@ peak_log_vwrite(const char* format, va_list args)
     FILE* output = peak_log_output_stream();
 
     if (output != NULL) {
+#if defined(__linux__) && defined(__GLIBC__)
+        int written = vfprintf(output, format, args);
+
+        /* Pinned ordinary owned FILE: positive unbuffered output proves the
+         * cancellable write path ran. Filtered/empty/error output proves less. */
+        if (written > 0 && output == peak_log_output &&
+            peak_log_owned_unbuffered) {
+            peak_cancel_scope_mark();
+        }
+#else
         vfprintf(output, format, args);
+#endif
     }
 }
 

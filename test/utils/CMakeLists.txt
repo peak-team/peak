@@ -17,7 +17,8 @@ add_executable(test_target_config
     ${PROJECT_SOURCE_DIR}/src/utils/target_config.c
     ${PROJECT_SOURCE_DIR}/src/utils/target_selector_syntax.c
     ${PROJECT_SOURCE_DIR}/src/utils/source_target.c
-    ${PROJECT_SOURCE_DIR}/src/logging.c)
+    ${PROJECT_SOURCE_DIR}/src/logging.c
+    ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
 target_compile_definitions(test_target_config PRIVATE PEAK_TARGET_CONFIG_TESTING=1)
 target_include_directories(test_target_config PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -37,7 +38,8 @@ if(PEAK_BUILD_FUZZ_TESTS)
             ${PROJECT_SOURCE_DIR}/src/utils/target_config.c
             ${PROJECT_SOURCE_DIR}/src/utils/target_selector_syntax.c
             ${PROJECT_SOURCE_DIR}/src/utils/source_target.c
-            ${PROJECT_SOURCE_DIR}/src/logging.c)
+            ${PROJECT_SOURCE_DIR}/src/logging.c
+            ${PROJECT_SOURCE_DIR}/src/utils/cancel_scope.c)
         target_include_directories(fuzz_target_config PRIVATE
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/include/utils)
