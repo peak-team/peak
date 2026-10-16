@@ -8,6 +8,7 @@
 #include "signal_policy.h"
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -3667,6 +3668,38 @@ static int supported_normal_send_count;
 static int supported_owned_rc;
 static int supported_owned_pending_s;
 static unsigned long supported_owned_cookie;
+/* Opt-in contract diagnostic: a failing result is not a repaired handoff. */
+static int supported_native_handoff;
+static atomic_int supported_native_owned_hits;
+static atomic_int supported_native_app_hits;
+static atomic_int supported_native_other_hits;
+static atomic_int supported_native_expected_epoch;
+static siginfo_t supported_native_owned_info;
+static siginfo_t supported_native_app_info;
+static const uintptr_t supported_native_app_cookie = 0x6170701234UL;
+
+static void
+supported_native_handler(int signo, siginfo_t* info, void* context)
+{
+    int saved_errno = errno;
+    (void)context;
+    if (info != NULL && signo == supported_signum &&
+        peak_signal_policy_cookie_matches_async(info,
+                                               atomic_load_explicit(&supported_native_expected_epoch,
+                                                                    memory_order_acquire),
+                                               atomic_load(&supported_tid))) {
+        supported_native_owned_info = *info;
+        atomic_fetch_add_explicit(&supported_native_owned_hits, 1, memory_order_release);
+    } else if (info != NULL && signo == supported_signum &&
+               info->si_code == SI_QUEUE &&
+               (uintptr_t)info->si_value.sival_ptr == supported_native_app_cookie) {
+        supported_native_app_info = *info;
+        atomic_fetch_add_explicit(&supported_native_app_hits, 1, memory_order_release);
+    } else {
+        atomic_fetch_add_explicit(&supported_native_other_hits, 1, memory_order_release);
+    }
+    errno = saved_errno;
+}
 
 static double
 supported_now(void)
@@ -3843,6 +3876,12 @@ run_supported_handler_recovery(void)
     }
     action.sa_handler = supported_application_handler;
     sigfillset(&action.sa_mask);
+    if (supported_native_handoff) {
+        /* Only S is required by this contract. Do not make all replacement
+         * wires unavailable and accidentally test RT exhaustion instead. */
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, supported_signum);
+    }
     action.sa_flags = 0;
     errno = 0;
     int action_rc = sigaction(SIGUSR1, &action, &previous);
@@ -3853,7 +3892,7 @@ run_supported_handler_recovery(void)
             queried.sa_handler == supported_application_handler, queried.sa_flags,
             sigismember(&queried.sa_mask, SIGUSR1),
             sigismember(&queried.sa_mask, supported_signum));
-    check_true("ordinary sigaction with full handler mask accepted",
+    check_true("ordinary sigaction with requested handler mask accepted",
                action_rc == 0 && query_rc == 0 &&
                queried.sa_handler == supported_application_handler &&
                sigismember(&queried.sa_mask, supported_signum) == 1 &&
@@ -3951,6 +3990,96 @@ run_supported_handler_recovery(void)
                peak_detach_controller_test_thread_creation_gate_epoch() == 0);
     check_int("supported target alive before releasing H_P",
               (int)syscall(SYS_tgkill, getpid(), atomic_load(&supported_tid), 0), 0);
+    if (supported_native_handoff) {
+        /* U is this thread; T is still blocked in P's read(done_pipe). Only U
+         * releases that read, after wrapped native H installation returns.
+         * No injected/replayed PEAK packet: O above came from real controller. */
+        void* libc = dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
+        int (*native_sigaction)(int, const struct sigaction*, struct sigaction*) =
+            libc != NULL ? dlsym(libc, "sigaction") : NULL;
+        struct sigaction h = {0}, native_h = {0};
+        h.sa_sigaction = supported_native_handler;
+        h.sa_flags = SA_SIGINFO;
+        atomic_store_explicit(&supported_native_expected_epoch, supported_epoch,
+                              memory_order_release);
+        sigemptyset(&h.sa_mask);
+        sigaddset(&h.sa_mask, SIGUSR2);
+        errno = 0;
+        double install_started = supported_now();
+        int install_rc = sigaction(supported_signum, &h, NULL);
+        int install_errno = errno;
+        double install_elapsed = supported_now() - install_started;
+        int query_rc = native_sigaction != NULL ?
+            native_sigaction(supported_signum, NULL, &native_h) : -1;
+        int exact_h = query_rc == 0 && native_h.sa_sigaction == supported_native_handler &&
+            (native_h.sa_flags & (SA_SIGINFO | SA_NODEFER | SA_RESETHAND |
+                                 SA_RESTART | SA_ONSTACK)) == SA_SIGINFO;
+        if (query_rc == 0) {
+            for (int signo = 1; signo < NSIG; signo++)
+                if (sigismember(&native_h.sa_mask, signo) !=
+                    sigismember(&h.sa_mask, signo)) exact_h = 0;
+        }
+        union sigval app_value = {.sival_ptr = (void*)supported_native_app_cookie};
+        int app_rc = pthread_sigqueue(supported_thread, supported_signum, app_value);
+        fprintf(stderr, "native-handoff-install U_tid=%ld T_tid=%d S=%d rc=%d errno=%d "
+                "seconds=%.9f native_query_rc=%d exact_H=%d P_returned=%d app_queue_rc=%d "
+                "owned_cookie=0x%lx app_cookie=0x%lx\n",
+                (long)syscall(SYS_gettid), atomic_load(&supported_tid), supported_signum,
+                install_rc, install_errno, install_elapsed, query_rc, exact_h,
+                atomic_load(&supported_returned), app_rc, supported_owned_cookie,
+                (unsigned long)supported_native_app_cookie);
+        check_true("native H install completes while P waits for U",
+                   install_rc == 0 && exact_h && !atomic_load(&supported_returned) &&
+                   install_elapsed < 2.0);
+        check_int("genuine application notification accepted", app_rc, 0);
+        supported_release_handler();
+        deadline = supported_now() + 2.0;
+        while ((!atomic_load(&supported_returned) ||
+                atomic_load_explicit(&supported_native_app_hits, memory_order_acquire) == 0) &&
+               supported_now() < deadline)
+            usleep(1000);
+        /* H runs only on this thread-directed target, with S automatically
+         * blocked (no SA_NODEFER). Join before reading payloads even on the
+         * timeout/failure path: count==0 is not permission to race a late H. */
+        atomic_store(&supported_running, 0);
+        pthread_join(supported_thread, NULL);
+        worker_started = 0;
+        int owned_hits = atomic_load_explicit(&supported_native_owned_hits, memory_order_acquire);
+        int app_hits = atomic_load_explicit(&supported_native_app_hits, memory_order_acquire);
+        fprintf(stderr, "native-handoff-delivery owned_H=%d app_H=%d other_H=%d P_returned=%d "
+                "owned_code=%d owned_pid=%d owned_uid=%u owned_cookie=0x%lx "
+                "app_code=%d app_pid=%d app_uid=%u app_cookie=0x%lx\n",
+                owned_hits, app_hits, atomic_load(&supported_native_other_hits),
+                atomic_load(&supported_returned), supported_native_owned_info.si_code,
+                supported_native_owned_info.si_pid, (unsigned)supported_native_owned_info.si_uid,
+                (unsigned long)(uintptr_t)supported_native_owned_info.si_value.sival_ptr,
+                supported_native_app_info.si_code, supported_native_app_info.si_pid,
+                (unsigned)supported_native_app_info.si_uid,
+                (unsigned long)(uintptr_t)supported_native_app_info.si_value.sival_ptr);
+        check_int("owned O must never reach native application H", owned_hits, 0);
+        check_true("genuine app notification retains native metadata",
+                   app_hits == 1 && supported_native_app_info.si_code == SI_QUEUE &&
+                   supported_native_app_info.si_pid == getpid() &&
+                   supported_native_app_info.si_uid == getuid() &&
+                   (uintptr_t)supported_native_app_info.si_value.sival_ptr == supported_native_app_cookie);
+        check_int("no unclassified notification", atomic_load(&supported_native_other_hits), 0);
+        memcpy(after_bytes, (void*)strict_helper_target, length);
+        callback_before = atomic_load(&supported_callbacks);
+        strict_helper_target();
+        callback_delta = atomic_load(&supported_callbacks) - callback_before;
+        fprintf(stderr, "native-handoff-physical bytes_equal_active=%d callback_delta=%d "
+                "held=%d physical=%d gate_epoch=%d\n",
+                memcmp(before_bytes, after_bytes, length) == 0, callback_delta,
+                peak_detach_controller_threads_are_held(),
+                peak_detach_controller_current_mutation_uses_physical_patch(),
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        check_true("handoff leaves actual instrumented entry and callback intact",
+                   memcmp(before_bytes, after_bytes, length) == 0 && callback_delta == 1 &&
+                   !peak_detach_controller_threads_are_held() &&
+                   !peak_detach_controller_current_mutation_uses_physical_patch());
+        if (libc != NULL) dlclose(libc);
+        goto cleanup;
+    }
     supported_release_handler();
     deadline = supported_now() + 2.0;
     while (!atomic_load(&supported_returned) && supported_now() < deadline)
@@ -5220,6 +5349,8 @@ main(int argc, char** argv)
         fprintf(stderr,
                 "usage: %s strict|strict-helper-empty|cached-helper-configuration|strict-helper-stale-caller|fake-helper-trace-disabled-stop-window|fake-helper-shutdown-sequence|fake-helper-batch-attach|fake-helper-arm64-attach-plan|fake-helper-batch-detach|fake-helper-batch-abort-rollback|fake-helper-batch-mixed|fake-helper-batch-missing-gum-snapshot|fake-helper-listener-canonical-address|fake-helper-listener-ambiguous-address|fake-helper-batch-canonical-duplicate|fake-helper-batch-reattach|batch-guards|invalid|fake-helper-gum-pc-corridor|fake-helper-reattach-patch-entry|fake-helper-fail-closed|fake-helper-auto-fallback|fake-helper-auto-mpi|cached-auto-backend-configuration|signal-event-futex|signal-backend-blocked-thread|signal-backend-missing-thread-gate|helper-backend-missing-thread-gate|signal-reserve-early-never|signal-reserve-helper-auto|accounting-snapshot-contention|accounting-snapshot-concurrent\n",
                 argv[0]);
+        fputs("additional signal diagnostics: supported-handler-owned-recovery|"
+              "supported-handler-native-handoff|active-slot-reader-reuse\n", stderr);
         return EXIT_FAILURE;
     }
 
@@ -5310,6 +5441,12 @@ main(int argc, char** argv)
             g_getenv("PEAK_TEST_PREFLIGHT_CLEAN") == NULL);
     }
     if (strcmp(argv[1], "supported-handler-owned-recovery") == 0) {
+        return run_supported_handler_recovery();
+    }
+    if (strcmp(argv[1], "supported-handler-native-handoff") == 0) {
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+        supported_native_handoff = 1;
+#endif
         return run_supported_handler_recovery();
     }
     if (strcmp(argv[1], "signal-receipt-control") == 0) {
