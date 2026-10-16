@@ -18,6 +18,7 @@
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #if defined(__x86_64__) || defined(__amd64__)
 #include <sys/user.h>
 #endif
@@ -465,8 +466,45 @@ tid_is_held(pid_t tid)
     return find_held_thread(tid) != NULL;
 }
 
+/* STOP diagnostics are local to one request; cleanup must not replace the
+ * first failing operation with a later release or logging error. */
+typedef struct {
+    const char* operation;
+    const char* stage;
+    pid_t tid;
+    int error;
+    size_t held;
+    const char* last_operation;
+    const char* last_stage;
+    pid_t last_tid;
+    int last_error;
+    size_t last_held;
+} PeakStopFailure;
+
+static void
+record_stop_failure(PeakStopFailure* failure, const char* operation,
+                    const char* stage, pid_t tid, int error)
+{
+    if (failure == NULL) {
+        return;
+    }
+    failure->last_operation = operation;
+    failure->last_stage = stage;
+    failure->last_tid = tid;
+    failure->last_error = error;
+    failure->last_held = held_thread_count;
+    if (failure->operation == NULL) {
+        failure->operation = operation;
+        failure->stage = stage;
+        failure->tid = tid;
+        failure->error = error;
+        failure->held = held_thread_count;
+    }
+}
+
 static PeakDetachHelperStatus
-verify_no_unstopped_threads(pid_t pid, pid_t controller_tid, int* errno_out)
+verify_no_unstopped_threads_diagnostic(pid_t pid, pid_t controller_tid, int* errno_out,
+                            PeakStopFailure* failure)
 {
     char task_path[64];
     DIR* task_dir;
@@ -475,6 +513,7 @@ verify_no_unstopped_threads(pid_t pid, pid_t controller_tid, int* errno_out)
     task_dir = opendir(task_path);
     if (task_dir == NULL) {
         *errno_out = errno;
+        record_stop_failure(failure, "opendir", "verify", pid, *errno_out);
         return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
     }
 
@@ -502,12 +541,20 @@ verify_no_unstopped_threads(pid_t pid, pid_t controller_tid, int* errno_out)
 
     if (errno != 0) {
         *errno_out = errno;
+        record_stop_failure(failure, "readdir", "verify", pid, *errno_out);
         closedir(task_dir);
         return PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR;
     }
 
     closedir(task_dir);
     return PEAK_DETACH_HELPER_STATUS_OK;
+}
+
+static PeakDetachHelperStatus
+verify_no_unstopped_threads(pid_t pid, pid_t controller_tid, int* errno_out)
+{
+    return verify_no_unstopped_threads_diagnostic(pid, controller_tid,
+                                                 errno_out, NULL);
 }
 
 static int
@@ -528,7 +575,8 @@ send_response(int fd,
 }
 
 static PeakDetachHelperStatus
-stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
+stop_target_threads_impl(int fd, pid_t pid, pid_t controller_tid,
+                         int* errno_out, PeakStopFailure* failure)
 {
     char task_path[64];
     PeakDetachHelperThreadSnapshot snapshots[PEAK_DETACH_HELPER_MAX_THREADS];
@@ -551,6 +599,8 @@ restart_stop_snapshot:
         DIR* task_dir = opendir(task_path);
         if (task_dir == NULL) {
             *errno_out = errno;
+            record_stop_failure(failure, "opendir",
+                held_thread_count != 0 ? "rescan" : "snapshot", pid, *errno_out);
             PeakDetachHelperStatus intended_status =
                 *errno_out == EACCES || *errno_out == EPERM ?
                     PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
@@ -593,6 +643,7 @@ restart_stop_snapshot:
             if (ptrace(PTRACE_SEIZE, tid, NULL, (void*)0) != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
+                record_stop_failure(failure, "PTRACE_SEIZE", "snapshot", tid, *errno_out);
                 closedir(task_dir);
                 intended_status = *errno_out == EACCES || *errno_out == EPERM ?
                     PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
@@ -618,6 +669,7 @@ restart_stop_snapshot:
             if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
+                record_stop_failure(failure, "PTRACE_INTERRUPT", "snapshot", tid, *errno_out);
                 closedir(task_dir);
                 intended_status = *errno_out == EACCES || *errno_out == EPERM ?
                     PEAK_DETACH_HELPER_STATUS_PERMISSION_DENIED :
@@ -637,6 +689,7 @@ restart_stop_snapshot:
             if (wait_for_ptrace_stop(tid, &held_thread->detach_signal) != 0) {
                 PeakDetachHelperStatus intended_status;
                 *errno_out = errno;
+                record_stop_failure(failure, "wait_for_ptrace_stop", "snapshot", tid, *errno_out);
                 closedir(task_dir);
                 intended_status = *errno_out == ETIMEDOUT ?
                     PEAK_DETACH_HELPER_STATUS_TIMEOUT :
@@ -663,6 +716,7 @@ restart_stop_snapshot:
             PeakRegs regs;
             if (peak_regs_get(tid, &regs) != 0) {
                 *errno_out = errno;
+                record_stop_failure(failure, "get_registers", "snapshot", tid, *errno_out);
                 closedir(task_dir);
                 int retry_snapshot = 0;
                 PeakDetachHelperStatus status = cleanup_or_retry_stop_snapshot(
@@ -700,6 +754,7 @@ restart_stop_snapshot:
 
         if (errno != 0) {
             *errno_out = errno;
+            record_stop_failure(failure, "readdir", "snapshot", pid, *errno_out);
             closedir(task_dir);
             return cleanup_held_threads_or_release_failed(
                 PEAK_DETACH_HELPER_STATUS_PTRACE_ERROR,
@@ -709,7 +764,7 @@ restart_stop_snapshot:
         closedir(task_dir);
 
         PeakDetachHelperStatus verify_status =
-            verify_no_unstopped_threads(pid, controller_tid, errno_out);
+            verify_no_unstopped_threads_diagnostic(pid, controller_tid, errno_out, failure);
         if (verify_status == PEAK_DETACH_HELPER_STATUS_OK) {
             break;
         }
@@ -740,6 +795,63 @@ restart_stop_snapshot:
     }
 
     return PEAK_DETACH_HELPER_STATUS_OK;
+}
+
+/* One best-effort failure record, never a blocking FIFO/socket write. The
+ * FIFO reopen has a private open-file description: original stderr flags and
+ * regular-file shared offsets remain unchanged. Diagnostics may be dropped. */
+static void
+write_stop_failure_diagnostic(const char* message, size_t count)
+{
+    int saved_errno = errno;
+    struct stat info;
+    if (fstat(STDERR_FILENO, &info) == 0) {
+        if (S_ISFIFO(info.st_mode)) {
+            int diagnostic_fd = open("/proc/self/fd/2",
+                O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            if (diagnostic_fd >= 0) {
+                (void)write(diagnostic_fd, message, count);
+                (void)close(diagnostic_fd);
+            }
+        } else if (S_ISREG(info.st_mode)) {
+            (void)write(STDERR_FILENO, message, count);
+        } else if (S_ISSOCK(info.st_mode)) {
+            (void)send(STDERR_FILENO, message, count,
+                       MSG_DONTWAIT | MSG_NOSIGNAL);
+        }
+    }
+    errno = saved_errno;
+}
+
+static PeakDetachHelperStatus
+stop_target_threads(int fd, pid_t pid, pid_t controller_tid, int* errno_out)
+{
+    PeakStopFailure failure = {0};
+    PeakDetachHelperStatus status = stop_target_threads_impl(
+        fd, pid, controller_tid, errno_out, &failure);
+    if (status != PEAK_DETACH_HELPER_STATUS_OK) {
+        int saved_errno = errno;
+        char message[512];
+        int length = snprintf(message, sizeof(message),
+            "peak_detach_helper: stop_failure operation=%s stage=%s "
+            "target_pid=%ld tid=%ld first_errno=%d held_before_cleanup=%zu "
+            "last_operation=%s last_stage=%s last_tid=%ld last_errno=%d "
+            "last_held=%zu final_status=%u final_errno=%d held_after_cleanup=%zu\n",
+            failure.operation != NULL ? failure.operation : "unknown",
+            failure.stage != NULL ? failure.stage : "stop",
+            (long)pid, (long)failure.tid, failure.error, failure.held,
+            failure.last_operation != NULL ? failure.last_operation : "unknown",
+            failure.last_stage != NULL ? failure.last_stage : "stop",
+            (long)failure.last_tid, failure.last_error, failure.last_held,
+            (unsigned)status, *errno_out, held_thread_count);
+        if (length > 0) {
+            size_t count = (size_t)length < sizeof(message) ?
+                (size_t)length : sizeof(message) - 1;
+            write_stop_failure_diagnostic(message, count);
+        }
+        errno = saved_errno;
+    }
+    return status;
 }
 
 static int
