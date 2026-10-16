@@ -227,4 +227,7 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME test_decode_window_observation
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/window_observation/test_decode_window_observation.py)
+  add_test(NAME test_window_observation_completion_gate
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/window_observation/test_completion_gate.py)
 endif()

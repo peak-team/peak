@@ -43,8 +43,11 @@ uninitialized clocks, failed calls and overflow return a nonzero status and
 rank. Test fixtures exercise validation only; they are not performance evidence.
 
 The reported API union clips serialized outer wall envelopes to the window.
-CPU for a clipped API scope is unknown, not proportionally apportioned. API CPU
-is an inner sample delta, not uninstrumented call cost. Reader CPU deltas cover
+CPU for a clipped API scope is unknown, not proportionally apportioned. CPU
+for a wholly outside scope is excluded; its observation must still be present
+when included in the protocol's expected counts. The complete fixed-work fixture
+records TLS cleanup scopes after its window as well as the scopes inside it.
+API CPU is an inner sample delta, not uninstrumented call cost. Reader CPU deltas cover
 slightly wider sampling intervals, with the overhang brackets retained; they
 are not exact-window CPU. Parallel thread CPU cannot be subtracted from wall
 time. The window outside API envelopes still contains worker/reader activity,
@@ -62,6 +65,26 @@ transitions, and collects one worker plus two readers. Four explicit 2ms sleeps
 are inside its window. It is an observability smoke, not an equal-work benchmark,
 cancellation test, errno-transparency runtime test or performance qualification.
 It is deliberately not registered as an automatic CTest runtime.
+
+Use `window_observation/bounded_observation.py` as a dedicated, initially
+childless local collector process. It writes stdout/stderr directly to a fresh
+directory, waits for natural leader completion, then reaps adopted children.
+It has no automatic signal or termination path. A finite deadline exceeded,
+nonzero/signal exit, missing receipt field, collector error, or unreaped child is
+a failure, even if a later poll sees exit zero. An unfinished target is handed
+to its owner with its PID; it is never terminated to turn a hang into success.
+Unfinished output is marked nonfinal. This collector is separate from general
+SSH/transport timeout tooling and is not an OS-wide signal auditor.
+
+```
+python3 test/detach_runtime/window_observation/bounded_observation.py \
+  --output-dir fresh-capture --timeout 20 -- ./test_window_observe_smoke
+python3 test/detach_runtime/window_observation/test_completion_gate.py
+```
+
+The example requires the real-library/helper environment described above.
+Keep original failed/ambiguous signal receipts immutable when replacing an old
+collector. Absence of a logged delivery result never means no signal was sent.
 
 ## Comparing existing fixed-work windows
 

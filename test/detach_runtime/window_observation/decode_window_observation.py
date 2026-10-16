@@ -126,15 +126,19 @@ def decode(text, rank, expected_counts):
     union = sum(max(0, min(end, row["wall1"]) - max(start, row["wall0"]))
                 for row in apis)
     contained = all(start <= row["wall0"] <= row["wall1"] <= end for row in apis)
+    intersects = lambda row: row["wall0"] < end and row["wall1"] > start
+    inside = lambda row: start <= row["wall0"] <= row["wall1"] <= end
+    partially_clipped = any(intersects(row) and not inside(row) for row in apis)
     by_kind = {}
     for kind in (1, 2, 3):
         rows = [row for row in apis if row["kind"] == kind]
         by_kind[str(kind)] = {
             "count": len(rows),
+            "in_window_count": sum(intersects(row) for row in rows),
             "clipped_outer_wall_ns": sum(max(0, min(end, row["wall1"])
                 - max(start, row["wall0"])) for row in rows),
-            "inner_cpu_ns": (sum(row["cpu1"] - row["cpu0"] for row in rows)
-                if all(start <= row["wall0"] <= row["wall1"] <= end for row in rows)
+            "inner_cpu_ns": (sum(row["cpu1"] - row["cpu0"] for row in rows if intersects(row))
+                if not any(intersects(row) and not inside(row) for row in rows)
                 else None),
         }
     reader_samples = []
@@ -155,8 +159,9 @@ def decode(text, rank, expected_counts):
         "api_clipped_outer_wall_union_ns": union,
         "window_outside_api_union_ns": end - start - union,
         "api_all_fully_contained": contained,
-        "api_inner_cpu_sum_ns": (sum(row["cpu1"] - row["cpu0"] for row in apis)
-                                  if contained else None),
+        "api_partially_clipped": partially_clipped,
+        "api_inner_cpu_sum_ns": (sum(row["cpu1"] - row["cpu0"] for row in apis if intersects(row))
+                                  if not partially_clipped else None),
         "api_by_kind": by_kind, "reader_samples": reader_samples,
     }, "limits": [
         "Clock values are recorded samples; no calibrated physical-time error bound.",

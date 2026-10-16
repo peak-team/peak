@@ -117,6 +117,18 @@ class DecodeTest(unittest.TestCase):
         self.check_invalid(text.replace("target_calls_hi=110", "target_calls_hi=89"))
         self.check_invalid(text.replace("lifetime_calls=120", "lifetime_calls=-1"))
 
+    def test_wholly_outside_scope_is_excluded(self):
+        text = VALID.replace("wall0=300", "wall0=1100").replace("wall1=330", "wall1=1130")
+        result = decode(text, 0, {1: 1, 2: 1, 3: 1})
+        self.assertTrue(result["valid"], result)
+        values = result["measurements"]
+        self.assertEqual(values["api_clipped_outer_wall_union_ns"], 80)
+        self.assertEqual(values["api_inner_cpu_sum_ns"], 30)
+        self.assertFalse(values["api_all_fully_contained"])
+        self.assertFalse(values["api_partially_clipped"])
+        self.assertEqual(values["api_by_kind"]["2"]["in_window_count"], 0)
+        self.assertEqual(values["api_by_kind"]["2"]["inner_cpu_ns"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
