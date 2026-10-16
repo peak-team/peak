@@ -207,3 +207,24 @@ foreach(scope_test test_drain_cancel_scope test_drain_cancel_pending)
   add_test(NAME ${scope_test} COMMAND $<TARGET_FILE:${scope_test}>)
   set_tests_properties(${scope_test} PROPERTIES TIMEOUT 10)
 endforeach()
+
+# Opt-in fixture observation only; no instrumentation in the PEAK library.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND TARGET peak_detach_helper AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_executable(test_window_observe_smoke
+    window_observation/test_window_observe_smoke.c)
+  target_include_directories(test_window_observe_smoke PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${FRIDA_GUM_INCLUDE_DIRS})
+  target_compile_definitions(test_window_observe_smoke PRIVATE PEAK_FIXED_WINDOW_OBSERVE=1)
+  target_compile_options(test_window_observe_smoke PRIVATE -UNDEBUG)
+  target_link_options(test_window_observe_smoke PRIVATE -Wl,--export-dynamic)
+  target_link_libraries(test_window_observe_smoke PRIVATE Threads::Threads ${DL_LIBRARY})
+  # Manual bounded invocation: requires a real preloaded library/helper and ptrace.
+endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME test_decode_window_observation
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/window_observation/test_decode_window_observation.py)
+endif()
