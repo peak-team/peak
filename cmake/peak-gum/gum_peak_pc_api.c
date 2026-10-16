@@ -18,11 +18,173 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
+#include <unwind.h>
 #include <unistd.h>
 #include "frida-gum.h"
 
 #define PEAK_GUM_FAST_DISPATCH_SECTION \
     __attribute__((section("peak_gum_fast_dispatch"), noinline, noclone))
+
+typedef struct {
+    GObject parent;
+    GumPeakFastTranslateFunc translate;
+} PeakGumFastUnwindTranslator;
+
+typedef struct {
+    GObjectClass parent;
+} PeakGumFastUnwindTranslatorClass;
+
+static void peak_gum_fast_unwind_translator_iface_init(gpointer iface,
+                                                       gpointer data);
+static void peak_gum_fast_unwind_translator_class_init(
+    PeakGumFastUnwindTranslatorClass * klass);
+static void peak_gum_fast_unwind_translator_init(
+    PeakGumFastUnwindTranslator * self);
+G_DEFINE_TYPE_EXTENDED(PeakGumFastUnwindTranslator,
+                      peak_gum_fast_unwind_translator,
+                      G_TYPE_OBJECT,
+                      0,
+                      G_IMPLEMENT_INTERFACE(
+                          GUM_TYPE_UNWIND_PC_TRANSLATOR,
+                          peak_gum_fast_unwind_translator_iface_init))
+
+G_LOCK_DEFINE_STATIC(peak_gum_fast_unwind);
+static GumUnwindBroker * peak_gum_fast_unwind_broker;
+static PeakGumFastUnwindTranslator * peak_gum_fast_unwind_translator;
+static GumInterceptor * peak_gum_fast_unwind_interceptor;
+static gpointer peak_gum_fast_unwind_forced_original;
+static _Thread_local guint peak_gum_fast_unwind_forced_depth;
+
+typedef _Unwind_Reason_Code (* PeakGumForcedUnwindFunc)(
+    struct _Unwind_Exception * exception,
+    _Unwind_Stop_Fn stop,
+    void * stop_argument);
+
+extern _Unwind_Reason_Code _Unwind_ForcedUnwind(
+    struct _Unwind_Exception * exception,
+    _Unwind_Stop_Fn stop,
+    void * stop_argument) __attribute__((weak));
+
+static _Unwind_Reason_Code
+peak_gum_fast_unwind_forced(struct _Unwind_Exception * exception,
+                            _Unwind_Stop_Fn stop,
+                            void * stop_argument)
+{
+    PeakGumForcedUnwindFunc original = GUM_POINTER_TO_FUNCPTR(
+        PeakGumForcedUnwindFunc, peak_gum_fast_unwind_forced_original);
+    _Unwind_Reason_Code result;
+
+    peak_gum_fast_unwind_forced_depth++;
+    result = original(exception, stop, stop_argument);
+    peak_gum_fast_unwind_forced_depth--;
+    return result;
+}
+
+static GumAddress
+peak_gum_fast_unwind_translate(GumUnwindPcTranslator * translator,
+                               GumAddress code_address)
+{
+    PeakGumFastUnwindTranslator * self =
+        (PeakGumFastUnwindTranslator *)translator;
+
+    /* A forced unwind has no handler lookup to preserve. Translating a Gum
+     * leave trampoline to its caller makes libgcc apply the caller's CFA
+     * rules to the trampoline frame, which can make _Unwind_ForcedUnwind()
+     * fail before glibc's stop callback reaches its cancellation boundary.
+     * Retain Gum's own trampoline unwind behavior for that path. */
+    if (peak_gum_fast_unwind_forced_depth != 0) {
+        return 0;
+    }
+    return GUM_ADDRESS(self->translate(GSIZE_TO_POINTER(code_address)));
+}
+
+static void
+peak_gum_fast_unwind_translator_iface_init(gpointer iface, gpointer data)
+{
+    (void)data;
+    ((GumUnwindPcTranslatorInterface *)iface)->translate =
+        peak_gum_fast_unwind_translate;
+}
+
+static void
+peak_gum_fast_unwind_translator_class_init(
+    PeakGumFastUnwindTranslatorClass * klass)
+{
+    (void)klass;
+}
+
+static void
+peak_gum_fast_unwind_translator_init(PeakGumFastUnwindTranslator * self)
+{
+    self->translate = NULL;
+}
+
+static gboolean
+peak_gum_fast_unwind_ensure(GumUnwindBroker * broker,
+                            GumPeakFastTranslateFunc translate)
+{
+    gboolean ready;
+
+    if (broker == NULL || translate == NULL) {
+        return FALSE;
+    }
+    G_LOCK(peak_gum_fast_unwind);
+    if (peak_gum_fast_unwind_translator == NULL) {
+        GumReplaceReturn replace_status;
+        PeakGumFastUnwindTranslator * translator = g_object_new(
+            peak_gum_fast_unwind_translator_get_type(), NULL);
+
+        if (_Unwind_ForcedUnwind == NULL) {
+            g_object_unref(translator);
+            G_UNLOCK(peak_gum_fast_unwind);
+            return FALSE;
+        }
+        peak_gum_fast_unwind_interceptor = gum_interceptor_obtain();
+        replace_status = gum_interceptor_replace(
+            peak_gum_fast_unwind_interceptor,
+            GUM_FUNCPTR_TO_POINTER(_Unwind_ForcedUnwind),
+            GUM_FUNCPTR_TO_POINTER(peak_gum_fast_unwind_forced),
+            &peak_gum_fast_unwind_forced_original,
+            NULL);
+        if (replace_status != GUM_REPLACE_OK) {
+            g_clear_object(&peak_gum_fast_unwind_interceptor);
+            g_object_unref(translator);
+            G_UNLOCK(peak_gum_fast_unwind);
+            return FALSE;
+        }
+        translator->translate = translate;
+        peak_gum_fast_unwind_broker = g_object_ref(broker);
+        gum_unwind_broker_add_pc_translator(
+            broker, GUM_UNWIND_PC_TRANSLATOR(translator));
+        peak_gum_fast_unwind_translator = translator;
+    }
+    ready = peak_gum_fast_unwind_broker == broker &&
+        peak_gum_fast_unwind_translator->translate == translate;
+    G_UNLOCK(peak_gum_fast_unwind);
+    return ready;
+}
+
+static void
+peak_gum_fast_unwind_shutdown(void)
+{
+    G_LOCK(peak_gum_fast_unwind);
+    if (peak_gum_fast_unwind_translator != NULL) {
+        /* Removal takes the broker lock, so any in-flight callback completes
+         * before either the callback object or its PEAK code is released.
+         * The translator owns no target/context/listener reference. */
+        gum_unwind_broker_remove_pc_translator(
+            peak_gum_fast_unwind_broker,
+            GUM_UNWIND_PC_TRANSLATOR(peak_gum_fast_unwind_translator));
+        gum_interceptor_revert(
+            peak_gum_fast_unwind_interceptor,
+            GUM_FUNCPTR_TO_POINTER(_Unwind_ForcedUnwind));
+        peak_gum_fast_unwind_forced_original = NULL;
+        g_clear_object(&peak_gum_fast_unwind_interceptor);
+        g_clear_object(&peak_gum_fast_unwind_translator);
+        g_clear_object(&peak_gum_fast_unwind_broker);
+    }
+    G_UNLOCK(peak_gum_fast_unwind);
+}
 
 extern const guint8 __start_peak_gum_fast_dispatch[];
 extern const guint8 __stop_peak_gum_fast_dispatch[];
@@ -564,6 +726,7 @@ gum_deinit(void)
         return;
     }
     peak_gum_module_sync_quiesce();
+    peak_gum_fast_unwind_shutdown();
     gum_deinit_peak_original();
 }
 
@@ -575,6 +738,7 @@ gum_deinit_embedded(void)
         return;
     }
     peak_gum_module_sync_quiesce();
+    peak_gum_fast_unwind_shutdown();
     gum_deinit_embedded_peak_original();
 }
 
@@ -586,6 +750,7 @@ gum_shutdown(void)
         return;
     }
     peak_gum_module_sync_quiesce();
+    peak_gum_fast_unwind_shutdown();
     gum_shutdown_peak_original();
 }
 
@@ -1338,7 +1503,8 @@ gum_interceptor_peak_enable_fast_listener(
         fast_listener->dispatch_size == 0 ||
         fast_listener->active_count == NULL ||
         fast_listener->active_close == NULL ||
-        fast_listener->active_reset == NULL) {
+        fast_listener->active_reset == NULL ||
+        fast_listener->translate_return_address == NULL) {
         return FALSE;
     }
 
@@ -1353,7 +1519,9 @@ gum_interceptor_peak_enable_fast_listener(
         peak_gum_context_has_only_listener(context, listener) &&
         context->trampoline_usage_counter == 0 &&
         (context->write_redirect_data == NULL ||
-         context->write_redirect_data == fast_listener)) {
+         context->write_redirect_data == fast_listener) &&
+        peak_gum_fast_unwind_ensure(private_interceptor->unwind_broker,
+                                    fast_listener->translate_return_address)) {
         g_atomic_pointer_set(
             &fast_listener->listener_entries_cookie,
             g_atomic_pointer_get(&context->listener_entries));
@@ -1366,6 +1534,21 @@ gum_interceptor_peak_enable_fast_listener(
     g_rec_mutex_unlock(&private_interceptor->mutex);
 
     return enabled;
+}
+
+gpointer
+gum_interceptor_peak_translate_fast_return_address(
+    gpointer function_context,
+    gpointer caller_return_address,
+    gpointer code_address)
+{
+    PeakGumFunctionContext17 * context = function_context;
+
+    if (context != NULL &&
+        context->on_leave_trampoline == code_address) {
+        return caller_return_address;
+    }
+    return NULL;
 }
 
 gboolean

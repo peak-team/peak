@@ -71,6 +71,10 @@ typedef gboolean (* GumPeakFastIsDirectLeaveFunc)(
 typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
 typedef guint (* GumPeakFastActiveCloseFunc)(gpointer user_data);
 typedef void (* GumPeakFastActiveResetFunc)(gpointer user_data);
+/* Translates any direct frame owned by the calling thread. The callback must
+ * be allocation-free and remain valid until Gum shutdown. It returns NULL
+ * for an unrelated PC and does not retire frames during handler search. */
+typedef gpointer (* GumPeakFastTranslateFunc)(gpointer code_address);
 
 typedef struct _GumPeakFastListener {
     guint version;
@@ -80,6 +84,7 @@ typedef struct _GumPeakFastListener {
     GumPeakFastActiveCountFunc active_count;
     GumPeakFastActiveCloseFunc active_close;
     GumPeakFastActiveResetFunc active_reset;
+    GumPeakFastTranslateFunc translate_return_address;
     gpointer user_data;
     GumInvocationListener * listener_instance;
     gpointer dispatch_start;
@@ -89,7 +94,12 @@ typedef struct _GumPeakFastListener {
     volatile gint release_required;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 8u
+#define GUM_PEAK_FAST_LISTENER_VERSION 9u
+
+GUM_API gpointer gum_interceptor_peak_translate_fast_return_address(
+    gpointer function_context,
+    gpointer caller_return_address,
+    gpointer code_address);
 
 GUM_API gboolean gum_interceptor_peak_invocation_stack_entry_matches(
     guint depth,

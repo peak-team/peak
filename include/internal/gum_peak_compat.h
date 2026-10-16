@@ -35,6 +35,7 @@ typedef gboolean (* GumPeakFastIsDirectLeaveFunc)(
 typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
 typedef guint (* GumPeakFastActiveCloseFunc)(gpointer user_data);
 typedef void (* GumPeakFastActiveResetFunc)(gpointer user_data);
+typedef gpointer (* GumPeakFastTranslateFunc)(gpointer code_address);
 
 typedef struct _GumPeakFastListener {
     guint version;
@@ -44,6 +45,7 @@ typedef struct _GumPeakFastListener {
     GumPeakFastActiveCountFunc active_count;
     GumPeakFastActiveCloseFunc active_close;
     GumPeakFastActiveResetFunc active_reset;
+    GumPeakFastTranslateFunc translate_return_address;
     gpointer user_data;
     GumInvocationListener* listener_instance;
     gpointer dispatch_start;

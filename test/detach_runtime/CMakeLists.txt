@@ -138,6 +138,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
       PRIVATE -Wl,--export-dynamic)
 endif()
 
+add_library(cxx_throw_provider SHARED cxx_throw_provider.cpp)
+add_executable(test_cxx_throw_transparency test_cxx_throw_transparency.cpp)
+target_link_libraries(test_cxx_throw_transparency PRIVATE
+  cxx_throw_provider Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(cxx_throw_provider PRIVATE -fexceptions -fno-lto)
+  target_compile_options(test_cxx_throw_transparency PRIVATE -fexceptions -fno-lto)
+endif()
+
 add_executable(test_unsafe_gum_prologue test_unsafe_gum_prologue.c)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     enable_language(ASM)

@@ -871,8 +871,8 @@ def check_fast_listener_unwind_abi(repo_root):
         repo_root / "test/detach_runtime/test_fastpath_nonlocal_unwind.c"
     ).read_text(encoding="utf-8")
 
-    require("GUM_PEAK_FAST_LISTENER_VERSION 8u" in api and
-            "GUM_PEAK_FAST_LISTENER_VERSION != 8" in cmake,
+    require("GUM_PEAK_FAST_LISTENER_VERSION 9u" in api and
+            "GUM_PEAK_FAST_LISTENER_VERSION != 9" in cmake,
             "patched Gum configuration must reject an older fast-listener callback ABI")
     require("peak_gum_get_interceptor_thread_context" in patcher and
             '"--globalize-symbol"' in patcher and

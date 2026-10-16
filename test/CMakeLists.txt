@@ -1050,6 +1050,17 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "handoff did not flush|restore failed|fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 20)
 
+        add_test(NAME test_cxx_throw_transparency_native
+            COMMAND $<TARGET_FILE:test_cxx_throw_transparency>)
+        add_test(NAME test_cxx_throw_transparency_peak
+            COMMAND $<TARGET_FILE:test_cxx_throw_transparency>)
+        set_tests_properties(test_cxx_throw_transparency_native
+            test_cxx_throw_transparency_peak PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_transparency_ok"
+                TIMEOUT 20)
+        set_tests_properties(test_cxx_throw_transparency_peak PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
+
         add_test(NAME test_fastpath_nonlocal_unwind
             COMMAND
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)
