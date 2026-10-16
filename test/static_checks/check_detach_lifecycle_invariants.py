@@ -2916,6 +2916,63 @@ def check_signal_backend_strict_invariants(repo_root):
         controller, "peak_detach_controller_test_delay_after_gate_begin"
     )
 
+    contamination_check = extract_function(
+        controller, "peak_detach_controller_signal_check_contamination")
+    forward_begin = extract_function(
+        controller, "peak_detach_controller_signal_begin_forward_effect")
+    signal_evacuate = extract_function(
+        controller, "peak_detach_controller_signal_evacuate")
+    guard = "peak_detach_controller_signal_check_contamination"
+    begin = "peak_detach_controller_signal_begin_forward_effect()"
+    require("peak_signal_policy_unexpected_delivery_count() == 0" in contamination_check
+            and "if (signal_forward_effect_started)" in contamination_check
+            and "peak_detach_controller_mark_helper_fatal" in contamination_check,
+            "contamination after the forward boundary must terminate, not resume")
+    require("signal_forward_effect_started = TRUE" in forward_begin,
+            "forward boundary must precede its test rendezvous and possible effect")
+    for body, classify in (
+            (prepare_mutation, "peak_detach_controller_classify_stopped_threads"),
+            (prepare_batch, "peak_detach_controller_classify_stopped_threads")):
+        require(guard in body and classify in body and
+                body.index(guard) < body.index(classify),
+                "scalar and batch contamination guards must precede planning")
+    # The validation loop contains the same action tests. Select each actual
+    # execution branch, and keep WRITE's assertions out of the later PC branch.
+    write_start = signal_evacuate.rindex(
+        "if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY)")
+    pc_start = signal_evacuate.rindex(
+        "if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_SET_PC)")
+    write_block = signal_evacuate[write_start:pc_start]
+    pc_block = signal_evacuate[pc_start:]
+    for body, effect in ((write_block, "peak_detach_controller_signal_write_memory"),
+                         (pc_block, "atomic_store_explicit(&slot->new_pc"),
+                         (signal_temp_breakpoint, "memcpy(original")):
+        require(guard in body and begin in body and effect in body and
+                body.index(guard) < body.index(begin) < body.index(effect) and
+                body.index(guard, body.index(begin)) < body.index(effect),
+                "every forward write, breakpoint and PC publication needs the boundary")
+    evacuate_backend = extract_function(controller,
+        "peak_detach_controller_evacuate_backend")
+    require("if (!ok && signal_forward_effect_started)" in evacuate_backend and
+            "peak_detach_controller_mark_helper_fatal" in evacuate_backend,
+            "failed signal evacuation after an effect must terminate before caller abort")
+    trap_install = signal_temp_breakpoint[
+        signal_temp_breakpoint.index("if (peak_detach_controller_signal_write_memory"):
+        signal_temp_breakpoint.index("peak_detach_controller_signal_observe_forward_effect")]
+    require("peak_detach_controller_mark_helper_fatal" in trap_install,
+            "unproved trap installation must not return and resume partial bytes")
+    require(guard in signal_release and
+            signal_release.index(guard) < signal_release.index(
+                "peak_filesystem_stat_guard_resume()"),
+            "contamination safety must precede every signal release")
+    require("*scalar_record = scalar_record_before" in prepare_mutation,
+            "recoverable scalar refusal must restore its planning record")
+    forward_tests = read_source(repo_root, "test/detach_controller/test_signal_forward_effect.c")
+    require("memcmp(fe_active, after, fe_length)" in forward_tests
+            and "refused prepare preserves actual listener invocation" in forward_tests
+            and "refused prepare preserves controller physical record" in forward_tests,
+            "contamination tests must measure bytes, listener calls and record state")
+
     require("PEAK_SAFE_DETACH_MODE_STRICT" in controller_mode and
             "getenv" not in controller_mode and
             '"compatibility"' not in controller_mode and
@@ -3048,18 +3105,42 @@ def check_signal_backend_strict_invariants(repo_root):
             tests.count("--min-weighted-call-coverage 0.001") >= 2 and
             tests.count("--min-phase-target-breadth 1.0") >= 2,
             "long acceptance must cap slowdown while proving explicit target coverage instead of requiring overhead")
-    require(signal_release.find("atomic_store_explicit(&signal_release_epoch, epoch") <
+    require(0 <= signal_release.find("atomic_store_explicit(&signal_release_epoch, epoch") <
             signal_release.find("peak_detach_controller_signal_wake_release_waiters"),
             "release publication must wake signal waiters")
-    require(signal_clear_slots.find("atomic_store_explicit(&signal_release_epoch, 0") <
+    require(0 <= signal_clear_slots.find("atomic_store_explicit(&signal_release_epoch, 0") <
             signal_clear_slots.find("peak_detach_controller_signal_wake_release_waiters"),
             "release reset must wake signal waiters")
-    require(signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
+    require(0 <= signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
             signal_temp_breakpoint.find("peak_detach_controller_signal_wake_release_waiters"),
             "evacuation publication must wake signal waiters")
-    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 4 and
-            "peak_detach_controller_test_wake_signal_waiters" in controller,
-            "production signal futex wake-all must occur only after release, reset, and evacuation publications")
+    signal_slots_after_fork = extract_function(
+        controller, "peak_detach_controller_signal_slots_after_fork_child")
+    require(0 <= signal_slots_after_fork.find(
+                "atomic_store_explicit(&signal_release_epoch, 0") <
+            signal_slots_after_fork.find(
+                "peak_detach_controller_signal_wake_release_waiters"),
+            "child slot reset must publish release reset before waking inherited waiters")
+    # Name every allowed callsite instead of a stale aggregate count. Each
+    # function owns exactly one wake, and removing those bodies must leave no
+    # other calls anywhere in the controller (including test-only code).
+    wake_call = re.compile(
+        r"\bpeak_detach_controller_signal_wake_release_waiters\s*\(\s*\)\s*;")
+    allowed_wake_functions = (
+        "peak_detach_controller_signal_slots_after_fork_child",
+        "peak_detach_controller_test_wake_signal_waiters",
+        "peak_detach_controller_signal_clear_slots",
+        "peak_detach_controller_signal_release",
+        "peak_detach_controller_signal_temp_breakpoint_out_of_range",
+    )
+    unaccounted_wakes = controller
+    for name in allowed_wake_functions:
+        body = extract_function(controller, name)
+        require(len(wake_call.findall(body)) == 1,
+                f"signal wake allowlist requires exactly one call in {name}")
+        unaccounted_wakes = unaccounted_wakes.replace(body, "", 1)
+    require(wake_call.search(unaccounted_wakes) is None,
+            "signal wake call outside named release/reset/evacuation/test allowlist")
     require(signal_wait_for_release.find("rewrite_epoch") <
             signal_wait_for_release.find("done_epoch"),
             "signal PC rewrite must remain ordered before done publication")
@@ -3083,9 +3164,100 @@ def check_signal_backend_strict_invariants(repo_root):
             "signal backend must fail closed when pthread_create gate is unavailable")
     require("peak_signal_policy_choose_reserved_signal" in controller and
             "peak_signal_policy_cookie_matches_async" in signal_handler and
-            "peak_signal_policy_send_thread_signal" in signal_stop and
+            "peak_detach_controller_signal_send_owned" in signal_stop and
             "SYS_rt_tgsigqueueinfo" in signal_policy,
             "signal backend must reserve a signal and authenticate stop delivery with rt_tgsigqueueinfo cookies")
+    send_owned = extract_function(controller, "peak_detach_controller_signal_send_owned")
+    admit_thread = extract_function(controller, "peak_detach_controller_signal_admit_thread")
+    reserve_receipt = extract_function(controller, "peak_detach_controller_signal_receipt_reserve")
+    note_seen = extract_function(controller, "peak_detach_controller_signal_receipt_note_seen")
+    retire_receipts = extract_function(controller, "peak_detach_controller_signal_receipts_retire_epoch")
+    native_sender = extract_function(signal_policy, "peak_signal_policy_send_thread_signal")
+    async_cookie = extract_function(signal_policy, "peak_signal_policy_cookie_matches_async")
+    preinitialized_cookie = extract_function(signal_policy, "peak_signal_policy_cookie_for_preinitialized")
+
+    def ordered(body, tokens, message):
+        positions = [body.find(token) for token in tokens]
+        require(all(position >= 0 for position in positions) and
+                all(a < b for a, b in zip(positions, positions[1:])), message)
+
+    for body in (signal_stop, admit_thread):
+        ordered(body, ("peak_detach_controller_signal_receipt_reserve(",
+                       "peak_detach_controller_signal_send_owned("),
+                "initial and newly admitted STOP sends must reserve a receipt first")
+        require("peak_signal_policy_send_thread_signal(" not in body,
+                "STOP paths must not bypass receipt-owned sender accounting")
+    ordered(send_owned, ("peak_signal_policy_send_thread_signal(", "if (rc == 0)",
+                         "errno = saved_errno", "return rc;"),
+            "owned sender must preserve native acceptance and errno")
+    require("peak_signal_policy_cookie_for(epoch, tid)" in send_owned and
+            re.search(r"if \(rc == 0\)\s*\{\s*"
+                      r"peak_detach_controller_signal_receipt_add_flags\(reference,\s*"
+                      r"PEAK_SIGNAL_RECEIPT_SENT\);\s*\} else \{\s*"
+                      r"peak_detach_controller_signal_receipt_discard\(reference\);\s*\}",
+                      send_owned) is not None,
+            "only native rc0 may grant SENT credit; failed send must discard its tagged reference")
+    require(all(token in native_sender for token in (
+                "info.si_signo = signum", "info.si_code = SI_QUEUE",
+                "info.si_pid = getpid()", "info.si_uid = getuid()",
+                "info.si_value.sival_ptr = (void*)(uintptr_t)cookie")) and
+            re.search(r"real_syscall_fn\(SYS_rt_tgsigqueueinfo,\s*getpid\(\),\s*"
+                      r"tid,\s*signum,\s*&info\)", native_sender) is not None,
+            "owned native send must carry the authenticated SI_QUEUE tuple to the exact thread")
+    ordered(reserve_receipt, ("atomic_store_explicit(&receipt->epoch",
+                              "atomic_store_explicit(&receipt->tid",
+                              "atomic_store_explicit(&receipt->signum",
+                              "tag | PEAK_SIGNAL_RECEIPT_PUBLISHED"),
+            "receipt identity must precede release publication of its allocation ticket")
+    duplicate_check = reserve_receipt[:reserve_receipt.find("uint32_t capacity =")]
+    require(all(token in duplicate_check for token in (
+                "i < PEAK_DETACH_HELPER_MAX_THREADS", "PEAK_SIGNAL_RECEIPT_SEEN",
+                "&receipt->epoch", "&receipt->tid", "&receipt->signum",
+                '"signal-receipt-identity-pending"')) and
+            "signal_receipt_next_ticket > (UINT64_MAX >> 4)" in reserve_receipt and
+            "(state & (PEAK_SIGNAL_RECEIPT_SENT | PEAK_SIGNAL_RECEIPT_SEEN)) ==" in reserve_receipt and
+            "(PEAK_SIGNAL_RECEIPT_SENT | PEAK_SIGNAL_RECEIPT_SEEN)" in reserve_receipt and
+            re.search(r"tag \| PEAK_SIGNAL_RECEIPT_PUBLISHED,\s*memory_order_release",
+                      reserve_receipt) is not None,
+            "receipt allocation must reject pending whole-ledger identity, avoid ticket wrap and retain SEEN-before-SENT debt")
+    for name, body in (
+            ("peak_detach_controller_signal_receipt_add_flags", extract_function(
+                controller, "peak_detach_controller_signal_receipt_add_flags")),
+            ("peak_detach_controller_signal_receipt_discard", extract_function(
+                controller, "peak_detach_controller_signal_receipt_discard")),
+            ("peak_detach_controller_signal_receipt_note_seen", note_seen)):
+        require(re.search(r"while \(peak_detach_controller_signal_receipt_tag\(state\) == "
+                          r"(?:reference\.tag|tag)\)", body) is not None and
+                "atomic_compare_exchange_strong_explicit(&receipt->state" in body and
+                "memory_order_acq_rel" in body and "memory_order_acquire" in body,
+                f"{name} must mutate only the originally observed receipt allocation")
+    seen_compact = re.sub(r"\s+", " ", note_seen)
+    require("peak_signal_policy_cookie_matches_async(" in note_seen and
+            "&receipt->tid" in note_seen and "&receipt->signum" in note_seen and
+            "atomic_load_explicit(&receipt->state, memory_order_acquire)" in note_seen and
+            "(retired_only && (state & (PEAK_SIGNAL_RECEIPT_SENT | PEAK_SIGNAL_RECEIPT_RETIRED)) != "
+            "(PEAK_SIGNAL_RECEIPT_SENT | PEAK_SIGNAL_RECEIPT_RETIRED))" in seen_compact and
+            "state | PEAK_SIGNAL_RECEIPT_SEEN" in note_seen,
+            "retired receipt consumption needs authenticated identity plus native SENT and RETIRED; active PUBLISHED may be seen before sender returns")
+    ordered(signal_handler, ("peak_signal_policy_cookie_matches_async(",
+                             "peak_detach_controller_signal_receipt_note_seen(",
+                             "peak_signal_policy_note_unexpected_delivery()"),
+            "handler must authenticate active identity and try retired ownership before contamination")
+    require(re.search(r"\(state & PEAK_SIGNAL_RECEIPT_SENT\) != 0\s*"
+                      r"\? state \| PEAK_SIGNAL_RECEIPT_RETIRED : 0", retire_receipts) is not None,
+            "retirement must preserve successful native sends and clear unsent reservations")
+    ordered(signal_release, ("peak_detach_controller_signal_receipts_retire_epoch(epoch)",
+                             "atomic_store_explicit(&signal_release_epoch, epoch"),
+            "owned receipt retirement must precede releasing its generation")
+    require(all(token in async_cookie for token in (
+                "info->si_code != SI_QUEUE", "info->si_pid != getpid()",
+                "info->si_uid != getuid()", "peak_signal_policy_cookie_for_preinitialized(",
+                "cookie == 0", "info->si_value.sival_ptr")) and
+            "atomic_load_explicit(&cookie_base, memory_order_acquire)" in preinitialized_cookie and
+            "base == 0" in preinitialized_cookie and
+            all(token not in async_cookie + preinitialized_cookie for token in (
+                "pthread_once", "peak_signal_policy_init_cookie(", "peak_signal_policy_ensure_real_symbols(")),
+            "handler authentication must compare real queue provenance and preinitialized nonzero cookie without lazy initialization")
     require("peak_signal_policy_cookie_matches(" not in signal_handler and
             "peak_signal_policy_cookie_for_preinitialized" in signal_policy and
             "base == 0" in signal_policy,

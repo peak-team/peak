@@ -723,3 +723,81 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_
   add_test(NAME test_signal_null_mask_reentry COMMAND test_signal_null_mask_reentry)
   set_tests_properties(test_signal_null_mask_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
 endif()
+
+# Genuine receipt-backed owned frames, with a separate unowned SI_QUEUE packet
+# at the contamination boundary. No old reusable-slot ownership test seeding.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  get_target_property(_forward_sources test_detach_controller SOURCES)
+  list(REMOVE_ITEM _forward_sources test_detach_controller.c)
+  add_executable(test_signal_forward_effect test_signal_forward_effect.c ${_forward_sources})
+  target_include_directories(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,COMPILE_DEFINITIONS>)
+  target_compile_options(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,COMPILE_OPTIONS>)
+  target_link_options(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,LINK_OPTIONS>)
+  target_link_libraries(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,LINK_LIBRARIES>)
+  foreach(forward_case recoverable pc-positive temp-positive)
+    foreach(forward_batch scalar batch)
+      set(forward_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+      if(forward_batch STREQUAL "batch")
+        list(APPEND forward_env "PEAK_TEST_FORWARD_BATCH=1")
+      endif()
+      add_test(NAME test_signal_forward_${forward_case}_${forward_batch}
+        COMMAND test_signal_forward_effect ${forward_case})
+      set_tests_properties(test_signal_forward_${forward_case}_${forward_batch}
+        PROPERTIES ENVIRONMENT "${forward_env}" TIMEOUT 15)
+    endforeach()
+  endforeach()
+  foreach(forward_case before after permission pc-fatal temp-fatal temp-error temp-multi-fatal)
+    foreach(forward_batch scalar batch)
+      set(forward_env "PEAK_TARGET=strict_helper_target")
+      if(forward_batch STREQUAL "batch")
+        list(APPEND forward_env "PEAK_TEST_FORWARD_BATCH=1")
+      endif()
+      set(forward_detail signal.contamination.after.forward.effect)
+      set(forward_witness1 "forward-fixture actual_owned_send=1")
+      set(forward_witness2 "forward-fixture before_effect_boundary=1")
+      set(forward_witness3 "forward-fixture actual_unowned_packet=1")
+      set(forward_witness4 "fatal safe-detach helper failure")
+      if(forward_case STREQUAL "after")
+        set(forward_witness2 "forward-fixture action=2 actual_effect_observed=1")
+      elseif(forward_case STREQUAL "permission")
+        set(forward_witness2 "forward-fixture permission_granted_without_code_effect=1")
+      elseif(forward_case STREQUAL "pc-fatal")
+        set(forward_witness2 "forward-fixture action=1 actual_effect_observed=1")
+      elseif(forward_case STREQUAL "temp-fatal")
+        set(forward_witness2 "forward-fixture action=3 actual_effect_observed=1")
+      endif()
+      if(forward_case STREQUAL "temp-error")
+        set(forward_detail signal.breakpoint.install)
+        set(forward_witness2 "forward-fixture actual_trap_before_RX_failure=1")
+        set(forward_witness3 "")
+      elseif(forward_case STREQUAL "temp-multi-fatal")
+        set(forward_detail signal.evacuation.incomplete.after.forward.effect)
+        list(APPEND forward_env "PEAK_TEST_MULTI_TEMP_FAILURE=1")
+        set(forward_witness2 "forward-fixture action=3 actual_effect_observed=1")
+        set(forward_witness3 "forward-fixture actual_exit_byte_restored=1")
+      endif()
+      add_test(NAME test_signal_forward_${forward_case}_${forward_batch}
+        COMMAND ${CMAKE_COMMAND}
+          -DTEST_EXECUTABLE=$<TARGET_FILE:test_signal_forward_effect>
+          -DTEST_ARG=${forward_case}
+          -DHELPER_EXECUTABLE=$<TARGET_FILE:test_detach_fake_helper>
+          -DFAKE_SCENARIO=success-zero -DDETACH_BACKEND=signal
+          -DEXPECTED_EXIT_CODE=128 -DEXPECTED_FATAL_DETAIL=${forward_detail}
+          "-DEXPECTED_WITNESS_1=${forward_witness1}"
+          "-DEXPECTED_WITNESS_2=${forward_witness2}"
+          "-DEXPECTED_WITNESS_3=${forward_witness3}"
+          "-DEXPECTED_WITNESS_4=${forward_witness4}"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/assert_fatal_failure.cmake)
+      set_tests_properties(test_signal_forward_${forward_case}_${forward_batch}
+        PROPERTIES ENVIRONMENT "${forward_env}" TIMEOUT 15)
+    endforeach()
+  endforeach()
+endif()

@@ -219,6 +219,15 @@ static char** configured_helper_env = NULL;
 static pthread_once_t helper_configuration_initialized = PTHREAD_ONCE_INIT;
 static PeakDetachHeldMutation held_mutation = { 0 };
 static PeakDetachPhysicalPatchRecord physical_patch_records[PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS];
+/* Coordinator-only, protected by the mutation guard. */
+static gboolean signal_forward_effect_started;
+static gboolean
+peak_detach_controller_signal_check_contamination(PeakDetachStatus *status_out);
+
+static gboolean peak_detach_controller_evacuate_backend(
+    PeakDetachHoldBackend backend, uint32_t instruction_count,
+    PeakDetachHelperInstruction *instructions, PeakDetachStatus *status_out);
+
 static double held_mutation_started_at = 0.0;
 static double last_stop_window_us = 0.0;
 static _Atomic int trace_diagnostics_enabled = 0;
@@ -567,6 +576,9 @@ peak_detach_controller_atfork_child(void)
     helper_owner_pid = -1;
     helper_state_fatal = FALSE;
     held_mutation = (PeakDetachHeldMutation){ 0 };
+    /* The child abandons the parent's mutation transaction. Receipt and tagged
+     * frame cleanup below still preserve the surviving caller's reader debt. */
+    signal_forward_effect_started = FALSE;
     memset(physical_patch_records, 0, sizeof(physical_patch_records));
     peak_detach_controller_signal_receipts_after_fork_child();
     peak_detach_controller_signal_slots_after_fork_child();
@@ -3056,6 +3068,7 @@ peak_detach_controller_signal_verify_no_unheld_threads(pid_t controller_tid,
 static gboolean
 peak_detach_controller_signal_release(PeakDetachStatus* status_out)
 {
+    (void)peak_detach_controller_signal_check_contamination(status_out);
     int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
     if (epoch == 0) {
         if (status_out != NULL) {
@@ -3127,11 +3140,52 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     }
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+extern void peak_test_before_signal_forward_effect(void) __attribute__((weak));
+extern void peak_test_after_signal_forward_effect(int action) __attribute__((weak));
+#endif
+
+static void
+peak_detach_controller_signal_begin_forward_effect(void)
+{
+    signal_forward_effect_started = TRUE;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_test_before_signal_forward_effect != NULL)
+        peak_test_before_signal_forward_effect();
+#endif
+}
+
+static void
+peak_detach_controller_signal_observe_forward_effect(int action)
+{
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    if (peak_test_after_signal_forward_effect != NULL)
+        peak_test_after_signal_forward_effect(action);
+#else
+    (void)action;
+#endif
+    (void)peak_detach_controller_signal_check_contamination(NULL);
+}
+
+static gboolean
+peak_detach_controller_signal_check_contamination(PeakDetachStatus *status_out)
+{
+    if (peak_signal_policy_unexpected_delivery_count() == 0)
+        return TRUE;
+    if (signal_forward_effect_started)
+        peak_detach_controller_mark_helper_fatal(
+            "signal contamination after forward effect", PEAK_DETACH_STATUS_UNSUPPORTED);
+    if (status_out != NULL)
+        *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+    return FALSE;
+}
+
 static void
 peak_detach_controller_signal_release_or_fatal(const char* context)
 {
     PeakDetachStatus release_status = PEAK_DETACH_STATUS_ERROR;
 
+    (void)peak_detach_controller_signal_check_contamination(&release_status);
     if (!peak_detach_controller_signal_release(&release_status)) {
         peak_detach_controller_mark_helper_fatal(context, release_status);
     }
@@ -3142,6 +3196,9 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
                                            uint32_t* snapshot_count_out,
                                            PeakDetachStatus* status_out)
 {
+    /* A fresh controller transaction only; never reset at release, which must
+     * still diagnose contamination after permission or any evacuation effect. */
+    signal_forward_effect_started = FALSE;
     if (!peak_detach_controller_ensure_signal_backend(status_out)) {
         return FALSE;
     }
@@ -3422,6 +3479,17 @@ peak_detach_controller_signal_write_memory(uint64_t address,
     memcpy((void*)(uintptr_t)address, bytes, size);
     __builtin___clear_cache((char*)(uintptr_t)address,
                             (char*)((uintptr_t)address + size));
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    extern int peak_test_after_signal_memory_write(uint64_t address, size_t size)
+        __attribute__((weak));
+    if (peak_test_after_signal_memory_write != NULL) {
+        int injected_errno = peak_test_after_signal_memory_write(address, size);
+        if (injected_errno != 0) {
+            errno = injected_errno;
+            return -1;
+        }
+    }
+#endif
     int saved_errno = 0;
     if (mprotect((void*)start, protect_size, PROT_READ | PROT_EXEC) != 0) {
         saved_errno = errno;
@@ -3489,16 +3557,25 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
         return TRUE;
     }
 
+    if (!peak_detach_controller_signal_check_contamination(status_out))
+        return FALSE;
+    peak_detach_controller_signal_begin_forward_effect();
+    (void)peak_detach_controller_signal_check_contamination(status_out);
     memcpy(original, (void*)breakpoint_pc, trap_size);
     if (peak_detach_controller_signal_write_memory(breakpoint_u64,
                                                    trap,
                                                    trap_size) != 0) {
-        if (status_out != NULL) {
-            *status_out = peak_detach_controller_errno_status();
-        }
+        PeakDetachStatus status = peak_detach_controller_errno_status();
+        if (status_out != NULL)
+            *status_out = status;
+        /* The helper may have written the trap before reporting protection or
+         * verification failure. Do not resume without proved restoration. */
+        peak_detach_controller_mark_helper_fatal("signal breakpoint install", status);
         return FALSE;
     }
 
+    peak_detach_controller_signal_observe_forward_effect(
+        PEAK_DETACH_HELPER_INSTRUCTION_SINGLE_STEP_OUT_OF_RANGE);
     atomic_store_explicit(&slot->evacuate_breakpoint_pc,
                           breakpoint_pc,
                           memory_order_release);
@@ -3560,6 +3637,11 @@ peak_detach_controller_signal_temp_breakpoint_out_of_range(
         return FALSE;
     }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    extern void peak_test_after_signal_temp_restore(void) __attribute__((weak));
+    if (peak_test_after_signal_temp_restore != NULL)
+        peak_test_after_signal_temp_restore();
+#endif
     atomic_store_explicit(&slot->evacuate_epoch, 0, memory_order_release);
     if (status_out != NULL) {
         *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -3664,10 +3746,17 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
         return FALSE;
     }
 
+    if (!peak_detach_controller_signal_check_contamination(status_out))
+        return FALSE;
+
     gboolean mutation_started = FALSE;
     for (uint32_t i = 0; i < instruction_count; i++) {
         PeakDetachHelperInstruction* instruction = &instructions[i];
         if (instruction->action == PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY) {
+            if (!peak_detach_controller_signal_check_contamination(status_out))
+                return FALSE;
+            peak_detach_controller_signal_begin_forward_effect();
+            (void)peak_detach_controller_signal_check_contamination(status_out);
             mutation_started = TRUE;
             if (peak_detach_controller_signal_write_memory(instruction->address,
                                                            instruction->bytes,
@@ -3682,6 +3771,8 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
                 }
                 return FALSE;
             }
+            peak_detach_controller_signal_observe_forward_effect(
+                PEAK_DETACH_HELPER_INSTRUCTION_WRITE_MEMORY);
         }
     }
 
@@ -3691,6 +3782,10 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
             PeakDetachSignalSlot* slot =
                 peak_detach_controller_signal_find_slot((pid_t)instruction->tid,
                                                         epoch);
+            if (!peak_detach_controller_signal_check_contamination(status_out))
+                return FALSE;
+            peak_detach_controller_signal_begin_forward_effect();
+            (void)peak_detach_controller_signal_check_contamination(status_out);
             atomic_store_explicit(&slot->new_pc,
                                   (uintptr_t)instruction->pc,
                                   memory_order_release);
@@ -3700,6 +3795,8 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
             atomic_store_explicit(&slot->rewrite_epoch,
                                   epoch,
                                   memory_order_release);
+            peak_detach_controller_signal_observe_forward_effect(
+                PEAK_DETACH_HELPER_INSTRUCTION_SET_PC);
         }
     }
 
@@ -3709,10 +3806,71 @@ peak_detach_controller_signal_evacuate(uint32_t instruction_count,
     return TRUE;
 }
 
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Exercise the real evacuation protocol on a real arrived owned slot only. */
+gboolean
+peak_detach_controller_test_signal_effect(long tid, int action, uintptr_t begin,
+                                          size_t size, uintptr_t *sampled_pc_out,
+                                          gboolean *published_out)
+{
+    peak_detach_controller_lock_mutation_guard();
+    int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
+    PeakDetachSignalSlot *slot =
+        peak_detach_controller_signal_find_slot((pid_t)tid, epoch);
+    if (epoch == 0 || slot == NULL ||
+        atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) != epoch)
+        goto invalid;
+    uintptr_t pc = atomic_load_explicit(&slot->pc, memory_order_acquire);
+    *sampled_pc_out = pc;
+    if (pc < begin || pc >= begin + size)
+        goto invalid;
+    PeakDetachHelperInstruction instruction = {0};
+    instruction.tid = tid;
+    instruction.action = action;
+    instruction.address = begin;
+    instruction.size = size;
+    instruction.pc = pc; /* Identity only: never redirect to an invented PC. */
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    PeakDetachHelperInstruction instructions[2] = {instruction, instruction};
+    uint32_t count = 1;
+    if (getenv("PEAK_TEST_MULTI_TEMP_FAILURE") != NULL) {
+        /* The live coordinator has no owned signal slot. The first real
+         * worker evacuation completes before this second slot check fails. */
+        instructions[1].tid = (long)syscall(SYS_gettid);
+        count = 2;
+    }
+    gboolean ok = peak_detach_controller_evacuate_backend(PEAK_DETACH_HOLD_BACKEND_SIGNAL,
+                                                          count, instructions, &status);
+    *published_out =
+        atomic_load_explicit(&slot->rewrite_epoch, memory_order_acquire) == epoch &&
+        atomic_load_explicit(&slot->new_pc, memory_order_acquire) == pc;
+    peak_detach_controller_unlock_mutation_guard();
+    return ok;
+
+invalid:
+    peak_detach_controller_unlock_mutation_guard();
+    return FALSE;
+}
+
+gboolean
+peak_detach_controller_test_signal_pc_published(long tid)
+{
+    int epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
+    PeakDetachSignalSlot *slot =
+        peak_detach_controller_signal_find_slot((pid_t)tid, epoch);
+    return epoch != 0 && slot != NULL &&
+           atomic_load_explicit(&slot->rewrite_epoch, memory_order_acquire) == epoch &&
+           atomic_load_explicit(&slot->new_pc, memory_order_acquire) ==
+               atomic_load_explicit(&slot->pc, memory_order_acquire);
+}
+#endif
+
 static gboolean
 peak_detach_controller_resume_backend(PeakDetachHoldBackend backend,
                                       PeakDetachStatus* status_out)
 {
+    if (backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL)
+        (void)peak_detach_controller_signal_check_contamination(status_out);
     /* No more code mutation follows this point; do not hold the gate while
      * resumed application signal handlers can enter filesystem-stat calls. */
     peak_filesystem_stat_guard_resume();
@@ -3730,9 +3888,13 @@ peak_detach_controller_evacuate_backend(PeakDetachHoldBackend backend,
                                         PeakDetachStatus* status_out)
 {
     if (backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
-        return peak_detach_controller_signal_evacuate(instruction_count,
-                                                     instructions,
-                                                     status_out);
+        gboolean ok = peak_detach_controller_signal_evacuate(instruction_count,
+                                                             instructions, status_out);
+        if (!ok && signal_forward_effect_started)
+            peak_detach_controller_mark_helper_fatal(
+                "signal evacuation incomplete after forward effect",
+                status_out != NULL ? *status_out : PEAK_DETACH_STATUS_ERROR);
+        return ok;
     }
     return peak_detach_controller_send_evacuate(instruction_count,
                                                instructions,
@@ -3765,6 +3927,34 @@ peak_detach_controller_find_physical_patch_record(size_t hook_id,
     free_record->hook_id = hook_id;
     return free_record;
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+size_t
+peak_detach_controller_test_physical_record_snapshot(size_t hook_id, unsigned char *bytes,
+                                                     size_t capacity)
+{
+    const size_t length = 1 + sizeof(size_t) + sizeof(uintptr_t) + sizeof(uint32_t) +
+                          PEAK_DETACH_HELPER_MAX_PATCH_BYTES;
+    if (capacity < length)
+        return 0;
+    memset(bytes, 0, length);
+    PeakDetachPhysicalPatchRecord *record =
+        peak_detach_controller_find_physical_patch_record(hook_id, FALSE);
+    if (record != NULL) {
+        size_t offset = 0;
+        bytes[offset++] = record->used ? 1 : 0;
+        memcpy(bytes + offset, &record->hook_id, sizeof(record->hook_id));
+        offset += sizeof(record->hook_id);
+        uintptr_t address = (uintptr_t)record->function_address;
+        memcpy(bytes + offset, &address, sizeof(address));
+        offset += sizeof(address);
+        memcpy(bytes + offset, &record->patch_size, sizeof(record->patch_size));
+        offset += sizeof(record->patch_size);
+        memcpy(bytes + offset, record->active_patch, sizeof(record->active_patch));
+    }
+    return length;
+}
+#endif
 
 static double
 peak_detach_controller_monotonic_second(void)
@@ -4812,6 +5002,32 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         }
     }
 
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL &&
+        !peak_detach_controller_signal_check_contamination(&status)) {
+        peak_detach_controller_signal_release_or_fatal(
+            "signal contamination before mutation");
+        peak_detach_controller_note_stop_window_failed();
+        if (creation_gate_active)
+            peak_detach_controller_end_thread_creation_gate();
+        held_mutation = (PeakDetachHeldMutation){0};
+        if (status_out != NULL)
+            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+    PeakDetachPhysicalPatchRecord *scalar_record =
+        peak_detach_controller_find_physical_patch_record(request->hook_id, FALSE);
+    if (scalar_record == NULL) {
+        for (size_t i = 0; i < PEAK_DETACH_MAX_PHYSICAL_PATCH_RECORDS; i++) {
+            if (!physical_patch_records[i].used) {
+                scalar_record = &physical_patch_records[i];
+                break;
+            }
+        }
+    }
+    PeakDetachPhysicalPatchRecord scalar_record_before = {0};
+    if (scalar_record != NULL)
+        scalar_record_before = *scalar_record;
     if (!peak_detach_controller_classify_stopped_threads(request,
                                                         &gum_snapshot,
                                                         stop_backend,
@@ -4821,6 +5037,8 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                         &status)) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
+        if (scalar_record != NULL)
+            *scalar_record = scalar_record_before;
         if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
             peak_detach_controller_mark_helper_fatal("classify abort",
                                                      resume_status);
@@ -4843,6 +5061,8 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                                  held_mutation.instruction_count,
                                                  held_mutation.instructions,
                                                  &status)) {
+        if (scalar_record != NULL)
+            *scalar_record = scalar_record_before;
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
             peak_detach_controller_signal_release_or_fatal("signal evacuate abort");
         }
@@ -4858,6 +5078,25 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         peak_detach_controller_unlock_mutation_guard();
         return FALSE;
     }
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL &&
+        !peak_detach_controller_signal_check_contamination(&status)) {
+        if (scalar_record != NULL)
+            *scalar_record = scalar_record_before;
+        peak_detach_controller_signal_release_or_fatal(
+            "signal contamination before mutation");
+        peak_detach_controller_note_stop_window_failed();
+        if (creation_gate_active)
+            peak_detach_controller_end_thread_creation_gate();
+        held_mutation = (PeakDetachHeldMutation){0};
+        if (status_out != NULL)
+            *status_out = PEAK_DETACH_STATUS_UNSUPPORTED;
+        peak_detach_controller_unlock_mutation_guard();
+        return FALSE;
+    }
+    /* Permission may let the caller mutate code even with no evacuation.
+     * From this point contamination cannot use the unchanged-state refusal. */
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL)
+        signal_forward_effect_started = TRUE;
     held_mutation.instruction_count = 0;
     held_mutation.active = TRUE;
     held_mutation.backend = stop_backend;
@@ -5207,6 +5446,27 @@ peak_detach_controller_prepare_hook_mutation_batch(
         stop_backend = PEAK_DETACH_HOLD_BACKEND_HELPER;
     }
 
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL &&
+        !peak_detach_controller_signal_check_contamination(&status)) {
+        memcpy(physical_patch_records, physical_patch_snapshot,
+               sizeof(physical_patch_records));
+        peak_detach_controller_signal_release_or_fatal(
+            "signal batch contamination before mutation");
+        peak_detach_controller_note_stop_window_failed();
+        if (creation_gate_active) {
+            peak_detach_controller_end_thread_creation_gate();
+            creation_gate_active = FALSE;
+        }
+        held_mutation = (PeakDetachHeldMutation){0};
+        status = PEAK_DETACH_STATUS_UNSUPPORTED;
+        safe_count = 0;
+        for (size_t i = 0; i < usable_count; i++) {
+            results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
+            results[i].prepared = FALSE;
+            results[i].uses_physical_patch = FALSE;
+        }
+        goto fail_without_resume_locked;
+    }
     for (size_t i = 0; i < usable_count; i++) {
         PeakDetachStatus candidate_status = PEAK_DETACH_STATUS_ERROR;
 
@@ -5245,6 +5505,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
     if (ambiguous_batch) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
+        memcpy(physical_patch_records, physical_patch_snapshot,
+               sizeof(physical_patch_records));
         if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
             peak_detach_controller_mark_helper_fatal("batch classify abort",
                                                      resume_status);
@@ -5254,9 +5516,6 @@ peak_detach_controller_prepare_hook_mutation_batch(
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
         }
-        memcpy(physical_patch_records,
-               physical_patch_snapshot,
-               sizeof(physical_patch_records));
         for (size_t i = 0; i < usable_count; i++) {
             if (candidates[i].valid) {
                 results[i].prepared = FALSE;
@@ -5270,6 +5529,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
     if (safe_count == 0) {
         PeakDetachStatus resume_status = PEAK_DETACH_STATUS_ERROR;
 
+        memcpy(physical_patch_records, physical_patch_snapshot,
+               sizeof(physical_patch_records));
         if (!peak_detach_controller_resume_backend(stop_backend, &resume_status)) {
             peak_detach_controller_mark_helper_fatal("batch classify retry",
                                                      resume_status);
@@ -5279,9 +5540,6 @@ peak_detach_controller_prepare_hook_mutation_batch(
             peak_detach_controller_end_thread_creation_gate();
             creation_gate_active = FALSE;
         }
-        memcpy(physical_patch_records,
-               physical_patch_snapshot,
-               sizeof(physical_patch_records));
         status = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
         goto fail_unlocked_after_resume;
     }
@@ -5291,6 +5549,8 @@ peak_detach_controller_prepare_hook_mutation_batch(
                                                  aggregate.instruction_count,
                                                  aggregate.instructions,
                                                  &status)) {
+        memcpy(physical_patch_records, physical_patch_snapshot,
+               sizeof(physical_patch_records));
         if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL) {
             peak_detach_controller_signal_release_or_fatal("signal batch evacuate abort");
         }
@@ -5305,12 +5565,34 @@ peak_detach_controller_prepare_hook_mutation_batch(
                 results[i].status = status;
             }
         }
-        memcpy(physical_patch_records,
-               physical_patch_snapshot,
-               sizeof(physical_patch_records));
         goto fail_without_resume_locked;
     }
 
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL &&
+        !peak_detach_controller_signal_check_contamination(&status)) {
+        memcpy(physical_patch_records, physical_patch_snapshot,
+               sizeof(physical_patch_records));
+        peak_detach_controller_signal_release_or_fatal(
+            "signal batch contamination before mutation");
+        peak_detach_controller_note_stop_window_failed();
+        if (creation_gate_active) {
+            peak_detach_controller_end_thread_creation_gate();
+            creation_gate_active = FALSE;
+        }
+        held_mutation = (PeakDetachHeldMutation){0};
+        status = PEAK_DETACH_STATUS_UNSUPPORTED;
+        safe_count = 0;
+        for (size_t i = 0; i < usable_count; i++) {
+            results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
+            results[i].prepared = FALSE;
+            results[i].uses_physical_patch = FALSE;
+        }
+        goto fail_without_resume_locked;
+    }
+    /* Permission may let the caller mutate code even with no evacuation.
+     * From this point contamination cannot use the unchanged-state refusal. */
+    if (stop_backend == PEAK_DETACH_HOLD_BACKEND_SIGNAL)
+        signal_forward_effect_started = TRUE;
     aggregate.instruction_count = 0;
     aggregate.active = TRUE;
     aggregate.operation = PEAK_DETACH_OPERATION_DETACH;
