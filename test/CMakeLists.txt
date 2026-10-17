@@ -1061,6 +1061,24 @@ if(BUILD_TESTING)
         set_tests_properties(test_cxx_throw_transparency_peak PROPERTIES
             ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
 
+        if(TARGET test_unwind_frame_reentry)
+            add_test(NAME test_unwind_frame_reentry_native
+                COMMAND $<TARGET_FILE:test_unwind_frame_reentry>)
+            add_test(NAME test_unwind_frame_reentry_peak
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_unwind_frame_reentry.py
+                    --application $<TARGET_FILE:test_unwind_frame_reentry>
+                    --libpeak $<TARGET_FILE:peak>)
+            add_test(NAME test_unwind_frame_release_boundary
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/check_unwind_frame_release.py
+                    --source ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_gum_unwind_frames.inc
+                    --cc ${CMAKE_C_COMPILER})
+            set_tests_properties(test_unwind_frame_reentry_native
+                test_unwind_frame_reentry_peak test_unwind_frame_release_boundary
+                PROPERTIES TIMEOUT 10)
+        endif()
+
         if(TARGET test_cxx_throw_late_provider)
             add_test(NAME test_cxx_throw_late_provider_native
                 COMMAND $<TARGET_FILE:test_cxx_throw_late_provider>

@@ -24,6 +24,7 @@ struct PeakUwFrame {
   PeakGumFunctionContext17 *context;
   guint8 *pc;
   gboolean observed, generic, leased;
+  guint diagnostic_active; /* Advisory only; never an ownership/lease count. */
   guint64 reaped_epoch;
   gpointer reaped_context, reaped_slot;
   guint64 walk_live_epoch;
@@ -39,7 +40,6 @@ struct PeakUwThread {
   PeakUwThread *next;
   PeakUwBlock *blocks;
   PeakUwFrame *free, *active;
-  guint live;
   gpointer cfi_cache;
   PeakGumInterceptorThreadContext17 *gum_context;
   guint64 cookie, reap_epoch;
@@ -314,13 +314,19 @@ gboolean gum_interceptor_peak_unwind_reap_threads(void) {
 }
 void gum_interceptor_peak_unwind_diagnostics(guint64 *owners, guint64 *blocks,
                                              guint64 *active) {
+  /* Advisory while threads execute: scanning separate slots is not an
+   * atomic snapshot. At quiescent checkpoints the count is exact. The lock
+   * pins blocks; no remote reader follows active/free or frame contexts. */
   *owners = *blocks = *active = 0;
   g_mutex_lock(&peak_uw_owners_lock);
   for (PeakUwThread *o = peak_uw_owners; o; o = o->next) {
     (*owners)++;
-    *active += __atomic_load_n(&o->live, __ATOMIC_RELAXED);
-    for (PeakUwBlock *b = o->blocks; b; b = b->next)
+    for (PeakUwBlock *b = o->blocks; b; b = b->next) {
       (*blocks)++;
+      for (guint i = 0; i < PEAK_UW_SLOTS; i++)
+        *active += __atomic_load_n(&b->frames[i].diagnostic_active,
+                                  __ATOMIC_RELAXED);
+    }
   }
   g_mutex_unlock(&peak_uw_owners_lock);
 }
@@ -380,7 +386,7 @@ static gpointer peak_uw_canonical_address(PeakUwThread *owner,
                                           gpointer caller) {
   if (!owner)
     return caller;
-  for (guint n = 0; n < owner->live; n++) {
+  for (PeakUwFrame *limit = owner->active; limit; limit = limit->next) {
     PeakUwFrame *match = NULL;
     for (PeakUwFrame *f = owner->active; f; f = f->next)
       if (caller == f->pc + 1) {
@@ -517,9 +523,14 @@ static void peak_uw_release(PeakUwFrame **link) {
     g_atomic_int_dec_and_test(&f->context->trampoline_usage_counter);
   f->slot = NULL;
   f->context = NULL;
+  /* Clear this instance before publishing f for reuse. A nested signal may
+   * reserve it immediately, then leave a nonlocal-exit frame to be reaped. */
+  __atomic_store_n(&f->diagnostic_active, 0, __ATOMIC_RELAXED);
+  __atomic_signal_fence(__ATOMIC_RELEASE);
   f->free_next = peak_uw_thread->free;
   peak_uw_thread->free = f;
-  if (__atomic_sub_fetch(&peak_uw_thread->live, 1, __ATOMIC_RELAXED) == 0)
+  __atomic_signal_fence(__ATOMIC_ACQ_REL);
+  if (peak_uw_thread->active == NULL)
     peak_uw_cache_clear(peak_uw_thread);
 }
 static void peak_uw_reap(gpointer *slot) {
@@ -597,7 +608,7 @@ static void peak_uw_enter(PeakUwFrame *f, PeakGumFunctionContext17 *context,
     g_atomic_int_inc(&context->trampoline_usage_counter);
   f->next = peak_uw_thread->active;
   peak_uw_thread->active = f;
-  __atomic_add_fetch(&peak_uw_thread->live, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&f->diagnostic_active, 1, __ATOMIC_RELAXED);
   __atomic_signal_fence(__ATOMIC_RELEASE);
   *slot = f->pc + 1;
 }
