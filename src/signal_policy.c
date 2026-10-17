@@ -650,7 +650,7 @@ static int
 peak_signal_policy_prepare_reserved_set_for_user(const sigset_t* set,
                                                  const char* api)
 {
-    if (!peak_signal_policy_enabled_for_process() ||
+    if (set == NULL || !peak_signal_policy_enabled_for_process() ||
         peak_signal_policy_is_internal()) {
         return 1;
     }
@@ -682,7 +682,8 @@ peak_signal_policy_prepare_reserved_signal_for_user(int signum,
                                                     const char* api)
 {
     if (!peak_signal_policy_enabled_for_process() ||
-        peak_signal_policy_is_internal() || signum <= 0) {
+        peak_signal_policy_is_internal() ||
+        signum < SIGRTMIN || signum > SIGRTMAX) {
         return 1;
     }
 
@@ -760,10 +761,15 @@ peak_signal_policy_prepare_event_for_user_excluding(
     }
 
     int signum = 0;
-    if (!peak_signal_policy_event_signal(evp, &signum)) {
+    /* Best-effort event inspection must not leak its errno to the native API. */
+    int saved_errno = errno;
+    int decoded = peak_signal_policy_event_signal(evp, &signum);
+    errno = saved_errno;
+    if (!decoded) {
         return 1;
     }
-    if (signum <= 0) {
+    /* Reservations are RT-only; ordinary events cannot need migration. */
+    if (signum < SIGRTMIN || signum > SIGRTMAX) {
         return 1;
     }
 
@@ -863,7 +869,7 @@ peak_signal_policy_prepare_reserved_raw_set_for_user(const void* set,
                                                      size_t set_size,
                                                      const char* api)
 {
-    if (!peak_signal_policy_enabled_for_process() ||
+    if (set == NULL || !peak_signal_policy_enabled_for_process() ||
         peak_signal_policy_is_internal()) {
         return 1;
     }
@@ -1265,7 +1271,9 @@ peak_signal_policy_install_protective_handler(int signum)
 static int
 peak_signal_policy_commit_reserved_signal(int signum)
 {
-    if (signum <= 0) {
+    /* Keep every reservation in the domain used by selection and migration.
+     * Ordinary signals can then bypass migration_mutex, including in handlers. */
+    if (signum < SIGRTMIN || signum > SIGRTMAX) {
         return 0;
     }
 
