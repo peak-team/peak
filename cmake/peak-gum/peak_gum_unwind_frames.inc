@@ -67,8 +67,8 @@ static void peak_uw_gum_context_destroy(gpointer data) {
    * inspect a new thread's invocation stack at the same address. */
   g_mutex_lock(&peak_uw_owners_lock);
   for (PeakUwThread *o = peak_uw_owners; o; o = o->next)
-    if (o->gum_context == data)
-      o->gum_context = NULL;
+    if (__atomic_load_n(&o->gum_context, __ATOMIC_RELAXED) == data)
+      __atomic_store_n(&o->gum_context, NULL, __ATOMIC_RELAXED);
   g_mutex_unlock(&peak_uw_owners_lock);
 
   peak_gum_release_interceptor_thread_context_original(data);
@@ -165,13 +165,15 @@ static void peak_uw_frame_cfi(PeakUwFrame *f) {
 static void peak_uw_cache_clear(PeakUwThread *owner);
 /* Called with peak_uw_owners_lock held after thread-death proof. */
 static void peak_uw_settle_dead_gum_context(PeakUwThread *owner) {
-  PeakGumInterceptorThreadContext17 *context = owner->gum_context;
+  PeakGumInterceptorThreadContext17 *context =
+      __atomic_load_n(&owner->gum_context, __ATOMIC_RELAXED);
 
   if (context == NULL)
     return;
   for (PeakUwThread *other = peak_uw_owners; other; other = other->next)
-    if (other != owner && other->gum_context == context) {
-      owner->gum_context = NULL;
+    if (other != owner &&
+        __atomic_load_n(&other->gum_context, __ATOMIC_RELAXED) == context) {
+      __atomic_store_n(&owner->gum_context, NULL, __ATOMIC_RELAXED);
       return;
     }
 
@@ -200,7 +202,7 @@ static void peak_uw_settle_dead_gum_context(PeakUwThread *owner) {
    * to remove a later context allocated at the same address. The exact dead
    * entries above are gone, so Gum's eventual destructor neither repeats
    * their lease decrements nor retains the PEAK trampolines. */
-  owner->gum_context = NULL;
+  __atomic_store_n(&owner->gum_context, NULL, __ATOMIC_RELAXED);
 }
 static void peak_uw_owner_free(PeakUwThread *owner) {
   peak_uw_cache_clear(owner);
@@ -355,7 +357,8 @@ static gboolean peak_uw_owner_ensure(void) {
 static void peak_uw_bind_gum_context(void) {
   PeakGumInterceptorThreadContext17 *context;
 
-  if (peak_uw_thread == NULL)
+  if (peak_uw_thread == NULL ||
+      __atomic_load_n(&peak_uw_thread->gum_context, __ATOMIC_RELAXED) != NULL)
     return;
   /* Gum's getter may run its deferred GPrivate collector. Do not hold the
    * owners lock across it: our wrapped notify also takes that lock before
@@ -363,8 +366,9 @@ static void peak_uw_bind_gum_context(void) {
    * allocator reuse, and the returned current-thread context remains live. */
   context = peak_gum_get_interceptor_thread_context();
   g_mutex_lock(&peak_uw_owners_lock);
-  if (peak_uw_thread->gum_context == NULL)
-    peak_uw_thread->gum_context = context;
+  if (__atomic_load_n(&peak_uw_thread->gum_context, __ATOMIC_RELAXED) == NULL)
+    __atomic_store_n(&peak_uw_thread->gum_context, context,
+                     __ATOMIC_RELAXED);
   g_mutex_unlock(&peak_uw_owners_lock);
 }
 static void peak_uw_release(PeakUwFrame **link);
