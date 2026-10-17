@@ -1,79 +1,146 @@
-# Exact81 plus forward-effect guards: partial candidate
+# Signal cancellation recovery regressions
 
-This source-only candidate starts at exact81a
-`81a6e2f10cd77e274183e5e5b97dc9e6d706c8ef`. It ports only the reviewed
-orthogonal forward-effect guards and corresponding tests from qualified local
-C `7883974b197bbd65f524a49b8bcca77797b6164b` (a88 safety semantics adapted
-to the existing authentic receipt ledger and tagged reader leases).
-It is not C, a full PR123 fix, or qualified merely because C passed tests.
+These regressions exercise the existing signal backend and real Gum entry
+patches. They cover recovery from a canceled owned notification and safe reuse
+of handler slots. They do not replace the physical detach/reattach mechanism or
+turn off reattachment.
 
-The product delta is confined to `src/detach_controller.c`: coordinator
-effect latch, contamination checks before effects and release, fatal handling
-after effects/partial evacuation/unproved temporary trap installation, and
-scalar/batch planning-record restoration before peer resume on recoverable
-refusal. Fork-child abandonment clears only the coordinator effect latch;
-existing receipt/reader cleanup is preserved.
+## Build and run
 
-There is no monotone issuer gate, typed action adapter, private pause exemption,
-or policy/header/listener change. Exact81 receipt transport, whole-ledger
-identity rejection, tagged readers, ordinary event/scalar and NULL-mask fixes
-are retained. The original controller fixture remains byte-identical to81,
-including its public initial P setter and all13 recovery/regression oracles.
+On a supported Linux host with the normal PEAK build dependencies:
 
-The20 new cases cover recoverable refusal, real PC and temporary-breakpoint
-positive effects, before/after/permission contamination fatal paths, PC/trap
-fatal paths, actual post-trap-write error, and partial multi-evacuation failure,
-each scalar and batch. Fatal tests require real owned-send and mode-specific
-effect witnesses, expected exit128 and diagnostic; they do not fabricate
-ownership. The static checker adds these boundaries, named wake/publication
-ordering, and receipt-owned sender invariants; its admitted-thread extraction
-uses exact81's unwrapped function name, not C's issuer-wrapper implementation.
+```sh
+cmake -S . -B build-signal \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON \
+  -DPEAK_ENABLE_MPI=OFF \
+  -DBUILD_CUDA_PROFILE=OFF \
+  -DPEAK_BUILD_DYNAMIC_LIB_TESTS=OFF \
+  -DPEAK_REQUIRE_GUM_PEAK_API=ON
+cmake --build build-signal --target peak_detach_helper test_detach_controller --parallel
+ctest --test-dir build-signal --output-on-failure \
+  -R '^test_detach_controller_(signal_preflight_|supported_owned_recovery_|signal_receipt_|active_slot_reuse_)'
+```
 
-Inherited measured defect: exact81's actual accepted owned O can reach native
-application H (`owned_H=1, app_H=1`) after a blocked-handler timeout and
-successful native H installation. Original evidence:
-`peak-pr123-signal-handoff-20261016/NATIVE-HANDOFF-BASELINE-v1.json`,
-baseline002, with actual pending O and unchanged instrumented bytes/physical0.
-Forward-effect guards do not fix native H transparency or kernel-selected old
-handler/frame retirement. No oracle is inverted and no failing handoff is
-registered as a green test.
+The helper executable is an existing build dependency; these cases explicitly
+select the signal backend and set the helper path to a nonexistent file. The
+test configuration still requires BLAS/LAPACK even though this target does not
+exercise numerical libraries. A site-provided patched Gum devkit can be selected
+with the normal provider options instead of downloading it.
 
-A separately authorized partial7995452 qualification may evaluate the same
-MILC workload, heartbeat/active-slot behavior and real physical transitions
-without claiming full PR readiness. Absence of the global admission gate
-retains81's opportunity for physical mutation but also its inherited safety
-gap. At initial source preparation no build/runtime/commit/deployment had been
-performed. Current execution, commit and merge status is recorded in the
-outside-source-tree review/merge receipts, not asserted by this document.
+The recovery and slot-overlap cases intentionally wait for the controller's
+real stop timeout (approximately ten seconds). CTest supplies an outer watchdog;
+the tests do not shorten the production timeout.
 
-## PR-head invariant reconciliation
+## What each group proves
 
-- 7c canceled-window owned-delivery credit: retained exact81 whole-ledger
-  receipts bind epoch/TID/signum before publication; only native rc0 grants
-  SENT, failed sends discard the tagged reference, and retirement retains SENT
-  debt before peer release. Supported-owned-recovery scalar/batch/replay and
-  receipt capacity/failed-send/identity-pending controls remain registered.
-- 7c reusable-slot/handler-reader reclamation: exact81's tagged slot readers
-  and separate receipt identity supersede slot-bound owned_state/retired
-  credit. Existing active-slot-reuse pre-pinned/selected/arrived tests remain;
-  fork-child tagged-reader/receipt preservation remains unchanged. This is not
-  proof against kernel-selected old frames not yet entered in userspace.
-- Availability difference, not equivalent reclamation: 7c's owned-target-exit
-  path probes ESRCH and reaps slot-bound pending ownership. Exact81 retains
-  native-SENT but not-SEEN receipt debt when that target exits; retirement
-  marks SENT receipts RETIRED and allocation reclaims only SENT+SEEN. Such
-  debt can consume ledger capacity and eventually refuse future windows. The
-  old owned-target-exit reclamation test is not claimed as covered by the13
-  regressions or20 effect cases; no safe dead-target receipt reaper is added.
-- a88 forward-effect boundary: the qualified C product guard delta is applied
-  verbatim to81; the20 genuine-send tests replace obsolete slot-seeded effect
-  setup, while preserving fatal-exit/detail and real-effect witness oracles.
-- Initial source preparation had no a88 ancestry. A genuine non-force merge
-  was subsequently started for review; its completion/parents/tree belong in
-  outside-tree receipts. Resolution keeps the reviewed receipt/tagged-reader
-  controller and native API behavior rather than reinstating old7c delivery
-  leases, slot-owned state, policy clear locking or slot-seeded cancellation
-  fixtures. The20 genuine-send effects plus13 original81 regressions cover
-  the mapped boundaries above, not full native handoff or dead-target reaping.
-  No ours strategy or force push is permitted; publication requires a reviewed
-  actual merge commit, not merely this source snapshot or merge-in-progress.
+| Group | Required observation |
+| --- | --- |
+| `signal_preflight_scalar/batch` | A delivered unexpected packet recorded during preflight prevents the first owned send and physical mutation. |
+| `signal_preflight_clean_scalar/clean_batch` | Clean control still performs physical detach and reattach with entry bytes and callbacks checked. |
+| `supported_owned_recovery_scalar/batch` | An ordinary handler masks the reserved signal after preflight; the controller's genuine successful send times out during DETACH; late delivery is recognized; subsequent physical detach and reattach succeed. |
+| `supported_owned_recovery_consumed_replay` | After genuine late consumption and successful recovery, replaying that consumed identity earns no second ownership exception. Only this negative follow-up is synthetic. |
+| `supported_owned_recovery_no_debt_handoff` | After all old owned notifications have been consumed, native application handler installation and an ordinary queued payload succeed on the original worker; physical detach and reattach still work through the migrated reservation. |
+| `supported_owned_recovery_reap_live` | A pressure sweep retains a genuine pending notification for a live worker; after unmasking, its exact late receipt is consumed and real detach/reattach still succeeds. |
+| `supported_owned_recovery_exited_target` | A worker exits with a genuine owned notification still pending; a one-record ledger recovers that capacity under pressure and completes physical detach/reattach with a new worker. The fixture deliberately uses Linux thread exit from the ordinary handler, not a claim of portable `pthread_exit` semantics inside a signal handler. |
+| `signal_receipt_control_capacity/failed_send` | Insufficient initial-cohort capacity sends nothing; a failed send earns no later ownership credit. |
+| `signal_receipt_identity_pending_published/sent` | A simulated unconsumed identity at the last record is found even when an earlier record is free or the allocation limit is smaller. This is a protocol-state test, not real TID reuse. |
+| `active_slot_reuse_before_pin/after_pin` | A real old handler delayed around its reader pin cannot modify reused generation payload; physical detach/reattach succeeds after it returns. |
+
+The recovery oracle compares saved original bytes, saved active patch bytes,
+Gum diagnostics, callback deltas, held-window state and the thread-start gate.
+An attached function produces a callback; physically detached entry bytes equal
+the saved original and a new call produces none; reattachment restores the
+active patch and callback. It never treats a logical flag alone as evidence of
+physical detachment.
+
+## Scope and remaining boundaries
+
+The initial delayed notification is not a replayed cookie. A normal `sigaction`
+installs an application handler whose `sa_mask` blocks the reserved signal; a
+test-only scheduling seam enters it after the real mask preflight. The real
+sender is observed with a linker wrapper that forwards the notification to the
+production send function. Successful send, the pending bit and exact late
+receipt consumption are checked separately.
+
+The no-debt handoff test is a positive compatibility test. It does **not** cover
+native handoff while an owned packet is still pending. If application handler H
+replaces the PEAK action before that old packet is delivered, the packet can
+bypass the ledger. Likewise, a user-space before-pin pause does not reproduce
+the kernel-selected-handler/pre-user-entry boundary, and reader pins do not
+establish an unload grace period for handler text.
+
+The changes keep main's signal policy, patch/release failure handling, retry
+budgets and supported platforms. Live or unprovable unconsumed receipts and
+unreturned reader pins remain bounded resource debt; exhaustion can still
+decline profiler windows for as long as that debt remains. Capacity recovery
+does not clear a genuine live packet just to make room.
+These focused tests do not qualify every application signal interleaving,
+thread-identity reuse, full handler unload, end-to-end performance or a new
+multi-node deployment.
+
+### Why an exited target's receipt can be reclaimed
+
+Linux's [thread-directed sender](https://github.com/torvalds/linux/blob/v6.12/kernel/signal.c)
+uses `PIDTYPE_PID` and the selected task's private pending queue. A real
+[`tgkill(tgid, tid, 0)` ESRCH result](https://man7.org/linux/man-pages/man2/tkill.2.html)
+is a negative existence observation for that thread in this process. The
+[task exit path](https://github.com/torvalds/linux/blob/v6.12/kernel/exit.c)
+unhashes the task and flushes its private queue; the old task cannot subsequently
+return to a user handler. Future numeric TID reuse does not inherit that queue.
+Reuse before the probe in the same process yields success, so the implementation
+conservatively retains the record in that case.
+
+The pressure sweep considers only successfully sent, retired, unconsumed records,
+uses the internal direct syscall primitive, preserves `errno`, and requires a
+successful compare-and-exchange on the same allocation state before reclaiming.
+It consumes no signal. Other probe results retain ownership, and each allocation attempt makes
+at most one pressure sweep. This proof assumes faithful Linux syscall results,
+the same assumption used by main's existing exited-slot detection; a seccomp
+supervisor, tracer or security policy synthesizing ESRCH without the lookup is
+not covered.
+
+## Retained a149 integration and remaining boundary
+
+This checkout starts at a1490e9dae9613e5c105edd91581f497b4cad989 and
+selectively ports the bounded-receipt recovery increment from PR127 commit
+f7145fd2dbcb6c9257cb9c1952f47a7cce258864 relative to ad781. The controller
+is not replaced wholesale. The a149 ordinary-event/scalar and NULL-mask
+signal-policy reentry fixes, tagged handler readers, forward-effect latch,
+contamination checks, release/planning restoration, and all corresponding
+regression and fatal-effect fixtures remain in place.
+
+The existing twenty scalar/batch forward-effect cases retain their genuine
+owned-send and mode-specific effect witnesses, expected fatal exit/detail,
+and recoverable-refusal oracles. The original recovery groups are extended by
+three cases: no-debt native handoff, live pending receipt retention, and
+exited-target capacity recovery. The first canceled physical request now uses
+DETACH, not an already-attached REATTACH no-op. Timeout assertions retain the
+production lower bound; CTest provides the outer watchdog.
+
+The new high-water mark bounds controller identity/retirement scans only.
+Handler lookup still covers the full fixed pool. Child-fork cleanup clears
+receipts without reducing the inherited conservative high-water bound or
+resetting nonwrapping tickets. Under pressure, only native ESRCH for a retired,
+successfully sent, unconsumed receipt permits full-tag CAS reclamation. A
+concurrent SEEN update defeats that CAS; the normal SENT+SEEN allocation path
+can reclaim it later. Same-group numeric TID reuse before the probe gives
+success and conservatively retains debt. Duplicate identity checks still cover
+all published records, including those beyond a test allocation limit.
+
+This increment repairs exited-target capacity loss; it does not solve the
+pending-owned-packet native handoff boundary. Exact81's observed accepted O can
+reach application H (owned_H=1, app_H=1) after a blocked-handler timeout and
+successful native H installation. The unchanged external negative evidence is
+peak-pr123-signal-handoff-20261016/NATIVE-HANDOFF-BASELINE-v1.json, baseline002.
+Commit 07abc3630c0f3a54a47886788838990864733c83 additionally records a focused
+pending-O native-handoff diagnostic; that missing in-tree diagnostic is not a
+new product feature requirement, and it must not be inverted or registered as
+a green handoff qualification. It is not ported by this increment. A no-debt
+positive test is not evidence that pending O was withdrawn or that selected
+old frames can safely outlive unloaded handler code.
+
+No monotone disable, new application-API rejection, helper fallback, additional
+fatal category, or replacement transport is introduced. Performance, native
+platform qualification, CI, and deployment require separate actual receipts;
+this source patch itself claims none of them.

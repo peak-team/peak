@@ -246,8 +246,10 @@ The controller also keeps a fixed ledger of identities for its successfully
 sent stop packets. A canceled generation marks those identities retired before
 hiding its active slots. If its genuine packet later reaches the PEAK handler,
 an exact signal/TID/cookie match consumes that receipt once, without accessing
-old slots or incrementing the unexpected-delivery counter. The next generation
-can then physically detach and reattach. In the canceled/late fallback,
+old slots or incrementing the unexpected-delivery counter. Once the delayed
+handler returns, subsequent generations can use the existing physical detach
+and reattach paths. A timeout does not disable profiling or reattachment for
+the remainder of the process. In the canceled/late fallback,
 never-sent identities, wrong cookies, and a duplicate of an already consumed
 identity receive no receipt exception and retain the contamination guard. The
 current active-generation path keeps main's existing matching rules; this does
@@ -255,19 +257,40 @@ not impose a new per-send-credit condition on that path.
 
 The ledger has 4096 records and a controller-only static reservation mapping;
 on the current 64-bit ABI they occupy 98,304 and 65,536 bytes respectively
-(24-byte records, 16-byte references, 160 KiB total). Normal handling may scan
-up to 4096 records; no performance improvement is claimed. Before selecting a
-free record, allocation rejects any outstanding unconsumed record with the same
-(epoch, TID, signal) wire identity across the entire ledger. Allocation tickets
+(24-byte records, 16-byte references, 160 KiB total). The controller tracks a
+high-water index and limits duplicate-identity checks and epoch retirement to
+the prefix that has actually held receipts. Every publication raises that bound
+as needed, including diagnostic seeds; the bound never shrinks when a record is
+reclaimed. A healthy small cohort therefore avoids scanning all 4096 records
+for every target. Handler lookup returns at the matching record and remains
+bounded by the full 4096-record pool. These costs belong to signal control
+windows; target-function callbacks and the physical entry writer are unchanged.
+This is not a measured end-to-end performance claim. Before selecting a free
+record, allocation rejects any outstanding unconsumed record with the same
+(epoch, TID, signal) wire identity, including records beyond a free slot or a
+test-only allocation limit. Allocation tickets
 are not encoded in cookies, so distinct tickets alone cannot distinguish those
 packets; this rejection is a profiler-window failure and changes no application
 signal API. Atomic identities
 and nonwrapping allocation tickets distinguish reuse, and epochs stop before
-wrapping. Capacity or identity-budget exhaustion returns unsupported without
-sending the initial stop cohort. Unseen sent debt is not reclaimed merely
-because a numeric TID disappears. Fork children drop copied receipt debt while
-keeping counters monotonic. No application signal API, policy lease, handler
-reservation lifetime, or helper backend is changed.
+wrapping. If allocation finds no room, it makes one bounded pressure sweep of
+retired, successfully sent, unconsumed records. A direct
+`tgkill(self_tgid, receipt_tid, 0)` result of `ESRCH` permits tag-checked receipt
+reclamation: the old target has exited and its thread-directed packet cannot
+later execute on a newly created task. A live same-TID replacement, any other
+error, and current or unsent records retain their debt. Each allocation attempt
+makes at most one pressure sweep and retries at most once; a later reservation
+in the same window has its own budget. Healthy windows do not pay for these existence probes. Capacity
+or identity-budget exhaustion still returns unsupported before sending the
+initial cohort when the sweep cannot provide enough space. Fork children drop
+copied receipt debt while keeping counters monotonic. No application signal API,
+policy lease, handler reservation lifetime, or helper backend is changed.
+
+The negative-existence proof uses normal Linux `tgkill` semantics, as does the
+existing stop backend's exited-slot detection. It does not infer exit from a
+stale thread enumeration or the age of a receipt. A tracer, seccomp supervisor
+or security policy that fabricates `ESRCH` without the actual task lookup is
+outside this proof; bypassing libc alone does not authenticate such a result.
 
 Active handler frames use a separate fixed pool of 4096 physical slots and an
 atomic map for the current cohort. Each slot has a nonwrapping 48-bit allocation
@@ -293,10 +316,18 @@ observe timeout and a later allocation's payload, then qualify real physical
 detach/reattach after the old frame returns. They do not test kernel-selected
 pre-entry frames or native disposition handoff.
 
-These are scoped canceled-packet and active-slot lifetime changes. Native
-disposition handoff remains unresolved if an ordinary application action
-replaces the old PEAK action before kernel delivery. Full signal transparency
-and merge approval for the blocked recovery work remain unresolved.
+These changes repair recovery after a canceled stop without replacing the
+signal backend or narrowing normal detach/reattach eligibility. Existing signal
+policy, retry budgets and patch/release failure handling remain unchanged; no
+new application API rejection or fatal path is introduced. This does not make
+arbitrary blocked-signal windows succeed. Native disposition handoff while an
+old owned packet is still pending also remains a separate limitation: if an
+application replaces the PEAK action before delivery, the packet may enter its
+native handler and bypass the receipt ledger. Receipt recognition cannot fix
+that case, and reader pins do not prove that old handler text can be unloaded.
+See the [focused recovery regressions](../test/detach_controller/README.md) for
+the exact tested transitions and remaining boundaries.
+
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current

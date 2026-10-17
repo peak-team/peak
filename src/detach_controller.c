@@ -255,6 +255,10 @@ static pid_t atfork_calling_tid;
 static PeakDetachSignalReceipt signal_receipts[PEAK_DETACH_HELPER_MAX_THREADS];
 /* Controller-owned, nonwrapping allocation tickets distinguish every reuse. */
 static uint64_t signal_receipt_next_ticket = 1;
+/* Controller-only, protected by the mutation guard. Every publication raises
+ * this bound as needed; clearing or reclaiming a record never lowers it.
+ * Handlers do not read it and retain the full fixed-pool lookup. */
+static uint32_t signal_receipt_high_water = 0;
 /* Controller-only mapping, protected by the existing mutation guard. */
 static PeakDetachSignalReceiptReference
     signal_initial_receipts[PEAK_DETACH_HELPER_MAX_THREADS];
@@ -2332,7 +2336,8 @@ peak_detach_controller_signal_receipts_after_fork_child(void)
         return;
     }
     /* Other parent threads and their queued packets do not survive fork. Keep
-     * ticket/epoch counters monotonic, but do not inherit their receipt debt. */
+     * ticket/epoch counters monotonic, but do not inherit their receipt debt.
+     * The inherited high-water bound remains conservative after clearing. */
     for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
         atomic_store_explicit(&signal_receipts[i].state, 0, memory_order_relaxed);
     }
@@ -2353,6 +2358,83 @@ peak_detach_controller_signal_receipt_capacity(void)
     return PEAK_DETACH_HELPER_MAX_THREADS;
 }
 
+static int
+peak_detach_controller_signal_receipts_reap_exited(void)
+{
+#if defined(__linux__)
+    int saved_errno = errno;
+    int reaped = 0;
+    pid_t tgid = (pid_t)peak_exec_raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+    if (tgid <= 0) {
+        errno = saved_errno;
+        return 0;
+    }
+    int active_epoch = atomic_load_explicit(&signal_hold_epoch, memory_order_acquire);
+    for (uint32_t i = 0; i < signal_receipt_high_water; i++) {
+        PeakDetachSignalReceipt* receipt = &signal_receipts[i];
+        uint64_t state = atomic_load_explicit(&receipt->state, memory_order_acquire);
+        if ((state & (PEAK_SIGNAL_RECEIPT_RETIRED | PEAK_SIGNAL_RECEIPT_SENT |
+                      PEAK_SIGNAL_RECEIPT_SEEN)) !=
+                (PEAK_SIGNAL_RECEIPT_RETIRED | PEAK_SIGNAL_RECEIPT_SENT)) {
+            continue;
+        }
+        int epoch = atomic_load_explicit(&receipt->epoch, memory_order_relaxed);
+        pid_t tid = (pid_t)atomic_load_explicit(&receipt->tid, memory_order_relaxed);
+        int signum = atomic_load_explicit(&receipt->signum, memory_order_relaxed);
+        if (epoch <= 0 || epoch == active_epoch || tid <= 0) {
+            continue;
+        }
+        /* For native Linux syscall semantics, ESRCH after a completed
+         * thread-directed send proves its task can no longer receive it.
+         * A later task cannot inherit that task's private pending queue;
+         * same-group TID reuse before this probe yields success and is kept.
+         * No queue or signal disposition is modified by this null probe. */
+        long rc = peak_exec_raw_syscall6(SYS_tgkill, (long)tgid, (long)tid,
+                                        0, 0, 0, 0);
+        int probe_errno = errno;
+        if (rc != -1 || probe_errno != ESRCH) {
+            continue;
+        }
+        /* The mutation guard excludes allocation. Still compare the entire
+         * tagged state so a handler's concurrent SEEN update is not lost. */
+        if (!atomic_compare_exchange_strong_explicit(&receipt->state, &state, 0,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            continue;
+        }
+        reaped++;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        extern void peak_test_signal_receipt_reaped(int, pid_t, int)
+            __attribute__((weak));
+        if (peak_test_signal_receipt_reaped != NULL) {
+            int hook_errno = errno;
+            peak_test_signal_receipt_reaped(epoch, tid, signum);
+            errno = hook_errno;
+        }
+#else
+        (void)signum;
+#endif
+    }
+    errno = saved_errno;
+    return reaped;
+#else
+    return 0;
+#endif
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+int
+peak_detach_controller_test_reap_exited_receipts(void)
+{
+    int saved_errno = errno;
+    peak_detach_controller_lock_mutation_guard();
+    int reaped = peak_detach_controller_signal_receipts_reap_exited();
+    peak_detach_controller_unlock_mutation_guard();
+    errno = saved_errno;
+    return reaped;
+}
+#endif
+
 static gboolean
 peak_detach_controller_signal_receipt_reserve(
     int epoch,
@@ -2364,8 +2446,9 @@ peak_detach_controller_signal_receipt_reserve(
     const char* failure_reason = "signal-receipt-capacity";
     /* Allocation tickets do not appear in the wire cookie. An unconsumed
      * identity must remain unique across the whole ledger, including records
-     * beyond a free slot or the test-only allocation-capacity limit. */
-    for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
+     * beyond a free slot or the test-only allocation-capacity limit. Records
+     * above the high-water bound have never been published and remain zero. */
+    for (uint32_t i = 0; i < signal_receipt_high_water; i++) {
         PeakDetachSignalReceipt* receipt = &signal_receipts[i];
         uint64_t state = atomic_load_explicit(&receipt->state, memory_order_acquire);
         if (state != 0 && (state & PEAK_SIGNAL_RECEIPT_SEEN) == 0 &&
@@ -2381,6 +2464,8 @@ peak_detach_controller_signal_receipt_reserve(
         failure_reason = "signal-receipt-ticket-exhausted";
         goto fail;
     }
+    gboolean retried_capacity = FALSE;
+retry_allocation:
     for (uint32_t i = 0; i < capacity; i++) {
         PeakDetachSignalReceipt* receipt = &signal_receipts[i];
         uint64_t state = atomic_load_explicit(&receipt->state, memory_order_acquire);
@@ -2401,12 +2486,25 @@ peak_detach_controller_signal_receipt_reserve(
         atomic_store_explicit(&receipt->epoch, epoch, memory_order_relaxed);
         atomic_store_explicit(&receipt->tid, (int)tid, memory_order_relaxed);
         atomic_store_explicit(&receipt->signum, signum, memory_order_relaxed);
+        if (signal_receipt_high_water < i + 1) {
+            signal_receipt_high_water = i + 1;
+        }
         atomic_store_explicit(&receipt->state,
                               tag | PEAK_SIGNAL_RECEIPT_PUBLISHED,
                               memory_order_release);
         reference->index = i;
         reference->tag = tag;
         return TRUE;
+    }
+    /* Healthy allocation performs no liveness probes. On capacity pressure,
+     * reclaim only positively exited targets and retry this search once.
+     * The earlier identity check remains valid: the mutation guard excludes
+     * new publishers, and this sweep can only remove retired records. */
+    if (!retried_capacity) {
+        retried_capacity = TRUE;
+        if (peak_detach_controller_signal_receipts_reap_exited() != 0) {
+            goto retry_allocation;
+        }
     }
 fail:
     peak_detach_controller_note_failure_detail(failure_reason, (long)tid,
@@ -2436,6 +2534,9 @@ peak_detach_controller_test_seed_pending_identity(
     atomic_store_explicit(&receipt->epoch, epoch, memory_order_relaxed);
     atomic_store_explicit(&receipt->tid, (int)tid, memory_order_relaxed);
     atomic_store_explicit(&receipt->signum, signum, memory_order_relaxed);
+    if (signal_receipt_high_water < index + 1) {
+        signal_receipt_high_water = index + 1;
+    }
     atomic_store_explicit(&receipt->state,
                           tag | PEAK_SIGNAL_RECEIPT_PUBLISHED |
                               (sent ? PEAK_SIGNAL_RECEIPT_SENT : 0),
@@ -2471,7 +2572,7 @@ peak_detach_controller_signal_send_owned(
 static void
 peak_detach_controller_signal_receipts_retire_epoch(int epoch)
 {
-    for (uint32_t i = 0; i < PEAK_DETACH_HELPER_MAX_THREADS; i++) {
+    for (uint32_t i = 0; i < signal_receipt_high_water; i++) {
         PeakDetachSignalReceipt* receipt = &signal_receipts[i];
         uint64_t state = atomic_load_explicit(&receipt->state, memory_order_acquire);
         uint64_t tag = peak_detach_controller_signal_receipt_tag(state);

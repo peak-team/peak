@@ -3211,7 +3211,7 @@ def check_signal_backend_strict_invariants(repo_root):
             "receipt identity must precede release publication of its allocation ticket")
     duplicate_check = reserve_receipt[:reserve_receipt.find("uint32_t capacity =")]
     require(all(token in duplicate_check for token in (
-                "i < PEAK_DETACH_HELPER_MAX_THREADS", "PEAK_SIGNAL_RECEIPT_SEEN",
+                "i < signal_receipt_high_water", "PEAK_SIGNAL_RECEIPT_SEEN",
                 "&receipt->epoch", "&receipt->tid", "&receipt->signum",
                 '"signal-receipt-identity-pending"')) and
             "signal_receipt_next_ticket > (UINT64_MAX >> 4)" in reserve_receipt and
@@ -3220,6 +3220,45 @@ def check_signal_backend_strict_invariants(repo_root):
             re.search(r"tag \| PEAK_SIGNAL_RECEIPT_PUBLISHED,\s*memory_order_release",
                       reserve_receipt) is not None,
             "receipt allocation must reject pending whole-ledger identity, avoid ticket wrap and retain SEEN-before-SENT debt")
+    reap_receipts = extract_function(
+        controller, "peak_detach_controller_signal_receipts_reap_exited")
+    seed_receipt = extract_function(
+        controller, "peak_detach_controller_test_seed_pending_identity")
+    fork_receipts = extract_function(
+        controller, "peak_detach_controller_signal_receipts_after_fork_child")
+    require("static uint32_t signal_receipt_high_water = 0;" in controller and
+            "i < signal_receipt_high_water" in retire_receipts and
+            "i < PEAK_DETACH_HELPER_MAX_THREADS" in note_seen,
+            "controller receipt scans must use high-water while handlers retain full-pool lookup")
+    for body, index in ((reserve_receipt, "i"), (seed_receipt, "index")):
+        ordered(body, (f"if (signal_receipt_high_water < {index} + 1)",
+                       f"signal_receipt_high_water = {index} + 1;",
+                       "tag | PEAK_SIGNAL_RECEIPT_PUBLISHED"),
+                "every receipt publisher must raise high-water before release publication")
+    require("signal_receipt_high_water =" not in fork_receipts and
+            "atomic_store_explicit(&signal_receipts[i].state, 0" in fork_receipts,
+            "fork-child clearing must preserve the inherited conservative high-water bound")
+    require(all(token in reap_receipts for token in (
+                "int saved_errno = errno", "SYS_getpid", "i < signal_receipt_high_water",
+                "PEAK_SIGNAL_RECEIPT_RETIRED | PEAK_SIGNAL_RECEIPT_SENT |",
+                "PEAK_SIGNAL_RECEIPT_SEEN", "epoch == active_epoch", "tid <= 0",
+                "SYS_tgkill, (long)tgid, (long)tid", "int probe_errno = errno",
+                "rc != -1 || probe_errno != ESRCH",
+                "atomic_compare_exchange_strong_explicit(&receipt->state, &state, 0",
+                "memory_order_acq_rel", "memory_order_acquire", "errno = saved_errno")),
+            "pressure reaper needs native ESRCH, retired successful unconsumed debt, full tagged CAS and errno preservation")
+    ordered(reap_receipts, ("epoch == active_epoch", "SYS_tgkill",
+                            "rc != -1 || probe_errno != ESRCH",
+                            "atomic_compare_exchange_strong_explicit(&receipt->state",
+                            "reaped++;"),
+            "reaping must reject current/live/unproven tasks before a tagged reclamation")
+    ordered(reserve_receipt, ("retry_allocation:", "for (uint32_t i = 0; i < capacity; i++)",
+                              "if (!retried_capacity)", "retried_capacity = TRUE;",
+                              "peak_detach_controller_signal_receipts_reap_exited()",
+                              "goto retry_allocation;"),
+            "healthy allocation must avoid probes and each allocation may sweep/retry only once")
+    require(reserve_receipt.count("peak_detach_controller_signal_receipts_reap_exited()") == 1,
+            "allocation must have exactly one pressure-sweep call site")
     for name, body in (
             ("peak_detach_controller_signal_receipt_add_flags", extract_function(
                 controller, "peak_detach_controller_signal_receipt_add_flags")),
