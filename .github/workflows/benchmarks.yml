@@ -42,4 +42,5 @@ jobs:
           ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.csv
           ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.log
           ${{ steps.strings.outputs.build-output-dir }}/benchmarks/detach/*.txt
+          ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
         if-no-files-found: ignore
