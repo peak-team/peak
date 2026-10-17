@@ -1,7 +1,6 @@
 /* Linux x86-64 return-frame metadata, owned through actual thread termination.
  */
 #if defined(__x86_64__)
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 extern void __register_frame(void *);
@@ -58,7 +57,6 @@ static gboolean peak_uw_key_ready;
 static GMutex peak_uw_owners_lock;
 static PeakUwThread *peak_uw_owners;
 static guint64 peak_uw_next_cookie;
-static gint peak_uw_task_fd = -1;
 static void peak_uw_gum_context_destroy(gpointer data) {
   int saved_errno = errno;
 
@@ -100,9 +98,16 @@ static void peak_uw_thread_destroy(void *data) {
 static void peak_uw_key_init(void) {
   peak_uw_key_ready =
       pthread_key_create(&peak_uw_key, peak_uw_thread_destroy) == 0;
-  if (peak_uw_key_ready)
-    peak_uw_task_fd =
-        open("/proc/self/task", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+static gboolean peak_uw_tid_is_dead(pid_t tid) {
+  struct stat st;
+  char path[64];
+  int n = g_snprintf(path, sizeof(path), "/proc/self/task/%ld", (long)tid);
+
+  if (n <= 0 || (gsize)n >= sizeof(path))
+    return FALSE;
+  errno = 0;
+  return stat(path, &st) != 0 && errno == ENOENT;
 }
 static void peak_uw_b(guint8 **p, guint8 v) { *(*p)++ = v; }
 static void peak_uw_u32(guint8 **p, guint32 v) {
@@ -252,17 +257,12 @@ void gum_interceptor_peak_unwind_thread_joined(guint64 cookie,
         o->pthread_generation == generation)
       match = TRUE;
     if (!match && cookie == 0 && (guintptr)o->thread == native_thread) {
-      struct stat st;
-      char name[32];
-      g_snprintf(name, sizeof(name), "%ld", (long)o->tid);
       /* A pool owner may be created during POSIX's final destructor pass,
        * after this key's destructor has already been considered. Successful
        * pthread_join plus absence of the saved kernel TID proves that owner
        * dead even when its retired callback never ran. A concurrently reused
        * pthread_t has a different, still-present TID and is retained. */
-      match = peak_uw_task_fd >= 0 &&
-              fstatat(peak_uw_task_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
-              errno == ENOENT;
+      match = peak_uw_tid_is_dead(o->tid);
     }
     if (match) {
       peak_uw_settle_dead_gum_context(o);
@@ -280,8 +280,6 @@ void gum_interceptor_peak_unwind_thread_joined(guint64 cookie,
   }
 }
 gboolean gum_interceptor_peak_unwind_reap_threads(void) {
-  if (peak_uw_task_fd < 0)
-    return FALSE;
   /* Prompt cleanup of any eligible Frida GPrivate context. This is progress,
    * not a barrier; PEAK never reads or mutates the associated Gum stack. */
   (void)_frida_g_thread_garbage_collect();
@@ -289,14 +287,10 @@ gboolean gum_interceptor_peak_unwind_reap_threads(void) {
   g_mutex_lock(&peak_uw_owners_lock);
   for (PeakUwThread **p = &peak_uw_owners; *p;) {
     PeakUwThread *o = *p;
-    struct stat st;
-    char name[32];
-    g_snprintf(name, sizeof(name), "%ld", (long)o->tid);
     /* TID absence is the death proof. retired is only an eager notification
      * and can be missing when the owner was first created in the final POSIX
      * destructor pass. */
-    if (fstatat(peak_uw_task_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0 &&
-        errno == ENOENT) {
+    if (peak_uw_tid_is_dead(o->tid)) {
       peak_uw_settle_dead_gum_context(o);
       *p = o->next;
       o->next = dead;
