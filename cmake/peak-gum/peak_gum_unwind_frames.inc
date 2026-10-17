@@ -49,8 +49,13 @@ struct PeakUwThread {
   pid_t tid;
   gint retired, pthread_token_valid;
 };
-static _Thread_local PeakUwThread *peak_uw_thread;
-static _Thread_local guint peak_uw_internal;
+/* These existing fields share libpeak's startup/static-TLS allocation with
+ * the callback and cached Gum-stack state. Changing their access model does
+ * not add TLS storage or change the pthread-key/owner destruction protocol. */
+static _Thread_local PeakUwThread *peak_uw_thread
+    __attribute__((tls_model("initial-exec")));
+static _Thread_local guint peak_uw_internal
+    __attribute__((tls_model("initial-exec")));
 static pthread_key_t peak_uw_key;
 static pthread_once_t peak_uw_once = PTHREAD_ONCE_INIT;
 static gboolean peak_uw_key_ready;

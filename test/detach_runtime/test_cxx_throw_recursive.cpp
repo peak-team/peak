@@ -6,11 +6,22 @@
 #include <cstdint>
 #include <thread>
 
+#ifdef PEAK_CXX_THROW_LATE_PROVIDER
+#include <chrono>
+#include <condition_variable>
+#include <dlfcn.h>
+#include <mutex>
+static float (*peak_cxx_throw_outer)(unsigned);
+static float (*peak_cxx_throw_recursive)(unsigned);
+static unsigned (*peak_cxx_throw_destroyed)();
+static unsigned (*peak_cxx_throw_unwound)();
+#else
 extern "C" float peak_cxx_throw_inner(unsigned);
 extern "C" float peak_cxx_throw_outer(unsigned);
 extern "C" float peak_cxx_throw_recursive(unsigned);
 extern "C" unsigned peak_cxx_throw_destroyed();
 extern "C" unsigned peak_cxx_throw_unwound();
+#endif
 
 namespace {
 thread_local unsigned app_destroyed;
@@ -61,6 +72,7 @@ bool exercise()
 }
 }
 
+#ifndef PEAK_CXX_THROW_LATE_PROVIDER
 int main()
 {
     bool ok = exercise();
@@ -74,3 +86,59 @@ int main()
     std::puts("cxx_throw_transparency_ok threads=2 calls=480 propagated=96 caught_inside=48 recursive=192");
     return 0;
 }
+#else
+int main(int argc, char** argv)
+{
+    if (argc != 2) return 2;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool waiting = false, ready = false, abort = false, worker_ok = false;
+    std::thread worker([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        waiting = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return ready; });
+        bool run = !abort;
+        lock.unlock();
+        if (run) worker_ok = exercise();
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] { return waiting; });
+    }
+    /* PEAK is preloaded; only the ordinary application provider is loaded
+     * here. The worker already exists before this DSO and its TLS are added. */
+    void* module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    bool loaded = false;
+    if (module != nullptr) {
+        peak_cxx_throw_outer = reinterpret_cast<decltype(peak_cxx_throw_outer)>(
+            dlsym(module, "peak_cxx_throw_outer"));
+        peak_cxx_throw_recursive = reinterpret_cast<decltype(peak_cxx_throw_recursive)>(
+            dlsym(module, "peak_cxx_throw_recursive"));
+        peak_cxx_throw_destroyed = reinterpret_cast<decltype(peak_cxx_throw_destroyed)>(
+            dlsym(module, "peak_cxx_throw_destroyed"));
+        peak_cxx_throw_unwound = reinterpret_cast<decltype(peak_cxx_throw_unwound)>(
+            dlsym(module, "peak_cxx_throw_unwound"));
+        loaded = peak_cxx_throw_outer && peak_cxx_throw_recursive &&
+                 peak_cxx_throw_destroyed && peak_cxx_throw_unwound;
+    }
+    /* Deferred target attachment does not promise observation of the first
+     * call immediately after dlopen. Match the existing late-target fixture. */
+    if (loaded) std::this_thread::sleep_for(std::chrono::seconds(1));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        abort = !loaded;
+        ready = true;
+    }
+    condition.notify_all();
+    bool ok = loaded && exercise();
+    worker.join();
+    bool closed = module != nullptr && dlclose(module) == 0;
+    if (!ok || !worker_ok || !closed) {
+        std::fputs("late-provider C++ exception/RAII/errno mismatch\n", stderr);
+        return 1;
+    }
+    std::puts("cxx_throw_late_provider_ok threads=2 calls=480 propagated=96 caught_inside=48 recursive=192");
+    return 0;
+}
+#endif

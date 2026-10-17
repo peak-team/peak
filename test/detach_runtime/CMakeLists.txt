@@ -146,6 +146,18 @@ target_link_libraries(test_cxx_throw_recursive PRIVATE
 add_executable(test_cxx_throw_transparency test_cxx_throw_transparency.cpp)
 target_link_libraries(test_cxx_throw_transparency PRIVATE
   cxx_throw_provider Threads::Threads)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_executable(test_cxx_throw_late_provider test_cxx_throw_recursive.cpp)
+  target_compile_definitions(test_cxx_throw_late_provider PRIVATE
+    PEAK_CXX_THROW_LATE_PROVIDER=1)
+  target_link_libraries(test_cxx_throw_late_provider PRIVATE
+    Threads::Threads ${DL_LIBRARY})
+  add_dependencies(test_cxx_throw_late_provider cxx_throw_recursive_provider)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_cxx_throw_late_provider PRIVATE -fexceptions -fno-lto)
+  endif()
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(cxx_throw_provider PRIVATE -fexceptions -fno-lto)
   target_compile_options(test_cxx_throw_transparency PRIVATE -fexceptions -fno-lto)

@@ -1061,6 +1061,22 @@ if(BUILD_TESTING)
         set_tests_properties(test_cxx_throw_transparency_peak PROPERTIES
             ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
 
+        if(TARGET test_cxx_throw_late_provider)
+            add_test(NAME test_cxx_throw_late_provider_native
+                COMMAND $<TARGET_FILE:test_cxx_throw_late_provider>
+                    $<TARGET_FILE:cxx_throw_recursive_provider>)
+            set_tests_properties(test_cxx_throw_late_provider_native PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_late_provider_ok" TIMEOUT 10)
+            add_test(NAME test_cxx_throw_late_provider_peak
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_cxx_throw_loading_check.py
+                    --application $<TARGET_FILE:test_cxx_throw_late_provider>
+                    --provider $<TARGET_FILE:cxx_throw_recursive_provider>
+                    --libpeak $<TARGET_FILE:peak>)
+            set_tests_properties(test_cxx_throw_late_provider_peak PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_late_provider_profiled" TIMEOUT 10)
+        endif()
+
         # Keep the discovered recursive gap visible as a failing test.
         # Labels document the expected failure; they do not invert its result.
         add_test(NAME test_cxx_throw_recursive_native
