@@ -3335,6 +3335,7 @@ static atomic_int preflight_worker_tid;
 static atomic_int preflight_worker_running;
 static atomic_int preflight_handler_returned;
 static atomic_int preflight_callback_count;
+static atomic_int preflight_probe_tid;
 static int preflight_inject;
 static int preflight_unexpected_before;
 static int preflight_injection_rc;
@@ -3454,8 +3455,41 @@ static void*
 preflight_gate_probe(void* unused)
 {
     (void)unused;
+    atomic_store(&preflight_probe_tid, (int)syscall(SYS_gettid));
     peak_detach_controller_wait_for_mutation_window();
     return NULL;
+}
+
+static int
+preflight_probe_task_absent(pid_t tid, const char* stage, int log_sample)
+{
+    char path[96], status_path[112], line[256], blocked[64] = "<unavailable>";
+    snprintf(path, sizeof(path), "/proc/self/task/%d", tid);
+    snprintf(status_path, sizeof(status_path), "%s/status", path);
+    errno = 0;
+    int task_rc = access(path, F_OK);
+    int task_errno = errno;
+    FILE* status_file = fopen(status_path, "r");
+    int status_errno = status_file == NULL ? errno : 0;
+    if (status_file != NULL) {
+        while (fgets(line, sizeof(line), status_file) != NULL) {
+            if (sscanf(line, "SigBlk: %63s", blocked) == 1)
+                break;
+        }
+        fclose(status_file);
+    }
+    errno = 0;
+    long native_rc = peak_exec_raw_syscall6(SYS_tgkill, getpid(), tid, 0, 0, 0, 0);
+    int native_errno = errno;
+    int absent = task_rc == -1 && task_errno == ENOENT &&
+                 native_rc == -1 && native_errno == ESRCH;
+    if (log_sample)
+        fprintf(stderr, "preflight-probe-task stage=%s tid=%d task_present=%d "
+                "task_rc=%d task_errno=%d SigBlk=%s status_errno=%d "
+                "native_rc=%ld native_errno=%d absent=%d\n",
+                stage, tid, task_rc == 0, task_rc, task_errno, blocked,
+                status_errno, native_rc, native_errno, absent);
+    return absent;
 }
 
 static void
@@ -3517,8 +3551,9 @@ run_signal_preflight_contamination(int batch, int inject)
     int signo = peak_detach_controller_test_signal_backend_signum();
     check_true("preflight fixture reserved signal", signo > 0);
     atomic_store(&preflight_worker_running, 1);
-    if (pthread_create(&worker, NULL, preflight_worker, NULL) != 0) {
-        failures++;
+    int worker_create_rc = pthread_create(&worker, NULL, preflight_worker, NULL);
+    check_int("preflight worker pthread_create", worker_create_rc, 0);
+    if (worker_create_rc != 0) {
         goto cleanup_gum;
     }
     double deadline = preflight_now() + 2.0;
@@ -3631,10 +3666,25 @@ run_signal_preflight_contamination(int batch, int inject)
     check_int("preflight target still alive",
               (int)syscall(SYS_tgkill, getpid(), atomic_load(&preflight_worker_tid), 0), 0);
     pthread_t probe;
-    if (pthread_create(&probe, NULL, preflight_gate_probe, NULL) == 0)
-        pthread_join(probe, NULL);
-    else
-        failures++;
+    atomic_store(&preflight_probe_tid, 0);
+    int probe_create_rc = pthread_create(&probe, NULL, preflight_gate_probe, NULL);
+    check_int("preflight probe pthread_create", probe_create_rc, 0);
+    if (probe_create_rc == 0) {
+        int probe_join_rc = pthread_join(probe, NULL);
+        check_int("preflight probe pthread_join", probe_join_rc, 0);
+        pid_t probe_tid = atomic_load(&preflight_probe_tid);
+        check_true("preflight probe actual TID published", probe_tid > 0);
+        if (probe_join_rc == 0 && probe_tid > 0) {
+            double exit_deadline = preflight_now() + 2.0;
+            int absent = preflight_probe_task_absent(probe_tid, "immediate-post-join", 1);
+            while (!absent && preflight_now() < exit_deadline) {
+                sched_yield();
+                absent = preflight_probe_task_absent(probe_tid, "poll", 0);
+            }
+            absent = preflight_probe_task_absent(probe_tid, "final-absence", 1);
+            check_true("preflight probe task absent in proc and native tgkill", absent);
+        }
+    }
     struct sigaction application_action = {0}, previous_action = {0};
     sigemptyset(&application_action.sa_mask);
     application_action.sa_handler = SIG_DFL;
@@ -3644,7 +3694,7 @@ run_signal_preflight_contamination(int batch, int inject)
             signo, action_rc, errno);
     check_int("ordinary application sigaction remains accepted", action_rc, 0);
     atomic_store(&preflight_worker_running, 0);
-    pthread_join(worker, NULL);
+    check_int("preflight worker pthread_join", pthread_join(worker, NULL), 0);
 cleanup_gum:
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
