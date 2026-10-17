@@ -972,6 +972,14 @@ G_GNUC_INTERNAL void peak_gum_unwind_relocate_all(PeakGumX86Relocator17 *rl) {
       break;
     }
     if (peak_invoke_building && !peak_invoke_failed) {
+      PeakDwarfBases bases;
+      /* Generated code and hand-written assembly may intentionally have no
+       * registered FDE. There is no source unwind row to preserve in that
+       * case, so retain Gum's established attach behavior. A present FDE
+       * still has to parse and reproduce completely before the trampoline is
+       * accepted. */
+      if (_Unwind_Find_FDE((void *)(source - 1), &bases) == NULL)
+        continue;
       PeakInvokeCfi *m = g_try_malloc0(sizeof(*m));
       PeakCfiRow row;
       if (!m) {

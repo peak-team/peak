@@ -1664,7 +1664,8 @@ _gum_function_context_begin_invocation(
         peak_gum_context_fast_listener_for_enter(function_ctx);
     PeakUwFrame *peak_reserved = NULL;
 #if defined(__x86_64__)
-    gboolean peak_needs_frame = function_ctx->function_address != (gpointer)_Unwind_Find_FDE &&
+    gboolean peak_needs_frame = fast_listener != NULL &&
+        function_ctx->function_address != (gpointer)_Unwind_Find_FDE &&
         function_ctx->function_address != (gpointer)_Unwind_GetIP &&
         function_ctx->function_address != (gpointer)_Unwind_GetIPInfo &&
         function_ctx->function_address != (gpointer)_Unwind_GetRegionStart &&
@@ -1678,7 +1679,6 @@ _gum_function_context_begin_invocation(
                 peak_general_listener_note_dropped_current_thread();
             return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
         }
-        peak_uw_bind_gum_context();
     }
 #endif
     if (G_LIKELY(fast_listener != NULL)) {
@@ -1717,10 +1717,12 @@ _gum_function_context_begin_invocation(
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             gboolean invoke = _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);
+            peak_uw_bind_gum_context();
             peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                           peak_original_return, invoke, TRUE);
             return invoke || peak_reserved != NULL;
         }
+        peak_uw_bind_gum_context();
         *next_hop = function_ctx->on_invoke_trampoline;
         if (result == GUM_PEAK_FAST_ENTER_INVOKE) {
             *caller_ret_addr = function_ctx->on_leave_trampoline;
@@ -1734,6 +1736,7 @@ _gum_function_context_begin_invocation(
 
     gboolean invoke = _gum_function_context_begin_invocation_peak_original(
         function_ctx, cpu_context, caller_ret_addr, next_hop);
+    peak_uw_bind_gum_context();
     peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                   peak_original_return, invoke, TRUE);
     return invoke || peak_reserved != NULL;

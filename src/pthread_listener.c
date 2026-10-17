@@ -544,10 +544,11 @@ peak_pthread_join(pthread_t thread, void **retval)
     uint64_t generation = 0;
     gboolean captured =
         pthread_listener_capture_thread_token(thread, &slot, &generation);
+    guint64 unwind_cookie =
+        gum_interceptor_peak_unwind_thread_cookie((guintptr)thread);
 #ifdef PEAK_ENABLE_TEST_HOOKS
     pthread_listener_test_pause_join_detach_after_capture(captured);
 #endif
-    guint64 unwind_cookie = gum_interceptor_peak_unwind_thread_cookie((guintptr)thread);
     int ret = original_pthread_join(thread, retval);
     int saved_errno = errno;
     if (ret == 0) {

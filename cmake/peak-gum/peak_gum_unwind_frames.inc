@@ -236,13 +236,11 @@ void gum_interceptor_peak_unwind_thread_joined(guint64 cookie,
                                                guint64 slot,
                                                guint64 generation) {
   PeakUwThread *dead = NULL;
-  /* Frida defers GPrivate destruction until its garbage collector observes
-   * the native thread's lifetime beacon. Prompt that collector now, but do
-   * not treat its return as a completion barrier: it drops its queue lock
-   * before running private-value destructors. Invocation-stack ownership and
-   * synchronization remain entirely inside Frida; PEAK releases only its
-   * separate atomic frame lease below. */
-  (void)_frida_g_thread_garbage_collect();
+  /* pthread_join is already the target-thread completion barrier. Settle
+   * PEAK's non-owning Gum stack reference directly and leave Frida's queued
+   * GPrivate value to its normal collector. Prompting that collector here can
+   * contend with the target's in-progress deferred cleanup in join/detach
+   * races, while providing no additional lifetime proof. */
   g_mutex_lock(&peak_uw_owners_lock);
   for (PeakUwThread **p = &peak_uw_owners; *p;) {
     PeakUwThread *o = *p;
@@ -590,9 +588,9 @@ static void peak_uw_enter(PeakUwFrame *f, PeakGumFunctionContext17 *context,
   f->caller = original;
   f->observed = observed;
   f->generic = generic;
-  /* Direct observed calls already own a fast-listener active lease.  Detach
+  /* Direct observed calls already own a fast-listener active lease. Detach
    * closes and transfers that lease to Gum's usage counter before it can
-   * release the context.  Only paths without that protection need a second
+   * release the context. Only paths without that protection need a second
    * per-frame lease here; avoiding it keeps the direct hot path thread-local. */
   f->leased = generic || !observed;
   f->destination = observed ? *slot : context->on_leave_trampoline;
