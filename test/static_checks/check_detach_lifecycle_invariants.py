@@ -2854,6 +2854,12 @@ def check_signal_backend_strict_invariants(repo_root):
     signal_clear_slots = extract_function(
         controller, "peak_detach_controller_signal_clear_slots"
     )
+    signal_slots_after_fork = extract_function(
+        controller, "peak_detach_controller_signal_slots_after_fork_child"
+    )
+    signal_send_owned = extract_function(
+        controller, "peak_detach_controller_signal_send_owned"
+    )
     signal_temp_breakpoint = extract_function(
         controller, "peak_detach_controller_signal_temp_breakpoint_out_of_range"
     )
@@ -3057,9 +3063,13 @@ def check_signal_backend_strict_invariants(repo_root):
     require(signal_temp_breakpoint.find("atomic_store_explicit(&slot->evacuate_epoch, epoch") <
             signal_temp_breakpoint.find("peak_detach_controller_signal_wake_release_waiters"),
             "evacuation publication must wake signal waiters")
-    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 4 and
+    for field in ("signal_slot_count", "signal_hold_epoch", "signal_release_epoch"):
+        require(0 <= signal_slots_after_fork.find(f"atomic_store_explicit(&{field}, 0") <
+                signal_slots_after_fork.find("peak_detach_controller_signal_wake_release_waiters"),
+                f"fork-child reset must publish {field} before waking inherited frames")
+    require(controller.count("peak_detach_controller_signal_wake_release_waiters()") == 5 and
             "peak_detach_controller_test_wake_signal_waiters" in controller,
-            "production signal futex wake-all must occur only after release, reset, and evacuation publications")
+            "production signal futex wake-all must occur only after release, reset, fork-child reset, and evacuation publications")
     require(signal_wait_for_release.find("rewrite_epoch") <
             signal_wait_for_release.find("done_epoch"),
             "signal PC rewrite must remain ordered before done publication")
@@ -3083,7 +3093,8 @@ def check_signal_backend_strict_invariants(repo_root):
             "signal backend must fail closed when pthread_create gate is unavailable")
     require("peak_signal_policy_choose_reserved_signal" in controller and
             "peak_signal_policy_cookie_matches_async" in signal_handler and
-            "peak_signal_policy_send_thread_signal" in signal_stop and
+            "peak_detach_controller_signal_send_owned" in signal_stop and
+            "peak_signal_policy_send_thread_signal" in signal_send_owned and
             "SYS_rt_tgsigqueueinfo" in signal_policy,
             "signal backend must reserve a signal and authenticate stop delivery with rt_tgsigqueueinfo cookies")
     require("peak_signal_policy_cookie_matches(" not in signal_handler and

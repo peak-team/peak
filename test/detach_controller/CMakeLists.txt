@@ -620,3 +620,89 @@ set_tests_properties(test_detach_controller_invalid_request
   PROPERTIES
     ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict"
 )
+
+# Real signal delivery with a deterministic contamination between mask preflight
+# and the first owned stop send. The same fixture also checks clean physical IO.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  target_link_options(test_detach_controller PRIVATE
+    -Wl,--wrap=peak_signal_policy_send_thread_signal)
+  foreach(preflight_case scalar batch clean_scalar clean_batch)
+    set(preflight_env
+      "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(preflight_case MATCHES "batch")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_BATCH=1")
+    endif()
+    if(preflight_case MATCHES "clean")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_CLEAN=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_preflight_${preflight_case}
+      COMMAND test_detach_controller signal-preflight-contamination)
+    set_tests_properties(test_detach_controller_signal_preflight_${preflight_case}
+      PROPERTIES ENVIRONMENT "${preflight_env}" TIMEOUT 10)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(recovery_case scalar batch consumed_replay no_debt_handoff reap_live exited_target)
+    set(recovery_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(recovery_case STREQUAL "batch")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_BATCH=1")
+    endif()
+    if(recovery_case STREQUAL "consumed_replay")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_REPLAY=1")
+    endif()
+    if(recovery_case STREQUAL "no_debt_handoff")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_NO_DEBT_HANDOFF=1")
+    endif()
+    if(recovery_case STREQUAL "reap_live")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_REAP_LIVE=1")
+    endif()
+    if(recovery_case STREQUAL "exited_target")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_EXITED_TARGET=1")
+    endif()
+    add_test(NAME test_detach_controller_supported_owned_recovery_${recovery_case}
+      COMMAND test_detach_controller supported-handler-owned-recovery)
+    set_tests_properties(test_detach_controller_supported_owned_recovery_${recovery_case}
+      PROPERTIES ENVIRONMENT "${recovery_env}" TIMEOUT 20)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(receipt_case capacity failed_send)
+    set(receipt_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(receipt_case STREQUAL "failed_send")
+      list(APPEND receipt_env "PEAK_TEST_RECEIPT_FAILED_SEND=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_receipt_control_${receipt_case}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_control_${receipt_case}
+      PROPERTIES ENVIRONMENT "${receipt_env}" TIMEOUT 10)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(identity_state published sent)
+    add_test(NAME test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_RECEIPT_DUPLICATE_STATE=${identity_state}"
+        TIMEOUT 5)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(slot_phase before_pin after_pin)
+    add_test(NAME test_detach_controller_active_slot_reuse_${slot_phase}
+      COMMAND test_detach_controller active-slot-reader-reuse)
+    set_tests_properties(test_detach_controller_active_slot_reuse_${slot_phase}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_SLOT_PHASE=${slot_phase}"
+        TIMEOUT 20)
+  endforeach()
+endif()
