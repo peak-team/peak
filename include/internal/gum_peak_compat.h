@@ -105,4 +105,80 @@ gum_interceptor_peak_release_fast_invocation(
 }
 #endif
 
+/*
+ * The unwind-frame lifecycle belongs to the patched direct-listener path.
+ * Stock Gum always uses its generic invocation stack, so it has no PEAK frame
+ * records to initialize, reconcile, or retire.  Keep the common lifecycle
+ * call sites available without introducing extension-symbol references into
+ * the prebuilt provider used on Darwin and other unsupported platforms.
+ */
+#if !defined(GUM_PEAK_UNWIND_FRAME_API_VERSION)
+static inline gboolean
+gum_interceptor_peak_unwind_lifecycle_init(void)
+{
+    return TRUE;
+}
+
+static inline gboolean
+gum_interceptor_peak_unwind_frame_is_live(
+    gpointer function_context,
+    gpointer stack_address)
+{
+    (void)function_context;
+    (void)stack_address;
+    return FALSE;
+}
+
+static inline gboolean
+gum_interceptor_peak_unwind_reconcile_current_thread(void)
+{
+    return FALSE;
+}
+
+static inline guint64
+gum_interceptor_peak_unwind_thread_cookie(guintptr native_thread)
+{
+    (void)native_thread;
+    return 0;
+}
+
+static inline void
+gum_interceptor_peak_unwind_thread_joined(
+    guint64 cookie,
+    guintptr native_thread,
+    gboolean token_valid,
+    guint64 slot,
+    guint64 generation)
+{
+    (void)cookie;
+    (void)native_thread;
+    (void)token_valid;
+    (void)slot;
+    (void)generation;
+}
+
+static inline gboolean
+gum_interceptor_peak_unwind_reap_threads(void)
+{
+    return FALSE;
+}
+
+static inline void
+gum_interceptor_peak_unwind_diagnostics(
+    guint64* owners,
+    guint64* blocks,
+    guint64* active)
+{
+    if (owners != NULL) {
+        *owners = 0;
+    }
+    if (blocks != NULL) {
+        *blocks = 0;
+    }
+    if (active != NULL) {
+        *active = 0;
+    }
+}
+#endif
+
 #endif /* PEAK_GUM_PEAK_COMPAT_H */
