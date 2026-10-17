@@ -1050,6 +1050,65 @@ if(BUILD_TESTING)
                 FAIL_REGULAR_EXPRESSION "handoff did not flush|restore failed|fatal|Gum [^\\r\\n]* failed"
                 TIMEOUT 20)
 
+        add_test(NAME test_cxx_throw_transparency_native
+            COMMAND $<TARGET_FILE:test_cxx_throw_transparency>)
+        add_test(NAME test_cxx_throw_transparency_peak
+            COMMAND $<TARGET_FILE:test_cxx_throw_transparency>)
+        set_tests_properties(test_cxx_throw_transparency_native
+            test_cxx_throw_transparency_peak PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_transparency_ok"
+                TIMEOUT 20)
+        set_tests_properties(test_cxx_throw_transparency_peak PROPERTIES
+            ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
+
+        if(TARGET test_unwind_frame_reentry)
+            add_test(NAME test_unwind_frame_reentry_native
+                COMMAND $<TARGET_FILE:test_unwind_frame_reentry>)
+            add_test(NAME test_unwind_frame_reentry_peak
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_unwind_frame_reentry.py
+                    --application $<TARGET_FILE:test_unwind_frame_reentry>
+                    --libpeak $<TARGET_FILE:peak>)
+            add_test(NAME test_unwind_frame_release_boundary
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/check_unwind_frame_release.py
+                    --source ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_gum_unwind_frames.inc
+                    --cc ${CMAKE_C_COMPILER})
+            set_tests_properties(test_unwind_frame_reentry_native
+                test_unwind_frame_reentry_peak test_unwind_frame_release_boundary
+                PROPERTIES TIMEOUT 10)
+        endif()
+
+        if(TARGET test_cxx_throw_late_provider)
+            add_test(NAME test_cxx_throw_late_provider_native
+                COMMAND $<TARGET_FILE:test_cxx_throw_late_provider>
+                    $<TARGET_FILE:cxx_throw_recursive_provider>)
+            set_tests_properties(test_cxx_throw_late_provider_native PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_late_provider_ok" TIMEOUT 10)
+            add_test(NAME test_cxx_throw_late_provider_peak
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_cxx_throw_loading_check.py
+                    --application $<TARGET_FILE:test_cxx_throw_late_provider>
+                    --provider $<TARGET_FILE:cxx_throw_recursive_provider>
+                    --libpeak $<TARGET_FILE:peak>)
+            set_tests_properties(test_cxx_throw_late_provider_peak PROPERTIES
+                PASS_REGULAR_EXPRESSION "cxx_throw_late_provider_profiled" TIMEOUT 10)
+        endif()
+
+        # Keep the discovered recursive gap visible as a failing test.
+        # Labels document the expected failure; they do not invert its result.
+        add_test(NAME test_cxx_throw_recursive_native
+            COMMAND $<TARGET_FILE:test_cxx_throw_recursive>)
+        add_test(NAME test_cxx_throw_recursive_peak_known_failure
+            COMMAND $<TARGET_FILE:test_cxx_throw_recursive>)
+        set_tests_properties(test_cxx_throw_recursive_native
+            test_cxx_throw_recursive_peak_known_failure PROPERTIES TIMEOUT 20)
+        set_tests_properties(test_cxx_throw_recursive_native PROPERTIES
+            PASS_REGULAR_EXPRESSION "cxx_throw_transparency_ok")
+        set_tests_properties(test_cxx_throw_recursive_peak_known_failure PROPERTIES
+            LABELS "known-failure;transparency;recursive-unwind"
+            ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner,peak_cxx_throw_recursive;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
+
         add_test(NAME test_fastpath_nonlocal_unwind
             COMMAND
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)

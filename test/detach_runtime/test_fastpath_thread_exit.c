@@ -1122,6 +1122,8 @@ main(void)
         typedef int (*CheckpointFunction)(const char*, char* const[]);
         CheckpointFunction checkpoint = (CheckpointFunction)dlsym(
             RTLD_DEFAULT, "peak_checkpoint_for_exec");
+        void (*stop_controller)(void) = (void (*)(void))dlsym(
+            RTLD_DEFAULT, "peak_general_listener_controller_stop");
         const char* base = getenv("PEAK_STATSLOG_PATH");
         char path[1024];
         char directory[1024];
@@ -1130,8 +1132,16 @@ main(void)
         struct dirent* entry;
         int matches = 0;
         char* argv[] = { (char*)"checkpoint-test", NULL };
-        if (checkpoint == NULL || base == NULL ||
-            checkpoint("checkpoint-test", argv) != 0 ||
+        if (checkpoint == NULL || stop_controller == NULL || base == NULL) {
+            fputs("checkpoint fixture prerequisites unavailable\n", stderr);
+            return 1;
+        }
+        /* This checks quiescent exact-once accounting. Joined workers do not
+         * quiesce the maintenance controller, which can still own the snapshot
+         * lock and make checkpoint's trylock legitimately fail. Stop/join it
+         * before the single capture; retain the exec1/count/file assertions. */
+        stop_controller();
+        if (checkpoint("checkpoint-test", argv) != 0 ||
             snprintf(directory, sizeof(directory), "%s", base) >=
                 (int)sizeof(directory) ||
             (slash = strrchr(directory, '/')) == NULL) {

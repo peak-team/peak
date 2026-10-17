@@ -54,6 +54,22 @@ GET_INTERCEPTOR_THREAD_CONTEXT = "get_interceptor_thread_context"
 EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT = (
     "peak_gum_get_interceptor_thread_context"
 )
+INTERCEPTOR_THREAD_CONTEXT_LOCK = "gum_interceptor_thread_context_lock"
+EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK = (
+    "peak_gum_interceptor_thread_context_lock"
+)
+INTERCEPTOR_THREAD_CONTEXTS = "gum_interceptor_thread_contexts"
+EXPORTED_INTERCEPTOR_THREAD_CONTEXTS = "peak_gum_interceptor_thread_contexts"
+INTERCEPTOR_CONTEXT_PRIVATE = "gum_interceptor_context_private"
+EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE = (
+    "peak_gum_interceptor_context_private"
+)
+RELEASE_INTERCEPTOR_THREAD_CONTEXT = (
+    "release_interceptor_thread_context"
+)
+EXPORTED_RELEASE_INTERCEPTOR_THREAD_CONTEXT = (
+    "peak_gum_release_interceptor_thread_context_original"
+)
 LOAD_SECTION = ".text.gum_elf_module_load"
 OLD_MARKER_X86_64 = b"PEAK_GUM_ELF_HEADER_GUARD_X86_64_V1\0"
 OLD_MARKER_AARCH64 = b"PEAK_GUM_ELF_HEADER_GUARD_AARCH64_V1\0"
@@ -127,6 +143,10 @@ def route_redirect_resolver_through_overlay(
         fail(f"failed to extract {object_name}:\n{result.stdout}\n{result.stderr}")
 
     before = symbol_kinds(nm, extracted)
+    if (("U", REDIRECT_RESOLVER) not in before and
+            ("U", RENAMED_REDIRECT_RESOLVER) in before):
+        print(f"{object_name}: redirect resolver dispatch already patched")
+        return
     if (("U", REDIRECT_RESOLVER) not in before or
             ("U", RENAMED_REDIRECT_RESOLVER) in before):
         fail(
@@ -196,9 +216,38 @@ def route_invocation_dispatch_through_overlay(
         "T",
         EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT,
     )
+    thread_context_state = {
+        ("b", INTERCEPTOR_THREAD_CONTEXT_LOCK),
+        ("b", INTERCEPTOR_THREAD_CONTEXTS),
+    }
+    exported_thread_context_state = {
+        ("B", EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK),
+        ("B", EXPORTED_INTERCEPTOR_THREAD_CONTEXTS),
+    }
+    thread_context_lifecycle = {
+        ("d", INTERCEPTOR_CONTEXT_PRIVATE),
+        ("t", RELEASE_INTERCEPTOR_THREAD_CONTEXT),
+    }
+    exported_thread_context_lifecycle = {
+        ("D", EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE),
+        ("T", EXPORTED_RELEASE_INTERCEPTOR_THREAD_CONTEXT),
+    }
+    if (not before.intersection(expected) and renamed.issubset(before) and
+            thread_context_getter not in before and
+            exported_thread_context_getter in before and
+            not before.intersection(thread_context_state) and
+            exported_thread_context_state.issubset(before) and
+            not before.intersection(thread_context_lifecycle) and
+            exported_thread_context_lifecycle.issubset(before)):
+        print(f"{object_name}: invocation dispatch already patched")
+        return
     if (not expected.issubset(before) or before.intersection(renamed) or
             thread_context_getter not in before or
-            exported_thread_context_getter in before):
+            exported_thread_context_getter in before or
+            not thread_context_state.issubset(before) or
+            before.intersection(exported_thread_context_state) or
+            not thread_context_lifecycle.issubset(before) or
+            before.intersection(exported_thread_context_lifecycle)):
         fail(
             f"unexpected invocation symbols in {object_name}: "
             f"begin={('T', BEGIN_INVOCATION) in before} "
@@ -217,6 +266,18 @@ def route_invocation_dispatch_through_overlay(
         "--redefine-sym",
         f"{GET_INTERCEPTOR_THREAD_CONTEXT}="
         f"{EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT}",
+        "--redefine-sym",
+        f"{INTERCEPTOR_THREAD_CONTEXT_LOCK}="
+        f"{EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK}",
+        "--redefine-sym",
+        f"{INTERCEPTOR_THREAD_CONTEXTS}="
+        f"{EXPORTED_INTERCEPTOR_THREAD_CONTEXTS}",
+        "--redefine-sym",
+        f"{INTERCEPTOR_CONTEXT_PRIVATE}="
+        f"{EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE}",
+        "--redefine-sym",
+        f"{RELEASE_INTERCEPTOR_THREAD_CONTEXT}="
+        f"{EXPORTED_RELEASE_INTERCEPTOR_THREAD_CONTEXT}",
         str(extracted),
     ])
     if result.returncode != 0:
@@ -229,6 +290,14 @@ def route_invocation_dispatch_through_overlay(
         objcopy,
         "--globalize-symbol",
         EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT,
+        "--globalize-symbol",
+        EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK,
+        "--globalize-symbol",
+        EXPORTED_INTERCEPTOR_THREAD_CONTEXTS,
+        "--globalize-symbol",
+        EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE,
+        "--globalize-symbol",
+        EXPORTED_RELEASE_INTERCEPTOR_THREAD_CONTEXT,
         str(extracted),
     ])
     if result.returncode != 0:
@@ -240,7 +309,11 @@ def route_invocation_dispatch_through_overlay(
     after = symbol_kinds(nm, extracted)
     if (after.intersection(expected) or not renamed.issubset(after) or
             ("t", GET_INTERCEPTOR_THREAD_CONTEXT) in after or
-            exported_thread_context_getter not in after):
+            exported_thread_context_getter not in after or
+            after.intersection(thread_context_state) or
+            not exported_thread_context_state.issubset(after) or
+            after.intersection(thread_context_lifecycle) or
+            not exported_thread_context_lifecycle.issubset(after)):
         fail(f"invocation dispatch rename did not take effect in {object_name}")
 
     replace_archive_member(ar, library, extracted)
@@ -270,6 +343,9 @@ def route_rtld_notification_through_overlay(
     before = symbol_kinds(nm, extracted)
     expected = ("T", RTLD_NOTIFICATION_HANDLER)
     renamed = ("T", RENAMED_RTLD_NOTIFICATION_HANDLER)
+    if expected not in before and renamed in before:
+        print(f"{object_name}: RTLD notification dispatch already patched")
+        return
     if expected not in before or renamed in before:
         fail(
             f"unexpected RTLD notification symbols in {object_name}: "
@@ -325,6 +401,9 @@ def route_module_registry_lifecycle_through_overlay(
         ("T", RENAMED_MODULE_REGISTRY_DEACTIVATE),
     }
     before = symbol_kinds(nm, extracted)
+    if not before.intersection(expected) and renamed.issubset(before):
+        print(f"{object_name}: module registry lifecycle already patched")
+        return
     if not expected.issubset(before) or before.intersection(renamed):
         fail(
             f"unexpected module registry lifecycle symbols in {object_name}: "
@@ -392,6 +471,9 @@ def route_gum_shutdown_through_overlay(
         ("T", RENAMED_GUM_SHUTDOWN),
     }
     before = symbol_kinds(nm, extracted)
+    if not before.intersection(expected) and renamed.issubset(before):
+        print(f"{object_name}: Gum shutdown lifecycle already patched")
+        return
     if not expected.issubset(before) or before.intersection(renamed):
         fail(f"unexpected Gum shutdown lifecycle symbols in {object_name}")
 
@@ -1139,6 +1221,66 @@ def patch_object(path: Path) -> bool:
     return False
 
 
+def route_x86_unwind_metadata(library, members, ar, nm, objcopy, work_dir):
+    backend = "backend-x86_guminterceptor-x86.c.o"
+    unwind = "backend-linux_gumunwindbroker-linux.c.o"
+    paths = {}
+    for member in [backend, unwind]:
+        if members.count(member) != 1:
+            fail(f"expected exactly one {member}")
+        result = run([ar, "x", str(library), member], cwd=work_dir)
+        if result.returncode: fail(result.stderr)
+        paths[member] = work_dir / member
+    backend_names = run([nm,str(paths[backend])]).stdout
+    unwind_names = run([nm,str(paths[unwind])]).stdout
+    markers = ["_gum_interceptor_backend_create_trampoline_peak_original" in backend_names,
+               "_gum_interceptor_backend_destroy_trampoline_peak_original" in backend_names,
+               "peak_gum_unwind_relocate_all" in backend_names,
+               "peak_gum_unwind_find_fde" in unwind_names,
+               "peak_gum_unwind_get_ip" in unwind_names]
+    if all(markers):
+        print("x86 unwind metadata routing already patched")
+        return
+    if any(markers): fail("partially patched x86 unwind metadata routing")
+    # Stage both member transformations before replacing either archive member.
+    command = [objcopy]
+    for old,new in [
+        ("_gum_interceptor_backend_create_trampoline", "_gum_interceptor_backend_create_trampoline_peak_original"),
+        ("_gum_interceptor_backend_destroy_trampoline", "_gum_interceptor_backend_destroy_trampoline_peak_original"),
+        ("gum_x86_relocator_write_all", "peak_gum_unwind_relocate_all")]:
+        command += ["--redefine-sym", old+"="+new]
+    result=run(command+[str(paths[backend])])
+    if result.returncode: fail(result.stderr)
+    path=paths[unwind]
+    routes=[(".rela.text.gum_unwind_broker_replacement_find_fde","_Unwind_Find_FDE","peak_gum_unwind_find_fde"),
+            (".rela.text.gum_unwind_broker_replacement_get_ip","_Unwind_GetIP","peak_gum_unwind_get_ip")]
+    for _,_,name in routes:
+        result=run([objcopy,"--add-symbol",name+"=0,global",str(path)])
+        if result.returncode: fail(result.stderr)
+    data=bytearray(path.read_bytes())
+    _,_,sections=elf64_load_sections(data)
+    sym=next(x for x in sections if x.type==2)
+    strings=sections[sym.link]
+    names=data[strings.offset:strings.offset+strings.size]
+    indices={}
+    for index in range(sym.size//sym.entsize):
+        start=sym.offset+index*sym.entsize
+        n=struct.unpack_from("<I",data,start)[0]
+        indices[read_c_string(names,n)]=index
+    for section,old,new in routes:
+        added=indices[new]
+        struct.pack_into("<H",data,sym.offset+added*sym.entsize+6,0)
+        rel=next(x for x in sections if x.name==section)
+        changed=0
+        for start in range(rel.offset,rel.offset+rel.size,rel.entsize):
+            offset,info,addend=struct.unpack_from("<QQq",data,start)
+            if info>>32==indices[old] and (info&0xffffffff)==4:
+                struct.pack_into("<Q",data,start+8,(added<<32)|4);changed+=1
+        if changed!=1: fail(f"unexpected {old} dispatch relocation count {changed}")
+    path.write_bytes(data)
+    for member in [backend,unwind]: replace_archive_member(ar,library,paths[member])
+    print("patched x86 invoke CFI lifecycle and public unwind metadata dispatch")
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True, type=Path)
@@ -1220,6 +1362,9 @@ def main() -> int:
         args.objcopy,
         work_dir,
     )
+
+    if machine == 62:
+        route_x86_unwind_metadata(library,members,args.ar,args.nm,args.objcopy,work_dir)
 
     if args.ranlib:
         result = run([args.ranlib, str(library)])

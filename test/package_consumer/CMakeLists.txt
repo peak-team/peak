@@ -33,8 +33,9 @@ foreach(component MPI OTF2 CUDA)
     endif()
 endforeach()
 
+find_package(Threads REQUIRED)
 add_executable(peak_package_consumer main.c)
-target_link_libraries(peak_package_consumer PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(peak_package_consumer PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 
 add_executable(peak_package_consumer_preload preload_fixture.c)
 set_target_properties(peak_package_consumer_preload PROPERTIES ENABLE_EXPORTS ON)
@@ -59,6 +60,8 @@ endif()
 enable_testing()
 add_test(NAME peak_package_consumer_load
     COMMAND peak_package_consumer $<TARGET_FILE:PEAK::peak>)
+add_test(NAME peak_package_consumer_load_with_threads
+    COMMAND peak_package_consumer $<TARGET_FILE:PEAK::peak> --existing-threads)
 add_test(NAME peak_package_consumer_symbols
     COMMAND ${CMAKE_COMMAND}
         -DNM=${CMAKE_NM}
@@ -83,6 +86,7 @@ add_test(NAME peak_package_consumer_preload
         -P ${CMAKE_CURRENT_SOURCE_DIR}/run_preload_check.cmake)
 set_tests_properties(
     peak_package_consumer_load
+    peak_package_consumer_load_with_threads
     peak_package_consumer_symbols
     peak_package_consumer_preload
     PROPERTIES TIMEOUT 60)

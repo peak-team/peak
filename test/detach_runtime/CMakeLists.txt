@@ -138,6 +138,44 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
       PRIVATE -Wl,--export-dynamic)
 endif()
 
+add_library(cxx_throw_provider SHARED cxx_throw_provider.cpp)
+add_library(cxx_throw_recursive_provider SHARED cxx_throw_recursive_provider.cpp)
+add_executable(test_cxx_throw_recursive test_cxx_throw_recursive.cpp)
+target_link_libraries(test_cxx_throw_recursive PRIVATE
+  cxx_throw_recursive_provider Threads::Threads)
+add_executable(test_cxx_throw_transparency test_cxx_throw_transparency.cpp)
+target_link_libraries(test_cxx_throw_transparency PRIVATE
+  cxx_throw_provider Threads::Threads)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_unwind_frame_reentry test_unwind_frame_reentry.cpp)
+    # Resolve unwind imports against the shared runtime before the project's
+    # global -static-libgcc libraries. -shared-libgcc alone cannot override
+    # that global driver option on GCC. Other fixture conditions stay intact.
+    target_link_libraries(test_unwind_frame_reentry PRIVATE
+      Threads::Threads ${DL_LIBRARY} gcc_s)
+    target_compile_options(test_unwind_frame_reentry PRIVATE
+      -fexceptions -fno-lto -fno-omit-frame-pointer -fno-optimize-sibling-calls)
+    target_link_options(test_unwind_frame_reentry PRIVATE -Wl,--export-dynamic)
+  endif()
+  add_executable(test_cxx_throw_late_provider test_cxx_throw_recursive.cpp)
+  target_compile_definitions(test_cxx_throw_late_provider PRIVATE
+    PEAK_CXX_THROW_LATE_PROVIDER=1)
+  target_link_libraries(test_cxx_throw_late_provider PRIVATE
+    Threads::Threads ${DL_LIBRARY})
+  add_dependencies(test_cxx_throw_late_provider cxx_throw_recursive_provider)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_cxx_throw_late_provider PRIVATE -fexceptions -fno-lto)
+  endif()
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(cxx_throw_provider PRIVATE -fexceptions -fno-lto)
+  target_compile_options(test_cxx_throw_transparency PRIVATE -fexceptions -fno-lto)
+  target_compile_options(cxx_throw_recursive_provider PRIVATE -fexceptions -fno-lto)
+  target_compile_options(test_cxx_throw_recursive PRIVATE -fexceptions -fno-lto)
+endif()
+
 add_executable(test_unsafe_gum_prologue test_unsafe_gum_prologue.c)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     enable_language(ASM)
