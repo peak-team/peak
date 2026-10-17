@@ -24,7 +24,7 @@ struct PeakUwFrame {
   gpointer *slot;
   PeakGumFunctionContext17 *context;
   guint8 *pc;
-  gboolean observed, generic;
+  gboolean observed, generic, leased;
   guint64 reaped_epoch;
   gpointer reaped_context, reaped_slot;
   guint64 walk_live_epoch;
@@ -205,7 +205,8 @@ static void peak_uw_settle_dead_gum_context(PeakUwThread *owner) {
 static void peak_uw_owner_free(PeakUwThread *owner) {
   peak_uw_cache_clear(owner);
   for (PeakUwFrame *f = owner->active; f; f = f->next)
-    g_atomic_int_dec_and_test(&f->context->trampoline_usage_counter);
+    if (f->leased)
+      g_atomic_int_dec_and_test(&f->context->trampoline_usage_counter);
   PeakUwBlock *b = owner->blocks;
   while (b) {
     PeakUwBlock *next = b->next;
@@ -511,7 +512,8 @@ static gboolean peak_uw_grow(void) {
 static void peak_uw_release(PeakUwFrame **link) {
   PeakUwFrame *f = *link;
   *link = f->next;
-  g_atomic_int_dec_and_test(&f->context->trampoline_usage_counter);
+  if (f->leased)
+    g_atomic_int_dec_and_test(&f->context->trampoline_usage_counter);
   f->slot = NULL;
   f->context = NULL;
   f->free_next = peak_uw_thread->free;
@@ -584,8 +586,14 @@ static void peak_uw_enter(PeakUwFrame *f, PeakGumFunctionContext17 *context,
   f->caller = original;
   f->observed = observed;
   f->generic = generic;
+  /* Direct observed calls already own a fast-listener active lease.  Detach
+   * closes and transfers that lease to Gum's usage counter before it can
+   * release the context.  Only paths without that protection need a second
+   * per-frame lease here; avoiding it keeps the direct hot path thread-local. */
+  f->leased = generic || !observed;
   f->destination = observed ? *slot : context->on_leave_trampoline;
-  g_atomic_int_inc(&context->trampoline_usage_counter);
+  if (f->leased)
+    g_atomic_int_inc(&context->trampoline_usage_counter);
   f->next = peak_uw_thread->active;
   peak_uw_thread->active = f;
   __atomic_add_fetch(&peak_uw_thread->live, 1, __ATOMIC_RELAXED);

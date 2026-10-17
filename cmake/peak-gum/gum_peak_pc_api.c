@@ -1657,9 +1657,6 @@ _gum_function_context_begin_invocation(
         return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
     gpointer peak_original_return = *caller_ret_addr;
     peak_uw_reap(caller_ret_addr);
-#if defined(__x86_64__)
-    peak_gum_invocation_stack_reap_unwound(caller_ret_addr);
-#endif
     GumPeakFastListener * fast_listener =
         peak_gum_context_fast_listener_for_enter(function_ctx);
     PeakUwFrame *peak_reserved = NULL;
@@ -1678,7 +1675,6 @@ _gum_function_context_begin_invocation(
                 peak_general_listener_note_dropped_current_thread();
             return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
         }
-        peak_uw_bind_gum_context();
     }
 #endif
     if (G_LIKELY(fast_listener != NULL)) {
@@ -1717,6 +1713,7 @@ _gum_function_context_begin_invocation(
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             gboolean invoke = _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);
+            peak_uw_bind_gum_context();
             peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                           peak_original_return, invoke, TRUE);
             return invoke || peak_reserved != NULL;
@@ -1734,6 +1731,7 @@ _gum_function_context_begin_invocation(
 
     gboolean invoke = _gum_function_context_begin_invocation_peak_original(
         function_ctx, cpu_context, caller_ret_addr, next_hop);
+    peak_uw_bind_gum_context();
     peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                   peak_original_return, invoke, TRUE);
     return invoke || peak_reserved != NULL;
