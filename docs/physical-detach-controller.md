@@ -1018,6 +1018,24 @@ policy defers to Gum's own attach result. The conservative PEAK policy can still
 skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
+The pinned Gum 17.15.3 checked relocator begins its control-flow walk after
+those relocated entry bytes. It can therefore miss an alternate path reached
+by a branch inside the prefix that later branches back into the overwritten
+entry. For checked online relocation, PEAK derives the backend's candidate
+patch size from Gum's result: 16 bytes on success, or its 8-byte fallback. PEAK
+supplements the walk with a bounded check of the candidate prefix branch
+targets and, for the 8-byte fallback, its reachable ordinary continuation. A
+destination inside entry bytes 4 through 15 (16-byte patch) or 4 through 7
+(8-byte patch) rejects the target. A 4-byte candidate has no aligned interior
+instruction entry and retains Gum's result. Unreadable or undecodable paths, unresolved
+indirect tail jumps, and exhaustion of the 4096-instruction scan budget also
+reject that target. Returns end a path; calls retain Gum's normal call/return
+assumption. Other targets retain Gum's existing patch-size selection, including
+ordinary 8- and 16-byte patches; a safe fallback preserves Gum's original
+false result and maximum instead of accidentally requesting a 16-byte patch.
+This attach-time check does not change Gum's allocator
+or force all Arm64 targets onto near branches.
+
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`
 through `x16`/`x17`). Gum follows the branch but its checked relocation rejects

@@ -232,4 +232,15 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
     PROPERTIES
       TIMEOUT 15
       PASS_REGULAR_EXPRESSION "gum_exact_attach_aarch64_ok")
+  add_executable(test_gum_arm64_prefix_branch
+    test_gum_arm64_prefix_branch.c gum_arm64_prefix_branch.S)
+  target_include_directories(test_gum_arm64_prefix_branch PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
+  target_link_libraries(test_gum_arm64_prefix_branch PRIVATE
+    ${FRIDA_GUM_LIBRARIES} Threads::Threads ${DL_LIBRARY}
+    ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
+  add_test(NAME test_gum_arm64_prefix_branch COMMAND test_gum_arm64_prefix_branch)
+  set_tests_properties(test_gum_arm64_prefix_branch PROPERTIES
+    TIMEOUT 15 SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "gum_arm64_prefix_branch_ok")
+
 endif()

@@ -178,6 +178,29 @@ def route_redirect_resolver_through_overlay(
     print(f"patched {object_name}: routed exact-entry attach resolver dispatch")
 
 
+def route_arm64_relocator(library, members, ar, nm, objcopy, work_dir):
+    object_name = "backend-arm64_guminterceptor-arm64.c.o"
+    original = "gum_arm64_relocator_can_relocate"
+    routed = "peak_gum_arm64_can_relocate"
+    if members.count(object_name) != 1:
+        fail(f"expected exactly one {object_name}")
+    extracted = work_dir / object_name
+    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+    if result.returncode != 0 or not extracted.exists():
+        fail(f"failed to extract {object_name}")
+    before = symbol_kinds(nm, extracted)
+    if ("U", original) not in before or ("U", routed) in before:
+        fail(f"unexpected Arm64 relocator imports in {object_name}")
+    result = run([objcopy, "--redefine-sym", f"{original}={routed}", str(extracted)])
+    if result.returncode != 0:
+        fail(f"failed to route Arm64 relocation check: {result.stderr}")
+    after = symbol_kinds(nm, extracted)
+    if ("U", original) in after or ("U", routed) not in after:
+        fail("Arm64 relocation routing did not take effect")
+    replace_archive_member(ar, library, extracted)
+    print(f"patched {object_name}: routed checked prefix-branch validation")
+
+
 def route_invocation_dispatch_through_overlay(
     library: Path,
     members: list[str],
@@ -1329,6 +1352,10 @@ def main() -> int:
             args.objcopy,
             work_dir,
         )
+
+    if machine == 183:
+        route_arm64_relocator(library, members, args.ar, args.nm,
+                             args.objcopy, work_dir)
 
     route_invocation_dispatch_through_overlay(
         library,
