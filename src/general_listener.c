@@ -98,6 +98,215 @@ static _Atomic gulong peak_general_listener_test_startup_selector_batch_count = 
 #endif
 static double* peak_hook_last_detach_time;
 static PeakHookState* peak_hook_states;
+/* Stable scalar publication for the public hook-state reader.  Chunks are
+ * retained for the lifetime of the loaded image and reused across attach
+ * cycles; the controller-owned array above may still move during expansion. */
+#define PEAK_HOOK_STATUS_CHUNK_SIZE 64
+typedef struct PeakHookStatusChunk {
+    struct PeakHookStatusChunk* next;
+    size_t base;
+    _Atomic int states[PEAK_HOOK_STATUS_CHUNK_SIZE];
+} PeakHookStatusChunk;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "hook status cells must always be lock-free");
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
+               "hook status root must always be lock-free");
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2 &&
+                   sizeof(size_t) <= sizeof(unsigned long long),
+               "published hook count must always be lock-free");
+static _Atomic(PeakHookStatusChunk*) peak_hook_status_root = NULL;
+static _Atomic unsigned long long peak_hook_status_published_count = 0;
+static size_t peak_hook_status_capacity = 0;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static _Atomic int peak_hook_status_test_fail_after = -1;
+static _Atomic int peak_hook_status_test_pause_stage = 0;
+static _Atomic int peak_hook_status_test_paused = 0;
+static _Atomic int peak_hook_status_test_resume = 0;
+static size_t peak_hook_status_test_allocations = 0;
+static size_t peak_hook_status_test_live_chunks = 0;
+#endif
+
+static PeakHookStatusChunk*
+peak_hook_status_chunk_for(size_t hook_id, PeakHookStatusChunk* chunk)
+{
+    while (chunk != NULL) {
+        if (hook_id >= chunk->base &&
+            hook_id - chunk->base < PEAK_HOOK_STATUS_CHUNK_SIZE) {
+            return chunk;
+        }
+        chunk = chunk->next;
+    }
+    return NULL;
+}
+
+/* Called only by the serialized lifecycle writer, before publishing count. */
+static gboolean peak_hook_status_reserve(size_t count)
+{
+    if (count > SIZE_MAX - (PEAK_HOOK_STATUS_CHUNK_SIZE - 1)) {
+        return FALSE;
+    }
+    PeakHookStatusChunk* old_root = atomic_load_explicit(
+        &peak_hook_status_root, memory_order_relaxed);
+    PeakHookStatusChunk* new_root = old_root;
+    size_t new_capacity = peak_hook_status_capacity;
+    while (new_capacity < count) {
+        PeakHookStatusChunk* chunk = NULL;
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        int fail_after = atomic_load_explicit(&peak_hook_status_test_fail_after,
+                                              memory_order_relaxed);
+        if (fail_after > 0) {
+            atomic_store_explicit(&peak_hook_status_test_fail_after,
+                                  fail_after - 1,
+                                  memory_order_relaxed);
+        }
+        if (fail_after != 0) {
+            chunk = calloc(1, sizeof(*chunk));
+        }
+#else
+        chunk = calloc(1, sizeof(*chunk));
+#endif
+        if (chunk == NULL) {
+            while (new_root != old_root) {
+                PeakHookStatusChunk* next = new_root->next;
+                free(new_root);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+                peak_hook_status_test_live_chunks--;
+#endif
+                new_root = next;
+            }
+            return FALSE;
+        }
+#ifdef PEAK_ENABLE_TEST_HOOKS
+        peak_hook_status_test_allocations++;
+        peak_hook_status_test_live_chunks++;
+#endif
+        chunk->base = new_capacity;
+        for (size_t i = 0; i < PEAK_HOOK_STATUS_CHUNK_SIZE; i++) {
+            atomic_init(&chunk->states[i], PEAK_HOOK_UNRESOLVED);
+        }
+        chunk->next = new_root;
+        new_root = chunk;
+        new_capacity += PEAK_HOOK_STATUS_CHUNK_SIZE;
+    }
+    atomic_store_explicit(&peak_hook_status_root, new_root, memory_order_release);
+    peak_hook_status_capacity = new_capacity;
+    return TRUE;
+}
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+/* Mirror-only protocol probes. Callers serialize mutation with the controller
+ * test lock and restore the real published count before leaving the process. */
+PEAK_API void peak_general_listener_test_status_fail_after(int allocations)
+{
+    atomic_store(&peak_hook_status_test_fail_after, allocations);
+}
+
+PEAK_API gboolean peak_general_listener_test_status_reserve(size_t count)
+{
+    return peak_hook_status_reserve(count);
+}
+
+PEAK_API size_t peak_general_listener_test_status_capacity(void)
+{
+    return peak_hook_status_capacity;
+}
+
+PEAK_API size_t peak_general_listener_test_status_allocations(void)
+{
+    return peak_hook_status_test_allocations;
+}
+
+PEAK_API size_t peak_general_listener_test_status_live_chunks(void)
+{
+    return peak_hook_status_test_live_chunks;
+}
+
+PEAK_API size_t peak_general_listener_test_status_chunk_bytes(void)
+{
+    return sizeof(PeakHookStatusChunk);
+}
+
+PEAK_API void peak_general_listener_test_status_publish_count(size_t count)
+{
+    atomic_store_explicit(&peak_hook_status_published_count,
+                          count,
+                          memory_order_release);
+}
+
+PEAK_API void peak_general_listener_test_status_pause(int stage)
+{
+    atomic_store(&peak_hook_status_test_paused, 0);
+    atomic_store(&peak_hook_status_test_resume, 0);
+    atomic_store(&peak_hook_status_test_pause_stage, stage);
+}
+
+PEAK_API int peak_general_listener_test_status_paused(void)
+{
+    return atomic_load(&peak_hook_status_test_paused);
+}
+
+PEAK_API void peak_general_listener_test_status_resume(void)
+{
+    atomic_store(&peak_hook_status_test_resume, 1);
+    atomic_store(&peak_hook_status_test_pause_stage, 0);
+}
+
+static void peak_hook_status_test_pause_if(int stage)
+{
+    if (atomic_load(&peak_hook_status_test_pause_stage) != stage) {
+        return;
+    }
+    atomic_store(&peak_hook_status_test_paused, stage);
+    while (!atomic_load(&peak_hook_status_test_resume)) {
+        sched_yield();
+    }
+}
+#endif
+
+static void peak_hook_status_reset_prefix(size_t count)
+{
+    PeakHookStatusChunk* chunk = atomic_load_explicit(
+        &peak_hook_status_root, memory_order_relaxed);
+    while (chunk != NULL) {
+        if (chunk->base < count) {
+            size_t limit = count - chunk->base;
+            if (limit > PEAK_HOOK_STATUS_CHUNK_SIZE) {
+                limit = PEAK_HOOK_STATUS_CHUNK_SIZE;
+            }
+            for (size_t i = 0; i < limit; i++) {
+                atomic_store_explicit(&chunk->states[i],
+                                      PEAK_HOOK_UNRESOLVED,
+                                      memory_order_release);
+            }
+        }
+        chunk = chunk->next;
+    }
+}
+
+static void peak_hook_status_store(size_t hook_id, PeakHookState state)
+{
+    PeakHookStatusChunk* chunk = peak_hook_status_chunk_for(
+        hook_id,
+        atomic_load_explicit(&peak_hook_status_root, memory_order_relaxed));
+    if (chunk == NULL) {
+        g_error("hook status cell missing for hook %lu", (unsigned long)hook_id);
+    }
+    atomic_store_explicit(&chunk->states[hook_id - chunk->base],
+                          state,
+                          memory_order_release);
+}
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API void peak_general_listener_test_status_reset_prefix(size_t count)
+{
+    peak_hook_status_reset_prefix(count);
+}
+
+PEAK_API void peak_general_listener_test_status_store(size_t hook_id,
+                                                       PeakHookState state)
+{
+    peak_hook_status_store(hook_id, state);
+}
+#endif
 static double* peak_hook_next_retry_time;
 static double* peak_hook_pending_observed_time;
 typedef enum {
@@ -370,6 +579,18 @@ void peak_general_listener_controller_unlock(void)
 {
     pthread_mutex_unlock(&lock);
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API void peak_general_listener_test_controller_lock(void)
+{
+    peak_general_listener_controller_lock();
+}
+
+PEAK_API void peak_general_listener_test_controller_unlock(void)
+{
+    peak_general_listener_controller_unlock();
+}
+#endif
 
 #if PEAK_GENERAL_CONTROLLER_RAW_FUTEX
 /*
@@ -2530,6 +2751,7 @@ peak_general_controller_set_state_unlocked(size_t hook_id, PeakHookState state)
     if (detach_count_request_published) {
         peak_general_listener_controller_wake();
     }
+    peak_hook_status_store(hook_id, state);
 }
 
 static gboolean
@@ -2707,15 +2929,26 @@ gboolean peak_general_listener_request_reattach(size_t hook_id)
 
 PeakHookState peak_general_listener_hook_state(size_t hook_id)
 {
-    PeakHookState state = PEAK_HOOK_UNRESOLVED;
-
-    pthread_mutex_lock(&lock);
-    if (peak_hook_states != NULL && hook_id < peak_hook_address_count) {
-        state = peak_hook_states[hook_id];
+    unsigned long long count = atomic_load_explicit(
+        &peak_hook_status_published_count, memory_order_acquire);
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_hook_status_test_pause_if(1);
+#endif
+    if (hook_id >= count) {
+        return PEAK_HOOK_UNRESOLVED;
     }
-    pthread_mutex_unlock(&lock);
-
-    return state;
+    PeakHookStatusChunk* chunk = peak_hook_status_chunk_for(
+        hook_id,
+        atomic_load_explicit(&peak_hook_status_root, memory_order_acquire));
+#ifdef PEAK_ENABLE_TEST_HOOKS
+    peak_hook_status_test_pause_if(2);
+#endif
+    /* A released count publication always follows its chunk publication. */
+    if (chunk == NULL) {
+        return PEAK_HOOK_UNRESOLVED;
+    }
+    return (PeakHookState)atomic_load_explicit(
+        &chunk->states[hook_id - chunk->base], memory_order_acquire);
 }
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
@@ -2917,6 +3150,11 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
         return FALSE;
     }
 
+    if (new_count < old_count || !peak_hook_status_reserve(new_count)) {
+        free(target_copy);
+        return FALSE;
+    }
+
     new_hook_strings = realloc(peak_hook_strings,
                                sizeof(char*) * new_count);
     if (new_hook_strings == NULL) {
@@ -2991,6 +3229,7 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     array_listener_gum_detach_flushed[old_count] = TRUE;
     peak_hook_last_detach_time[old_count] = 0.0;
     peak_hook_states[old_count] = PEAK_HOOK_UNRESOLVED;
+    peak_hook_status_store(old_count, PEAK_HOOK_UNRESOLVED);
     peak_hook_next_retry_time[old_count] = 0.0;
     peak_hook_pending_observed_time[old_count] = 0.0;
     peak_hook_pending_request_source[old_count] =
@@ -3018,6 +3257,9 @@ peak_general_listener_expand_dynamic_hook_tables_unlocked(
     }
 
     peak_hook_address_count = new_count;
+    atomic_store_explicit(&peak_hook_status_published_count,
+                          new_count,
+                          memory_order_release);
     if (hook_id_out != NULL) {
         *hook_id_out = old_count;
     }
@@ -7166,6 +7408,13 @@ peak_general_listener_attach()
     array_listener_gum_detach_flushed = g_new0(gboolean, peak_hook_address_count);
     peak_hook_last_detach_time = g_new0(double, peak_hook_address_count);
     peak_hook_states = g_new0(PeakHookState, peak_hook_address_count);
+    if (!peak_hook_status_reserve(peak_hook_address_count)) {
+        g_error("unable to reserve hook status cells");
+    }
+    peak_hook_status_reset_prefix(peak_hook_address_count);
+    atomic_store_explicit(&peak_hook_status_published_count,
+                          peak_hook_address_count,
+                          memory_order_release);
     peak_hook_next_retry_time = g_new0(double, peak_hook_address_count);
     peak_hook_pending_observed_time = g_new0(double, peak_hook_address_count);
     peak_hook_pending_request_source =
@@ -8976,6 +9225,10 @@ gboolean peak_general_listener_dettach()
         g_printerr("[peak] Gum detach teardown did not flush; leaving listener state alive\n");
         return FALSE;
     }
+
+    atomic_store_explicit(&peak_hook_status_published_count,
+                          0,
+                          memory_order_release);
 
     for (size_t i = 0; i < peak_hook_address_count; i++) {
         if (hook_address[i] && array_listener[i] != NULL) {
