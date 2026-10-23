@@ -12,6 +12,10 @@ extern int peak_prefix_branch_unsafe12(int);
 extern int peak_prefix_branch_ret8(int);
 extern int peak_prefix_branch_backward8(int);
 extern int peak_prefix_branch_terminal8(int);
+/* The public devkit amalgamation omits this exported relocator API. Keep its
+ * pinned signature explicit so C compilers do not infer an unprototyped call. */
+extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
+    GumRelocationScenario, GumRelocationPolicy, guint*, arm64_reg*);
 extern gboolean peak_gum_arm64_can_relocate(gpointer, guint,
     GumRelocationScenario, GumRelocationPolicy, guint*, arm64_reg*)
     __attribute__((weak));
@@ -47,7 +51,10 @@ static int check_fallback(gpointer target, guint expected_max, gboolean safe)
     }
     return 0;
 }
-static int check_refused(GumInterceptor* interceptor,
+/* NVHPC 24.7 cannot compile memcpy/memcmp with a function symbol directly
+ * as the data address ("alignment: unknown type"). Keep byte comparisons
+ * behind an opaque pointer boundary while retaining the same assertions. */
+static __attribute__((noinline)) int check_refused(GumInterceptor* interceptor,
     GumInvocationListener* listener, gpointer target)
 {
     guint8 before[16];
@@ -65,7 +72,7 @@ int main(void)
 {
     guint old_max = 0, maximum = 0, length = 0;
     arm64_reg scratch = ARM64_REG_INVALID;
-    guint8 before[16], active[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 active[GUM_PEAK_MAX_PROLOGUE_SIZE];
     guint8 original[GUM_PEAK_MAX_PROLOGUE_SIZE];
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
@@ -127,16 +134,11 @@ int main(void)
         fprintf(stderr, "unsupported BC.cond prefix accepted: maximum=%u\n", maximum);
         return 1;
     }
-    memcpy(before, (gpointer)peak_prefix_branch_unsafe, 16);
-    status = gum_interceptor_attach(interceptor,
-        (gpointer)peak_prefix_branch_unsafe, listener, NULL);
-    if (status == GUM_ATTACH_OK) {
-        fputs("backend accepted unsafe target despite relocation guard\n", stderr);
+    if (check_refused(interceptor, listener,
+            (gpointer)peak_prefix_branch_unsafe))
         return 1;
-    }
     result_zero = peak_prefix_branch_unsafe(0);
-    if (memcmp(before, (gpointer)peak_prefix_branch_unsafe, 16) ||
-        result_zero != 7 || calls != 0) {
+    if (result_zero != 7 || calls != 0) {
         fputs("unsafe target did not fail closed without mutation\n", stderr);
         return 1;
     }

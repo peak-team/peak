@@ -768,6 +768,10 @@ typedef union _PeakGumFunctionContextBackendData17 PeakGumFunctionContextBackend
  * Include alternate paths reached by branches inside that prefix before
  * allowing the backend's 8- or 16-byte entry patch. Keep Gum's other policies
  * and patch-size decisions unchanged. */
+/* The public devkit amalgamation omits this exported relocator API. */
+extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
+    GumRelocationScenario, GumRelocationPolicy, guint *, arm64_reg *);
+
 gboolean
 peak_gum_arm64_can_relocate(gpointer address, guint min_bytes,
                             GumRelocationScenario scenario,
