@@ -1,6 +1,5 @@
 #include "frida-gum.h"
 #include <stdio.h>
-#include <string.h>
 extern int peak_prefix_branch_unsafe(int);
 extern int peak_prefix_branch_safe(int);
 extern int peak_prefix_branch_indirect(int);
@@ -26,13 +25,31 @@ static void count(GumInvocationContext* context, gpointer data)
     (void)data;
     calls++;
 }
+/* NVHPC 24.7 cannot compile memory intrinsics on code addresses
+ * ("alignment: unknown type"). Volatile byte reads preserve the byte checks
+ * without letting the compiler recreate a memcpy/memcmp intrinsic. */
+static void snapshot_entry(gpointer target, guint8 before[16])
+{
+    const volatile guint8* code = (const volatile guint8*)target;
+    guint i;
+    for (i = 0; i != 16; i++) before[i] = code[i];
+}
+static gboolean entry_matches(gpointer target, const guint8 before[16])
+{
+    const volatile guint8* code = (const volatile guint8*)target;
+    guint i;
+    for (i = 0; i != 16; i++) {
+        if (before[i] != code[i]) return FALSE;
+    }
+    return TRUE;
+}
 static int check_fallback(gpointer target, guint expected_max, gboolean safe)
 {
     guint old_max = 0, maximum = 0;
     arm64_reg scratch = ARM64_REG_INVALID;
     guint8 before[16];
     gboolean result;
-    memcpy(before, target, sizeof(before));
+    snapshot_entry(target, before);
     result = gum_arm64_relocator_can_relocate(target, 16,
         GUM_SCENARIO_ONLINE, GUM_RELOCATION_CHECKED, &old_max, &scratch);
     if (result || old_max != expected_max) {
@@ -44,24 +61,21 @@ static int check_fallback(gpointer target, guint expected_max, gboolean safe)
     result = peak_gum_arm64_can_relocate(target, 16, GUM_SCENARIO_ONLINE,
         GUM_RELOCATION_CHECKED, &maximum, &scratch);
     if (result || maximum != (safe ? old_max : 0) ||
-        memcmp(before, target, sizeof(before)) != 0) {
+        !entry_matches(target, before)) {
         fprintf(stderr, "fallback guard mismatch: result=%d maximum=%u safe=%d\n",
             result, maximum, safe);
         return 1;
     }
     return 0;
 }
-/* NVHPC 24.7 cannot compile memcpy/memcmp with a function symbol directly
- * as the data address ("alignment: unknown type"). Keep byte comparisons
- * behind an opaque pointer boundary while retaining the same assertions. */
-static __attribute__((noinline)) int check_refused(GumInterceptor* interceptor,
+static int check_refused(GumInterceptor* interceptor,
     GumInvocationListener* listener, gpointer target)
 {
     guint8 before[16];
     GumAttachReturn status;
-    memcpy(before, target, sizeof(before));
+    snapshot_entry(target, before);
     status = gum_interceptor_attach(interceptor, target, listener, NULL);
-    if (status == GUM_ATTACH_OK || memcmp(before, target, sizeof(before)) != 0) {
+    if (status == GUM_ATTACH_OK || !entry_matches(target, before)) {
         fprintf(stderr, "backend accepted or changed unsafe fallback: status=%d\n",
             status);
         return 1;
