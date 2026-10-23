@@ -729,14 +729,14 @@ if(BUILD_TESTING)
                 "x86_dl_dead|peak_unsafe_gum_x86_dl_dead_target"
                 "x86_rdx_dead|peak_unsafe_gum_x86_rdx_dead_target")
             list(APPEND UNSAFE_GUM_PROLOGUE_OVERRIDE_CASES
-                "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target|72"
-                "x86_dl_inc_rax_base|peak_unsafe_gum_x86_dl_inc_rax_base_target|72"
-                "x86_dl_add|peak_unsafe_gum_x86_dl_add_target|72"
-                "x86_edx_inc|peak_unsafe_gum_x86_edx_inc_target|72"
-                "x86_edx_add|peak_unsafe_gum_x86_edx_add_target|72"
-                "x86_dl_sub_zero|peak_unsafe_gum_x86_dl_sub_zero_target|72"
-                "x86_edx_sub_zero|peak_unsafe_gum_x86_edx_sub_zero_target|72"
-                "x86_dl_mov_zero|peak_unsafe_gum_x86_dl_mov_zero_target|72")
+                "x86_dl_inc|peak_unsafe_gum_x86_dl_inc_target"
+                "x86_dl_inc_rax_base|peak_unsafe_gum_x86_dl_inc_rax_base_target"
+                "x86_dl_add|peak_unsafe_gum_x86_dl_add_target"
+                "x86_edx_inc|peak_unsafe_gum_x86_edx_inc_target"
+                "x86_edx_add|peak_unsafe_gum_x86_edx_add_target"
+                "x86_dl_sub_zero|peak_unsafe_gum_x86_dl_sub_zero_target"
+                "x86_edx_sub_zero|peak_unsafe_gum_x86_edx_sub_zero_target"
+                "x86_dl_mov_zero|peak_unsafe_gum_x86_dl_mov_zero_target")
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
             list(APPEND UNSAFE_GUM_PROLOGUE_ALLOWED_CASES
                 "arm64_ip_counter|peak_unsafe_gum_arm64_ip_counter_target"
@@ -846,19 +846,18 @@ if(BUILD_TESTING)
             string(REPLACE "|" ";" _unsafe_parts "${_unsafe_case}")
             list(GET _unsafe_parts 0 _unsafe_name)
             list(GET _unsafe_parts 1 _unsafe_target)
-            list(GET _unsafe_parts 2 _unsafe_expected_byte)
-            add_test(NAME test_unsafe_gum_prologue_override_exercises_${_unsafe_name}
+            add_test(NAME test_unsafe_gum_prologue_override_rejected_${_unsafe_name}
                 COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_unsafe_gum_prologue_case.py
                     --exe ${PROJECT_BINARY_DIR}/test/detach_runtime/test_unsafe_gum_prologue
                     --libpeak ${PROJECT_BINARY_DIR}/src/libpeak.so
                     --case ${_unsafe_name}
                     --target ${_unsafe_target}
-                    --mode override-exercises
-                    --expected-byte ${_unsafe_expected_byte})
-            set_tests_properties(test_unsafe_gum_prologue_override_exercises_${_unsafe_name}
+                    --mode override-rejected)
+            set_tests_properties(test_unsafe_gum_prologue_override_rejected_${_unsafe_name}
                 PROPERTIES
-                    PASS_REGULAR_EXPRESSION "unsafe_gum_prologue_override_exercises_ok")
+                    PASS_REGULAR_EXPRESSION "unsafe_gum_prologue_override_rejected_ok"
+                    FAIL_REGULAR_EXPRESSION "unsafe_prologue_mismatch")
         endforeach()
     endif()
     if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND

@@ -1018,23 +1018,44 @@ policy defers to Gum's own attach result. The conservative PEAK policy can still
 skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
-The pinned Gum 17.15.3 checked relocator begins its control-flow walk after
-those relocated entry bytes. It can therefore miss an alternate path reached
-by a branch inside the prefix that later branches back into the overwritten
-entry. For checked online relocation, PEAK derives the backend's candidate
-patch size from Gum's result: 16 bytes on success, or its 8-byte fallback. PEAK
-supplements the walk with a bounded check of the candidate prefix branch
-targets and, for the 8-byte fallback, its reachable ordinary continuation. A
-destination inside entry bytes 4 through 15 (16-byte patch) or 4 through 7
-(8-byte patch) rejects the target. A 4-byte candidate has no aligned interior
-instruction entry and retains Gum's result. Within the supplemental walk,
-unreadable or undecodable paths, unresolved indirect tail jumps, and exhaustion
-of the 4096-instruction scan budget also reject that target. Returns end a path; calls retain Gum's normal call/return
-assumption. Other targets retain Gum's existing patch-size selection, including
-ordinary 8- and 16-byte patches; a safe fallback preserves Gum's original
-false result and maximum instead of accidentally requesting a 16-byte patch.
-This attach-time check does not change Gum's allocator
-or force all Arm64 targets onto near branches.
+The auto-patched Linux devkit replaces the pinned Gum 17.15.3 native Arm64 and
+x86 relocator members with corrected checked range analysis. The analysis
+starts at the function entry and follows reachable direct branches, including
+branches in the proposed overwrite region. An incoming branch reduces the safe
+overwrite range. Arm64 validates the backend's 16-, 8-, and 4-byte candidates,
+so an incoming branch at offset 12 can yield an 8-byte candidate; x86 reports
+an instruction-boundary maximum. The backend can then choose its existing
+smaller patch when its register and allocation requirements permit it.
+Unreadable or undecodable code, unresolved indirect tail jumps, and scan-budget
+exhaustion fail closed. Returns end a path and calls retain Gum's normal
+call/return assumption. On Linux x86-64, `SYSCALL` has its normal returning
+edge and `UD2` terminates the path. A branch can be pruned only when a unique
+dominating instruction chain proves its value from private, file-backed,
+read-only, non-executable data belonging to the same loaded ELF image. This
+uses the same image-code/data stability assumption as instruction relocation;
+arbitrary read-only mappings are not constants. A reachable unresolved indirect
+tail jump still fails closed. The original instruction rewriters and other
+relocation policies are retained. All Linux x86-64/Arm64 providers, including
+supplied and prebuilt devkits, must expose checked entry-range revision 1; an
+older devkit fails configuration with an update instruction. Supplied devkits
+are never silently patched. The generated header advertises
+`PEAK_GUM_ENTRY_RANGE_CHECKS` only after the replacement succeeds;
+configuration independently verifies its runtime revision query and calls the
+scoped instruction-view helpers. Patched PC-classification providers
+additionally verify the architecture fingerprint. Both checks use compile/link
+validation when cross-compiling. Independent range tests skip older devkits
+without this capability.
+
+While preparing a trampoline under Gum's existing interceptor mutex, graph
+instruction reads use an owned snapshot of ordinary checked listener prologues.
+This avoids treating a previously installed hook as the target's original
+control flow. Constant-data reads remain live. Separate occupied-range checks
+prevent a new patch from overlapping active or queued patches, and direct edges
+into an existing patch interior are rejected. Supported x86 conditional labels
+within the same original relocated prefix retain their trampoline mapping.
+Unsupported existing patch kinds block proofs through their ranges; standalone
+relocation queries keep their conservative live-memory view. This keeps
+supported targets independent of function attachment order.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`

@@ -178,27 +178,36 @@ def route_redirect_resolver_through_overlay(
     print(f"patched {object_name}: routed exact-entry attach resolver dispatch")
 
 
-def route_arm64_relocator(library, members, ar, nm, objcopy, work_dir):
-    object_name = "backend-arm64_guminterceptor-arm64.c.o"
-    original = "gum_arm64_relocator_can_relocate"
-    routed = "peak_gum_arm64_can_relocate"
-    if members.count(object_name) != 1:
-        fail(f"expected exactly one {object_name}")
-    extracted = work_dir / object_name
-    result = run([ar, "x", str(library), object_name], cwd=work_dir)
+def route_trampoline_preparation_through_overlay(
+    library: Path, members: list[str], ar: str, nm: str, objcopy: str,
+    work_dir: Path,
+) -> None:
+    # Rename only the caller's undefined import. The backend definition and
+    # every other backend import remain intact.
+    original = "_gum_interceptor_backend_create_trampoline"
+    dispatch = original + "_peak_dispatch"
+    member = INTERCEPTOR_OBJECT_NAME
+    if members.count(member) != 1:
+        fail(f"expected exactly one {member} for trampoline preparation route")
+    extracted = work_dir / member
+    result = run([ar, "x", str(library), member], cwd=work_dir)
     if result.returncode != 0 or not extracted.exists():
-        fail(f"failed to extract {object_name}")
+        fail(f"failed to extract {member}: {result.stderr}")
     before = symbol_kinds(nm, extracted)
-    if ("U", original) not in before or ("U", routed) in before:
-        fail(f"unexpected Arm64 relocator imports in {object_name}")
-    result = run([objcopy, "--redefine-sym", f"{original}={routed}", str(extracted)])
+    if ("U", original) not in before and ("U", dispatch) in before:
+        print(f"{member}: scoped trampoline preparation already patched")
+        return
+    if ("U", original) not in before or any(name == dispatch for _, name in before):
+        fail(f"unexpected trampoline preparation symbols in {member}")
+    result = run([objcopy, "--redefine-sym", f"{original}={dispatch}", str(extracted)])
     if result.returncode != 0:
-        fail(f"failed to route Arm64 relocation check: {result.stderr}")
+        fail(f"failed to route trampoline preparation: {result.stderr}")
     after = symbol_kinds(nm, extracted)
-    if ("U", original) in after or ("U", routed) not in after:
-        fail("Arm64 relocation routing did not take effect")
+    expected = (before - {("U", original)}) | {("U", dispatch)}
+    if after != expected:
+        fail(f"trampoline preparation route changed unexpected symbols in {member}")
     replace_archive_member(ar, library, extracted)
-    print(f"patched {object_name}: routed checked prefix-branch validation")
+    print(f"patched {member}: routed locked trampoline original-code view")
 
 
 def route_invocation_dispatch_through_overlay(
@@ -1353,9 +1362,9 @@ def main() -> int:
             work_dir,
         )
 
-    if machine == 183:
-        route_arm64_relocator(library, members, args.ar, args.nm,
-                             args.objcopy, work_dir)
+    if machine in (62, 183):
+        route_trampoline_preparation_through_overlay(
+            library, members, args.ar, args.nm, args.objcopy, work_dir)
 
     route_invocation_dispatch_through_overlay(
         library,

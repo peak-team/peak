@@ -13,6 +13,22 @@ extern "C" {
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
+/* Returns the native checked entry-range implementation revision, or zero. */
+GUM_API guint gum_interceptor_peak_entry_range_revision(void);
+/* Instruction-only original-byte view during locked trampoline preparation.
+ * The returned allocation belongs to the caller (g_free). Outside preparation
+ * this reads live memory; it never overlays constant-data reads. */
+GUM_API guint8 * gum_interceptor_peak_read_relocation_code(gconstpointer address,
+                                                          gsize length,
+                                                          gsize * bytes_read);
+GUM_API gboolean gum_interceptor_peak_relocation_range_available(gconstpointer address,
+                                                                 gsize length);
+GUM_API gboolean gum_interceptor_peak_relocation_target_available(gconstpointer address);
+GUM_API gboolean gum_interceptor_peak_relocation_branch_available(
+    gconstpointer source, gsize source_size, gconstpointer target,
+    gboolean internal_label_supported);
+
+
 #define GUM_PEAK_UNWIND_FRAME_API_VERSION 4
 GUM_API gboolean gum_interceptor_peak_unwind_lifecycle_init(void);
 GUM_API gboolean gum_interceptor_peak_unwind_frame_is_live(gpointer context,

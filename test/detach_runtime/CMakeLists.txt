@@ -244,3 +244,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
     PASS_REGULAR_EXPRESSION "gum_arm64_prefix_branch_ok")
 
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_executable(test_gum_x86_entry_range
+    test_gum_x86_entry_range.c gum_x86_entry_range.S)
+  target_include_directories(test_gum_x86_entry_range PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
+  target_link_libraries(test_gum_x86_entry_range PRIVATE
+    ${FRIDA_GUM_LIBRARIES} Threads::Threads ${DL_LIBRARY}
+    ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
+  add_test(NAME test_gum_x86_entry_range COMMAND test_gum_x86_entry_range)
+  set_tests_properties(test_gum_x86_entry_range PROPERTIES
+    TIMEOUT 15 SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "gum_x86_entry_range_ok")
+endif()

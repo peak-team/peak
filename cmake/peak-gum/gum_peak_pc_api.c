@@ -22,6 +22,16 @@
 #include <unistd.h>
 #include "frida-gum.h"
 
+guint
+gum_interceptor_peak_entry_range_revision(void)
+{
+#ifdef PEAK_GUM_ENTRY_RANGE_CHECKS
+    return PEAK_GUM_ENTRY_RANGE_CHECKS;
+#else
+    return 0;
+#endif
+}
+
 #define PEAK_GUM_FAST_DISPATCH_SECTION \
     __attribute__((section("peak_gum_fast_dispatch"), noinline, noclone))
 
@@ -763,201 +773,6 @@ typedef guint8 PeakGumInterceptorType17;
 typedef struct _PeakGumInterceptorBackend17 PeakGumInterceptorBackend17;
 typedef struct _PeakGumFunctionContext17 PeakGumFunctionContext17;
 typedef union _PeakGumFunctionContextBackendData17 PeakGumFunctionContextBackendData17;
-#if defined(__linux__) && defined(__aarch64__)
-/* The pinned relocator starts its CHECKED walk after the relocated prefix.
- * Include alternate paths reached by branches inside that prefix before
- * allowing the backend's 8- or 16-byte entry patch. Keep Gum's other policies
- * and patch-size decisions unchanged. */
-/* The public devkit amalgamation omits this exported relocator API. */
-extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
-    GumRelocationScenario, GumRelocationPolicy, guint *, arm64_reg *);
-
-gboolean
-peak_gum_arm64_can_relocate(gpointer address, guint min_bytes,
-                            GumRelocationScenario scenario,
-                            GumRelocationPolicy policy, guint * maximum,
-                            arm64_reg * scratch)
-{
-    guint original_maximum = 0, candidate_span;
-    gboolean result = gum_arm64_relocator_can_relocate(address, min_bytes,
-        scenario, policy, &original_maximum, scratch);
-    uintptr_t entry = (uintptr_t)address;
-    uintptr_t pending[4096];
-    guint head = 0, tail = 0, examined = 0;
-    GHashTable * visited = NULL;
-    csh capstone = 0;
-    cs_insn * insn = NULL;
-    guint8 * cache = NULL;
-    uintptr_t cache_base = 0;
-    gsize cache_size = 0;
-    gboolean safe = TRUE;
-
-    if (maximum != NULL) *maximum = original_maximum;
-    if (min_bytes != 16 || scenario != GUM_SCENARIO_ONLINE ||
-        policy != GUM_RELOCATION_CHECKED)
-        return result;
-    candidate_span = result ? 16 : original_maximum >= 8 ? 8 :
-        original_maximum >= 4 ? 4 : 0;
-    /* A single aligned instruction has no interior instruction entry. */
-    if (candidate_span <= 4) return result;
-    if (entry > UINTPTR_MAX - candidate_span) {
-        if (maximum != NULL) *maximum = 0;
-        return FALSE;
-    }
-    /* Gum already checks the ordinary continuation of a successful 16-byte
-     * relocation. An 8-byte fallback may have stopped at an ONLINE call or
-     * terminal branch, so it must also check the reachable continuation. */
-    if (candidate_span == 16) {
-        guint8 * prefix;
-        gsize size = 0;
-        gboolean has_branch = FALSE;
-        prefix = gum_memory_read(address, 16, &size);
-        if (prefix == NULL || size != 16) {
-            g_free(prefix);
-            if (maximum != NULL) *maximum = 0;
-            return FALSE;
-        }
-        for (guint offset = 0; offset < 16; offset += 4) {
-            guint32 word;
-            memcpy(&word, prefix + offset, sizeof(word));
-            if ((word & 0xfc000000u) == 0x14000000u ||
-                (word & 0xff000000u) == 0x54000000u ||
-                (word & 0x7e000000u) == 0x34000000u ||
-                (word & 0x7e000000u) == 0x36000000u)
-                has_branch = TRUE;
-        }
-        g_free(prefix);
-        if (!has_branch) return result;
-    }
-    if (cs_open(CS_ARCH_ARM64, GUM_DEFAULT_CS_ENDIAN, &capstone) != CS_ERR_OK) {
-        if (maximum != NULL) *maximum = 0;
-        return FALSE;
-    }
-    if (cs_option(capstone, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) {
-        safe = FALSE;
-        goto done;
-    }
-    insn = cs_malloc(capstone);
-    visited = g_hash_table_new(g_direct_hash, g_direct_equal);
-    if (insn == NULL || visited == NULL) {
-        safe = FALSE;
-        goto done;
-    }
-
-    /* Seed only branch targets missed by the original post-prefix walk. */
-    for (guint offset = 0; offset < candidate_span; offset += 4)
-        pending[tail++] = entry + offset;
-    while (head < tail) {
-        uintptr_t pc = pending[head++];
-        const guint8 * code;
-        size_t available = 4;
-        uint64_t decoded_pc = pc;
-        cs_arm64 * operands;
-        gint target_operand = -1;
-        gboolean fall_through = TRUE;
-        gboolean prefix = pc >= entry && pc < entry + candidate_span;
-
-        if (g_hash_table_contains(visited, (gpointer)pc)) continue;
-        if (++examined > 4096 || (pc & 3) != 0) {
-            safe = FALSE;
-            break;
-        }
-        g_hash_table_add(visited, (gpointer)pc);
-        if (cache == NULL || pc < cache_base || pc - cache_base + 4 > cache_size) {
-            g_free(cache);
-            cache_base = pc & ~((uintptr_t)1023);
-            cache = gum_memory_read((gpointer)cache_base, 1024, &cache_size);
-            if (cache == NULL || pc - cache_base + 4 > cache_size) {
-                safe = FALSE;
-                break;
-            }
-        }
-        code = cache + (pc - cache_base);
-        if (!cs_disasm_iter(capstone, &code, &available, &decoded_pc, insn)) {
-            safe = FALSE;
-            break;
-        }
-        operands = &insn->detail->arm64;
-        switch (insn->id) {
-        case ARM64_INS_BC:
-            /* The pinned relocator does not relocate FEAT_HBC BC.cond and
-             * Capstone may omit its generic jump group. Do not treat this
-             * unproven control transfer as an ordinary instruction. */
-            safe = FALSE;
-            break;
-        case ARM64_INS_B:
-            target_operand = 0;
-            fall_through = operands->cc != ARM64_CC_INVALID &&
-                operands->cc != ARM64_CC_AL && operands->cc != ARM64_CC_NV;
-            break;
-        case ARM64_INS_CBZ: case ARM64_INS_CBNZ:
-            target_operand = 1;
-            break;
-        case ARM64_INS_TBZ: case ARM64_INS_TBNZ:
-            target_operand = 2;
-            break;
-        case ARM64_INS_RET: case ARM64_INS_RETAA: case ARM64_INS_RETAB:
-            fall_through = FALSE;
-            break;
-        case ARM64_INS_BR: case ARM64_INS_BRAA: case ARM64_INS_BRAAZ:
-        case ARM64_INS_BRAB: case ARM64_INS_BRABZ:
-        case ARM64_INS_ERET: case ARM64_INS_ERETAA: case ARM64_INS_ERETAB:
-        case ARM64_INS_DRPS:
-            /* An indirect alternate-path jump could land inside the patch;
-             * unlike a return, its destination has not been established. */
-            safe = FALSE;
-            break;
-        case ARM64_INS_BL: case ARM64_INS_BLR:
-        case ARM64_INS_BLRAA: case ARM64_INS_BLRAAZ:
-        case ARM64_INS_BLRAB: case ARM64_INS_BLRABZ:
-            /* Calls return to this path's next instruction, outside the
-             * overwritten entry. Callee control flow follows Gum's normal
-             * call/return assumption; it is not treated as a tail jump. */
-            break;
-        default:
-            if (cs_insn_group(capstone, insn, CS_GRP_JUMP) ||
-                cs_insn_group(capstone, insn, CS_GRP_IRET) ||
-                cs_insn_group(capstone, insn, CS_GRP_RET))
-                safe = FALSE;
-            break;
-        }
-        if (!safe) break;
-        if (target_operand >= 0) {
-            uintptr_t destination;
-            if (operands->operands[target_operand].type != ARM64_OP_IMM) {
-                safe = FALSE;
-                break;
-            }
-            destination = (uintptr_t)operands->operands[target_operand].imm;
-            if (destination > entry && destination < entry + candidate_span) {
-                safe = FALSE;
-                break;
-            }
-            /* Returning to the entry is valid: the normal hook handles it.
-             * Prefix instructions themselves have already been examined. */
-            if (destination < entry || destination >= entry + candidate_span) {
-                if (tail == G_N_ELEMENTS(pending)) { safe = FALSE; break; }
-                pending[tail++] = destination;
-            }
-        }
-        if ((!prefix || (candidate_span == 8 &&
-                pc == entry + candidate_span - 4)) && fall_through) {
-            if (pc > UINTPTR_MAX - 4 || tail == G_N_ELEMENTS(pending)) {
-                safe = FALSE;
-                break;
-            }
-            pending[tail++] = pc + 4;
-        }
-    }
-done:
-    g_free(cache);
-    if (visited != NULL) g_hash_table_unref(visited);
-    if (insn != NULL) cs_free(insn, 1);
-    cs_close(&capstone);
-    if (!safe && maximum != NULL) *maximum = 0;
-    return safe ? result : FALSE;
-}
-#endif
 
 #if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
 typedef struct _GumInterceptorBackend GumInterceptorBackend;
@@ -1178,6 +993,283 @@ struct _PeakGumFunctionContext17 {
     PeakGumFunctionContextBackendData17 backend_data;
     GumInterceptor * interceptor;
 };
+
+/* Backend trampoline preparation holds this interceptor's recursive mutex.
+ * Copy metadata once: graph reads never acquire the singleton or registry locks,
+ * and a nested preparation gets its own owned view before restoring its parent. */
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+    gboolean ordinary;
+    guint8 original[GUM_PEAK_MAX_PROLOGUE_SIZE];
+} PeakGumRelocationInterval;
+
+typedef struct {
+    GArray * intervals;
+    gboolean valid;
+} PeakGumRelocationScope;
+
+typedef struct {
+    PeakGumFunctionContext17 * ctx;
+    gpointer func;
+} PeakGumUpdateTask17;
+
+typedef struct {
+    PeakGumFunctionContext17 * ctx;
+    GDestroyNotify notify;
+    gpointer data;
+} PeakGumDestroyTask17;
+
+#define PEAK_GUM_RELOCATION_MAX_CONTEXTS 65536u
+#define PEAK_GUM_RELOCATION_MAX_TASKS 1048576u
+static _Thread_local PeakGumRelocationScope * peak_gum_relocation_scope;
+
+static gint
+peak_gum_relocation_interval_compare(gconstpointer left, gconstpointer right)
+{
+    const PeakGumRelocationInterval * a = left;
+    const PeakGumRelocationInterval * b = right;
+    return a->start < b->start ? -1 : a->start != b->start;
+}
+
+static gboolean
+peak_gum_relocation_snapshot_add(PeakGumRelocationScope * scope,
+                                 GHashTable * seen,
+                                 PeakGumInterceptor17 * owner,
+                                 PeakGumFunctionContext17 * current,
+                                 PeakGumFunctionContext17 * ctx)
+{
+    PeakGumRelocationInterval interval;
+    guint length;
+
+    if (ctx == NULL || ctx == current || ctx->interceptor != (GumInterceptor *)owner ||
+        ctx->destroyed > 1 || ctx->activated > 1 || ctx->type > 1) {
+        return FALSE;
+    }
+    if (g_hash_table_contains(seen, ctx)) return TRUE;
+    g_hash_table_add(seen, ctx);
+    if (scope->intervals->len == PEAK_GUM_RELOCATION_MAX_CONTEXTS) return FALSE;
+    length = ctx->overwritten_prologue_len;
+    interval.start = (uintptr_t)ctx->function_address;
+    if (interval.start == 0 || length == 0 || length > GUM_PEAK_MAX_PROLOGUE_SIZE ||
+        interval.start > UINTPTR_MAX - length || ctx->overwritten_prologue == NULL) {
+        return FALSE;
+    }
+#if defined(__aarch64__)
+    if ((interval.start & 3) != 0 || (length & 3) != 0) return FALSE;
+#endif
+    interval.end = interval.start + length;
+    interval.ordinary = ctx->type == 0 && ctx->grafted_hook == NULL &&
+        ctx->import_target == NULL && ctx->replacement_function == NULL &&
+        ctx->write_redirect == NULL &&
+        ctx->relocation_policy == GUM_RELOCATION_CHECKED;
+    /* These bytes are owned by ctx and stable under the borrowed mutex, just
+     * like the existing get_function_patch API's original-prologue copy. */
+    if (interval.ordinary)
+        memcpy(interval.original, ctx->overwritten_prologue, length);
+    else
+        memset(interval.original, 0, sizeof(interval.original));
+    g_array_append_val(scope->intervals, interval);
+    return TRUE;
+}
+
+static gboolean
+peak_gum_relocation_snapshot(PeakGumRelocationScope * scope,
+                             PeakGumInterceptor17 * owner,
+                             PeakGumFunctionContext17 * current)
+{
+    GHashTable * seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GHashTableIter iter;
+    gpointer key, value;
+    guint task_count = 0, i;
+    GList * item;
+    gboolean valid = FALSE;
+
+    if (owner->function_by_address == NULL ||
+        owner->current_transaction.pending_update_tasks == NULL ||
+        owner->current_transaction.pending_destroy_tasks == NULL ||
+        owner->current_transaction.interceptor != (GumInterceptor *)owner ||
+        g_hash_table_size(owner->function_by_address) > PEAK_GUM_RELOCATION_MAX_CONTEXTS)
+        goto done;
+    g_hash_table_iter_init(&iter, owner->function_by_address);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        PeakGumFunctionContext17 * ctx = value;
+        if (ctx == NULL || key != ctx->function_address || ctx->destroyed ||
+            !peak_gum_relocation_snapshot_add(scope, seen, owner, current, ctx))
+            goto done;
+    }
+    /* A detach may already have removed a still-active context from the map.
+     * Pending updates also contain prepared but not-yet-activated contexts. */
+    g_hash_table_iter_init(&iter, owner->current_transaction.pending_update_tasks);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        GArray * tasks = value;
+        if (tasks == NULL || g_array_get_element_size(tasks) != sizeof(PeakGumUpdateTask17) ||
+            tasks->len > PEAK_GUM_RELOCATION_MAX_TASKS - task_count ||
+            (tasks->len != 0 && tasks->data == NULL)) goto done;
+        task_count += tasks->len;
+        for (i = 0; i != tasks->len; ++i) {
+            PeakGumUpdateTask17 * task = &g_array_index(tasks, PeakGumUpdateTask17, i);
+            if (!peak_gum_relocation_snapshot_add(scope, seen, owner, current, task->ctx))
+                goto done;
+        }
+    }
+    item = owner->current_transaction.pending_destroy_tasks->head;
+    while (item != NULL) {
+        PeakGumDestroyTask17 * task = item->data;
+        if (++task_count > PEAK_GUM_RELOCATION_MAX_TASKS || task == NULL ||
+            task->ctx == NULL) goto done;
+        if (task->ctx->activated &&
+            !peak_gum_relocation_snapshot_add(scope, seen, owner, current, task->ctx))
+            goto done;
+        item = item->next;
+    }
+    g_array_sort(scope->intervals, peak_gum_relocation_interval_compare);
+    for (i = 1; i < scope->intervals->len; ++i) {
+        PeakGumRelocationInterval * previous =
+            &g_array_index(scope->intervals, PeakGumRelocationInterval, i - 1);
+        PeakGumRelocationInterval * next =
+            &g_array_index(scope->intervals, PeakGumRelocationInterval, i);
+        if (previous->end > next->start) goto done;
+    }
+    valid = TRUE;
+done:
+    g_hash_table_unref(seen);
+    return valid;
+}
+
+static guint
+peak_gum_relocation_first_interval(PeakGumRelocationScope * scope,
+                                   uintptr_t address)
+{
+    guint low = 0, high = scope->intervals->len;
+    while (low < high) {
+        guint middle = low + (high - low) / 2;
+        PeakGumRelocationInterval * interval =
+            &g_array_index(scope->intervals, PeakGumRelocationInterval, middle);
+        if (interval->end <= address) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
+guint8 *
+gum_interceptor_peak_read_relocation_code(gconstpointer address,
+                                          gsize length, gsize * bytes_read)
+{
+    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    uintptr_t start = (uintptr_t)address, end;
+    guint8 * copy;
+    gsize available = 0;
+    guint index;
+
+    if (bytes_read != NULL) *bytes_read = 0;
+    if (start == 0 || length == 0 || start > UINTPTR_MAX - length ||
+        (scope != NULL && !scope->valid)) return NULL;
+    end = start + length;
+    if (scope != NULL) {
+        index = peak_gum_relocation_first_interval(scope, start);
+        for (; index < scope->intervals->len; ++index) {
+            PeakGumRelocationInterval * interval =
+                &g_array_index(scope->intervals, PeakGumRelocationInterval, index);
+            if (interval->start >= end) break;
+            if (!interval->ordinary) return NULL;
+        }
+    }
+    copy = gum_memory_read(address, length, &available);
+    if (copy == NULL || available > length) {
+        g_free(copy);
+        return NULL;
+    }
+    end = start + available;
+    if (scope != NULL) {
+        index = peak_gum_relocation_first_interval(scope, start);
+        for (; index < scope->intervals->len; ++index) {
+            PeakGumRelocationInterval * interval =
+                &g_array_index(scope->intervals, PeakGumRelocationInterval, index);
+            uintptr_t left, right;
+            if (interval->start >= end) break;
+            left = MAX(start, interval->start);
+            right = MIN(end, interval->end);
+            memcpy(copy + (left - start), interval->original + (left - interval->start),
+                   right - left);
+        }
+    }
+    if (bytes_read != NULL) *bytes_read = available;
+    return copy;
+}
+
+gboolean
+gum_interceptor_peak_relocation_range_available(gconstpointer address,
+                                                 gsize length)
+{
+    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    uintptr_t start = (uintptr_t)address;
+    guint index;
+    if (start == 0 || length == 0 || start > UINTPTR_MAX - length) return FALSE;
+    if (scope == NULL) return TRUE;
+    if (!scope->valid) return FALSE;
+    index = peak_gum_relocation_first_interval(scope, start);
+    return index == scope->intervals->len ||
+        g_array_index(scope->intervals, PeakGumRelocationInterval, index).start >= start + length;
+}
+
+gboolean
+gum_interceptor_peak_relocation_branch_available(gconstpointer source,
+                                                  gsize source_size,
+                                                  gconstpointer address,
+                                                  gboolean internal_label_supported)
+{
+    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    uintptr_t target = (uintptr_t)address, origin = (uintptr_t)source;
+    PeakGumRelocationInterval * interval;
+    guint index;
+    if (target == 0) return FALSE;
+    if (scope == NULL) return TRUE;
+    if (!scope->valid) return FALSE;
+    index = peak_gum_relocation_first_interval(scope, target);
+    if (index == scope->intervals->len) return TRUE;
+    interval = &g_array_index(scope->intervals, PeakGumRelocationInterval, index);
+    if (target <= interval->start) return TRUE;
+    /* Only supported x86 internal conditional labels are remapped into B's
+     * invoke trampoline. External edges and JMP/CALL retain live destinations. */
+    return internal_label_supported && interval->ordinary && source_size != 0 &&
+        origin >= interval->start && origin < interval->end &&
+        source_size <= interval->end - origin;
+}
+
+gboolean
+gum_interceptor_peak_relocation_target_available(gconstpointer address)
+{
+    return gum_interceptor_peak_relocation_branch_available(NULL, 0, address, FALSE);
+}
+
+G_GNUC_INTERNAL gboolean
+_gum_interceptor_backend_create_trampoline(GumInterceptorBackend * backend,
+                                            PeakGumFunctionContext17 * ctx,
+                                            gboolean force);
+
+G_GNUC_INTERNAL gboolean
+_gum_interceptor_backend_create_trampoline_peak_dispatch(
+    GumInterceptorBackend * backend, PeakGumFunctionContext17 * ctx,
+    gboolean force)
+{
+    PeakGumRelocationScope scope;
+    PeakGumRelocationScope * previous = peak_gum_relocation_scope;
+    PeakGumInterceptor17 * owner;
+    gboolean result;
+
+    if (ctx == NULL || ctx->interceptor == NULL) return FALSE;
+    owner = (PeakGumInterceptor17 *)ctx->interceptor;
+    if (owner->backend != (PeakGumInterceptorBackend17 *)backend) return FALSE;
+    scope.intervals = g_array_new(FALSE, FALSE, sizeof(PeakGumRelocationInterval));
+    scope.valid = peak_gum_relocation_snapshot(&scope, owner, ctx);
+    peak_gum_relocation_scope = &scope;
+    result = scope.valid &&
+        _gum_interceptor_backend_create_trampoline(backend, ctx, force);
+    peak_gum_relocation_scope = previous;
+    g_array_unref(scope.intervals);
+    return result;
+}
 
 typedef GArray PeakGumInvocationStack17;
 

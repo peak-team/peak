@@ -103,6 +103,100 @@ function(_peak_patch_frida_gum_elf_module _source_dir _output_dir)
     endif()
 endfunction()
 
+set(PEAK_GUM_RELOCATOR_SOURCE_DIR "" CACHE PATH
+    "Directory containing hash-pinned Gum 17.15.3 gumarm64relocator.c/gumx86relocator.c")
+
+function(_peak_replace_gum_relocator _source_dir _output_dir)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _processor)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        return()
+    endif()
+    if(_processor MATCHES "^(aarch64|arm64)$")
+        set(_arch arm64)
+        set(_hash 94ce96c7783d944443c37682dbd51c71b81829e9af0cd89b84075abc01a90f54)
+    elseif(_processor MATCHES "^(x86_64|amd64)$")
+        set(_arch x86)
+        set(_hash cab6091265282f49d3f0adea72108e0a73ea218622e5b51b4ffccf668410e0ea)
+    else()
+        return()
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(PEAK_GUM_RELOCATOR_SOURCE_DIR)
+        set(_cache "${PEAK_GUM_RELOCATOR_SOURCE_DIR}")
+    else()
+        set(_cache "${PROJECT_BINARY_DIR}/frida-gum-relocator-source")
+    endif()
+    set(_original "${_cache}/gum${_arch}relocator.c")
+    if(NOT EXISTS "${_original}")
+        if(NOT PEAK_FETCH_DEPS OR PEAK_GUM_RELOCATOR_SOURCE_DIR)
+            message(FATAL_ERROR "Missing pinned relocator source ${_original}; provide PEAK_GUM_RELOCATOR_SOURCE_DIR or enable PEAK_FETCH_DEPS")
+        endif()
+        file(MAKE_DIRECTORY "${_cache}")
+        file(DOWNLOAD
+            "https://raw.githubusercontent.com/frida/frida-gum/e5b0d7d6a9a83da1750b6fc654006a714b81a890/gum/arch-${_arch}/gum${_arch}relocator.c"
+            "${_original}" EXPECTED_HASH "SHA256=${_hash}" TLS_VERIFY ON
+            TIMEOUT 60 INACTIVITY_TIMEOUT 20 STATUS _download_status)
+        list(GET _download_status 0 _download_code)
+        if(NOT _download_code EQUAL 0)
+            file(REMOVE "${_original}")
+            message(FATAL_ERROR "Failed to download pinned Gum relocator: ${_download_status}")
+        endif()
+    endif()
+    file(SHA256 "${_original}" _actual_hash)
+    if(NOT _actual_hash STREQUAL _hash)
+        message(FATAL_ERROR "Pinned Gum relocator SHA256 mismatch: ${_original}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${_original}"
+        "${_source_dir}/peak-gum/prepare_relocator_source.py"
+        "${_source_dir}/peak-gum/replace_relocator_member.py"
+        "${_source_dir}/peak-gum/gum${_arch}relocator-compat.h"
+        "${_source_dir}/peak-gum/${_arch}-relocator-range.inc"
+        "${_source_dir}/peak-gum/gum_peak_pc_api.c"
+        "${_source_dir}/peak-gum/frida-gum-peak-api.h"
+        "${_source_dir}/peak-gum/patch_frida_gum_elf_module.py")
+    set(_prepared "${_output_dir}/gum${_arch}relocator-peak.c")
+    execute_process(COMMAND "${Python3_EXECUTABLE}"
+        "${_source_dir}/peak-gum/prepare_relocator_source.py"
+        --source "${_original}" --output "${_prepared}"
+        --arch "${_arch}" --sha256 "${_hash}"
+        TIMEOUT 30 RESULT_VARIABLE _prepare_result ERROR_VARIABLE _prepare_error)
+    if(NOT _prepare_result EQUAL 0)
+        message(FATAL_ERROR "Cannot prepare Gum relocator: ${_prepare_error}")
+    endif()
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" _build_type)
+    separate_arguments(_flags NATIVE_COMMAND
+        "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_build_type}}")
+    set(_toolchain_flags)
+    if(CMAKE_C_COMPILER_TARGET)
+        list(APPEND _toolchain_flags "--target=${CMAKE_C_COMPILER_TARGET}")
+    endif()
+    if(CMAKE_SYSROOT)
+        list(APPEND _toolchain_flags "--sysroot=${CMAKE_SYSROOT}")
+    endif()
+    set(_object "${_output_dir}/arch-${_arch}_gum${_arch}relocator.c.o")
+    execute_process(COMMAND "${CMAKE_C_COMPILER}" ${_toolchain_flags}
+        -std=c11 -fPIC -O2 -DG_DISABLE_ASSERT -D_GNU_SOURCE -DHAVE_LINUX ${_flags}
+        "-I${_output_dir}" "-I${_source_dir}/peak-gum"
+        -c "${_prepared}" -o "${_object}"
+        TIMEOUT 120 RESULT_VARIABLE _compile_result ERROR_VARIABLE _compile_error)
+    if(NOT _compile_result EQUAL 0)
+        message(FATAL_ERROR "Cannot compile Gum relocator: ${_compile_error}")
+    endif()
+    execute_process(COMMAND "${Python3_EXECUTABLE}"
+        "${_source_dir}/peak-gum/replace_relocator_member.py"
+        --library "${_output_dir}/libfrida-gum.a" --object "${_object}"
+        --ar "${CMAKE_AR}" --nm "${CMAKE_NM}"
+        --work-dir "${_output_dir}/relocator-member-patch"
+        TIMEOUT 120 RESULT_VARIABLE _replace_result OUTPUT_VARIABLE _replace_output ERROR_VARIABLE _replace_error)
+    if(NOT _replace_result EQUAL 0)
+        message(FATAL_ERROR "Cannot replace Gum relocator: ${_replace_error}")
+    endif()
+    string(STRIP "${_replace_output}" _replace_output)
+    message(STATUS "${_replace_output}")
+    set(PEAK_GUM_ENTRY_RANGE_REPLACED ON PARENT_SCOPE)
+endfunction()
+
 function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     file(MAKE_DIRECTORY "${_output_dir}")
     configure_file("${_input_dir}/libfrida-gum.a"
@@ -110,6 +204,12 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     configure_file("${_input_dir}/frida-gum.h"
                    "${_output_dir}/frida-gum.h" COPYONLY)
 
+    set(PEAK_GUM_ENTRY_RANGE_REPLACED OFF)
+    _peak_replace_gum_relocator("${_source_dir}" "${_output_dir}")
+    if(PEAK_GUM_ENTRY_RANGE_REPLACED)
+        file(APPEND "${_output_dir}/frida-gum.h"
+            "\n/* Capability of this generated archive/header pair. */\n#define PEAK_GUM_ENTRY_RANGE_CHECKS 1\n")
+    endif()
     _peak_patch_frida_gum_elf_module("${_source_dir}" "${_output_dir}")
 
     file(READ "${_source_dir}/peak-gum/frida-gum-peak-api.h" _peak_gum_api_header)
@@ -287,6 +387,58 @@ function(_peak_configure_patched_frida_gum)
     set(FRIDA_GUM_INCLUDE_DIRS "${_gum_include_dir}" PARENT_SCOPE)
 endfunction()
 
+function(_peak_validate_gum_entry_range)
+    include(CheckCSourceCompiles)
+    include(CheckCSourceRuns)
+    set(CMAKE_REQUIRED_INCLUDES "${FRIDA_GUM_INCLUDE_DIRS}")
+    set(CMAKE_REQUIRED_LIBRARIES
+        "${FRIDA_GUM_LIBRARIES};Threads::Threads;${DL_LIBRARY};${RT_LIBRARY};${RESOLV_LIBRARY};${M_LIBRARY}")
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
+    set(_probe "
+#include <frida-gum.h>
+#if !defined(PEAK_GUM_ENTRY_RANGE_CHECKS) || PEAK_GUM_ENTRY_RANGE_CHECKS != 1
+#error Missing PEAK Gum checked entry-range revision 1
+#endif
+int main(void)
+{
+    static const guint8 original[] = { 0x5a };
+    guint8 * (*read_code)(gconstpointer, gsize, gsize *) =
+        gum_interceptor_peak_read_relocation_code;
+    gboolean (*range_available)(gconstpointer, gsize) =
+        gum_interceptor_peak_relocation_range_available;
+    gboolean (*target_available)(gconstpointer) =
+        gum_interceptor_peak_relocation_target_available;
+    gboolean (*branch_available)(gconstpointer, gsize, gconstpointer, gboolean) =
+        gum_interceptor_peak_relocation_branch_available;
+    gsize size = 0;
+    guint8 * copy;
+    int result;
+    if (gum_interceptor_peak_entry_range_revision() != 1) return 1;
+    gum_init_embedded();
+    copy = read_code(original, sizeof(original), &size);
+    result = copy == NULL || size != sizeof(original) || copy[0] != original[0] ||
+        !range_available(original, sizeof(original)) ||
+        !target_available(original) ||
+        !branch_available(original, sizeof(original), original, FALSE);
+    g_free(copy);
+    gum_deinit_embedded();
+    return result;
+}
+")
+    unset(PEAK_GUM_HAS_ENTRY_RANGE_CHECKS CACHE)
+    if(CMAKE_CROSSCOMPILING)
+        check_c_source_compiles("${_probe}" PEAK_GUM_HAS_ENTRY_RANGE_CHECKS)
+    else()
+        check_c_source_runs("${_probe}" PEAK_GUM_HAS_ENTRY_RANGE_CHECKS)
+    endif()
+    if(NOT PEAK_GUM_HAS_ENTRY_RANGE_CHECKS)
+        message(FATAL_ERROR
+            "Linux x86-64/Arm64 instrumentation requires Frida Gum checked entry-range revision 1 and its scoped instruction-view helper API. "
+            "Update the supplied devkit and select patched-devkit, or use PEAK_FRIDA_GUM_PROVIDER=auto "
+            "with FRIDA_GUM_* unset. Unpatched prebuilt devkits cannot safely instrument these targets.")
+    endif()
+endfunction()
+
 function(_peak_validate_frida_gum_peak_api)
     include(CheckCSourceCompiles)
     include(CheckCSourceRuns)
@@ -449,7 +601,7 @@ int main(void)
     if(NOT PEAK_GUM_HAS_PEAK_PC_API)
         message(FATAL_ERROR
             "The selected Frida Gum devkit does not expose a linkable PEAK PC classification API. "
-            "Use the stock prebuilt provider, or point PEAK_PATCHED_GUM_ROOT at patched headers and libfrida-gum.a.")
+            "Update the caller-provided patched devkit (including checked entry-range revision 1), or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset.")
     endif()
 
     set(_peak_gum_exact_attach_probe_source "
@@ -581,6 +733,11 @@ macro(configure_frida_gum _download_module_path _download_root)
         # the exact 17.15.3 devkit pinned by frida-gum-download.cmake.  Fail
         # closed for caller-provided Gum, whose private ABI is unknown.
         set(PEAK_GUM_DARWIN_PATCH_API_AVAILABLE ON)
+    endif()
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       _peak_processor MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+        _peak_validate_gum_entry_range()
     endif()
 
     if(PEAK_REQUIRE_GUM_PEAK_API OR
