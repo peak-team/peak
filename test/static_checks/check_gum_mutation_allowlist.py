@@ -47,6 +47,12 @@ EXPECTED = {
     ("strict-target-attach", "cmake/peak-gum/gum_peak_pc_api.c"): {
         "attach": 1,
     },
+    ("support-init", "cmake/peak-gum/gum_peak_pc_api.c"): {
+        "replace": 1,
+    },
+    ("support-shutdown-debt", "cmake/peak-gum/gum_peak_pc_api.c"): {
+        "revert": 1,
+    },
     ("support-init", "src/mpi_interceptor.c"): {
         "begin_transaction": 1,
         "end_transaction": 1,
@@ -125,6 +131,8 @@ FUNCTION_ANCHORS = {
     },
     "cmake/peak-gum/gum_peak_pc_api.c": {
         "gum_interceptor_peak_attach_exact": "strict-target-attach",
+        "peak_gum_fast_unwind_ensure": "support-init",
+        "peak_gum_fast_unwind_shutdown": "support-shutdown-debt",
     },
 }
 

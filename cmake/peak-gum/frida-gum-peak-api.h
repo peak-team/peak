@@ -13,7 +13,23 @@ extern "C" {
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
-
+#define GUM_PEAK_UNWIND_FRAME_API_VERSION 4
+GUM_API gboolean gum_interceptor_peak_unwind_lifecycle_init(void);
+GUM_API gboolean gum_interceptor_peak_unwind_frame_is_live(gpointer context,
+                                                           gpointer slot);
+GUM_API guint gum_interceptor_peak_unwind_frame_api_version(void);
+GUM_API gboolean gum_interceptor_peak_unwind_reconcile_current_thread(void);
+GUM_API guint64
+gum_interceptor_peak_unwind_thread_cookie(guintptr native_thread);
+GUM_API void gum_interceptor_peak_unwind_thread_joined(guint64 cookie,
+                                                       guintptr native_thread,
+                                                       gboolean token_valid,
+                                                       guint64 slot,
+                                                       guint64 generation);
+GUM_API gboolean gum_interceptor_peak_unwind_reap_threads(void);
+GUM_API void gum_interceptor_peak_unwind_diagnostics(guint64 *owners,
+                                                     guint64 *blocks,
+                                                     guint64 *active);
 #define GUM_PEAK_DEFERRED_MODULE_SYNC_API_VERSION 5
 
 /*
@@ -47,60 +63,60 @@ GUM_API void gum_interceptor_peak_end_module_mutation(void);
  * can use these callbacks without duplicating that machinery.
  */
 typedef enum {
-    GUM_PEAK_FAST_ENTER_SKIP = 0,
-    GUM_PEAK_FAST_ENTER_INVOKE = 1,
-    GUM_PEAK_FAST_ENTER_FALLBACK = 2
+  GUM_PEAK_FAST_ENTER_SKIP = 0,
+  GUM_PEAK_FAST_ENTER_INVOKE = 1,
+  GUM_PEAK_FAST_ENTER_FALLBACK = 2
 } GumPeakFastEnterResult;
 
-typedef GumPeakFastEnterResult (* GumPeakFastEnterFunc)(
-    gpointer user_data,
-    gpointer function_context,
-    gpointer stack_address,
-    gpointer caller_return_address,
-    guint gum_stack_depth);
-typedef gboolean (* GumPeakFastLeaveFunc)(
-    gpointer user_data,
-    gpointer function_context,
-    gpointer stack_address,
-    guint * gum_stack_depth,
-    gpointer * caller_return_address);
-typedef gboolean (* GumPeakFastIsDirectLeaveFunc)(
-    gpointer user_data,
-    gpointer function_context,
-    gpointer stack_address);
-typedef guint (* GumPeakFastActiveCountFunc)(gpointer user_data);
-typedef guint (* GumPeakFastActiveCloseFunc)(gpointer user_data);
-typedef void (* GumPeakFastActiveResetFunc)(gpointer user_data);
+typedef GumPeakFastEnterResult (*GumPeakFastEnterFunc)(
+    gpointer user_data, gpointer function_context, gpointer stack_address,
+    gpointer caller_return_address, guint gum_stack_depth);
+typedef gboolean (*GumPeakFastLeaveFunc)(gpointer user_data,
+                                         gpointer function_context,
+                                         gpointer stack_address,
+                                         guint *gum_stack_depth,
+                                         gpointer *caller_return_address);
+typedef gboolean (*GumPeakFastIsDirectLeaveFunc)(gpointer user_data,
+                                                 gpointer function_context,
+                                                 gpointer stack_address);
+typedef guint (*GumPeakFastActiveCountFunc)(gpointer user_data);
+typedef guint (*GumPeakFastActiveCloseFunc)(gpointer user_data);
+typedef void (*GumPeakFastActiveResetFunc)(gpointer user_data);
+/* Translates any direct frame owned by the calling thread. The callback must
+ * be allocation-free and remain valid until Gum shutdown. It returns NULL
+ * for an unrelated PC and does not retire frames during handler search. */
+typedef gpointer (*GumPeakFastTranslateFunc)(gpointer code_address);
 
 typedef struct _GumPeakFastListener {
-    guint version;
-    GumPeakFastEnterFunc on_enter;
-    GumPeakFastLeaveFunc on_leave;
-    GumPeakFastIsDirectLeaveFunc is_direct_leave;
-    GumPeakFastActiveCountFunc active_count;
-    GumPeakFastActiveCloseFunc active_close;
-    GumPeakFastActiveResetFunc active_reset;
-    gpointer user_data;
-    GumInvocationListener * listener_instance;
-    gpointer dispatch_start;
-    gsize dispatch_size;
-    gpointer listener_entries_cookie;
-    volatile gint enabled;
-    volatile gint release_required;
+  guint version;
+  GumPeakFastEnterFunc on_enter;
+  GumPeakFastLeaveFunc on_leave;
+  GumPeakFastIsDirectLeaveFunc is_direct_leave;
+  GumPeakFastActiveCountFunc active_count;
+  GumPeakFastActiveCloseFunc active_close;
+  GumPeakFastActiveResetFunc active_reset;
+  GumPeakFastTranslateFunc translate_return_address;
+  gpointer user_data;
+  GumInvocationListener *listener_instance;
+  gpointer dispatch_start;
+  gsize dispatch_size;
+  gpointer listener_entries_cookie;
+  volatile gint enabled;
+  volatile gint release_required;
 } GumPeakFastListener;
 
-#define GUM_PEAK_FAST_LISTENER_VERSION 8u
+#define GUM_PEAK_FAST_LISTENER_VERSION 10u
+
+GUM_API gpointer gum_interceptor_peak_translate_fast_return_address(
+    gpointer function_context, gpointer caller_return_address,
+    gpointer code_address);
 
 GUM_API gboolean gum_interceptor_peak_invocation_stack_entry_matches(
-    guint depth,
-    gpointer function_address,
-    gpointer stack_address);
+    guint depth, gpointer function_address, gpointer stack_address);
 
 GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener,
-    GumPeakFastListener * fast_listener);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, GumPeakFastListener *fast_listener);
 
 /*
  * Called while PEAK's existing stop-the-world mutation guard is active. The
@@ -115,88 +131,74 @@ GUM_API gboolean gum_interceptor_peak_enable_fast_listener(
  * This function then seeds Gum's deferred-destruction counter from that total.
  */
 GUM_API gboolean gum_interceptor_peak_prepare_fast_detach(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener);
 
 /* Releases a fast frame skipped by non-local unwind or thread exit. */
 G_GNUC_INTERNAL void gum_interceptor_peak_release_fast_invocation(
-    gpointer function_context,
-    GumPeakFastListener * fast_listener);
+    gpointer function_context, GumPeakFastListener *fast_listener);
 
 typedef enum {
-    GUM_PEAK_PC_SAFE = 0,
-    GUM_PEAK_PC_AT_PATCH_ENTRY,
-    GUM_PEAK_PC_IN_ENTER_TRAMPOLINE,
-    GUM_PEAK_PC_IN_INVOKE_TRAMPOLINE,
-    GUM_PEAK_PC_IN_LEAVE_TRAMPOLINE,
-    GUM_PEAK_PC_IN_DISPATCH,
-    GUM_PEAK_PC_UNKNOWN
+  GUM_PEAK_PC_SAFE = 0,
+  GUM_PEAK_PC_AT_PATCH_ENTRY,
+  GUM_PEAK_PC_IN_ENTER_TRAMPOLINE,
+  GUM_PEAK_PC_IN_INVOKE_TRAMPOLINE,
+  GUM_PEAK_PC_IN_LEAVE_TRAMPOLINE,
+  GUM_PEAK_PC_IN_DISPATCH,
+  GUM_PEAK_PC_UNKNOWN
 } GumPeakPcState;
 
 typedef struct _GumPeakPcDiagnostics {
-    gpointer function_address;
-    guint overwritten_prologue_len;
-    gpointer trampoline_slice_start;
-    gsize trampoline_slice_size;
-    gpointer on_enter_trampoline;
-    gpointer on_leave_trampoline;
-    gpointer on_invoke_trampoline;
-    gpointer enter_thunk_start;
-    gsize enter_thunk_size;
-    gpointer leave_thunk_start;
-    gsize leave_thunk_size;
-    gpointer fast_overlay_dispatch_start;
-    gsize fast_overlay_dispatch_size;
-    gpointer fast_listener_dispatch_start;
-    gsize fast_listener_dispatch_size;
+  gpointer function_address;
+  guint overwritten_prologue_len;
+  gpointer trampoline_slice_start;
+  gsize trampoline_slice_size;
+  gpointer on_enter_trampoline;
+  gpointer on_leave_trampoline;
+  gpointer on_invoke_trampoline;
+  gpointer enter_thunk_start;
+  gsize enter_thunk_size;
+  gpointer leave_thunk_start;
+  gsize leave_thunk_size;
+  gpointer fast_overlay_dispatch_start;
+  gsize fast_overlay_dispatch_size;
+  gpointer fast_listener_dispatch_start;
+  gsize fast_listener_dispatch_size;
 } GumPeakPcDiagnostics;
 
 GUM_API gboolean gum_interceptor_peak_classify_pc(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener,
-    gpointer pc,
-    GumPeakFunctionContext ** ctx,
-    GumPeakPcState * state);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, gpointer pc, GumPeakFunctionContext **ctx,
+    GumPeakPcState *state);
 
-GUM_API gpointer gum_interceptor_peak_safe_pc(
-    GumPeakFunctionContext * ctx,
-    gpointer pc,
-    GumPeakPcState state);
+GUM_API gpointer gum_interceptor_peak_safe_pc(GumPeakFunctionContext *ctx,
+                                              gpointer pc,
+                                              GumPeakPcState state);
 
 GUM_API gboolean gum_interceptor_peak_get_pc_diagnostics(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener,
-    GumPeakPcDiagnostics * diagnostics);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, GumPeakPcDiagnostics *diagnostics);
 
 #define GUM_PEAK_MAX_PROLOGUE_SIZE 32u
 
 GUM_API gboolean gum_interceptor_peak_get_function_patch(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener,
-    guint8 * active_patch,
-    guint8 * original_prologue,
-    guint * prologue_len);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, guint8 *active_patch,
+    guint8 *original_prologue, guint *prologue_len);
 
 #if defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__)
-# define GUM_PEAK_EXACT_ATTACH_API_VERSION 1
-# define GUM_PEAK_REDIRECT_RESOLVER_API_VERSION 1
+#define GUM_PEAK_EXACT_ATTACH_API_VERSION 1
+#define GUM_PEAK_REDIRECT_RESOLVER_API_VERSION 1
 
 /* Attach to the supplied entry without following its leading redirect. */
 GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    GumInvocationListener * listener,
-    const GumAttachOptions * options);
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, const GumAttachOptions *options);
 
 /* Resolves the same redirect chain followed by Gum replacement APIs. */
 GUM_API gboolean gum_interceptor_peak_resolve_redirect_chain(
-    GumInterceptor * interceptor,
-    gpointer function_address,
-    gpointer * resolved_address);
+    GumInterceptor *interceptor, gpointer function_address,
+    gpointer *resolved_address);
 #endif
 
 #ifdef __cplusplus

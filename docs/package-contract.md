@@ -20,6 +20,25 @@ may remove a library for which the executable references no symbols. Linux
 applications load PEAK through `LD_PRELOAD`; macOS applications use
 `DYLD_INSERT_LIBRARIES`. `PEAK_PUBLIC_INTERFACE` is `PRELOAD_ONLY`.
 
+On Linux, libpeak's callback TLS already uses the initial-exec model: its
+per-thread storage is reserved when the loader admits the whole DSO. Profiling
+uses the startup-loaded library. Loading target DSOs later is supported as
+described in [runtime dlopen profiling](dlopen-profiling.md); this does not
+mean that loading libpeak itself later starts profiling. The package's
+`dlopen` smoke test checks library loading and release, including with existing
+threads. Late loading of libpeak retains the loader's existing static-TLS
+capacity and alignment restrictions; success on one process is not a promise
+of arbitrary late-load admission. The [GNU C Library's TLS guidance](https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html)
+also describes this initial-exec/dynamic-loading limitation.
+
+The Linux x86-64 unwind owner pointer and recursion guard use the same access
+model. They remain zero-initialized scalar thread-local fields, without a TLS
+destructor of their own. Their lifetime still covers pthread-key destruction;
+the existing key/owner protocol retains unwind metadata until thread-death
+proof. This change does not add storage, shorten that lifetime, or change the
+frame live counter's atomic updates. These unwind TLS fields are not compiled on
+Linux Arm64 or macOS.
+
 PEAK does not currently publish a general C or C++ header API. Headers under
 the source-tree `include/` directory are implementation interfaces and are not
 installed. Downstream code must not include or depend on them.

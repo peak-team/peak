@@ -6430,8 +6430,10 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address)
             &thread_data.entries[thread_data.level - 1];
         if (entry->fast_dispatch) {
             if (entry->stack_address == NULL ||
-                (guint8*)entry->stack_address >=
-                    (guint8*)stack_address) {
+                (guint8*)entry->stack_address > (guint8*)stack_address ||
+                (entry->stack_address == stack_address &&
+                 gum_interceptor_peak_unwind_frame_is_live(
+                     entry->function_context, entry->stack_address))) {
                 break;
             }
         } else if (
@@ -6442,6 +6444,34 @@ peak_general_listener_fast_reap_unwound(gpointer stack_address)
             break;
         }
 
+        thread_data.level--;
+        peak_general_listener_abandon_entry(
+            &thread_data,
+            &thread_data.entries[thread_data.level]);
+    }
+}
+
+static void
+peak_general_listener_reap_known_unwound(void)
+{
+    while (thread_data.level > 0) {
+        PeakGeneralInvocationEntry* entry =
+            &thread_data.entries[thread_data.level - 1];
+        gboolean live;
+
+        if (entry->fast_dispatch) {
+            live = entry->stack_address == NULL ||
+                gum_interceptor_peak_unwind_frame_is_live(
+                    entry->function_context, entry->stack_address);
+        } else {
+            live = gum_interceptor_peak_invocation_stack_entry_matches(
+                entry->gum_stack_depth,
+                entry->function_context,
+                entry->stack_address);
+        }
+        if (live) {
+            break;
+        }
         thread_data.level--;
         peak_general_listener_abandon_entry(
             &thread_data,
@@ -6505,6 +6535,29 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     thread_data.in_callback = FALSE;
     return GUM_PEAK_FAST_ENTER_INVOKE;
 }
+
+#if GUM_PEAK_FAST_LISTENER_VERSION >= 9
+static gpointer
+peak_general_listener_fast_translate_return_address(gpointer code_address)
+{
+    /* Keep entries intact throughout both unwind phases. In particular,
+     * handler search must not release the lifetime or timing record. */
+    for (gulong level = thread_data.level; level > 0; level--) {
+        PeakGeneralInvocationEntry* entry = &thread_data.entries[level - 1];
+        if (entry->fast_dispatch) {
+            gpointer translated =
+                gum_interceptor_peak_translate_fast_return_address(
+                    entry->function_context,
+                    entry->caller_return_address,
+                    code_address);
+            if (translated != NULL) {
+                return translated;
+            }
+        }
+    }
+    return NULL;
+}
+#endif
 
 static gboolean PEAK_LISTENER_FAST_DISPATCH_SECTION
 peak_general_listener_fast_on_leave(gpointer user_data,
@@ -6738,12 +6791,18 @@ peak_general_listener_gum_attach_target(
 
     if (status == GUM_ATTACH_OK && PEAKGENERAL_IS_LISTENER(listener)) {
         PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+#if GUM_PEAK_FAST_LISTENER_VERSION >= 9
         self->fast_dispatch_enabled =
             gum_interceptor_peak_enable_fast_listener(
                 target_interceptor,
                 address,
                 listener,
                 &self->fast_listener);
+#else
+        /* Earlier direct-dispatch ABIs cannot expose PEAK's private return
+         * PCs to the unwinder. The generic Gum path retains that metadata. */
+        self->fast_dispatch_enabled = FALSE;
+#endif
         if (!self->fast_dispatch_enabled) {
             peak_log_debug(
                 "[peak] Gum direct listener dispatch unavailable for hook %lu; using generic dispatch\n",
@@ -7045,6 +7104,10 @@ peak_general_listener_init(PeakGeneralListener* self)
         .active_count = peak_general_listener_fast_active_count,
         .active_close = peak_general_listener_fast_active_close,
         .active_reset = peak_general_listener_fast_active_reset,
+#if GUM_PEAK_FAST_LISTENER_VERSION >= 9
+        .translate_return_address =
+            peak_general_listener_fast_translate_return_address,
+#endif
         .user_data = self,
         .listener_instance = GUM_INVOCATION_LISTENER(self),
 #if defined(__APPLE__)
@@ -9124,6 +9187,9 @@ gboolean peak_general_listener_dettach()
     }
 
     peak_general_listener_controller_stop();
+    if (gum_interceptor_peak_unwind_reconcile_current_thread()) {
+        peak_general_listener_reap_known_unwound();
+    }
 
 #if defined(__APPLE__)
     /*

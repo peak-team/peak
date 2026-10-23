@@ -102,6 +102,10 @@ size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found);
 /** Returns the calling thread's TLS slot without consulting the hash table. */
 gboolean pthread_listener_current_thread_slot(size_t* slot_out);
 
+/** Returns the calling thread's stable slot generation when it is tracked. */
+gboolean pthread_listener_current_thread_token(size_t* slot_out,
+                                               uint64_t* generation_out);
+
 /** Marks the calling PEAK helper thread as ineligible for user accounting. */
 void pthread_listener_exclude_current_thread(void);
 

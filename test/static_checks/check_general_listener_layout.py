@@ -30,6 +30,11 @@ EXPECTED_SECTIONS = (
     "Final reporting and shutdown",
 )
 
+EXPECTED_IMPLEMENTATION_FRAGMENTS = (
+    Path("cmake/peak-gum/peak_gum_invoke_cfi.inc"),
+    Path("cmake/peak-gum/peak_gum_unwind_frames.inc"),
+)
+
 
 def main() -> int:
     if len(sys.argv) != 2:
@@ -78,8 +83,11 @@ def main() -> int:
         for path in (root / directory).rglob("*.inc")
         if path.is_file()
     )
-    if inc_files:
-        errors.append(f"implementation fragments remain: {inc_files!r}")
+    if tuple(inc_files) != EXPECTED_IMPLEMENTATION_FRAGMENTS:
+        errors.append(
+            "implementation fragment inventory changed: "
+            f"expected {EXPECTED_IMPLEMENTATION_FRAGMENTS!r}, "
+            f"found {tuple(inc_files)!r}")
     if re.search(r'^\s*#\s*include\s+[<\"][^>\"]+\.(?:inc|c)[>\"]',
                  source_text,
                  re.MULTILINE):
