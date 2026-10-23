@@ -1022,7 +1022,9 @@ typedef struct {
 
 #define PEAK_GUM_RELOCATION_MAX_CONTEXTS 65536u
 #define PEAK_GUM_RELOCATION_MAX_TASKS 1048576u
-static _Thread_local PeakGumRelocationScope * peak_gum_relocation_scope;
+/* Attach-time scopes use a pthread-backed key instead of consuming the
+ * static TLS budget needed by callback fast paths and late library loading. */
+static GPrivate peak_gum_relocation_scope = G_PRIVATE_INIT(NULL);
 
 static gint
 peak_gum_relocation_interval_compare(gconstpointer left, gconstpointer right)
@@ -1156,7 +1158,7 @@ guint8 *
 gum_interceptor_peak_read_relocation_code(gconstpointer address,
                                           gsize length, gsize * bytes_read)
 {
-    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    PeakGumRelocationScope * scope = g_private_get(&peak_gum_relocation_scope);
     uintptr_t start = (uintptr_t)address, end;
     guint8 * copy;
     gsize available = 0;
@@ -1202,7 +1204,7 @@ gboolean
 gum_interceptor_peak_relocation_range_available(gconstpointer address,
                                                  gsize length)
 {
-    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    PeakGumRelocationScope * scope = g_private_get(&peak_gum_relocation_scope);
     uintptr_t start = (uintptr_t)address;
     guint index;
     if (start == 0 || length == 0 || start > UINTPTR_MAX - length) return FALSE;
@@ -1219,7 +1221,7 @@ gum_interceptor_peak_relocation_branch_available(gconstpointer source,
                                                   gconstpointer address,
                                                   gboolean internal_label_supported)
 {
-    PeakGumRelocationScope * scope = peak_gum_relocation_scope;
+    PeakGumRelocationScope * scope = g_private_get(&peak_gum_relocation_scope);
     uintptr_t target = (uintptr_t)address, origin = (uintptr_t)source;
     PeakGumRelocationInterval * interval;
     guint index;
@@ -1254,7 +1256,8 @@ _gum_interceptor_backend_create_trampoline_peak_dispatch(
     gboolean force)
 {
     PeakGumRelocationScope scope;
-    PeakGumRelocationScope * previous = peak_gum_relocation_scope;
+    PeakGumRelocationScope * previous =
+        g_private_get(&peak_gum_relocation_scope);
     PeakGumInterceptor17 * owner;
     gboolean result;
 
@@ -1263,10 +1266,10 @@ _gum_interceptor_backend_create_trampoline_peak_dispatch(
     if (owner->backend != (PeakGumInterceptorBackend17 *)backend) return FALSE;
     scope.intervals = g_array_new(FALSE, FALSE, sizeof(PeakGumRelocationInterval));
     scope.valid = peak_gum_relocation_snapshot(&scope, owner, ctx);
-    peak_gum_relocation_scope = &scope;
+    g_private_set(&peak_gum_relocation_scope, &scope);
     result = scope.valid &&
         _gum_interceptor_backend_create_trampoline(backend, ctx, force);
-    peak_gum_relocation_scope = previous;
+    g_private_set(&peak_gum_relocation_scope, previous);
     g_array_unref(scope.intervals);
     return result;
 }
