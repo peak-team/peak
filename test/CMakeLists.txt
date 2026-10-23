@@ -685,6 +685,15 @@ if(BUILD_TESTING)
     add_subdirectory(exec_chain)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        check_c_compiler_flag("-fcf-protection=none" PEAK_HAVE_NO_CF_PROTECTION_FLAG)
+        if(PEAK_HAVE_NO_CF_PROTECTION_FLAG)
+            # These naked fixtures require exact entry bytes: an inserted CET
+            # landing pad moves their backedges outside the intended patch span.
+            target_compile_options(test_unsafe_gum_prologue PRIVATE -fcf-protection=none)
+        endif()
+    endif()
     add_subdirectory(dlopen_controller)
     add_subdirectory(symbol_resolution)
     add_subdirectory(jit)

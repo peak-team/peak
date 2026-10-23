@@ -277,19 +277,26 @@ main(void)
         return 1;
     }
 #elif defined(__aarch64__)
+    /* The conservative policy examines the complete 16-byte prefix, including
+     * bytes after RET. Each byte fixture must supply that whole readable range
+     * rather than relying on the compiler's adjacent constant-pool layout. */
     static const guint8 x16_only[] = {
         0x10, 0x00, 0x80, 0xd2,       /* mov x16, #0 */
         0x08, 0x02, 0x70, 0xb8,       /* ldr w8, [x16], #0 */
-        0xc0, 0x03, 0x5f, 0xd6
+        0xc0, 0x03, 0x5f, 0xd6,       /* ret */
+        0x1f, 0x20, 0x03, 0xd5        /* nop: complete the 16-byte prefix */
     };
     static const guint8 x16_x17[] = {
         0xf0, 0x03, 0x00, 0xaa,       /* mov x16, x0 */
         0x11, 0x00, 0x04, 0x91,       /* add x17, x0, #256 */
-        0xc0, 0x03, 0x5f, 0xd6
+        0xc0, 0x03, 0x5f, 0xd6,       /* ret */
+        0x1f, 0x20, 0x03, 0xd5        /* nop: complete the 16-byte prefix */
     };
     static const guint8 add_imm_ip_bits[] = {
         0x20, 0x40, 0x04, 0x91,       /* add x0, x1, #0x110 */
-        0xc0, 0x03, 0x5f, 0xd6
+        0xc0, 0x03, 0x5f, 0xd6,       /* ret */
+        0x1f, 0x20, 0x03, 0xd5,       /* nop */
+        0x1f, 0x20, 0x03, 0xd5        /* nop: complete the 16-byte prefix */
     };
 #if defined(__linux__)
     static const guint32 branch_to_canonical_plt[] = {

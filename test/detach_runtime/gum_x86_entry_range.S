@@ -249,3 +249,28 @@ START peak_x86_call_hook_interior
  add $8,%rsp
  ret
 END peak_x86_call_hook_interior
+
+/* Explicit landing pads make the whole first overwrite ENDBR64 + XOR (6B),
+ * leaving the loop entry at +8. Without the pad the same loop enters at +4. */
+.text
+.macro COPY_BACKEDGE name, counter, landing
+START \name
+ .if \landing
+ .byte 0xf3,0x0f,0x1e,0xfa
+ .endif
+ xor \counter,\counter
+ xor %eax,%eax
+1: mov (%rdi,%rax,1),%ecx
+ inc \counter
+ mov %ecx,(%rsi,%rax,1)
+ add $4,%rax
+ cmp $4,\counter
+ jb 1b
+ ret
+ .fill 16,1,0x90
+END \name
+.endm
+COPY_BACKEDGE peak_x86_endbr_dl,%dl,1
+COPY_BACKEDGE peak_x86_endbr_edx,%edx,1
+COPY_BACKEDGE peak_x86_plain_dl,%dl,0
+COPY_BACKEDGE peak_x86_plain_edx,%edx,0

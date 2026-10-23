@@ -268,6 +268,44 @@ static int entry_thunk(GumInterceptor *i,GumInvocationListener *l)
  CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
  CHECK(munmap(far,page)==0);CHECK(munmap(source,page*2)==0);return 0;
 }
+extern void peak_x86_endbr_dl(const guint8*,guint8*);
+extern void peak_x86_endbr_edx(const guint8*,guint8*);
+extern void peak_x86_plain_dl(const guint8*,guint8*);
+extern void peak_x86_plain_edx(const guint8*,guint8*);
+static int endbr_backedge(GumInterceptor *i,GumInvocationListener *l)
+{
+ void(*functions[])(const guint8*,guint8*)={peak_x86_endbr_dl,peak_x86_endbr_edx};
+ void(*plain[])(const guint8*,guint8*)={peak_x86_plain_dl,peak_x86_plain_edx};
+ const guint8 endbr[]={0xf3,0x0f,0x1e,0xfa};
+ const guint8 loop_load[]={0x8b,0x0c,0x07};
+ guint kind,generation,iteration;guint8 source[16],destination[16];
+ for(iteration=0;iteration!=sizeof source;iteration++)source[iteration]=iteration*13+7;
+ for(kind=0;kind!=G_N_ELEMENTS(functions);kind++) {
+  guint8 before[32];memcpy(before,functions[kind],32);
+  CHECK(memcmp(before,endbr,4)==0);
+  CHECK(memcmp(before+8,loop_load,sizeof loop_load)==0);
+  CHECK(memcmp((guint8*)plain[kind]+4,loop_load,sizeof loop_load)==0);
+  CHECK(range(functions[kind],5,TRUE,6)==0);
+  CHECK(range(plain[kind],5,FALSE,4)==0);
+  CHECK(gum_interceptor_peak_attach_exact(i,plain[kind],l,NULL)!=GUM_ATTACH_OK);
+  for(generation=0;generation!=2;generation++) {
+   guint old=calls,length;guint8 active[32],original[32];
+   CHECK(gum_interceptor_peak_attach_exact(i,functions[kind],l,NULL)==GUM_ATTACH_OK);
+   CHECK(gum_interceptor_peak_get_function_patch(i,functions[kind],l,
+       active,original,&length));
+   CHECK(length==6 && memcmp(original,before,length)==0);
+   for(iteration=0;iteration!=1000;iteration++) {
+    memset(destination,0,sizeof destination);functions[kind](source,destination);
+    CHECK(memcmp(source,destination,sizeof source)==0);
+   }
+   CHECK(calls==old+1000);gum_interceptor_detach(i,l);
+   CHECK(memcmp(before,functions[kind],32)==0);
+   memset(destination,0,sizeof destination);functions[kind](source,destination);
+   CHECK(memcmp(source,destination,sizeof source)==0);
+  }
+ }
+ return 0;
+}
 int main(void)
 {
 #ifndef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -318,6 +356,7 @@ int main(void)
  CHECK(scope_conflicts(i)==0);
  CHECK(mutable_tail(i,l)==0);
  CHECK(entry_thunk(i,l)==0);
+ CHECK(endbr_backedge(i,l)==0);
  CHECK(full_span(i)==0);
  CHECK(far_rewrite(peak_x86_full_span,50,50)==0);
  CHECK(far_rewrite(peak_x86_far_branch,17,13)==0);
