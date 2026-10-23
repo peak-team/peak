@@ -1034,9 +1034,7 @@ assumption. Other targets retain Gum's existing patch-size selection, including
 ordinary 8- and 16-byte patches; a safe fallback preserves Gum's original
 false result and maximum instead of accidentally requesting a 16-byte patch.
 This attach-time check does not change Gum's allocator
-or force all Arm64 targets onto near branches. See
-[the relocation design investigation](arm64-entry-relocation-design.md) for
-remaining analysis limits and target-specific recovery options.
+or force all Arm64 targets onto near branches.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`
