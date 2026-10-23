@@ -1027,14 +1027,16 @@ supplements the walk with a bounded check of the candidate prefix branch
 targets and, for the 8-byte fallback, its reachable ordinary continuation. A
 destination inside entry bytes 4 through 15 (16-byte patch) or 4 through 7
 (8-byte patch) rejects the target. A 4-byte candidate has no aligned interior
-instruction entry and retains Gum's result. Unreadable or undecodable paths, unresolved
-indirect tail jumps, and exhaustion of the 4096-instruction scan budget also
-reject that target. Returns end a path; calls retain Gum's normal call/return
+instruction entry and retains Gum's result. Within the supplemental walk,
+unreadable or undecodable paths, unresolved indirect tail jumps, and exhaustion
+of the 4096-instruction scan budget also reject that target. Returns end a path; calls retain Gum's normal call/return
 assumption. Other targets retain Gum's existing patch-size selection, including
 ordinary 8- and 16-byte patches; a safe fallback preserves Gum's original
 false result and maximum instead of accidentally requesting a 16-byte patch.
 This attach-time check does not change Gum's allocator
-or force all Arm64 targets onto near branches.
+or force all Arm64 targets onto near branches. See
+[the relocation design investigation](arm64-entry-relocation-design.md) for
+remaining analysis limits and target-specific recovery options.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`
