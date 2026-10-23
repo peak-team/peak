@@ -620,3 +620,193 @@ set_tests_properties(test_detach_controller_invalid_request
   PROPERTIES
     ENVIRONMENT "PEAK_SAFE_DETACH_MODE=strict"
 )
+
+# Real signal delivery with a deterministic contamination between mask preflight
+# and the first owned stop send. The same fixture also checks clean physical IO.
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  target_link_options(test_detach_controller PRIVATE
+    -Wl,--wrap=peak_signal_policy_send_thread_signal)
+  foreach(preflight_case scalar batch clean_scalar clean_batch)
+    set(preflight_env
+      "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(preflight_case MATCHES "batch")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_BATCH=1")
+    endif()
+    if(preflight_case MATCHES "clean")
+      list(APPEND preflight_env "PEAK_TEST_PREFLIGHT_CLEAN=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_preflight_${preflight_case}
+      COMMAND test_detach_controller signal-preflight-contamination)
+    set_tests_properties(test_detach_controller_signal_preflight_${preflight_case}
+      PROPERTIES ENVIRONMENT "${preflight_env}" TIMEOUT 10)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(recovery_case scalar batch consumed_replay no_debt_handoff reap_live exited_target)
+    set(recovery_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(recovery_case STREQUAL "batch")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_BATCH=1")
+    endif()
+    if(recovery_case STREQUAL "consumed_replay")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_REPLAY=1")
+    endif()
+    if(recovery_case STREQUAL "no_debt_handoff")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_NO_DEBT_HANDOFF=1")
+    endif()
+    if(recovery_case STREQUAL "reap_live")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_REAP_LIVE=1")
+    endif()
+    if(recovery_case STREQUAL "exited_target")
+      list(APPEND recovery_env "PEAK_TEST_SUPPORTED_EXITED_TARGET=1")
+    endif()
+    add_test(NAME test_detach_controller_supported_owned_recovery_${recovery_case}
+      COMMAND test_detach_controller supported-handler-owned-recovery)
+    set_tests_properties(test_detach_controller_supported_owned_recovery_${recovery_case}
+      PROPERTIES ENVIRONMENT "${recovery_env}" TIMEOUT 20)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(receipt_case capacity failed_send)
+    set(receipt_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+    if(receipt_case STREQUAL "failed_send")
+      list(APPEND receipt_env "PEAK_TEST_RECEIPT_FAILED_SEND=1")
+    endif()
+    add_test(NAME test_detach_controller_signal_receipt_control_${receipt_case}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_control_${receipt_case}
+      PROPERTIES ENVIRONMENT "${receipt_env}" TIMEOUT 10)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(identity_state published sent)
+    add_test(NAME test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      COMMAND test_detach_controller signal-receipt-control)
+    set_tests_properties(test_detach_controller_signal_receipt_identity_pending_${identity_state}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_RECEIPT_DUPLICATE_STATE=${identity_state}"
+        TIMEOUT 5)
+  endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  foreach(slot_phase before_pin after_pin)
+    add_test(NAME test_detach_controller_active_slot_reuse_${slot_phase}
+      COMMAND test_detach_controller active-slot-reader-reuse)
+    set_tests_properties(test_detach_controller_active_slot_reuse_${slot_phase}
+      PROPERTIES
+        ENVIRONMENT "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper;PEAK_TEST_SLOT_PHASE=${slot_phase}"
+        TIMEOUT 20)
+  endforeach()
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_executable(test_signal_nonrt_reentry
+    test_signal_nonrt_reentry.c ${PROJECT_SOURCE_DIR}/src/signal_policy.c
+    ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall_trampoline.S)
+  target_include_directories(test_signal_nonrt_reentry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_options(test_signal_nonrt_reentry PRIVATE -Wl,--wrap=pthread_mutex_lock)
+  target_link_libraries(test_signal_nonrt_reentry PRIVATE Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY})
+  add_test(NAME test_signal_nonrt_reentry COMMAND test_signal_nonrt_reentry)
+  set_tests_properties(test_signal_nonrt_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
+  add_executable(test_signal_nonrt_event_reentry
+    test_signal_nonrt_event_reentry.c ${PROJECT_SOURCE_DIR}/src/signal_policy.c
+    ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall_trampoline.S)
+  target_include_directories(test_signal_nonrt_event_reentry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_options(test_signal_nonrt_event_reentry PRIVATE -Wl,--wrap=pthread_mutex_lock)
+  target_link_libraries(test_signal_nonrt_event_reentry PRIVATE Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY})
+  add_test(NAME test_signal_nonrt_event_reentry COMMAND test_signal_nonrt_event_reentry)
+  set_tests_properties(test_signal_nonrt_event_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
+  add_executable(test_signal_null_mask_reentry
+    test_signal_null_mask_reentry.c ${PROJECT_SOURCE_DIR}/src/signal_policy.c
+    ${PROJECT_SOURCE_DIR}/src/exec_raw_syscall_trampoline.S)
+  target_include_directories(test_signal_null_mask_reentry PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_options(test_signal_null_mask_reentry PRIVATE -Wl,--wrap=pthread_mutex_lock)
+  target_link_libraries(test_signal_null_mask_reentry PRIVATE Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY})
+  add_test(NAME test_signal_null_mask_reentry COMMAND test_signal_null_mask_reentry)
+  set_tests_properties(test_signal_null_mask_reentry PROPERTIES TIMEOUT 5 ENVIRONMENT "PEAK_DETACH_SIGNAL=auto")
+endif()
+
+# Genuine receipt-backed owned frames, with a separate unowned SI_QUEUE packet
+# at the contamination boundary. No old reusable-slot ownership test seeding.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+   PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
+  get_target_property(_forward_sources test_detach_controller SOURCES)
+  list(REMOVE_ITEM _forward_sources test_detach_controller.c)
+  add_executable(test_signal_forward_effect test_signal_forward_effect.c ${_forward_sources})
+  target_include_directories(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,COMPILE_DEFINITIONS>)
+  target_compile_options(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,COMPILE_OPTIONS>)
+  target_link_options(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,LINK_OPTIONS>)
+  target_link_libraries(test_signal_forward_effect PRIVATE
+    $<TARGET_PROPERTY:test_detach_controller,LINK_LIBRARIES>)
+  foreach(forward_case recoverable pc-positive temp-positive)
+    foreach(forward_batch scalar batch)
+      set(forward_env "PEAK_TARGET=strict_helper_target;PEAK_SAFE_DETACH_MODE=signal;PEAK_DETACH_BACKEND=signal;PEAK_DETACH_HELPER=/no/such/peak_detach_helper")
+      if(forward_batch STREQUAL "batch")
+        list(APPEND forward_env "PEAK_TEST_FORWARD_BATCH=1")
+      endif()
+      add_test(NAME test_signal_forward_${forward_case}_${forward_batch}
+        COMMAND test_signal_forward_effect ${forward_case})
+      set_tests_properties(test_signal_forward_${forward_case}_${forward_batch}
+        PROPERTIES ENVIRONMENT "${forward_env}" TIMEOUT 15)
+    endforeach()
+  endforeach()
+  foreach(forward_case before after permission pc-fatal temp-fatal temp-error temp-multi-fatal)
+    foreach(forward_batch scalar batch)
+      set(forward_env "PEAK_TARGET=strict_helper_target")
+      if(forward_batch STREQUAL "batch")
+        list(APPEND forward_env "PEAK_TEST_FORWARD_BATCH=1")
+      endif()
+      set(forward_detail signal.contamination.after.forward.effect)
+      set(forward_witness1 "forward-fixture actual_owned_send=1")
+      set(forward_witness2 "forward-fixture before_effect_boundary=1")
+      set(forward_witness3 "forward-fixture actual_unowned_packet=1")
+      set(forward_witness4 "fatal safe-detach helper failure")
+      if(forward_case STREQUAL "after")
+        set(forward_witness2 "forward-fixture action=2 actual_effect_observed=1")
+      elseif(forward_case STREQUAL "permission")
+        set(forward_witness2 "forward-fixture permission_granted_without_code_effect=1")
+      elseif(forward_case STREQUAL "pc-fatal")
+        set(forward_witness2 "forward-fixture action=1 actual_effect_observed=1")
+      elseif(forward_case STREQUAL "temp-fatal")
+        set(forward_witness2 "forward-fixture action=3 actual_effect_observed=1")
+      endif()
+      if(forward_case STREQUAL "temp-error")
+        set(forward_detail signal.breakpoint.install)
+        set(forward_witness2 "forward-fixture actual_trap_before_RX_failure=1")
+        set(forward_witness3 "")
+      elseif(forward_case STREQUAL "temp-multi-fatal")
+        set(forward_detail signal.evacuation.incomplete.after.forward.effect)
+        list(APPEND forward_env "PEAK_TEST_MULTI_TEMP_FAILURE=1")
+        set(forward_witness2 "forward-fixture action=3 actual_effect_observed=1")
+        set(forward_witness3 "forward-fixture actual_exit_byte_restored=1")
+      endif()
+      add_test(NAME test_signal_forward_${forward_case}_${forward_batch}
+        COMMAND ${CMAKE_COMMAND}
+          -DTEST_EXECUTABLE=$<TARGET_FILE:test_signal_forward_effect>
+          -DTEST_ARG=${forward_case}
+          -DHELPER_EXECUTABLE=$<TARGET_FILE:test_detach_fake_helper>
+          -DFAKE_SCENARIO=success-zero -DDETACH_BACKEND=signal
+          -DEXPECTED_EXIT_CODE=128 -DEXPECTED_FATAL_DETAIL=${forward_detail}
+          "-DEXPECTED_WITNESS_1=${forward_witness1}"
+          "-DEXPECTED_WITNESS_2=${forward_witness2}"
+          "-DEXPECTED_WITNESS_3=${forward_witness3}"
+          "-DEXPECTED_WITNESS_4=${forward_witness4}"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/assert_fatal_failure.cmake)
+      set_tests_properties(test_signal_forward_${forward_case}_${forward_batch}
+        PROPERTIES ENVIRONMENT "${forward_env}" TIMEOUT 15)
+    endforeach()
+  endforeach()
+endif()

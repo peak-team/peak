@@ -235,7 +235,99 @@ delivery is treated as backend contamination and signal-backed mutation then
 fails closed with `signal-unexpected-delivery`, while helper-backed mutation
 remains independent. Before every signal-backed stop, PEAK revalidates that its
 handler still owns the current reserved signal and that no unexpected
-non-cookie delivery has contaminated the backend.
+non-cookie delivery has contaminated the backend. The controller checks the
+unexpected-delivery count again after completing every target's mask preflight,
+before sending the first owned stop packet. If contamination arrived during
+preflight, it clears the unsent slots and returns unsupported with
+`signal-unexpected-delivery`; it grants no physical mutation permission and
+reopens the thread-creation gate.
+
+The controller also keeps a fixed ledger of identities for its successfully
+sent stop packets. A canceled generation marks those identities retired before
+hiding its active slots. If its genuine packet later reaches the PEAK handler,
+an exact signal/TID/cookie match consumes that receipt once, without accessing
+old slots or incrementing the unexpected-delivery counter. Once the delayed
+handler returns, subsequent generations can use the existing physical detach
+and reattach paths. A timeout does not disable profiling or reattachment for
+the remainder of the process. In the canceled/late fallback,
+never-sent identities, wrong cookies, and a duplicate of an already consumed
+identity receive no receipt exception and retain the contamination guard. The
+current active-generation path keeps main's existing matching rules; this does
+not impose a new per-send-credit condition on that path.
+
+The ledger has 4096 records and a controller-only static reservation mapping;
+on the current 64-bit ABI they occupy 98,304 and 65,536 bytes respectively
+(24-byte records, 16-byte references, 160 KiB total). The controller tracks a
+high-water index and limits duplicate-identity checks and epoch retirement to
+the prefix that has actually held receipts. Every publication raises that bound
+as needed, including diagnostic seeds; the bound never shrinks when a record is
+reclaimed. A healthy small cohort therefore avoids scanning all 4096 records
+for every target. Handler lookup returns at the matching record and remains
+bounded by the full 4096-record pool. These costs belong to signal control
+windows; target-function callbacks and the physical entry writer are unchanged.
+This is not a measured end-to-end performance claim. Before selecting a free
+record, allocation rejects any outstanding unconsumed record with the same
+(epoch, TID, signal) wire identity, including records beyond a free slot or a
+test-only allocation limit. Allocation tickets
+are not encoded in cookies, so distinct tickets alone cannot distinguish those
+packets; this rejection is a profiler-window failure and changes no application
+signal API. Atomic identities
+and nonwrapping allocation tickets distinguish reuse, and epochs stop before
+wrapping. If allocation finds no room, it makes one bounded pressure sweep of
+retired, successfully sent, unconsumed records. A direct
+`tgkill(self_tgid, receipt_tid, 0)` result of `ESRCH` permits tag-checked receipt
+reclamation: the old target has exited and its thread-directed packet cannot
+later execute on a newly created task. A live same-TID replacement, any other
+error, and current or unsent records retain their debt. Each allocation attempt
+makes at most one pressure sweep and retries at most once; a later reservation
+in the same window has its own budget. Healthy windows do not pay for these existence probes. Capacity
+or identity-budget exhaustion still returns unsupported before sending the
+initial cohort when the sweep cannot provide enough space. Fork children drop
+copied receipt debt while keeping counters monotonic. No application signal API,
+policy lease, handler reservation lifetime, or helper backend is changed.
+
+The negative-existence proof uses normal Linux `tgkill` semantics, as does the
+existing stop backend's exited-slot detection. It does not infer exit from a
+stale thread enumeration or the age of a receipt. A tracer, seccomp supervisor
+or security policy that fabricates `ESRCH` without the actual task lookup is
+outside this proof; bypassing libc alone does not authenticate such a result.
+
+Active handler frames use a separate fixed pool of 4096 physical slots and an
+atomic map for the current cohort. Each slot has a nonwrapping 48-bit allocation
+ticket, an OPEN bit, and a 15-bit reader count. Signal and trap handlers acquire
+a pin with one strong CAS before accessing mutable payload and drop it after
+their last slot access. Cancellation closes admission and clears the current
+map without resetting payload. Allocation only resets closed, unpinned storage;
+a delayed pre-pin reader cannot acquire a reused tag, and an already pinned
+frame retains its old physical slot. The map stays injective when an inactive
+entry is reused. Pool or ticket exhaustion fails the profiler window with
+unsupported rather than waiting for an unarrived handler. On the current 64-bit
+ABI, lifetime words add 32 KiB and the map adds 16 KiB of fixed storage. Pool
+scans remain bounded by 4096; no performance claim is made.
+
+Fork children close copied slots, discard references belonging to vanished
+threads, and preserve pins belonging to the calling thread's inherited frames.
+Only those closed copied slots have their owner TID rebound to the child TID,
+so repeated nested forks preserve the same frames. Tags, reader counts and
+payload stay intact; ordinary clear and cancellation never reset live pins.
+This changes no application signal API, policy lease, helper backend or fatal
+path. Fixed before-pin and after-pin tests pause a genuine owned handler,
+observe timeout and a later allocation's payload, then qualify real physical
+detach/reattach after the old frame returns. They do not test kernel-selected
+pre-entry frames or native disposition handoff.
+
+These changes repair recovery after a canceled stop without replacing the
+signal backend or narrowing normal detach/reattach eligibility. Existing signal
+policy, retry budgets and patch/release failure handling remain unchanged; no
+new application API rejection or fatal path is introduced. This does not make
+arbitrary blocked-signal windows succeed. Native disposition handoff while an
+old owned packet is still pending also remains a separate limitation: if an
+application replaces the PEAK action before delivery, the packet may enter its
+native handler and bypass the receipt ledger. Receipt recognition cannot fix
+that case, and reader pins do not prove that old handler text can be unloaded.
+See the [focused recovery regressions](../test/detach_controller/README.md) for
+the exact tested transitions and remaining boundaries.
+
 PEAK virtualizes the reserved-signal disposition for normal user introspection:
 wrapped `sigaction(signum, NULL, oldact)` and wrapped
 `syscall(SYS_rt_sigaction, signum, NULL, oldact, ...)` queries of the current

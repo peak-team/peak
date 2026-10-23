@@ -1,12 +1,15 @@
+#define _GNU_SOURCE
 #include "detach_controller.h"
 #include "internal/filesystem_stat_guard.h"
 #include <sys/vfs.h>
 #include "detach_helper_protocol.h"
+#include "internal/exec_raw_syscall.h"
 #include "internal/signal_policy_internal.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "signal_policy.h"
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -19,6 +22,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <poll.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 static int failures = 0;
 
@@ -3273,6 +3281,1543 @@ run_fake_helper_reattach_patch_entry(void)
 }
 
 
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+/* The wrapper forwards every delivery to the real SI_QUEUE sender. Only the
+ * controller's sends are counted; the seam calls __real_ directly. */
+static void supported_after_preflight(int epoch);
+static void supported_observe_send(pid_t, int, unsigned long, int, int);
+static void slot_reuse_observe_send(pid_t, int, unsigned long, int);
+static atomic_int receipt_consumed_count;
+static atomic_int receipt_consumed_epoch, receipt_consumed_tid, receipt_consumed_signum;
+static atomic_ulong receipt_consumed_cookie;
+static atomic_int receipt_reaped_count;
+static atomic_int receipt_reaped_epoch, receipt_reaped_tid, receipt_reaped_signum;
+static atomic_int receipt_fail_next_send;
+static int receipt_failed_tid, receipt_failed_signum;
+static unsigned long receipt_failed_cookie;
+static uint32_t receipt_test_capacity = PEAK_DETACH_HELPER_MAX_THREADS;
+static int receipt_control_replay, receipt_control_replay_rc;
+static int receipt_duplicate_mode, receipt_seed_index;
+static int receipt_seed_epoch, receipt_seed_signum;
+static pid_t receipt_seed_tid;
+static uint64_t receipt_seed_state;
+extern int peak_detach_controller_test_seed_pending_identity(
+    int, pid_t, int, gboolean, int*, pid_t*, int*, uint64_t*);
+extern int peak_detach_controller_test_reap_exited_receipts(void);
+static void receipt_control_after_preflight(int epoch);
+
+uint32_t peak_test_signal_receipt_capacity(void)
+{
+    return receipt_test_capacity;
+}
+
+void peak_test_signal_retired_receipt_consumed(int signum, int epoch,
+                                              pid_t tid, unsigned long cookie)
+{
+    atomic_store_explicit(&receipt_consumed_signum, signum, memory_order_relaxed);
+    atomic_store_explicit(&receipt_consumed_epoch, epoch, memory_order_relaxed);
+    atomic_store_explicit(&receipt_consumed_tid, (int)tid, memory_order_relaxed);
+    atomic_store_explicit(&receipt_consumed_cookie, cookie, memory_order_relaxed);
+    atomic_fetch_add_explicit(&receipt_consumed_count, 1, memory_order_release);
+}
+
+void peak_test_signal_receipt_reaped(int epoch, pid_t tid, int signum)
+{
+    atomic_store_explicit(&receipt_reaped_epoch, epoch, memory_order_relaxed);
+    atomic_store_explicit(&receipt_reaped_tid, (int)tid, memory_order_relaxed);
+    atomic_store_explicit(&receipt_reaped_signum, signum, memory_order_relaxed);
+    atomic_fetch_add_explicit(&receipt_reaped_count, 1, memory_order_release);
+}
+
+static atomic_int preflight_normal_sends;
+static atomic_int preflight_tracking;
+static atomic_int preflight_worker_tid;
+static atomic_int preflight_worker_running;
+static atomic_int preflight_handler_returned;
+static atomic_int preflight_callback_count;
+static atomic_int preflight_probe_tid;
+static int preflight_inject;
+static int preflight_unexpected_before;
+static int preflight_injection_rc;
+static int preflight_seen_epoch;
+
+extern int __real_peak_signal_policy_send_thread_signal(pid_t, int, unsigned long);
+int
+__wrap_peak_signal_policy_send_thread_signal(pid_t tid, int signo,
+                                            unsigned long cookie)
+{
+    if (atomic_load(&preflight_tracking))
+        atomic_fetch_add(&preflight_normal_sends, 1);
+    if (atomic_exchange(&receipt_fail_next_send, 0)) {
+        receipt_failed_tid = (int)tid;
+        receipt_failed_signum = signo;
+        receipt_failed_cookie = cookie;
+        errno = EAGAIN;
+        return -1;
+    }
+    int rc = __real_peak_signal_policy_send_thread_signal(tid, signo, cookie);
+    int saved_errno = errno;
+    supported_observe_send(tid, signo, cookie, rc, saved_errno);
+    slot_reuse_observe_send(tid, signo, cookie, rc);
+    errno = saved_errno;
+    return rc;
+}
+
+static double
+preflight_now(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec / 1e9;
+}
+
+void
+peak_test_after_signal_mask_preflight(int epoch)
+{
+    supported_after_preflight(epoch);
+    receipt_control_after_preflight(epoch);
+    if (!preflight_inject)
+        return;
+    preflight_seen_epoch = epoch;
+    pid_t tid = atomic_load(&preflight_worker_tid);
+    int signo = peak_detach_controller_test_signal_backend_signum();
+    unsigned long cookie = peak_signal_policy_cookie_for(epoch - 1, tid);
+    preflight_injection_rc = __real_peak_signal_policy_send_thread_signal(
+        tid, signo, cookie);
+    double deadline = preflight_now() + 2.0;
+    /* The worker publishes this only after the real handler has returned to
+     * application code, so no temporary handler mask survives this seam. */
+    while (!atomic_load(&preflight_handler_returned) &&
+           preflight_now() < deadline)
+        usleep(1000);
+    fprintf(stderr,
+            "preflight-injection epoch=%d wrong_epoch=%d tid=%d signum=%d "
+            "si_code=%d cookie=0x%lx rc=%d unexpected_before=%d "
+            "unexpected_after=%d handler_returned=%d\n",
+            epoch, epoch - 1, tid, signo, SI_QUEUE, cookie,
+            preflight_injection_rc, preflight_unexpected_before,
+            peak_signal_policy_unexpected_delivery_count(),
+            atomic_load(&preflight_handler_returned));
+}
+
+static void
+receipt_control_after_preflight(int epoch)
+{
+    if (receipt_duplicate_mode != 0) {
+        receipt_seed_index = peak_detach_controller_test_seed_pending_identity(
+            epoch, atomic_load(&preflight_worker_tid),
+            peak_detach_controller_test_signal_backend_signum(),
+            receipt_duplicate_mode == 2, &receipt_seed_epoch, &receipt_seed_tid,
+            &receipt_seed_signum, &receipt_seed_state);
+        fprintf(stderr, "receipt-wire-identity-simulation actual_TID_reuse=0 "
+                "prior_packet_sent=0 mode=%d index=%d epoch=%d T=%d S=%d state=0x%" PRIx64 "\n",
+                receipt_duplicate_mode, receipt_seed_index, receipt_seed_epoch,
+                receipt_seed_tid, receipt_seed_signum, receipt_seed_state);
+        return;
+    }
+    if (!receipt_control_replay)
+        return;
+    receipt_control_replay_rc = __real_peak_signal_policy_send_thread_signal(
+        receipt_failed_tid, receipt_failed_signum, receipt_failed_cookie);
+    double deadline = preflight_now() + 2.0;
+    while (!atomic_load(&preflight_handler_returned) && preflight_now() < deadline)
+        usleep(1000);
+    fprintf(stderr, "receipt-failed-send-replay new_epoch=%d tid=%d S=%d cookie=0x%lx "
+            "rc=%d handler_returned=%d unexpected=%d\n",
+            epoch, receipt_failed_tid, receipt_failed_signum, receipt_failed_cookie,
+            receipt_control_replay_rc, atomic_load(&preflight_handler_returned),
+            peak_signal_policy_unexpected_delivery_count());
+}
+
+static void*
+preflight_worker(void* unused)
+{
+    (void)unused;
+    atomic_store(&preflight_worker_tid, (int)syscall(SYS_gettid));
+    while (atomic_load(&preflight_worker_running)) {
+        if (peak_signal_policy_unexpected_delivery_count() ==
+            preflight_unexpected_before + 1)
+            atomic_store(&preflight_handler_returned, 1);
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void
+preflight_on_enter(GumInvocationContext* context, gpointer unused)
+{
+    (void)context;
+    (void)unused;
+    atomic_fetch_add(&preflight_callback_count, 1);
+}
+
+static void*
+preflight_gate_probe(void* unused)
+{
+    (void)unused;
+    atomic_store(&preflight_probe_tid, (int)syscall(SYS_gettid));
+    peak_detach_controller_wait_for_mutation_window();
+    return NULL;
+}
+
+static int
+preflight_probe_task_absent(pid_t tid, const char* stage, int log_sample)
+{
+    char path[96], status_path[112], line[256], blocked[64] = "<unavailable>";
+    snprintf(path, sizeof(path), "/proc/self/task/%d", tid);
+    snprintf(status_path, sizeof(status_path), "%s/status", path);
+    errno = 0;
+    int task_rc = access(path, F_OK);
+    int task_errno = errno;
+    FILE* status_file = fopen(status_path, "r");
+    int status_errno = status_file == NULL ? errno : 0;
+    if (status_file != NULL) {
+        while (fgets(line, sizeof(line), status_file) != NULL) {
+            if (sscanf(line, "SigBlk: %63s", blocked) == 1)
+                break;
+        }
+        fclose(status_file);
+    }
+    errno = 0;
+    long native_rc = peak_exec_raw_syscall6(SYS_tgkill, getpid(), tid, 0, 0, 0, 0);
+    int native_errno = errno;
+    int absent = task_rc == -1 && task_errno == ENOENT &&
+                 native_rc == -1 && native_errno == ESRCH;
+    if (log_sample)
+        fprintf(stderr, "preflight-probe-task stage=%s tid=%d task_present=%d "
+                "task_rc=%d task_errno=%d SigBlk=%s status_errno=%d "
+                "native_rc=%ld native_errno=%d absent=%d\n",
+                stage, tid, task_rc == 0, task_rc, task_errno, blocked,
+                status_errno, native_rc, native_errno, absent);
+    return absent;
+}
+
+static void
+preflight_dump_bytes(const char* stage, const uint8_t* bytes, guint length)
+{
+    fprintf(stderr, "preflight-bytes stage=%s len=%u hex=", stage, length);
+    for (guint i = 0; i < length; i++)
+        fprintf(stderr, "%02x", bytes[i]);
+    fputc('\n', stderr);
+}
+#endif
+
+static int
+run_signal_preflight_contamination(int batch, int inject)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    (void)batch;
+    (void)inject;
+    return 77;
+#else
+    uint8_t original[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t active[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t after[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    GumPeakPcDiagnostics before_diag = {0}, after_diag = {0};
+    pthread_t worker;
+    preflight_inject = 0;
+    preflight_seen_epoch = 0;
+    preflight_injection_rc = -1;
+    atomic_store(&preflight_worker_tid, 0);
+    atomic_store(&preflight_handler_returned, 0);
+    atomic_store(&preflight_callback_count, 0);
+    preflight_unexpected_before = peak_signal_policy_unexpected_delivery_count();
+    memcpy(original, (void*)strict_helper_target, sizeof(original));
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener =
+        gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
+    check_int("preflight fixture Gum attach",
+              gum_interceptor_attach(interceptor, (gpointer)strict_helper_target,
+                                     listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("preflight fixture diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &before_diag));
+    guint length = before_diag.overwritten_prologue_len;
+    if (length == 0 || length > sizeof(active)) {
+        fprintf(stderr, "invalid preflight fixture prologue length=%u\n", length);
+        failures++;
+        goto cleanup_gum;
+    }
+    memcpy(active, (void*)strict_helper_target, length);
+    check_true("preflight fixture active entry differs from original",
+               memcmp(active, original, length) != 0);
+    strict_helper_target();
+    check_int("preflight fixture initial callback",
+              atomic_load(&preflight_callback_count), 1);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    /* Initialize reservation before the worker starts and before preflight. */
+    int signo = peak_detach_controller_test_signal_backend_signum();
+    check_true("preflight fixture reserved signal", signo > 0);
+    atomic_store(&preflight_worker_running, 1);
+    int worker_create_rc = pthread_create(&worker, NULL, preflight_worker, NULL);
+    check_int("preflight worker pthread_create", worker_create_rc, 0);
+    if (worker_create_rc != 0) {
+        goto cleanup_gum;
+    }
+    double deadline = preflight_now() + 2.0;
+    while (atomic_load(&preflight_worker_tid) == 0 && preflight_now() < deadline)
+        usleep(1000);
+    check_true("preflight worker ready", atomic_load(&preflight_worker_tid) > 0);
+
+    PeakDetachRequest request = {
+        .hook_id = 129, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor, .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+    preflight_inject = inject;
+    for (int operation = 0; operation < (inject ? 1 : 2); operation++) {
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+        PeakDetachBatchResult result = {0};
+        size_t count = SIZE_MAX;
+        atomic_store(&preflight_normal_sends, 0);
+        atomic_store(&preflight_tracking, 1);
+        gboolean prepared = batch
+            ? peak_detach_controller_prepare_hook_mutation_batch(
+                &request, 1, &result, &count, &status)
+            : peak_detach_controller_prepare_hook_mutation(&request, &status);
+        atomic_store(&preflight_tracking, 0);
+        preflight_inject = 0;
+        gboolean held = peak_detach_controller_threads_are_held();
+        gboolean physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+        const char* reason = detail != NULL && detail->reason != NULL
+            ? detail->reason : "<none>";
+        memcpy(after, (void*)strict_helper_target, length);
+        preflight_dump_bytes("original", original, length);
+        preflight_dump_bytes("active-before", active, length);
+        preflight_dump_bytes(operation == 0 ? "after-detach-prepare" :
+                             "after-reattach-prepare", after, length);
+        fprintf(stderr,
+                "preflight-result batch=%d inject=%d operation=%d prepared=%d "
+                "status=%s reason=%s normal_sends=%d held=%d physical=%d "
+                "count=%zu result_prepared=%d result_physical=%d "
+                "entry_equal_active=%d\n",
+                batch, inject, operation, prepared,
+                peak_detach_controller_status_string(status), reason,
+                atomic_load(&preflight_normal_sends), held, physical, count,
+                result.prepared, result.uses_physical_patch,
+                memcmp(after, active, length) == 0);
+        if (inject) {
+            fprintf(stderr, "preflight-detail tid=%ld pc=%" PRIuPTR " aux=%" PRIuPTR "\n",
+                    detail != NULL ? detail->tid : -1,
+                    detail != NULL ? detail->pc : 0,
+                    detail != NULL ? detail->aux : 0);
+            check_true("contaminated preflight precise failure detail",
+                       detail != NULL && detail->tid == 0 &&
+                       detail->pc == (uintptr_t)signo &&
+                       detail->aux == (uintptr_t)(preflight_unexpected_before + 1));
+            check_true("preflight injection delivered and handler returned",
+                       preflight_seen_epoch > 0 && preflight_injection_rc == 0 &&
+                       atomic_load(&preflight_handler_returned) &&
+                       peak_signal_policy_unexpected_delivery_count() ==
+                           preflight_unexpected_before + 1);
+            check_true("contaminated preflight sends no owned stop packets",
+                       atomic_load(&preflight_normal_sends) == 0);
+            check_true("contaminated preflight refuses all permission",
+                       !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                       !held && !physical &&
+                       strcmp(reason, "signal-unexpected-delivery") == 0);
+            if (batch)
+                check_true("contaminated batch result refuses all permission",
+                           count == 0 && !result.prepared &&
+                           !result.uses_physical_patch &&
+                           result.status == PEAK_DETACH_STATUS_UNSUPPORTED);
+            check_true("contaminated preflight preserves entry bytes",
+                       memcmp(after, active, length) == 0);
+        } else {
+            check_true("clean signal prepare physical permission",
+                       prepared && status == PEAK_DETACH_STATUS_SAFE && held && physical &&
+                       atomic_load(&preflight_normal_sends) > 0);
+            if (batch)
+                check_true("clean batch result physical permission",
+                           count == 1 && result.prepared && result.uses_physical_patch);
+            check_true("clean physical entry bytes",
+                       memcmp(after, operation == 0 ? original : active, length) == 0);
+        }
+        /* Baseline may already have changed entry bytes and stopped workers.
+         * Always finish before callbacks, diagnostics or ordinary cleanup. */
+        if (prepared)
+            check_true("preflight successful prepare finish",
+                       batch ? peak_detach_controller_finish_hook_mutation_batch(&status)
+                             : peak_detach_controller_finish_hook_mutation(&request, &status));
+        memset(&after_diag, 0, sizeof(after_diag));
+        check_true("preflight post-prepare Gum diagnostics",
+                   gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                       (gpointer)strict_helper_target, listener, &after_diag));
+        int diag_equal = memcmp(&before_diag, &after_diag, sizeof(before_diag)) == 0;
+        check_true("preflight preserves Gum diagnostics", diag_equal);
+        int callbacks_before = atomic_load(&preflight_callback_count);
+        strict_helper_target();
+        int callback_delta = atomic_load(&preflight_callback_count) - callbacks_before;
+        fprintf(stderr, "preflight-after-finish batch=%d inject=%d operation=%d "
+                "diagnostics_equal=%d callback_delta=%d gate_epoch=%d\n",
+                batch, inject, operation, diag_equal, callback_delta,
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        check_int("preflight callback behavior", callback_delta,
+                  inject || operation == 1 ? 1 : 0);
+        check_int("preflight cleanup creation gate open",
+                  peak_detach_controller_test_thread_creation_gate_epoch(), 0);
+        request.operation = PEAK_DETACH_OPERATION_REATTACH;
+    }
+    /* The original target remains alive through every prepare and assertion. */
+    check_int("preflight target still alive",
+              (int)syscall(SYS_tgkill, getpid(), atomic_load(&preflight_worker_tid), 0), 0);
+    pthread_t probe;
+    atomic_store(&preflight_probe_tid, 0);
+    int probe_create_rc = pthread_create(&probe, NULL, preflight_gate_probe, NULL);
+    check_int("preflight probe pthread_create", probe_create_rc, 0);
+    if (probe_create_rc == 0) {
+        int probe_join_rc = pthread_join(probe, NULL);
+        check_int("preflight probe pthread_join", probe_join_rc, 0);
+        pid_t probe_tid = atomic_load(&preflight_probe_tid);
+        check_true("preflight probe actual TID published", probe_tid > 0);
+        if (probe_join_rc == 0 && probe_tid > 0) {
+            double exit_deadline = preflight_now() + 2.0;
+            int absent = preflight_probe_task_absent(probe_tid, "immediate-post-join", 1);
+            while (!absent && preflight_now() < exit_deadline) {
+                sched_yield();
+                absent = preflight_probe_task_absent(probe_tid, "poll", 0);
+            }
+            absent = preflight_probe_task_absent(probe_tid, "final-absence", 1);
+            check_true("preflight probe task absent in proc and native tgkill", absent);
+        }
+    }
+    struct sigaction application_action = {0}, previous_action = {0};
+    sigemptyset(&application_action.sa_mask);
+    application_action.sa_handler = SIG_DFL;
+    errno = 0;
+    int action_rc = sigaction(signo, &application_action, &previous_action);
+    fprintf(stderr, "preflight-application-sigaction signum=%d rc=%d errno=%d\n",
+            signo, action_rc, errno);
+    check_int("ordinary application sigaction remains accepted", action_rc, 0);
+    atomic_store(&preflight_worker_running, 0);
+    check_int("preflight worker pthread_join", pthread_join(worker, NULL), 0);
+cleanup_gum:
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    fprintf(stderr, "preflight-complete batch=%d inject=%d failures=%d\n",
+            batch, inject, failures);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+static int supported_entered_pipe[2] = {-1, -1};
+static int supported_done_pipe[2] = {-1, -1};
+static pthread_t supported_thread;
+static atomic_int supported_tid;
+static atomic_int supported_running;
+static atomic_int supported_returned;
+static atomic_int supported_callbacks;
+static atomic_int supported_release_started;
+static atomic_int supported_exit_from_handler;
+static atomic_int supported_replay_enabled;
+static atomic_int supported_replay_returned;
+static atomic_int supported_native_calls;
+static atomic_int supported_native_returned;
+static atomic_int supported_native_tid;
+static atomic_int supported_native_signum;
+static atomic_int supported_native_code;
+static atomic_int supported_native_value;
+static int supported_replay_before;
+static int supported_replay_rc;
+static int supported_signum;
+static int supported_enabled;
+static int supported_epoch;
+static int supported_pthread_kill_rc;
+static int supported_entered;
+static int supported_handler_mask_s;
+static int supported_normal_send_count;
+static int supported_owned_rc;
+static int supported_owned_pending_s;
+static unsigned long supported_owned_cookie;
+
+static double
+supported_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static int
+supported_status_bit(pid_t tid, const char* field, int signo)
+{
+    char path[96], line[256];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/status", tid);
+    FILE* file = fopen(path, "r");
+    if (file == NULL)
+        return -1;
+    int bit = -1;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        unsigned long long mask;
+        if (strncmp(line, field, strlen(field)) == 0 &&
+            sscanf(line + strlen(field), "%llx", &mask) == 1) {
+            bit = (int)((mask >> (signo - 1)) & 1);
+            break;
+        }
+    }
+    fclose(file);
+    return bit;
+}
+
+static void
+supported_application_handler(int signo)
+{
+    int saved_errno = errno;
+    char byte = 'E';
+    ssize_t result;
+    (void)signo;
+    do { result = write(supported_entered_pipe[1], &byte, 1); }
+    while (result < 0 && errno == EINTR);
+    do { result = read(supported_done_pipe[0], &byte, 1); }
+    while (result < 0 && errno == EINTR);
+    if (atomic_load_explicit(&supported_exit_from_handler, memory_order_acquire)) {
+        /* Linux-only exit fixture: leave the task while its handler mask still
+         * blocks O. This deliberately uses SYS_exit and bypasses pthread user
+         * cleanup; it is not a claim that pthread_exit is signal-safe. The
+         * interrupted worker only publishes atomics and sleeps. */
+        (void)peak_exec_raw_syscall6(SYS_exit, 0, 0, 0, 0, 0, 0);
+    }
+    errno = saved_errno;
+}
+
+static void
+supported_native_handler(int signo, siginfo_t* info, void* context)
+{
+    int saved_errno = errno;
+    (void)context;
+    atomic_store_explicit(&supported_native_tid, (int)syscall(SYS_gettid),
+                          memory_order_relaxed);
+    atomic_store_explicit(&supported_native_signum, signo, memory_order_relaxed);
+    atomic_store_explicit(&supported_native_code, info != NULL ? info->si_code : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&supported_native_value,
+                          info != NULL ? info->si_value.sival_int : 0,
+                          memory_order_relaxed);
+    atomic_fetch_add_explicit(&supported_native_calls, 1, memory_order_release);
+    errno = saved_errno;
+}
+
+static int
+supported_read_ack(int fd)
+{
+    double deadline = supported_now() + 2.0;
+    for (;;) {
+        double remaining = deadline - supported_now();
+        if (remaining <= 0)
+            return -1;
+        struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
+        int rc = poll(&poll_fd, 1, (int)(remaining * 1000) + 1);
+        if (rc < 0 && errno == EINTR)
+            continue;
+        if (rc <= 0 || !(poll_fd.revents & POLLIN))
+            return -1;
+        char byte;
+        return read(fd, &byte, 1) == 1 ? 0 : -1;
+    }
+}
+
+static void
+supported_release_handler(void)
+{
+    char byte = 'D';
+    ssize_t rc;
+    atomic_store(&supported_release_started, 1);
+    do { rc = write(supported_done_pipe[1], &byte, 1); }
+    while (rc < 0 && errno == EINTR);
+}
+
+static int
+supported_timed_join(pthread_t worker)
+{
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+        return errno;
+    deadline.tv_sec += 2;
+    return pthread_timedjoin_np(worker, NULL, &deadline);
+}
+
+static void
+supported_after_preflight(int epoch)
+{
+    if (atomic_load(&supported_replay_enabled)) {
+        pid_t tid = atomic_load(&supported_tid);
+        supported_replay_rc = __real_peak_signal_policy_send_thread_signal(
+            tid, supported_signum, supported_owned_cookie);
+        double deadline = supported_now() + 2.0;
+        while (!atomic_load(&supported_replay_returned) && supported_now() < deadline)
+            usleep(1000);
+        fprintf(stderr, "supported-consumed-cookie-replay old_epoch=%d new_epoch=%d "
+                "tid=%d S=%d old_cookie=0x%lx rc=%d handler_returned=%d "
+                "unexpected_before=%d unexpected_after=%d\n",
+                supported_epoch, epoch, tid, supported_signum,
+                supported_owned_cookie, supported_replay_rc,
+                atomic_load(&supported_replay_returned), supported_replay_before,
+                peak_signal_policy_unexpected_delivery_count());
+        return;
+    }
+    if (!supported_enabled)
+        return;
+    supported_epoch = epoch;
+    supported_pthread_kill_rc = pthread_kill(supported_thread, SIGUSR1);
+    supported_entered = supported_pthread_kill_rc == 0 &&
+        supported_read_ack(supported_entered_pipe[0]) == 0;
+    supported_handler_mask_s = supported_status_bit(
+        atomic_load(&supported_tid), "SigBlk:", supported_signum);
+    fprintf(stderr, "supported-preflight epoch=%d tid=%d P=%d S=%d "
+            "pthread_kill_rc=%d entered=%d handler_mask_S=%d\n",
+            epoch, atomic_load(&supported_tid), SIGUSR1, supported_signum,
+            supported_pthread_kill_rc, supported_entered,
+            supported_handler_mask_s);
+}
+
+static void
+supported_observe_send(pid_t tid, int signo, unsigned long cookie,
+                       int rc, int saved_errno)
+{
+    if (supported_enabled) {
+        supported_normal_send_count++;
+        supported_owned_rc = rc;
+        supported_owned_cookie = cookie;
+        supported_owned_pending_s = supported_status_bit(tid, "SigPnd:", signo);
+        fprintf(stderr, "supported-owned-send epoch=%d tid=%d S=%d "
+                "cookie=0x%lx expected_cookie=0x%lx rc=%d errno=%d "
+                "thread_SigPnd_S=%d thread_SigBlk_S=%d\n",
+                supported_epoch, tid, signo, cookie,
+                peak_signal_policy_cookie_for(supported_epoch, tid), rc,
+                saved_errno, supported_owned_pending_s,
+                supported_status_bit(tid, "SigBlk:", signo));
+    }
+}
+
+static void*
+supported_worker(void* unused)
+{
+    (void)unused;
+    atomic_store(&supported_tid, (int)syscall(SYS_gettid));
+    while (atomic_load(&supported_running)) {
+        /* This is application code reached only after H_P and the subsequently
+         * delivered real PEAK handler have returned. */
+        if (atomic_load(&supported_release_started))
+            atomic_store(&supported_returned, 1);
+        if (atomic_load(&supported_replay_enabled) &&
+            peak_signal_policy_unexpected_delivery_count() == supported_replay_before + 1)
+            atomic_store(&supported_replay_returned, 1);
+        /* Publish from ordinary worker code, after the native handler returns,
+         * so a following mask preflight cannot still observe its sa_mask. */
+        atomic_store_explicit(&supported_native_returned,
+            atomic_load_explicit(&supported_native_calls, memory_order_acquire),
+            memory_order_release);
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void
+supported_on_enter(GumInvocationContext* context, gpointer unused)
+{
+    (void)context;
+    (void)unused;
+    atomic_fetch_add(&supported_callbacks, 1);
+}
+
+static void
+supported_check_physical_cycle(PeakDetachRequest* request, int batch,
+                               const uint8_t* original_bytes,
+                               const uint8_t* active_bytes, guint length,
+                               const GumPeakPcDiagnostics* before_diag,
+                               const char* phase)
+{
+    for (int operation = 0; operation < 2; operation++) {
+        uint8_t after_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+        GumPeakPcDiagnostics after_diag = {0};
+        request->operation = operation == 0 ? PEAK_DETACH_OPERATION_DETACH
+                                           : PEAK_DETACH_OPERATION_REATTACH;
+        PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+        PeakDetachBatchResult result = {0};
+        size_t count = SIZE_MAX;
+        gboolean prepared = batch
+            ? peak_detach_controller_prepare_hook_mutation_batch(
+                request, 1, &result, &count, &status)
+            : peak_detach_controller_prepare_hook_mutation(request, &status);
+        gboolean physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+        fprintf(stderr, "supported-recovery-prepare phase=%s batch=%d operation=%d "
+                "prepared=%d status=%s reason=%s count=%zu physical=%d\n",
+                phase, batch, operation, prepared,
+                peak_detach_controller_status_string(status),
+                detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+                count, physical);
+        check_true("drained own packet permits next physical mutation",
+                   prepared && status == PEAK_DETACH_STATUS_SAFE && physical &&
+                   (!batch || (count == 1 && result.prepared && result.uses_physical_patch)));
+        /* Always release held workers before callbacks or ordinary cleanup. */
+        if (prepared)
+            check_true("supported recovery physical finish",
+                       batch ? peak_detach_controller_finish_hook_mutation_batch(&status)
+                             : peak_detach_controller_finish_hook_mutation(request, &status));
+        memcpy(after_bytes, (void*)strict_helper_target, length);
+        int calls_before = atomic_load(&supported_callbacks);
+        strict_helper_target();
+        int calls_delta = atomic_load(&supported_callbacks) - calls_before;
+        fprintf(stderr, "supported-recovery-entry phase=%s batch=%d operation=%d "
+                "equal_active=%d callback_delta=%d gate_epoch=%d len=%u hex=",
+                phase, batch, operation, memcmp(active_bytes, after_bytes, length) == 0,
+                calls_delta, peak_detach_controller_test_thread_creation_gate_epoch(), length);
+        for (guint i = 0; i < length; i++) fprintf(stderr, "%02x", after_bytes[i]);
+        fputc('\n', stderr);
+        check_true("supported recovery physical entry transition",
+                   memcmp(operation == 0 ? original_bytes : active_bytes,
+                          after_bytes, length) == 0);
+        check_true("supported recovery keeps Gum metadata",
+                   gum_interceptor_peak_get_pc_diagnostics(request->interceptor,
+                       (gpointer)strict_helper_target, request->listener, &after_diag) &&
+                   memcmp(before_diag, &after_diag, sizeof(*before_diag)) == 0);
+        check_int("supported recovery callback transition", calls_delta, operation);
+        check_int("supported recovery gate open",
+                  peak_detach_controller_test_thread_creation_gate_epoch(), 0);
+    }
+}
+#endif
+
+static int
+run_supported_handler_recovery(void)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    return 77;
+#else
+    GumPeakPcDiagnostics before_diag = {0}, after_diag = {0};
+    uint8_t before_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t original_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    uint8_t after_bytes[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    int worker_started = 0;
+    int native_action_installed = 0;
+    int reap_live = g_getenv("PEAK_TEST_SUPPORTED_REAP_LIVE") != NULL;
+    int exited_target = g_getenv("PEAK_TEST_SUPPORTED_EXITED_TARGET") != NULL;
+    pid_t exited_tid = 0;
+    if (reap_live || exited_target)
+        receipt_test_capacity = 1;
+    atomic_store_explicit(&supported_exit_from_handler, exited_target,
+                          memory_order_release);
+    struct sigaction action = {0}, queried = {0}, previous = {0};
+    supported_signum = peak_detach_controller_test_signal_backend_signum();
+    check_true("supported reserved signal differs from P", supported_signum > 0 &&
+               supported_signum <= 64 && supported_signum != SIGUSR1);
+    check_int("supported initial unexpected count",
+              peak_signal_policy_unexpected_delivery_count(), 0);
+    if (pipe(supported_entered_pipe) != 0 || pipe(supported_done_pipe) != 0) {
+        perror("supported pipe");
+        return EXIT_FAILURE;
+    }
+    action.sa_handler = supported_application_handler;
+    sigfillset(&action.sa_mask);
+    action.sa_flags = 0;
+    errno = 0;
+    int action_rc = sigaction(SIGUSR1, &action, &previous);
+    int query_rc = sigaction(SIGUSR1, NULL, &queried);
+    fprintf(stderr, "supported-application-sigaction P=%d S=%d rc=%d query_rc=%d "
+            "handler_equal=%d requested_flags=0 queried_flags=0x%x mask_P=%d mask_S=%d\n",
+            SIGUSR1, supported_signum, action_rc, query_rc,
+            queried.sa_handler == supported_application_handler, queried.sa_flags,
+            sigismember(&queried.sa_mask, SIGUSR1),
+            sigismember(&queried.sa_mask, supported_signum));
+    check_true("ordinary sigaction with full handler mask accepted",
+               action_rc == 0 && query_rc == 0 &&
+               queried.sa_handler == supported_application_handler &&
+               sigismember(&queried.sa_mask, supported_signum) == 1 &&
+               (queried.sa_flags & (SA_NODEFER | SA_RESETHAND | SA_SIGINFO)) == 0);
+    memcpy(original_bytes, (void*)strict_helper_target, sizeof(original_bytes));
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener =
+        gum_make_call_listener(supported_on_enter, NULL, NULL, NULL);
+    check_int("supported Gum attach",
+              gum_interceptor_attach(interceptor, (gpointer)strict_helper_target,
+                                     listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("supported initial Gum diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &before_diag));
+    guint length = before_diag.overwritten_prologue_len;
+    if (length == 0 || length > sizeof(before_bytes)) {
+        failures++;
+        goto cleanup;
+    }
+    memcpy(before_bytes, (void*)strict_helper_target, length);
+    strict_helper_target();
+    check_int("supported initial callback", atomic_load(&supported_callbacks), 1);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    atomic_store(&supported_running, 1);
+    if (pthread_create(&supported_thread, NULL, supported_worker, NULL) != 0) {
+        failures++;
+        goto cleanup;
+    }
+    worker_started = 1;
+    double deadline = supported_now() + 2.0;
+    while (atomic_load(&supported_tid) == 0 && supported_now() < deadline)
+        usleep(1000);
+    int initial_mask_p = supported_status_bit(atomic_load(&supported_tid), "SigBlk:", SIGUSR1);
+    int initial_mask_s = supported_status_bit(atomic_load(&supported_tid), "SigBlk:", supported_signum);
+    fprintf(stderr, "supported-initial-mask tid=%d P=%d S=%d mask_P=%d mask_S=%d\n",
+            atomic_load(&supported_tid), SIGUSR1, supported_signum,
+            initial_mask_p, initial_mask_s);
+    check_true("supported worker initially unblocks P and S",
+               atomic_load(&supported_tid) > 0 && initial_mask_p == 0 && initial_mask_s == 0);
+    if (failures != 0)
+        goto cleanup;
+    PeakDetachRequest request = {
+        .hook_id = 130, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor, .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    supported_enabled = 1;
+    double started = supported_now();
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    double elapsed = supported_now() - started;
+    supported_enabled = 0;
+    gboolean held = peak_detach_controller_threads_are_held();
+    gboolean physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    /* Even an unexpected successful prepare must release before any target call. */
+    if (prepared)
+        check_true("supported unexpected prepare finish",
+                   peak_detach_controller_finish_hook_mutation(&request, &status));
+    int unexpected_at_return = peak_signal_policy_unexpected_delivery_count();
+    memcpy(after_bytes, (void*)strict_helper_target, length);
+    fprintf(stderr, "supported-entry-before len=%u hex=", length);
+    for (guint i = 0; i < length; i++) fprintf(stderr, "%02x", before_bytes[i]);
+    fprintf(stderr, "\nsupported-entry-after len=%u hex=", length);
+    for (guint i = 0; i < length; i++) fprintf(stderr, "%02x", after_bytes[i]);
+    fputc('\n', stderr);
+    check_true("supported post-timeout Gum diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &after_diag));
+    int callback_before = atomic_load(&supported_callbacks);
+    strict_helper_target();
+    int callback_delta = atomic_load(&supported_callbacks) - callback_before;
+    fprintf(stderr, "supported-first-prepare prepared=%d status=%s elapsed=%.9f "
+            "unexpected=%d held=%d physical=%d bytes_equal=%d diagnostics_equal=%d "
+            "callback_delta=%d gate_epoch=%d\n",
+            prepared, peak_detach_controller_status_string(status), elapsed,
+            unexpected_at_return, held, physical,
+            memcmp(before_bytes, after_bytes, length) == 0,
+            memcmp(&before_diag, &after_diag, sizeof(before_diag)) == 0,
+            callback_delta, peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("ordinary handler mask creates a real pending owned stop",
+               supported_epoch > 0 && supported_pthread_kill_rc == 0 &&
+               supported_entered && supported_handler_mask_s == 1 &&
+               supported_normal_send_count == 1 && supported_owned_rc == 0 &&
+               supported_owned_pending_s == 1 && supported_owned_cookie ==
+                   peak_signal_policy_cookie_for(supported_epoch, atomic_load(&supported_tid)));
+    check_true("main ordinary handler mask reproduces timeout before mutation",
+               !prepared && status == PEAK_DETACH_STATUS_TIMEOUT && elapsed >= 9.0 &&
+               unexpected_at_return == 0 && !held && !physical &&
+               memcmp(before_bytes, after_bytes, length) == 0 &&
+               memcmp(&before_diag, &after_diag, sizeof(before_diag)) == 0 &&
+               callback_delta == 1 &&
+               peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    check_int("supported target alive before releasing H_P",
+              (int)syscall(SYS_tgkill, getpid(), atomic_load(&supported_tid), 0), 0);
+    if (reap_live) {
+        errno = E2BIG;
+        int reclaimed = peak_detach_controller_test_reap_exited_receipts();
+        int sweep_errno = errno;
+        int pending = supported_status_bit(atomic_load(&supported_tid), "SigPnd:",
+                                           supported_signum);
+        fprintf(stderr, "supported-live-receipt-sweep capacity=%u reclaimed=%d "
+                "reaped_count=%d consumed_count=%d pending_S=%d\n",
+                receipt_test_capacity, reclaimed, atomic_load(&receipt_reaped_count),
+                atomic_load(&receipt_consumed_count), pending);
+        check_true("pressure sweep preserves live target's pending receipt",
+                   receipt_test_capacity == 1 && reclaimed == 0 &&
+                   atomic_load_explicit(&receipt_reaped_count, memory_order_acquire) == 0 &&
+                   atomic_load_explicit(&receipt_consumed_count, memory_order_acquire) == 0 &&
+                   pending == 1);
+        check_int("receipt sweep preserves caller errno", sweep_errno, E2BIG);
+    }
+    supported_release_handler();
+    if (exited_target) {
+        exited_tid = atomic_load(&supported_tid);
+        int join_rc = supported_timed_join(supported_thread);
+        check_int("raw-exited worker joins within the fixture deadline", join_rc, 0);
+        if (join_rc != 0)
+            goto cleanup;
+        worker_started = 0;
+        char exited_path[96];
+        snprintf(exited_path, sizeof(exited_path), "/proc/self/task/%d", exited_tid);
+        int path_rc, path_errno, probe_errno;
+        long probe_rc;
+        deadline = supported_now() + 2.0;
+        do {
+            errno = 0;
+            path_rc = access(exited_path, F_OK);
+            path_errno = errno;
+            errno = 0;
+            probe_rc = peak_exec_raw_syscall6(SYS_tgkill, getpid(), exited_tid,
+                                              0, 0, 0, 0);
+            probe_errno = errno;
+            if (path_rc == -1 && path_errno == ENOENT &&
+                probe_rc == -1 && probe_errno == ESRCH)
+                break;
+            usleep(1000);
+        } while (supported_now() < deadline);
+        fprintf(stderr, "supported-exited-target raw_SYS_exit=1 old_tid=%d "
+                "join_rc=%d task_path_rc=%d task_path_errno=%d native_probe_rc=%ld "
+                "native_probe_errno=%d consumed_count=%d reaped_count=%d\n",
+                exited_tid, join_rc, path_rc, path_errno, probe_rc, probe_errno,
+                atomic_load(&receipt_consumed_count), atomic_load(&receipt_reaped_count));
+        check_true("native task exit is confirmed before receipt pressure",
+                   path_rc == -1 && path_errno == ENOENT &&
+                   probe_rc == -1 && probe_errno == ESRCH);
+        check_int("blocked owned packet never entered a handler before target exit",
+                  atomic_load_explicit(&receipt_consumed_count, memory_order_acquire), 0);
+        check_int("target exit alone has not run the capacity reaper",
+                  atomic_load_explicit(&receipt_reaped_count, memory_order_acquire), 0);
+        check_int("target exit does not report unexpected delivery",
+                  peak_signal_policy_unexpected_delivery_count(), 0);
+        if (failures != 0)
+            goto cleanup;
+        atomic_store_explicit(&supported_exit_from_handler, 0, memory_order_release);
+        atomic_store(&supported_tid, 0);
+        atomic_store(&supported_returned, 0);
+        atomic_store(&supported_release_started, 0);
+        if (pthread_create(&supported_thread, NULL, supported_worker, NULL) != 0) {
+            failures++;
+            goto cleanup;
+        }
+        worker_started = 1;
+        deadline = supported_now() + 2.0;
+        while (atomic_load(&supported_tid) == 0 && supported_now() < deadline)
+            usleep(1000);
+        check_true("replacement worker has a distinct live task and unblocked S",
+                   atomic_load(&supported_tid) > 0 &&
+                   atomic_load(&supported_tid) != exited_tid &&
+                   supported_status_bit(atomic_load(&supported_tid), "SigBlk:",
+                                        supported_signum) == 0);
+        if (failures != 0)
+            goto cleanup;
+    } else {
+        deadline = supported_now() + 2.0;
+        while (!atomic_load(&supported_returned) && supported_now() < deadline)
+            usleep(1000);
+        int unexpected_after = peak_signal_policy_unexpected_delivery_count();
+        fprintf(stderr, "supported-real-late-delivery handler_returned=%d unexpected=%d\n",
+                atomic_load(&supported_returned), unexpected_after);
+        fprintf(stderr, "supported-genuine-consume count=%d epoch=%d tid=%d S=%d cookie=0x%lx\n",
+                atomic_load_explicit(&receipt_consumed_count, memory_order_acquire),
+                atomic_load(&receipt_consumed_epoch), atomic_load(&receipt_consumed_tid),
+                atomic_load(&receipt_consumed_signum), atomic_load(&receipt_consumed_cookie));
+        check_true("ordinary H_P return drains original owned packet without contamination",
+                   atomic_load(&supported_returned) && unexpected_after == 0 &&
+                   atomic_load_explicit(&receipt_consumed_count, memory_order_acquire) == 1 &&
+                   atomic_load(&receipt_consumed_epoch) == supported_epoch &&
+                   atomic_load(&receipt_consumed_tid) == atomic_load(&supported_tid) &&
+                   atomic_load(&receipt_consumed_signum) == supported_signum &&
+                   atomic_load(&receipt_consumed_cookie) == supported_owned_cookie);
+    }
+    int batch = g_getenv("PEAK_TEST_SUPPORTED_BATCH") != NULL;
+    supported_check_physical_cycle(&request, batch, original_bytes, before_bytes,
+                                   length, &before_diag,
+                                   exited_target ? "after-target-exit" : "late-owned-recovery");
+    fprintf(stderr, "supported-after-physical-cycle unexpected=%d consume_count=%d pending_S=%d\n",
+            peak_signal_policy_unexpected_delivery_count(), atomic_load(&receipt_consumed_count),
+            supported_status_bit(atomic_load(&supported_tid), "SigPnd:", supported_signum));
+    check_int("complete physical recovery leaves unexpected zero",
+              peak_signal_policy_unexpected_delivery_count(), 0);
+    if (exited_target) {
+        fprintf(stderr, "supported-exited-receipt-reclaimed capacity=%u count=%d "
+                "epoch=%d tid=%d S=%d consumed_count=%d\n",
+                receipt_test_capacity, atomic_load(&receipt_reaped_count),
+                atomic_load(&receipt_reaped_epoch), atomic_load(&receipt_reaped_tid),
+                atomic_load(&receipt_reaped_signum), atomic_load(&receipt_consumed_count));
+        check_true("capacity pressure reclaims exactly the exited target's receipt",
+                   receipt_test_capacity == 1 &&
+                   atomic_load_explicit(&receipt_reaped_count, memory_order_acquire) == 1 &&
+                   atomic_load(&receipt_reaped_epoch) == supported_epoch &&
+                   atomic_load(&receipt_reaped_tid) == exited_tid &&
+                   atomic_load(&receipt_reaped_signum) == supported_signum);
+        check_int("exited target packet was never consumed by a replacement worker",
+                  atomic_load(&receipt_consumed_count), 0);
+    } else {
+        check_int("the genuine canceled packet is consumed once",
+                  atomic_load(&receipt_consumed_count), 1);
+        if (reap_live)
+            check_int("live target's receipt is consumed instead of reaped",
+                      atomic_load(&receipt_reaped_count), 0);
+    }
+    if (g_getenv("PEAK_TEST_SUPPORTED_NO_DEBT_HANDOFF") != NULL) {
+        /* This positive migration case starts only after O has been consumed.
+         * It does not cover replacing the native action while O is pending. */
+        if (failures != 0)
+            goto cleanup;
+        check_int("native handoff starts with no pending owned packet",
+                  supported_status_bit(atomic_load(&supported_tid), "SigPnd:",
+                                       supported_signum), 0);
+        check_true("native handoff uses a real-time signal",
+                   supported_signum >= SIGRTMIN && supported_signum <= SIGRTMAX);
+        int (*native_sigaction)(int, const struct sigaction*, struct sigaction*) =
+            (int (*)(int, const struct sigaction*, struct sigaction*))
+                dlsym(RTLD_NEXT, "sigaction");
+        check_true("resolve native sigaction for read-only verification",
+                   native_sigaction != NULL);
+        if (failures != 0)
+            goto cleanup;
+        struct sigaction native_action = {0}, native_query = {0};
+        sigemptyset(&native_action.sa_mask);
+        sigaddset(&native_action.sa_mask, SIGUSR2);
+        native_action.sa_sigaction = supported_native_handler;
+        native_action.sa_flags = SA_SIGINFO;
+        int install_rc = sigaction(supported_signum, &native_action, NULL);
+        native_action_installed = install_rc == 0;
+        int native_query_rc = native_sigaction(supported_signum, NULL, &native_query);
+        int migrated_signum = peak_signal_policy_reserved_signal();
+        fprintf(stderr, "supported-no-debt-native-install old_S=%d new_S=%d "
+                "rc=%d native_query_rc=%d handler_equal=%d flags=0x%x\n",
+                supported_signum, migrated_signum, install_rc, native_query_rc,
+                native_query.sa_sigaction == supported_native_handler,
+                native_query.sa_flags);
+        check_true("no-debt application handler is installed natively",
+                   install_rc == 0 && native_query_rc == 0 &&
+                   native_query.sa_sigaction == supported_native_handler &&
+                   (native_query.sa_flags & SA_SIGINFO) != 0 &&
+                   (native_query.sa_flags & (SA_RESETHAND | SA_NODEFER)) == 0 &&
+                   sigismember(&native_query.sa_mask, SIGUSR2) == 1 &&
+                   sigismember(&native_query.sa_mask, supported_signum) == 0);
+        check_true("no-debt native handoff migrates the reserved signal",
+                   migrated_signum >= SIGRTMIN && migrated_signum <= SIGRTMAX &&
+                   migrated_signum != supported_signum);
+        if (failures != 0)
+            goto cleanup;
+        const int application_payload = 0x5a17;
+        union sigval application_value = {.sival_int = application_payload};
+        int send_rc = pthread_sigqueue(supported_thread, supported_signum,
+                                      application_value);
+        check_int("ordinary application pthread_sigqueue succeeds", send_rc, 0);
+        deadline = supported_now() + 2.0;
+        while (atomic_load_explicit(&supported_native_returned, memory_order_acquire) == 0 &&
+               supported_now() < deadline)
+            usleep(1000);
+        fprintf(stderr, "supported-no-debt-native-delivery send_rc=%d calls=%d "
+                "returned=%d tid=%d expected_tid=%d S=%d code=%d payload=0x%x\n",
+                send_rc, atomic_load(&supported_native_calls),
+                atomic_load(&supported_native_returned), atomic_load(&supported_native_tid),
+                atomic_load(&supported_tid), atomic_load(&supported_native_signum),
+                atomic_load(&supported_native_code), atomic_load(&supported_native_value));
+        check_true("ordinary native notification preserves target and payload",
+                   atomic_load_explicit(&supported_native_returned, memory_order_acquire) == 1 &&
+                   atomic_load(&supported_native_calls) == 1 &&
+                   atomic_load(&supported_native_tid) == atomic_load(&supported_tid) &&
+                   atomic_load(&supported_native_signum) == supported_signum &&
+                   atomic_load(&supported_native_code) == SI_QUEUE &&
+                   atomic_load(&supported_native_value) == application_payload);
+        if (failures != 0)
+            goto cleanup;
+        supported_check_physical_cycle(&request, batch, original_bytes, before_bytes,
+                                       length, &before_diag, "after-native-handoff");
+        check_int("physical recovery uses the migrated reserved signal",
+                  peak_detach_controller_test_signal_backend_signum(), migrated_signum);
+        memset(&native_query, 0, sizeof(native_query));
+        check_true("physical recovery preserves the native application handler",
+                   native_sigaction(supported_signum, NULL, &native_query) == 0 &&
+                   native_query.sa_sigaction == supported_native_handler);
+        check_int("migrated control packets do not enter the native handler",
+                  atomic_load(&supported_native_calls), 1);
+        check_int("native application delivery leaves owned consumption unchanged",
+                  atomic_load(&receipt_consumed_count), 1);
+        check_int("native handoff and physical recovery leave unexpected zero",
+                  peak_signal_policy_unexpected_delivery_count(), 0);
+    }
+    if (g_getenv("PEAK_TEST_SUPPORTED_REPLAY") != NULL) {
+        supported_replay_before = peak_signal_policy_unexpected_delivery_count();
+        atomic_store(&supported_replay_returned, 0);
+        atomic_store(&supported_replay_enabled, 1);
+        atomic_store(&preflight_normal_sends, 0);
+        atomic_store(&preflight_tracking, 1);
+        request.operation = PEAK_DETACH_OPERATION_DETACH;
+        status = PEAK_DETACH_STATUS_ERROR;
+        gboolean replay_prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+        atomic_store(&preflight_tracking, 0);
+        atomic_store(&supported_replay_enabled, 0);
+        const PeakDetachFailureDetail* replay_detail = peak_detach_controller_last_failure_detail();
+        int replay_held = peak_detach_controller_threads_are_held();
+        int replay_physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        memcpy(after_bytes, (void*)strict_helper_target, length);
+        if (replay_prepared)
+            check_true("consumed-cookie unexpected prepare finish",
+                       peak_detach_controller_finish_hook_mutation(&request, &status));
+        int calls_before = atomic_load(&supported_callbacks);
+        strict_helper_target();
+        int calls_delta = atomic_load(&supported_callbacks) - calls_before;
+        fprintf(stderr, "supported-consumed-cookie-guard prepared=%d status=%s "
+                "reason=%s normal_sends=%d held=%d physical=%d entry_equal=%d "
+                "callback_delta=%d gate_epoch=%d\n",
+                replay_prepared, peak_detach_controller_status_string(status),
+                replay_detail != NULL && replay_detail->reason != NULL ? replay_detail->reason : "<none>",
+                atomic_load(&preflight_normal_sends), replay_held, replay_physical,
+                memcmp(before_bytes, after_bytes, length) == 0, calls_delta,
+                peak_detach_controller_test_thread_creation_gate_epoch());
+        check_true("consumed canceled identity is not accepted twice",
+                   supported_replay_before == 0 && supported_replay_rc == 0 &&
+                   atomic_load(&supported_replay_returned) &&
+                   peak_signal_policy_unexpected_delivery_count() == 1 &&
+                   !replay_prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                   replay_detail != NULL && replay_detail->reason != NULL &&
+                   strcmp(replay_detail->reason, "signal-unexpected-delivery") == 0 &&
+                   replay_detail->tid == 0 && replay_detail->pc == (uintptr_t)supported_signum &&
+                   replay_detail->aux == 1 && atomic_load(&preflight_normal_sends) == 0 &&
+                   !replay_held && !replay_physical &&
+                   memcmp(before_bytes, after_bytes, length) == 0 && calls_delta == 1 &&
+                   peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    }
+    if (!native_action_installed) {
+        struct sigaction no_debt_action = {0};
+        sigemptyset(&no_debt_action.sa_mask);
+        no_debt_action.sa_handler = SIG_DFL;
+        errno = 0;
+        int no_debt_rc = sigaction(supported_signum, &no_debt_action, NULL);
+        fprintf(stderr, "supported-no-current-debt-application-sigaction S=%d rc=%d errno=%d\n",
+                supported_signum, no_debt_rc, errno);
+        check_int("no-current-debt application sigaction stays accepted", no_debt_rc, 0);
+    }
+cleanup:
+    supported_enabled = 0;
+    /* Release first on every path, including assertion failures. */
+    supported_release_handler();
+    if (worker_started) {
+        atomic_store(&supported_running, 0);
+        if (exited_target) {
+            int join_rc = supported_timed_join(supported_thread);
+            check_int("exit fixture cleanup joins its remaining worker", join_rc, 0);
+            if (join_rc != 0)
+                return EXIT_FAILURE;
+        } else {
+            pthread_join(supported_thread, NULL);
+        }
+    }
+    if (native_action_installed) {
+        /* If delivery timed out, keep H valid until its target has exited. */
+        struct sigaction default_action = {0};
+        sigemptyset(&default_action.sa_mask);
+        default_action.sa_handler = SIG_DFL;
+        check_int("restore native application disposition after worker exit",
+                  sigaction(supported_signum, &default_action, NULL), 0);
+    }
+    sigaction(SIGUSR1, &previous, NULL);
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener);
+    g_object_unref(interceptor);
+    gum_deinit_embedded();
+    close(supported_entered_pipe[0]); close(supported_entered_pipe[1]);
+    close(supported_done_pipe[0]); close(supported_done_pipe[1]);
+    fprintf(stderr, "supported-handler-owned-recovery failures=%d\n", failures);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+static int
+run_signal_receipt_control(int failed_send)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    (void)failed_send;
+    return 77;
+#else
+    pthread_t worker;
+    int worker_started = 0;
+    uint8_t before[GUM_PEAK_MAX_PROLOGUE_SIZE], after[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    GumPeakPcDiagnostics diagnostics = {0}, after_diagnostics = {0};
+    const char* duplicate_state = g_getenv("PEAK_TEST_RECEIPT_DUPLICATE_STATE");
+    receipt_duplicate_mode = duplicate_state == NULL ? 0 :
+        (strcmp(duplicate_state, "sent") == 0 ? 2 : 1);
+    receipt_seed_index = -1;
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener = gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
+    check_int("receipt control attach", gum_interceptor_attach(interceptor,
+              (gpointer)strict_helper_target, listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("receipt control diagnostics",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &diagnostics));
+    guint length = diagnostics.overwritten_prologue_len;
+    if (length == 0 || length > sizeof(before)) {
+        failures++;
+        goto cleanup;
+    }
+    memcpy(before, (void*)strict_helper_target, length);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    int signo = peak_detach_controller_test_signal_backend_signum();
+    preflight_unexpected_before = peak_signal_policy_unexpected_delivery_count();
+    atomic_store(&preflight_worker_tid, 0);
+    atomic_store(&preflight_handler_returned, 0);
+    atomic_store(&preflight_worker_running, 1);
+    if (pthread_create(&worker, NULL, preflight_worker, NULL) != 0) {
+        failures++;
+        goto cleanup;
+    }
+    worker_started = 1;
+    double deadline = preflight_now() + 2.0;
+    while (atomic_load(&preflight_worker_tid) == 0 && preflight_now() < deadline)
+        usleep(1000);
+    check_true("receipt control worker ready", atomic_load(&preflight_worker_tid) > 0);
+    receipt_test_capacity = failed_send || receipt_duplicate_mode != 0
+        ? PEAK_DETACH_HELPER_MAX_THREADS : 0;
+    atomic_store(&receipt_fail_next_send, failed_send);
+    atomic_store(&preflight_normal_sends, 0);
+    atomic_store(&preflight_tracking, 1);
+    PeakDetachRequest request = {
+        .hook_id = 131, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target,
+        .interceptor = interceptor, .listener = listener,
+        .operation = PEAK_DETACH_OPERATION_DETACH
+    };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    atomic_store(&preflight_tracking, 0);
+    receipt_test_capacity = PEAK_DETACH_HELPER_MAX_THREADS;
+    const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+    int held = peak_detach_controller_threads_are_held();
+    int physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    memcpy(after, (void*)strict_helper_target, length);
+    if (prepared)
+        check_true("receipt control unexpected prepare finish",
+                   peak_detach_controller_finish_hook_mutation(&request, &status));
+    check_true("receipt control full Gum state remains unchanged",
+               gum_interceptor_peak_get_pc_diagnostics(interceptor,
+                   (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+               memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
+    int callbacks_before = atomic_load(&preflight_callback_count);
+    strict_helper_target();
+    int callbacks = atomic_load(&preflight_callback_count) - callbacks_before;
+    fprintf(stderr, "receipt-control failed_send=%d prepared=%d status=%s reason=%s "
+            "normal_send_attempts=%d forced_failure_tid=%d forced_failure_S=%d "
+            "forced_failure_cookie=0x%lx real_sends=%d held=%d physical=%d "
+            "entry_equal=%d callback_delta=%d unexpected=%d consume_count=%d gate=%d\n",
+            failed_send, prepared, peak_detach_controller_status_string(status),
+            detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+            atomic_load(&preflight_normal_sends), receipt_failed_tid, receipt_failed_signum,
+            receipt_failed_cookie, atomic_load(&preflight_normal_sends) - (failed_send ? 1 : 0),
+            held, physical, memcmp(before, after, length) == 0,
+            callbacks, peak_signal_policy_unexpected_delivery_count(),
+            atomic_load(&receipt_consumed_count),
+            peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("receipt bound or send failure grants no permission",
+               !prepared && !held && !physical && memcmp(before, after, length) == 0 &&
+               callbacks == 1 && peak_signal_policy_unexpected_delivery_count() == 0 &&
+               atomic_load(&receipt_consumed_count) == 0 &&
+               peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    if (receipt_duplicate_mode != 0) {
+        fprintf(stderr, "receipt-wire-identity-rejection mode=%d status=%s reason=%s "
+                "tid=%ld pc=%" PRIuPTR " aux=%" PRIuPTR " normal_sends=%d\n",
+                receipt_duplicate_mode, peak_detach_controller_status_string(status),
+                detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+                detail != NULL ? detail->tid : -1, detail != NULL ? detail->pc : 0,
+                detail != NULL ? detail->aux : 0, atomic_load(&preflight_normal_sends));
+        check_true("duplicate wire tuple rejected before new allocation or send",
+                   receipt_seed_index == PEAK_DETACH_HELPER_MAX_THREADS - 1 &&
+                   receipt_seed_epoch > 0 && receipt_seed_tid == atomic_load(&preflight_worker_tid) &&
+                   receipt_seed_signum == signo &&
+                   (receipt_seed_state & UINT64_C(15)) == (receipt_duplicate_mode == 2 ? 3 : 1) &&
+                   !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                   atomic_load(&preflight_normal_sends) == 0 && detail != NULL &&
+                   detail->reason != NULL && strcmp(detail->reason, "signal-receipt-identity-pending") == 0 &&
+                   detail->tid == receipt_seed_tid && detail->pc == (uintptr_t)signo &&
+                   detail->aux == (uintptr_t)receipt_seed_epoch);
+    } else if (!failed_send) {
+        check_true("receipt capacity refuses before first send",
+                   status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                   atomic_load(&preflight_normal_sends) == 0 && detail != NULL &&
+                   detail->reason != NULL && strcmp(detail->reason, "signal-receipt-capacity") == 0);
+    } else {
+        check_true("receipt synthetic send failed without actual delivery",
+                   status == PEAK_DETACH_STATUS_TIMEOUT &&
+                   atomic_load(&preflight_normal_sends) == 1 &&
+                   receipt_failed_tid == atomic_load(&preflight_worker_tid) && receipt_failed_signum == signo);
+        receipt_control_replay = 1;
+        atomic_store(&preflight_normal_sends, 0);
+        atomic_store(&preflight_tracking, 1);
+        status = PEAK_DETACH_STATUS_ERROR;
+        prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+        atomic_store(&preflight_tracking, 0);
+        receipt_control_replay = 0;
+        detail = peak_detach_controller_last_failure_detail();
+        memcpy(after, (void*)strict_helper_target, length);
+        if (prepared)
+            check_true("failed-send identity unexpected prepare finish",
+                       peak_detach_controller_finish_hook_mutation(&request, &status));
+        fprintf(stderr, "receipt-failed-send-credit replay_rc=%d handler_returned=%d "
+                "prepared=%d status=%s reason=%s normal_sends=%d unexpected=%d consume_count=%d\n",
+                receipt_control_replay_rc, atomic_load(&preflight_handler_returned),
+                prepared, peak_detach_controller_status_string(status),
+                detail != NULL && detail->reason != NULL ? detail->reason : "<none>",
+                atomic_load(&preflight_normal_sends), peak_signal_policy_unexpected_delivery_count(),
+                atomic_load(&receipt_consumed_count));
+        check_true("failed send never grants a canceled owned credit",
+                   receipt_control_replay_rc == 0 && atomic_load(&preflight_handler_returned) &&
+                   !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED &&
+                   detail != NULL && detail->reason != NULL &&
+                   strcmp(detail->reason, "signal-unexpected-delivery") == 0 &&
+                   detail->tid == 0 && detail->pc == (uintptr_t)signo && detail->aux == 1 &&
+                   atomic_load(&preflight_normal_sends) == 0 &&
+                   peak_signal_policy_unexpected_delivery_count() == 1 &&
+                   atomic_load(&receipt_consumed_count) == 0 && memcmp(before, after, length) == 0 &&
+                   !peak_detach_controller_threads_are_held() &&
+                   !peak_detach_controller_current_mutation_uses_physical_patch() &&
+                   peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    }
+cleanup:
+    receipt_test_capacity = PEAK_DETACH_HELPER_MAX_THREADS;
+    receipt_control_replay = 0;
+    receipt_duplicate_mode = 0;
+    atomic_store(&receipt_fail_next_send, 0);
+    if (worker_started) {
+        atomic_store(&preflight_worker_running, 0);
+        pthread_join(worker, NULL);
+    }
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    g_object_unref(listener); g_object_unref(interceptor); gum_deinit_embedded();
+    fprintf(stderr, "receipt-control-complete failed_send=%d failures=%d\n", failed_send, failures);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif
+}
+
+#if defined(__linux__) && defined(PEAK_HAVE_GUM_PEAK_PC_API)
+/* This holds a real owned handler after lookup/before pin or after pin. It
+ * tests userspace slot lifetime, not kernel-selected/pre-entry disposition. */
+extern int peak_detach_controller_test_slot_payload(void*, uint64_t*);
+static atomic_int slot_reuse_enabled, slot_reuse_phase, slot_reuse_paused;
+static atomic_int slot_reuse_running, slot_reuse_tid, slot_reuse_release_requested;
+static atomic_int slot_reuse_returned, slot_reuse_old_epoch, slot_reuse_old_index;
+static atomic_int slot_reuse_latest_epoch, slot_reuse_latest_index;
+static _Atomic(void*) slot_reuse_latest_slot;
+static int slot_reuse_entered_pipe[2] = {-1, -1}, slot_reuse_release_pipe[2] = {-1, -1};
+static int slot_reuse_send_count, slot_reuse_send_S, slot_reuse_send_rc;
+static pid_t slot_reuse_send_tid;
+static unsigned long slot_reuse_send_cookie;
+
+static void slot_reuse_observe_send(pid_t tid, int signo, unsigned long cookie, int rc)
+{
+    if (!atomic_load(&slot_reuse_enabled)) return;
+    slot_reuse_send_count++;
+    slot_reuse_send_tid = tid; slot_reuse_send_S = signo;
+    slot_reuse_send_cookie = cookie; slot_reuse_send_rc = rc;
+}
+
+void peak_test_signal_slot_published(int epoch, pid_t tid, uint32_t index, void* slot)
+{
+    if (!atomic_load(&slot_reuse_enabled) || tid != atomic_load(&slot_reuse_tid)) return;
+    atomic_store(&slot_reuse_latest_epoch, epoch);
+    atomic_store(&slot_reuse_latest_index, (int)index);
+    atomic_store(&slot_reuse_latest_slot, slot);
+}
+
+static void slot_reuse_pause(int phase, int epoch, pid_t tid, void* slot)
+{
+    int saved_errno = errno;
+    if (atomic_load(&slot_reuse_enabled) && tid == atomic_load(&slot_reuse_tid) &&
+        phase == atomic_load(&slot_reuse_phase) &&
+        atomic_exchange(&slot_reuse_paused, 1) == 0) {
+        atomic_store(&slot_reuse_old_epoch, epoch);
+        atomic_store(&slot_reuse_old_index,
+                     peak_detach_controller_test_slot_payload(slot, NULL));
+        char byte = 'E';
+        ssize_t rc;
+        do { rc = write(slot_reuse_entered_pipe[1], &byte, 1); } while (rc < 0 && errno == EINTR);
+        if (rc == 1)
+            do { rc = read(slot_reuse_release_pipe[0], &byte, 1); } while (rc < 0 && errno == EINTR);
+    }
+    errno = saved_errno;
+}
+void peak_test_signal_slot_before_pin(int epoch, pid_t tid, void* slot)
+{ slot_reuse_pause(0, epoch, tid, slot); }
+void peak_test_signal_slot_after_pin(int epoch, pid_t tid, void* slot)
+{ slot_reuse_pause(1, epoch, tid, slot); }
+
+static void slot_reuse_release(void)
+{
+    atomic_store(&slot_reuse_release_requested, 1);
+    if (slot_reuse_release_pipe[1] >= 0) {
+        char byte = 'R';
+        ssize_t rc;
+        do { rc = write(slot_reuse_release_pipe[1], &byte, 1); } while (rc < 0 && errno == EINTR);
+    }
+}
+static void* slot_reuse_worker(void* unused)
+{
+    (void)unused;
+    atomic_store(&slot_reuse_tid, (int)syscall(SYS_gettid));
+    while (atomic_load(&slot_reuse_running)) {
+        if (atomic_load(&slot_reuse_paused) && atomic_load(&slot_reuse_release_requested))
+            atomic_store(&slot_reuse_returned, 1);
+        usleep(1000);
+    }
+    return NULL;
+}
+static void slot_reuse_dump(const char* label, const uint64_t* payload)
+{
+    fprintf(stderr, "slot-reuse-payload label=%s values=", label);
+    for (int i = 0; i < 13; i++) fprintf(stderr, "%s0x%" PRIx64, i ? "," : "", payload[i]);
+    fputc('\n', stderr);
+}
+#endif
+
+static int run_active_slot_reader_reuse(void)
+{
+#if !defined(__linux__) || !defined(PEAK_HAVE_GUM_PEAK_PC_API)
+    return 77;
+#else
+    pthread_t worker;
+    int worker_started = 0;
+    uint8_t original[GUM_PEAK_MAX_PROLOGUE_SIZE], active[sizeof(original)], after[sizeof(original)];
+    uint64_t payload_before[13] = {0}, payload_after[13] = {0};
+    GumPeakPcDiagnostics diagnostics = {0}, after_diagnostics = {0};
+    const char* phase = g_getenv("PEAK_TEST_SLOT_PHASE");
+    atomic_store(&slot_reuse_phase, phase != NULL && strcmp(phase, "after_pin") == 0);
+    atomic_store(&slot_reuse_old_index, -1);
+    atomic_store(&slot_reuse_latest_index, -1);
+    check_int("slot reuse entered pipe", pipe(slot_reuse_entered_pipe), 0);
+    check_int("slot reuse release pipe", pipe(slot_reuse_release_pipe), 0);
+    memcpy(original, (void*)strict_helper_target, sizeof(original));
+    gum_init_embedded();
+    GumInterceptor* interceptor = gum_interceptor_obtain();
+    GumInvocationListener* listener = gum_make_call_listener(preflight_on_enter, NULL, NULL, NULL);
+    check_int("slot reuse Gum attach", gum_interceptor_attach(interceptor,
+              (gpointer)strict_helper_target, listener, NULL), GUM_ATTACH_OK);
+    gum_interceptor_flush(interceptor);
+    check_true("slot reuse initial Gum diagnostics", gum_interceptor_peak_get_pc_diagnostics(
+        interceptor, (gpointer)strict_helper_target, listener, &diagnostics));
+    guint length = diagnostics.overwritten_prologue_len;
+    if (failures || length == 0 || length > sizeof(active)) { failures++; goto cleanup; }
+    memcpy(active, (void*)strict_helper_target, length);
+    peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    atomic_store(&slot_reuse_enabled, 1);
+    atomic_store(&slot_reuse_running, 1);
+    if (pthread_create(&worker, NULL, slot_reuse_worker, NULL) != 0) { failures++; goto cleanup; }
+    worker_started = 1;
+    double deadline = preflight_now() + 2.0;
+    while (atomic_load(&slot_reuse_tid) == 0 && preflight_now() < deadline) usleep(1000);
+    check_true("slot reuse worker ready", atomic_load(&slot_reuse_tid) > 0);
+    if (failures) goto cleanup;
+    PeakDetachRequest request = { .hook_id = 132, .symbol_name = "strict_helper_target",
+        .function_address = (gpointer)strict_helper_target, .interceptor = interceptor,
+        .listener = listener, .operation = PEAK_DETACH_OPERATION_DETACH };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    double started = preflight_now();
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    double elapsed = preflight_now() - started;
+    int held = peak_detach_controller_threads_are_held();
+    int physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (prepared) check_true("slot reuse unexpected E1 finish",
+        peak_detach_controller_finish_hook_mutation(&request, &status));
+    int entered = supported_read_ack(slot_reuse_entered_pipe[0]) == 0;
+    memcpy(after, (void*)strict_helper_target, length);
+    int calls = atomic_load(&preflight_callback_count); strict_helper_target();
+    int delta = atomic_load(&preflight_callback_count) - calls;
+    check_true("slot reuse E1 Gum unchanged", gum_interceptor_peak_get_pc_diagnostics(
+        interceptor, (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+        memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
+    fprintf(stderr, "slot-reuse-E1 phase=%s entered=%d prepared=%d status=%s elapsed=%.9f "
+        "epoch=%d physical_index=%d normal_sends=%d tid=%d S=%d cookie=0x%lx rc=%d "
+        "held=%d physical=%d bytes_equal=%d callback_delta=%d unexpected=%d gate=%d\n",
+        phase, entered, prepared, peak_detach_controller_status_string(status), elapsed,
+        atomic_load(&slot_reuse_old_epoch), atomic_load(&slot_reuse_old_index),
+        slot_reuse_send_count, slot_reuse_send_tid, slot_reuse_send_S, slot_reuse_send_cookie,
+        slot_reuse_send_rc, held, physical, memcmp(active, after, length) == 0, delta,
+        peak_signal_policy_unexpected_delivery_count(), peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("real owned E1 times out before mutation", entered && !prepared &&
+        status == PEAK_DETACH_STATUS_TIMEOUT && elapsed >= 9 &&
+        atomic_load(&slot_reuse_old_epoch) > 0 && slot_reuse_send_count == 1 &&
+        slot_reuse_send_rc == 0 && slot_reuse_send_tid == atomic_load(&slot_reuse_tid) &&
+        slot_reuse_send_cookie == peak_signal_policy_cookie_for(atomic_load(&slot_reuse_old_epoch), slot_reuse_send_tid) &&
+        !held && !physical && memcmp(active, after, length) == 0 && delta == 1 &&
+        peak_signal_policy_unexpected_delivery_count() == 0 &&
+        peak_detach_controller_test_thread_creation_gate_epoch() == 0);
+    if (!entered) goto cleanup;
+    atomic_store(&slot_reuse_latest_slot, NULL);
+    status = PEAK_DETACH_STATUS_ERROR;
+    prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+    const PeakDetachFailureDetail* detail = peak_detach_controller_last_failure_detail();
+    int e2_held = peak_detach_controller_threads_are_held();
+    int e2_physical = peak_detach_controller_current_mutation_uses_physical_patch();
+    fprintf(stderr, "slot-reuse-E2 phase=%s prepared=%d status=%s reason=%s epoch=%d "
+        "physical_index=%d normal_sends=%d held=%d physical=%d\n", phase, prepared,
+        peak_detach_controller_status_string(status), detail && detail->reason ? detail->reason : "<none>",
+        atomic_load(&slot_reuse_latest_epoch), atomic_load(&slot_reuse_latest_index),
+        slot_reuse_send_count, e2_held, e2_physical);
+    if (prepared) check_true("slot reuse unexpected E2 finish",
+        peak_detach_controller_finish_hook_mutation(&request, &status));
+    void* e2_slot = atomic_load(&slot_reuse_latest_slot);
+    check_true("E2 allocated and rejected before another owned send", e2_slot != NULL &&
+        atomic_load(&slot_reuse_latest_epoch) > atomic_load(&slot_reuse_old_epoch) &&
+        !prepared && status == PEAK_DETACH_STATUS_UNSUPPORTED && detail && detail->reason &&
+        strcmp(detail->reason, "signal-reserved-blocked") == 0 &&
+        slot_reuse_send_count == 1 && !e2_held && !e2_physical);
+    if (e2_slot != NULL) peak_detach_controller_test_slot_payload(e2_slot, payload_before);
+    slot_reuse_release();
+    deadline = preflight_now() + 2.0;
+    while (!atomic_load(&slot_reuse_returned) && preflight_now() < deadline) usleep(1000);
+    if (e2_slot != NULL) peak_detach_controller_test_slot_payload(e2_slot, payload_after);
+    slot_reuse_dump("E2-before-old-return", payload_before);
+    slot_reuse_dump("E2-after-old-return", payload_after);
+    fprintf(stderr, "slot-reuse-old-return phase=%s old_index=%d new_index=%d returned=%d "
+        "payload_equal=%d unexpected=%d gate=%d\n", phase, atomic_load(&slot_reuse_old_index),
+        atomic_load(&slot_reuse_latest_index), atomic_load(&slot_reuse_returned),
+        memcmp(payload_before, payload_after, sizeof(payload_before)) == 0,
+        peak_signal_policy_unexpected_delivery_count(), peak_detach_controller_test_thread_creation_gate_epoch());
+    check_true("old handler returned to ordinary worker code", atomic_load(&slot_reuse_returned));
+    check_true("old handler cannot modify reused generation payload", e2_slot != NULL &&
+        memcmp(payload_before, payload_after, sizeof(payload_before)) == 0);
+    /* Baseline failures are retained while both sides qualify real physical IO. */
+    for (int op = 0; op < 2; op++) {
+        request.operation = op ? PEAK_DETACH_OPERATION_REATTACH : PEAK_DETACH_OPERATION_DETACH;
+        status = PEAK_DETACH_STATUS_ERROR;
+        prepared = peak_detach_controller_prepare_hook_mutation(&request, &status);
+        physical = peak_detach_controller_current_mutation_uses_physical_patch();
+        fprintf(stderr, "slot-reuse-cycle-prepare operation=%d prepared=%d status=%s physical=%d\n",
+                op, prepared, peak_detach_controller_status_string(status), physical);
+        check_true("slot reuse real physical prepare", prepared && status == PEAK_DETACH_STATUS_SAFE && physical);
+        if (prepared) check_true("slot reuse real physical finish",
+            peak_detach_controller_finish_hook_mutation(&request, &status));
+        memcpy(after, (void*)strict_helper_target, length);
+        calls = atomic_load(&preflight_callback_count); strict_helper_target();
+        delta = atomic_load(&preflight_callback_count) - calls;
+        memset(&after_diagnostics, 0, sizeof(after_diagnostics));
+        check_true("slot reuse physical cycle Gum unchanged", gum_interceptor_peak_get_pc_diagnostics(
+            interceptor, (gpointer)strict_helper_target, listener, &after_diagnostics) &&
+            memcmp(&diagnostics, &after_diagnostics, sizeof(diagnostics)) == 0);
+        fprintf(stderr, "slot-reuse-cycle-entry operation=%d callback_delta=%d gate=%d len=%u hex=",
+            op, delta, peak_detach_controller_test_thread_creation_gate_epoch(), length);
+        for (guint i = 0; i < length; i++) fprintf(stderr, "%02x", after[i]);
+        fputc('\n', stderr);
+        check_true("slot reuse physical entry bytes", memcmp(op ? active : original, after, length) == 0);
+        check_int("slot reuse callback transition", delta, op);
+        check_int("slot reuse physical cycle gate open", peak_detach_controller_test_thread_creation_gate_epoch(), 0);
+    }
+    check_int("slot reuse final unexpected zero", peak_signal_policy_unexpected_delivery_count(), 0);
+cleanup:
+    slot_reuse_release();
+    if (worker_started) { atomic_store(&slot_reuse_running, 0); pthread_join(worker, NULL); }
+    atomic_store(&slot_reuse_enabled, 0);
+    gum_interceptor_detach(interceptor, listener); gum_interceptor_flush(interceptor);
+    g_object_unref(listener); g_object_unref(interceptor); gum_deinit_embedded();
+    for (int i = 0; i < 2; i++) {
+        if (slot_reuse_entered_pipe[i] >= 0) close(slot_reuse_entered_pipe[i]);
+        if (slot_reuse_release_pipe[i] >= 0) close(slot_reuse_release_pipe[i]);
+    }
+    fprintf(stderr, "slot-reuse-complete phase=%s failures=%d\n", phase, failures);
+    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+#endif
+}
+
 static int
 run_signal_backend_blocked_thread(void)
 {
@@ -4085,6 +5630,20 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "signal-event-futex") == 0) {
         return run_signal_event_futex();
+    }
+    if (strcmp(argv[1], "signal-preflight-contamination") == 0) {
+        return run_signal_preflight_contamination(
+            g_getenv("PEAK_TEST_PREFLIGHT_BATCH") != NULL,
+            g_getenv("PEAK_TEST_PREFLIGHT_CLEAN") == NULL);
+    }
+    if (strcmp(argv[1], "supported-handler-owned-recovery") == 0) {
+        return run_supported_handler_recovery();
+    }
+    if (strcmp(argv[1], "signal-receipt-control") == 0) {
+        return run_signal_receipt_control(g_getenv("PEAK_TEST_RECEIPT_FAILED_SEND") != NULL);
+    }
+    if (strcmp(argv[1], "active-slot-reader-reuse") == 0) {
+        return run_active_slot_reader_reuse();
     }
     if (strcmp(argv[1], "signal-backend-blocked-thread") == 0) {
         return run_signal_backend_blocked_thread();
