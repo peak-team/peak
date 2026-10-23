@@ -1240,6 +1240,20 @@ gum_interceptor_peak_relocation_branch_available(gconstpointer source,
 }
 
 gboolean
+gum_interceptor_peak_relocation_is_opaque_entry(gconstpointer address)
+{
+    PeakGumRelocationScope * scope = g_private_get(&peak_gum_relocation_scope);
+    uintptr_t target = (uintptr_t)address;
+    PeakGumRelocationInterval * interval;
+    guint index;
+    if (target == 0 || scope == NULL || !scope->valid) return FALSE;
+    index = peak_gum_relocation_first_interval(scope, target);
+    if (index == scope->intervals->len) return FALSE;
+    interval = &g_array_index(scope->intervals, PeakGumRelocationInterval, index);
+    return interval->start == target && !interval->ordinary;
+}
+
+gboolean
 gum_interceptor_peak_relocation_target_available(gconstpointer address)
 {
     return gum_interceptor_peak_relocation_branch_available(NULL, 0, address, FALSE);

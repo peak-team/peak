@@ -24,6 +24,7 @@ GUM_API guint8 * gum_interceptor_peak_read_relocation_code(gconstpointer address
 GUM_API gboolean gum_interceptor_peak_relocation_range_available(gconstpointer address,
                                                                  gsize length);
 GUM_API gboolean gum_interceptor_peak_relocation_target_available(gconstpointer address);
+GUM_API gboolean gum_interceptor_peak_relocation_is_opaque_entry(gconstpointer address);
 GUM_API gboolean gum_interceptor_peak_relocation_branch_available(
     gconstpointer source, gsize source_size, gconstpointer target,
     gboolean internal_label_supported);

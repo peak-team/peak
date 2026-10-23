@@ -17,6 +17,8 @@ typedef struct {
   gboolean direct;
   gboolean fall_through;
   gboolean call;
+  gboolean indirect_tail;
+  gboolean opaque_entry;
   gboolean decoded;
   gboolean complete;
 } PeakArm64RangeNode;
@@ -73,6 +75,13 @@ peak_arm64_range_decode (PeakArm64RangeScan * scan, guint index)
   gint operand = -1;
   guint i;
 
+  /* A registered nonordinary replacement is a normal ABI callee boundary,
+   * never a reason to decode its redirect as though it were original code. */
+  if (gum_interceptor_peak_relocation_is_opaque_entry ((gpointer) node->pc)) {
+    node->decoded = node->complete = TRUE;
+    node->opaque_entry = node->call = TRUE;
+    return TRUE;
+  }
   if (scan->cache == NULL || node->pc < scan->cache_base ||
       node->pc - scan->cache_base + 4 > scan->cache_size) {
     g_free (scan->cache);
@@ -167,6 +176,12 @@ peak_arm64_range_decode (PeakArm64RangeScan * scan, guint index)
       break;
     case ARM64_INS_BR: case ARM64_INS_BRAA: case ARM64_INS_BRAAZ:
     case ARM64_INS_BRAB: case ARM64_INS_BRABZ:
+      /* Under Gum's normal ABI tail-call contract, the decoded register target
+       * is an exit. Its real register reads still constrain scratch liveness.
+       * Such an instruction may not itself be relocated by this check. */
+      node->indirect_tail = TRUE;
+      node->fall_through = FALSE;
+      break;
     case ARM64_INS_ERET: case ARM64_INS_ERETAA: case ARM64_INS_ERETAB:
     case ARM64_INS_DRPS: case ARM64_INS_BC:
       return FALSE;
@@ -246,7 +261,8 @@ peak_arm64_range_candidate (PeakArm64RangeScan * scan, uintptr_t entry,
     if (node->direct && node->target > entry &&
         node->target - entry < span) return FALSE;
     if (node->pc >= entry && node->pc - entry < span) {
-      if (!node->complete) return FALSE;
+      if (!node->complete || node->indirect_tail || node->opaque_entry)
+        return FALSE;
       used |= node->reads | node->writes;
       if (node->pc - entry == span - 4) last = node;
       /* These upstream rewriters use X16 independently of backend scratch. */

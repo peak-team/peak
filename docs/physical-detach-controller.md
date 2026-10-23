@@ -1019,23 +1019,29 @@ skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
 The auto-patched Linux devkit replaces the pinned Gum 17.15.3 native Arm64 and
-x86 relocator members with corrected checked range analysis. The analysis
-starts at the function entry and follows reachable direct branches, including
-branches in the proposed overwrite region. An incoming branch reduces the safe
-overwrite range. Arm64 validates the backend's 16-, 8-, and 4-byte candidates,
-so an incoming branch at offset 12 can yield an 8-byte candidate; x86 reports
-an instruction-boundary maximum. The backend can then choose its existing
-smaller patch when its register and allocation requirements permit it.
-Unreadable or undecodable code, unresolved indirect tail jumps, and scan-budget
-exhaustion fail closed. Returns end a path and calls retain Gum's normal
-call/return assumption. On Linux x86-64, `SYSCALL` has its normal returning
-edge and `UD2` terminates the path. A branch can be pruned only when a unique
-dominating instruction chain proves its value from private, file-backed,
-read-only, non-executable data belonging to the same loaded ELF image. This
-uses the same image-code/data stability assumption as instruction relocation;
-arbitrary read-only mappings are not constants. A reachable unresolved indirect
-tail jump still fails closed. The original instruction rewriters and other
-relocation policies are retained. All Linux x86-64/Arm64 providers, including
+x86 relocator members with corrected checked range analysis. The analysis starts
+at the function entry and follows reachable direct branches, including branches
+in the proposed overwrite region. An incoming branch reduces the safe overwrite
+range. Arm64 validates the backend's 16-, 8-, and 4-byte candidates, so an incoming
+branch at offset 12 can yield an 8-byte candidate; x86 reports an
+instruction-boundary maximum. The Arm64 backend can use its existing 8- or
+4-byte fallback when its register and allocation requirements permit it. The
+x86 backend retains its near/full allocation policy and rejects a requested
+patch whose complete instruction span exceeds the safe maximum.
+
+The graph retains Gum's normal call/return and indirect-tail function-entry ABI
+assumptions. Unknown indirect tails beyond the candidate terminate a path;
+unresolved indirect transfers inside the selected entry bytes remain
+unsupported except for the pinned writer's canonical six-byte x86-64
+`FF 25` RIP-relative entry stub. That exact form retains its mutable pointer
+slot; current targets inside an overwritten interval are rejected, and future
+destinations must remain valid ABI function entries. Returns end a path. On
+Linux x86-64, `SYSCALL` has its normal
+returning edge and `UD2` terminates the path. Unreadable or undecodable code,
+unsupported entry instructions, and scan-budget exhaustion fail closed. The
+original instruction rewriters and other relocation policies are retained.
+
+All Linux x86-64/Arm64 providers, including
 supplied and prebuilt devkits, must expose checked entry-range revision 1; an
 older devkit fails configuration with an update instruction. Supplied devkits
 are never silently patched. The generated header advertises
@@ -1053,9 +1059,10 @@ control flow. Constant-data reads remain live. Separate occupied-range checks
 prevent a new patch from overlapping active or queued patches, and direct edges
 into an existing patch interior are rejected. Supported x86 conditional labels
 within the same original relocated prefix retain their trampoline mapping.
-Unsupported existing patch kinds block proofs through their ranges; standalone
-relocation queries keep their conservative live-memory view. This keeps
-supported targets independent of function attachment order.
+Registered opaque replacement or custom-patch entries form normal ABI terminal
+boundaries without exposing their original bytes. Interior targets remain
+invalid. Standalone relocation queries keep their conservative live-memory view.
+This keeps supported targets independent of function attachment order.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`

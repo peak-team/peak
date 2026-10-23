@@ -20,6 +20,8 @@ GUM_API gboolean gum_interceptor_peak_relocation_range_available (
     gconstpointer address, gsize length);
 GUM_API gboolean gum_interceptor_peak_relocation_target_available (
     gconstpointer target);
+GUM_API gboolean gum_interceptor_peak_relocation_is_opaque_entry (
+    gconstpointer address);
 
 typedef struct _GumArm64Relocator GumArm64Relocator;
 

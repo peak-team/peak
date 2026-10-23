@@ -39,6 +39,8 @@ extern int peak_order_back_b(int);
 extern int peak_order_overlap_a(int);
 extern int peak_order_overlap_b(int);
 extern int peak_order_interior_b(int);
+extern int peak_suffix_dispatch(int (*callee)(int), int);
+extern int peak_prefix_indirect_entry(int);
 /* The public devkit amalgamation omits this exported relocator API. */
 extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
     GumRelocationScenario, GumRelocationPolicy, guint*, arm64_reg*);
@@ -232,19 +234,25 @@ static int check_active_interior_target(GumInterceptor* interceptor,
     gum_interceptor_flush(interceptor);
     return 0;
 }
-static int replacement_seven(int value)
+static int replacement_seventeen(int value)
 {
     (void)value;
-    return 7;
+    return 17;
 }
 static int check_opaque_replacement(GumInterceptor* interceptor,
     GumInvocationListener* listener)
 {
     GumReplaceReturn status = gum_interceptor_replace(interceptor,
-        (gpointer)peak_order_b, (gpointer)replacement_seven, NULL, NULL);
-    if (status != GUM_REPLACE_OK ||
-        check_refused(interceptor, listener, (gpointer)peak_order_a) ||
+        (gpointer)peak_order_b, (gpointer)replacement_seventeen, NULL, NULL);
+    if (status != GUM_REPLACE_OK) return 1;
+    calls = 0;
+    if (gum_interceptor_peak_attach_exact(interceptor, (gpointer)peak_order_a,
+            listener, NULL) != GUM_ATTACH_OK ||
+        peak_order_a(0) != 17 || peak_order_a(7) != 7 || calls != 2 ||
         check_scope_ended((gpointer)peak_order_b)) return 1;
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    if (peak_order_a(0) != 17 || calls != 2) return 1;
     gum_interceptor_revert(interceptor, (gpointer)peak_order_b);
     gum_interceptor_flush(interceptor);
     return peak_order_a(0) != 7;
@@ -259,6 +267,24 @@ static int check_occupied_overlap(GumInterceptor* interceptor,
         check_scope_ended((gpointer)peak_order_overlap_a)) return 1;
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
+    return 0;
+}
+static int dispatch_plus_one(int value) { return value + 1; }
+static int dispatch_plus_seven(int value) { return value + 7; }
+static int check_indirect_dispatch(GumInterceptor* interceptor,
+    GumInvocationListener* listener)
+{
+    calls = 0;
+    if (gum_interceptor_peak_attach_exact(interceptor,
+            (gpointer)peak_suffix_dispatch, listener, NULL) != GUM_ATTACH_OK)
+        return 1;
+    if (peak_suffix_dispatch(dispatch_plus_one, 3) != 4 ||
+        peak_suffix_dispatch(dispatch_plus_seven, 3) != 10 || calls != 2)
+        return 1;
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    if (peak_suffix_dispatch(dispatch_plus_one, 5) != 6 || calls != 2)
+        return 1;
     return 0;
 }
 int main(void)
@@ -284,7 +310,9 @@ int main(void)
         check_range((gpointer)peak_prefix_branch_ret8, 8) ||
         check_range((gpointer)peak_prefix_branch_backward8, 4) ||
         check_range((gpointer)peak_prefix_branch_terminal8, 4) ||
-        check_range((gpointer)peak_prefix_branch_indirect, 0) ||
+        check_range((gpointer)peak_prefix_branch_indirect, 16) ||
+        check_range((gpointer)peak_prefix_indirect_entry, 0) ||
+        check_range((gpointer)peak_suffix_dispatch, 16) ||
         check_range((gpointer)peak_prefix_branch_eret, 0) ||
         check_range((gpointer)peak_prefix_branch_bc, 0) ||
         check_range((gpointer)peak_prefix_branch_budget, 0) ||
@@ -309,7 +337,7 @@ int main(void)
         check_range((gpointer)peak_prefix_suffix_svc, 16) ||
         check_range((gpointer)peak_prefix_suffix_svc_live, 0))
         return 1;
-    if (check_refused(interceptor, listener, (gpointer)peak_prefix_branch_indirect) ||
+    if (check_refused(interceptor, listener, (gpointer)peak_prefix_indirect_entry) ||
         check_refused(interceptor, listener, (gpointer)peak_prefix_branch_eret) ||
         check_refused(interceptor, listener, (gpointer)peak_prefix_branch_bc) ||
         check_refused(interceptor, listener, (gpointer)peak_prefix_branch_x16_live))
@@ -329,6 +357,7 @@ int main(void)
         check_order(interceptor, peak_order_overlap_a, peak_order_overlap_b, 8, 2, FALSE, TRUE) ||
         check_active_interior_target(interceptor, listener) ||
         check_opaque_replacement(interceptor, listener) ||
+        check_indirect_dispatch(interceptor, listener) ||
         check_occupied_overlap(interceptor, listener))
         return 1;
     g_object_unref(listener);

@@ -27,12 +27,7 @@ extern void gum_x86_relocator_write_all(GumX86Relocator*);
 extern void gum_x86_relocator_unref(GumX86Relocator*);
 static int (*fast_original)(int);
 static int fast_replacement(int n) { return fast_original(n)+1; }
-extern int peak_x86_readonly_zero(int),peak_x86_readonly_nonzero(int);
-extern int peak_x86_writable_zero(int),peak_x86_readonly_bypass(int);
-extern int peak_x86_readonly_alias(int),peak_x86_readonly_call(int);
-extern int peak_x86_readonly_chain(int),peak_x86_suffix_trap(int),peak_x86_prefix_trap(int);
-extern int peak_x86_entry_condition(int),peak_x86_call_into_test(int),peak_x86_call_into_instruction(int);
-extern int peak_x86_readonly_other_gprs(int),peak_x86_readonly_r10d(int),peak_x86_readonly_r15b(int);
+extern int peak_x86_suffix_trap(int),peak_x86_prefix_trap(int);
 extern int peak_x86_xsave_extent(int),peak_x86_fxsave_extent(int);
 static guint calls;
 static void enter(GumInvocationContext *c,gpointer d) { (void)c;(void)d;calls++; }
@@ -131,33 +126,6 @@ static int far_rewrite(int(*source)(int),int zero,int one)
  CHECK(munmap(code,page)==0);
  return 0;
 }
-/* A readable first half must not turn a partially unreadable eight-byte
- * operand into a constant. Keep this a classifier test: the original load
- * intentionally cannot execute. */
-static int readonly_boundaries(void)
-{
- static const guint8 instructions[]={0x48,0x8b,0x05,0,0,0,0,
-   0x48,0x85,0xc0,0x74,0x02,0xff,0xe0,0xb8,43,0,0,0,0xc3};
- long page=sysconf(_SC_PAGESIZE);guint8 *mapping;gint32 displacement;
- CHECK(page>0);
- mapping=mmap(NULL,page*3,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
- CHECK(mapping!=MAP_FAILED);
- memcpy(mapping,instructions,sizeof instructions);
- displacement=(gint32)(page*2-4-7);memcpy(mapping+3,&displacement,4);
- CHECK(mprotect(mapping,page,PROT_READ|PROT_EXEC)==0);
- CHECK(mprotect(mapping+page,page,PROT_READ)==0);
- CHECK(mprotect(mapping+page*2,page,PROT_NONE)==0);
- CHECK(range(mapping,5,FALSE,0)==0);
- CHECK(munmap(mapping,page*3)==0);
- /* Executable mappings are mutable by Gum and cannot certify constants. */
- mapping=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
- CHECK(mapping!=MAP_FAILED);memcpy(mapping,instructions,sizeof instructions);
- displacement=64-7;memcpy(mapping+3,&displacement,4);
- CHECK(mprotect(mapping,page,PROT_READ|PROT_EXEC)==0);
- CHECK(range(mapping,5,FALSE,0)==0);
- CHECK(munmap(mapping,page)==0);
- return 0;
-}
 /* Establish the pinned decoder precondition rather than testing a silently
  * different opcode: these state images access >=512B but report an8B operand.
  * Never execute the state-store fixtures against their read-only destination. */
@@ -175,49 +143,10 @@ static int state_image_width(gpointer target,guint expected)
  cs_free(instruction,n);cs_close(&capstone);
  CHECK(range(target,5,FALSE,0)==0);return 0;
 }
-/* RO permissions alone do not certify constants. In all three cases the
- * instruction stream sees a full readable zero8B value; the shared alias also
- * demonstrates a change through another mapping without changing RO access. */
-static int readonly_provenance(void)
-{
- static const guint8 instructions[]={0x48,0x8b,0x05,0,0,0,0,
-   0x48,0x85,0xc0,0x74,0x02,0xff,0xe0,0xb8,43,0,0,0,0xc3};
- long page=sysconf(_SC_PAGESIZE);guint kind;gint32 displacement;
- CHECK(page>0);
- for(kind=0;kind!=3;kind++) {
-  guint8 *mapping,*alias=NULL;gint fd=-1;
-  gchar path[]="/tmp/peak entry provenance-XXXXXX";
-  mapping=mmap(NULL,page*3,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-  CHECK(mapping!=MAP_FAILED);
-  if(kind!=0) {
-   guint8 *zeros=calloc(1,page);CHECK(zeros!=NULL);
-   fd=mkstemp(path);CHECK(fd!=-1);
-   CHECK(write(fd,zeros,page)==page);free(zeros);
-   CHECK(mmap(mapping+page,page,PROT_READ,MAP_FIXED|
-       (kind==1?MAP_SHARED:MAP_PRIVATE),fd,0)==mapping+page);
-   if(kind==1) {
-    alias=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-    CHECK(alias!=MAP_FAILED);
-   }
-  }else CHECK(mprotect(mapping+page,page,PROT_READ)==0);
-  memcpy(mapping,instructions,sizeof instructions);
-  displacement=(gint32)(page+64-7);memcpy(mapping+3,&displacement,4);
-  CHECK(mprotect(mapping,page,PROT_READ|PROT_EXEC)==0);
-  CHECK(range(mapping,5,FALSE,0)==0);
-  if(alias!=NULL) {
-   alias[64]=1;
-   CHECK(((volatile guint8*)mapping)[page+64]==1);
-   CHECK(range(mapping,5,FALSE,0)==0);
-   CHECK(munmap(alias,page)==0);
-  }
-  CHECK(munmap(mapping,page*3)==0);
-  if(fd!=-1) { CHECK(close(fd)==0);CHECK(unlink(path)==0); }
- }
- return 0;
-}
 extern int peak_x86_order_b(int),peak_x86_order_call(int),peak_x86_order_tail(int);
 extern int peak_x86_order_interior(int),peak_x86_order_original_entry(int);
 extern int peak_x86_order_original_b(int);
+extern int peak_x86_call_middle(int),peak_x86_call_hook_interior(int);
 /* Every attach owns a distinct listener so A can be detached with B active. */
 static int installation_order(GumInterceptor *i,int(*a)(int),gboolean b_first)
 {
@@ -253,6 +182,7 @@ static int scope_conflicts(GumInterceptor *i)
  gum_interceptor_end_transaction(i);
  CHECK(gum_interceptor_peak_attach_exact(i,(guint8*)peak_x86_order_b+4,la,NULL)!=GUM_ATTACH_OK);
  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_interior,la,NULL)!=GUM_ATTACH_OK);
+ CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_call_hook_interior,la,NULL)!=GUM_ATTACH_OK);
  live=gum_interceptor_peak_read_relocation_code(peak_x86_order_b,32,&n);
  CHECK(live!=NULL && n==32 && memcmp(live,peak_x86_order_b,32)==0);g_free(live);
  gum_interceptor_detach(i,lb);CHECK(memcmp(before,peak_x86_order_b,32)==0);
@@ -261,10 +191,82 @@ static int scope_conflicts(GumInterceptor *i)
  gum_interceptor_detach(i,lb);
  CHECK(gum_interceptor_replace(i,peak_x86_order_b,fast_replacement,
      (gpointer*)&fast_original,NULL)==GUM_REPLACE_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_tail,la,NULL)!=GUM_ATTACH_OK);
+ CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_tail,la,NULL)==GUM_ATTACH_OK);
+ CHECK(peak_x86_order_tail(0)==62 && peak_x86_order_tail(1)==62);
+ gum_interceptor_detach(i,la);
  gum_interceptor_revert(i,peak_x86_order_b);
  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_tail,la,NULL)==GUM_ATTACH_OK);
  gum_interceptor_detach(i,la);g_object_unref(la);g_object_unref(lb);return 0;
+}
+extern int peak_x86_mutable_tail(int),peak_x86_prefix_tail(int);
+extern int peak_x86_mutable_one(int),peak_x86_mutable_two(int);
+extern int (*peak_x86_mutable_slot)(int);
+static int mutable_tail(GumInterceptor *i,GumInvocationListener *l)
+{
+ guint generation;guint8 before[16];memcpy(before,peak_x86_mutable_tail,16);
+ CHECK(range(peak_x86_mutable_tail,5,TRUE,7)==0);
+ CHECK(range(peak_x86_prefix_tail,5,FALSE,0)==0);
+ CHECK(refuse(i,l,peak_x86_prefix_tail)==0);
+ for(generation=0;generation!=2;generation++) {
+  guint old=calls;
+  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_mutable_tail,l,NULL)==GUM_ATTACH_OK);
+  peak_x86_mutable_slot=peak_x86_mutable_one;CHECK(peak_x86_mutable_tail(0)==71);
+  peak_x86_mutable_slot=peak_x86_mutable_two;CHECK(peak_x86_mutable_tail(1)==73);
+  CHECK(calls==old+2);gum_interceptor_detach(i,l);
+  CHECK(memcmp(before,peak_x86_mutable_tail,16)==0);
+ }
+ return 0;
+}
+/* Build a canonical FF25 thunk with a mutable slot, and relocate the complete
+ * six-byte terminal instruction to both nearby and distant executable memory. */
+static int entry_thunk(GumInterceptor *i,GumInvocationListener *l)
+{
+ long page=sysconf(_SC_PAGESIZE);guint8 *source,*far;
+ gint32 displacement=58;int(*target)(int);guint mode,generation;
+ guint8 original[6];guint old;int(*f)(int);
+ GumInvocationListener *lb=gum_make_call_listener(enter,NULL,NULL,NULL);
+ CHECK(page>0);
+ source=mmap(NULL,page*2,PROT_READ|PROT_WRITE|PROT_EXEC,
+     MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(source!=MAP_FAILED);
+ source[0]=0xff;source[1]=0x25;memcpy(source+2,&displacement,4);
+ memcpy(original,source,6);target=peak_x86_mutable_one;memcpy(source+64,&target,8);
+ f=(int(*)(int))source;
+ CHECK(range(source,5,TRUE,6)==0);
+ for(generation=0;generation!=2;generation++) {
+  old=calls;CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)==GUM_ATTACH_OK);
+  target=peak_x86_mutable_one;memcpy(source+64,&target,8);CHECK(f(0)==71);
+  target=peak_x86_mutable_two;memcpy(source+64,&target,8);CHECK(f(1)==73);
+  CHECK(calls==old+2);gum_interceptor_detach(i,l);CHECK(memcmp(source,original,6)==0);
+ }
+ far=mmap(NULL,page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);
+ CHECK(far!=MAP_FAILED);
+ CHECK(((guintptr)source>(guintptr)far?(guintptr)source-(guintptr)far:
+     (guintptr)far-(guintptr)source)>(guintptr)INT32_MAX+page);
+ for(mode=0;mode!=2;mode++) {
+  guint8 *output=mode==0?source+page:far;
+  GumX86Writer *w=gum_x86_writer_new(output);
+  GumX86Relocator *r=gum_x86_relocator_new(source,w);
+  CHECK(gum_x86_relocator_read_one(r,NULL)==6);
+  gum_x86_relocator_write_all(r);CHECK(gum_x86_writer_flush(w));
+  CHECK(mprotect(output,page,PROT_READ|PROT_EXEC)==0);
+  target=peak_x86_mutable_one;memcpy(source+64,&target,8);
+  CHECK(((int(*)(int))output)(0)==71);
+  target=peak_x86_mutable_two;memcpy(source+64,&target,8);
+  CHECK(((int(*)(int))output)(1)==73);
+  gum_x86_relocator_unref(r);gum_x86_writer_unref(w);
+ }
+ CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
+ target=(int(*)(int))((guint8*)peak_x86_order_b+4);memcpy(source+64,&target,8);
+ CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
+ gum_interceptor_detach(i,lb);g_object_unref(lb);
+ target=(int(*)(int))(source+1);memcpy(source+64,&target,8);
+ CHECK(range(source,5,FALSE,0)==0);
+ CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
+ target=peak_x86_mutable_one;memcpy(source+64,&target,8);
+ displacement=-5;memcpy(source+2,&displacement,4);
+ CHECK(range(source,5,FALSE,0)==0);
+ CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
+ CHECK(munmap(far,page)==0);CHECK(munmap(source,page*2)==0);return 0;
 }
 int main(void)
 {
@@ -286,7 +288,8 @@ int main(void)
  CHECK(range(peak_x86_recoverable,16,FALSE,12)==0);
  CHECK(range(peak_x86_recoverable,5,TRUE,5)==0);
  CHECK(range(peak_x86_mid_instruction,5,FALSE,0)==0);
- CHECK(range(peak_x86_indirect,5,FALSE,0)==0);
+ CHECK(range(peak_x86_call_middle,5,FALSE,0)==0);
+ CHECK(range(peak_x86_indirect,5,TRUE,5)==0);
  CHECK(range(peak_x86_indirect_call,5,TRUE,7)==0);
  CHECK(range(peak_x86_budget,5,FALSE,0)==0);
  CHECK(range(peak_x86_internal_jmp,7,FALSE,4)==0);
@@ -296,7 +299,6 @@ int main(void)
  CHECK(refuse(i,l,peak_x86_negative)==0);
  CHECK(refuse(i,l,peak_x86_prefix_data)==0);
  CHECK(refuse(i,l,peak_x86_mid_instruction)==0);
- CHECK(refuse(i,l,peak_x86_indirect)==0);
  CHECK(run(i,l,peak_x86_indirect_call,37)==0);
  CHECK(refuse(i,l,peak_x86_budget)==0);
  CHECK(run(i,l,peak_x86_recoverable,11)==0);
@@ -305,23 +307,8 @@ int main(void)
  CHECK(run(i,l,peak_x86_rip_lea,23)==0);
  CHECK(run(i,l,peak_x86_call_next,31)==0);
  CHECK(run(i,l,peak_x86_syscall,(int)getpid())==0);
- CHECK(run(i,l,peak_x86_readonly_zero,43)==0);
- CHECK(run(i,l,peak_x86_readonly_chain,47)==0);
- CHECK(run(i,l,peak_x86_readonly_other_gprs,53)==0);
- CHECK(range(peak_x86_readonly_r10d,5,FALSE,0)==0);
- CHECK(range(peak_x86_readonly_r15b,5,FALSE,0)==0);
- CHECK(range(peak_x86_readonly_nonzero,5,FALSE,0)==0);
- CHECK(range(peak_x86_writable_zero,5,FALSE,0)==0);
- CHECK(range(peak_x86_readonly_bypass,5,FALSE,0)==0);
- CHECK(range(peak_x86_entry_condition,5,FALSE,0)==0);
- CHECK(range(peak_x86_call_into_test,5,FALSE,0)==0);
- CHECK(range(peak_x86_call_into_instruction,5,FALSE,0)==0);
- CHECK(range(peak_x86_readonly_alias,5,FALSE,0)==0);
- CHECK(range(peak_x86_readonly_call,5,FALSE,0)==0);
  CHECK(range(peak_x86_suffix_trap,5,TRUE,5)==0);
  CHECK(range(peak_x86_prefix_trap,5,FALSE,0)==0);
- CHECK(readonly_boundaries()==0);
- CHECK(readonly_provenance()==0);
  CHECK(state_image_width(peak_x86_xsave_extent,X86_INS_XSAVE)==0);
  CHECK(state_image_width(peak_x86_fxsave_extent,X86_INS_FXSAVE)==0);
  CHECK(installation_order(i,peak_x86_order_call,FALSE)==0);
@@ -329,6 +316,8 @@ int main(void)
  CHECK(installation_order(i,peak_x86_order_tail,FALSE)==0);
  CHECK(installation_order(i,peak_x86_order_tail,TRUE)==0);
  CHECK(scope_conflicts(i)==0);
+ CHECK(mutable_tail(i,l)==0);
+ CHECK(entry_thunk(i,l)==0);
  CHECK(full_span(i)==0);
  CHECK(far_rewrite(peak_x86_full_span,50,50)==0);
  CHECK(far_rewrite(peak_x86_far_branch,17,13)==0);

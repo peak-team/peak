@@ -367,4 +367,23 @@ peak_order_interior_b:
  mov w0,#7
  b 2b
 .size peak_order_interior_b,.-peak_order_interior_b
+/* Actual normal ABI dispatch; X16 is live at the tail, so backend scratch
+ * must be X17. Two different callees exercise the mutable function pointer. */
+.p2align 4
+.global peak_suffix_dispatch
+.type peak_suffix_dispatch,%function
+peak_suffix_dispatch:
+ mov x16,x0
+ mov w0,w1
+ nop
+ nop
+ br x16
+.size peak_suffix_dispatch,.-peak_suffix_dispatch
+/* An unresolved computed branch in the overwritten prefix is unsupported. */
+.p2align 4
+.global peak_prefix_indirect_entry
+.type peak_prefix_indirect_entry,%function
+peak_prefix_indirect_entry:
+ br x0
+.size peak_prefix_indirect_entry,.-peak_prefix_indirect_entry
 .section .note.GNU-stack,"",%progbits

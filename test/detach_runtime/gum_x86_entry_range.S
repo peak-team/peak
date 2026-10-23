@@ -149,58 +149,6 @@ START peak_x86_syscall
  syscall
  ret
 END peak_x86_syscall
-.macro READONLY_BRANCH name, slot
-.text
-START \name
- mov \slot(%rip),%rax
- test %rax,%rax
- je 1f
- jmp *%rax
-1: mov $43,%eax
- ret
-END \name
-.endm
-READONLY_BRANCH peak_x86_readonly_zero, peak_x86_ro_zero
-READONLY_BRANCH peak_x86_readonly_nonzero, peak_x86_ro_nonzero
-READONLY_BRANCH peak_x86_writable_zero, peak_x86_rw_zero
-.text
-START peak_x86_readonly_bypass
- test %edi,%edi
- je 1f
- mov peak_x86_ro_zero(%rip),%rax
-1: test %rax,%rax
- je 2f
- jmp *%rax
-2: mov $43,%eax
- ret
-END peak_x86_readonly_bypass
-START peak_x86_readonly_alias
- mov peak_x86_ro_zero(%rip),%rax
- mov $1,%eax
- test %rax,%rax
- je 1f
- jmp *%rax
-1: ret
-END peak_x86_readonly_alias
-START peak_x86_readonly_call
- mov peak_x86_ro_zero(%rip),%rax
- call peak_x86_indirect_callee
- test %rax,%rax
- je 1f
- jmp *%rax
-1: ret
-END peak_x86_readonly_call
-START peak_x86_readonly_chain
- push %r12
- mov peak_x86_ro_pointer(%rip),%rax
- mov (%rax),%r12
- test %r12,%r12
- je 1f
- jmp *%rax
-1: mov $47,%eax
- pop %r12
- ret
-END peak_x86_readonly_chain
 START peak_x86_suffix_trap
  .fill 5,1,0x90
  test %edi,%edi
@@ -217,75 +165,6 @@ END peak_x86_prefix_trap
 .section .rodata
 .p2align 3
 peak_x86_ro_zero: .quad 0
-peak_x86_ro_nonzero: .quad 1
-.section .data.rel.ro,"aw"
-peak_x86_ro_pointer: .quad peak_x86_ro_zero
-.data
-peak_x86_rw_zero: .quad 0
-.text
-peak_x86_entry_predecessor:
- mov $0,%rax
- test %rax,%rax
-START peak_x86_entry_condition
- je 1f
- jmp *%rax
- .fill 8,1,0x90
-1: jmp peak_x86_entry_predecessor
-END peak_x86_entry_condition
-
-.text
-START peak_x86_call_into_test
- call 1f
- mov peak_x86_ro_zero(%rip),%rax
-1: test %rax,%rax
- je 2f
- jmp *%rax
-2: mov $43,%eax
- ret
-END peak_x86_call_into_test
-
-.text
-START peak_x86_call_into_instruction
- call 1f+1
-1: mov peak_x86_ro_zero(%rip),%rax
- test %rax,%rax
- je 2f
- jmp *%rax
-2: mov $43,%eax
- ret
-END peak_x86_call_into_instruction
-
-.text
-START peak_x86_readonly_other_gprs
- push %r15
- mov peak_x86_ro_pointer(%rip),%r10
- mov (%r10),%r15
- test %r15,%r15
- je 1f
- jmp *%r10
-1: mov $53,%eax
- pop %r15
- ret
-END peak_x86_readonly_other_gprs
-START peak_x86_readonly_r10d
- mov peak_x86_ro_zero(%rip),%r10
- mov $1,%r10d
- test %r10,%r10
- je 1f
- jmp *%r10
-1: ret
-END peak_x86_readonly_r10d
-START peak_x86_readonly_r15b
- push %r15
- mov peak_x86_ro_zero(%rip),%r15
- mov $1,%r15b
- test %r15,%r15
- je 1f
- jmp *%r15
-1: pop %r15
- ret
-END peak_x86_readonly_r15b
-
 .text
 START peak_x86_xsave_extent
  xsave peak_x86_ro_zero(%rip)
@@ -336,3 +215,37 @@ START peak_x86_order_original_b
  ret
  .fill 32,1,0x90
 END peak_x86_order_original_b
+
+.text
+START peak_x86_mutable_tail
+ mov peak_x86_mutable_slot(%rip),%rax
+ jmp *%rax
+END peak_x86_mutable_tail
+START peak_x86_prefix_tail
+ jmp *%rax
+ .fill 32,1,0x90
+END peak_x86_prefix_tail
+START peak_x86_mutable_one
+ mov $71,%eax
+ ret
+END peak_x86_mutable_one
+START peak_x86_mutable_two
+ mov $73,%eax
+ ret
+END peak_x86_mutable_two
+.data
+.globl peak_x86_mutable_slot
+peak_x86_mutable_slot: .quad peak_x86_mutable_one
+
+.text
+START peak_x86_call_middle
+ call 1f+1
+1: mov $0x90909090,%eax
+ ret
+END peak_x86_call_middle
+START peak_x86_call_hook_interior
+ sub $8,%rsp
+ call peak_x86_order_b+4
+ add $8,%rsp
+ ret
+END peak_x86_call_hook_interior

@@ -408,6 +408,8 @@ int main(void)
         gum_interceptor_peak_relocation_range_available;
     gboolean (*target_available)(gconstpointer) =
         gum_interceptor_peak_relocation_target_available;
+    gboolean (*is_opaque_entry)(gconstpointer) =
+        gum_interceptor_peak_relocation_is_opaque_entry;
     gboolean (*branch_available)(gconstpointer, gsize, gconstpointer, gboolean) =
         gum_interceptor_peak_relocation_branch_available;
     gsize size = 0;
@@ -418,7 +420,7 @@ int main(void)
     copy = read_code(original, sizeof(original), &size);
     result = copy == NULL || size != sizeof(original) || copy[0] != original[0] ||
         !range_available(original, sizeof(original)) ||
-        !target_available(original) ||
+        !target_available(original) || is_opaque_entry(original) ||
         !branch_available(original, sizeof(original), original, FALSE);
     g_free(copy);
     gum_deinit_embedded();
