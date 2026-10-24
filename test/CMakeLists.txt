@@ -1117,6 +1117,20 @@ if(BUILD_TESTING)
             LABELS "known-failure;transparency;recursive-unwind"
             ENVIRONMENT "PEAK_TARGET=peak_cxx_throw_outer,peak_cxx_throw_inner,peak_cxx_throw_recursive;PEAK_MAX_NUM_THREADS=8;PEAK_COST=0;PEAK_HEARTBEAT_INTERVAL=0;PEAK_ENABLE_GLOBAL_HEARTBEAT=0;PEAK_ENABLE_PER_TARGET_HEARTBEAT=0;PEAK_ENABLE_REATTACH=0;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}")
 
+        target_include_directories(test_fastpath_nonlocal_unwind
+            PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        if(TARGET peak_detach_helper)
+            add_test(NAME test_extent_reattach_nonlocal_unwind
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_extent_reattach_case.py
+                    --exe $<TARGET_FILE:test_fastpath_nonlocal_unwind>
+                    --libpeak $<TARGET_FILE:peak>
+                    --detach-helper $<TARGET_FILE:peak_detach_helper>)
+            set_tests_properties(test_extent_reattach_nonlocal_unwind PROPERTIES
+                PASS_REGULAR_EXPRESSION "extent_reattach_physical_ok"
+                TIMEOUT 25)
+        endif()
+
         add_test(NAME test_fastpath_nonlocal_unwind
             COMMAND
                 ${PROJECT_BINARY_DIR}/test/detach_runtime/test_fastpath_nonlocal_unwind)

@@ -5,6 +5,9 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+
+#include "general_listener.h"
 
 #include "frida-gum.h"
 
@@ -271,9 +274,61 @@ require_fast_dispatch(void)
     return 1;
 }
 
-int
-main(void)
+static int
+run_extent_reattach_check(void)
 {
+    typedef gboolean (*RequestFunc)(size_t);
+    typedef gboolean (*DrainFunc)(unsigned int);
+    typedef PeakHookState (*StateFunc)(size_t);
+    typedef gulong (*CountFunc)(size_t);
+    RequestFunc detach = (RequestFunc)required_symbol(
+        "peak_general_listener_request_detach");
+    RequestFunc reattach = (RequestFunc)required_symbol(
+        "peak_general_listener_request_reattach");
+    DrainFunc drain = (DrainFunc)required_symbol(
+        "peak_general_listener_controller_drain");
+    StateFunc state = (StateFunc)required_symbol(
+        "peak_general_listener_hook_state");
+    CountFunc count = (CountFunc)required_symbol(
+        "peak_general_listener_test_call_count");
+    const size_t hook_id = 2;
+
+    if (detach == NULL || reattach == NULL || drain == NULL ||
+        state == NULL || count == NULL || !require_fast_dispatch())
+        return 1;
+    if (peak_fastpath_unwind_recursive(2, 0) != 3 ||
+        peak_fastpath_unwind_recursive(2, 0) != 3 ||
+        state(hook_id) != PEAK_HOOK_ATTACHED || count(hook_id) != 6)
+        return 1;
+
+    for (unsigned int round = 0; round < 2; round++) {
+        gulong before = count(hook_id);
+        if (!detach(hook_id) || !drain(2000) ||
+            state(hook_id) != PEAK_HOOK_DETACHED ||
+            peak_fastpath_unwind_recursive(2, 1) != 7 ||
+            peak_fastpath_unwind_recursive(2, 0) != 3 ||
+            count(hook_id) != before) {
+            fprintf(stderr, "extent detach/unwind mismatch round=%u\n", round);
+            return 1;
+        }
+        if (!reattach(hook_id) || !drain(2000) ||
+            state(hook_id) != PEAK_HOOK_ATTACHED ||
+            peak_fastpath_unwind_recursive(2, 1) != 7 ||
+            peak_fastpath_unwind_recursive(2, 0) != 3 ||
+            count(hook_id) != before + 6) {
+            fprintf(stderr, "extent reattach/unwind mismatch round=%u\n", round);
+            return 1;
+        }
+    }
+    puts("extent_reattach_unwind_ok");
+    return 0;
+}
+
+int
+main(int argc, char** argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--extent-reattach-check") == 0)
+        return run_extent_reattach_check();
     typedef gulong (*StackLevelFunc)(void);
 
     /*
