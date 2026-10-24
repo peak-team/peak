@@ -36,3 +36,15 @@ python3 benchmarks/detach/run_callback_hotpath_matrix.py \
   --current-libpeak build/src/libpeak.so \
   --baseline-libpeak /path/to/baseline/libpeak.so
 ```
+
+`benchmark_entry_attach` (Linux x86-64/AArch64) reports JSON lines for cold and
+1000 warm relocation queries over 129, 4097, and 65537 instruction bodies, plus
+real attachment and callback checks. On AArch64 it also measures 128-branch
+suffix and entry-target chains, checking both conditional paths before and after
+detach. It also measures 100 and 1000 small targets
+in transactions of 64, including first/last transaction times. It checks behavior
+and counts without imposing hardware-dependent timing limits. Run it separately:
+
+```sh
+ctest --test-dir build -R '^benchmark_entry_attach$' -V
+```

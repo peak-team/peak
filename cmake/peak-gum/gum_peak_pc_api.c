@@ -22,6 +22,16 @@
 #include <unistd.h>
 #include "frida-gum.h"
 
+guint
+gum_interceptor_peak_entry_range_revision(void)
+{
+#ifdef PEAK_GUM_ENTRY_RANGE_CHECKS
+    return PEAK_GUM_ENTRY_RANGE_CHECKS;
+#else
+    return 0;
+#endif
+}
+
 #define PEAK_GUM_FAST_DISPATCH_SECTION \
     __attribute__((section("peak_gum_fast_dispatch"), noinline, noclone))
 
