@@ -240,7 +240,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
     ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
   add_test(NAME test_gum_arm64_prefix_branch COMMAND test_gum_arm64_prefix_branch)
   set_tests_properties(test_gum_arm64_prefix_branch PROPERTIES
-    TIMEOUT 15 SKIP_RETURN_CODE 77
+    TIMEOUT 15
     PASS_REGULAR_EXPRESSION "gum_arm64_prefix_branch_ok")
 
 endif()
@@ -255,6 +255,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
   add_test(NAME test_gum_x86_entry_range COMMAND test_gum_x86_entry_range)
   set_tests_properties(test_gum_x86_entry_range PROPERTIES
-    TIMEOUT 15 SKIP_RETURN_CODE 77
+    TIMEOUT 15
     PASS_REGULAR_EXPRESSION "gum_x86_entry_range_ok")
 endif()

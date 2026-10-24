@@ -60,26 +60,12 @@ jobs:
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
       run: ctest --build-config ${{ matrix.build_type }} -LE "(benchmark|stress)" -V
 
-    - name: Capture failing fixture diagnostics
-      if: failure()
-      working-directory: ${{ steps.strings.outputs.build-output-dir }}
-      run: |
-        mkdir -p Testing/Temporary
-        mpicc --version > Testing/Temporary/fixture-toolchain.log
-        printenv CFLAGS CPPFLAGS LDFLAGS >> Testing/Temporary/fixture-toolchain.log || true
-        objdump -d --disassemble=b_dynamic test/dynamic_lib/libB.so > Testing/Temporary/dynamic-entry.log || true
-        objdump -d test/detach_runtime/test_unsafe_gum_prologue > Testing/Temporary/unsafe-entries.log || true
-
     - name: Upload CTest diagnostics
       if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: ctest-${{ matrix.mpi }}
-        path: |
-          ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
-          ${{ steps.strings.outputs.build-output-dir }}/test/dynamic_lib/libB.so
-          ${{ steps.strings.outputs.build-output-dir }}/test/dynamic_lib/main_dynA_dynB
-          ${{ steps.strings.outputs.build-output-dir }}/test/detach_runtime/test_unsafe_gum_prologue
+        path: ${{ steps.strings.outputs.build-output-dir }}/Testing/Temporary/*.log
         if-no-files-found: ignore
 
 

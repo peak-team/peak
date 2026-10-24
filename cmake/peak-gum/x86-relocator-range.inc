@@ -89,7 +89,7 @@ gum_x86_relocator_can_relocate (gpointer address, guint min_bytes,
         insn->id == X86_INS_JECXZ || insn->id == X86_INS_JRCXZ;
     node->unsupported = insn->id == X86_INS_JCXZ ||
         insn->id == X86_INS_LOOP || insn->id == X86_INS_LOOPE ||
-        insn->id == X86_INS_LOOPNE || insn->id == X86_INS_UD2 ||
+        insn->id == X86_INS_LOOPNE ||
         (cs_insn_group (capstone, insn, CS_GRP_BRANCH_RELATIVE) &&
          !node->conditional && !node->call && !jmp);
     if (node->call || jmp || node->conditional)
