@@ -100,7 +100,8 @@ gum_x86_relocator_can_relocate (gpointer address, guint min_bytes,
     for (i = 0; i < x->op_count; i++)
     {
       cs_x86_op * op = &x->operands[i];
-      if (op->type != X86_OP_MEM || op->mem.base != X86_REG_RIP) continue;
+      if (insn->id == X86_INS_NOP || op->type != X86_OP_MEM ||
+          op->mem.base != X86_REG_RIP) continue;
       node->data_target = node->pc + node->size + op->mem.disp;
       node->data_size = insn->id == X86_INS_LEA ? 1 :
           (peak_x86_range_state_image (insn->id) ? 0 : op->size);

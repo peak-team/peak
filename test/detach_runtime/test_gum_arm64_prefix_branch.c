@@ -1,8 +1,11 @@
 #include "frida-gum.h"
 #include <stdio.h>
+#include <unistd.h>
 extern int peak_prefix_hpsort(int);
 extern int peak_prefix_linear(int);
 extern int peak_prefix_branch_entry(int);
+extern int peak_prefix_loop3(int);
+extern int peak_prefix_early_return(int);
 extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
     GumRelocationScenario, GumRelocationPolicy, guint*, arm64_reg*);
 static guint calls;
@@ -41,19 +44,24 @@ static int check_range(gpointer target, guint expected)
     return 0;
 }
 static int check_profile(GumInterceptor* interceptor,
-    GumInvocationListener* listener, int (*target)(int), guint expected)
+    GumInvocationListener* listener, int (*target)(int), guint expected,
+    int expected_zero, int expected_seven)
 {
     guint length = 0;
     guint8 active[GUM_PEAK_MAX_PROLOGUE_SIZE];
     guint8 original[GUM_PEAK_MAX_PROLOGUE_SIZE];
     guint8 before[16];
     snapshot((gpointer)target, before);
+    if (target(0) != expected_zero || target(7) != expected_seven) {
+        fputs("unexpected fixture baseline\n", stderr);
+        return 1;
+    }
     calls = 0;
     if (gum_interceptor_peak_attach_exact(interceptor, (gpointer)target,
             listener, NULL) != GUM_ATTACH_OK ||
         !gum_interceptor_peak_get_function_patch(interceptor, (gpointer)target,
             listener, active, original, &length) || length != expected ||
-        target(0) != 7 || target(7) != 7 || calls != 2) {
+        target(0) != expected_zero || target(7) != expected_seven || calls != 2) {
         fprintf(stderr, "prefix profile failed: length=%u expected=%u calls=%u\n",
             length, expected, calls);
         return 1;
@@ -61,7 +69,7 @@ static int check_profile(GumInterceptor* interceptor,
     gum_interceptor_detach(interceptor, listener);
     gum_interceptor_flush(interceptor);
     if (!unchanged((gpointer)target, before) ||
-        target(0) != 7 || target(7) != 7 || calls != 2) {
+        target(0) != expected_zero || target(7) != expected_seven || calls != 2) {
         fputs("detach did not restore the original entry\n", stderr);
         return 1;
     }
@@ -71,25 +79,24 @@ int main(void)
 {
     GumInterceptor* interceptor;
     GumInvocationListener* listener;
-    guint8 before[16];
+    alarm(10); /* Bound a regression that turns the three-iteration loop into a hang. */
     gum_init_embedded();
     interceptor = gum_interceptor_obtain();
     listener = gum_make_call_listener(count, NULL, NULL, NULL);
-    if (check_range((gpointer)peak_prefix_hpsort, 8) ||
+    if (check_range((gpointer)peak_prefix_hpsort, 12) ||
         check_range((gpointer)peak_prefix_linear, 16) ||
-        check_range((gpointer)peak_prefix_branch_entry, 0)) return 1;
-    snapshot((gpointer)peak_prefix_branch_entry, before);
-    if (gum_interceptor_peak_attach_exact(interceptor,
-            (gpointer)peak_prefix_branch_entry, listener, NULL) == GUM_ATTACH_OK ||
-        !unchanged((gpointer)peak_prefix_branch_entry, before)) {
-        fputs("unsupported entry was attached or changed\n", stderr);
-        return 1;
-    }
-    if (check_profile(interceptor, listener, peak_prefix_hpsort, 8) ||
-        check_profile(interceptor, listener, peak_prefix_linear, 16)) return 1;
+        check_range((gpointer)peak_prefix_loop3, 4) ||
+        check_range((gpointer)peak_prefix_early_return, 16) ||
+        check_range((gpointer)peak_prefix_branch_entry, 4)) return 1;
+    if (check_profile(interceptor, listener, peak_prefix_hpsort, 8, 7, 7) ||
+        check_profile(interceptor, listener, peak_prefix_linear, 16, 7, 7) ||
+        check_profile(interceptor, listener, peak_prefix_branch_entry, 4, 7, 7) ||
+        check_profile(interceptor, listener, peak_prefix_loop3, 4, 3, 3) ||
+        check_profile(interceptor, listener, peak_prefix_early_return, 16, 0, 8)) return 1;
     g_object_unref(listener);
     g_object_unref(interceptor);
     gum_deinit_embedded();
+    alarm(0);
     puts("gum_arm64_prefix_branch_ok");
     return 0;
 }

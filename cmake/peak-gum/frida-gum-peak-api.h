@@ -13,7 +13,7 @@ extern "C" {
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
-/* Revision 2 checks only the actual entry patch prefix. */
+/* Revision 3 includes bounded Arm64 suffix backedge checks. */
 GUM_API guint gum_interceptor_peak_entry_range_revision(void);
 #define GUM_PEAK_UNWIND_FRAME_API_VERSION 4
 GUM_API gboolean gum_interceptor_peak_unwind_lifecycle_init(void);

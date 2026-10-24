@@ -10,6 +10,7 @@ extern int peak_x86_internal_jcc(int value);
 extern int peak_x86_external_jcc(int value);
 extern int peak_x86_internal_mid_jcc(int value);
 extern int peak_x86_prefix_read(int value);
+extern int peak_x86_rip_nop(int value);
 extern void peak_x86_endbr_copy(const guint8 *source, guint8 *destination);
 
 static guint calls;
@@ -124,6 +125,30 @@ static int endbr_copy(GumInterceptor *interceptor,
     return 0;
 }
 
+static int rip_nop(GumInterceptor *interceptor, GumInvocationListener *listener)
+{
+    guint8 before[7];
+    guint8 active[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 original[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint old = calls;
+    guint length;
+
+    memcpy(before, peak_x86_rip_nop, sizeof before);
+    CHECK(range(peak_x86_rip_nop, TRUE, sizeof before) == 0);
+    CHECK(peak_x86_rip_nop(0) == 7 && calls == old);
+    CHECK(gum_interceptor_peak_attach_exact(
+        interceptor, peak_x86_rip_nop, listener, NULL) == GUM_ATTACH_OK);
+    CHECK(gum_interceptor_peak_get_function_patch(
+        interceptor, peak_x86_rip_nop, listener, active, original, &length));
+    CHECK(length == sizeof before);
+    CHECK(memcmp(original, before, sizeof before) == 0);
+    CHECK(peak_x86_rip_nop(0) == 7 && calls == old + 1);
+    gum_interceptor_detach(interceptor, listener);
+    CHECK(memcmp(before, peak_x86_rip_nop, sizeof before) == 0);
+    CHECK(peak_x86_rip_nop(0) == 7 && calls == old + 1);
+    return 0;
+}
+
 int main(void)
 {
     GumInterceptor *interceptor;
@@ -138,6 +163,7 @@ int main(void)
     CHECK(attach_case(interceptor, listener, peak_x86_internal_jcc, 19, 19) == 0);
     CHECK(attach_case(interceptor, listener, peak_x86_external_jcc, 17, 13) == 0);
     CHECK(refuse(interceptor, listener, peak_x86_prefix_read) == 0);
+    CHECK(rip_nop(interceptor, listener) == 0);
     g_object_unref(listener);
     g_object_unref(interceptor);
     gum_deinit_embedded();

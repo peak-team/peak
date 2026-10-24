@@ -57,4 +57,10 @@ START peak_x86_prefix_read
  movb peak_x86_prefix_read(%rip),%al
  ret
 END peak_x86_prefix_read
+/* The apparent RIP memory operand of NOP performs no data access. */
+START peak_x86_rip_nop
+ nopl peak_x86_rip_nop(%rip)
+ mov $7,%eax
+ ret
+END peak_x86_rip_nop
 .section .note.GNU-stack,"",@progbits

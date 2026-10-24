@@ -395,7 +395,7 @@ The current code implements this Linux x86_64 and Linux Arm64 helper path behind
 the patched-Gum capability check. The default Linux x86_64 and Linux Arm64 CMake
 paths now construct a PEAK-patched Frida Gum devkit by copying the downloaded
 devkit, replacing its native relocator, and appending PEAK's PC API implementation
-to the archive. All providers on these architectures must pass the revision 2
+to the archive. All providers on these architectures must pass the revision 3
 entry-range check at configure time; an old stock devkit is rejected. The helper uses `PTRACE_GETREGS` /
 `PTRACE_SETREGS` on x86_64 and `PTRACE_GETREGSET` / `PTRACE_SETREGSET` with
 `NT_PRSTATUS` on Arm64. When `PR_SET_PTRACER` is unavailable and returns
@@ -1021,13 +1021,13 @@ skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
 The auto-patched Linux devkit replaces the pinned Gum 17.15.3 native Arm64 and
-x86 relocator members with checked entry-prefix relocation. Checks cover the
-actual bytes selected for the entry patch, rather than traversing the function's
-suffix. The Arm64 ONLINE CHECKED path reads at most 16 bytes and decodes at most
-four instructions. It evaluates the backend's 16-, 8-, and 4-byte candidates
-subject to existing scratch-register, local literal-overlap, and allocation
-requirements. A first non-call branch truncates the prefix; the branch at
-offset 8 in `hpsort` leaves an 8-byte candidate. The x86 backend validates the complete
+x86 relocator members with checked entry-range analysis. Arm64 retains the
+pinned suffix backedge walker and supplements direct conditional and
+unconditional branch targets in the first 16 entry bytes within the same fixed
+1024-byte budget. If that check cannot establish the larger range, it
+conservatively limits the range to 4 bytes. Backend candidates, scratch-register
+requirements, and original instruction rewriting remain subject to Gum's
+existing contracts. The x86 backend validates the complete
 instruction span needed for its actual 5- or 16-byte patch; the resulting span
 can be 6 or 20 bytes when the last instruction crosses the requested boundary.
 Its single safe read requests at most the requested size plus 14 bytes and
@@ -1042,29 +1042,25 @@ The original instruction rewriters and backend allocation policies are retained.
 Offline relocation and explicit non-CHECKED policies keep the upstream API
 behavior.
 
-This is a local relocation check under Gum's existing function-entry ABI
-contract. Calls, returns, and ABI tail transfers retain their normal meaning.
-Arm64 continuation IP0/IP1 availability follows Gum's ABI and caller contract;
-checking actual prefix register use does not prove suffix register liveness.
-It does not prove that an unscanned suffix has no branch back into the prefix,
-that arbitrary external code never enters a patch interior, or that a function
-never reads its own entry bytes as data. Such targets need a stronger caller
-contract or must remain uninstrumented. There is no suffix control-flow graph,
-whole-function scan budget, function-extent metadata lookup, or all-hook
-original-code snapshot in this path. Attach work is limited to the selected
-prefix rather than growing with function size or the number of installed hooks.
+The Arm64 bounded walker is not a whole-function proof and does not resolve
+arbitrary indirect control flow. The x86 check remains bounded to the entry
+range. Both retain Gum's function-entry ABI contract; neither establishes that
+arbitrary external code cannot enter a patch interior or that all self-reads are
+safe. Arm64 scratch-register selection follows pinned Gum's relocated-span check;
+it does not prove suffix register liveness. There is
+no function-extent metadata lookup or all-hook original-code snapshot.
 
 All Linux x86_64 and Arm64 providers, including supplied and prebuilt devkits,
-must expose checked entry-range revision 2 through a linkable revision query
-and native prefix classifier. Older
-devkits, including the previous whole-function analysis revision, fail
+must expose checked entry-range revision 3 through a linkable revision query
+and native entry-range classifier. Older
+devkits, including revision 2, fail
 configuration with an update instruction. Supplied devkits are never silently
 patched. Header and archive must be updated together; controlled offline
 packages follow the same requirement. Auto-patching verifies the original
 relocator source's pinned SHA-256 and requires that source in the configured
 cache when downloads are disabled. The separate full PEAK PC/unwind API validation, enabled for auto-patched
 providers or by `PEAK_REQUIRE_GUM_PEAK_API`, also verifies the architecture
-fingerprint; entry-range revision 2 alone does not establish that full API. Cross builds use compile/link validation
+fingerprint; entry-range revision 3 alone does not establish that full API. Cross builds use compile/link validation
 where the configure probes cannot execute target code.
 
 The narrow exception is an exported target consisting of one unconditional

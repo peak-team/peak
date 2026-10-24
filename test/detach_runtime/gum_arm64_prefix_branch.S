@@ -36,4 +36,31 @@ peak_prefix_branch_entry:
  mov w0,#7
  ret
 .size peak_prefix_branch_entry,.-peak_prefix_branch_entry
+/* Direct regression: a suffix conditional branch re-enters at entry+4. */
+.p2align 4
+.global peak_prefix_loop3
+.type peak_prefix_loop3,%function
+peak_prefix_loop3:
+ mov w0,#0
+0:
+ add w0,w0,#1
+ cmp w0,#3
+ nop
+ b.lt 0b
+ ret
+.size peak_prefix_loop3,.-peak_prefix_loop3
+/* A supported entry conditional must retain taken and fallthrough behavior. */
+.p2align 4
+.global peak_prefix_early_return
+.type peak_prefix_early_return,%function
+peak_prefix_early_return:
+ cbz w0,1f
+ add w0,w0,#1
+ nop
+ nop
+ nop
+ ret
+1:
+ ret
+.size peak_prefix_early_return,.-peak_prefix_early_return
 .section .note.GNU-stack,"",%progbits
