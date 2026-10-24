@@ -39,10 +39,14 @@ peak_arm64_read_instruction (PeakArm64CodeRead * read, csh capstone,
   const guint8 * cursor;
   size_t available;
   gsize offset;
-  if (GPOINTER_TO_SIZE (*code) < GPOINTER_TO_SIZE (read->start)) return FALSE;
+  if (*remaining < 4) return FALSE;
   offset = GPOINTER_TO_SIZE (*code) - GPOINTER_TO_SIZE (read->start);
-  if (*remaining < 4 || read->bytes == NULL || offset > read->size ||
-      read->size - offset < 4) return FALSE;
+  if (read->bytes == NULL || offset > read->size || read->size - offset < 4) {
+    /* Branch roots often share a readable window. Refill only on a miss. */
+    peak_arm64_begin_code_read (read, *code, *remaining);
+    offset = 0;
+    if (read->bytes == NULL || read->size < 4) return FALSE;
+  }
   cursor = read->bytes + offset;
   available = 4;
   if (!cs_disasm_iter (capstone, &cursor, &available, address, insn) ||

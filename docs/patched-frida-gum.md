@@ -64,7 +64,9 @@ devkit. `PEAK_REQUIRE_GUM_PEAK_API=OFF` does not bypass the entry-range check.
 
 Revision 3 retains the pinned Arm64 suffix backedge walker and supplements
 direct branch targets in the first 16 entry bytes within the same fixed
-1024-byte budget. Failure conservatively limits the range to 4 bytes. This is
+1024-byte budget. Each classifier call reuses its current safe-read window to
+avoid overlapping copies across branch targets. Failure conservatively limits
+the range to 4 bytes. This is
 not a whole-function or indirect-control-flow proof. The x86 classifier retains
 bounded entry-range checks.
 

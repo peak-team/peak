@@ -105,6 +105,30 @@ detach_and_flush(GumInterceptor* interceptor, GumInvocationListener* listener)
 }
 
 static int
+classify_case(unsigned char* code, const char* scenario, size_t instructions,
+              size_t bytes, guint minimum)
+{
+    guint maximum = 0;
+    uint64_t begin = now_ns();
+    gboolean cold_ok = classify(code, minimum, &maximum);
+    uint64_t cold = now_ns() - begin;
+    int ok = cold_ok && maximum >= minimum;
+    begin = now_ns();
+    for (unsigned int query = 0; query < WARM_QUERIES; query++) {
+        gboolean accepted = classify(code, minimum, &maximum);
+        ok &= accepted && maximum >= minimum;
+    }
+    uint64_t warm = now_ns() - begin;
+    printf("{\"mode\":\"classify\",\"scenario\":\"%s\",\"instructions\":%zu,\"bytes\":%zu,"
+           "\"minimum\":%u,\"maximum\":%u,\"cold_ns\":%" PRIu64 ","
+           "\"warm_queries\":%u,\"warm_total_ns\":%" PRIu64 ","
+           "\"warm_ns_per_query\":%.2f}\n", scenario, instructions, bytes,
+           minimum, maximum, cold, WARM_QUERIES, warm,
+           (double)warm / WARM_QUERIES);
+    return ok;
+}
+
+static int
 linear_case(GumInterceptor* interceptor, GumInvocationListener* listener,
             size_t instructions)
 {
@@ -125,25 +149,8 @@ linear_case(GumInterceptor* interceptor, GumInvocationListener* listener,
         munmap(code, mapped);
         return 0;
     }
-    for (size_t test = 0; test < sizeof(minimums) / sizeof(minimums[0]); test++) {
-        guint maximum = 0;
-        uint64_t begin = now_ns();
-        gboolean cold_ok = classify(code, minimums[test], &maximum);
-        uint64_t cold = now_ns() - begin;
-        ok &= cold_ok && maximum >= minimums[test];
-        begin = now_ns();
-        for (unsigned int query = 0; query < WARM_QUERIES; query++) {
-            gboolean accepted = classify(code, minimums[test], &maximum);
-            ok &= accepted && maximum >= minimums[test];
-        }
-        uint64_t warm = now_ns() - begin;
-        printf("{\"mode\":\"classify\",\"instructions\":%zu,\"bytes\":%zu,"
-               "\"minimum\":%u,\"maximum\":%u,\"cold_ns\":%" PRIu64 ","
-               "\"warm_queries\":%u,\"warm_total_ns\":%" PRIu64 ","
-               "\"warm_ns_per_query\":%.2f}\n", instructions, bytes,
-               minimums[test], maximum, cold, WARM_QUERIES, warm,
-               (double)warm / WARM_QUERIES);
-    }
+    for (size_t test = 0; test < sizeof(minimums) / sizeof(minimums[0]); test++)
+        ok &= classify_case(code, "linear", instructions, bytes, minimums[test]);
     callbacks = 0;
     GumAttachOptions options = {
         .instrumentation = { .relocation_policy = GUM_RELOCATION_CHECKED }
@@ -162,6 +169,56 @@ linear_case(GumInterceptor* interceptor, GumInvocationListener* listener,
     munmap(code, mapped);
     return ok;
 }
+
+#if defined(__aarch64__)
+static int
+branch_case(GumInterceptor* interceptor, GumInvocationListener* listener,
+            int prefix_target)
+{
+    const size_t chain = 8, branches = 128, instructions = chain + branches + 2;
+    const char* scenario = prefix_target ? "prefix_target_chain128" : "suffix_chain128";
+    size_t mapped;
+    unsigned char* code = allocate_code(instructions * 4, &mapped);
+    if (code == NULL)
+        return 0;
+    uint32_t* words = (uint32_t*)code;
+    size_t conditional = prefix_target ? 0 : 4;
+    /* CBZ w0, entry+32; otherwise ADD w0,w0,#1 and RET. */
+    words[conditional] = UINT32_C(0x34000000) | ((chain - conditional) << 5);
+    words[conditional + 1] = UINT32_C(0x11000400);
+    words[prefix_target ? 4 : 6] = UINT32_C(0xd65f03c0);
+    for (size_t i = 0; i < branches; i++)
+        words[chain + i] = UINT32_C(0x14000001); /* B to the next instruction */
+    words[chain + branches] = UINT32_C(0x528000e0); /* MOV w0,#7 */
+    words[chain + branches + 1] = UINT32_C(0xd65f03c0);
+    if (!publish_code(code, mapped)) {
+        munmap(code, mapped);
+        return 0;
+    }
+    int ok = classify_case(code, scenario, instructions, instructions * 4, 16);
+    GumAttachOptions options = {
+        .instrumentation = { .relocation_policy = GUM_RELOCATION_CHECKED }
+    };
+    callbacks = 0;
+    alarm(5); /* Bound execution if a generated branch or relocated path regresses. */
+    uint64_t begin = now_ns();
+    GumAttachReturn status = gum_interceptor_attach(interceptor, code, listener, &options);
+    uint64_t elapsed = now_ns() - begin;
+    int (*function)(int) = (int (*)(int))code;
+    int taken = function(0), fallthrough = function(7);
+    ok &= status == GUM_ATTACH_OK && taken == 7 && fallthrough == 8 && callbacks == 2;
+    printf("{\"mode\":\"branch_attach\",\"scenario\":\"%s\","
+           "\"attach_ns\":%" PRIu64 ",\"status\":%d,\"taken\":%d,"
+           "\"fallthrough\":%d,\"callbacks\":%lu}\n",
+           scenario, elapsed, status, taken, fallthrough, callbacks);
+    if (!detach_and_flush(interceptor, listener))
+        return 0;
+    ok &= function(0) == 7 && function(7) == 8 && callbacks == 2;
+    alarm(0);
+    munmap(code, mapped);
+    return ok;
+}
+#endif
 
 static int
 batch_case(GumInterceptor* interceptor, GumInvocationListener* listener,
@@ -230,6 +287,12 @@ main(void)
     const size_t lengths[] = { 129, 4097, 65537 };
     for (size_t i = 0; ok && i < sizeof(lengths) / sizeof(lengths[0]); i++)
         ok = linear_case(interceptor, listener, lengths[i]);
+#if defined(__aarch64__)
+    if (ok)
+        ok = branch_case(interceptor, listener, 0);
+    if (ok)
+        ok = branch_case(interceptor, listener, 1);
+#endif
     if (ok)
         ok = batch_case(interceptor, listener, 100);
     if (ok)

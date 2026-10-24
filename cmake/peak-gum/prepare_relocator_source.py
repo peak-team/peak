@@ -60,7 +60,7 @@ if a.arch == 'arm64':
         '      }\n\n'
         '      g_hash_table_add (checked_targets, (gpointer) current_code);')
     s = replace_once(s, '      gum_ensure_code_readable (current_code, current_code_size);',
-        '      peak_arm64_begin_code_read (&peak_read, current_code, current_code_size);')
+        '      /* Safe decoder input is filled lazily and shared across blocks. */')
     s = replace_once(s, '      while (carry_on && cs_disasm_iter (capstone, &current_code,\n'
         '          &current_code_size, &current_address, insn))',
         '      while (carry_on && peak_arm64_read_instruction (&peak_read, capstone,\n'
