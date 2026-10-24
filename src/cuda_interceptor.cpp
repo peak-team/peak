@@ -3094,9 +3094,7 @@ peak_cuda_attach_capture_entry(gpointer target,
                                GumInvocationListener* listener)
 {
     PeakGumTargetAttachPlan plan = {};
-    /* Capture hooks are installed inside a Gum transaction; do not discover
-     * unwind / module metadata while that interceptor lock is held. */
-    peak_gum_target_attach_plan_with_extent(target, nullptr, &plan);
+    peak_gum_target_attach_plan(target, &plan);
 
 #if defined(__linux__) && defined(__aarch64__)
     if (peak_cuda_capture_entry_is_arm64_branch(target)) {

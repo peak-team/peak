@@ -9,14 +9,14 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 extern gboolean gum_x86_relocator_can_relocate(gpointer,guint,GumRelocationScenario,guint*);
-extern int peak_x86_unsafe(int), peak_x86_recoverable(int);
+extern int peak_x86_recoverable(int);
 extern int peak_x86_internal_jcc(int), peak_x86_internal_jmp(int);
-extern int peak_x86_mid_instruction(int), peak_x86_indirect(int);
+extern int peak_x86_indirect(int);
 extern int peak_x86_budget(int), peak_x86_rip_data(int);
 extern int peak_x86_rip_lea(int), peak_x86_call_next(int);
 extern gpointer peak_x86_prefix_data(void);
 extern int peak_x86_prefix_read(int);
-extern int peak_x86_negative(int),peak_x86_crossing_data(int);
+extern int peak_x86_crossing_data(int);
 extern int peak_x86_rounding(int);
 extern int peak_x86_indirect_call(int);
 #ifdef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -31,7 +31,8 @@ extern void gum_x86_relocator_unref(GumX86Relocator*);
 static int (*fast_original)(int);
 static int fast_replacement(int n) { return fast_original(n)+1; }
 extern int peak_x86_suffix_trap(int),peak_x86_prefix_trap(int);
-extern int peak_x86_xsave_extent(int),peak_x86_fxsave_extent(int);
+extern int peak_x86_fxsave_overlap(int),peak_x86_fxsave_buffered(int);
+extern guint8 peak_x86_fxsave_buffer[512];
 static guint calls;
 static void enter(GumInvocationContext *c,gpointer d) { (void)c;(void)d;calls++; }
 #define CHECK(expr) do { if (!(expr)) { fprintf(stderr,"%s:%d: %s\n",__FILE__,__LINE__,#expr); return 1; } } while(0)
@@ -130,9 +131,8 @@ static int far_rewrite(gpointer source,int zero,int one,gboolean self_entry)
  CHECK(munmap(code,page)==0);
  return 0;
 }
-/* Establish the pinned decoder precondition rather than testing a silently
- * different opcode: these state images access >=512B but report an8B operand.
- * Never execute the state-store fixtures against their read-only destination. */
+/* The pinned decoder reports an 8B operand for a 512B state image. The
+ * potentially prefix-crossing store is classified only, never executed. */
 static int state_image_width(gpointer target,guint expected)
 {
  csh capstone;cs_insn *instruction;size_t n;
@@ -148,9 +148,6 @@ static int state_image_width(gpointer target,guint expected)
  CHECK(range(target,5,FALSE,0)==0);return 0;
 }
 extern int peak_x86_order_b(int),peak_x86_order_call(int),peak_x86_order_tail(int);
-extern int peak_x86_order_interior(int),peak_x86_order_original_entry(int);
-extern int peak_x86_order_original_b(int);
-extern int peak_x86_call_middle(int),peak_x86_call_hook_interior(int);
 /* Every attach owns a distinct listener so A can be detached with B active. */
 static int installation_order(GumInterceptor *i,int(*a)(int),gboolean b_first)
 {
@@ -162,45 +159,14 @@ static int installation_order(GumInterceptor *i,int(*a)(int),gboolean b_first)
  CHECK(gum_interceptor_peak_attach_exact(i,a,la,NULL)==GUM_ATTACH_OK);
  if(!b_first)CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
  for(generation=0;generation!=2;generation++) {
-  guint old=calls;gsize n=0;guint8 *live;
+  guint old=calls;
   CHECK(a(0)==61 && a(1)==61);CHECK(calls==old+4);
   CHECK(peak_x86_order_b(0)==61 && peak_x86_order_b(1)==61);
-  /* Successful preparation must leave no original-byte overlay in scope. */
-  live=gum_interceptor_peak_read_relocation_code(a,32,&n);
-  CHECK(live!=NULL && n==32 && memcmp(live,a,32)==0);g_free(live);
   gum_interceptor_detach(i,la);CHECK(memcmp(before,a,32)==0);
   CHECK(a(0)==61 && a(1)==61);
   if(generation==0)CHECK(gum_interceptor_peak_attach_exact(i,a,la,NULL)==GUM_ATTACH_OK);
  }
  gum_interceptor_detach(i,lb);g_object_unref(la);g_object_unref(lb);return 0;
-}
-static int scope_conflicts(GumInterceptor *i)
-{
- GumInvocationListener *la=gum_make_call_listener(enter,NULL,NULL,NULL);
- GumInvocationListener *lb=gum_make_call_listener(enter,NULL,NULL,NULL);
- guint8 before[32];gsize n;guint8 *live;
- memcpy(before,peak_x86_order_b,32);
- gum_interceptor_begin_transaction(i);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,(guint8*)peak_x86_order_b+4,la,NULL)!=GUM_ATTACH_OK);
- gum_interceptor_end_transaction(i);
- CHECK(gum_interceptor_peak_attach_exact(i,(guint8*)peak_x86_order_b+4,la,NULL)!=GUM_ATTACH_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_interior,la,NULL)!=GUM_ATTACH_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_call_hook_interior,la,NULL)!=GUM_ATTACH_OK);
- live=gum_interceptor_peak_read_relocation_code(peak_x86_order_b,32,&n);
- CHECK(live!=NULL && n==32 && memcmp(live,peak_x86_order_b,32)==0);g_free(live);
- gum_interceptor_detach(i,lb);CHECK(memcmp(before,peak_x86_order_b,32)==0);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_original_b,lb,NULL)==GUM_ATTACH_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_original_entry,la,NULL)!=GUM_ATTACH_OK);
- gum_interceptor_detach(i,lb);
- CHECK(gum_interceptor_replace(i,peak_x86_order_b,fast_replacement,
-     (gpointer*)&fast_original,NULL)==GUM_REPLACE_OK);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_tail,la,NULL)==GUM_ATTACH_OK);
- CHECK(peak_x86_order_tail(0)==62 && peak_x86_order_tail(1)==62);
- gum_interceptor_detach(i,la);
- gum_interceptor_revert(i,peak_x86_order_b);
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_tail,la,NULL)==GUM_ATTACH_OK);
- gum_interceptor_detach(i,la);g_object_unref(la);g_object_unref(lb);return 0;
 }
 extern int peak_x86_mutable_tail(int),peak_x86_prefix_tail(int);
 extern int peak_x86_mutable_one(int),peak_x86_mutable_two(int);
@@ -209,7 +175,7 @@ static int mutable_tail(GumInterceptor *i,GumInvocationListener *l)
 {
  guint generation;guint8 before[16];memcpy(before,peak_x86_mutable_tail,16);
  CHECK(range(peak_x86_mutable_tail,5,TRUE,7)==0);
- CHECK(range(peak_x86_prefix_tail,5,FALSE,0)==0);
+ CHECK(range(peak_x86_prefix_tail,5,FALSE,2)==0);
  CHECK(refuse(i,l,peak_x86_prefix_tail)==0);
  for(generation=0;generation!=2;generation++) {
   guint old=calls;
@@ -228,7 +194,6 @@ static int entry_thunk(GumInterceptor *i,GumInvocationListener *l)
  long page=sysconf(_SC_PAGESIZE);guint8 *source,*far;
  gint32 displacement=58;int(*target)(int);guint mode,generation;
  guint8 original[6];guint old;int(*f)(int);
- GumInvocationListener *lb=gum_make_call_listener(enter,NULL,NULL,NULL);
  CHECK(page>0);
  source=mmap(NULL,page*2,PROT_READ|PROT_WRITE|PROT_EXEC,
      MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(source!=MAP_FAILED);
@@ -259,14 +224,7 @@ static int entry_thunk(GumInterceptor *i,GumInvocationListener *l)
   CHECK(((int(*)(int))output)(1)==73);
   gum_x86_relocator_unref(r);gum_x86_writer_unref(w);
  }
- CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
- target=(int(*)(int))((guint8*)peak_x86_order_b+4);memcpy(source+64,&target,8);
- CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
- gum_interceptor_detach(i,lb);g_object_unref(lb);
- target=(int(*)(int))(source+1);memcpy(source+64,&target,8);
- CHECK(range(source,5,FALSE,0)==0);
- CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
- target=peak_x86_mutable_one;memcpy(source+64,&target,8);
+ /* A slot overlapping the actual patch is a local data conflict. */
  displacement=-5;memcpy(source+2,&displacement,4);
  CHECK(range(source,5,FALSE,0)==0);
  CHECK(gum_interceptor_peak_attach_exact(i,source,l,NULL)!=GUM_ATTACH_OK);
@@ -274,12 +232,9 @@ static int entry_thunk(GumInterceptor *i,GumInvocationListener *l)
 }
 extern void peak_x86_endbr_dl(const guint8*,guint8*);
 extern void peak_x86_endbr_edx(const guint8*,guint8*);
-extern void peak_x86_plain_dl(const guint8*,guint8*);
-extern void peak_x86_plain_edx(const guint8*,guint8*);
 static int endbr_backedge(GumInterceptor *i,GumInvocationListener *l)
 {
  void(*functions[])(const guint8*,guint8*)={peak_x86_endbr_dl,peak_x86_endbr_edx};
- void(*plain[])(const guint8*,guint8*)={peak_x86_plain_dl,peak_x86_plain_edx};
  const guint8 endbr[]={0xf3,0x0f,0x1e,0xfa};
  const guint8 loop_load[]={0x8b,0x0c,0x07};
  guint kind,generation,iteration;guint8 source[16],destination[16];
@@ -288,10 +243,7 @@ static int endbr_backedge(GumInterceptor *i,GumInvocationListener *l)
   guint8 before[32];memcpy(before,functions[kind],32);
   CHECK(memcmp(before,endbr,4)==0);
   CHECK(memcmp(before+8,loop_load,sizeof loop_load)==0);
-  CHECK(memcmp((guint8*)plain[kind]+4,loop_load,sizeof loop_load)==0);
   CHECK(range(functions[kind],5,TRUE,6)==0);
-  CHECK(range(plain[kind],5,FALSE,4)==0);
-  CHECK(gum_interceptor_peak_attach_exact(i,plain[kind],l,NULL)!=GUM_ATTACH_OK);
   for(generation=0;generation!=2;generation++) {
    guint old=calls,length;guint8 active[32],original[32];
    CHECK(gum_interceptor_peak_attach_exact(i,functions[kind],l,NULL)==GUM_ATTACH_OK);
@@ -326,58 +278,44 @@ static int self_entry_pointer(GumInterceptor *i,GumInvocationListener *l)
   * execute the original LEA and miss the distant writer's address rewrite. */
  CHECK(far_rewrite(entry,0,0,TRUE)==0);return 0;
 }
-extern int peak_x86_extent_exit(int),peak_x86_extent_call_before_end(int);
-extern int peak_x86_extent_fallthrough(int),peak_x86_extent_cold(int);
-extern int peak_x86_extent_call_prefix(int),peak_x86_extent_hook_interior(int);
-extern guint8 peak_x86_extent_exit_end[],peak_x86_extent_call_before_end_end[];
-extern guint8 peak_x86_extent_fallthrough_end[],peak_x86_extent_cold_end[];
-extern guint8 peak_x86_extent_call_prefix_end[],peak_x86_extent_hook_interior_end[];
-static int extent_refuse(GumInterceptor *i,GumInvocationListener *l,
-                         gpointer entry,gpointer end)
+/* Distinct branch results check both paths through an external conditional
+ * target. The same source is also executed after distant standalone rewrite. */
+static int external_jcc(GumInterceptor *i,GumInvocationListener *l)
 {
- GumMemoryRange extent={(GumAddress)entry,(guintptr)end-(guintptr)entry};
- guint8 before[32];memcpy(before,entry,32);
- CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&extent,TRUE)!=GUM_ATTACH_OK);
- CHECK(memcmp(before,entry,32)==0);return 0;
-}
-static int trusted_extent(GumInterceptor *i,GumInvocationListener *l)
-{
- gpointer entry=peak_x86_extent_exit;guint generation,bad;
- GumMemoryRange extent={(GumAddress)entry,
-     (guintptr)peak_x86_extent_exit_end-(guintptr)entry};
- GumMemoryRange invalid[3]={{(GumAddress)entry,0},{(GumAddress)entry,G_MAXSIZE},
-     {(GumAddress)entry+1,extent.size}};
- guint8 before[32];memcpy(before,entry,32);
- CHECK(peak_x86_extent_exit(0)==79);CHECK(range(entry,5,FALSE,0)==0);
- CHECK(gum_interceptor_peak_attach_exact(i,entry,l,NULL)!=GUM_ATTACH_OK);
- for(bad=0;bad!=G_N_ELEMENTS(invalid);bad++) {
-  CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&invalid[bad],TRUE)!=GUM_ATTACH_OK);
-  CHECK(memcmp(before,entry,32)==0);
- }
+ guint generation;guint8 before[32];memcpy(before,peak_x86_far_branch,32);
+ CHECK(range(peak_x86_far_branch,5,TRUE,5)==0);
+ CHECK(peak_x86_far_branch(0)==17 && peak_x86_far_branch(1)==13);
  for(generation=0;generation!=2;generation++) {
-  pid_t child;int status;guint old=calls;
-  CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&extent,TRUE)==GUM_ATTACH_OK);
-  CHECK(peak_x86_extent_exit(0)==79);CHECK(calls==old+1);
-  child=fork();CHECK(child>=0);
-  if(child==0) { alarm(3);peak_x86_extent_exit(1);_exit(99); }
-  CHECK(waitpid(child,&status,0)==child);
-  CHECK(WIFEXITED(status) && WEXITSTATUS(status)==17);
-  gum_interceptor_detach(i,l);CHECK(memcmp(before,entry,32)==0);
-  CHECK(peak_x86_extent_exit(0)==79);CHECK(calls==old+1);
-  CHECK(range(entry,5,FALSE,0)==0);
- }
- CHECK(extent_refuse(i,l,peak_x86_extent_call_before_end,peak_x86_extent_call_before_end_end)==0);
- CHECK(extent_refuse(i,l,peak_x86_extent_fallthrough,peak_x86_extent_fallthrough_end)==0);
- CHECK(extent_refuse(i,l,peak_x86_extent_cold,peak_x86_extent_cold_end)==0);
- CHECK(extent_refuse(i,l,peak_x86_extent_call_prefix,peak_x86_extent_call_prefix_end)==0);
- {
-  GumInvocationListener *lb=gum_make_call_listener(enter,NULL,NULL,NULL);
-  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
-  CHECK(extent_refuse(i,l,peak_x86_extent_hook_interior,peak_x86_extent_hook_interior_end)==0);
-  gum_interceptor_detach(i,lb);g_object_unref(lb);
+  guint old=calls;
+  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_far_branch,l,NULL)==GUM_ATTACH_OK);
+  CHECK(peak_x86_far_branch(0)==17 && peak_x86_far_branch(1)==13);
+  CHECK(calls==old+2);gum_interceptor_detach(i,l);
+  CHECK(memcmp(before,peak_x86_far_branch,32)==0);
+  CHECK(peak_x86_far_branch(0)==17 && peak_x86_far_branch(1)==13);
  }
  return 0;
 }
+static int page_tail(GumInterceptor *i,GumInvocationListener *l)
+{
+ const guint8 bytes[]={0xb8,89,0,0,0,0xc3};long page=sysconf(_SC_PAGESIZE);
+ guint8 *mapping;guint generation;gpointer entry;
+ CHECK(page>0);
+ mapping=mmap(NULL,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+ CHECK(mapping!=MAP_FAILED);entry=mapping+page-sizeof bytes;
+ memcpy(entry,bytes,sizeof bytes);
+ CHECK(mprotect(mapping,page,PROT_READ|PROT_EXEC)==0);
+ CHECK(mprotect(mapping+page,page,PROT_NONE)==0);
+ CHECK(range(entry,5,TRUE,5)==0);CHECK(((int(*)(void))entry)()==89);
+ for(generation=0;generation!=2;generation++) {
+  guint old=calls;
+  CHECK(gum_interceptor_peak_attach_exact(i,entry,l,NULL)==GUM_ATTACH_OK);
+  CHECK(((int(*)(void))entry)()==89);CHECK(calls==old+1);
+  gum_interceptor_detach(i,l);CHECK(memcmp(entry,bytes,sizeof bytes)==0);
+  CHECK(((int(*)(void))entry)()==89);CHECK(calls==old+1);
+ }
+ CHECK(munmap(mapping,page*2)==0);return 0;
+}
+extern int peak_x86_call_prefix(int),peak_x86_internal_mid_jcc(int);
 int main(void)
 {
 #ifndef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -386,52 +324,50 @@ int main(void)
  GumInterceptor*i;GumInvocationListener*l;guint n;
  long page;guint8 * mapping;
 #ifdef PEAK_GUM_ENTRY_RANGE_CHECKS
- CHECK(gum_interceptor_peak_entry_range_revision()==1);
+ CHECK(gum_interceptor_peak_entry_range_revision()==2);
 #endif
  gum_init_embedded();i=gum_interceptor_obtain();l=gum_make_call_listener(enter,NULL,NULL,NULL);
- CHECK(range(peak_x86_unsafe,5,FALSE,4)==0);
- CHECK(range(peak_x86_negative,5,FALSE,4)==0);
  CHECK(range(peak_x86_prefix_data,5,TRUE,5)==0);
+ CHECK(range(peak_x86_prefix_data,12,TRUE,12)==0);
  CHECK(range(peak_x86_prefix_read,5,FALSE,0)==0);
  CHECK(range(peak_x86_crossing_data,5,FALSE,0)==0);
- CHECK(range(peak_x86_rounding,16,FALSE,1)==0);
- CHECK(range(peak_x86_unsafe,16,FALSE,4)==0);
- CHECK(range(peak_x86_recoverable,16,FALSE,12)==0);
+ CHECK(range(peak_x86_rounding,5,FALSE,1)==0);
  CHECK(range(peak_x86_recoverable,5,TRUE,5)==0);
- CHECK(range(peak_x86_mid_instruction,5,FALSE,0)==0);
- CHECK(range(peak_x86_call_middle,5,FALSE,0)==0);
  CHECK(range(peak_x86_indirect,5,TRUE,5)==0);
  CHECK(range(peak_x86_indirect_call,5,TRUE,7)==0);
- CHECK(range(peak_x86_budget,5,FALSE,0)==0);
+ CHECK(range(peak_x86_budget,5,TRUE,5)==0);
  CHECK(range(peak_x86_internal_jmp,7,FALSE,4)==0);
+ CHECK(range(peak_x86_call_prefix,5,FALSE,0)==0);
+ CHECK(range(peak_x86_internal_mid_jcc,5,FALSE,0)==0);
  CHECK(gum_x86_relocator_can_relocate(peak_x86_internal_jcc,10,GUM_SCENARIO_ONLINE,&n));
  CHECK(n==10);
- CHECK(refuse(i,l,peak_x86_unsafe)==0);
+ CHECK(refuse(i,l,peak_x86_call_prefix)==0);
+ CHECK(refuse(i,l,peak_x86_internal_mid_jcc)==0);
  CHECK(refuse(i,l,peak_x86_prefix_read)==0);
- CHECK(refuse(i,l,peak_x86_negative)==0);
- CHECK(refuse(i,l,peak_x86_mid_instruction)==0);
  CHECK(run(i,l,peak_x86_indirect_call,37)==0);
- CHECK(refuse(i,l,peak_x86_budget)==0);
- CHECK(run(i,l,peak_x86_recoverable,11)==0);
+ CHECK(run(i,l,peak_x86_budget,83)==0);
  CHECK(run(i,l,peak_x86_internal_jcc,19)==0);
+ CHECK(run(i,l,peak_x86_recoverable,11)==0);
  CHECK(run(i,l,peak_x86_rip_data,23)==0);
  CHECK(run(i,l,peak_x86_rip_lea,23)==0);
  CHECK(run(i,l,peak_x86_call_next,31)==0);
  CHECK(run(i,l,peak_x86_syscall,(int)getpid())==0);
  CHECK(range(peak_x86_suffix_trap,5,TRUE,5)==0);
  CHECK(range(peak_x86_prefix_trap,5,FALSE,0)==0);
- CHECK(state_image_width(peak_x86_xsave_extent,X86_INS_XSAVE)==0);
- CHECK(state_image_width(peak_x86_fxsave_extent,X86_INS_FXSAVE)==0);
+ CHECK(state_image_width(peak_x86_fxsave_overlap,X86_INS_FXSAVE)==0);
+ CHECK(((guintptr)peak_x86_fxsave_buffer&15)==0);
+ CHECK(range(peak_x86_fxsave_buffered,5,TRUE,7)==0);
+ CHECK(run(i,l,peak_x86_fxsave_buffered,97)==0);
  CHECK(installation_order(i,peak_x86_order_call,FALSE)==0);
  CHECK(installation_order(i,peak_x86_order_call,TRUE)==0);
  CHECK(installation_order(i,peak_x86_order_tail,FALSE)==0);
  CHECK(installation_order(i,peak_x86_order_tail,TRUE)==0);
- CHECK(scope_conflicts(i)==0);
  CHECK(mutable_tail(i,l)==0);
  CHECK(entry_thunk(i,l)==0);
  CHECK(endbr_backedge(i,l)==0);
  CHECK(self_entry_pointer(i,l)==0);
- CHECK(trusted_extent(i,l)==0);
+ CHECK(page_tail(i,l)==0);
+ CHECK(external_jcc(i,l)==0);
  CHECK(full_span(i)==0);
  CHECK(far_rewrite(peak_x86_full_span,50,50,FALSE)==0);
  CHECK(far_rewrite(peak_x86_far_branch,17,13,FALSE)==0);
@@ -440,7 +376,7 @@ int main(void)
  CHECK(mapping!=MAP_FAILED);
  memset(mapping+page-4,0x90,4);
  CHECK(mprotect(mapping+page,page,PROT_NONE)==0);
- CHECK(range(mapping+page-4,5,FALSE,0)==0);
+ CHECK(range(mapping+page-4,5,FALSE,4)==0);
  CHECK(munmap(mapping,page*2)==0);
  g_object_unref(l);g_object_unref(i);gum_deinit_embedded();
  puts("gum_x86_entry_range_ok");return 0;

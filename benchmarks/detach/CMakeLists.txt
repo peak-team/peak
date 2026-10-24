@@ -242,3 +242,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux" AND
       TIMEOUT 180
       PASS_REGULAR_EXPRESSION "stale_thread_stress_ok")
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+  add_executable(benchmark_entry_attach benchmark_entry_attach.c)
+  target_include_directories(benchmark_entry_attach PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
+  target_link_libraries(benchmark_entry_attach PRIVATE
+    ${FRIDA_GUM_LIBRARIES} Threads::Threads ${DL_LIBRARY}
+    ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
+  add_test(NAME benchmark_entry_attach COMMAND benchmark_entry_attach)
+  set_tests_properties(benchmark_entry_attach PROPERTIES
+    LABELS benchmark
+    RESOURCE_LOCK peak_detach_benchmark
+    TIMEOUT 30)
+endif()

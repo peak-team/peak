@@ -25,7 +25,6 @@ typedef struct _PeakGumTargetAttachPlan {
     gpointer mutation_address;
     gsize mutation_guard_size;
     gboolean attach_exact_entry;
-    GumMemoryRange function_extent;
 } PeakGumTargetAttachPlan;
 
 PeakUnsafeGumProloguePolicy
@@ -54,12 +53,6 @@ peak_gum_prologue_too_short_for_attach(gpointer address,
 void
 peak_gum_target_attach_plan(gpointer address,
                             PeakGumTargetAttachPlan* plan_out);
-
-/* Pure metadata form: invalid or absent extents stay absent; no lookup. */
-void
-peak_gum_target_attach_plan_with_extent(gpointer address,
-                                       const GumMemoryRange* extent,
-                                       PeakGumTargetAttachPlan* plan_out);
 
 /* Applies a target plan, including exact-entry semantics when available. */
 GumAttachReturn

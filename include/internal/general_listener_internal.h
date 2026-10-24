@@ -46,11 +46,4 @@ gboolean peak_general_listener_print_with_mpi_job_policy(
 /* Starts target lifecycle processing after startup-only Gum hooks are ready. */
 void peak_general_listener_controller_start(void);
 
-void peak_general_listener_set_function_extent(PeakGeneralListener* listener,
-                                                gpointer address,
-                                                const GumMemoryRange* extent,
-                                                uint64_t generation);
-const GumMemoryRange* peak_general_listener_function_extent(
-    PeakGeneralListener* listener, gpointer address, uint64_t generation);
-
 #endif /* PEAK_GENERAL_LISTENER_INTERNAL_H */

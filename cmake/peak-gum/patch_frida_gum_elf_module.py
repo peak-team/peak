@@ -178,38 +178,6 @@ def route_redirect_resolver_through_overlay(
     print(f"patched {object_name}: routed exact-entry attach resolver dispatch")
 
 
-def route_trampoline_preparation_through_overlay(
-    library: Path, members: list[str], ar: str, nm: str, objcopy: str,
-    work_dir: Path,
-) -> None:
-    # Rename only the caller's undefined import. The backend definition and
-    # every other backend import remain intact.
-    original = "_gum_interceptor_backend_create_trampoline"
-    dispatch = original + "_peak_dispatch"
-    member = INTERCEPTOR_OBJECT_NAME
-    if members.count(member) != 1:
-        fail(f"expected exactly one {member} for trampoline preparation route")
-    extracted = work_dir / member
-    result = run([ar, "x", str(library), member], cwd=work_dir)
-    if result.returncode != 0 or not extracted.exists():
-        fail(f"failed to extract {member}: {result.stderr}")
-    before = symbol_kinds(nm, extracted)
-    if ("U", original) not in before and ("U", dispatch) in before:
-        print(f"{member}: scoped trampoline preparation already patched")
-        return
-    if ("U", original) not in before or any(name == dispatch for _, name in before):
-        fail(f"unexpected trampoline preparation symbols in {member}")
-    result = run([objcopy, "--redefine-sym", f"{original}={dispatch}", str(extracted)])
-    if result.returncode != 0:
-        fail(f"failed to route trampoline preparation: {result.stderr}")
-    after = symbol_kinds(nm, extracted)
-    expected = (before - {("U", original)}) | {("U", dispatch)}
-    if after != expected:
-        fail(f"trampoline preparation route changed unexpected symbols in {member}")
-    replace_archive_member(ar, library, extracted)
-    print(f"patched {member}: routed locked trampoline original-code view")
-
-
 def route_invocation_dispatch_through_overlay(
     library: Path,
     members: list[str],
@@ -1361,10 +1329,6 @@ def main() -> int:
             args.objcopy,
             work_dir,
         )
-
-    if machine in (62, 183):
-        route_trampoline_preparation_through_overlay(
-            library, members, args.ar, args.nm, args.objcopy, work_dir)
 
     route_invocation_dispatch_through_overlay(
         library,

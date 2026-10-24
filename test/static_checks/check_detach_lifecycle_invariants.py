@@ -737,12 +737,7 @@ def check_safe_arm64_plt_reads(repo_root):
             "Arm64 branch-to-PLT detection must safely read both ranges and preserve errno")
     require("memcpy(plt, plt_address" not in arm64,
             "Arm64 branch-to-PLT detection must not directly read a computed target")
-    plan = extract_function(unsafe, "peak_gum_target_attach_plan_with_extent")
-    discover = extract_function(unsafe, "peak_gum_target_attach_plan")
-    require("gum_process_find_function_range" in discover and
-            "peak_gum_target_attach_plan_with_extent" in discover and
-            "gum_process_find_function_range" not in plan,
-            "extent discovery and pure supplied-metadata planning must stay separate")
+    plan = extract_function(unsafe, "peak_gum_target_attach_plan")
     require("plan_out->mutation_address = plt_address" in plan and
             "plan_out->mutation_guard_size = GUM_PEAK_MAX_PROLOGUE_SIZE" in plan and
             "defined(GUM_PEAK_MAX_PROLOGUE_SIZE)" in plan,
@@ -773,8 +768,7 @@ def check_safe_arm64_plt_reads(repo_root):
         ("JIT", jit_attach),
     ):
         normalized = re.sub(r"\s+", " ", body)
-        plan_match = re.search(r"peak_gum_target_attach_plan(?:_with_extent)?\(", body)
-        plan_position = plan_match.start() if plan_match else -1
+        plan_position = body.find("peak_gum_target_attach_plan(")
         blocked_position = body.find(".blocked_pc_start =")
         prepare_position = body.find("peak_detach_controller_prepare_hook_mutation")
         require(plan_position != -1 and blocked_position != -1 and
@@ -791,8 +785,7 @@ def check_safe_arm64_plt_reads(repo_root):
             f"{label} attach must use one plan for both strict guard and Gum options",
         )
     require(
-        "peak_gum_target_attach_plan_with_extent(" in dlopen_plan and
-        "gum_process_find_function_range" not in dlopen_plan and
+        "peak_gum_target_attach_plan(" in dlopen_plan and
         ".blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0 ? "
         "candidate->attach_plan.mutation_address : NULL" in normalized_dlopen_plan and
         ".blocked_pc_size = candidate->attach_plan.mutation_guard_size" in normalized_dlopen_plan,
@@ -837,15 +830,6 @@ def check_safe_arm64_plt_reads(repo_root):
                 "write(STDERR_FILENO" not in runtime_source and
                 "fprintf(stderr" not in runtime_source,
                 f"{rel} diagnostics must use the PEAK-owned report descriptor")
-
-
-def check_cuda_attach_extent_lookup_stays_outside_transaction(repo_root):
-    source = read_source(repo_root, "src/cuda_interceptor.cpp")
-    capture = extract_function(source, "peak_cuda_attach_capture_entry")
-    require("peak_gum_target_attach_plan_with_extent(target, nullptr, &plan)" in capture and
-            "peak_gum_target_attach_plan(" not in capture and
-            "gum_process_find_function_range" not in capture,
-            "CUDA capture attach inside a Gum transaction must use a pure no-extent plan")
 
 
 def check_x86_patched_gum_requires_exact_attach(repo_root):
@@ -3582,7 +3566,6 @@ def main():
     check_dlopen_resolution_lock_order(repo_root)
     check_dlopen_fftw_scope_and_fork_guard(repo_root)
     check_safe_arm64_plt_reads(repo_root)
-    check_cuda_attach_extent_lookup_stays_outside_transaction(repo_root)
     check_x86_patched_gum_requires_exact_attach(repo_root)
     check_fast_listener_unwind_abi(repo_root)
     check_peak_init_heartbeat_order(repo_root)

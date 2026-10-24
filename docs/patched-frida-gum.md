@@ -1,8 +1,10 @@
 # PEAK-Patched Frida Gum Build Path
 
-PEAK can build with either the stock prebuilt Frida Gum devkit or a PEAK-patched
-devkit exposing the PC classification and safe-point hooks described in
-`docs/physical-detach-controller.md`. On Linux x86_64 and Linux Arm64 the
+Linux x86_64 and Linux Arm64 builds require a current PEAK-patched Frida Gum
+devkit with checked entry-range revision 2, a linkable revision query, and the
+native prefix classifier. The default patched provider also exposes the PC
+classification and safe-point hooks described in
+`docs/physical-detach-controller.md`. On these Linux architectures the
 default `auto` provider downloads the Frida Gum devkit, copies it to a
 PEAK-patched devkit directory, guards Gum's online in-memory ELF fallback, and
 appends PEAK's Gum PC API implementation to the archive. On x86_64 it also
@@ -52,13 +54,20 @@ bounds, and offset-plus-table-size overflow. Invalid memory sources return Gum's
 normal invalid-header error so the caller can skip that module instead of
 crashing while interpreting arbitrary loader memory as ELF metadata.
 
-If a caller supplies `FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS` while
-leaving `PEAK_FRIDA_GUM_PROVIDER=auto`, PEAK treats that as a caller-managed
-stock-Gum build. It validates the PEAK API only when
-`PEAK_REQUIRE_GUM_PEAK_API=ON` is also set; without the PEAK API, strict runtime
-mutation fails closed with `missing-gum-api`. Selecting
-`PEAK_FRIDA_GUM_PROVIDER=auto-patched-devkit` requires CMake to own the downloaded
-devkit so it can append the overlay.
+Every Linux x86_64 and Arm64 provider is checked at configure time, including
+caller-managed `FRIDA_GUM_LIBRARIES` / `FRIDA_GUM_INCLUDE_DIRS`, `prebuilt`, and
+`patched-devkit`. The linked archive and header must provide checked entry-range
+revision 2 through a linkable revision query and native prefix classifier. Old stock devkits and the earlier
+whole-function analysis revision are rejected. External devkits are never
+silently patched; `auto-patched-devkit` requires CMake to own the downloaded
+devkit. `PEAK_REQUIRE_GUM_PEAK_API=OFF` does not bypass the entry-range check.
+
+Auto-patching replaces the pinned native relocator source. The original source
+is pinned by SHA-256 in `cmake/frida-gum.cmake`; a controlled offline auto-patch
+build must cache that exact source through `PEAK_GUM_RELOCATOR_SOURCE_DIR` as well
+as the devkit. Offline builds that supply an already patched devkit must update
+its archive and header together to revision 2. No source download is needed for
+that caller-provided patched devkit.
 
 ## Patched Devkit Provider
 
@@ -83,7 +92,8 @@ cmake -S . -B build-patched-gum \
 ```
 
 Selecting `patched-devkit` fails configuration unless the selected headers and
-`libfrida-gum.a` expose a linkable PEAK PC-classification API. On Linux x86_64,
+`libfrida-gum.a` expose the current revision query, native prefix classifier, and a linkable
+PEAK PC-classification API. On Linux x86_64,
 the devkit must also expose the exact-entry attach API shown below; otherwise
 Gum can follow an exported tail jump and attribute wrapper calls to the
 downstream implementation. See
@@ -148,9 +158,10 @@ GumAttachReturn gum_interceptor_peak_attach_exact(
 ```
 
 For custom Gum paths that are not selected through `patched-devkit`, set both
-`FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS`. Add
-`-DPEAK_REQUIRE_GUM_PEAK_API=ON` when that custom path should be validated for
-the PEAK API.
+`FRIDA_GUM_LIBRARIES` and `FRIDA_GUM_INCLUDE_DIRS`. Linux x86_64 and Arm64 still
+require revision 2 entry-range validation. `PEAK_REQUIRE_GUM_PEAK_API=ON` also
+requests the full PEAK PC API validation for a custom provider. The entry-range
+check alone does not establish PC classification or unwind API availability.
 
 ## Runtime Behavior
 
@@ -170,8 +181,8 @@ structured helper STOP response reports permission denied, timeout, or
 unsupported. Helper protocol loss or no-response after STOP remains fail-stop
 because the controller cannot prove whether target threads were already stopped.
 
-With stock Gum, strict mode still fails closed with `missing-gum-api`. With a
-patched devkit, PEAK uses a strict stop backend to hold every non-controller
+A Linux x86_64 or Arm64 stock devkit is rejected during configuration. With a
+current patched devkit, PEAK uses a strict stop backend to hold every non-controller
 Linux TID, read PCs, let the in-process controller classify those PCs through
 the patched Gum API, optionally move audited trampoline PCs to Gum-provided safe
 PCs, perform the physical patch write while all other threads remain stopped or

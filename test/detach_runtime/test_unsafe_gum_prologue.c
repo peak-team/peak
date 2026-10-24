@@ -1,6 +1,5 @@
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 typedef void (*unsafe_target_fn)(const uint8_t* src, uint8_t* dst);
@@ -520,10 +519,6 @@ main(int argc, char** argv)
     }
 
     if (argc == 3 && strcmp(argv[1], "--case") == 0) {
-        const char* override = getenv("PEAK_ALLOW_UNSAFE_GUM_PROLOGUE");
-        if (override != NULL && strcmp(override, "1") == 0) {
-            puts("unsafe_gum_policy_override_enabled");
-        }
         const UnsafeCase* test_case = find_case(argv[2]);
         if (test_case == NULL) {
             fprintf(stderr, "unsupported unsafe prologue case: %s\n", argv[2]);

@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 
@@ -38,12 +37,12 @@ def run_case(args):
     env["PEAK_ENABLE_PER_TARGET_HEARTBEAT"] = "0"
     env["PEAK_ENABLE_GLOBAL_HEARTBEAT"] = "0"
     env["PEAK_HEARTBEAT_INTERVAL"] = "0"
-    if args.mode in ("guard", "override-rejected"):
+    if args.mode == "guard":
         # Expected safety-policy skips are INFO diagnostics. Keep the guard
         # tests diagnostic while production's default WARN level stays quiet.
         env["PEAK_VERBOSITY"] = "info"
 
-    if args.mode == "override-rejected":
+    if args.mode == "override-exercises":
         env["PEAK_ALLOW_UNSAFE_GUM_PROLOGUE"] = "1"
     else:
         env.pop("PEAK_ALLOW_UNSAFE_GUM_PROLOGUE", None)
@@ -111,30 +110,56 @@ def run_case(args):
         print(f"unsafe_gum_prologue_default_allows_ok case={args.case}")
         return 0
 
-    # These fixtures have a body backedge into the minimum x86 entry patch.
-    # Overriding PEAK's heuristic does not override Gum's relocation safety.
-    rejected_cases = {
-        "x86_dl_inc", "x86_dl_inc_rax_base", "x86_dl_add", "x86_edx_inc",
-        "x86_edx_add", "x86_dl_sub_zero", "x86_edx_sub_zero", "x86_dl_mov_zero",
-    }
-    if args.case not in rejected_cases or args.target != f"peak_unsafe_gum_{args.case}_target":
-        raise AssertionError("override-rejected requires a confirmed backedge fixture")
-    expected_ok = f"unsafe_gum_prologue_guard_ok:{args.case}"
-    if proc.returncode != 0 or expected_ok not in proc.stdout:
-        raise AssertionError(f"rejected target changed original behavior\n{combined}")
-    if "unsafe_gum_policy_override_enabled" not in proc.stdout:
-        raise AssertionError(f"fixture did not observe the PEAK policy override\n{combined}")
-    if line_mentions_peak_policy_skip_for_target(proc.stderr, args.target):
-        raise AssertionError(f"PEAK policy unexpectedly skipped the target\n{combined}")
-    refusal = rf"^\[peak\] Gum initial attach failed for hook 0 \({re.escape(args.target)}\), status=-1$"
-    if re.search(refusal, proc.stderr, re.MULTILINE) is None:
-        raise AssertionError(f"Gum did not explicitly refuse the unsafe target\n{combined}")
-    if line_mentions_profile_row_for_target(combined, args.target):
-        raise AssertionError(f"rejected target has a profile row\n{combined}")
-    for metric in ("Instrumented targets", "Recorded calls"):
-        if re.search(rf"^{metric}: 0$", combined, re.MULTILINE) is None:
-            raise AssertionError(f"rejected target has nonzero {metric}\n{combined}")
-    print(f"unsafe_gum_prologue_override_rejected_ok case={args.case}")
+    expected_mismatch = f"unsafe_prologue_mismatch case={args.case}"
+    if proc.returncode == 0:
+        expected_ok = f"unsafe_gum_prologue_guard_ok:{args.case}"
+        if expected_ok not in proc.stdout:
+            raise AssertionError(
+                f"override run for {args.case} preserved semantics without "
+                f"printing {expected_ok!r}\n{combined}"
+            )
+        if line_mentions_peak_policy_skip_for_target(proc.stderr, args.target):
+            raise AssertionError(
+                f"override run for {args.case} unexpectedly policy-skipped "
+                f"{args.target}\n{combined}"
+            )
+        if line_mentions_gum_attach_failure_for_target(proc.stderr, args.target):
+            raise AssertionError(
+                f"override run for {args.case} did not attach {args.target}\n"
+                f"{combined}"
+            )
+        if not line_mentions_profile_row_for_target(combined, args.target):
+            raise AssertionError(
+                f"override run for {args.case} preserved semantics but did not "
+                f"prove PEAK profiled {args.target}\n{combined}"
+            )
+        print(
+            f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
+            "preserved=1"
+        )
+        return 0
+    if proc.returncode < 0:
+        print(
+            f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
+            f"signal={-proc.returncode}"
+        )
+        return 0
+    if args.expected_byte is not None:
+        expected_byte = f"byte={args.expected_byte}"
+        if expected_mismatch not in proc.stderr or expected_byte not in proc.stderr:
+            raise AssertionError(
+                f"override run for {args.case} did not show expected corruption "
+                f"{expected_mismatch!r} and {expected_byte!r}\n{combined}"
+            )
+    elif expected_mismatch not in proc.stderr:
+        raise AssertionError(
+            f"override run for {args.case} failed, but not with the expected mismatch\n"
+            f"{combined}"
+        )
+    print(
+        f"unsafe_gum_prologue_override_exercises_ok case={args.case} "
+        f"rc={proc.returncode}"
+    )
     return 0
 
 
@@ -147,9 +172,10 @@ def main():
     parser.add_argument(
         "--mode",
         choices=("guard", "default-allows", "no-policy-skip",
-                 "override-rejected"),
+                 "override-exercises"),
         required=True,
     )
+    parser.add_argument("--expected-byte", type=int)
     parser.add_argument("--timeout", type=float, default=10.0)
     args = parser.parse_args()
 

@@ -30,9 +30,10 @@ listener attach/detach is also guarded because it changes a
 process-wide Gum patch site. Initial startup attach has one narrow exception:
 before the controller exists, PEAK may attach directly when `/proc/self/task`
 confirms that the process has exactly one task. Outside that single-task startup
-case, stock Gum causes startup target hooks to be skipped; already-attached
-target hooks remain attached, and PEAK logs why later target mutation was
-skipped. Process-lifetime support hooks keep explicit startup/shutdown
+case, a provider without the PC API causes startup target hooks to be skipped;
+already-attached target hooks remain attached, and PEAK logs why later target
+mutation was skipped. Supported Linux x86_64 and Arm64 builds reject an old
+stock devkit at configure time before reaching this runtime path. Process-lifetime support hooks keep explicit startup/shutdown
 ordering outside steady-state target detach. Startup target hooks and the
 process-lifetime `close`, allocator, and inert `dlopen` hooks, when enabled or
 needed, are installed before the target controller starts. Runtime `dlopen`
@@ -393,8 +394,9 @@ thread cannot be admitted and classified.
 The current code implements this Linux x86_64 and Linux Arm64 helper path behind
 the patched-Gum capability check. The default Linux x86_64 and Linux Arm64 CMake
 paths now construct a PEAK-patched Frida Gum devkit by copying the downloaded
-devkit and appending PEAK's PC API implementation to the archive. Stock Gum still
-reports `missing-gum-api` in strict mode. The helper uses `PTRACE_GETREGS` /
+devkit, replacing its native relocator, and appending PEAK's PC API implementation
+to the archive. All providers on these architectures must pass the revision 2
+entry-range check at configure time; an old stock devkit is rejected. The helper uses `PTRACE_GETREGS` /
 `PTRACE_SETREGS` on x86_64 and `PTRACE_GETREGSET` / `PTRACE_SETREGSET` with
 `NT_PRSTATUS` on Arm64. When `PR_SET_PTRACER` is unavailable and returns
 `EINVAL`/`ENOSYS`, PEAK falls back to the helper's real `ptrace` attempt; actual
@@ -1019,61 +1021,51 @@ skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
 
 The auto-patched Linux devkit replaces the pinned Gum 17.15.3 native Arm64 and
-x86 relocator members with corrected checked range analysis. The analysis starts
-at the function entry and follows reachable direct branches, including branches
-in the proposed overwrite region. An incoming branch reduces the safe overwrite
-range. Arm64 validates the backend's 16-, 8-, and 4-byte candidates, so an incoming
-branch at offset 12 can yield an 8-byte candidate; x86 reports an
-instruction-boundary maximum. The Arm64 backend can use its existing 8- or
-4-byte fallback when its register and allocation requirements permit it. The
-x86 backend retains its near/full allocation policy and rejects a requested
-patch whose complete instruction span exceeds the safe maximum.
+x86 relocator members with checked entry-prefix relocation. Checks cover the
+actual bytes selected for the entry patch, rather than traversing the function's
+suffix. The Arm64 ONLINE CHECKED path reads at most 16 bytes and decodes at most
+four instructions. It evaluates the backend's 16-, 8-, and 4-byte candidates
+subject to existing scratch-register, local literal-overlap, and allocation
+requirements. A first non-call branch truncates the prefix; the branch at
+offset 8 in `hpsort` leaves an 8-byte candidate. The x86 backend validates the complete
+instruction span needed for its actual 5- or 16-byte patch; the resulting span
+can be 6 or 20 bytes when the last instruction crosses the requested boundary.
+Its single safe read requests at most the requested size plus 14 bytes and
+accepts a partial read at a mapping boundary. Decoding stops once the complete
+patch span is available; it does not decode external branch targets. Local
+branches and RIP-relative data references can reduce the supported span. A
+conditional branch targeting the patch interior must land on a decoded
+instruction boundary to retain its relocated label mapping. External conditional
+targets retain the pinned writer's supported external-jump behavior without
+following those targets.
+The original instruction rewriters and backend allocation policies are retained.
+Offline relocation and explicit non-CHECKED policies keep the upstream API
+behavior.
 
-The graph retains Gum's normal call/return and indirect-tail function-entry ABI
-assumptions. Unknown indirect tails beyond the candidate terminate a path;
-unresolved indirect transfers inside the selected entry bytes remain
-unsupported except for the pinned writer's canonical six-byte x86-64
-`FF 25` RIP-relative entry stub. That exact form retains its mutable pointer
-slot; current targets inside an overwritten interval are rejected, and future
-destinations must remain valid ABI function entries. Returns end a path. On
-Linux x86-64, `SYSCALL` has its normal
-returning edge and `UD2` terminates the path. Unreadable or undecodable code,
-unsupported entry instructions, and scan-budget exhaustion fail closed. The
-original instruction rewriters and other relocation policies are retained.
+This is a local relocation check under Gum's existing function-entry ABI
+contract. Calls, returns, and ABI tail transfers retain their normal meaning.
+Arm64 continuation IP0/IP1 availability follows Gum's ABI and caller contract;
+checking actual prefix register use does not prove suffix register liveness.
+It does not prove that an unscanned suffix has no branch back into the prefix,
+that arbitrary external code never enters a patch interior, or that a function
+never reads its own entry bytes as data. Such targets need a stronger caller
+contract or must remain uninstrumented. There is no suffix control-flow graph,
+whole-function scan budget, function-extent metadata lookup, or all-hook
+original-code snapshot in this path. Attach work is limited to the selected
+prefix rather than growing with function size or the number of installed hooks.
 
-Attach planning uses an optional provided or listener-owned function extent
-from trusted compiler, unwind, or symbol function-boundary ABI metadata. The
-attach call borrows an owned copy for that operation only. When its base matches
-the actual patched entry, a call ending exactly at that extent ends the graph
-path after its direct-target checks: the final call is assumed nonreturning at
-that ABI boundary. This handles compiler-generated failure calls without
-scanning padding or the next function; it does not prove arbitrary hand-written
-code cannot return across symbol boundaries. Missing or mismatched extents
-retain the conservative scan. Extent discovery runs before controller/listener
-locks and stopped-thread windows, and never under the interceptor mutex.
-
-All Linux x86-64/Arm64 providers, including
-supplied and prebuilt devkits, must expose checked entry-range revision 1; an
-older devkit fails configuration with an update instruction. Supplied devkits
-are never silently patched. The generated header advertises
-`PEAK_GUM_ENTRY_RANGE_CHECKS` only after the replacement succeeds;
-configuration independently verifies its runtime revision query and calls the
-scoped instruction-view helpers. Patched PC-classification providers
-additionally verify the architecture fingerprint. Both checks use compile/link
-validation when cross-compiling. Independent range tests skip older devkits
-without this capability.
-
-While preparing a trampoline under Gum's existing interceptor mutex, graph
-instruction reads use an owned snapshot of ordinary checked listener prologues.
-This avoids treating a previously installed hook as the target's original
-control flow. Constant-data reads remain live. Separate occupied-range checks
-prevent a new patch from overlapping active or queued patches, and direct edges
-into an existing patch interior are rejected. Supported x86 conditional labels
-within the same original relocated prefix retain their trampoline mapping.
-Registered opaque replacement or custom-patch entries form normal ABI terminal
-boundaries without exposing their original bytes. Interior targets remain
-invalid. Standalone relocation queries keep their conservative live-memory view.
-This keeps supported targets independent of function attachment order.
+All Linux x86_64 and Arm64 providers, including supplied and prebuilt devkits,
+must expose checked entry-range revision 2 through a linkable revision query
+and native prefix classifier. Older
+devkits, including the previous whole-function analysis revision, fail
+configuration with an update instruction. Supplied devkits are never silently
+patched. Header and archive must be updated together; controlled offline
+packages follow the same requirement. Auto-patching verifies the original
+relocator source's pinned SHA-256 and requires that source in the configured
+cache when downloads are disabled. The separate full PEAK PC/unwind API validation, enabled for auto-patched
+providers or by `PEAK_REQUIRE_GUM_PEAK_API`, also verifies the architecture
+fingerprint; entry-range revision 2 alone does not establish that full API. Cross builds use compile/link validation
+where the configure probes cannot execute target code.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`

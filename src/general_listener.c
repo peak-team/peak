@@ -3273,6 +3273,8 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
                                             const char* provider_name,
                                             uint64_t provider_generation)
 {
+    (void)symbol_size;
+
     if (symbol_name == NULL || symbol_name[0] == '\0' ||
         symbol_address == NULL || peak_hook_address_count == 0) {
         return PEAK_DYNAMIC_ATTACH_NO_MATCH;
@@ -3319,14 +3321,6 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             peak_general_listener_provider_is_perfmap(provider_name) &&
             peak_hook_provider_generation != NULL &&
             peak_hook_provider_generation[i] != provider_generation) {
-            const GumMemoryRange extent = {
-                .base_address = GUM_ADDRESS(symbol_address), .size = symbol_size
-            };
-            if (array_listener[i] != NULL) {
-                peak_general_listener_set_function_extent(
-                    PEAKGENERAL_LISTENER(array_listener[i]), symbol_address,
-                    &extent, provider_generation);
-            }
             peak_hook_provider_generation[i] = provider_generation;
             result = PEAK_DYNAMIC_ATTACH_GENERATION_REFRESHED;
             duplicate_address = TRUE;
@@ -3388,15 +3382,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
         }
 
         PeakGumTargetAttachPlan attach_plan;
-        const GumMemoryRange function_extent = {
-            .base_address = GUM_ADDRESS(symbol_address),
-            .size = symbol_size
-        };
-        peak_gum_target_attach_plan_with_extent(symbol_address, &function_extent,
-                                                &attach_plan);
-        peak_general_listener_set_function_extent(
-            PEAKGENERAL_LISTENER(new_listener), symbol_address,
-            &attach_plan.function_extent, provider_generation);
+        peak_gum_target_attach_plan(symbol_address, &attach_plan);
         PeakDetachRequest mutation_request = {
             .hook_id = i,
             .symbol_name = peak_hook_strings[i],
@@ -3858,12 +3844,7 @@ static gboolean peak_general_controller_reattach_if_requested_unlocked(
     }
 
     PeakGumTargetAttachPlan attach_plan;
-    peak_gum_target_attach_plan_with_extent(hook_address[hook_id],
-        peak_general_listener_function_extent(
-            PEAKGENERAL_LISTENER(array_listener[hook_id]), hook_address[hook_id],
-            peak_hook_provider_generation != NULL
-                ? peak_hook_provider_generation[hook_id] : 0),
-        &attach_plan);
+    peak_gum_target_attach_plan(hook_address[hook_id], &attach_plan);
     {
         PeakDetachStatus prepare_status = PEAK_DETACH_STATUS_ERROR;
         if (!peak_general_controller_prepare_hook_mutation(hook_id,
@@ -4346,13 +4327,8 @@ peak_general_controller_collect_batch_unlocked(
         };
         if (operation == PEAK_DETACH_OPERATION_REATTACH &&
             requests[count].function_address != NULL) {
-            peak_gum_target_attach_plan_with_extent(requests[count].function_address,
-                peak_general_listener_function_extent(
-                    PEAKGENERAL_LISTENER(array_listener[i]),
-                    requests[count].function_address,
-                    peak_hook_provider_generation != NULL
-                        ? peak_hook_provider_generation[i] : 0),
-                &candidates[count].attach_plan);
+            peak_gum_target_attach_plan(requests[count].function_address,
+                                        &candidates[count].attach_plan);
             requests[count].blocked_pc_start =
                 candidates[count].attach_plan.mutation_guard_size > 0
                     ? candidates[count].attach_plan.mutation_address
@@ -7015,18 +6991,6 @@ peak_general_listener_test_gum_attach_target(
     GumInvocationListener* listener,
     const struct _PeakGumTargetAttachPlan* plan)
 {
-    PeakGumTargetAttachPlan cached_plan;
-    if (plan == NULL && PEAKGENERAL_IS_LISTENER(listener)) {
-        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
-        uint64_t generation = peak_hook_provider_generation != NULL &&
-            self->hook_id < peak_hook_address_count
-                ? peak_hook_provider_generation[self->hook_id] : 0;
-        /* Test reconstruction uses the same pure cached path as reattach. */
-        peak_gum_target_attach_plan_with_extent(address,
-            peak_general_listener_function_extent(self, address, generation),
-            &cached_plan);
-        plan = &cached_plan;
-    }
     return peak_general_listener_gum_attach_target(target_interceptor,
                                                    address,
                                                    listener,
@@ -7126,8 +7090,6 @@ peak_general_listener_is_ready(const PeakGeneralListener* self)
 static void
 peak_general_listener_init(PeakGeneralListener* self)
 {
-    self->function_extent = (GumMemoryRange){ 0 };
-    self->function_extent_generation = 0;
     size_t total_count = peak_max_num_threads;
     g_mutex_init(&self->retired_mutex);
     self->retired_mutex_initialized = TRUE;
@@ -7223,36 +7185,8 @@ peak_general_listener_init(PeakGeneralListener* self)
 }
 
 void
-peak_general_listener_set_function_extent(PeakGeneralListener* listener,
-                                          gpointer address,
-                                          const GumMemoryRange* extent,
-                                          uint64_t generation)
-{
-    listener->function_extent = (GumMemoryRange){ 0 };
-    listener->function_extent_generation = generation;
-    if (extent != NULL && address != NULL &&
-        extent->base_address == GUM_ADDRESS(address) && extent->size > 0 &&
-        extent->size <= G_MAXSIZE - extent->base_address) {
-        listener->function_extent = *extent;
-    }
-}
-
-const GumMemoryRange*
-peak_general_listener_function_extent(PeakGeneralListener* listener,
-                                      gpointer address,
-                                      uint64_t generation)
-{
-    return listener != NULL &&
-        listener->function_extent_generation == generation &&
-        listener->function_extent.size > 0 &&
-        listener->function_extent.base_address == GUM_ADDRESS(address)
-        ? &listener->function_extent : NULL;
-}
-
-void
 peak_general_listener_free(PeakGeneralListener* self)
 {
-    peak_general_listener_set_function_extent(self, NULL, NULL, 0);
     if (self->fast_active != NULL && self->fast_stats_mapping_size != 0) {
         (void)munmap(self->fast_active, self->fast_stats_mapping_size);
     }
@@ -7770,9 +7704,6 @@ peak_general_listener_attach()
             }
             PeakGumTargetAttachPlan attach_plan;
             peak_gum_target_attach_plan(resolved_hook_address, &attach_plan);
-            peak_general_listener_set_function_extent(
-                PEAKGENERAL_LISTENER(new_listener), resolved_hook_address,
-                &attach_plan.function_extent, 0);
             PeakDetachRequest mutation_request = {
                 .hook_id = i,
                 .symbol_name = peak_hook_strings[i],

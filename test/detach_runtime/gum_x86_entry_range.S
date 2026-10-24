@@ -7,15 +7,6 @@
 .macro END name
 .size \name,.-\name
 .endm
-START peak_x86_unsafe
- test %edi,%edi
- je 2f
-1: mov $7,%eax
- ret
- .fill 32,1,0x90
-2: mov $1,%edi
- jmp 1b
-END peak_x86_unsafe
 START peak_x86_recoverable
  test %edi,%edi
  je 2f
@@ -29,8 +20,8 @@ END peak_x86_recoverable
 START peak_x86_internal_jcc
  test %edi,%edi
  je 1f
- nop
-1: mov $19,%eax
+1: nop
+ mov $19,%eax
  ret
 END peak_x86_internal_jcc
 START peak_x86_internal_jmp
@@ -41,13 +32,6 @@ START peak_x86_internal_jmp
 1: nop
  jmp 1b
 END peak_x86_internal_jmp
-START peak_x86_mid_instruction
- test %edi,%edi
- je 2f
-1: mov $0x90909090,%eax
- ret
-2: jmp 1b+1
-END peak_x86_mid_instruction
 START peak_x86_indirect
  nop
  nop
@@ -65,9 +49,10 @@ peak_x86_indirect_callee:
  mov $37,%eax
  ret
 START peak_x86_budget
- .rept 4096
+ .rept 4097
  nop
  .endr
+ mov $83,%eax
  ret
 END peak_x86_budget
 START peak_x86_rip_data
@@ -91,29 +76,12 @@ START peak_x86_prefix_data
  lea peak_x86_prefix_data(%rip),%rax
  ret
 END peak_x86_prefix_data
-peak_x86_negative_block:
- test %edi,%edi
- je peak_x86_negative+4
- ret
-START peak_x86_negative
- test %edi,%edi
- je peak_x86_negative_block
-1: mov $41,%eax
- ret
-END peak_x86_negative
 START peak_x86_rounding
  nop
-1: nop
- nop
- nop
- .byte 0x0f,0x85
- .long 1b - . - 4
- .fill 8,1,0x90
- lea peak_x86_rounding+7(%rip),%rax
+ lea peak_x86_rounding+3(%rip),%rax
  ret
 END peak_x86_rounding
 START peak_x86_crossing_data
- .fill 5,1,0x90
  movq peak_x86_crossing_data-4(%rip),%rax
  ret
 END peak_x86_crossing_data
@@ -162,26 +130,32 @@ START peak_x86_prefix_trap
  .fill 16,1,0x90
  ret
 END peak_x86_prefix_trap
-.section .rodata
-.p2align 3
-peak_x86_ro_zero: .quad 0
 .text
-START peak_x86_xsave_extent
- xsave peak_x86_ro_zero(%rip)
+/* This overlap fixture is classifier-only: never store a state image into code. */
+START peak_x86_fxsave_overlap
+ fxsave peak_x86_fxsave_overlap-4(%rip)
  ret
-END peak_x86_xsave_extent
-START peak_x86_fxsave_extent
- fxsave peak_x86_ro_zero(%rip)
+END peak_x86_fxsave_overlap
+START peak_x86_fxsave_buffered
+ fxsave peak_x86_fxsave_buffer(%rip)
+ mov $97,%eax
  ret
-END peak_x86_fxsave_extent
+END peak_x86_fxsave_buffered
+.bss
+.p2align 4
+.globl peak_x86_fxsave_buffer
+.type peak_x86_fxsave_buffer,@object
+peak_x86_fxsave_buffer: .skip 512
+.size peak_x86_fxsave_buffer,512
+.text
 
 /* Independent hook entries, including an internal Jcc in the callee. */
 .text
 START peak_x86_order_b
  test %edi,%edi
  je 1f
- nop
-1: mov $61,%eax
+1: nop
+ mov $61,%eax
  ret
  .fill 32,1,0x90
 END peak_x86_order_b
@@ -197,24 +171,6 @@ START peak_x86_order_tail
  jmp peak_x86_order_b
  .fill 32,1,0x90
 END peak_x86_order_tail
-START peak_x86_order_interior
- .fill 5,1,0x90
- jmp peak_x86_order_b+4
- .fill 32,1,0x90
-END peak_x86_order_interior
-START peak_x86_order_original_entry
- .fill 5,1,0x90
- jmp peak_x86_order_original_b
- .fill 32,1,0x90
-END peak_x86_order_original_entry
-START peak_x86_order_original_b
- test %edi,%edi
- je 1f
- jmp peak_x86_order_original_entry+1
-1: mov $63,%eax
- ret
- .fill 32,1,0x90
-END peak_x86_order_original_b
 
 .text
 START peak_x86_mutable_tail
@@ -238,17 +194,6 @@ END peak_x86_mutable_two
 peak_x86_mutable_slot: .quad peak_x86_mutable_one
 
 .text
-START peak_x86_call_middle
- call 1f+1
-1: mov $0x90909090,%eax
- ret
-END peak_x86_call_middle
-START peak_x86_call_hook_interior
- sub $8,%rsp
- call peak_x86_order_b+4
- add $8,%rsp
- ret
-END peak_x86_call_hook_interior
 
 /* Explicit landing pads make the whole first overwrite ENDBR64 + XOR (6B),
  * leaving the loop entry at +8. Without the pad the same loop enters at +4. */
@@ -272,68 +217,23 @@ END \name
 .endm
 COPY_BACKEDGE peak_x86_endbr_dl,%dl,1
 COPY_BACKEDGE peak_x86_endbr_edx,%edx,1
-COPY_BACKEDGE peak_x86_plain_dl,%dl,0
-COPY_BACKEDGE peak_x86_plain_edx,%edx,0
 
 .text
 START peak_x86_prefix_read
- .fill 5,1,0x90
  movb peak_x86_prefix_read(%rip),%al
  ret
 END peak_x86_prefix_read
 
-/* A real return path and a terminal nonreturning call, followed immediately by
- * deliberately invalid bytes outside the trusted function extent. */
+
+/* Locally visible destinations must be valid instruction starts, and CALL
+ * keeps its original target rather than a relocated internal label. */
 .text
-START peak_x86_extent_exit
- sub $8,%rsp
- test %edi,%edi
- jne 1f
- mov $79,%eax
- add $8,%rsp
- ret
-1: mov $17,%edi
- call _exit
-.globl peak_x86_extent_exit_end
-peak_x86_extent_exit_end:
-END peak_x86_extent_exit
- .byte 0x0f,0x04
+START peak_x86_call_prefix
+ call peak_x86_call_prefix+1
  .fill 32,1,0x90
-START peak_x86_extent_call_before_end
- .fill 5,1,0x90
- call peak_x86_indirect_callee
- jmp peak_x86_extent_call_before_end+1
-.globl peak_x86_extent_call_before_end_end
-peak_x86_extent_call_before_end_end:
-END peak_x86_extent_call_before_end
-START peak_x86_extent_fallthrough
- .fill 5,1,0x90
-.globl peak_x86_extent_fallthrough_end
-peak_x86_extent_fallthrough_end:
-END peak_x86_extent_fallthrough
- jmp peak_x86_extent_fallthrough+1
-START peak_x86_extent_cold
- test %edi,%edi
- je 1f
- nop
+END peak_x86_call_prefix
+START peak_x86_internal_mid_jcc
+ .byte 0x75,0x01
+ mov $0x90909090,%eax
  ret
-.globl peak_x86_extent_cold_end
-peak_x86_extent_cold_end:
-END peak_x86_extent_cold
-1: mov $1,%edi
- jmp peak_x86_extent_cold+4
-START peak_x86_extent_call_prefix
- .fill 5,1,0x90
- call peak_x86_extent_call_prefix+1
-.globl peak_x86_extent_call_prefix_end
-peak_x86_extent_call_prefix_end:
-END peak_x86_extent_call_prefix
- .byte 0x0f,0x04
-START peak_x86_extent_hook_interior
- sub $8,%rsp
- call peak_x86_order_b+4
-.globl peak_x86_extent_hook_interior_end
-peak_x86_extent_hook_interior_end:
-END peak_x86_extent_hook_interior
- .byte 0x0f,0x04
- .fill 32,1,0x90
+END peak_x86_internal_mid_jcc

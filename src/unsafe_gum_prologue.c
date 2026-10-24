@@ -206,27 +206,10 @@ void
 peak_gum_target_attach_plan(gpointer address,
                             PeakGumTargetAttachPlan* plan_out)
 {
-    GumMemoryRange extent = {0};
-#if defined(PEAK_GUM_ENTRY_RANGE_CHECKS) && defined(__linux__) && \
-    (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
-    /* Only this constructor may discover metadata, before a mutation window. */
-    if (address != NULL) gum_process_find_function_range(address, &extent);
-#endif
-    peak_gum_target_attach_plan_with_extent(address, &extent, plan_out);
-}
-
-void
-peak_gum_target_attach_plan_with_extent(gpointer address,
-                                       const GumMemoryRange* extent,
-                                       PeakGumTargetAttachPlan* plan_out)
-{
     g_return_if_fail(plan_out != NULL);
+
     memset(plan_out, 0, sizeof(*plan_out));
     plan_out->mutation_address = address;
-    if (extent != NULL && address != NULL &&
-        extent->base_address == GUM_ADDRESS(address) && extent->size != 0 &&
-        extent->base_address <= G_MAXSIZE - extent->size)
-        plan_out->function_extent = *extent;
 #if defined(__linux__) && \
     (defined(__x86_64__) || defined(__amd64__)) && \
     defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
@@ -276,13 +259,7 @@ peak_gum_interceptor_attach_target(GumInterceptor* interceptor,
                                    GumInvocationListener* listener,
                                    const PeakGumTargetAttachPlan* plan)
 {
-#if defined(PEAK_GUM_ENTRY_RANGE_CHECKS) && defined(__linux__) && \
-    (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
-    return gum_interceptor_peak_attach_with_extent(interceptor, address, listener,
-        plan != NULL ? &plan->options : NULL,
-        plan != NULL ? &plan->function_extent : NULL,
-        plan != NULL && plan->attach_exact_entry);
-#elif defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
+#if defined(GUM_PEAK_EXACT_ATTACH_API_VERSION)
     if (plan != NULL && plan->attach_exact_entry) {
         return gum_interceptor_peak_attach_exact(interceptor,
                                                  address,

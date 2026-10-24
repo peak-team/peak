@@ -208,7 +208,7 @@ function(_peak_compile_peak_gum_overlay _source_dir _input_dir _output_dir)
     _peak_replace_gum_relocator("${_source_dir}" "${_output_dir}")
     if(PEAK_GUM_ENTRY_RANGE_REPLACED)
         file(APPEND "${_output_dir}/frida-gum.h"
-            "\n/* Capability of this generated archive/header pair. */\n#define PEAK_GUM_ENTRY_RANGE_CHECKS 1\n")
+            "\n/* Capability of this generated archive/header pair. */\n#define PEAK_GUM_ENTRY_RANGE_CHECKS 2\n")
     endif()
     _peak_patch_frida_gum_elf_module("${_source_dir}" "${_output_dir}")
 
@@ -396,44 +396,49 @@ function(_peak_validate_gum_entry_range)
     set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)
     set(_probe "
 #include <frida-gum.h>
-#if !defined(PEAK_GUM_ENTRY_RANGE_CHECKS) || PEAK_GUM_ENTRY_RANGE_CHECKS != 1
-#error Missing PEAK Gum checked entry-range revision 1
+#if !defined(PEAK_GUM_ENTRY_RANGE_CHECKS) || PEAK_GUM_ENTRY_RANGE_CHECKS != 2
+#error Missing PEAK Gum checked entry-range revision 2
+#endif
+#if defined(__aarch64__)
+extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
+    GumRelocationScenario, GumRelocationPolicy, guint *, arm64_reg *);
+#elif defined(__x86_64__) || defined(__amd64__)
+extern gboolean gum_x86_relocator_can_relocate(gpointer, guint,
+    GumRelocationScenario, guint *);
 #endif
 int main(void)
 {
-    static const guint8 original[] = { 0x5a };
-    guint8 * (*read_code)(gconstpointer, gsize, gsize *) =
-        gum_interceptor_peak_read_relocation_code;
-    gboolean (*range_available)(gconstpointer, gsize) =
-        gum_interceptor_peak_relocation_range_available;
-    gboolean (*target_available)(gconstpointer) =
-        gum_interceptor_peak_relocation_target_available;
-    gboolean (*is_opaque_entry)(gconstpointer) =
-        gum_interceptor_peak_relocation_is_opaque_entry;
-    gboolean (*call_ends_function)(gconstpointer, gsize) =
-        gum_interceptor_peak_relocation_call_ends_function;
-    GumAttachReturn (*attach_with_extent)(GumInterceptor *, gpointer,
-        GumInvocationListener *, const GumAttachOptions *,
-        const GumMemoryRange *, gboolean) =
-        gum_interceptor_peak_attach_with_extent;
-    gboolean (*branch_available)(gconstpointer, gsize, gconstpointer, gboolean) =
-        gum_interceptor_peak_relocation_branch_available;
-    gsize size = 0;
-    guint8 * copy;
-    int result;
-    if (gum_interceptor_peak_entry_range_revision() != 1) return 1;
+    guint (*revision)(void) = gum_interceptor_peak_entry_range_revision;
+    guint maximum = 0;
+    gboolean result;
+#if defined(__aarch64__)
+    static const guint32 code[] = {
+        0xd503201f, 0xd503201f, 0xd503201f, 0xd503201f
+    };
+    arm64_reg scratch = ARM64_REG_INVALID;
+    gboolean (*can_relocate)(gpointer, guint, GumRelocationScenario,
+        GumRelocationPolicy, guint *, arm64_reg *) =
+        gum_arm64_relocator_can_relocate;
+#elif defined(__x86_64__) || defined(__amd64__)
+    static const guint8 code[] = {
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+    gboolean (*can_relocate)(gpointer, guint, GumRelocationScenario, guint *) =
+        gum_x86_relocator_can_relocate;
+#else
+#error Unsupported checked entry-range architecture
+#endif
+    if (revision() != 2) return 1;
     gum_init_embedded();
-    copy = read_code(original, sizeof(original), &size);
-    result = copy == NULL || size != sizeof(original) || copy[0] != original[0] ||
-        !range_available(original, sizeof(original)) ||
-        !target_available(original) || is_opaque_entry(original) ||
-        call_ends_function(original, sizeof(original)) ||
-        attach_with_extent(NULL, NULL, NULL, NULL, NULL, FALSE) !=
-            GUM_ATTACH_WRONG_SIGNATURE ||
-        !branch_available(original, sizeof(original), original, FALSE);
-    g_free(copy);
+#if defined(__aarch64__)
+    result = can_relocate((gpointer) code, 4, GUM_SCENARIO_ONLINE,
+        GUM_RELOCATION_CHECKED, &maximum, &scratch);
+#else
+    result = can_relocate((gpointer) code, 5, GUM_SCENARIO_ONLINE, &maximum);
+#endif
     gum_deinit_embedded();
-    return result;
+    return !result;
 }
 ")
     unset(PEAK_GUM_HAS_ENTRY_RANGE_CHECKS CACHE)
@@ -444,7 +449,7 @@ int main(void)
     endif()
     if(NOT PEAK_GUM_HAS_ENTRY_RANGE_CHECKS)
         message(FATAL_ERROR
-            "Linux x86-64/Arm64 instrumentation requires Frida Gum checked entry-range revision 1 and its scoped instruction-view and attach-extent helper APIs. "
+            "Linux x86-64/Arm64 instrumentation requires Frida Gum checked entry-range revision 2 with bounded entry-prefix checks. "
             "Update the supplied devkit and select patched-devkit, or use PEAK_FRIDA_GUM_PROVIDER=auto "
             "with FRIDA_GUM_* unset. Unpatched prebuilt devkits cannot safely instrument these targets.")
     endif()
@@ -612,7 +617,7 @@ int main(void)
     if(NOT PEAK_GUM_HAS_PEAK_PC_API)
         message(FATAL_ERROR
             "The selected Frida Gum devkit does not expose a linkable PEAK PC classification API. "
-            "Update the caller-provided patched devkit (including checked entry-range revision 1), or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset.")
+            "Update the caller-provided patched devkit (including checked entry-range revision 2), or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset.")
     endif()
 
     set(_peak_gum_exact_attach_probe_source "

@@ -13,25 +13,8 @@ extern "C" {
 typedef struct _GumPeakFunctionContext GumPeakFunctionContext;
 
 GUM_API guint gum_interceptor_peak_abi_fingerprint(void);
-/* Returns the native checked entry-range implementation revision, or zero. */
+/* Revision 2 checks only the actual entry patch prefix. */
 GUM_API guint gum_interceptor_peak_entry_range_revision(void);
-/* Instruction-only original-byte view during locked trampoline preparation.
- * The returned allocation belongs to the caller (g_free). Outside preparation
- * this reads live memory; it never overlays constant-data reads. */
-GUM_API guint8 * gum_interceptor_peak_read_relocation_code(gconstpointer address,
-                                                          gsize length,
-                                                          gsize * bytes_read);
-GUM_API gboolean gum_interceptor_peak_relocation_range_available(gconstpointer address,
-                                                                 gsize length);
-GUM_API gboolean gum_interceptor_peak_relocation_target_available(gconstpointer address);
-GUM_API gboolean gum_interceptor_peak_relocation_is_opaque_entry(gconstpointer address);
-GUM_API gboolean gum_interceptor_peak_relocation_call_ends_function(
-    gconstpointer pc, gsize insn_size);
-GUM_API gboolean gum_interceptor_peak_relocation_branch_available(
-    gconstpointer source, gsize source_size, gconstpointer target,
-    gboolean internal_label_supported);
-
-
 #define GUM_PEAK_UNWIND_FRAME_API_VERSION 4
 GUM_API gboolean gum_interceptor_peak_unwind_lifecycle_init(void);
 GUM_API gboolean gum_interceptor_peak_unwind_frame_is_live(gpointer context,
@@ -213,12 +196,6 @@ GUM_API gboolean gum_interceptor_peak_get_function_patch(
 GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
     GumInterceptor *interceptor, gpointer function_address,
     GumInvocationListener *listener, const GumAttachOptions *options);
-
-/* Extent discovery belongs to the caller, before its mutation stop window. */
-GUM_API GumAttachReturn gum_interceptor_peak_attach_with_extent(
-    GumInterceptor *interceptor, gpointer function_address,
-    GumInvocationListener *listener, const GumAttachOptions *options,
-    const GumMemoryRange *extent, gboolean exact_entry);
 
 /* Resolves the same redirect chain followed by Gum replacement APIs. */
 GUM_API gboolean gum_interceptor_peak_resolve_redirect_chain(
