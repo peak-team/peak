@@ -8,11 +8,6 @@
 
 #include "frida-gum.h"
 
-/* A volatile, normally returning call type keeps a visible terminal after the
- * real nonlocal transfer. This fixture supplies a closed instruction stream
- * without requiring the relocator to recognize longjmp by symbol name. */
-static void (*volatile fixture_longjmp)(jmp_buf, int) = longjmp;
-
 static _Thread_local jmp_buf unwind_target;
 static _Thread_local jmp_buf recursive_unwind_target;
 static _Thread_local jmp_buf escape_target;
@@ -30,12 +25,10 @@ peak_fastpath_unwind_inner(uintptr_t unwind)
 {
     atomic_fetch_add_explicit(&target_sink, 1, memory_order_relaxed);
     if (unwind == 1) {
-        fixture_longjmp(unwind_target, 1);
-        __builtin_trap();
+        longjmp(unwind_target, 1);
     }
     if (unwind == 2) {
-        fixture_longjmp(escape_target, 1);
-        __builtin_trap();
+        longjmp(escape_target, 1);
     }
     return unwind + 1;
 }
@@ -71,8 +64,7 @@ peak_fastpath_unwind_generic_escape(uintptr_t unwind)
 {
     atomic_fetch_add_explicit(&target_sink, 1, memory_order_relaxed);
     if (unwind != 0) {
-        fixture_longjmp(generic_escape_target, 1);
-        __builtin_trap();
+        longjmp(generic_escape_target, 1);
     }
     return 3;
 }
@@ -114,8 +106,7 @@ peak_fastpath_unwind_recursive(uintptr_t depth, uintptr_t unwind)
     }
     if (depth == 0) {
         if (unwind != 0) {
-            fixture_longjmp(recursive_unwind_target, 1);
-            __builtin_trap();
+            longjmp(recursive_unwind_target, 1);
         }
         return 1;
     }

@@ -25,6 +25,8 @@ GUM_API gboolean gum_interceptor_peak_relocation_range_available(gconstpointer a
                                                                  gsize length);
 GUM_API gboolean gum_interceptor_peak_relocation_target_available(gconstpointer address);
 GUM_API gboolean gum_interceptor_peak_relocation_is_opaque_entry(gconstpointer address);
+GUM_API gboolean gum_interceptor_peak_relocation_call_ends_function(
+    gconstpointer pc, gsize insn_size);
 GUM_API gboolean gum_interceptor_peak_relocation_branch_available(
     gconstpointer source, gsize source_size, gconstpointer target,
     gboolean internal_label_supported);
@@ -211,6 +213,12 @@ GUM_API gboolean gum_interceptor_peak_get_function_patch(
 GUM_API GumAttachReturn gum_interceptor_peak_attach_exact(
     GumInterceptor *interceptor, gpointer function_address,
     GumInvocationListener *listener, const GumAttachOptions *options);
+
+/* Extent discovery belongs to the caller, before its mutation stop window. */
+GUM_API GumAttachReturn gum_interceptor_peak_attach_with_extent(
+    GumInterceptor *interceptor, gpointer function_address,
+    GumInvocationListener *listener, const GumAttachOptions *options,
+    const GumMemoryRange *extent, gboolean exact_entry);
 
 /* Resolves the same redirect chain followed by Gum replacement APIs. */
 GUM_API gboolean gum_interceptor_peak_resolve_redirect_chain(

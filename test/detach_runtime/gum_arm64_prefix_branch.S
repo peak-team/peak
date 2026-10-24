@@ -386,4 +386,62 @@ peak_suffix_dispatch:
 peak_prefix_indirect_entry:
  br x0
 .size peak_prefix_indirect_entry,.-peak_prefix_indirect_entry
+/* A normal returning function demonstrates the scoped extent API without
+ * changing a call which ends before the root function boundary. */
+.p2align 4
+.global peak_extent_returning
+.type peak_extent_returning,%function
+peak_extent_returning:
+ stp x29,x30,[sp,#-16]!
+ mov x29,sp
+ bl 1f
+ ldp x29,x30,[sp],#16
+ ret
+.global peak_extent_returning_end
+peak_extent_returning_end:
+.size peak_extent_returning,.-peak_extent_returning
+1:
+ mov w0,#7
+ ret
+/* Never executed by the fixture: the final BL is a genuine noreturn exit.
+ * Without a trusted ending-call hint, fallthrough reaches unknown padding. */
+.p2align 4
+.global peak_extent_noreturn
+.type peak_extent_noreturn,%function
+peak_extent_noreturn:
+ nop
+ nop
+ nop
+ nop
+ bl 1f
+.global peak_extent_noreturn_end
+peak_extent_noreturn_end:
+.size peak_extent_noreturn,.-peak_extent_noreturn
+ .inst 0xffffffff
+1:
+ mov w0,#7
+ mov w8,#93 /* Linux AArch64 exit */
+ svc #0
+ brk #0
+/* A direct branch outside the hinted root still has its cold backedge
+ * analyzed. The hint must not hide its jump into entry+12. */
+.p2align 4
+.global peak_extent_cold
+.type peak_extent_cold,%function
+peak_extent_cold:
+ mov w8,w0
+ nop
+ nop
+0:
+ cbz w8,2f
+ b 1f
+.global peak_extent_cold_end
+peak_extent_cold_end:
+.size peak_extent_cold,.-peak_extent_cold
+1:
+ mov w8,#0
+ b 0b
+2:
+ mov w0,#7
+ ret
 .section .note.GNU-stack,"",%progbits

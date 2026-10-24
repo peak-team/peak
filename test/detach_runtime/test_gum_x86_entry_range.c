@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 extern gboolean gum_x86_relocator_can_relocate(gpointer,guint,GumRelocationScenario,guint*);
 extern int peak_x86_unsafe(int), peak_x86_recoverable(int);
 extern int peak_x86_internal_jcc(int), peak_x86_internal_jmp(int);
@@ -325,6 +326,58 @@ static int self_entry_pointer(GumInterceptor *i,GumInvocationListener *l)
   * execute the original LEA and miss the distant writer's address rewrite. */
  CHECK(far_rewrite(entry,0,0,TRUE)==0);return 0;
 }
+extern int peak_x86_extent_exit(int),peak_x86_extent_call_before_end(int);
+extern int peak_x86_extent_fallthrough(int),peak_x86_extent_cold(int);
+extern int peak_x86_extent_call_prefix(int),peak_x86_extent_hook_interior(int);
+extern guint8 peak_x86_extent_exit_end[],peak_x86_extent_call_before_end_end[];
+extern guint8 peak_x86_extent_fallthrough_end[],peak_x86_extent_cold_end[];
+extern guint8 peak_x86_extent_call_prefix_end[],peak_x86_extent_hook_interior_end[];
+static int extent_refuse(GumInterceptor *i,GumInvocationListener *l,
+                         gpointer entry,gpointer end)
+{
+ GumMemoryRange extent={(GumAddress)entry,(guintptr)end-(guintptr)entry};
+ guint8 before[32];memcpy(before,entry,32);
+ CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&extent,TRUE)!=GUM_ATTACH_OK);
+ CHECK(memcmp(before,entry,32)==0);return 0;
+}
+static int trusted_extent(GumInterceptor *i,GumInvocationListener *l)
+{
+ gpointer entry=peak_x86_extent_exit;guint generation,bad;
+ GumMemoryRange extent={(GumAddress)entry,
+     (guintptr)peak_x86_extent_exit_end-(guintptr)entry};
+ GumMemoryRange invalid[3]={{(GumAddress)entry,0},{(GumAddress)entry,G_MAXSIZE},
+     {(GumAddress)entry+1,extent.size}};
+ guint8 before[32];memcpy(before,entry,32);
+ CHECK(peak_x86_extent_exit(0)==79);CHECK(range(entry,5,FALSE,0)==0);
+ CHECK(gum_interceptor_peak_attach_exact(i,entry,l,NULL)!=GUM_ATTACH_OK);
+ for(bad=0;bad!=G_N_ELEMENTS(invalid);bad++) {
+  CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&invalid[bad],TRUE)!=GUM_ATTACH_OK);
+  CHECK(memcmp(before,entry,32)==0);
+ }
+ for(generation=0;generation!=2;generation++) {
+  pid_t child;int status;guint old=calls;
+  CHECK(gum_interceptor_peak_attach_with_extent(i,entry,l,NULL,&extent,TRUE)==GUM_ATTACH_OK);
+  CHECK(peak_x86_extent_exit(0)==79);CHECK(calls==old+1);
+  child=fork();CHECK(child>=0);
+  if(child==0) { alarm(3);peak_x86_extent_exit(1);_exit(99); }
+  CHECK(waitpid(child,&status,0)==child);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status)==17);
+  gum_interceptor_detach(i,l);CHECK(memcmp(before,entry,32)==0);
+  CHECK(peak_x86_extent_exit(0)==79);CHECK(calls==old+1);
+  CHECK(range(entry,5,FALSE,0)==0);
+ }
+ CHECK(extent_refuse(i,l,peak_x86_extent_call_before_end,peak_x86_extent_call_before_end_end)==0);
+ CHECK(extent_refuse(i,l,peak_x86_extent_fallthrough,peak_x86_extent_fallthrough_end)==0);
+ CHECK(extent_refuse(i,l,peak_x86_extent_cold,peak_x86_extent_cold_end)==0);
+ CHECK(extent_refuse(i,l,peak_x86_extent_call_prefix,peak_x86_extent_call_prefix_end)==0);
+ {
+  GumInvocationListener *lb=gum_make_call_listener(enter,NULL,NULL,NULL);
+  CHECK(gum_interceptor_peak_attach_exact(i,peak_x86_order_b,lb,NULL)==GUM_ATTACH_OK);
+  CHECK(extent_refuse(i,l,peak_x86_extent_hook_interior,peak_x86_extent_hook_interior_end)==0);
+  gum_interceptor_detach(i,lb);g_object_unref(lb);
+ }
+ return 0;
+}
 int main(void)
 {
 #ifndef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -378,6 +431,7 @@ int main(void)
  CHECK(entry_thunk(i,l)==0);
  CHECK(endbr_backedge(i,l)==0);
  CHECK(self_entry_pointer(i,l)==0);
+ CHECK(trusted_extent(i,l)==0);
  CHECK(full_span(i)==0);
  CHECK(far_rewrite(peak_x86_full_span,50,50,FALSE)==0);
  CHECK(far_rewrite(peak_x86_far_branch,17,13,FALSE)==0);

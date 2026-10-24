@@ -410,6 +410,12 @@ int main(void)
         gum_interceptor_peak_relocation_target_available;
     gboolean (*is_opaque_entry)(gconstpointer) =
         gum_interceptor_peak_relocation_is_opaque_entry;
+    gboolean (*call_ends_function)(gconstpointer, gsize) =
+        gum_interceptor_peak_relocation_call_ends_function;
+    GumAttachReturn (*attach_with_extent)(GumInterceptor *, gpointer,
+        GumInvocationListener *, const GumAttachOptions *,
+        const GumMemoryRange *, gboolean) =
+        gum_interceptor_peak_attach_with_extent;
     gboolean (*branch_available)(gconstpointer, gsize, gconstpointer, gboolean) =
         gum_interceptor_peak_relocation_branch_available;
     gsize size = 0;
@@ -421,6 +427,9 @@ int main(void)
     result = copy == NULL || size != sizeof(original) || copy[0] != original[0] ||
         !range_available(original, sizeof(original)) ||
         !target_available(original) || is_opaque_entry(original) ||
+        call_ends_function(original, sizeof(original)) ||
+        attach_with_extent(NULL, NULL, NULL, NULL, NULL, FALSE) !=
+            GUM_ATTACH_WRONG_SIGNATURE ||
         !branch_available(original, sizeof(original), original, FALSE);
     g_free(copy);
     gum_deinit_embedded();
@@ -435,7 +444,7 @@ int main(void)
     endif()
     if(NOT PEAK_GUM_HAS_ENTRY_RANGE_CHECKS)
         message(FATAL_ERROR
-            "Linux x86-64/Arm64 instrumentation requires Frida Gum checked entry-range revision 1 and its scoped instruction-view helper API. "
+            "Linux x86-64/Arm64 instrumentation requires Frida Gum checked entry-range revision 1 and its scoped instruction-view and attach-extent helper APIs. "
             "Update the supplied devkit and select patched-devkit, or use PEAK_FRIDA_GUM_PROVIDER=auto "
             "with FRIDA_GUM_* unset. Unpatched prebuilt devkits cannot safely instrument these targets.")
     endif()

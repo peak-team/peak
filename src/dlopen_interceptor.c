@@ -5,6 +5,7 @@
 #endif
 
 #include "general_listener.h"
+#include "internal/general_listener_internal.h"
 #include "dlopen_interceptor.h"
 #include "detach_controller.h"
 #include "pthread_listener.h"
@@ -102,6 +103,7 @@ typedef struct {
 typedef struct {
     const char* name;
     gpointer address;
+    GumMemoryRange function_extent;
     char* demangled;
     gboolean selector_applicable;
     gboolean ordinary_symbol_fallback;
@@ -2368,6 +2370,7 @@ static gboolean
 dlopen_interceptor_initialize_attach_candidate(
     size_t hook_id,
     gpointer dynamic_hook_address,
+    const GumMemoryRange* function_extent,
     const char* demangled_name,
     GumInterceptor* target_interceptor,
     PeakDlopenAttachCandidate* candidate,
@@ -2408,8 +2411,12 @@ dlopen_interceptor_initialize_attach_candidate(
         candidate->demangled_name = NULL;
         return FALSE;
     }
-    peak_gum_target_attach_plan(dynamic_hook_address,
-                                &candidate->attach_plan);
+    peak_gum_target_attach_plan_with_extent(dynamic_hook_address,
+                                             function_extent,
+                                             &candidate->attach_plan);
+    peak_general_listener_set_function_extent(
+        PEAKGENERAL_LISTENER(candidate->listener), dynamic_hook_address,
+        &candidate->attach_plan.function_extent, 0);
 
     *mutation_request = (PeakDetachRequest){
         .hook_id = hook_id,
@@ -2747,6 +2754,21 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
             if (!explicit_selector) {
                 resolved_targets[i].address = dlsym(request->handle,
                                                     resolved_targets[i].name);
+#if defined(PEAK_GUM_ENTRY_RANGE_CHECKS) && defined(__linux__) && \
+    (defined(__x86_64__) || defined(__amd64__) || defined(__aarch64__))
+                /* The retained module owns this address; discover before locks. */
+                if (resolved_targets[i].address != NULL) {
+                    GumMemoryRange extent = { 0 };
+                    gum_process_find_function_range(resolved_targets[i].address,
+                                                     &extent);
+                    if (extent.base_address ==
+                            GUM_ADDRESS(resolved_targets[i].address) &&
+                        extent.size > 0 &&
+                        extent.size <= G_MAXSIZE - extent.base_address) {
+                        resolved_targets[i].function_extent = extent;
+                    }
+                }
+#endif
                 if (resolved_targets[i].address == NULL) {
 #if defined(__linux__)
                     Lmid_t namespace_id;
@@ -2869,6 +2891,10 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
                     if (dlopen_interceptor_symbol_matches_candidate_module(
                             candidate->symbol_address, candidate, request)) {
                         resolved_targets[i].address = candidate->address;
+                        resolved_targets[i].function_extent = (GumMemoryRange){
+                            .base_address = GUM_ADDRESS(candidate->symbol_address),
+                            .size = candidate->size
+                        };
                         if (!resolved_targets[i].ordinary_symbol_fallback)
                             resolved_targets[i].demangled =
                                 peak_target_resolver_format_display_name(
@@ -3030,6 +3056,7 @@ publish_resolved_targets:
         if (!dlopen_interceptor_initialize_attach_candidate(
                 i,
                 dynamic_hook_address,
+                &resolved_targets[i].function_extent,
                 resolved_targets[i].demangled,
                 target_interceptor,
                 &attach_candidates[candidate_count],

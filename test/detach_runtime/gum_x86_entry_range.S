@@ -281,3 +281,59 @@ START peak_x86_prefix_read
  movb peak_x86_prefix_read(%rip),%al
  ret
 END peak_x86_prefix_read
+
+/* A real return path and a terminal nonreturning call, followed immediately by
+ * deliberately invalid bytes outside the trusted function extent. */
+.text
+START peak_x86_extent_exit
+ sub $8,%rsp
+ test %edi,%edi
+ jne 1f
+ mov $79,%eax
+ add $8,%rsp
+ ret
+1: mov $17,%edi
+ call _exit
+.globl peak_x86_extent_exit_end
+peak_x86_extent_exit_end:
+END peak_x86_extent_exit
+ .byte 0x0f,0x04
+ .fill 32,1,0x90
+START peak_x86_extent_call_before_end
+ .fill 5,1,0x90
+ call peak_x86_indirect_callee
+ jmp peak_x86_extent_call_before_end+1
+.globl peak_x86_extent_call_before_end_end
+peak_x86_extent_call_before_end_end:
+END peak_x86_extent_call_before_end
+START peak_x86_extent_fallthrough
+ .fill 5,1,0x90
+.globl peak_x86_extent_fallthrough_end
+peak_x86_extent_fallthrough_end:
+END peak_x86_extent_fallthrough
+ jmp peak_x86_extent_fallthrough+1
+START peak_x86_extent_cold
+ test %edi,%edi
+ je 1f
+ nop
+ ret
+.globl peak_x86_extent_cold_end
+peak_x86_extent_cold_end:
+END peak_x86_extent_cold
+1: mov $1,%edi
+ jmp peak_x86_extent_cold+4
+START peak_x86_extent_call_prefix
+ .fill 5,1,0x90
+ call peak_x86_extent_call_prefix+1
+.globl peak_x86_extent_call_prefix_end
+peak_x86_extent_call_prefix_end:
+END peak_x86_extent_call_prefix
+ .byte 0x0f,0x04
+START peak_x86_extent_hook_interior
+ sub $8,%rsp
+ call peak_x86_order_b+4
+.globl peak_x86_extent_hook_interior_end
+peak_x86_extent_hook_interior_end:
+END peak_x86_extent_hook_interior
+ .byte 0x0f,0x04
+ .fill 32,1,0x90

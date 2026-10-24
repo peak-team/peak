@@ -1041,6 +1041,17 @@ returning edge and `UD2` terminates the path. Unreadable or undecodable code,
 unsupported entry instructions, and scan-budget exhaustion fail closed. The
 original instruction rewriters and other relocation policies are retained.
 
+Attach planning uses an optional provided or listener-owned function extent
+from trusted compiler, unwind, or symbol function-boundary ABI metadata. The
+attach call borrows an owned copy for that operation only. When its base matches
+the actual patched entry, a call ending exactly at that extent ends the graph
+path after its direct-target checks: the final call is assumed nonreturning at
+that ABI boundary. This handles compiler-generated failure calls without
+scanning padding or the next function; it does not prove arbitrary hand-written
+code cannot return across symbol boundaries. Missing or mismatched extents
+retain the conservative scan. Extent discovery runs before controller/listener
+locks and stopped-thread windows, and never under the interceptor mutex.
+
 All Linux x86-64/Arm64 providers, including
 supplied and prebuilt devkits, must expose checked entry-range revision 1; an
 older devkit fails configuration with an update instruction. Supplied devkits

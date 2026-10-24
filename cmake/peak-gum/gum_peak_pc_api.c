@@ -782,6 +782,18 @@ _gum_interceptor_backend_resolve_redirect(
     GumInterceptorBackend * backend,
     gpointer address);
 
+/* Borrowed only for one balanced attach call; no loader lookup under Gum's
+ * interceptor mutex and no lifetime beyond this caller-owned stack frame. */
+static GPrivate peak_gum_attach_extent = G_PRIVATE_INIT(NULL);
+
+static gboolean
+peak_gum_extent_valid(const GumMemoryRange * extent, gconstpointer entry)
+{
+    return extent != NULL && entry != NULL &&
+        extent->base_address == GUM_ADDRESS(entry) && extent->size != 0 &&
+        extent->base_address <= G_MAXSIZE - extent->size;
+}
+
 static _Thread_local gpointer peak_gum_exact_attach_target;
 
 /*
@@ -817,6 +829,29 @@ gum_interceptor_peak_attach_exact(GumInterceptor * interceptor,
                                                     listener,
                                                     options);
     peak_gum_exact_attach_target = previous_target;
+    return result;
+}
+GumAttachReturn
+gum_interceptor_peak_attach_with_extent(GumInterceptor * interceptor,
+                                        gpointer function_address,
+                                        GumInvocationListener * listener,
+                                        const GumAttachOptions * options,
+                                        const GumMemoryRange * extent,
+                                        gboolean exact_entry)
+{
+    GumMemoryRange owned_extent = {0};
+    gpointer previous = g_private_get(&peak_gum_attach_extent);
+    GumAttachReturn result;
+
+    if (interceptor == NULL || function_address == NULL || listener == NULL)
+        return GUM_ATTACH_WRONG_SIGNATURE;
+    if (peak_gum_extent_valid(extent, function_address)) owned_extent = *extent;
+    g_private_set(&peak_gum_attach_extent, &owned_extent);
+    result = exact_entry
+        ? gum_interceptor_peak_attach_exact(interceptor, function_address,
+                                            listener, options)
+        : gum_interceptor_attach(interceptor, function_address, listener, options);
+    g_private_set(&peak_gum_attach_extent, previous);
     return result;
 }
 #endif
@@ -1007,6 +1042,7 @@ typedef struct {
 typedef struct {
     GArray * intervals;
     gboolean valid;
+    GumMemoryRange function_extent;
 } PeakGumRelocationScope;
 
 typedef struct {
@@ -1259,6 +1295,20 @@ gum_interceptor_peak_relocation_target_available(gconstpointer address)
     return gum_interceptor_peak_relocation_branch_available(NULL, 0, address, FALSE);
 }
 
+gboolean
+gum_interceptor_peak_relocation_call_ends_function(gconstpointer pc,
+                                                    gsize insn_size)
+{
+    PeakGumRelocationScope * scope = g_private_get(&peak_gum_relocation_scope);
+    guintptr address = GPOINTER_TO_SIZE(pc);
+    if (scope == NULL || !scope->valid || insn_size == 0 ||
+        scope->function_extent.size == 0 ||
+        address < scope->function_extent.base_address ||
+        address > G_MAXSIZE - insn_size) return FALSE;
+    return address + insn_size == scope->function_extent.base_address +
+        scope->function_extent.size;
+}
+
 G_GNUC_INTERNAL gboolean
 _gum_interceptor_backend_create_trampoline(GumInterceptorBackend * backend,
                                             PeakGumFunctionContext17 * ctx,
@@ -1269,7 +1319,8 @@ _gum_interceptor_backend_create_trampoline_peak_dispatch(
     GumInterceptorBackend * backend, PeakGumFunctionContext17 * ctx,
     gboolean force)
 {
-    PeakGumRelocationScope scope;
+    PeakGumRelocationScope scope = {0};
+    const GumMemoryRange * extent = g_private_get(&peak_gum_attach_extent);
     PeakGumRelocationScope * previous =
         g_private_get(&peak_gum_relocation_scope);
     PeakGumInterceptor17 * owner;
@@ -1280,6 +1331,8 @@ _gum_interceptor_backend_create_trampoline_peak_dispatch(
     if (owner->backend != (PeakGumInterceptorBackend17 *)backend) return FALSE;
     scope.intervals = g_array_new(FALSE, FALSE, sizeof(PeakGumRelocationInterval));
     scope.valid = peak_gum_relocation_snapshot(&scope, owner, ctx);
+    if (peak_gum_extent_valid(extent, ctx->function_address))
+        scope.function_extent = *extent;
     g_private_set(&peak_gum_relocation_scope, &scope);
     result = scope.valid &&
         _gum_interceptor_backend_create_trampoline(backend, ctx, force);

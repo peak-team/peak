@@ -233,8 +233,11 @@ gum_x86_relocator_can_relocate (gpointer address, guint min_bytes,
           terminal = !node->conditional;
         }
       }
-      /* Calls are opaque conventional returning edges, not tail branches.
-       * Their fallthrough remains reachable, including call-next idioms. */
+      /* Calls conventionally return, including call-next idioms. Only a
+       * trusted exact function extent may certify that a final call has no
+       * in-function fallthrough; its known target obligations still apply. */
+      if (node->call && gum_interceptor_peak_relocation_call_ends_function (
+          GSIZE_TO_POINTER (node->pc), node->size)) terminal = TRUE;
     }
     else if (insn->id == X86_INS_RET || insn->id == X86_INS_RETF ||
              insn->id == X86_INS_RETFQ || insn->id == X86_INS_UD2)

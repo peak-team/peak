@@ -207,6 +207,10 @@ peak_arm64_range_decode (PeakArm64RangeScan * scan, guint index)
       node->next_count++;
     }
   }
+  /* A trusted root extent only identifies an ending call, never a generic
+   * CFG boundary. Known direct destinations were already checked above. */
+  if (node->call && gum_interceptor_peak_relocation_call_ends_function (
+      (gpointer) node->pc, 4)) node->fall_through = FALSE;
   if (node->fall_through) {
     if (node->pc > UINTPTR_MAX - 4 || !peak_arm64_range_add (scan,
         node->pc + 4, &node->next[node->next_count])) return FALSE;

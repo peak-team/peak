@@ -92,6 +92,9 @@ struct _PeakGeneralListener {
     GObject parent;
 
     size_t hook_id;
+    /* Owned metadata; accessed under the controller lock after publication. */
+    GumMemoryRange function_extent;
+    uint64_t function_extent_generation;
     /*
      * Callback-visible state, detach-count request/initial-crossing bits, and
      * lifecycle generation share one atomic word.  Keeping them in one CAS

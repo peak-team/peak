@@ -41,6 +41,12 @@ extern int peak_order_overlap_b(int);
 extern int peak_order_interior_b(int);
 extern int peak_suffix_dispatch(int (*callee)(int), int);
 extern int peak_prefix_indirect_entry(int);
+extern int peak_extent_returning(int);
+extern const guint8 peak_extent_returning_end[];
+extern int peak_extent_noreturn(int);
+extern const guint8 peak_extent_noreturn_end[];
+extern int peak_extent_cold(int);
+extern const guint8 peak_extent_cold_end[];
 /* The public devkit amalgamation omits this exported relocator API. */
 extern gboolean gum_arm64_relocator_can_relocate(gpointer, guint,
     GumRelocationScenario, GumRelocationPolicy, guint*, arm64_reg*);
@@ -108,8 +114,9 @@ static int check_refused(GumInterceptor* interceptor,
     }
     return 0;
 }
-static int check_profile(GumInterceptor* interceptor,
-    GumInvocationListener* listener, int (*target)(int), guint expected_length)
+static int check_profile_with_extent(GumInterceptor* interceptor,
+    GumInvocationListener* listener, int (*target)(int), guint expected_length,
+    const GumMemoryRange* extent)
 {
     guint length = 0;
     guint8 active[GUM_PEAK_MAX_PROLOGUE_SIZE];
@@ -123,7 +130,10 @@ static int check_profile(GumInterceptor* interceptor,
         return 1;
     }
     calls = 0;
-    status = gum_interceptor_attach(interceptor, (gpointer)target, listener, NULL);
+    status = extent != NULL
+        ? gum_interceptor_peak_attach_with_extent(interceptor, (gpointer)target,
+            listener, NULL, extent, TRUE)
+        : gum_interceptor_attach(interceptor, (gpointer)target, listener, NULL);
     if (status != GUM_ATTACH_OK) {
         fprintf(stderr, "backend rejected safe range %u: status=%d\n",
             expected_length, status);
@@ -148,6 +158,39 @@ static int check_profile(GumInterceptor* interceptor,
         return 1;
     }
     return 0;
+}
+static int check_profile(GumInterceptor* interceptor,
+    GumInvocationListener* listener, int (*target)(int), guint expected_length)
+{
+    return check_profile_with_extent(interceptor, listener, target,
+        expected_length, NULL);
+}
+static int check_extent_cases(GumInterceptor* interceptor,
+    GumInvocationListener* listener)
+{
+    GumMemoryRange extent;
+    guint8 active[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint8 original[GUM_PEAK_MAX_PROLOGUE_SIZE];
+    guint length = 0;
+    extent.base_address = GUM_ADDRESS(peak_extent_returning);
+    extent.size = GUM_ADDRESS(peak_extent_returning_end) - extent.base_address;
+    if (check_profile_with_extent(interceptor, listener, peak_extent_returning,
+            8, &extent)) return 1;
+    extent.base_address = GUM_ADDRESS(peak_extent_cold);
+    extent.size = GUM_ADDRESS(peak_extent_cold_end) - extent.base_address;
+    if (check_profile_with_extent(interceptor, listener, peak_extent_cold,
+            8, &extent)) return 1;
+    extent.base_address = GUM_ADDRESS(peak_extent_noreturn);
+    extent.size = GUM_ADDRESS(peak_extent_noreturn_end) - extent.base_address;
+    if (check_refused(interceptor, listener, (gpointer)peak_extent_noreturn) ||
+        gum_interceptor_peak_attach_with_extent(interceptor,
+            (gpointer)peak_extent_noreturn, listener, NULL, &extent, TRUE) != GUM_ATTACH_OK ||
+        !gum_interceptor_peak_get_function_patch(interceptor,
+            (gpointer)peak_extent_noreturn, listener, active, original, &length) ||
+        length != 16) return 1;
+    gum_interceptor_detach(interceptor, listener);
+    gum_interceptor_flush(interceptor);
+    return check_refused(interceptor, listener, (gpointer)peak_extent_noreturn);
 }
 static void count_slot(GumInvocationContext* context, gpointer data)
 {
@@ -313,6 +356,9 @@ int main(void)
         check_range((gpointer)peak_prefix_branch_indirect, 16) ||
         check_range((gpointer)peak_prefix_indirect_entry, 0) ||
         check_range((gpointer)peak_suffix_dispatch, 16) ||
+        check_range((gpointer)peak_extent_returning, 8) ||
+        check_range((gpointer)peak_extent_cold, 8) ||
+        check_range((gpointer)peak_extent_noreturn, 0) ||
         check_range((gpointer)peak_prefix_branch_eret, 0) ||
         check_range((gpointer)peak_prefix_branch_bc, 0) ||
         check_range((gpointer)peak_prefix_branch_budget, 0) ||
@@ -357,6 +403,7 @@ int main(void)
         check_order(interceptor, peak_order_overlap_a, peak_order_overlap_b, 8, 2, FALSE, TRUE) ||
         check_active_interior_target(interceptor, listener) ||
         check_opaque_replacement(interceptor, listener) ||
+        check_extent_cases(interceptor, listener) ||
         check_indirect_dispatch(interceptor, listener) ||
         check_occupied_overlap(interceptor, listener))
         return 1;
