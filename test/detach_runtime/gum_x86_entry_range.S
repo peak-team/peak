@@ -274,3 +274,10 @@ COPY_BACKEDGE peak_x86_endbr_dl,%dl,1
 COPY_BACKEDGE peak_x86_endbr_edx,%edx,1
 COPY_BACKEDGE peak_x86_plain_dl,%dl,0
 COPY_BACKEDGE peak_x86_plain_edx,%edx,0
+
+.text
+START peak_x86_prefix_read
+ .fill 5,1,0x90
+ movb peak_x86_prefix_read(%rip),%al
+ ret
+END peak_x86_prefix_read

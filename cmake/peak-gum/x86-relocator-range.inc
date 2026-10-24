@@ -162,6 +162,10 @@ gum_x86_relocator_can_relocate (gpointer address, guint min_bytes,
         node->data_target = node->pc + node->size + op->mem.disp;
         /* LEA exposes an address, not an operand-sized memory access. */
         node->data_size = insn->id == X86_INS_LEA ? 1 : MAX (op->size, 1);
+        /* Returning the exact public function entry preserves pointer identity
+         * across attach. It materializes an address without reading modified entry bytes. */
+        if (insn->id == X86_INS_LEA && node->data_target == entry)
+          node->rip_data = FALSE;
         if (node->data_target > G_MAXSIZE - node->data_size) goto beach;
       }
     }

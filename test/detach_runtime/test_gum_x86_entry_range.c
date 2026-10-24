@@ -13,7 +13,9 @@ extern int peak_x86_internal_jcc(int), peak_x86_internal_jmp(int);
 extern int peak_x86_mid_instruction(int), peak_x86_indirect(int);
 extern int peak_x86_budget(int), peak_x86_rip_data(int);
 extern int peak_x86_rip_lea(int), peak_x86_call_next(int);
-extern int peak_x86_prefix_data(int),peak_x86_negative(int),peak_x86_crossing_data(int);
+extern gpointer peak_x86_prefix_data(void);
+extern int peak_x86_prefix_read(int);
+extern int peak_x86_negative(int),peak_x86_crossing_data(int);
 extern int peak_x86_rounding(int);
 extern int peak_x86_indirect_call(int);
 #ifdef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -92,7 +94,7 @@ static int full_span(GumInterceptor *i)
 /* Use a real distant mapping, not a fictitious writer PC: generated code is
  * executed, exercising far RIP / CALL / external-Jcc encodings and jump-back.
  * Hints are advisory and every returned mapping is checked before use. */
-static int far_rewrite(int(*source)(int),int zero,int one)
+static int far_rewrite(gpointer source,int zero,int one,gboolean self_entry)
 {
  long page=sysconf(_SC_PAGESIZE);guint attempt,span=0;
  guintptr origin=(guintptr)source,output;
@@ -115,13 +117,14 @@ static int far_rewrite(int(*source)(int),int zero,int one)
  do {
   span=gum_x86_relocator_read_one(relocator,NULL);
   CHECK(span!=0);
- }while(span<16);
+ }while(span<(self_entry?12u:16u));
  gum_x86_relocator_write_all(relocator);
  CHECK(gum_x86_writer_put_jmp_address(writer,(GumAddress)source+span));
  CHECK(gum_x86_writer_flush(writer));
  CHECK(gum_x86_writer_offset(writer)<(guint)page);
  CHECK(mprotect(code,page,PROT_READ|PROT_EXEC)==0);
- CHECK(((int(*)(int))code)(0)==zero && ((int(*)(int))code)(1)==one);
+ if(self_entry)CHECK(((gpointer(*)(void))code)()==source);
+ else CHECK(((int(*)(int))code)(0)==zero && ((int(*)(int))code)(1)==one);
  gum_x86_relocator_unref(relocator);gum_x86_writer_unref(writer);
  CHECK(munmap(code,page)==0);
  return 0;
@@ -306,6 +309,22 @@ static int endbr_backedge(GumInterceptor *i,GumInvocationListener *l)
  }
  return 0;
 }
+static int self_entry_pointer(GumInterceptor *i,GumInvocationListener *l)
+{
+ guint generation;guint8 before[32];gpointer entry=peak_x86_prefix_data;
+ memcpy(before,entry,32);CHECK(peak_x86_prefix_data()==entry);
+ for(generation=0;generation!=2;generation++) {
+  guint old=calls;gpointer returned;
+  CHECK(gum_interceptor_peak_attach_exact(i,entry,l,NULL)==GUM_ATTACH_OK);
+  returned=peak_x86_prefix_data();CHECK(returned==entry);
+  CHECK(((gpointer(*)(void))returned)()==entry);CHECK(calls==old+2);
+  gum_interceptor_detach(i,l);CHECK(memcmp(before,entry,32)==0);
+  CHECK(peak_x86_prefix_data()==entry);CHECK(calls==old+2);
+ }
+ /* Include all seven LEA bytes: copying only the leading five NOPs would
+  * execute the original LEA and miss the distant writer's address rewrite. */
+ CHECK(far_rewrite(entry,0,0,TRUE)==0);return 0;
+}
 int main(void)
 {
 #ifndef PEAK_GUM_ENTRY_RANGE_CHECKS
@@ -319,7 +338,8 @@ int main(void)
  gum_init_embedded();i=gum_interceptor_obtain();l=gum_make_call_listener(enter,NULL,NULL,NULL);
  CHECK(range(peak_x86_unsafe,5,FALSE,4)==0);
  CHECK(range(peak_x86_negative,5,FALSE,4)==0);
- CHECK(range(peak_x86_prefix_data,5,FALSE,0)==0);
+ CHECK(range(peak_x86_prefix_data,5,TRUE,5)==0);
+ CHECK(range(peak_x86_prefix_read,5,FALSE,0)==0);
  CHECK(range(peak_x86_crossing_data,5,FALSE,0)==0);
  CHECK(range(peak_x86_rounding,16,FALSE,1)==0);
  CHECK(range(peak_x86_unsafe,16,FALSE,4)==0);
@@ -334,8 +354,8 @@ int main(void)
  CHECK(gum_x86_relocator_can_relocate(peak_x86_internal_jcc,10,GUM_SCENARIO_ONLINE,&n));
  CHECK(n==10);
  CHECK(refuse(i,l,peak_x86_unsafe)==0);
+ CHECK(refuse(i,l,peak_x86_prefix_read)==0);
  CHECK(refuse(i,l,peak_x86_negative)==0);
- CHECK(refuse(i,l,peak_x86_prefix_data)==0);
  CHECK(refuse(i,l,peak_x86_mid_instruction)==0);
  CHECK(run(i,l,peak_x86_indirect_call,37)==0);
  CHECK(refuse(i,l,peak_x86_budget)==0);
@@ -357,9 +377,10 @@ int main(void)
  CHECK(mutable_tail(i,l)==0);
  CHECK(entry_thunk(i,l)==0);
  CHECK(endbr_backedge(i,l)==0);
+ CHECK(self_entry_pointer(i,l)==0);
  CHECK(full_span(i)==0);
- CHECK(far_rewrite(peak_x86_full_span,50,50)==0);
- CHECK(far_rewrite(peak_x86_far_branch,17,13)==0);
+ CHECK(far_rewrite(peak_x86_full_span,50,50,FALSE)==0);
+ CHECK(far_rewrite(peak_x86_far_branch,17,13,FALSE)==0);
  page=sysconf(_SC_PAGESIZE);CHECK(page>0);
  mapping=mmap(NULL,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
  CHECK(mapping!=MAP_FAILED);
