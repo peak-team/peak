@@ -1119,13 +1119,24 @@ if(BUILD_TESTING)
 
         target_include_directories(test_fastpath_nonlocal_unwind
             PRIVATE ${PROJECT_SOURCE_DIR}/include)
-        if(TARGET peak_detach_helper)
+        if(TARGET peak_detach_helper AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+           AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
             add_test(NAME test_extent_reattach_nonlocal_unwind
                 COMMAND ${Python3_EXECUTABLE}
                     ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_extent_reattach_case.py
                     --exe $<TARGET_FILE:test_fastpath_nonlocal_unwind>
                     --libpeak $<TARGET_FILE:peak>
                     --detach-helper $<TARGET_FILE:peak_detach_helper>)
+            add_test(NAME test_extent_cached_gum_rebuild
+                COMMAND ${Python3_EXECUTABLE}
+                    ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_extent_reattach_case.py
+                    --exe $<TARGET_FILE:test_fastpath_nonlocal_unwind>
+                    --libpeak $<TARGET_FILE:peak>
+                    --detach-helper $<TARGET_FILE:peak_detach_helper>
+                    --direct-gum-rebuild)
+            set_tests_properties(test_extent_cached_gum_rebuild PROPERTIES
+                PASS_REGULAR_EXPRESSION "extent_cached_gum_rebuild_checked"
+                TIMEOUT 25)
             set_tests_properties(test_extent_reattach_nonlocal_unwind PROPERTIES
                 PASS_REGULAR_EXPRESSION "extent_reattach_physical_ok"
                 TIMEOUT 25)

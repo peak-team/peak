@@ -13,15 +13,14 @@ def main():
     parser.add_argument('--exe', required=True)
     parser.add_argument('--libpeak', required=True)
     parser.add_argument('--detach-helper', required=True)
+    parser.add_argument('--direct-gum-rebuild', action='store_true')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='peak-extent-reattach-') as directory:
         trace = os.path.join(directory, 'trace.csv')
         env = os.environ.copy()
         env.update({
             'LD_PRELOAD': os.path.realpath(args.libpeak),
-            'PEAK_TARGET': ','.join('peak_fastpath_unwind_' + name for name in
-                                    ('outer', 'inner', 'recursive', 'escape_outer',
-                                     'generic_escape')),
+            'PEAK_TARGET': 'peak_extent_reattach_target',
             'PEAK_MAX_NUM_THREADS': '16',
             'PEAK_ENABLE_PER_TARGET_HEARTBEAT': '0',
             'PEAK_ENABLE_GLOBAL_HEARTBEAT': '0',
@@ -34,7 +33,9 @@ def main():
             'PEAK_DETACH_HELPER': os.path.realpath(args.detach_helper),
             'PEAK_DETACH_TRACE_PATH': trace,
         })
-        process = subprocess.Popen([args.exe, '--extent-reattach-check'],
+        mode = ('--extent-gum-rebuild-check' if args.direct_gum_rebuild
+                else '--extent-reattach-check')
+        process = subprocess.Popen([args.exe, mode],
                                    env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
@@ -52,12 +53,17 @@ def main():
             except ProcessLookupError:
                 pass
         print(output, end='')
-        if process.returncode != 0 or 'extent_reattach_unwind_ok' not in output:
+        marker = ('extent_cached_gum_rebuild_ok' if args.direct_gum_rebuild
+                  else 'extent_reattach_unwind_ok')
+        if process.returncode != 0 or marker not in output:
             raise RuntimeError('extent reattach target behavior/count check failed')
+        if args.direct_gum_rebuild:
+            print('extent_cached_gum_rebuild_checked')
+            return
         with open(trace, newline='', encoding='utf-8') as handle:
             events = []
             for row in csv.reader(handle):
-                if (len(row) < 4 or row[2] != 'peak_fastpath_unwind_recursive'
+                if (len(row) < 4 or row[2] != 'peak_extent_reattach_target'
                         or row[3] not in ('detach', 'reattach')):
                     continue
                 if len(row) < 7 or row[4:7] != ['success', '1', 'safe']:

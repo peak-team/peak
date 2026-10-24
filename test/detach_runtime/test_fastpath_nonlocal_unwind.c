@@ -274,6 +274,152 @@ require_fast_dispatch(void)
     return 1;
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+static _Thread_local jmp_buf extent_unwind_target;
+
+__attribute__((noreturn, noinline, visibility("default")))
+void
+peak_extent_reattach_escape(void)
+{
+    longjmp(extent_unwind_target, 1);
+}
+
+extern uintptr_t peak_extent_reattach_target(uintptr_t unwind);
+/*
+ * The ELF and CFI extents both stop at the noreturn call.  Invalid long-mode
+ * instructions outside that extent make an absent boundary fail reliably,
+ * rather than accidentally finding a return in the following function.
+ */
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl peak_extent_reattach_target\n"
+    ".type peak_extent_reattach_target,@function\n"
+    "peak_extent_reattach_target:\n"
+    ".cfi_startproc\n"
+    "test %rdi,%rdi\n"
+    "jne 1f\n"
+    "mov $3,%eax\n"
+    "ret\n"
+    "1: sub $8,%rsp\n"
+    ".cfi_def_cfa_offset 16\n"
+    "call peak_extent_reattach_escape\n"
+    ".cfi_endproc\n"
+    ".size peak_extent_reattach_target,.-peak_extent_reattach_target\n"
+    ".rept 64\n"
+    ".byte 0x06\n"
+    ".endr\n");
+
+static int
+exercise_extent_unwind(void)
+{
+    if (setjmp(extent_unwind_target) == 0) {
+        peak_extent_reattach_target(1);
+        return 0;
+    }
+    return peak_extent_reattach_target(0) == 3;
+}
+
+static int
+extent_entry_is_original(void)
+{
+    static const unsigned char original[] = {
+        0x48, 0x85, 0xff, 0x75, 0x06, 0xb8, 0x03, 0x00,
+        0x00, 0x00, 0xc3, 0x48, 0x83, 0xec, 0x08, 0xe8
+    };
+    const volatile unsigned char* entry =
+        (const volatile unsigned char*)peak_extent_reattach_target;
+    for (size_t i = 0; i < sizeof(original); i++) {
+        if (entry[i] != original[i])
+            return 0;
+    }
+    return 1;
+}
+
+static int
+run_extent_gum_rebuild_check(void)
+{
+    typedef void (*TransactionFunc)(GumInterceptor*);
+    typedef void (*DetachFunc)(GumInterceptor*, GumInvocationListener*);
+    typedef gboolean (*FlushFunc)(GumInterceptor*);
+    typedef gboolean (*PrepareFunc)(GumInterceptor*, gpointer,
+                                   GumInvocationListener*);
+    typedef GumAttachReturn (*AttachFunc)(GumInterceptor*, gpointer,
+                                         GumInvocationListener*, const void*);
+    typedef gboolean (*RelocateFunc)(gpointer, guint,
+                                     GumRelocationScenario, guint*);
+    typedef gulong (*CountFunc)(size_t);
+    GumInterceptor** owner = (GumInterceptor**)required_symbol("interceptor");
+    GumInvocationListener*** listeners =
+        (GumInvocationListener***)required_symbol("array_listener");
+    TransactionFunc begin = (TransactionFunc)required_symbol(
+        "gum_interceptor_begin_transaction");
+    TransactionFunc end = (TransactionFunc)required_symbol(
+        "gum_interceptor_end_transaction");
+    DetachFunc detach = (DetachFunc)required_symbol("gum_interceptor_detach");
+    FlushFunc flush = (FlushFunc)required_symbol("gum_interceptor_flush");
+    PrepareFunc prepare = (PrepareFunc)required_symbol(
+        "gum_interceptor_peak_prepare_fast_detach");
+    AttachFunc attach = (AttachFunc)required_symbol(
+        "peak_general_listener_test_gum_attach_target");
+    RelocateFunc relocate = (RelocateFunc)required_symbol(
+        "gum_x86_relocator_can_relocate");
+    CountFunc count = (CountFunc)required_symbol(
+        "peak_general_listener_test_call_count");
+    if (owner == NULL || *owner == NULL || listeners == NULL ||
+        *listeners == NULL || (*listeners)[0] == NULL || begin == NULL ||
+        end == NULL || detach == NULL || flush == NULL || prepare == NULL ||
+        attach == NULL || relocate == NULL || count == NULL)
+        return 1;
+    if (peak_extent_reattach_target(0) != 3 ||
+        peak_extent_reattach_target(0) != 3 || count(0) != 2 ||
+        extent_entry_is_original())
+        return 1;
+    for (unsigned int round = 0; round < 2; round++) {
+        gulong before = count(0);
+        if (!prepare(*owner, (gpointer)peak_extent_reattach_target,
+                     (*listeners)[0]))
+            return 1;
+        begin(*owner);
+        detach(*owner, (*listeners)[0]);
+        end(*owner);
+        gboolean flushed = FALSE;
+        for (unsigned int attempt = 0; attempt < 2000; attempt++) {
+            if ((flushed = flush(*owner)))
+                break;
+            usleep(1000);
+        }
+        if (!flushed || !extent_entry_is_original() ||
+            !exercise_extent_unwind() || count(0) != before) {
+            fprintf(stderr, "direct Gum detach mismatch round=%u\n", round);
+            return 1;
+        }
+        for (guint minimum = 5; minimum <= 16; minimum += 11) {
+            guint maximum = 999;
+            if (relocate((gpointer)peak_extent_reattach_target, minimum,
+                         GUM_SCENARIO_ONLINE, &maximum) || maximum != 0) {
+                fputs("extent target unexpectedly relocates without metadata\n",
+                      stderr);
+                return 1;
+            }
+        }
+        begin(*owner);
+        GumAttachReturn status = attach(*owner,
+            (gpointer)peak_extent_reattach_target, (*listeners)[0], NULL);
+        end(*owner);
+        if (status != GUM_ATTACH_OK || extent_entry_is_original() ||
+            (round == 0 ? peak_extent_reattach_target(0) != 3
+                        : !exercise_extent_unwind()) ||
+            count(0) != before + (round == 0 ? 1 : 2)) {
+            fprintf(stderr, "cached Gum rebuild failed round=%u status=%d\n",
+                    round, status);
+            return 1;
+        }
+    }
+    puts("extent_cached_gum_rebuild_ok");
+    return 0;
+}
+
 static int
 run_extent_reattach_check(void)
 {
@@ -291,31 +437,30 @@ run_extent_reattach_check(void)
         "peak_general_listener_hook_state");
     CountFunc count = (CountFunc)required_symbol(
         "peak_general_listener_test_call_count");
-    const size_t hook_id = 2;
+    const size_t hook_id = 0;
 
     if (detach == NULL || reattach == NULL || drain == NULL ||
-        state == NULL || count == NULL || !require_fast_dispatch())
+        state == NULL || count == NULL)
         return 1;
-    if (peak_fastpath_unwind_recursive(2, 0) != 3 ||
-        peak_fastpath_unwind_recursive(2, 0) != 3 ||
-        state(hook_id) != PEAK_HOOK_ATTACHED || count(hook_id) != 6)
+    if (peak_extent_reattach_target(0) != 3 ||
+        peak_extent_reattach_target(0) != 3 ||
+        state(hook_id) != PEAK_HOOK_ATTACHED || count(hook_id) != 2)
         return 1;
 
     for (unsigned int round = 0; round < 2; round++) {
         gulong before = count(hook_id);
         if (!detach(hook_id) || !drain(2000) ||
             state(hook_id) != PEAK_HOOK_DETACHED ||
-            peak_fastpath_unwind_recursive(2, 1) != 7 ||
-            peak_fastpath_unwind_recursive(2, 0) != 3 ||
+            !exercise_extent_unwind() ||
             count(hook_id) != before) {
             fprintf(stderr, "extent detach/unwind mismatch round=%u\n", round);
             return 1;
         }
         if (!reattach(hook_id) || !drain(2000) ||
             state(hook_id) != PEAK_HOOK_ATTACHED ||
-            peak_fastpath_unwind_recursive(2, 1) != 7 ||
-            peak_fastpath_unwind_recursive(2, 0) != 3 ||
-            count(hook_id) != before + 6) {
+            (round == 0 ? peak_extent_reattach_target(0) != 3
+                        : !exercise_extent_unwind()) ||
+            count(hook_id) != before + (round == 0 ? 1 : 2)) {
             fprintf(stderr, "extent reattach/unwind mismatch round=%u\n", round);
             return 1;
         }
@@ -324,11 +469,22 @@ run_extent_reattach_check(void)
     return 0;
 }
 
+#endif
+
 int
 main(int argc, char** argv)
 {
+#if defined(__linux__) && defined(__x86_64__)
     if (argc == 2 && strcmp(argv[1], "--extent-reattach-check") == 0)
         return run_extent_reattach_check();
+    if (argc == 2 && strcmp(argv[1], "--extent-gum-rebuild-check") == 0)
+        return run_extent_gum_rebuild_check();
+#else
+    if (argc == 2 && strcmp(argv[1], "--extent-reattach-check") == 0) {
+        fputs("extent reattach fixture requires Linux x86-64\n", stderr);
+        return 2;
+    }
+#endif
     typedef gulong (*StackLevelFunc)(void);
 
     /*

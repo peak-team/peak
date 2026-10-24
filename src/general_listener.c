@@ -7015,6 +7015,18 @@ peak_general_listener_test_gum_attach_target(
     GumInvocationListener* listener,
     const struct _PeakGumTargetAttachPlan* plan)
 {
+    PeakGumTargetAttachPlan cached_plan;
+    if (plan == NULL && PEAKGENERAL_IS_LISTENER(listener)) {
+        PeakGeneralListener* self = PEAKGENERAL_LISTENER(listener);
+        uint64_t generation = peak_hook_provider_generation != NULL &&
+            self->hook_id < peak_hook_address_count
+                ? peak_hook_provider_generation[self->hook_id] : 0;
+        /* Test reconstruction uses the same pure cached path as reattach. */
+        peak_gum_target_attach_plan_with_extent(address,
+            peak_general_listener_function_extent(self, address, generation),
+            &cached_plan);
+        plan = &cached_plan;
+    }
     return peak_general_listener_gum_attach_target(target_interceptor,
                                                    address,
                                                    listener,
