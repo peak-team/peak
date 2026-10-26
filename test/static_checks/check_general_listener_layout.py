@@ -31,8 +31,10 @@ EXPECTED_SECTIONS = (
 )
 
 EXPECTED_IMPLEMENTATION_FRAGMENTS = (
+    Path("cmake/peak-gum/arm64-relocator-range.inc"),
     Path("cmake/peak-gum/peak_gum_invoke_cfi.inc"),
     Path("cmake/peak-gum/peak_gum_unwind_frames.inc"),
+    Path("cmake/peak-gum/x86-relocator-range.inc"),
 )
 
 

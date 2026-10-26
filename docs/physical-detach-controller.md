@@ -30,9 +30,10 @@ listener attach/detach is also guarded because it changes a
 process-wide Gum patch site. Initial startup attach has one narrow exception:
 before the controller exists, PEAK may attach directly when `/proc/self/task`
 confirms that the process has exactly one task. Outside that single-task startup
-case, stock Gum causes startup target hooks to be skipped; already-attached
-target hooks remain attached, and PEAK logs why later target mutation was
-skipped. Process-lifetime support hooks keep explicit startup/shutdown
+case, a provider without the PC API causes startup target hooks to be skipped;
+already-attached target hooks remain attached, and PEAK logs why later target
+mutation was skipped. Supported Linux x86_64 and Arm64 builds reject an old
+stock devkit at configure time before reaching this runtime path. Process-lifetime support hooks keep explicit startup/shutdown
 ordering outside steady-state target detach. Startup target hooks and the
 process-lifetime `close`, allocator, and inert `dlopen` hooks, when enabled or
 needed, are installed before the target controller starts. Runtime `dlopen`
@@ -393,8 +394,9 @@ thread cannot be admitted and classified.
 The current code implements this Linux x86_64 and Linux Arm64 helper path behind
 the patched-Gum capability check. The default Linux x86_64 and Linux Arm64 CMake
 paths now construct a PEAK-patched Frida Gum devkit by copying the downloaded
-devkit and appending PEAK's PC API implementation to the archive. Stock Gum still
-reports `missing-gum-api` in strict mode. The helper uses `PTRACE_GETREGS` /
+devkit, replacing its native relocator, and appending PEAK's PC API implementation
+to the archive. All providers on these architectures must pass the revision 3
+entry-range check at configure time; an old stock devkit is rejected. The helper uses `PTRACE_GETREGS` /
 `PTRACE_SETREGS` on x86_64 and `PTRACE_GETREGSET` / `PTRACE_SETREGSET` with
 `NT_PRSTATUS` on Arm64. When `PR_SET_PTRACER` is unavailable and returns
 `EINVAL`/`ENOSYS`, PEAK falls back to the helper's real `ptrace` attempt; actual
@@ -1017,6 +1019,49 @@ checking whether `x16` or `x17` appears in the relocated operands, so the defaul
 policy defers to Gum's own attach result. The conservative PEAK policy can still
 skip prefixes that mention both IP registers, but this is a diagnostic
 fail-closed mode rather than a proven Arm64 corruption guard.
+
+The auto-patched Linux devkit replaces the pinned Gum 17.15.3 native Arm64 and
+x86 relocator members with checked entry-range analysis. Arm64 retains the
+pinned suffix backedge walker and supplements direct conditional and
+unconditional branch targets in the first 16 entry bytes within the same fixed
+1024-byte budget. If that check cannot establish the larger range, it
+conservatively limits the range to 4 bytes. Backend candidates, scratch-register
+requirements, and original instruction rewriting remain subject to Gum's
+existing contracts. The x86 backend validates the complete
+instruction span needed for its actual 5- or 16-byte patch; the resulting span
+can be 6 or 20 bytes when the last instruction crosses the requested boundary.
+Its single safe read requests at most the requested size plus 14 bytes and
+accepts a partial read at a mapping boundary. Decoding stops once the complete
+patch span is available; it does not decode external branch targets. Local
+branches and RIP-relative data references can reduce the supported span. A
+conditional branch targeting the patch interior must land on a decoded
+instruction boundary to retain its relocated label mapping. External conditional
+targets retain the pinned writer's supported external-jump behavior without
+following those targets.
+The original instruction rewriters and backend allocation policies are retained.
+Offline relocation and explicit non-CHECKED policies keep the upstream API
+behavior.
+
+The Arm64 bounded walker is not a whole-function proof and does not resolve
+arbitrary indirect control flow. The x86 check remains bounded to the entry
+range. Both retain Gum's function-entry ABI contract; neither establishes that
+arbitrary external code cannot enter a patch interior or that all self-reads are
+safe. Arm64 scratch-register selection follows pinned Gum's relocated-span check;
+it does not prove suffix register liveness. There is
+no function-extent metadata lookup or all-hook original-code snapshot.
+
+All Linux x86_64 and Arm64 providers, including supplied and prebuilt devkits,
+must expose checked entry-range revision 3 through a linkable revision query
+and native entry-range classifier. Older
+devkits, including revision 2, fail
+configuration with an update instruction. Supplied devkits are never silently
+patched. Header and archive must be updated together; controlled offline
+packages follow the same requirement. Auto-patching verifies the original
+relocator source's pinned SHA-256 and requires that source in the configured
+cache when downloads are disabled. The separate full PEAK PC/unwind API validation, enabled for auto-patched
+providers or by `PEAK_REQUIRE_GUM_PEAK_API`, also verifies the architecture
+fingerprint; entry-range revision 3 alone does not establish that full API. Cross builds use compile/link validation
+where the configure probes cannot execute target code.
 
 The narrow exception is an exported target consisting of one unconditional
 branch to the canonical GNU ELF Arm64 PLT sequence (`adrp`/`ldr`/`add`/`br`
