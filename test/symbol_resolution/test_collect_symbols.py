@@ -97,6 +97,16 @@ def main():
         run([origin_app], env=loader_env, cwd=origin/'lib', ok=False)
         collect(origin_app, env=loader_env, cwd=origin/'lib', ok=False)
 
+        rpath_plugin = root/'rpath-plugin.so'
+        build('rpath-plugin.c', 'extern int origin_leaf(void);int plugin_call(void){return origin_leaf();}',
+              rpath_plugin, '-shared', '-fPIC', '-nostdlib', '-L'+str(origin/'lib'), '-lleaf')
+        rpath_main = root/'rpath-main'
+        build('rpath-main.c', '#include <dlfcn.h>\nint main(void){void*h=dlopen("'+str(rpath_plugin)+'",RTLD_NOW);if(!h)return 1;int(*f)(void)=dlsym(h,"plugin_call");return !f||f()!=7;}',
+              rpath_main, '-ldl', '-Wl,--disable-new-dtags,-rpath,'+str(origin/'lib'))
+        run([rpath_main])
+        plugin_symbols = collect(rpath_main, '--module', str(rpath_plugin))
+        assert f'{origin_leaf}!origin_leaf' in plugin_symbols
+
         search = root/'search'
         (search/'a').mkdir(parents=True)
         (search/'b').mkdir()
@@ -663,6 +673,54 @@ print("collector_saturation_originals_ok")
                            'atexit.register(load)\n')
         at_exit_symbols = collect(at_exit, '--run-python')
         assert f'{extension}!extension_function' in at_exit_symbols
+        script_real, script_alias = root/'script-real', root/'script-alias'
+        script_real.mkdir()
+        script_alias.mkdir()
+        shutil.copy2(extension, script_alias/'libfixture.so')
+        (script_real/'app.py').write_text(
+            'import ctypes, os, sys\nfrom pathlib import Path\n'
+            'assert sys.argv[0] in ("script-alias/app.py", "./script-alias/app.py")\n'
+            f'assert sys.path[0] == {str(script_real)!r}\n'
+            f'assert __file__ == os.path.join({str(root)!r}, sys.argv[0])\n'
+            'ctypes.CDLL(str(Path(__file__).parent/"libfixture.so"))\n')
+        (script_alias/'app.py').symlink_to(script_real/'app.py')
+        for script_argument in ('script-alias/app.py', './script-alias/app.py'):
+            run([sys.executable, script_argument], cwd=root)
+            alias_symbols = collect(script_argument, '--run-python', cwd=root)
+            assert f'{script_alias/"libfixture.so"}!extension_function' in alias_symbols
+
+        interpreter_dynamic = run(['readelf', '-W', '-d', sys.executable])
+        python_include = sysconfig.get_path('include')
+        if ('(RPATH)' in interpreter_dynamic and '[$ORIGIN/../lib]' in interpreter_dynamic
+                and '(RUNPATH)' not in interpreter_dynamic and python_include
+                and (Path(python_include)/'Python.h').is_file()):
+            copied_python = root/'inherited-python/bin/python'
+            copied_python.parent.mkdir(parents=True)
+            inherited_lib = copied_python.parent.parent/'lib'
+            inherited_lib.mkdir()
+            shutil.copy2(sys.executable, copied_python)
+            inherited_leaf = inherited_lib/'libcollector_inherited.so'
+            build('inherited-leaf.c', 'int inherited_leaf(void){return 17;}',
+                  inherited_leaf, '-shared', '-fPIC', '-nostdlib',
+                  '-Wl,-soname,libcollector_inherited.so')
+            inherited_native = root/('collector_inherited'+sysconfig.get_config_var('EXT_SUFFIX'))
+            build('inherited-native.c', '#include <Python.h>\nextern int inherited_leaf(void); static struct PyModuleDef m={PyModuleDef_HEAD_INIT,"collector_inherited",NULL,-1,NULL}; PyMODINIT_FUNC PyInit_collector_inherited(void){if(inherited_leaf()!=17)return NULL;return PyModule_Create(&m);}',
+                  inherited_native, '-shared', '-fPIC', '-nostdlib', '-I'+python_include,
+                  '-L'+str(inherited_lib), '-lcollector_inherited')
+            inherited_script = root/'inherited-app.py'
+            inherited_script.write_text('import collector_inherited\n')
+            inherited_env = os.environ.copy()
+            inherited_env['PYTHONHOME'] = sys.prefix
+            inherited_env.pop('LD_LIBRARY_PATH', None)
+            run([copied_python, inherited_script], env=inherited_env)
+            for mode in ((), ('--run-python',)):
+                symbols = collect(inherited_script, '--python', str(copied_python), *mode,
+                                  env=inherited_env)
+                assert f'{inherited_leaf}!inherited_leaf' in symbols
+                assert not any(symbol.startswith(str(copied_python)+'!') for symbol in symbols)
+        else:
+            print('SKIP inherited interpreter RPATH: compatible origin RPATH/Python headers unavailable')
+
         empty_runtime = root/'empty-runtime.py'
         empty_runtime.write_text('pass\n')
         assert collect(empty_runtime, '--run-python') == set(), 'helper baseline polluted empty target'
