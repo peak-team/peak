@@ -10,19 +10,31 @@ static unsigned char active[4] = { 1, 2, 3, 4 };
 static unsigned char original[4] = { 0 };
 static unsigned int snapshots, suspended, resumed, staged, finished, cancelled;
 static gboolean bad_pc, bad_bytes, bad_identity, endless;
+static gboolean peer_held[PEAK_DARWIN_MAX_THREADS];
 unsigned int mach_task_self(void) { return 1; }
 thread_act_t mach_thread_self(void) { return 1; }
 kern_return_t task_threads(unsigned int task, thread_act_array_t* out,
                            mach_msg_type_number_t* count) {
     (void)task;
     snapshots++;
+    /* Peer 2 was already creating peer 3 when the ungated first snapshot
+     * began. The child becomes visible only after its creator is held. */
+    if (!endless && snapshots == 2) {
+        assert(peer_held[2]);
+        assert(!peer_held[3]);
+        assert(memcmp(entry, original, 4) == 0 || bad_bytes);
+    }
     *count = endless ? snapshots + 1 : (snapshots == 1 ? 2 : 3);
     *out = malloc(*count * sizeof(**out));
     for (unsigned int i = 0; i < *count; i++) (*out)[i] = i + 1;
     return KERN_SUCCESS;
 }
-kern_return_t thread_suspend(thread_act_t t) { (void)t; suspended++; return 0; }
-kern_return_t thread_resume(thread_act_t t) { (void)t; resumed++; return 0; }
+kern_return_t thread_suspend(thread_act_t t) {
+    assert(!peer_held[t]); peer_held[t] = TRUE; suspended++; return 0;
+}
+kern_return_t thread_resume(thread_act_t t) {
+    assert(peer_held[t]); peer_held[t] = FALSE; resumed++; return 0;
+}
 kern_return_t thread_get_state(thread_act_t t, int flavor, thread_state_t out,
                                mach_msg_type_number_t* count) {
     (void)t; (void)flavor; (void)count;
@@ -43,7 +55,13 @@ void gum_memory_dispose_writable_pages(gpointer p, guint n) {
     assert(suspended == resumed); (void)p; (void)n;
 }
 gpointer gum_strip_code_pointer(gpointer p) { return p; }
-void sys_dcache_flush(void* p, size_t n) { (void)p; (void)n; }
+void sys_dcache_flush(void* p, size_t n) {
+    (void)p; (void)n;
+    /* Publication cannot occur after only the first or second snapshot.
+     * Creator and child must both remain held through the stable third pass. */
+    assert(snapshots == 3 && peer_held[2] && peer_held[3]);
+    assert(suspended == 2 && resumed == 0);
+}
 void sys_icache_invalidate(void* p, size_t n) { (void)p; (void)n; }
 GumAttachReturn peak_gum_darwin_prepare_attach(GumInterceptor* i, gpointer p,
     GumInvocationListener* l, const GumAttachOptions* o) {
@@ -54,7 +72,8 @@ GumAttachReturn peak_gum_darwin_prepare_attach(GumInterceptor* i, gpointer p,
 }
 GumReplaceReturn peak_gum_darwin_prepare_replace(GumInterceptor* i, gpointer p,
     gpointer r, gpointer* o, const GumReplaceOptions* options) {
-    (void)r; (void)o; (void)options;
+    (void)r; (void)options;
+    if (o != NULL) *o = (void*)4;
     return peak_gum_darwin_prepare_attach(i, p, NULL, NULL);
 }
 gboolean peak_gum_darwin_get_staged_patch(GumInterceptor* i, gpointer* p,
@@ -82,6 +101,7 @@ static PeakDetachRequest request = {
 };
 static void reset(void) {
     memset(entry, 0, sizeof(entry));
+    memset(peer_held, 0, sizeof(peer_held));
     snapshots = suspended = resumed = staged = finished = cancelled = 0;
     bad_pc = bad_bytes = bad_identity = endless = FALSE;
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
@@ -115,6 +135,12 @@ int main(void) {
     assert(peak_detach_controller_prepare_hook_mutation(&request, &status));
     assert(peak_detach_controller_finish_hook_mutation(&request, &status));
     assert(finished == 1);
+    reset(); peak_detach_controller_note_thread_creation_gate_installed(TRUE);
+    gpointer replacement_original = NULL;
+    request.original_function = &replacement_original;
+    bad_identity = TRUE;
+    assert(!peak_detach_controller_prepare_hook_mutation(&request, &status));
+    assert(cancelled == 1 && replacement_original == NULL);
     request.operation = PEAK_DETACH_OPERATION_REVERT;
     assert(!peak_detach_controller_prepare_hook_mutation(&request, &status));
     assert(status == PEAK_DETACH_STATUS_UNSUPPORTED);

@@ -43,6 +43,7 @@ typedef struct {
     gboolean uses_physical_patch;
     gboolean staged_mutation;
     GumInterceptor* staged_interceptor;
+    gpointer* staged_original_function;
     size_t hook_id;
     PeakDetachOperation operation;
     thread_act_t threads[PEAK_DARWIN_MAX_THREADS];
@@ -487,9 +488,12 @@ peak_darwin_cancel_stop_window(void)
     }
 
     peak_darwin_dispose_writable_pages();
-    if (peak_darwin_held.staged_mutation)
+    if (peak_darwin_held.staged_mutation) {
         peak_gum_darwin_finish_staged_mutation(
             peak_darwin_held.staged_interceptor, FALSE);
+        if (peak_darwin_held.staged_original_function != NULL)
+            *peak_darwin_held.staged_original_function = NULL;
+    }
     peak_darwin_end_thread_gate();
     peak_darwin_publish_window(FALSE, &peak_darwin_held.started_at);
     peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
@@ -754,6 +758,7 @@ peak_darwin_prepare_hook_mutation(const PeakDetachRequest* request,
         }
         peak_darwin_held.staged_mutation = TRUE;
         peak_darwin_held.staged_interceptor = request->interceptor;
+        peak_darwin_held.staged_original_function = request->original_function;
     }
     if (!peak_darwin_build_patch_plan(request, &plan, &status) ||
         !peak_darwin_prepare_writable_alias(&plan, &status)) {

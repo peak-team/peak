@@ -99,9 +99,13 @@ signing settings describe the permissions required by the test fixture; they
 are not a recommendation to weaken signing policy for production apps.
 
 The macOS Arm64 backend installs the initial hook set while holding target
-threads and uses the staged Darwin patch operation. Its safety scope for
-subsequent zero-overhead detach and reattach remains pthread-based; direct Mach
-thread creation is not covered. Targets whose entry resolves through a branch
-or thunk to another address are rejected to preserve attribution. See
+threads and uses the staged Darwin patch operation. After initialization, the
+Darwin controller can stage `ATTACH` and `REPLACE` operations for new entries;
+`REVERT` and `SHUTDOWN` remain unsupported. This controller support does not
+provide automatic `dlopen` discovery or JIT target activation. The safety
+scope for subsequent zero-overhead detach and reattach remains pthread-based;
+direct Mach thread creation is not covered. Targets whose entry resolves
+through a branch or thunk to another address are rejected to preserve
+attribution. See
 [Physical detach controller](physical-detach-controller.md) for lifecycle and
 controller details.

@@ -161,12 +161,14 @@ installing hooks if an early constructor or deferred post-MPI activation has
 already made the process multithreaded. With `PEAK_BUILD_ATTACH=ON`, the
 separate `peak-attach` executable also supports one-time initial attach on
 macOS Arm64. It installs the initial hook set through a staged Darwin patch
-operation while target threads are held safely. Later runtime `ATTACH`,
-`REPLACE`, and `REVERT` mutations still fail closed as unsupported; PEAK does
-not install its `dlopen` listener, `dlclose` guard, ownership thread, or
-automatic dynamic-library discovery queue on macOS. The JIT metadata provider
-is also kept disabled on macOS. `PEAK_MEMORY_PROFILE` is rejected explicitly
-rather than starting a partially supported memory profiler.
+operation while target threads are held safely. The Darwin controller can also
+stage later `ATTACH` and `REPLACE` operations for new entries. `REVERT` and
+`SHUTDOWN` mutations remain unsupported. PEAK does not install its `dlopen`
+listener, `dlclose` guard, ownership thread, or automatic dynamic-library
+discovery queue on macOS, so future libraries are not discovered
+automatically. The JIT metadata provider is also kept disabled on macOS.
+`PEAK_MEMORY_PROFILE` is rejected explicitly rather than starting a partially
+supported memory profiler.
 
 On Arm64, PEAK supports zero-overhead physical detach and reattach for
 pthread-based workloads: it gates `pthread_create`, suspends the other

@@ -30,12 +30,14 @@ listener attach/detach is also guarded because it changes a
 process-wide Gum patch site. Initial installation has narrow platform-specific
 exceptions. Linux startup profiling may attach before the controller exists
 when `/proc/self/task` confirms exactly one task. With `PEAK_BUILD_ATTACH=ON`,
-macOS Arm64's `peak-attach` may perform a one-time live initial install using
-the staged Darwin patch operation while target threads are safely held. This
-is a separate bootstrap path; it does not enable later `ATTACH`, `REPLACE`, or
-`REVERT` mutation through the regular controller API. Outside these initial
-installation paths, a provider without the required PC or staged-patch API
-causes target hooks to be skipped or later mutation to fail closed. Supported
+macOS Arm64's `peak-attach` may perform a live initial install using the staged
+Darwin patch operation while target threads are safely held. Once the Darwin
+controller is running, it can stage `ATTACH` and `REPLACE` operations for new
+entries through the same safe path; `REVERT` and `SHUTDOWN` remain unsupported.
+This controller capability does not add automatic discovery of future
+`dlopen` modules or JIT targets. A provider without the required PC or
+staged-patch API causes target hooks to be skipped or mutation to fail closed.
+Supported
 Linux x86_64 and Arm64 builds reject an old stock devkit at configure time
 before reaching this runtime path. Process-lifetime support hooks keep explicit startup/shutdown
 ordering outside steady-state target detach. Startup target hooks and the
@@ -63,17 +65,16 @@ proves the process is single-threaded before its first Gum initialization or
 hook mutation; if peers already exist, including after deferred MPI
 initialization, preload activation is rejected with no Gum hooks installed.
 When `PEAK_BUILD_ATTACH=ON`, the independent `peak-attach` executable supports
-one-time live bootstrap on macOS Arm64. It installs the initial hook set
-through a staged Darwin patch operation while target threads are held. That
-initial install is separate from the controller's regular mutation protocol:
-subsequent `ATTACH`, `REPLACE`, `REVERT`, and `SHUTDOWN` operations still fail
-closed as unsupported when no safe held window exists. Automatic runtime
-discovery and attach of future `dlopen` modules is unsupported, so Darwin does
-not install the `dlopen` listener, `dlclose` guard, ownership thread, or queue;
-JIT provider activation is skipped. Memory profiling is rejected as outside the
-named-CPU-only scope. A Darwin process destructor stops PEAK-owned controller
-work and writes the final report, then leaves installed target and support Gum
-hooks plus their reachable PEAK state alive for process exit to reclaim.
+live bootstrap on macOS Arm64. It installs the initial hook set through a
+staged Darwin patch operation while target threads are held. Once active, the
+controller can also stage `ATTACH` and `REPLACE` operations for new entries;
+`REVERT` and `SHUTDOWN` remain unsupported. Automatic discovery and attach of
+future `dlopen` modules is unavailable, so Darwin does not install the `dlopen`
+listener, `dlclose` guard, ownership thread, or queue; JIT provider activation
+is skipped. Memory profiling is rejected as outside the named-CPU-only scope.
+A Darwin process destructor stops PEAK-owned controller work and writes the
+final report, then leaves installed target and support Gum hooks plus their
+reachable PEAK state alive for process exit to reclaim.
 
 Darwin entry-byte mutation additionally requires exclusive ownership of the
 canonical Gum context: its listener array must contain exactly the requested
@@ -107,13 +108,12 @@ outside the code and state being mutated.
 
 ## Core Invariants
 
-1. Except for the documented initial startup and staged Darwin live-attach
-   installs above, all target-hook mutation is serialized by the controller
-   API and strict mutation guard. These bootstrap exceptions do not enable
-   later runtime attach, detach, reattach, dynamic/JIT attach, or shutdown
-   mutations. The controller
-   thread owns steady-state detach/reattach transitions, queued dynamic and JIT
-   attaches, and deferred destruction. The
+1. After controller startup, target-hook mutations are serialized by its API
+   and strict mutation guard. On Darwin, the staged path supports `ATTACH` and
+   `REPLACE` for new entries; `REVERT` and `SHUTDOWN` remain unsupported. The
+   controller thread owns steady-state detach/reattach transitions, queued
+   dynamic and JIT attaches where the platform supports them, and deferred
+   destruction. The
    deferred `dlopen` path does not add a mutation owner: its callback only
    publishes borrowed work, its ownership thread only obtains exact module
    references, and the controller performs every resulting target ATTACH. It

@@ -65,3 +65,18 @@ add_test(NAME test_attach_transport
         --fixture $<TARGET_FILE:test_attach_fixture>
         --agent $<TARGET_FILE:test_attach_unresponsive_agent>)
 set_tests_properties(test_attach_transport PROPERTIES TIMEOUT 40)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Compile the real Darwin overlay with a fake transaction backend. The
+    # pinned Gum amalgamated header exposes Arm64 writers on every host.
+    add_executable(test_attach_gum_darwin_staging
+        ${PROJECT_SOURCE_DIR}/test/gum_darwin_staging_mock.c)
+    target_include_directories(test_attach_gum_darwin_staging PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${FRIDA_GUM_INCLUDE_DIRS})
+    target_compile_options(test_attach_gum_darwin_staging PRIVATE -UNDEBUG)
+    target_link_libraries(test_attach_gum_darwin_staging PRIVATE
+        ${_peak_attach_runtime_libraries})
+    add_test(NAME test_attach_gum_darwin_staging
+        COMMAND test_attach_gum_darwin_staging)
+    set_tests_properties(test_attach_gum_darwin_staging PROPERTIES TIMEOUT 20)
+endif()
