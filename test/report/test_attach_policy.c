@@ -8,6 +8,8 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
+#include <link.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -130,14 +132,25 @@ main(int argc, char** argv)
         loader_path = strdup(gum_module_get_path(loader));
         GumMemoryRange range = *gum_module_get_range(loader);
         g_object_unref(loader);
-        if (peak_general_listener_attach_target_is_supported(
-                "loader_base", (gpointer)range.base_address) ||
-            peak_general_listener_attach_target_is_supported(
-                "loader_end", (gpointer)(range.base_address + range.size - 1))) {
-            fputs("unsafe override allowed the ELF loader range\n", stderr);
-            gum_deinit_embedded();
+        const ElfW(Ehdr)* elf = (const void*)range.base_address;
+        const ElfW(Phdr)* headers = (const void*)(range.base_address + elf->e_phoff);
+        for (size_t i = 0; i < elf->e_phnum; i++) {
+            if (headers[i].p_type != PT_LOAD || !(headers[i].p_flags & PF_X))
+                continue;
+            if (peak_general_listener_attach_target_is_supported(
+                    "loader_code", (gpointer)(range.base_address + headers[i].p_vaddr))) {
+                fputs("unsafe override allowed loader executable segment\n", stderr);
+                return EXIT_FAILURE;
+            }
+        }
+        void* code = mmap((void*)(range.base_address - 4096), 4096,
+                          PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (code == MAP_FAILED ||
+            !peak_general_listener_attach_target_is_supported("anonymous_jit", code)) {
+            fputs("loader policy rejected anonymous JIT mapping\n", stderr);
             return EXIT_FAILURE;
         }
+        munmap(code, 4096);
     }
     if (!peak_general_listener_attach_target_is_supported(
             "ordinary_libc", (gpointer)puts)) {

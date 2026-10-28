@@ -28,7 +28,24 @@ GUM_API gpointer gum_arm64_reader_try_get_relative_jump_target(
 
 static gsize peak_attach_policy_initialized = 0;
 #if defined(__linux__)
-static GumMemoryRange peak_elf_loader_range = {0};
+static GArray* peak_elf_loader_ranges;
+
+static int
+peak_collect_loader_ranges(struct dl_phdr_info* info, size_t size, void* data)
+{
+    GumAddress base = *(GumAddress*)data;
+    (void)size;
+    if ((GumAddress)info->dlpi_addr != base)
+        return 0;
+    for (size_t i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* header = &info->dlpi_phdr[i];
+        if (header->p_type == PT_LOAD && (header->p_flags & PF_X)) {
+            GumMemoryRange range = {base + header->p_vaddr, header->p_memsz};
+            g_array_append_val(peak_elf_loader_ranges, range);
+        }
+    }
+    return 1;
+}
 #endif
 static gboolean peak_allow_unsafe_gum_prologue = FALSE;
 static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
@@ -45,13 +62,10 @@ peak_general_listener_init_attach_policy_once(void)
      * identifies the actual loader without mistaking the main executable. */
     if (loader_base == 0 && &_r_debug != NULL)
         loader_base = _r_debug.r_ldbase;
-    if (loader_base != 0) {
-        GumModule* loader = gum_process_find_module_by_address(loader_base);
-        if (loader != NULL) {
-            peak_elf_loader_range = *gum_module_get_range(loader);
-            g_object_unref(loader);
-        }
-    }
+    /* Gum's module extent can span anonymous mappings between ELF segments. */
+    peak_elf_loader_ranges = g_array_new(FALSE, FALSE, sizeof(GumMemoryRange));
+    if (loader_base != 0)
+        dl_iterate_phdr(peak_collect_loader_ranges, &loader_base);
 #endif
 
     peak_allow_unsafe_gum_prologue =
@@ -116,11 +130,14 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     }
     /* The ELF loader has private resolver calling conventions that cannot
      * be intercepted with ordinary function entry hooks. */
-    if (GUM_MEMORY_RANGE_INCLUDES(&peak_elf_loader_range,
-                                 (GumAddress)address)) {
-        peak_log_info("[peak] skipping Gum attach for hook %s: target belongs to ELF loader infrastructure; target will remain unprofiled\n",
-                      symbol_name != NULL ? symbol_name : "<unknown>");
-        return FALSE;
+    for (guint i = 0; i < peak_elf_loader_ranges->len; i++) {
+        const GumMemoryRange* range = &g_array_index(
+            peak_elf_loader_ranges, GumMemoryRange, i);
+        if (GUM_MEMORY_RANGE_INCLUDES(range, (GumAddress)address)) {
+            peak_log_info("[peak] skipping Gum attach for hook %s: target belongs to ELF loader infrastructure; target will remain unprofiled\n",
+                          symbol_name != NULL ? symbol_name : "<unknown>");
+            return FALSE;
+        }
     }
 #endif
 
