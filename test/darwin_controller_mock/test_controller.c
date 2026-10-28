@@ -13,6 +13,7 @@ static gboolean bad_pc, bad_bytes, bad_identity, endless;
 static int prepare_result;
 static gboolean clone_mode, other_page_change, map_failure, writable_source;
 static unsigned int allocations;
+static int region_mode;
 static gboolean peer_held[PEAK_DARWIN_MAX_THREADS];
 unsigned int mach_task_self(void) { return 1; }
 thread_act_t mach_thread_self(void) { return 1; }
@@ -50,6 +51,19 @@ kern_return_t mach_port_deallocate(unsigned int task, unsigned int t) {
 }
 kern_return_t vm_deallocate(unsigned int task, vm_address_t a, vm_size_t n) {
     (void)task; (void)n; free((void*)a); return 0;
+}
+kern_return_t mach_vm_region_recurse(unsigned int task, mach_vm_address_t* address,
+    mach_vm_size_t* size, natural_t* depth, vm_region_recurse_info_t raw,
+    mach_msg_type_number_t* count) {
+    (void)task; (void)address; (void)depth; (void)count;
+    vm_region_submap_info_data_64_t* info = (void*)raw;
+    if (region_mode == 1) return KERN_INVALID_ARGUMENT;
+    if (region_mode == 5) { *count = 0; return KERN_SUCCESS; }
+    if (region_mode == 2) { *size = 1; return KERN_SUCCESS; }
+    info->is_submap = region_mode == 3 || (region_mode == 4 && *depth == 0);
+    info->protection = writable_source ? 3 : (VM_PROT_READ | VM_PROT_EXECUTE);
+    *size = 4096;
+    return KERN_SUCCESS;
 }
 gboolean gum_memory_can_remap_writable(void) { return !clone_mode; }
 gboolean gum_memory_query_protection(const void* p, GumPageProtection* protection) {
@@ -162,6 +176,17 @@ int main(void) {
     reset(); clone_mode = writable_source = TRUE;
     assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
     assert(suspended == 0 && allocations == 0);
+    for (int mode = 1; mode <= 3; mode++) {
+        reset(); clone_mode = TRUE; region_mode = mode;
+        assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+        assert(suspended == 0 && allocations == 0);
+    }
+    reset(); clone_mode = TRUE; region_mode = 5;
+    assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(suspended == 0 && allocations == 0);
+    reset(); clone_mode = TRUE; region_mode = 4;
+    assert(peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(peak_detach_controller_finish_hook_mutation(&request, &status));
     reset(); prepare_result = -4;
     assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
     assert(strcmp(peak_detach_controller_last_failure_detail()->reason,

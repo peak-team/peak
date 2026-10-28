@@ -5,6 +5,7 @@
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -508,6 +509,45 @@ peak_darwin_cancel_stop_window(void)
     peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
 }
 
+/* Query leaf Mach mappings, including the shared-cache submap. */
+static gboolean
+peak_darwin_page_is_rx(uintptr_t page, gsize page_size)
+{
+    natural_t depth = 0;
+    for (guint attempt = 0; attempt != 32; attempt++) {
+        mach_vm_address_t start = page;
+        mach_vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &start,
+            &size, &depth, (vm_region_recurse_info_t)&info, &count);
+        if (kr != KERN_SUCCESS) {
+            peak_darwin_note_failure("clone-page-query-failed", 0, page, kr);
+            return FALSE;
+        }
+        if (count < VM_REGION_SUBMAP_INFO_COUNT_64) {
+            peak_darwin_note_failure("clone-page-query-short", 0, page, count);
+            return FALSE;
+        }
+        if (start > page || size < page_size || page - start > size - page_size) {
+            peak_darwin_note_failure("clone-page-query-range", 0, page, size);
+            return FALSE;
+        }
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+        if (info.protection != (VM_PROT_READ | VM_PROT_EXECUTE)) {
+            peak_darwin_note_failure("clone-page-protection-unsupported", 0,
+                page, info.protection);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    peak_darwin_note_failure("clone-page-submap-depth", 0, page, depth);
+    return FALSE;
+}
+
 static gboolean
 peak_darwin_prepare_writable_alias(const PeakDarwinPatchPlan* plan,
                                    PeakDetachStatus* status_out)
@@ -534,10 +574,7 @@ peak_darwin_prepare_writable_alias(const PeakDarwinPatchPlan* plan,
     if (!gum_memory_can_remap_writable()) {
         gsize size = page_count * page_size;
         for (guint i = 0; i < page_count; i++) {
-            GumPageProtection protection;
-            if (!gum_memory_query_protection((gpointer)(first_page + i * page_size),
-                    &protection) || protection != GUM_PAGE_RX) {
-                peak_darwin_note_failure("clone-page-protection-unsupported", 0, address, i);
+            if (!peak_darwin_page_is_rx(first_page + i * page_size, page_size)) {
                 peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
                 return FALSE;
             }

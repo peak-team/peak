@@ -1343,6 +1343,8 @@ extern const guint8 __stop_peak_listener_fast_dispatch[];
  */
 #if defined(PEAK_ATTACH_RUNTIME)
 /* Existing threads allocate this TLS block on first access after injection. */
+static __thread GumInvocationListener* peak_calibration_listener;
+static __thread guint peak_calibration_callbacks;
 static __thread PeakGeneralThreadState thread_data;
 #else
 static __thread PeakGeneralThreadState thread_data
@@ -6331,7 +6333,11 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     if (G_UNLIKELY(thread_data.in_callback)) {
         return;
     }
-    if (G_UNLIKELY(pthread_listener_current_thread_excluded())) {
+    if (G_UNLIKELY(pthread_listener_current_thread_excluded())
+#ifdef PEAK_ATTACH_RUNTIME
+        && listener != peak_calibration_listener
+#endif
+        ) {
         return;
     }
     thread_data.in_callback = TRUE;
@@ -6360,6 +6366,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
     gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
+#ifdef PEAK_ATTACH_RUNTIME
+    if ((GumInvocationListener*)self == peak_calibration_listener)
+        peak_calibration_callbacks++;
+#endif
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -6511,7 +6521,11 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     PeakGeneralListener* self = user_data;
 
     if (G_UNLIKELY(thread_data.in_callback) ||
-        G_UNLIKELY(pthread_listener_current_thread_excluded()) ||
+        (G_UNLIKELY(pthread_listener_current_thread_excluded())
+#ifdef PEAK_ATTACH_RUNTIME
+         && (GumInvocationListener*)self != peak_calibration_listener
+#endif
+        ) ||
         G_UNLIKELY(thread_data.fast_ignore_level != 0) ||
         G_UNLIKELY(atomic_load_explicit(&peak_general_callbacks_suspended,
                                         memory_order_acquire))) {
@@ -6546,6 +6560,10 @@ peak_general_listener_fast_on_enter(gpointer user_data,
 
     gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
+#ifdef PEAK_ATTACH_RUNTIME
+    if ((GumInvocationListener*)self == peak_calibration_listener)
+        peak_calibration_callbacks++;
+#endif
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -7334,6 +7352,11 @@ peak_general_overhead_bootstrapping()
     const guint n_tests = 1000;
     const guint calls_per_test = 32;
     double* time = g_new(double, n_tests * 2);
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_calibration_listener = listener_bootstrapping;
+    peak_calibration_callbacks = 0;
+    pthread_listener_calibration_begin();
+#endif
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
         for (guint call = 0; call < calls_per_test; call++) {
@@ -7343,6 +7366,11 @@ peak_general_overhead_bootstrapping()
             (peak_second() - time[n_tests + i]) / calls_per_test;
     }
 
+#ifdef PEAK_ATTACH_RUNTIME
+    guint calibration_callbacks = peak_calibration_callbacks;
+    peak_calibration_listener = NULL;
+    pthread_listener_calibration_end();
+#endif
     mutation_request.listener = listener_bootstrapping;
     mutation_request.operation = PEAK_DETACH_OPERATION_DETACH;
     startup_attach_can_skip_stop =
@@ -7404,6 +7432,13 @@ peak_general_overhead_bootstrapping()
     if (peak_general_overhead <= 0.0) {
         peak_general_overhead = peak_general_overhead_floor;
     }
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_info("[peak] attach overhead calibration: callbacks=%u excluded=%d cost_seconds=%.9g\n",
+        calibration_callbacks, pthread_listener_current_thread_excluded(), peak_general_overhead);
+    if (calibration_callbacks != n_tests * calls_per_test) {
+        peak_log_warn("[peak] attach overhead calibration did not exercise every profiling callback\n");
+    }
+#endif
     g_free(time);
 }
 

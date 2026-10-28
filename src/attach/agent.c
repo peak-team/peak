@@ -2,6 +2,7 @@
 #include "internal/attach_protocol.h"
 #include "internal/attach_runtime_config.h"
 #include "frida-gum.h"
+#include "pthread_listener.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -252,6 +253,7 @@ has_existing_runtime(void)
 static void *
 activate_runtime(void *data)
 {
+    pthread_listener_exclude_current_thread();
     gchar *socket_path = data;
     int fd = connect_controller(socket_path);
     GVariant *config = NULL, *dictionary = NULL;

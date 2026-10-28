@@ -1,6 +1,7 @@
 """Exercise the public attach executable against a non-preloaded live process."""
 import argparse
 import csv
+import math
 from concurrent.futures import ThreadPoolExecutor
 import os
 import re
@@ -202,7 +203,7 @@ else:
             alive(target, progress, root / "fixture.log")
             agent_options = ["--agent", str(args.agent.resolve())] if args.agent else []
             base = [cli, str(target.pid)] + agent_options
-            env.update(PEAK_HEARTBEAT_INTERVAL="0.05", PEAK_COST="0.01",
+            env.update(PEAK_HEARTBEAT_INTERVAL="0.05", PEAK_VERBOSITY="info",
                        PEAK_ENABLE_PER_TARGET_HEARTBEAT="1",
                        PEAK_ENABLE_GLOBAL_HEARTBEAT="1", PEAK_ENABLE_REATTACH="1",
                        PEAK_HIBERNATION_CYCLE="1", PEAK_REATTACH_COOLDOWN_MS="0",
@@ -316,6 +317,17 @@ else:
                        if line.startswith("statfs_guarded_calls=")]
             assert guarded and int(guarded[-1].split("=")[1]) > 0, guarded
             report(prefix)
+            if args.mode == "runtime":
+                calibration = re.findall(
+                    r"attach overhead calibration: callbacks=(\d+) excluded=(\d+) cost_seconds=([^\s]+)",
+                    (root / "fixture.log").read_text())
+                assert len(calibration) == 1, calibration
+                callbacks, excluded, cost = calibration[0]
+                assert (int(callbacks), int(excluded)) == (32000, 1), calibration
+                assert math.isfinite(float(cost)) and float(cost) > 0, calibration
+                with next(prefix.parent.glob(prefix.name + "*.csv")).open() as stream:
+                    assert not any(row.get("function") == "peak_general_overhead_dummy_func"
+                                   for row in csv.DictReader(stream))
             if args.mode == "runtime":
                 with (root / "detach.csv").open() as stream:
                     transitions = list(csv.reader(stream))

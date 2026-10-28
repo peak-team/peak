@@ -78,6 +78,7 @@ static __thread gboolean pthread_next_create_is_helper PEAK_PTHREAD_TLS_MODEL;
 static __thread gboolean pthread_thread_excluded PEAK_PTHREAD_TLS_MODEL;
 #ifdef PEAK_ATTACH_RUNTIME
 static __thread gboolean pthread_slot_registration_active;
+static __thread gboolean pthread_calibration_slot_allowed;
 static gboolean pthread_attach_ready;
 #endif
 static pthread_key_t pthread_slot_key;
@@ -355,7 +356,8 @@ static void
 pthread_listener_ensure_current_slot(void)
 {
     int saved_errno = errno;
-    if (!pthread_slot_identity.valid && !pthread_thread_excluded &&
+    if (!pthread_slot_identity.valid &&
+        (!pthread_thread_excluded || pthread_calibration_slot_allowed) &&
         !pthread_slot_registration_active && tid_mapping_initialized) {
         pthread_slot_registration_active = TRUE;
         if (pthread_listener_insert_thread_unlocked(pthread_self())) {
@@ -1105,6 +1107,23 @@ void
 pthread_listener_mark_next_created_thread_helper(void)
 {
     pthread_next_create_is_helper = TRUE;
+}
+
+void
+pthread_listener_calibration_begin(void)
+{
+#ifdef PEAK_ATTACH_RUNTIME
+    pthread_calibration_slot_allowed = TRUE;
+#endif
+}
+
+void
+pthread_listener_calibration_end(void)
+{
+#ifdef PEAK_ATTACH_RUNTIME
+    pthread_calibration_slot_allowed = FALSE;
+    pthread_listener_exclude_current_thread();
+#endif
 }
 
 gboolean
