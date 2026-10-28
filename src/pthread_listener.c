@@ -5,6 +5,8 @@
 #include "logging.h"
 #include "internal/pthread_slot_registry.h"
 #include "internal/signal_policy_internal.h"
+#include "internal/gum_module_mutation.h"
+#include "internal/unsafe_gum_prologue.h"
 #include "utils/env_parser.h"
 
 #include <errno.h>
@@ -54,7 +56,8 @@ static void pthread_listener_iface_init(gpointer g_iface, gpointer iface_data);
 static gboolean pthread_listener_insert_thread_unlocked(pthread_t tid);
 
 /*
- * The callback path reads only this initial-exec TLS record.  The pthread key
+ * The preload callback path uses initial-exec TLS; the injected runtime uses
+ * dynamic TLS so already-existing threads can acquire a record. The pthread key
  * is deliberately PEAK-owned: it keeps the identity alive across user TLS
  * destructors, whose ordering is unspecified by POSIX.
  */
@@ -65,12 +68,18 @@ typedef struct {
     gboolean valid;
 } PeakPthreadSlotIdentity;
 
-static __thread PeakPthreadSlotIdentity pthread_slot_identity
-    __attribute__((tls_model("initial-exec")));
-static __thread gboolean pthread_next_create_is_helper
-    __attribute__((tls_model("initial-exec")));
-static __thread gboolean pthread_thread_excluded
-    __attribute__((tls_model("initial-exec")));
+#ifdef PEAK_ATTACH_RUNTIME
+#define PEAK_PTHREAD_TLS_MODEL
+#else
+#define PEAK_PTHREAD_TLS_MODEL __attribute__((tls_model("initial-exec")))
+#endif
+static __thread PeakPthreadSlotIdentity pthread_slot_identity PEAK_PTHREAD_TLS_MODEL;
+static __thread gboolean pthread_next_create_is_helper PEAK_PTHREAD_TLS_MODEL;
+static __thread gboolean pthread_thread_excluded PEAK_PTHREAD_TLS_MODEL;
+#ifdef PEAK_ATTACH_RUNTIME
+static __thread gboolean pthread_slot_registration_active;
+static gboolean pthread_attach_ready;
+#endif
 static pthread_key_t pthread_slot_key;
 static pthread_once_t pthread_slot_key_once = PTHREAD_ONCE_INIT;
 static gboolean pthread_slot_key_created = FALSE;
@@ -333,8 +342,41 @@ pthread_listener_insert_thread_unlocked(pthread_t tid)
                                                         true);
         return FALSE;
     }
+    (void)peak_pthread_slot_registry_mark_kernel_tid(
+        &pthread_slot_registry, token, pthread_listener_current_kernel_tid());
     return TRUE;
 }
+
+#ifdef PEAK_ATTACH_RUNTIME
+/* An already-running thread has never passed PEAK's pthread start wrapper.
+ * Register it on its own first callback so the TLS destructor and kernel-TID
+ * lifetime proofs are identical to those of newly created threads. */
+static void
+pthread_listener_ensure_current_slot(void)
+{
+    int saved_errno = errno;
+    if (!pthread_slot_identity.valid && !pthread_thread_excluded &&
+        !pthread_slot_registration_active && tid_mapping_initialized) {
+        pthread_slot_registration_active = TRUE;
+        if (pthread_listener_insert_thread_unlocked(pthread_self())) {
+            PeakPthreadSlotToken token = {
+                .slot = pthread_slot_identity.slot,
+                .generation = pthread_slot_identity.generation,
+            };
+            bool became_exit_pending = false;
+            /* The joinability of a thread created before injection is unknown.
+             * Admit it to the kernel-TID reclamation path: retirement still
+             * requires its final TLS destructor AND /proc task absence. This
+             * proof also safely covers a pre-existing detached thread. */
+            (void)peak_pthread_slot_registry_mark_detached(
+                &pthread_slot_registry, pthread_self(), token.generation,
+                &became_exit_pending);
+        }
+        pthread_slot_registration_active = FALSE;
+    }
+    errno = saved_errno;
+}
+#endif
 
 #define PTHREAD_TYPE_LISTENER (pthread_listener_get_type())
 G_DECLARE_FINAL_TYPE(PthreadListener, pthread_listener, PTHREAD, LISTENER, GObject)
@@ -731,6 +773,77 @@ pthread_listener_get_reclamation_diagnostics(
     (void)pthread_mutex_unlock(&pthread_reclaim_mutex);
 }
 
+#ifdef PEAK_ATTACH_RUNTIME
+static gboolean
+pthread_listener_attach_support(const char* name, gpointer address,
+                                 gpointer replacement, gpointer* original,
+                                 size_t hook_id)
+{
+    if (address == NULL) return FALSE;
+    PeakDetachRequest request = {
+        .hook_id = hook_id,
+        .symbol_name = name,
+        .function_address = address,
+        .interceptor = pthread_create_interceptor,
+        .listener = replacement == NULL ? pthread_create_listener : NULL,
+        .operation = replacement == NULL ? PEAK_DETACH_OPERATION_ATTACH :
+                                          PEAK_DETACH_OPERATION_REPLACE,
+        .attach_options = replacement == NULL ? &pthread_create_attach_options : NULL,
+        .replacement_function = replacement,
+        .original_function = original,
+    };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    gboolean installed = FALSE;
+    peak_gum_module_mutation_begin();
+    gboolean prepared = replacement == NULL ?
+        peak_detach_controller_prepare_pthread_bootstrap(&request, &status) :
+        peak_detach_controller_prepare_hook_mutation(&request, &status);
+    if (prepared) {
+        if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+            /* Darwin staged the metadata and committed only prepared entry
+             * bytes while peers were held. Its original trampoline is ready. */
+            installed = TRUE;
+        } else {
+            gum_interceptor_begin_transaction(pthread_create_interceptor);
+            if (replacement == NULL) {
+                installed = gum_interceptor_attach(pthread_create_interceptor,
+                    address, pthread_create_listener, &pthread_create_attach_options)
+                    == GUM_ATTACH_OK;
+            } else {
+                installed = gum_interceptor_replace_fast(pthread_create_interceptor,
+                    address, replacement, original, NULL) == GUM_REPLACE_OK;
+            }
+            gum_interceptor_end_transaction(pthread_create_interceptor);
+        }
+        if (replacement == NULL) {
+            /* Publish while every peer is held. A resumed creator can enter
+             * the listener immediately after the helper releases its stop. */
+            peak_detach_controller_note_thread_creation_gate_installed(installed);
+        }
+        if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
+            peak_detach_controller_abort_after_failed_finish(
+                "attach pthread support finish", status);
+        }
+    }
+    peak_gum_module_mutation_end();
+    if (!installed) {
+        peak_log_warn("[peak] cannot install attach support hook %s (%s); profiling activation will be refused\n",
+                      name, peak_detach_controller_status_string(status));
+    }
+    return installed;
+}
+#endif
+
+gboolean
+pthread_listener_attach_ready(void)
+{
+#ifdef PEAK_ATTACH_RUNTIME
+    return pthread_attach_ready;
+#else
+    return TRUE;
+#endif
+}
+
 void pthread_listener_attach()
 {
     PeakEnvUnsignedSchema handshake_timeout_schema = {
@@ -748,7 +861,7 @@ void pthread_listener_attach()
         peak_parse_env_unsigned(&handshake_timeout_schema);
     tid_mapping_initialized = peak_pthread_slot_registry_init(
         &pthread_slot_registry, peak_max_num_threads);
-    if (tid_mapping_initialized) {
+    if (tid_mapping_initialized && !pthread_thread_excluded) {
         (void)pthread_listener_insert_thread_unlocked(pthread_self());
     }
 
@@ -756,6 +869,22 @@ void pthread_listener_attach()
     pthread_create_listener = g_object_new(PTHREAD_TYPE_LISTENER, NULL);
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Resolve every address before STOP. The support symbol lookup is the
+     * runtime's loaded-module lookup, never RTLD_NEXT from the injected DSO. */
+    pthread_create_hook_address = peak_general_listener_find_function("pthread_create");
+    pthread_join_hook_address = peak_general_listener_find_function("pthread_join");
+    pthread_detach_hook_address = peak_general_listener_find_function("pthread_detach");
+    pthread_attach_ready = tid_mapping_initialized &&
+        pthread_listener_attach_support("pthread_create", pthread_create_hook_address,
+            NULL, NULL, SIZE_MAX - 3) &&
+        pthread_listener_attach_support("pthread_join", pthread_join_hook_address,
+            (gpointer)peak_pthread_join, (gpointer*)&original_pthread_join,
+            SIZE_MAX - 2) &&
+        pthread_listener_attach_support("pthread_detach", pthread_detach_hook_address,
+            (gpointer)peak_pthread_detach, (gpointer*)&original_pthread_detach,
+            SIZE_MAX - 1);
+#else
     gum_interceptor_begin_transaction(pthread_create_interceptor);
     pthread_create_hook_address =
         peak_general_listener_find_function("pthread_create");
@@ -787,6 +916,8 @@ void pthread_listener_attach()
                                     NULL);
     }
     gum_interceptor_end_transaction(pthread_create_interceptor);
+
+#endif
 
 #if defined(__linux__)
     if (pthread_task_directory_fd < 0) {
@@ -844,6 +975,11 @@ pthread_listener_log_reclamation_diagnostics(void)
 
 gboolean pthread_listener_dettach()
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Existing application threads may still own Gum invocations or PEAK TLS
+     * destructors during process exit. Keep every reachable support object. */
+    return FALSE;
+#endif
     if (pthread_create_interceptor == NULL) {
         return TRUE;
     }
@@ -905,6 +1041,9 @@ size_t pthread_listener_lookup_thread(pthread_t thread, gboolean* found)
 gboolean
 pthread_listener_current_thread_slot(size_t* slot_out)
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    pthread_listener_ensure_current_slot();
+#endif
     if (!pthread_slot_identity.valid) {
         return FALSE;
     }
@@ -918,6 +1057,9 @@ gboolean
 pthread_listener_current_thread_token(size_t* slot_out,
                                       uint64_t* generation_out)
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    pthread_listener_ensure_current_slot();
+#endif
     if (!pthread_slot_identity.valid) {
         return FALSE;
     }

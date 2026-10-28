@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "mpi_interceptor.h"
 #include "general_listener.h"
+#include "detach_controller.h"
+#include "internal/gum_module_mutation.h"
 #include "internal/mpi_teardown_guard.h"
 #include "logging.h"
 #include "utils/env_parser.h"
@@ -52,6 +54,7 @@ static _Atomic unsigned int peak_finalize_test_original_calls;
 static int (*original_pmpi_finalize)(void);
 extern void peak_fini(void);
 
+#ifndef PEAK_ATTACH_RUNTIME
 typedef int (*PeakMpiInitFunction)(int*, char***);
 typedef int (*PeakMpiInitThreadFunction)(int*, char***, int, int*);
 
@@ -64,6 +67,7 @@ static pthread_once_t real_pmpi_init_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_mpi_init_thread_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_pmpi_init_thread_once = PTHREAD_ONCE_INIT;
 static _Thread_local unsigned int peak_mpi_init_wrapper_depth;
+#endif
 
 static void
 mpi_interceptor_configure_finalize_owner_timeout(void)
@@ -298,6 +302,7 @@ failed_closed:
     return MPI_ERR_OTHER;
 }
 
+#ifndef PEAK_ATTACH_RUNTIME
 static void
 mpi_interceptor_resolve_mpi_init_once(void)
 {
@@ -416,6 +421,8 @@ PMPI_Init_thread(int* argc, char*** argv, int required, int* provided)
                                             provided);
 }
 
+#endif /* !PEAK_ATTACH_RUNTIME: MPI_Init interposition is startup-only. */
+
 static int
 mpi_interceptor_env_truthy(const char* value)
 {
@@ -469,6 +476,11 @@ mpi_interceptor_real_finalize_enabled(void)
 static int
 mpi_interceptor_restore_finalize_for_direct_call(void)
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Direct restoration mutates a callable entry while peers run. Keep the
+     * hook and invoke its original trampoline throughout attached sessions. */
+    return 0;
+#endif
     if (mpi_interceptor == NULL || hook_address == NULL) {
         return 0;
     }
@@ -623,8 +635,23 @@ int mpi_interceptor_attach()
     mpi_interceptor_configure_finalize_owner_timeout();
     mpi_interceptor = gum_interceptor_obtain();
 
-    gum_interceptor_begin_transaction(mpi_interceptor);
     hook_address = peak_general_listener_find_function("PMPI_Finalize");
+#ifdef PEAK_ATTACH_RUNTIME
+    PeakDetachRequest request = {
+        .hook_id = SIZE_MAX - 32, .symbol_name = "PMPI_Finalize",
+        .function_address = hook_address, .interceptor = mpi_interceptor,
+        .operation = PEAK_DETACH_OPERATION_REPLACE,
+    };
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    peak_gum_module_mutation_begin();
+    if (!peak_detach_controller_prepare_hook_mutation(&request, &status)) {
+        peak_gum_module_mutation_end();
+        peak_log_warn("[peak] cannot safely attach MPI finalization hook (%s)\n",
+                      peak_detach_controller_status_string(status));
+        return -1;
+    }
+#endif
+    gum_interceptor_begin_transaction(mpi_interceptor);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
                                                      hook_address, &peak_pmpi_finalize,
@@ -632,6 +659,12 @@ int mpi_interceptor_attach()
                                                      NULL);
     }
     gum_interceptor_end_transaction(mpi_interceptor);
+#ifdef PEAK_ATTACH_RUNTIME
+    if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
+        peak_detach_controller_abort_after_failed_finish("MPI attach finish", status);
+    }
+    peak_gum_module_mutation_end();
+#endif
     return replace_check;
 }
 
@@ -695,6 +728,11 @@ mpi_interceptor_test_original_finalize_call_count(void)
 
 void mpi_interceptor_dettach(int allow_delayed_finalize)
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Process exit can overlap another thread's finalization trampoline. */
+    (void)allow_delayed_finalize;
+    return;
+#endif
     (void)allow_delayed_finalize;
 
     if (mpi_interceptor == NULL || hook_address == NULL) {

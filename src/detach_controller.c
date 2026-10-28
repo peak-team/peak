@@ -48,6 +48,9 @@ static _Atomic unsigned long long
     peak_detach_accounting_stop_window_wall_ns = 0;
 static _Atomic unsigned long long peak_detach_accounting_sequence = 0;
 static _Atomic int peak_detach_mpi_process = 0;
+#ifdef PEAK_ATTACH_RUNTIME
+static __thread gboolean peak_pthread_bootstrap_active;
+#endif
 
 static unsigned long long
 peak_detach_controller_seconds_to_ns(double seconds)
@@ -724,6 +727,15 @@ peak_detach_controller_init_backend_configuration_once(void)
     }
 #endif
 
+#ifdef PEAK_ATTACH_RUNTIME
+    /* A dlopen-loaded runtime cannot interpose the application's already-bound
+     * signal APIs. Never reserve a signal or fall back to that backend. */
+    if (requested_backend == PEAK_DETACH_REQUESTED_BACKEND_SIGNAL) {
+        peak_log_warn("[peak] attach runtime requires the ptrace detach helper; PEAK_DETACH_BACKEND=signal cannot protect an already-running process\n");
+    }
+    requested_backend = PEAK_DETACH_REQUESTED_BACKEND_HELPER;
+    ptrace_requires_signal = FALSE;
+#endif
     configured_requested_backend = requested_backend;
     configured_auto_ptrace_requires_signal = ptrace_requires_signal;
     configured_auto_ptrace_scope = ptrace_scope;
@@ -1352,7 +1364,11 @@ peak_detach_controller_ensure_helper(PeakDetachStatus* status_out)
         return FALSE;
     }
 
-    if (!peak_detach_controller_thread_creation_gate_installed()) {
+    if (!peak_detach_controller_thread_creation_gate_installed()
+#ifdef PEAK_ATTACH_RUNTIME
+        && !peak_pthread_bootstrap_active
+#endif
+    ) {
         if (!warned_helper_gate_unavailable) {
             warned_helper_gate_unavailable = TRUE;
             g_printerr("[peak] strict helper detach requested, but pthread_create interception is not installed; refusing helper-backed physical mutation\n");
@@ -4930,6 +4946,33 @@ peak_detach_controller_configure_trace_diagnostics(gboolean enabled)
 #endif
 }
 
+#ifdef PEAK_ATTACH_RUNTIME
+gboolean
+peak_detach_controller_prepare_pthread_bootstrap(
+    const PeakDetachRequest* request, PeakDetachStatus* status_out)
+{
+    /* Do not advertise a creation gate until its listener really exists. The
+     * helper repeatedly stops and verifies every peer, including creators that
+     * crossed before the snapshot. The sole running controller must not create
+     * threads until finish. ATTACH rejects live entry PCs without evacuation. */
+    if (request == NULL || request->operation != PEAK_DETACH_OPERATION_ATTACH ||
+        request->symbol_name == NULL ||
+        strcmp(request->symbol_name, "pthread_create") != 0 ||
+        peak_pthread_bootstrap_active) {
+        if (status_out != NULL) *status_out = PEAK_DETACH_STATUS_ERROR;
+        return FALSE;
+    }
+    peak_pthread_bootstrap_active = TRUE;
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation(request,
+                                                                     status_out);
+    peak_pthread_bootstrap_active = FALSE;
+    if (!prepared) {
+        peak_log_warn("[peak] attach pthread bootstrap could not stop the process safely; check ptrace permissions, an existing debugger, and PEAK_DETACH_HELPER\n");
+    }
+    return prepared;
+}
+#endif
+
 gboolean
 peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
                                              PeakDetachStatus* status_out)
@@ -5378,7 +5421,11 @@ peak_detach_controller_prepare_hook_mutation_batch(
         }
         if (requests[i].operation != PEAK_DETACH_OPERATION_ATTACH &&
             requests[i].operation != PEAK_DETACH_OPERATION_DETACH &&
-            requests[i].operation != PEAK_DETACH_OPERATION_REATTACH) {
+            requests[i].operation != PEAK_DETACH_OPERATION_REATTACH
+#ifdef PEAK_ATTACH_RUNTIME
+            && requests[i].operation != PEAK_DETACH_OPERATION_REPLACE
+#endif
+        ) {
             results[i].status = PEAK_DETACH_STATUS_UNSUPPORTED;
             continue;
         }

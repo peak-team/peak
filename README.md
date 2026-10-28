@@ -29,6 +29,8 @@ safe attach and detach behavior, and reliable final reports matter.
 - Profile named functions instead of instrumenting the whole application.
 - Inject PEAK around existing Linux and macOS applications without rebuilding
   them.
+- Attach the full PEAK runtime to an already running Linux or macOS Arm64
+  process with the separate `peak-attach` executable.
 - Control profiling overhead by detaching and reattaching selected targets.
 - Produce human-readable and CSV reports, including MPI-aware aggregation.
 - On Linux, optionally profile CUDA kernels, memory activity, and JIT-published
@@ -79,7 +81,8 @@ built or installed outside the protected system locations.
 
 - Linux for the full `LD_PRELOAD` runtime path, or macOS for named CPU function
   profiling through `DYLD_INSERT_LIBRARIES` (including physical detach and
-  reattach on Arm64)
+  reattach on Arm64); `PEAK_BUILD_ATTACH=ON` additionally enables Linux
+  x86_64/Arm64 and macOS Arm64 live attach through `peak-attach`
 - CMake 3.13 or newer
 - C and C++ compilers (a Fortran compiler is needed only for
   `PEAK_ENABLE_FORTRAN_TESTS=ON`)
@@ -132,6 +135,10 @@ Common CMake options:
 | `BUILD_TESTING=ON` | Build the CTest suite. `BUILD_TESTS=ON` is also accepted. |
 | `PEAK_BUILD_BENCHMARKS=ON` | Build benchmark and stress targets. |
 | `PEAK_ENABLE_JIT_RUNTIME_PRELOAD_TESTS=ON` | Enable opt-in real-runtime JIT preload tests when testing is enabled. |
+| `PEAK_BUILD_ATTACH=ON` | Build the Linux x86_64/Arm64 or macOS Arm64 `peak-attach` executable and its injected runtime. |
+
+See [Profiling an already running process](docs/process-attach.md) for the
+attach build requirements, command usage, configuration, and platform limits.
 
 After installation:
 
@@ -147,16 +154,19 @@ DYLD_INSERT_LIBRARIES="$HOME/.local/lib/libpeak.dylib" \
 ./target_application
 ```
 
-The macOS path supports startup attachment and reporting for named CPU
+The macOS preload path supports startup attachment and reporting for named CPU
 functions only while the process is still single-threaded. PEAK proves that
 condition before Gum initialization and refuses the entire activation without
 installing hooks if an early constructor or deferred post-MPI activation has
-already made the process multithreaded. Runtime `ATTACH`, `REPLACE`, and
-`REVERT` mutations fail closed as unsupported; PEAK therefore does not install
-its `dlopen` listener, `dlclose` guard, ownership thread, or dynamic-attach
-queue on macOS. The JIT metadata provider is also kept disabled on macOS.
-`PEAK_MEMORY_PROFILE` is also rejected explicitly rather than starting a
-partially supported memory profiler.
+already made the process multithreaded. With `PEAK_BUILD_ATTACH=ON`, the
+separate `peak-attach` executable also supports one-time initial attach on
+macOS Arm64. It installs the initial hook set through a staged Darwin patch
+operation while target threads are held safely. Later runtime `ATTACH`,
+`REPLACE`, and `REVERT` mutations still fail closed as unsupported; PEAK does
+not install its `dlopen` listener, `dlclose` guard, ownership thread, or
+automatic dynamic-library discovery queue on macOS. The JIT metadata provider
+is also kept disabled on macOS. `PEAK_MEMORY_PROFILE` is rejected explicitly
+rather than starting a partially supported memory profiler.
 
 On Arm64, PEAK supports zero-overhead physical detach and reattach for
 pthread-based workloads: it gates `pthread_create`, suspends the other
@@ -166,11 +176,11 @@ crossed the gate before it closed; this v1 does not claim to cover threads
 created directly through Mach APIs. If a thread is observed inside the
 overwritten prologue, PEAK resumes every thread and retries through the normal
 controller backoff; it deliberately does not single-step threads for liveness.
-Before startup attach, Apple Arm64 rejects any target entry that stock Gum would
-resolve to another address. Darwin v1 has no exact-entry attach, so profiling
-such a branch or thunk would silently attribute direct calls to the destination
-to the requested symbol; `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` cannot override this
-target-identity check.
+Before installing hooks on Apple Arm64, PEAK rejects any target entry that
+stock Gum would resolve to another address. Profiling such a branch or thunk
+would silently attribute direct calls to the destination to the requested
+symbol; `PEAK_ALLOW_UNSAFE_GUM_PROLOGUE` cannot override this target-identity
+check.
 
 Entry-byte mutation is eligible only when the canonical Gum context contains
 exactly the requested PEAK listener and has no replacement; a context shared by
@@ -179,8 +189,8 @@ At process exit, Darwin stops PEAK-owned controller work and writes the final
 report but leaves installed Gum hooks, listeners, and their reachable state
 alive for the operating system to reclaim; it does not claim an unheld final
 shutdown mutation is safe. The Linux detach helper, raw-syscall exec handling,
-CUDA profiling, memory profiling, runtime dynamic attach, and Linux
-signal-policy interception remain Linux-only. macOS CI builds and installs
+CUDA profiling, memory profiling, automatic dynamic-library discovery, and
+Linux signal-policy interception remain Linux-only. macOS CI builds and installs
 PEAK on Arm64 and runs real `DYLD_INSERT_LIBRARIES` profiling plus startup
 rejection, redirect-attribution rejection, and single- and multithreaded
 physical detach/reattach lifecycle tests with MPI, CUDA, and OTF2 disabled.

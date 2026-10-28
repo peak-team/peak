@@ -1309,6 +1309,18 @@ def main():
             "CUDA physical detach must retain Gum trampoline state")
     require("cuda_interceptor = NULL" not in detach,
             "CUDA physical detach must keep interceptor state referenced")
+    # Attached sessions retain every callable hook and map at process exit;
+    # only the normal preload path attempts physical teardown and destruction.
+    attached_start = detach.find("#ifdef PEAK_ATTACH_RUNTIME")
+    attached_end = detach.find("#endif", attached_start)
+    require(0 <= attached_start < attached_end and
+            "peak_cuda_finalize_pending()" in detach[attached_start:attached_end] and
+            "peak_cuda_note_retained_state()" in detach[attached_start:attached_end] and
+            "return;" in detach[attached_start:attached_end] and
+            "gum_interceptor_" not in detach[attached_start:attached_end] and
+            "g_hash_table_destroy" not in detach[attached_start:attached_end],
+            "attached CUDA exit must finalize events and retain callable state")
+    detach = detach[:attached_start] + detach[attached_end:]
     active_guard = detach.find("if (active_cuda_wrappers != 0)")
     finalize = detach.find("peak_cuda_finalize_pending()")
     require(active_guard != -1 and finalize != -1 and

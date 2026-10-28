@@ -77,6 +77,9 @@ struct _PthreadState {
  */
 void pthread_listener_attach();
 
+/** Whether all support hooks required by late attach were installed. */
+gboolean pthread_listener_attach_ready(void);
+
 /**
  * @brief Attempts to remove pthread hooks and release Gum listener objects.
  *

@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "malloc_interceptor.h"
 #include "malloc_otf2.h"
+#include "detach_controller.h"
+#include "internal/gum_module_mutation.h"
 #include "internal/general_listener/output_identity.h"
 #include "internal/general_listener/report_snapshot.h"
 #include "logging.h"
@@ -168,6 +170,14 @@ peak_malloc_test_should_force_standard_replace(const char* name)
 #define PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name) \
     gum_interceptor_replace_fast(malloc_interceptor, _addr, _hook, \
                                  (gpointer*)(&_orig), NULL)
+#endif
+
+#ifdef PEAK_ATTACH_RUNTIME
+/* Dynamic TLS first touch may allocate. Standard Gum replacement keeps its
+ * recursion guard active while the wrapper obtains that thread's TLS. */
+#undef PEAK_MALLOC_REPLACE_FAST
+#define PEAK_MALLOC_REPLACE_FAST(_addr, _hook, _orig, _name) \
+    GUM_REPLACE_WRONG_SIGNATURE
 #endif
 
 /*=========================
@@ -1842,14 +1852,47 @@ malloc_interceptor_attach(void)
         peak_memlog_finalize();
         return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
     }
-    gum_interceptor_begin_transaction(malloc_interceptor);
-
     malloc_addr        = (void*) malloc;
     free_addr          = (void*) free;
     calloc_addr        = (void*) calloc;
     realloc_addr       = (void*) realloc;
     aligned_alloc_addr = (void*) aligned_alloc;
     posix_memalign_addr= (void*) posix_memalign;
+
+#ifdef PEAK_ATTACH_RUNTIME
+    gpointer addresses[] = {malloc_addr, free_addr, calloc_addr, realloc_addr,
+                            aligned_alloc_addr, posix_memalign_addr};
+    const char* names[] = {"malloc", "free", "calloc", "realloc",
+                           "aligned_alloc", "posix_memalign"};
+    PeakDetachRequest requests[G_N_ELEMENTS(addresses)] = {0};
+    PeakDetachBatchResult results[G_N_ELEMENTS(addresses)] = {0};
+    size_t prepared_count = 0;
+    PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
+    for (size_t i = 0; i < G_N_ELEMENTS(addresses); i++) {
+        requests[i] = (PeakDetachRequest){
+            .hook_id = SIZE_MAX - 16 - i, .symbol_name = names[i],
+            .function_address = addresses[i], .interceptor = malloc_interceptor,
+            .operation = PEAK_DETACH_OPERATION_REPLACE,
+        };
+    }
+    peak_gum_module_mutation_begin();
+    gboolean prepared = peak_detach_controller_prepare_hook_mutation_batch(
+        requests, G_N_ELEMENTS(requests), results, &prepared_count, &status);
+    if (!prepared || prepared_count != G_N_ELEMENTS(requests)) {
+        if (prepared && !peak_detach_controller_finish_hook_mutation_batch(&status)) {
+            peak_detach_controller_abort_after_failed_finish("memory attach refusal", status);
+        }
+        peak_gum_module_mutation_end();
+        peak_log_warn("[peak] memory attach could not obtain a safe window for every allocator (%s); no allocator hooks installed\n",
+                      peak_detach_controller_status_string(status));
+        g_object_unref(malloc_interceptor);
+        malloc_interceptor = NULL;
+        malloc_interceptor_release_tracking_tables();
+        peak_memlog_finalize();
+        return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
+    }
+#endif
+    gum_interceptor_begin_transaction(malloc_interceptor);
 
     DO_REPLACE_FAST(malloc_addr, custom_malloc, original_malloc, "malloc", malloc_replaced);
     DO_REPLACE_FAST(free_addr, custom_free, original_free, "free", free_replaced);
@@ -1877,6 +1920,12 @@ malloc_interceptor_attach(void)
 #endif
         malloc_interceptor_revert_all_in_transaction();
         gum_interceptor_end_transaction(malloc_interceptor);
+#ifdef PEAK_ATTACH_RUNTIME
+        if (!peak_detach_controller_finish_hook_mutation_batch(&status)) {
+            peak_detach_controller_abort_after_failed_finish("memory attach rollback", status);
+        }
+        peak_gum_module_mutation_end();
+#endif
         if (!malloc_interceptor_flush_rollback() ||
             !malloc_interceptor_wait_for_quiescence()) {
             peak_log_warn("[peak] fatal memory interceptor rollback was not proven safe after mutation\n");
@@ -1890,6 +1939,12 @@ malloc_interceptor_attach(void)
     }
 
     gum_interceptor_end_transaction(malloc_interceptor);
+#ifdef PEAK_ATTACH_RUNTIME
+    if (!peak_detach_controller_finish_hook_mutation_batch(&status)) {
+        peak_detach_controller_abort_after_failed_finish("memory attach finish", status);
+    }
+    peak_gum_module_mutation_end();
+#endif
 
     malloc_interceptor_attached = TRUE;
     peak_log_info("[peak] Memory allocation functions intercepted successfully\n");
@@ -1903,6 +1958,16 @@ malloc_interceptor_detach(void)
         return;
     }
     atomic_store_explicit(&cleanup_in_progress, 1, memory_order_release);
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Normal process exit may overlap surviving application threads. Close
+     * tracking, drain writers and emit results, retaining all callable hooks,
+     * original trampolines, TLS keys and tables until OS reclamation. */
+    if (malloc_interceptor_wait_for_quiescence()) {
+        peak_memlog_finalize();
+        memory_usage_log_print();
+    }
+    return;
+#endif
 
     gum_interceptor_begin_transaction(malloc_interceptor);
     if (malloc_addr)        gum_interceptor_revert(malloc_interceptor, malloc_addr);
