@@ -374,10 +374,12 @@ def namespace(module):
     if isinstance(module, type(sys)):
         return object.__getattribute__(module, '__dict__')
     return {}
+def observed_path(filename):
+    return filename if os.path.isabs(filename) else os.path.join(os.getcwd(), filename)
 def remember(module):
     filename = namespace(module).get('__file__')
     if isinstance(filename, str):
-        paths.add(os.path.abspath(filename))
+        paths.add(observed_path(filename))
 original_import = builtins.__import__
 def target_import(name, globals=None, locals=None, fromlist=(), level=0):
     module = original_import(name, globals, locals, fromlist, level)
@@ -397,9 +399,9 @@ def target_import_module(name, package=None):
     return module
 def audit(event, args):
     if event == 'import' and len(args) > 1 and isinstance(args[1], str):
-        paths.add(args[1])
+        paths.add(observed_path(args[1]))
     elif event == 'ctypes.dlopen' and args and isinstance(args[0], str):
-        paths.add(args[0])
+        paths.add(observed_path(args[0]) if '/' in args[0] else args[0])
 if hasattr(sys, 'addaudithook'):
     sys.addaudithook(audit)
 output, script = sys.argv[1:3]

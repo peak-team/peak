@@ -666,6 +666,21 @@ print("collector_saturation_originals_ok")
         if _imp.is_frozen('os'):
             collect(frozen_script)
         (root/'os.py').unlink()
+        audit_libs = root/'audit-libraries'
+        audit_libs.mkdir()
+        audit_library = audit_libs/'libaudit.so'
+        shutil.copy2(extension, audit_library)
+        for load_path in ('./libaudit.so', str(audit_library)):
+            audit_script = root/'audit-runtime.py'
+            audit_script.write_text('import ctypes, _ctypes, os\n'+
+                                    f'os.chdir({str(audit_libs)!r})\n'+
+                                    f'library = ctypes.CDLL({load_path!r})\n'+
+                                    'assert library.extension_function() == 19\n'
+                                    '_ctypes.dlclose(library._handle)\n'+
+                                    f'os.chdir({str(root)!r})\n')
+            audit_symbols = collect(audit_script, '--run-python')
+            assert f'{audit_library}!extension_function' in audit_symbols
+
         at_exit = root/'atexit-runtime.py'
         at_exit.write_text('import atexit\n'
                            'def load():\n    import ctypes\n'+
