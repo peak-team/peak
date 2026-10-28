@@ -17,8 +17,10 @@ void peak_general_listener_init_attach_policy(void);
  * The policy is initialized once from the process environment. Darwin Arm64
  * rejects targets that stock Gum would redirect to another entry because its
  * v1 backend has no exact-entry attach. That attribution check cannot be
- * overridden. Otherwise, an unsafe override bypasses the minimum-prologue and
- * relocation-safety checks.
+ * overridden. Linux also rejects loader infrastructure, interceptor errno/TLS
+ * primitives, and entries reserved by profiler support wrappers. These
+ * infrastructure checks cannot be overridden. Otherwise, an unsafe override
+ * bypasses the minimum-prologue and relocation-safety checks.
  */
 gboolean peak_general_listener_attach_target_is_supported(
     const char* symbol_name,

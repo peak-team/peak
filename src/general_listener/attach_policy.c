@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "internal/general_listener/attach_policy.h"
 
 #include "internal/general_listener/runtime_config.h"
@@ -6,8 +7,11 @@
 
 #include <dirent.h>
 #include <errno.h>
-#if defined(__APPLE__)
 #include <pthread.h>
+#include <string.h>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <sys/auxv.h>
 #endif
 
 #if defined(__APPLE__) && \
@@ -65,6 +69,42 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     const char* reason = NULL;
 
     peak_general_listener_init_attach_policy();
+
+#if defined(__linux__)
+    /* Gum reads errno and its TLS guard before invoking listener recursion
+     * guards. Hooking these primitives recurses inside Gum itself. Compare
+     * entry addresses so libc aliases receive the same protection. */
+    if (address == (gpointer)__errno_location ||
+        address == (gpointer)pthread_getspecific ||
+        address == (gpointer)pthread_setspecific) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: errno/TLS accessor is required by the interceptor; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+    /* PEAK's ownership wrappers require exclusive replacement of these
+     * entries. An ordinary target listener would prevent that replacement.
+     * The internal dlopen support listener calls this policy with its literal
+     * name; ordinary startup dlopen targets are already skipped by the caller. */
+    if (address == (gpointer)dlclose ||
+        address == (gpointer)pthread_join ||
+        address == (gpointer)pthread_detach ||
+        (address == (gpointer)dlopen &&
+         (symbol_name == NULL || strcmp(symbol_name, "dlopen") != 0))) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: target is owned by a profiler support wrapper; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+    /* The ELF loader has private resolver calling conventions that cannot
+     * be intercepted with ordinary function entry hooks. */
+    Dl_info target_module = {0};
+    if (address != NULL && dladdr(address, &target_module) != 0 &&
+        getauxval(AT_BASE) != 0 &&
+        target_module.dli_fbase == (gpointer)getauxval(AT_BASE)) {
+        peak_log_info("[peak] skipping Gum attach for hook %s: target belongs to ELF loader infrastructure; target will remain unprofiled\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+#endif
 
 #if defined(__APPLE__) && \
     (defined(__arm64__) || defined(__aarch64__))

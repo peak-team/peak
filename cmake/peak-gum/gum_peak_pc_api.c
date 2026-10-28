@@ -1046,6 +1046,45 @@ _gum_function_context_end_invocation_peak_original(
 G_GNUC_INTERNAL PeakGumInterceptorThreadContext17 *
 peak_gum_get_interceptor_thread_context(void);
 
+#if defined(__linux__)
+G_GNUC_INTERNAL extern GumTlsKey peak_gum_interceptor_guard_key;
+static _Thread_local gpointer peak_gum_dispatch_interceptor
+    __attribute__((tls_model("initial-exec")));
+
+/* Bookkeeping may allocate or lock before a new thread's Gum context has
+ * been published. Use Gum's own guard so nested hooks bypass both PEAK and
+ * generic listener dispatch rather than recursively allocating a context. */
+static gpointer
+peak_gum_metadata_guard_enter(void)
+{
+    gpointer previous_guard = gum_tls_key_get_value(peak_gum_interceptor_guard_key);
+    gum_tls_key_set_value(peak_gum_interceptor_guard_key,
+                          peak_gum_dispatch_interceptor);
+    return previous_guard;
+}
+
+static void
+peak_gum_metadata_guard_leave(gpointer previous_guard)
+{
+    gum_tls_key_set_value(peak_gum_interceptor_guard_key, previous_guard);
+}
+
+static PeakGumInterceptorThreadContext17 *
+peak_gum_get_interceptor_thread_context_guarded(void)
+{
+    gpointer previous_guard = peak_gum_metadata_guard_enter();
+    PeakGumInterceptorThreadContext17 * context =
+        peak_gum_get_interceptor_thread_context();
+    peak_gum_metadata_guard_leave(previous_guard);
+    return context;
+}
+#else
+static gpointer peak_gum_metadata_guard_enter(void) { return NULL; }
+static void peak_gum_metadata_guard_leave(gpointer previous) { (void)previous; }
+#define peak_gum_get_interceptor_thread_context_guarded \
+    peak_gum_get_interceptor_thread_context
+#endif
+
 G_GNUC_INTERNAL extern GumSpinlock peak_gum_interceptor_thread_context_lock;
 G_GNUC_INTERNAL extern GHashTable *peak_gum_interceptor_thread_contexts;
 
@@ -1085,7 +1124,7 @@ peak_gum_invocation_stack(void)
 
     if (G_UNLIKELY(stack == NULL)) {
         PeakGumInterceptorThreadContext17 * thread_context =
-            peak_gum_get_interceptor_thread_context();
+            peak_gum_get_interceptor_thread_context_guarded();
 
         if (thread_context != NULL) {
             stack = thread_context->stack;
@@ -1663,13 +1702,24 @@ _gum_function_context_begin_invocation(
     gpointer * caller_ret_addr,
     gpointer * next_hop)
 {
+#if defined(__linux__)
+    peak_gum_dispatch_interceptor = function_ctx->interceptor;
+    /* Lazy Gum context allocation may itself invoke intercepted libc code.
+     * Honor Gum's guard before PEAK's reaping or depth snapshots touch it. */
+    if (peak_uw_internal != 0 ||
+        gum_tls_key_get_value(peak_gum_interceptor_guard_key) ==
+            function_ctx->interceptor)
+#else
     if (peak_uw_internal != 0)
+#endif
         return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
     gpointer peak_original_return = *caller_ret_addr;
+    gpointer metadata_guard = peak_gum_metadata_guard_enter();
     peak_uw_reap(caller_ret_addr);
 #if defined(__x86_64__)
     peak_gum_invocation_stack_reap_unwound(caller_ret_addr);
 #endif
+    peak_gum_metadata_guard_leave(metadata_guard);
     GumPeakFastListener * fast_listener =
         peak_gum_context_fast_listener_for_enter(function_ctx);
     PeakUwFrame *peak_reserved = NULL;
@@ -1681,7 +1731,9 @@ _gum_function_context_begin_invocation(
         function_ctx->function_address != (gpointer)_Unwind_GetRegionStart &&
         function_ctx->function_address != (gpointer)_Unwind_GetLanguageSpecificData;
     if (peak_needs_frame) {
+        metadata_guard = peak_gum_metadata_guard_enter();
         peak_reserved = peak_uw_prepare();
+        peak_gum_metadata_guard_leave(metadata_guard);
         if (peak_reserved == NULL) {
             /* Preserve Gum replacement/listener semantics on resource failure.
              * This is explicitly degraded admission, not a repaired EH path. */

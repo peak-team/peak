@@ -1,8 +1,14 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "internal/general_listener/attach_policy.h"
 
 #include <pthread.h>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <errno.h>
+#include <sys/auxv.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -82,6 +88,40 @@ main(void)
         gum_deinit_embedded();
         return EXIT_FAILURE;
     }
+#if defined(__linux__)
+    /* Exact entry addresses also cover aliases from a collected symbol file.
+     * The unsafe-prologue override above must not disable these safeguards. */
+    gpointer protected_entries[] = {
+        (gpointer)__errno_location,
+        (gpointer)pthread_getspecific,
+        (gpointer)pthread_setspecific,
+        (gpointer)dlclose,
+        (gpointer)pthread_join,
+        (gpointer)pthread_detach,
+        (gpointer)dlopen,
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(protected_entries); i++) {
+        if (peak_general_listener_attach_target_is_supported(
+                "collector_alias", protected_entries[i])) {
+            fputs("unsafe override allowed a protected runtime entry\n", stderr);
+            gum_deinit_embedded();
+            return EXIT_FAILURE;
+        }
+    }
+    const char *loader_names[] = {"_dl_find_dso_for_object", "_dl_allocate_tls"};
+    for (size_t i = 0; i < G_N_ELEMENTS(loader_names); i++) {
+        gpointer entry = dlsym(RTLD_DEFAULT, loader_names[i]);
+        Dl_info owner = {0};
+        if (entry != NULL && dladdr(entry, &owner) != 0 &&
+            getauxval(AT_BASE) != 0 &&
+            owner.dli_fbase == (gpointer)getauxval(AT_BASE) &&
+            peak_general_listener_attach_target_is_supported("collector_alias", entry)) {
+            fputs("unsafe override allowed an ELF loader entry\n", stderr);
+            gum_deinit_embedded();
+            return EXIT_FAILURE;
+        }
+    }
+#endif
     gum_deinit_embedded();
 
     puts("attach_policy_test_ok");

@@ -232,6 +232,60 @@ Set `PEAK_TEXT_OUTPUT=0` for per-function CSV-only output. Heartbeat
 profile/control/risk diagnostics are currently text-only. `PEAK_TARGET`,
 `PEAK_TARGET_GROUP`, and `PEAK_TARGET_FILE` are merged into one CPU target list.
 
+### Collecting targets from a program
+
+On Linux, `peak-collect-symbols` writes a sorted, deduplicated
+`PEAK_TARGET_FILE`-compatible selector list. It reads ELF symbol tables and
+includes symbols from the target and its transitive shared libraries. Install
+Python 3 and `readelf` from binutils first. For a native executable, collect
+the list and pass it to PEAK:
+
+```bash
+peak-collect-symbols ./target_application -o peak-targets.txt
+PEAK_TARGET_FILE=peak-targets.txt \
+LD_PRELOAD=/path/to/libpeak.so \
+./target_application
+```
+
+For Python, use the same interpreter and environment for collection and
+profiling. Discovery statically follows imports to find compiled extension
+modules and their native dependencies without running the script. It does not
+automatically target the interpreter executable or `libpython` internals:
+
+```bash
+peak-collect-symbols app.py --python /path/to/python -o peak-targets.txt
+PEAK_PROFILE_INTERPRETERS=1 \
+PEAK_TARGET_FILE=peak-targets.txt \
+LD_PRELOAD=/path/to/libpeak.so \
+/path/to/python app.py
+```
+
+Static discovery cannot see libraries loaded dynamically with `dlopen()` or
+`ctypes`; add their paths with repeated `--module` options. Alternatively,
+`--run-python` selects runtime-only discovery: it runs the script once and
+collects extensions observed through `sys.modules` or Python's audit events,
+plus native libraries loaded during that run. It excludes the interpreter's
+baseline mappings and cannot discover libraries used only on other code paths.
+Script output is sent to stderr.
+
+```bash
+peak-collect-symbols app.py --python /path/to/python --run-python \
+  --timeout 30 -o peak-targets.txt -- script-arg1 -v
+```
+
+`--run-python` uses a default 30-second timeout; arguments after `--` go to the
+script. Collection includes local and exported symbols still present in ELF
+symbol tables; symbols removed by stripping cannot be recovered. The file is
+an inventory of symbols in selected modules, not a promise that PEAK can attach
+to each one: PEAK skips unsafe runtime infrastructure such as loader, errno,
+TLS, and its own wrapper symbols. `PEAK_PROFILE_INTERPRETERS=1` allows the
+Python process to be profiled; it does not request interpreter internals. Pure
+Python functions have no native ELF symbols to instrument. Duplicate local
+names in one module or symbol versions may be ambiguous, aliases can share an
+address, and IFUNC support is not guaranteed. Large lists increase startup
+cost. Rebuild PEAK together with its bundled patched Frida Gum to use this
+feature.
+
 ### C++ target selectors
 
 For C++ targets, use a full demangled signature, an exact mangled name, or a

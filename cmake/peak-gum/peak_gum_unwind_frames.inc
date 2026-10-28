@@ -367,12 +367,14 @@ static void peak_uw_bind_gum_context(void) {
    * owners lock across it: our wrapped notify also takes that lock before
    * freeing an old context. The wrapper clears every stale pointer before
    * allocator reuse, and the returned current-thread context remains live. */
-  context = peak_gum_get_interceptor_thread_context();
+  gpointer metadata_guard = peak_gum_metadata_guard_enter();
+  context = peak_gum_get_interceptor_thread_context_guarded();
   g_mutex_lock(&peak_uw_owners_lock);
   if (__atomic_load_n(&peak_uw_thread->gum_context, __ATOMIC_RELAXED) == NULL)
     __atomic_store_n(&peak_uw_thread->gum_context, context,
                      __ATOMIC_RELAXED);
   g_mutex_unlock(&peak_uw_owners_lock);
+  peak_gum_metadata_guard_leave(metadata_guard);
 }
 static void peak_uw_release(PeakUwFrame **link);
 typedef struct {
