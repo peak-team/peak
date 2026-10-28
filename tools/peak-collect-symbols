@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Collect ELF function selectors without loading the inspected objects."""
 import argparse
+import _imp
 from collections import deque
 import ast
 import glob
@@ -242,8 +243,9 @@ class Collector:
                     raise CollectionError('cannot resolve dependency {!r} required by {}'.format(name, path))
                 aliases = self.inspect(found)[5]
                 # Reuse an object already selected under a matching SONAME.
-                found = next((selected[(abi, alias)] for alias in aliases
-                              if (abi, alias) in selected), found)
+                if '/' not in name:
+                    found = next((selected[(abi, alias)] for alias in aliases
+                                  if (abi, alias) in selected), found)
                 selected[(abi, name)] = found
                 for alias in self.inspect(found)[5]:
                     selected.setdefault((abi, alias), found)
@@ -254,7 +256,7 @@ class Collector:
 def python_info(interpreter):
     code = ('import sys,json,importlib.machinery;'
             'print(json.dumps({"executable":sys.executable,"version":list(sys.version_info[:2]),"path":sys.path,'
-            '"suffixes":importlib.machinery.EXTENSION_SUFFIXES}))')
+            '"builtins":list(sys.builtin_module_names),"suffixes":importlib.machinery.EXTENSION_SUFFIXES}))')
     return json.loads(run([interpreter, '-c', code]))
 
 
@@ -272,6 +274,8 @@ def static_python(script, info, collector):
 
     def locate(name):
         parts = name.split('.')
+        if parts[0] in info['builtins'] or _imp.is_frozen(parts[0]):
+            return None
         locations = roots
         qualified = []
         result = None
@@ -350,7 +354,7 @@ def runtime_python(script, interpreter, arguments, timeout):
     helper = r'''
 import sys
 initial_modules = set(sys.modules)
-import builtins, importlib, importlib.machinery, os
+import atexit, builtins, importlib, importlib.machinery, os
 paths = set()
 def mapped_paths():
     result = set()
@@ -405,14 +409,12 @@ main.__dict__.update(__file__=script, __package__=None, __spec__=None, __cached_
                      __builtins__=builtins.__dict__)
 with open(script, 'rb') as source:
     code = compile(source.read(), script, 'exec')
-for name in set(sys.modules) - initial_modules:
+for name in set(sys.modules) - initial_modules - {'atexit'}:
     del sys.modules[name]
 sys.modules['__main__'] = main
 builtins.__import__ = target_import
 importlib.import_module = target_import_module
-try:
-    exec(code, main.__dict__)
-finally:
+def finish():
     builtins.__import__ = original_import
     importlib.import_module = original_import_module
     for name, module in list(sys.modules.items()):
@@ -421,6 +423,9 @@ finally:
     paths.update(mapped_paths() - baseline)
     with open(output, 'w') as result:
         result.write(repr(sorted(paths)))
+# Registered first so target callbacks run before the final inventory.
+atexit.register(finish)
+exec(code, main.__dict__)
 '''
     with tempfile.TemporaryDirectory(prefix='peak-symbols-') as directory:
         receipt = Path(directory) / 'modules.json'
@@ -479,7 +484,8 @@ def main():
             collector.add(target if 'Requesting program interpreter:' in headers else visible_target)
         else:
             info = python_info(args.python)
-            if not args.run_python and info['version'] != list(sys.version_info[:2]):
+            if not args.run_python and (info['version'] != list(sys.version_info[:2])
+                    or Path(info['executable']).absolute() != Path(sys.executable).absolute()):
                 os.execv(info['executable'], [info['executable'], str(Path(__file__).resolve())] + sys.argv[1:])
             collector.root_origin = Path(info['executable']).resolve().parent
             if args.run_python:
