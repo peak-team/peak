@@ -24,19 +24,24 @@ def run(command, timeout=30, env=None, forward=False, parsed=False):
     """Bound external tools and reap their entire process group."""
     if parsed:
         env = dict(os.environ if env is None else env, LC_ALL='C')
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True, env=env)
+    destination = sys.stderr if forward else subprocess.PIPE
+    process = subprocess.Popen(command, stdout=destination, stderr=destination,
+                               text=not forward, start_new_session=True, env=env)
+    stdout, stderr = '', ''
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        if forward:
+            process.wait(timeout=timeout)
+        else:
+            stdout, stderr = process.communicate(timeout=timeout)
     except BaseException:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        stdout, stderr = process.communicate()
         if forward:
-            sys.stderr.write(stdout)
-            sys.stderr.write(stderr)
+            process.wait()
+        else:
+            process.communicate()
         raise
     finally:
         # A script can leave descendants behind after its direct process exits.
@@ -44,9 +49,6 @@ def run(command, timeout=30, env=None, forward=False, parsed=False):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    if forward:
-        sys.stderr.write(stdout)
-        sys.stderr.write(stderr)
     if process.returncode:
         raise CollectionError('{} failed ({}): {}'.format(command[0], process.returncode,
                                                         stderr.strip()[-4000:]))
@@ -64,6 +66,9 @@ class Collector:
         self.cache = {}
         self.library_dirs = [Path(p).resolve() for p in args.library_dir]
         self.ldcache = {}
+        self.hwcaps = None
+        self.hwcaps_checked = False
+        self.host_abi = None
         ldconfig = shutil.which('ldconfig') or '/sbin/ldconfig'
         if Path(ldconfig).exists():
             for line in run([ldconfig, '-p'], parsed=True).splitlines():
@@ -126,6 +131,55 @@ class Collector:
                 result.append(Path(item or '.').resolve())
         return result
 
+    def active_hwcaps(self, abi):
+        if not self.hwcaps_checked:
+            self.hwcaps_checked = True
+            self.host_abi = self.inspect(sys.executable)[0]
+            headers = run(['readelf', '-W', '-l', sys.executable], parsed=True)
+            match = re.search(r'Requesting program interpreter: ([^\]]+)\]', headers)
+            if match and Path(match[1]).name.startswith('ld-musl-'):
+                self.hwcaps = []  # musl does not implement glibc-hwcaps lookup.
+            elif match:
+                try:
+                    diagnostics = run([match[1], '--list-diagnostics'], parsed=True)
+                    subdirs = re.search(r'^dl_hwcaps_subdirs="([^"]*)"$', diagnostics, re.M)
+                    active = re.search(r'^dl_hwcaps_subdirs_active=(0x[0-9a-fA-F]+|[0-9]+)$', diagnostics, re.M)
+                    if subdirs and active:
+                        names = subdirs[1].split(':') if subdirs[1] else []
+                        mask = int(active[1], 0)
+                        self.hwcaps = [name for index, name in enumerate(names) if mask & (1 << index)]
+                except CollectionError:
+                    pass
+        if self.hwcaps is None or abi != self.host_abi:
+            raise CollectionError('glibc-hwcaps candidates require compatible local loader diagnostics; '
+                                  'cannot safely choose a library for this target ABI')
+        return self.hwcaps
+
+    def directory_candidates(self, directories, name, abi):
+        result = []
+        for directory in directories:
+            caproot = directory / 'glibc-hwcaps'
+            if caproot.is_dir() and any(path.is_file() for path in caproot.glob('*/' + name)):
+                for capability in self.active_hwcaps(abi):
+                    result.append(directory / 'glibc-hwcaps' / capability / name)
+            result.append(directory / name)
+        return result
+
+    def cached_candidates(self, name, abi):
+        candidates = [path for path in self.ldcache.get(name, []) if path.is_file()]
+        if not any('/glibc-hwcaps/' in str(path) for path in candidates):
+            return candidates
+        active = self.active_hwcaps(abi)
+        result = []
+        for path in candidates:
+            if '/glibc-hwcaps/' in str(path):
+                capability = str(path).split('/glibc-hwcaps/', 1)[1].split('/', 1)[0]
+                if capability in active:
+                    result.append((active.index(capability), path))
+            else:
+                result.append((len(active), path))
+        return [path for rank, path in sorted(result, key=lambda entry: entry[0])]
+
     def add(self, path):
         # Each explicitly selected root has a loader closure. Resolve siblings before
         # descendants so a direct dependency's SONAME wins over a nested request.
@@ -163,12 +217,13 @@ class Collector:
                     candidates = self.expand([name], path.parent)
                     candidates += [directory / Path(name).name for directory in self.library_dirs]
                 else:
-                    candidates = [directory / name for directory in search]
-                    candidates += self.ldcache.get(name, [])
-                    candidates += [Path(directory) / name for directory in
+                    candidates = self.directory_candidates(search, name, abi)
+                    candidates += self.cached_candidates(name, abi)
+                    system_dirs = [Path(directory) for directory in
                                    ('/lib', '/lib64', '/usr/lib', '/usr/lib64')]
-                    candidates += [Path(p) for p in glob.glob('/lib/*-linux-gnu/' + name)]
-                    candidates += [Path(p) for p in glob.glob('/usr/lib/*-linux-gnu/' + name)]
+                    system_dirs += [Path(p) for p in glob.glob('/lib/*-linux-gnu')]
+                    system_dirs += [Path(p) for p in glob.glob('/usr/lib/*-linux-gnu')]
+                    candidates += self.directory_candidates(system_dirs, name, abi)
                 found = None
                 for candidate in candidates:
                     if candidate.is_file():
@@ -192,14 +247,19 @@ class Collector:
 
 def python_info(interpreter):
     code = ('import sys,json,importlib.machinery;'
-            'print(json.dumps({"executable":sys.executable,"path":sys.path,'
+            'print(json.dumps({"executable":sys.executable,"version":list(sys.version_info[:2]),"path":sys.path,'
             '"suffixes":importlib.machinery.EXTENSION_SUFFIXES}))')
     return json.loads(run([interpreter, '-c', code]))
 
 
 def static_python(script, info, collector):
     """Follow filesystem imports, never import user code in this process."""
-    roots = [script.parent] + [Path(p or '.').resolve() for p in info['path']]
+    paths = list(info['path'])
+    # -c injects an empty first entry; a script replaces it with its own directory.
+    # Later empty entries may come from PYTHONPATH and must retain cwd semantics.
+    if paths and paths[0] == '':
+        paths[0] = str(script.parent)
+    roots = [Path(p or '.').resolve() for p in paths]
     queue = [(script, '')]
     seen = set()
     bundled = set()
@@ -295,8 +355,12 @@ def mapped_paths():
     return result
 baseline = mapped_paths()
 baseline_modules = set(sys.modules)
+def namespace(module):
+    if isinstance(module, type(sys)):
+        return object.__getattribute__(module, '__dict__')
+    return {}
 def remember(module):
-    filename = getattr(module, '__file__', None)
+    filename = namespace(module).get('__file__')
     if isinstance(filename, str):
         paths.add(os.path.abspath(filename))
 original_import = builtins.__import__
@@ -306,7 +370,7 @@ def target_import(name, globals=None, locals=None, fromlist=(), level=0):
     if not level and name in sys.modules:
         remember(sys.modules[name])
     for item in fromlist or ():
-        remember(getattr(module, item, None))
+        remember(namespace(module).get(item))
     return module
 original_import_module = importlib.import_module
 def target_import_module(name, package=None):
@@ -391,6 +455,8 @@ def main():
             collector.add(target)
         else:
             info = python_info(args.python)
+            if not args.run_python and info['version'] != list(sys.version_info[:2]):
+                os.execv(info['executable'], [info['executable'], str(Path(__file__).resolve())] + sys.argv[1:])
             collector.root_origin = Path(info['executable']).resolve().parent
             if args.run_python:
                 for module in runtime_python(target, args.python, arguments, args.timeout):
