@@ -52,7 +52,13 @@ def parse(root,label):
     final=re.findall(r'^process_seconds=(\S+) oracle=PASS$',text,re.M)
     if len(final)!=1 or not math.isfinite(float(final[0])) or float(final[0])<=0: raise ValueError('missing final PASS')
     if float(final[0])<sum(v['root_wall'] for v in phases.values()): raise ValueError('process shorter than measured phases')
-    return {'config':config[0],'scenario':scenario[0],'phases':phases,'process_seconds':float(final[0]),'bindings':bindings,'affinity_unique':affinity_unique}
+    exec_rows=[fields(line) for line in text.splitlines() if line.startswith('exec_interval rank=0 ')]
+    exec_seconds=None
+    if exec_rows:
+        if len(exec_rows)!=1:raise ValueError('duplicate exec interval')
+        e=exec_rows[0];begin=int(e['begin_ns']);end=int(e['end_ns']);exec_seconds=float(e['seconds'])
+        if begin<=0 or end<begin or not math.isfinite(exec_seconds) or not math.isclose(exec_seconds,(end-begin)/1e9,rel_tol=0,abs_tol=1e-9) or exec_seconds+1e-6<float(final[0]):raise ValueError('invalid exec interval')
+    return {'config':config[0],'scenario':scenario[0],'phases':phases,'process_seconds':float(final[0]),'bindings':bindings,'affinity_unique':affinity_unique,'exec_seconds':exec_seconds}
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--labels',nargs='+',required=True);p.add_argument('--require-unique-affinity',action='store_true');a=p.parse_args()

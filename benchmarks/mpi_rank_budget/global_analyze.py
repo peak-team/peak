@@ -113,19 +113,31 @@ def restoration_proof(text, parsed):
                 proofs.append({'completed_wave':wave,'hook_id':hook,'done_ns':done[wave],'physical_restore_ns':at,'baseline_calls':baseline,'final_calls':counts[hook]})
     return proofs
 
+def validate_meter(root,label,work,policy,global_mode):
+    if work.get('exec_seconds') is None:raise ValueError('missing meter interval')
+    for rank in range(int(work['config']['ranks'])):
+        out=(root/label/f'rank-{rank}.out').read_text()
+        er=re.findall(r'^exec_interval rank=(\d+) begin_ns=(\d+) end_ns=(\d+) seconds=([^\s]+)$',out,re.M)
+        if len(er)!=1 or int(er[0][0])!=rank or int(er[0][1])<=0 or int(er[0][2])<int(er[0][1]) or not math.isfinite(float(er[0][3])) or not math.isclose(float(er[0][3]),(int(er[0][2])-int(er[0][1]))/1e9,abs_tol=1e-9,rel_tol=0):raise ValueError('invalid/missing rank meter interval')
+        err=(root/label/f'rank-{rank}.err').read_text()
+        expected=f'bench_exec_meter entry_ld_preload=empty entry_ld_audit=empty policy={policy} global={int(global_mode)}'
+        if err.count(expected)!=1 or re.search(r'^PEAK done with: .*exec_meter',err,re.M):raise ValueError('missing native meter entry/policy proof')
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','escrow_targeted','all'),default='small');a=p.parse_args();cases={};errors={}
+    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','escrow_targeted','activation_probe','all'),default='small');a=p.parse_args();cases={};errors={}
     matrix=tuple(sy+'-'+la for sy in ('allreduce','barrier','bcast','ring','iallreduce') for la in ('rotating','slack','critical','aligned'))
     funded=tuple('funded-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     funded+=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     matrix22=matrix+('bcast-rotating-repeat1','bcast-rotating-repeat2')
-    selected={'escrow_targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'),'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
+    activation_cases=tuple(policy+'-'+name for policy in ('immediate','post-init') for name in ('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'))
+    selected={'activation_probe':activation_cases,'escrow_targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'),'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
     for name in selected:
       try:
         root=a.results/name;runs={l:workload(root,l) for l in LABELS};ref=runs['N0'];reports={}
         for l,r in runs.items():
             if int(r['config']['ranks'])!=32 or int(r['config']['threads'])!=6 or not r['affinity_unique'] or len(set(b['host'] for b in r['bindings'].values()))!=2:raise ValueError('invalid topology')
             if r['config']!=ref['config'] or r['scenario']!=ref['scenario'] or r['bindings']!=ref['bindings'] or any(r['phases'][s]['checksum']!=ref['phases'][s]['checksum'] for s in ('warmup','phase')):raise ValueError('mismatched workload')
+            if a.set=='activation_probe':validate_meter(root,l,r,'post-init' if name.startswith('post-init-') else 'immediate',l[0]=='G')
             if l[0] not in 'LG':continue
             perrank=[]
             expected={int(row['rank']):int(row['potential_profiled_calls']) for row in r['phases']['phase']['ranks']}
@@ -156,8 +168,8 @@ def main():
         groups={}
         for g,labels in {'native':('N0','N1'),'local':('L0','L1'),'global':('G0','G1')}.items():
             groups[g]={}
-            for metric in ('main','warmup_main','main_to_finalize'):
-                samples=[runs[l]['process_seconds'] if metric=='main_to_finalize' else runs[l]['phases']['phase']['root_wall']+(runs[l]['phases']['warmup']['root_wall'] if metric=='warmup_main' else 0) for l in labels]
+            for metric in (('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set=='activation_probe' else ('main','warmup_main','main_to_finalize')):
+                samples=[runs[l]['exec_seconds'] if metric=='exec_to_finalize' else runs[l]['process_seconds'] if metric=='main_to_finalize' else runs[l]['phases']['phase']['root_wall']+(runs[l]['phases']['warmup']['root_wall'] if metric=='warmup_main' else 0) for l in labels]
                 groups[g][metric]={'samples':samples,'mean':statistics.mean(samples)}
         for g in groups.values():
             for metric,v in g.items():v['ratio_to_native']=v['mean']/groups['native'][metric]['mean']
@@ -175,13 +187,14 @@ def main():
         cases[name]={'acceptance_findings':acceptance,'performance':groups,'coordination_diagnostics':coord,'reports':reports,'workloads':runs}
       except (OSError,ValueError,KeyError) as e:errors[name]=str(e)
     diagnostics={}
-    for name in ('diagnostic-short','diagnostic-funded'):
+    for name in (tuple(policy+'-'+name for policy in ('immediate','post-init') for name in ('diagnostic-short','diagnostic-funded')) if a.set=='activation_probe' else ('diagnostic-short','diagnostic-funded')):
         root=a.results/name
         if not root.exists():
             if a.require_diagnostics:errors[name]='missing requested diagnostic arm'
             continue
         try:
             work=workload(root,'D0');rows=[]
+            if a.set=='activation_probe':validate_meter(root,'D0',work,'post-init' if name.startswith('post-init-') else 'immediate',True)
             for rank in range(32):
                 text=(root/'D0'/f'rank-{rank}.err').read_text();parsed=timing_and_events(text)
                 local=peak(text);glob=global_report(text)
@@ -205,7 +218,7 @@ def main():
         # Keep all independently matched groups visible; pool all six samples equally.
         for group in ('native','local','global'):
             pooled[group]={}
-            for metric in ('main','warmup_main','main_to_finalize'):
+            for metric in (('main','warmup_main','main_to_finalize','exec_to_finalize') if a.set=='activation_probe' else ('main','warmup_main','main_to_finalize')):
                 samples=[sample for name in repeat_names for sample in cases[name]['performance'][group][metric]['samples']]
                 pooled[group][metric]={'samples':samples,'mean':statistics.mean(samples),'minimum':min(samples),'maximum':max(samples),'source_cases':list(repeat_names)}
         for group in pooled.values():

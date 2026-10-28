@@ -219,3 +219,23 @@ cases for all five synchronization modes, with `--profile-threads 6
 from the single-thread funded cases. The new source SHA256 is
 `726dc38ff93d40255304ce7d72a88549d660376e2a1334daa7743d2300c9b0ae`;
 older recorded runs retain their original workload source hash.
+
+The activation probe builds `exec_meter.c` as an independent native executable.
+Its wrapper clears `LD_PRELOAD` and `LD_AUDIT` before entering the meter. The meter
+checks this condition, records `CLOCK_MONOTONIC`, sets child preload/global mode
+and explicit `PEAK_MPI_ACTIVATION_POLICY=immediate` or `post-init`, then calls
+`execv`. `sync_pressure.c` optionally reads `PEAK_BENCH_EXEC_BEGIN_NS` and emits
+`exec_interval rank=... begin_ns=... end_ns=... seconds=...` after the original
+MPI_Finalize returns. This interval includes child environment setup, exec,
+loader/constructor activation and application work through MPI return. It excludes
+launcher/wrapper startup and the meter's own loader and entry-proof print.
+Existing phase and main-through-finalize measurements remain available.
+
+`global_analyze.py --set activation_probe --require-final-members
+--require-diagnostics` requires meter data and empty-preload/policy proof on every
+rank. It reports `exec_to_finalize` alongside the existing intervals, separately
+for both policies; missing meter records are errors. This probe isolates
+activation placement and does not assert an overhead improvement. The meter
+source SHA256 is `b679162c832e4d3ceafd8cde3ad6247cff731834ff2329a7b312c83b3639a9d8`;
+the pressure source with optional meter reporting is
+`6243c35a549c29456f0441acd9e1795fd759cb767988d25bcd95aaae07340fc1`.

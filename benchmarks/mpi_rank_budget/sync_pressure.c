@@ -123,7 +123,14 @@ int main(int argc,char **argv) {
   double row[11]={wall,cs/nt,cpus/nt,mpi,process_delta,(double)local_steps,(double)rank_calls,post,overlap_time,wait_time,completion_wait};double *rows=!rank?calloc(size*11,sizeof(double)):NULL;MPI_Gather(row,11,MPI_DOUBLE,rows,11,MPI_DOUBLE,0,MPI_COMM_WORLD);if(!rank){for(int r=0;r<size;r++)printf("rank_metric phase=%u rank=%d wall=%.9f compute=%.9f cpu=%.9f sync=%.9f process_cpu=%.9f lcg_steps=%.0f potential_profiled_calls=%.0f post=%.9f overlap=%.9f wait=%.9f completion_wait=%.9f\n",phase,r,rows[r*11],rows[r*11+1],rows[r*11+2],rows[r*11+3],rows[r*11+4],rows[r*11+5],rows[r*11+6],rows[r*11+7],rows[r*11+8],rows[r*11+9],rows[r*11+10]);printf("phase_root_wall phase=%u seconds=%.9f\n",phase,wall);free(rows);}
   stats("wall_seconds",wall,rank,size);stats("thread_mean_compute_seconds",cs/nt,rank,size);stats("thread_mean_compute_cpu_seconds",cpus/nt,rank,size);stats("process_user_plus_system_cpu_seconds",process_delta,rank,size);stats("thread_mean_pre_collective_barrier_seconds",ps/nt,rank,size);stats("thread_mean_collective_release_barrier_seconds_OVERLAPS_MPI",rs/nt,rank,size);stats("master_mpi_allreduce_seconds",mpi,rank,size);fflush(stdout);
  }
- free(compute);free(cpu);free(pre);free(release);free(state);free(expected);stamp("before_mpi_finalize",rank);MPI_Finalize();stamp("after_mpi_finalize",rank);
- if(!rank){printf("process_seconds=%.6f oracle=%s\n",now()-startup,failures?"FAIL":"PASS");}
+ free(compute);free(cpu);free(pre);free(release);free(state);free(expected);stamp("before_mpi_finalize",rank);MPI_Finalize();stamp("after_mpi_finalize",rank);struct timespec exec_end={0};int exec_clock_valid=clock_gettime(CLOCK_MONOTONIC,&exec_end)==0;
+ if(!exec_clock_valid)return 2;
+ double interval_end=exec_end.tv_sec+1e-9*exec_end.tv_nsec;
+ if(!rank){printf("process_seconds=%.6f oracle=%s\n",interval_end-startup,failures?"FAIL":"PASS");}
+ const char *exec_begin=getenv("PEAK_BENCH_EXEC_BEGIN_NS");
+ if(exec_begin){char *end;unsigned long long begin=strtoull(exec_begin,&end,10);uint64_t finish=(uint64_t)exec_end.tv_sec*UINT64_C(1000000000)+(uint64_t)exec_end.tv_nsec;
+  if(!exec_clock_valid||!*exec_begin||*end||*exec_begin=='-'||!begin||begin>finish){fprintf(stderr,"invalid PEAK_BENCH_EXEC_BEGIN_NS\n");return 2;}
+  printf("exec_interval rank=%d begin_ns=%llu end_ns=%llu seconds=%.9f\n",rank,begin,(unsigned long long)finish,(double)(finish-begin)/1e9);
+ }
  return failures?1:0;
 }

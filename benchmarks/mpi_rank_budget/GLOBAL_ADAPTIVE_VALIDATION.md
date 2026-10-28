@@ -1,6 +1,6 @@
 # Adaptive global budget validation
 
-Latest candidate `5e100d0` completed all 194 hardware launches with valid data, but **did not achieve the combined overhead, useful-coverage and recovery target**. Several MPI configurations exceed 5% and the independent hardware recovery diagnostics show no restoration. The complete results below retain all repeats and earlier failures.
+Candidate `5e100d0` completed all 194 hardware launches with valid data, but **did not achieve the combined overhead, useful-coverage and recovery target**. The subsequent escrow correction `dd1d7e9` also completed its separate 32-launch diagnostic with valid data and did not establish acceptance. Several MPI configurations exceed 5% and the independent hardware recovery diagnostics show no restoration. The complete results below retain all repeats and earlier failures.
 
 Earlier measured revision `aa055912` uses funded admission before the first physical hook attachment in global mode, retains instrumentation and the safe controller, fixes the stop/wake ordering race, and exposes report-stage wall/CPU and final-flush/join timing. It remains experimental and opt-in. Targeted hardware job **3654296** completed all 26 launches with valid data, but failed combined performance/utility acceptance; no 5% performance pass is asserted. Its source is exact `git archive` of `aa05591223146834d6ae3ea5695c76317e855331`, archive SHA256 `42881e3d1a5627bd4c5b62004d41b457714ba86a451adf1cf19415bcca9c9bd1`. Historical evidence below is preserved.
 
@@ -311,3 +311,29 @@ input-manifest SHA256 is
 All 153 inventoried files match the commit, including `test_control_escrow.c`.
 This submission tests the reserved-balance correction separately; the 194-run
 5e100d0 outcome above remains unchanged.
+
+## dd1d7e9 escrow hardware diagnostic result (3655082)
+
+All 32 launches completed on PVC in 5:39, exit 0:0. Strict data validation passes; the recorded dataset is `global_validation/dd1d7e9-escrow-summary.json`. This tests the escrow correction independently and does not replace any 5e100d0 result.
+
+| Case | G main / N | G cumulative work / N | G main-through-finalize / N | G calls (two runs) |
+|---|---:|---:|---:|---|
+| bcast-rotating | 1.195471 | 1.056125 | 1.140711 | 0 / 0 |
+| barrier-critical | 1.008792 | 1.002465 | 1.008926 | 15,922 / 15,918 |
+| barrier-aligned | 0.865650 | 0.885030 | 0.858213 | 0 / 0 |
+| funded-concurrent-allreduce-rotating | 1.403887 | 1.042662 | 1.070654 | 10,616 / 22,612 |
+| iallreduce-critical | 1.093106 | 1.063835 | 1.130603 | 27,999 / 21,015 |
+
+Three of five whole-interval means exceed 5%; bcast-rotating and iallreduce-critical also exceed 5% in cumulative work. Aligned native samples are unusually slow (9.082290/8.038202 s versus global 7.297735/7.395292 s), so its ratio below one is not a demonstrated speedup. Both global aligned runs record zero calls, as do both bcast runs; bcast has zero first attachments across all 32 ranks in both runs. The ledger correction alone has not restored useful sampling in these cases.
+
+All ten main global samples have zero emergency, degradation and invalid-accounting counters. Actual reattach/revisit occurs in barrier-critical (16/2 and 48/7) and iallreduce-critical (0/0 and 32/10), but the two independent trace-enabled diagnostics still prove no recovery: short has zero calls/restoration; funded has 2924 calls and zero restoration. Per-case restoration is not universally required, but these diagnostics do not supply the intended hardware recovery proof.
+
+Four of ten final global samples retain spent above budget: bcast G0 0.208814/0.183017 s, bcast G1 0.169683/0.161515 s, barrier-critical G1 0.321960/0.314248 s and iallreduce-critical G1 0.324958/0.321483 s. All pre-report and final reserved balances are zero after retirement; this does not establish that no escrow existed while the application was active. In this revision unsettled control prepayment belongs in global reserved, while spent reflects actual costs; control costs remain summed across ranks without a wave-span discount.
+
+Verified result archive SHA256: `e2dbd4d67705c9ebbed75b0e932dd3e13167a3eb0278508bdc121d63a5dbab31`; actual library SHA256: `806f9cbaf78644045d27047436d4283ca67456c127d369c55864256566aff178`. The exact dd1d7e9 source archive is recorded above. All original parameters and independent oracles remain unchanged; valid receipts and lower accounting estimates are not treated as proof of a performance pass.
+
+## Activation-placement control (prepared, hardware results pending)
+
+The next diagnostic explicitly gives both local and global arms the same activation policy within each group: immediate or post-init. Five unchanged workloads per policy, each N/L/G/G/L/N, plus both recovery diagnostics per policy yield 64 launches. An independent native `exec_meter` starts without LD_PRELOAD or LD_AUDIT, records monotonic time, sets the child's preload/policy environment and execs the workload. The pressure program records exec-start elapsed alongside its existing main/phase times, using a shared final endpoint after the original MPI_Finalize and its timestamp. This captures loader/constructor placement without profiling the meter itself; it excludes launcher/wrapper and the meter's own loader/entry print.
+
+Six bounded local two-rank × two-thread smoke runs (native/local/global under both policies) pass work oracles, empty-preload proof, target-byte checks and exec duration ≥ main duration. Missing meter records are rejected. The receipt is `global_validation/activation-meter-local-smoke.json`. These functional smokes are not performance estimates. The hardware package at `/tmp/peak-global-activation-probe-20261028` is guarded until exact-source commit/freeze; runtime production files are unchanged.
