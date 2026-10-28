@@ -1,0 +1,33 @@
+{
+  "library_sha256": "bcedcf9aa355ea1b7265c3d25f5a16bf3074db885800c3552fc49d957f9b902b",
+  "pressure_sha256": "a7cd2dd16c89ca26d6f349153325f4bf86415dbe5bfb13f765dfa0444c35b26d",
+  "fault_shim_sha256": "fbbdf7de7b67748ae55021095e5db18a1ef05662444031bbb5e29be93ba93cc7",
+  "harness_sha256": "61c641ff6937ac8437f1f38a5234161f2bc8f78547e397f45009dbaec2d02587",
+  "source_sha256": {
+    "src/general_listener.c": "6ee6ddefd1f3e92cd99267d52c9cc1062cae76ed9a1d9a045bde7d66650b79a6",
+    "src/mpi_interceptor.c": "294f60a1484b5ff927f01fa217da0777c60046102e1e861c771c0e884629899b",
+    "src/global_budget.c": "ac5ba6bf536f108aea45d1f78974ade9b2591c72efd403bb58969ceb8668d32c",
+    "include/internal/global_budget.h": "6f4707dff6ec1bac2f52a52530b1e2ea4a5f7d825195653b878ab09d883d507a",
+    "src/peak.c": "aaa35bdce45982a6e9c65784b9b161a28237394fbe694e4d0aa476b4b1feba18",
+    "src/exec_interceptor.c": "2be0d7c819b71d278d5895f55278909a82d5593f669130a61746e0dbcf74a2b3",
+    "include/mpi_interceptor.h": "14349643de6d929f8a59e217e3fd1e98536f6e695424fc6163436c7fdaa39dc2",
+    "include/general_listener.h": "7dbed2d188f59acc9c64f62dfff74a032aebd2874f1d350e3d014e2af39a4b42",
+    "src/logging.c": "1ae521b6c6f3896c2c8c0f361f94ec3e78e87487f95737703a2caea3319bfcdb",
+    "include/logging.h": "e23f7a43cf018fe5510cb0e43f716f8f9eab7da4ecb10483b2e7a90f5645b056",
+    "src/general_listener/report_formatter.c": "081c91178e09fe583f7a081396385d73174460ccb194b8d22b0944c7bc895932",
+    "include/internal/exec_interceptor_internal.h": "7b054aaa128c6028384dbc6c2aa5081d769853cf5b3d91944313725423650dc9"
+  },
+  "candidate_commit": "aa6f36d",
+  "local_gate": {
+    "ctest_passed": 56,
+    "ctest_total": 56,
+    "ctest_seconds": 61.86,
+    "static": "PASS",
+    "mpi_functional_five": "PASS",
+    "skewed_finalize": "PASS",
+    "cold_slack": "PASS"
+  },
+  "hardware_status": "pending verified archives",
+  "matrix_job": 3654125,
+  "funded_job": 3654127
+}
