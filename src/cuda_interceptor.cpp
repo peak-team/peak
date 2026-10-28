@@ -3124,6 +3124,7 @@ peak_cuda_attach_capture_entry(gpointer target,
     request.interceptor = cuda_interceptor;
     request.listener = listener;
     request.operation = PEAK_DETACH_OPERATION_ATTACH;
+    request.attach_options = &plan.options;
     request.blocked_pc_start = plan.mutation_address;
     request.blocked_pc_size = plan.mutation_guard_size;
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
@@ -3134,12 +3135,18 @@ peak_cuda_attach_capture_entry(gpointer target,
                       peak_detach_controller_status_string(status));
         return GUM_ATTACH_WRONG_SIGNATURE;
     }
-    gum_interceptor_begin_transaction(cuda_interceptor);
+    if (!peak_detach_controller_current_mutation_uses_physical_patch())
+        gum_interceptor_begin_transaction(cuda_interceptor);
 #endif
-    GumAttachReturn result = peak_gum_interceptor_attach_target(cuda_interceptor,
+    GumAttachReturn result =
+#ifdef PEAK_ATTACH_RUNTIME
+        peak_detach_controller_current_mutation_uses_physical_patch() ? GUM_ATTACH_OK :
+#endif
+        peak_gum_interceptor_attach_target(cuda_interceptor,
                                               target, listener, &plan);
 #ifdef PEAK_ATTACH_RUNTIME
-    gum_interceptor_end_transaction(cuda_interceptor);
+    if (!peak_detach_controller_current_mutation_uses_physical_patch())
+        gum_interceptor_end_transaction(cuda_interceptor);
     if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
         peak_detach_controller_abort_after_failed_finish("CUDA capture attach", status);
     }
@@ -3415,15 +3422,21 @@ peak_cuda_replace_fast(gpointer address,
         request.function_address = address;
         request.interceptor = cuda_interceptor;
         request.operation = PEAK_DETACH_OPERATION_REPLACE;
+        request.replacement_function = replacement;
+        request.original_function = original;
         PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
         peak_gum_module_mutation_begin();
         if (peak_detach_controller_prepare_hook_mutation(&request, &status)) {
+            if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+                result = GUM_REPLACE_OK;
+            } else {
             gum_interceptor_begin_transaction(cuda_interceptor);
             /* Dynamic TLS first touch can allocate. Keep Gum's standard
              * replacement recursion protection around the launch wrapper. */
             result = gum_interceptor_replace(
                 cuda_interceptor, address, replacement, original, NULL);
             gum_interceptor_end_transaction(cuda_interceptor);
+            }
             if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
                 peak_detach_controller_abort_after_failed_finish("CUDA replacement attach", status);
             }

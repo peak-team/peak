@@ -2418,6 +2418,7 @@ dlopen_interceptor_initialize_attach_candidate(
         .interceptor = target_interceptor,
         .listener = candidate->listener,
         .operation = PEAK_DETACH_OPERATION_ATTACH,
+        .attach_options = &candidate->attach_plan.options,
         .blocked_pc_start = candidate->attach_plan.mutation_guard_size > 0
             ? candidate->attach_plan.mutation_address
             : NULL,
@@ -2498,14 +2499,15 @@ dlopen_interceptor_attach_candidate_scalar(
         return;
     }
 
-    gum_interceptor_begin_transaction(mutation_request->interceptor);
+    gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (!staged) gum_interceptor_begin_transaction(mutation_request->interceptor);
     GumAttachReturn attach_status =
         peak_general_listener_gum_attach_target(
             mutation_request->interceptor,
             mutation_request->function_address,
             candidate->listener,
             &candidate->attach_plan);
-    gum_interceptor_end_transaction(mutation_request->interceptor);
+    if (!staged) gum_interceptor_end_transaction(mutation_request->interceptor);
     if (!peak_detach_controller_finish_hook_mutation(mutation_request,
                                                      &detach_status)) {
         peak_detach_controller_abort_after_failed_finish(
@@ -2549,7 +2551,8 @@ dlopen_interceptor_attach_candidate_batch(
         &detach_status);
 
     if (prepared_count > 0) {
-        gum_interceptor_begin_transaction(mutation_requests[0].interceptor);
+        gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+        if (!staged) gum_interceptor_begin_transaction(mutation_requests[0].interceptor);
         for (size_t i = 0; i < candidate_count; i++) {
             if (!batch_results[i].prepared) {
                 continue;
@@ -2561,7 +2564,7 @@ dlopen_interceptor_attach_candidate_batch(
                     candidates[i].listener,
                     &candidates[i].attach_plan);
         }
-        gum_interceptor_end_transaction(mutation_requests[0].interceptor);
+        if (!staged) gum_interceptor_end_transaction(mutation_requests[0].interceptor);
         if (!peak_detach_controller_finish_hook_mutation_batch(
                 &detach_status)) {
             peak_detach_controller_abort_after_failed_finish(
@@ -3502,12 +3505,16 @@ int dlopen_interceptor_attach()
         return attach_status;
     }
 
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        attach_status = GUM_ATTACH_OK;
+    } else {
     gum_interceptor_begin_transaction(dlopen_interceptor);
     attach_status = gum_interceptor_attach(dlopen_interceptor,
                                            dlopen_hook_address,
                                            dlopen_listener,
                                            NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
+    }
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -3537,7 +3544,9 @@ int dlopen_interceptor_attach()
         .function_address = dlclose_hook_address,
         .interceptor = dlopen_interceptor,
         .listener = NULL,
-        .operation = PEAK_DETACH_OPERATION_REPLACE
+        .operation = PEAK_DETACH_OPERATION_REPLACE,
+        .replacement_function = (gpointer)&dlopen_interceptor_guarded_dlclose,
+        .original_function = (gpointer*)&original_dlclose
     };
     detach_status = PEAK_DETACH_STATUS_ERROR;
     peak_gum_module_mutation_begin();
@@ -3549,6 +3558,9 @@ int dlopen_interceptor_attach()
         peak_gum_module_mutation_end();
         goto rollback_dlopen_listener;
     }
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        replace_status = GUM_REPLACE_OK;
+    } else {
     gum_interceptor_begin_transaction(dlopen_interceptor);
     replace_status =
         gum_interceptor_replace_fast(
@@ -3558,6 +3570,7 @@ int dlopen_interceptor_attach()
             (gpointer*)&original_dlclose,
             NULL);
     gum_interceptor_end_transaction(dlopen_interceptor);
+    }
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&replace_request,
                                                      &detach_status)) {
@@ -3591,6 +3604,10 @@ int dlopen_interceptor_attach()
     goto rollback_dlopen_listener;
 
 rollback_dlclose_guard:
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_warn("[peak] dlopen broker startup failed; retaining resident support hooks and metadata\n");
+    return GUM_ATTACH_WRONG_SIGNATURE;
+#endif
     replace_request.operation = PEAK_DETACH_OPERATION_REVERT;
     detach_status = PEAK_DETACH_STATUS_ERROR;
     if (!dlopen_interceptor_revert_dlclose_guard(
@@ -3604,6 +3621,10 @@ rollback_dlclose_guard:
     }
 
 rollback_dlopen_listener:
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_warn("[peak] dynamic-loader attach failed; retaining resident listener metadata\n");
+    return GUM_ATTACH_WRONG_SIGNATURE;
+#endif
     mutation_request.operation = PEAK_DETACH_OPERATION_SHUTDOWN;
     detach_status = PEAK_DETACH_STATUS_ERROR;
     peak_gum_module_mutation_begin();
@@ -3645,6 +3666,12 @@ rollback_dlopen_listener:
 
 gboolean dlopen_interceptor_dettach()
 {
+#ifdef PEAK_ATTACH_RUNTIME
+    /* Existing threads can still own Gum invocations during process exit.
+     * Close loader admission and drain the broker, retaining reachable Gum
+     * metadata and the dlclose trampoline with the resident attach image. */
+    return dlopen_interceptor_shutdown_dynamic_attach();
+#endif
     pthread_mutex_lock(&dynamic_attach_gate_mutex);
     atomic_store_explicit(&dlopen_listener_owner_pid,
                           0,

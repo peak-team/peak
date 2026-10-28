@@ -25,12 +25,12 @@
 #include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
 
-/* Darwin stages Gum allocation/metadata before holding peer threads. Linux
- * retains its established initial-attach and calibration teardown path. */
+/* Late attach stages Gum allocation/metadata before holding peer threads.
+ * The preload path retains its existing platform-specific lifecycle. */
 static gboolean
 peak_general_listener_initial_mutation_is_staged(void)
 {
-#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)
+#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API) || defined(PEAK_ATTACH_RUNTIME)
     return peak_detach_controller_current_mutation_uses_physical_patch();
 #else
     return FALSE;
@@ -9229,14 +9229,14 @@ gboolean peak_general_listener_dettach()
         peak_general_listener_reap_known_unwound();
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
     /*
      * A process destructor cannot prove that arbitrary application threads
      * have stopped.  Keep every Gum target context and listener reachable and
      * let process exit reclaim them instead of performing an unguarded final
      * detach/free sequence.
      */
-    peak_log_info("[peak] Darwin process-exit teardown leaves Gum target listener state alive\n");
+    peak_log_info("[peak] Resident process-exit teardown leaves Gum target listener state alive\n");
     return FALSE;
 #endif
 

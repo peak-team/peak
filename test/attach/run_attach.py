@@ -86,6 +86,7 @@ def alive(process, progress, fixture_log=None):
 def fixture_evidence(process, log_path):
     evidence = log_path.read_text(errors="replace")
     status = process.poll()
+    evidence += f"\nTarget PID {process.pid} status={status}"
     if sys.platform.startswith("linux"):
         tracers = set()
         for task in sorted(Path(f"/proc/{process.pid}/task").glob("*/status"))[:24]:
@@ -102,7 +103,7 @@ def fixture_evidence(process, log_path):
                 evidence += f"\ntracer {tracer} comm: " + Path(f"/proc/{tracer}/comm").read_text().strip()
             except OSError:
                 pass
-    if sys.platform != "darwin" or status is None or status >= 0:
+    if sys.platform != "darwin":
         return evidence
     directories = [Path.home() / "Library/Logs/DiagnosticReports",
                    Path("/Library/Logs/DiagnosticReports")]
@@ -112,7 +113,7 @@ def fixture_evidence(process, log_path):
     while time.monotonic() < deadline:
         for directory in directories:
             try:
-                candidates = list(directory.glob("*attach*"))
+                candidates = list(directory.glob("*attach*")) + list(directory.glob("frida*"))
             except OSError:
                 continue
             for report in candidates:
@@ -122,10 +123,10 @@ def fixture_evidence(process, log_path):
                     content = report.read_text(errors="replace")[:262144]
                 except OSError:
                     continue
-                if expected_pid.search(content):
+                if expected_pid.search(content) or report.name.startswith("frida"):
                     return evidence + f"\nNative crash report {report}:\n{content}"
         time.sleep(0.2)
-    return evidence + (f"\nNo native crash report for PID {process.pid} signal {-status} "
+    return evidence + (f"\nNo native target/helper crash report for PID {process.pid} status {status} "
                        f"within 6s; inspected {directories!r}")
 
 

@@ -2242,9 +2242,9 @@ peak_fini_impl(void)
     #endif
 #endif
     gboolean general_listener_shutdown_flushed = peak_general_listener_dettach();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
     (void)general_listener_shutdown_flushed;
-    peak_log_info("[peak] Darwin process-exit teardown leaves Gum support hook state alive\n");
+    peak_log_info("[peak] Resident process-exit teardown leaves Gum support hook state alive\n");
     peak_log_shutdown();
     return;
 #else

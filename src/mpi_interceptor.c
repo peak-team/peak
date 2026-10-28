@@ -641,6 +641,8 @@ int mpi_interceptor_attach()
         .hook_id = SIZE_MAX - 32, .symbol_name = "PMPI_Finalize",
         .function_address = hook_address, .interceptor = mpi_interceptor,
         .operation = PEAK_DETACH_OPERATION_REPLACE,
+        .replacement_function = (gpointer)peak_pmpi_finalize,
+        .original_function = (gpointer*)&original_pmpi_finalize,
     };
     PeakDetachStatus status = PEAK_DETACH_STATUS_ERROR;
     peak_gum_module_mutation_begin();
@@ -651,6 +653,12 @@ int mpi_interceptor_attach()
         return -1;
     }
 #endif
+#ifdef PEAK_ATTACH_RUNTIME
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        replace_check = GUM_REPLACE_OK;
+    } else
+#endif
+    {
     gum_interceptor_begin_transaction(mpi_interceptor);
     if (hook_address) {
         replace_check = gum_interceptor_replace_fast(mpi_interceptor,
@@ -659,6 +667,7 @@ int mpi_interceptor_attach()
                                                      NULL);
     }
     gum_interceptor_end_transaction(mpi_interceptor);
+    }
 #ifdef PEAK_ATTACH_RUNTIME
     if (!peak_detach_controller_finish_hook_mutation(&request, &status)) {
         peak_detach_controller_abort_after_failed_finish("MPI attach finish", status);

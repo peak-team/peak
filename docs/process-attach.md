@@ -18,6 +18,9 @@ Frida Core 17.15.3. The default dependency setup downloads pinned artifacts;
 for an offline build, select a `patched-devkit` provider and point
 `PEAK_PATCHED_GUM_ROOT` at that devkit, and provide Frida Core with
 `FRIDA_CORE_LIBRARIES` and `FRIDA_CORE_INCLUDE_DIRS`.
+Attach builds require the current PEAK staged-mutation Gum API. The default
+auto-patched provider builds it from the checked-in overlay; a caller-provided
+patched devkit must be rebuilt with that overlay before enabling attach.
 
 On macOS Arm64, use PEAK's pinned stock Frida Gum devkit and Frida Core
 17.15.3. The regular macOS Arm64 Gum requirements in the main README apply to
@@ -83,6 +86,13 @@ Once activation is confirmed, `peak-attach` exits successfully while profiling
 continues in the target. The injected runtime stays resident until normal
 process exit, when PEAK writes its usual report. The command does not provide a
 separate stop operation or report the target's eventual native exit status.
+
+On Linux, Gum prepares hook metadata, trampolines, and entry bytes before PEAK
+stops application threads. The stop window validates the prepared bytes and
+program counters, then applies the patch; Gum finalizes the metadata after
+threads resume. This lets attach use the same safe mutation path as PEAK's
+overhead controller without allocating Gum metadata while application threads
+are stopped.
 
 The debugger's initial attach and runtime bootstrap briefly interrupt target
 execution. A syscall already in flight may return `EINTR` if it is not

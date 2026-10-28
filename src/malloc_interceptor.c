@@ -1864,6 +1864,12 @@ malloc_interceptor_attach(void)
                             aligned_alloc_addr, posix_memalign_addr};
     const char* names[] = {"malloc", "free", "calloc", "realloc",
                            "aligned_alloc", "posix_memalign"};
+    gpointer replacements[] = {(gpointer)custom_malloc, (gpointer)custom_free,
+        (gpointer)custom_calloc, (gpointer)custom_realloc,
+        (gpointer)custom_aligned_alloc, (gpointer)custom_posix_memalign};
+    gpointer* originals[] = {(gpointer*)&original_malloc, (gpointer*)&original_free,
+        (gpointer*)&original_calloc, (gpointer*)&original_realloc,
+        (gpointer*)&original_aligned_alloc, (gpointer*)&original_posix_memalign};
     PeakDetachRequest requests[G_N_ELEMENTS(addresses)] = {0};
     PeakDetachBatchResult results[G_N_ELEMENTS(addresses)] = {0};
     size_t prepared_count = 0;
@@ -1873,6 +1879,7 @@ malloc_interceptor_attach(void)
             .hook_id = SIZE_MAX - 16 - i, .symbol_name = names[i],
             .function_address = addresses[i], .interceptor = malloc_interceptor,
             .operation = PEAK_DETACH_OPERATION_REPLACE,
+            .replacement_function = replacements[i], .original_function = originals[i],
         };
     }
     peak_gum_module_mutation_begin();
@@ -1892,6 +1899,13 @@ malloc_interceptor_attach(void)
         return PEAK_MALLOC_ATTACH_PREPARE_FAILED;
     }
 #endif
+#ifdef PEAK_ATTACH_RUNTIME
+    if (peak_detach_controller_current_mutation_uses_physical_patch()) {
+        malloc_replaced = free_replaced = calloc_replaced = realloc_replaced =
+            aligned_alloc_replaced = posix_memalign_replaced = TRUE;
+    } else
+#endif
+    {
     gum_interceptor_begin_transaction(malloc_interceptor);
 
     DO_REPLACE_FAST(malloc_addr, custom_malloc, original_malloc, "malloc", malloc_replaced);
@@ -1901,6 +1915,7 @@ malloc_interceptor_attach(void)
     DO_REPLACE_FAST(aligned_alloc_addr, custom_aligned_alloc, original_aligned_alloc, "aligned_alloc", aligned_alloc_replaced);
     DO_REPLACE_FAST(posix_memalign_addr, custom_posix_memalign, original_posix_memalign, "posix_memalign", posix_memalign_replaced);
 
+    }
     if (!malloc_replaced || !free_replaced || !calloc_replaced ||
         !realloc_replaced || !aligned_alloc_replaced ||
         !posix_memalign_replaced) {
@@ -1938,7 +1953,10 @@ malloc_interceptor_attach(void)
         return PEAK_MALLOC_ATTACH_ROLLED_BACK;
     }
 
-    gum_interceptor_end_transaction(malloc_interceptor);
+#ifdef PEAK_ATTACH_RUNTIME
+    if (!peak_detach_controller_current_mutation_uses_physical_patch())
+#endif
+        gum_interceptor_end_transaction(malloc_interceptor);
 #ifdef PEAK_ATTACH_RUNTIME
     if (!peak_detach_controller_finish_hook_mutation_batch(&status)) {
         peak_detach_controller_abort_after_failed_finish("memory attach finish", status);

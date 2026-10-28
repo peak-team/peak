@@ -583,11 +583,12 @@ peak_filesystem_stat_guard_attach(void)
         }
         g_usleep(1000);
     }
-    gum_interceptor_begin_transaction(guard_interceptor);
+    gboolean staged = peak_detach_controller_current_mutation_uses_physical_patch();
+    if (!staged) gum_interceptor_begin_transaction(guard_interceptor);
     for (size_t i = 0; i < unique_count; i++) {
         /* Standard replacements retain Gum's recursion protection during
          * late TLS first touch and preserve the libc call through a trampoline. */
-        installed[i] = gum_interceptor_replace(guard_interceptor,
+        installed[i] = staged || gum_interceptor_replace(guard_interceptor,
             requests[i].function_address, requests[i].replacement_function,
             &originals[i], NULL) == GUM_REPLACE_OK;
         success = success && installed[i];
@@ -605,7 +606,7 @@ peak_filesystem_stat_guard_attach(void)
         if (owners[3] != SIZE_MAX)
             next_fstatfs64 = (int (*)(int, struct statfs64 *)) originals[owners[3]];
     }
-    gum_interceptor_end_transaction(guard_interceptor);
+    if (!staged) gum_interceptor_end_transaction(guard_interceptor);
     if (!peak_detach_controller_finish_hook_mutation_batch(&status))
         peak_detach_controller_abort_after_failed_finish(
             "filesystem-stat attach finish", status);

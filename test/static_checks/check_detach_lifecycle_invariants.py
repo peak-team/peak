@@ -328,12 +328,16 @@ def check_darwin_strict_lifecycle(repo_root):
             "Darwin bootstrap must close the complete peer snapshot within a bound")
 
     final_detach = extract_function(general, "peak_general_listener_dettach")
-    require("Darwin process-exit teardown leaves Gum target listener state alive"
+    require("Resident process-exit teardown leaves Gum target listener state alive"
             in final_detach and
             final_detach.find("return FALSE;") <
             final_detach.find("pthread_t controller_tid"),
             "Darwin process exit must retain Gum target listener state")
+    require("#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)" in final_detach,
+            "Darwin and late attach must retain resident target metadata")
     finalizer = extract_function(peak, "peak_fini_impl")
+    require("#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)" in finalizer,
+            "resident finalization must retain callback-visible configuration")
     loader_state = finalizer.find("gboolean dlopen_shutdown_flushed")
     darwin_loader_guard = finalizer.find("#if defined(__APPLE__)", loader_state)
     darwin_loader_else = finalizer.find("#else", darwin_loader_guard)
@@ -342,7 +346,7 @@ def check_darwin_strict_lifecycle(repo_root):
             finalizer[darwin_loader_guard:darwin_loader_else] and
             "no loader listener" in
             finalizer[darwin_loader_guard:darwin_loader_else] and
-            "Darwin process-exit teardown leaves Gum support hook state alive"
+            "Resident process-exit teardown leaves Gum support hook state alive"
             in finalizer,
             "Darwin must neither install nor shut down dynamic-loader attach machinery")
 
@@ -3071,11 +3075,21 @@ def check_signal_backend_strict_invariants(repo_root):
         controller, "peak_detach_controller_warmup_backend"
     )
     prepare_mutation = extract_function(
-        controller, "peak_detach_controller_prepare_hook_mutation"
+        controller, "peak_detach_controller_prepare_hook_mutation_internal"
     )
     prepare_batch = extract_function(
-        controller, "peak_detach_controller_prepare_hook_mutation_batch"
+        controller, "peak_detach_controller_prepare_hook_mutation_batch_internal"
     )
+    for public_name in ("peak_detach_controller_prepare_hook_mutation",
+                        "peak_detach_controller_prepare_hook_mutation_batch"):
+        wrapper = extract_function(controller, public_name)
+        require("peak_attach_prepare_stages" in wrapper and
+                public_name + "_internal" in wrapper and
+                wrapper.index("peak_attach_prepare_stages") <
+                wrapper.index(public_name + "_internal"),
+                "attach metadata must be staged before the strict stop implementation")
+        require("peak_attach_finish_stages(FALSE)" in wrapper,
+                "failed strict preparation must roll back staged metadata after resume")
     wait_for_mutation = extract_function(
         controller, "peak_detach_controller_wait_for_mutation_window"
     )
