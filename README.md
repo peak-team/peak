@@ -250,7 +250,9 @@ LD_PRELOAD=/path/to/libpeak.so \
 For Python, use the same interpreter and environment for collection and
 profiling. Discovery statically follows imports to find compiled extension
 modules and their native dependencies without running the script. It does not
-automatically target the interpreter executable or `libpython` internals:
+automatically target the interpreter executable or `libpython` internals.
+Because independent modules' load order is unknown, static discovery may
+include alternative dependency libraries for those modules.
 
 ```bash
 peak-collect-symbols app.py --python /path/to/python -o peak-targets.txt
@@ -264,9 +266,9 @@ Static discovery cannot see libraries loaded dynamically with `dlopen()` or
 `ctypes`; add their paths with repeated `--module` options. Alternatively,
 `--run-python` selects runtime-only discovery: it runs the script once and
 collects extensions observed through `sys.modules` or Python's audit events,
-plus native libraries loaded during that run. It excludes the interpreter's
-baseline mappings and cannot discover libraries used only on other code paths.
-Script output is sent to stderr.
+plus native shared libraries mapped during that run. It excludes the
+interpreter's baseline mappings and cannot discover libraries used only on
+other code paths. Script output is sent to stderr.
 
 ```bash
 peak-collect-symbols app.py --python /path/to/python --run-python \

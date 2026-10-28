@@ -2638,8 +2638,130 @@ dlopen_interceptor_attach_candidates(
     }
 }
 
+static gboolean
+dlopen_interceptor_path_equal(gconstpointer a, gconstpointer b)
+{
+    return strcmp(a, b) == 0;
+}
+
+/* Reconcile selected libraries that were loaded transitively: only the root
+ * receives a dlopen callback. Each discovered module gets its own ordinary
+ * owned request, so resolution, hook lifetime, and teardown use the same path.
+ * Derived requests have no borrowed source handle and never rediscover modules. */
+static gboolean
+dlopen_interceptor_enqueue_selected_modules(
+    const PeakDlopenDynamicAttachRequest* source,
+    const PeakDlopenResolvedTarget* targets,
+    size_t count,
+    GPtrArray* handles_to_close)
+{
+#if defined(__linux__) && defined(RTLD_NOLOAD)
+    Lmid_t namespace_id;
+    if (source->source_handle_token == NULL ||
+        dlinfo(source->handle, RTLD_DI_LMID, &namespace_id) != 0 ||
+        namespace_id != LM_ID_BASE) {
+        return FALSE;
+    }
+
+    gboolean retry = FALSE;
+    GHashTable* paths = g_hash_table_new_full(
+        g_str_hash, dlopen_interceptor_path_equal, g_free, NULL);
+    for (size_t i = 0; i < count; i++) {
+        gchar* path = NULL;
+        if (targets[i].name != NULL &&
+            peak_target_resolver_dup_selector_module(targets[i].name, &path) &&
+            path != NULL && strchr(path, G_DIR_SEPARATOR) != NULL &&
+            !peak_target_resolver_module_matches(path, source->filename)) {
+            g_hash_table_add(paths, path);
+        } else {
+            g_free(path);
+        }
+    }
+
+    GHashTableIter iter;
+    gpointer key;
+    g_hash_table_iter_init(&iter, paths);
+    while (g_hash_table_iter_next(&iter, &key, NULL)) {
+        const char* path = key;
+        gboolean queued = FALSE;
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        size_t index = dynamic_attach_queue_head;
+        for (size_t n = 0; n < dynamic_attach_queue_length; n++) {
+            const PeakDlopenDynamicAttachRequest* pending =
+                &dynamic_attach_queue[index];
+            if (g_strcmp0(pending->filename, path) == 0 &&
+                pending->state != PEAK_DLOPEN_REQUEST_PIN_FAILED) {
+                queued = TRUE;
+                break;
+            }
+            index = (index + 1) % PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+        }
+        gboolean controller_open =
+            dynamic_attach_state == PEAK_DLOPEN_CONTROLLER_OPEN;
+        /* Reserve the last slot for the original request to resume discovery
+         * after this bounded queue's derived requests have been drained. */
+        gboolean can_accept = controller_open &&
+            dynamic_attach_queue_length + 1 <
+                PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        if (queued) continue;
+        if (!can_accept) {
+            retry = controller_open;
+            break;
+        }
+
+        PeakDlopenDynamicAttachRequest discovered = {0};
+        discovered.handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+        if (discovered.handle == NULL) continue;
+        long loaded_namespace;
+        if (!dlopen_interceptor_loaded_module_identity(
+                discovered.handle, path, &discovered.filename,
+                &discovered.module_token, &loaded_namespace) ||
+            loaded_namespace != LM_ID_BASE ||
+            !peak_target_resolver_module_matches(path, discovered.filename)) {
+            g_ptr_array_add(handles_to_close, discovered.handle);
+            g_free(discovered.filename);
+            continue;
+        }
+        discovered.binding_flags = RTLD_LAZY;
+        discovered.scope = PEAK_DLOPEN_ATTACH_NON_FFTW_ONLY;
+        discovered.state = PEAK_DLOPEN_REQUEST_READY;
+        discovered.handle_owned = TRUE;
+        pthread_mutex_lock(&dynamic_attach_gate_mutex);
+        queued = dlopen_interceptor_find_queued_request_unlocked(
+            discovered.filename, discovered.module_token) != NULL;
+        if (!queued && dlopen_interceptor_queue_can_accept_unlocked()) {
+            discovered.ownership_ticket =
+                dlopen_interceptor_next_ownership_ticket_unlocked();
+            dynamic_attach_queue[dynamic_attach_queue_tail] = discovered;
+            dynamic_attach_queue_tail = (dynamic_attach_queue_tail + 1) %
+                PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY;
+            dynamic_attach_queue_length++;
+            dynamic_attach_enqueue_count++;
+            if (dynamic_attach_queue_length > dynamic_attach_queue_max_depth)
+                dynamic_attach_queue_max_depth = dynamic_attach_queue_length;
+            discovered.handle = NULL;
+            discovered.filename = NULL;
+        }
+        pthread_mutex_unlock(&dynamic_attach_gate_mutex);
+        if (discovered.handle != NULL)
+            g_ptr_array_add(handles_to_close, discovered.handle);
+        g_free(discovered.filename);
+    }
+    g_hash_table_unref(paths);
+    return retry;
+#else
+    (void)source;
+    (void)targets;
+    (void)count;
+    (void)handles_to_close;
+    return FALSE;
+#endif
+}
+
 static PeakDlopenAttachResult
-dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
+dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request,
+                                       GPtrArray* handles_to_close)
 {
     gboolean retained_handle_for_hooks = FALSE;
     gboolean retry_later = FALSE;
@@ -2738,6 +2860,8 @@ dlopen_interceptor_attach_from_request(PeakDlopenDynamicAttachRequest* request)
     peak_general_listener_fast_ignore_current_thread();
     gum_interceptor_ignore_current_thread(target_interceptor);
 #endif
+    retry_later = dlopen_interceptor_enqueue_selected_modules(
+        request, resolved_targets, target_count, handles_to_close);
     for (size_t i = 0; i < target_count; i++) {
         if (resolved_targets[i].name != NULL) {
             gboolean explicit_selector =
@@ -3124,10 +3248,9 @@ static void
 dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
 {
     size_t drained = 0;
-    size_t close_count = 0;
     size_t initial_queue_length = 0;
     size_t drain_limit;
-    void* handles_to_close[PEAK_DLOPEN_DYNAMIC_ATTACH_QUEUE_CAPACITY] = { 0 };
+    GPtrArray* handles_to_close;
     PeakDlopenDynamicAttachRequest request = { 0 };
 
     if (dynamic_attach_drain_reentrant) {
@@ -3155,11 +3278,12 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
         drain_limit = max_requests;
     }
 
+    handles_to_close = g_ptr_array_new();
     dynamic_attach_drain_reentrant = TRUE;
     while (drained < drain_limit &&
            dlopen_interceptor_pop_dynamic_attach_request(&request)) {
         PeakDlopenAttachResult result =
-            dlopen_interceptor_attach_from_request(&request);
+            dlopen_interceptor_attach_from_request(&request, handles_to_close);
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
         dynamic_attach_drain_count++;
         pthread_mutex_unlock(&dynamic_attach_gate_mutex);
@@ -3172,7 +3296,7 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
             dlopen_interceptor_release_dynamic_attach_request_metadata(
                 &request);
         if (handle_to_close != NULL) {
-            handles_to_close[close_count++] = handle_to_close;
+            g_ptr_array_add(handles_to_close, handle_to_close);
         }
         drained++;
     }
@@ -3188,9 +3312,11 @@ dlopen_interceptor_drain_dynamic_attach_queue_with_budget(size_t max_requests)
      * Keeping the close observable also preserves genuine dynamic loads
      * initiated by application destructors.
      */
-    for (size_t i = 0; i < close_count; i++) {
-        (void)dlopen_interceptor_internal_dlclose(handles_to_close[i]);
+    for (guint i = 0; i < handles_to_close->len; i++) {
+        (void)dlopen_interceptor_internal_dlclose(
+            g_ptr_array_index(handles_to_close, i));
     }
+    g_ptr_array_free(handles_to_close, TRUE);
 }
 
 void
