@@ -61,6 +61,7 @@ class Collector:
         self.objects = {}
         self.completed_roots = set()
         self.root_origin = None
+        self.inherited_rpath = ()
         self.sources = set()
         self.unsupported_paths = set()
         self.symbols = set()
@@ -188,7 +189,7 @@ class Collector:
         root_key = (root, self.root_origin)
         if root_key in self.completed_roots:
             return
-        pending = deque([(root, ())])
+        pending = deque([(root, self.inherited_rpath)])
         selected = {}
         visited = set()
         root_info = self.inspect(root)
@@ -403,8 +404,10 @@ if hasattr(sys, 'addaudithook'):
     sys.addaudithook(audit)
 output, script = sys.argv[1:3]
 sys.argv = sys.argv[2:]
+if not os.path.isabs(script):
+    script = os.path.join(os.getcwd(), script)
 if sys.path and sys.path[0] == '':
-    sys.path[0] = os.path.dirname(os.path.abspath(script))
+    sys.path[0] = os.path.dirname(os.path.realpath(script))
 main = type(sys)('__main__')
 main.__dict__.update(__file__=script, __package__=None, __spec__=None, __cached__=None,
                      __loader__=importlib.machinery.SourceFileLoader('__main__', script),
@@ -484,14 +487,20 @@ def main():
             headers = run(['readelf', '-W', '-l', str(target)], parsed=True)
             # The kernel resolves an executable's path; dlopen preserves a DSO alias.
             collector.add(target if 'Requesting program interpreter:' in headers else visible_target)
+            main_object = collector.inspect(target)
+            if not main_object[3]:
+                collector.inherited_rpath = tuple(collector.expand(main_object[2], target.parent))
         else:
             info = python_info(args.python)
             if not args.run_python and (info['version'] != list(sys.version_info[:2])
                     or Path(info['executable']).absolute() != Path(sys.executable).absolute()):
                 os.execv(info['executable'], [info['executable'], str(Path(__file__).resolve())] + sys.argv[1:])
             collector.root_origin = Path(info['executable']).resolve().parent
+            interpreter = collector.inspect(info['executable'])
+            if not interpreter[3]:
+                collector.inherited_rpath = tuple(collector.expand(interpreter[2], collector.root_origin))
             if args.run_python:
-                for module in runtime_python(target, args.python, arguments, args.timeout):
+                for module in runtime_python(args.target, args.python, arguments, args.timeout):
                     path = Path(module)
                     if path.is_file():
                         collector.sources.add(path.resolve())
