@@ -1,0 +1,332 @@
+[
+  {
+    "case": "smoke-local",
+    "label": "S0",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 32,
+    "calls": 128,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "smoke-global",
+    "label": "S0",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 32,
+    "calls": 128,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "N0",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "L0",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "G0",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "G1",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "L1",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-rotating",
+    "label": "N1",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "N0",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "L0",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "G0",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "G1",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "L1",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "allreduce-slack",
+    "label": "N1",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "N0",
+    "mode": "N",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "L0",
+    "mode": "L",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "G0",
+    "mode": "G",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "G1",
+    "mode": "G",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "L1",
+    "mode": "L",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "bcast-slack",
+    "label": "N1",
+    "mode": "N",
+    "sync": "bcast",
+    "layout": "slack",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "N0",
+    "mode": "N",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "L0",
+    "mode": "L",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "G0",
+    "mode": "G",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "G1",
+    "mode": "G",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "L1",
+    "mode": "L",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "iallreduce-critical",
+    "label": "N1",
+    "mode": "N",
+    "sync": "iallreduce",
+    "layout": "critical",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "N0",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "L0",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "G0",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "G1",
+    "mode": "G",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "L1",
+    "mode": "L",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "funded-allreduce-rotating",
+    "label": "N1",
+    "mode": "N",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 60000
+  },
+  {
+    "case": "current-a87",
+    "label": "A0",
+    "mode": "A",
+    "sync": "allreduce",
+    "layout": "rotating",
+    "epochs": 2048,
+    "calls": 2000,
+    "warmup_calls": 10000
+  }
+]
