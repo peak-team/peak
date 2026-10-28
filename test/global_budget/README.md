@@ -263,3 +263,46 @@ predictive margin. Real positive profile consumption updates immediately with a
 1us minimum denominator, rather than waiting an additional 1ms or dividing the
 first burst by the preceding cold phase. All larger allowances still consume the
 root's already earned pool; the session grace remains 500us.
+
+Shutdown publishes `running=false` before its final eventfd wake. This wake
+bypasses the ordinary `poke()` running guard. Waking first permits a helper on
+the same rank CPU to consume the event, reenter its 100ms normal poll, and then
+leave `pthread_join` waiting for that timeout. The deterministic `stop_wake`
+regression forces this interleaving and checks state/order rather than a fragile
+wall-time threshold. The manual 32-client `many_final` harness binds each rank's
+main/helper pair to one allowed CPU and simulates 1ms preemption after the wake.
+It reports FINAL flush and stop/join separately and preserves a configurable
+last-rank FINAL delay, so a join fix cannot pass by weakening the cohort barrier:
+
+```sh
+gcc -O2 -std=c11 -Wall -Wextra -Werror -Iinclude \
+  test/global_budget/test_many_final.c -pthread -lm -o /tmp/many-final
+timeout -k 2s 18s /tmp/many-final 32 150000
+```
+
+With the same 150ms FINAL delay, the old ac5 stop measured root flush 151.993ms
+and join 100.220ms; fixed ordering measured 152.291ms and 1.097ms respectively
+(the latter includes the deliberate 1ms scheduling delay). These are controlled
+local scheduler-race experiments, not MPI slowdown claims.
+
+Post-init global admission now leaves newly resolved targets physically
+unpatched until a complete paid installation/observation lease is available.
+On supported MPI launches this is the default for global mode when the
+activation policy is unset. First installation uses the controller's ATTACH
+operation and event kind 7; a genuine post-detach restoration retains kind 6.
+The lifetime grace and future closing reserve are unchanged.
+
+`run_mpi_lifecycle.py` additionally accepts these real-MPI modes:
+
+- `unfunded`: compares the target's entry bytes before and after execution with
+  an unfundable budget; requires native execution, zero installs and zero closes.
+- `initial-once`: disables reattachment, requires paid first installation and
+  real calls, then STOP without a kind-6 restoration.
+- `fallback`: disconnects the coordinator and requires safe local installation,
+  real calls and an unconfirmed global shutdown.
+
+Run each with `--library /absolute/path/to/libpeak.so --mode MODE`, using the
+same MPI compiler/launcher options as the existing recovery test. Omit
+`--activation-policy` to test the global-mode default; explicit `immediate` and
+`post-init` remain available. These checks establish behavior and coverage;
+fixed-work hardware timings are still required to assess slowdown.

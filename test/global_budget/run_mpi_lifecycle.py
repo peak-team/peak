@@ -62,8 +62,29 @@ def validate_lifecycle(directory, receipt):
         match = re.search(r't0=\[(\d+)\] t1=\[(\d+)\]', record['affinity'][0])
         assert match and list(map(int, match.groups())) == bindings[rank], record
         fields = record['settlement']
-        assert fields and fields['shutdown_confirmed'] == '1', record
-        assert fields['runtime_degraded_samples'] == '0' and fields['invalid_accounting_samples'] == '0', record
+        assert fields and fields['shutdown_confirmed'] == ('0' if mode == 'fallback' else '1'), record
+        if mode == 'unfunded':
+            text = (directory / f'rank-{rank}.err').read_text()
+            out = (directory / f'rank-{rank}.out').read_text()
+            assert 'initially_unpatched=1' in out, record
+            assert 'first_paid_attach_count=0 first_local_attach_count=0' in text, record
+            assert '0 detached, 0 reattached, 0 revisited' in text, record
+            assert int(fields['granted_total_ns']) == 0 if 'granted_total_ns' in fields else float(fields['granted_total_seconds']) == 0, record
+        assert fields['invalid_accounting_samples'] == '0', record
+        if mode != 'fallback':
+            assert fields['runtime_degraded_samples'] == '0', record
+        else:
+            assert int(fields['runtime_degraded_samples']) > 0 or fields['startup_ready'] == '0', record
+            text = (directory / f'rank-{rank}.err').read_text()
+            assert 'local_initial_patched=1' in (directory / f'rank-{rank}.out').read_text(), record
+            initial = re.findall(r'first_local_attach_count=(\d+)', text)
+            assert initial and int(initial[-1]) > 0, record
+        if mode == 'initial-once':
+            text = (directory / f'rank-{rank}.err').read_text()
+            assert 'first_paid_attach_count=16' in text, record
+            assert 'event: kind=7 ' in text and 'event: kind=6 ' not in text, record
+            transitions = re.findall(r'Transition coverage.*: (\d+) detached, (\d+) reattached, (\d+) revisited', text)
+            assert transitions and int(transitions[-1][0]) > 0 and transitions[-1][1:] == ('0', '0'), record
         count = int(fields['emergency_fallback_count'])
         if count:
             assert mode == 'skew' and count == 1 and original and debt_views, record
@@ -98,7 +119,8 @@ parser.add_argument('--replay', type=Path)
 parser.add_argument('--mpicc', default='/usr/lib64/mpich/bin/mpicc')
 parser.add_argument('--mpiexec', default='/usr/lib64/mpich/bin/mpiexec')
 parser.add_argument('--ranks', type=int, default=2)
-parser.add_argument('--mode', choices=('skew', 'recovery'))
+parser.add_argument('--mode', choices=('skew', 'recovery', 'unfunded', 'initial-once', 'fallback'))
+parser.add_argument('--activation-policy', choices=('immediate', 'post-init'))
 parser.add_argument('--output', type=Path, default=Path('/tmp'))
 parser.add_argument('--timeout', type=float, default=35)
 args = parser.parse_args()
@@ -150,6 +172,12 @@ env.update(OMP_NUM_THREADS='2', OMP_DYNAMIC='FALSE', OMP_PROC_BIND='close',
            PEAK_OUTPUT_AGGREGATION='local', PEAK_TEXT_OUTPUT='1', PEAK_MPI_REAL_FINALIZE='1',
            PEAK_MPI_TIMING_TRACE='1', PEAK_MPI_GLOBAL_TRACE='1', PEAK_MAX_NUM_THREADS='32',
            TEST_DEST=str(directory))
+if args.activation_policy:
+    env['PEAK_MPI_ACTIVATION_POLICY'] = args.activation_policy
+if args.mode == 'initial-once':
+    env['PEAK_ENABLE_REATTACH'] = '0'
+if args.mode == 'unfunded':
+    env['PEAK_GLOBAL_OVERHEAD_RATIO'] = '0.000000001'
 argv = [args.mpiexec, '-n', str(args.ranks), '/bin/sh', '-c', command]
 print('RESULT_ROOT', directory, flush=True)
 code = run(argv, env, args.timeout, directory, 'launcher')

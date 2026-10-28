@@ -954,9 +954,17 @@ bool peak_global_budget_final_flush(unsigned timeout_ms)
 void peak_global_budget_stop(void)
 {
     if (getpid() != atomic_load(&owner)) { close_fd(&client); close_fd(&listener); close_fd(&wake_fd); return; }
-    if (atomic_load(&running)) {
-        poke();
-        if (atomic_exchange(&running, false)) pthread_join(worker, NULL);
+    if (atomic_exchange_explicit(&running, false, memory_order_acq_rel)) {
+        /* Stop must be visible before the wake. Otherwise a same-CPU helper
+         * can consume the wake, reenter poll while running is still true,
+         * and leave join waiting for the entire 100ms normal poll timeout.
+         * poke() cannot be used here because it deliberately ignores stopped
+         * sessions. The nonblocking stop wake bypasses that running guard. */
+        if (wake_fd >= 0) {
+            uint64_t value = 1;
+            (void)write(wake_fd, &value, sizeof(value));
+        }
+        pthread_join(worker, NULL);
         unsigned capacity = sizeof(events) / sizeof(events[0]);
         for (unsigned i = event_count > capacity ? event_count - capacity : 0; i < event_count; ++i) {
             BudgetEvent *e = &events[i % capacity];

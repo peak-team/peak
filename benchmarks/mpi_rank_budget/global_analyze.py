@@ -105,11 +105,11 @@ def restoration_proof(text, parsed):
     return proofs
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','all'),default='small');a=p.parse_args();cases={};errors={}
+    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','all'),default='small');a=p.parse_args();cases={};errors={}
     matrix=tuple(sy+'-'+la for sy in ('allreduce','barrier','bcast','ring','iallreduce') for la in ('rotating','slack','critical','aligned'))
     funded=tuple('funded-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     funded+=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
-    selected={'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
+    selected={'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
     for name in selected:
       try:
         root=a.results/name;runs={l:workload(root,l) for l in LABELS};ref=runs['N0'];reports={}

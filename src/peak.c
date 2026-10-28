@@ -1285,10 +1285,18 @@ peak_mpi_activation_policy_post_init(void)
 {
     const char* value = getenv(PEAK_MPI_ACTIVATION_POLICY_ENV);
 
-    if (value == NULL || value[0] == '\0' ||
-        g_ascii_strcasecmp(value, "immediate") == 0) {
+    if (value == NULL || value[0] == '\0') {
+        const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
+        /* Only an already identified MPI process gets the opt-in default.
+         * A non-MPI process must not wait forever for an MPI_Init callback. */
+#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
+        return found_MPI && global_mode != NULL && strcmp(global_mode, "1") == 0;
+#else
+        (void)global_mode;
         return FALSE;
+#endif
     }
+    if (g_ascii_strcasecmp(value, "immediate") == 0) return FALSE;
     if (g_ascii_strcasecmp(value, "post-init") == 0 ||
         g_ascii_strcasecmp(value, "defer") == 0 ||
         g_ascii_strcasecmp(value, "deferred") == 0) {
@@ -1522,6 +1530,8 @@ peak_activate_runtime(void)
     if (peak_requested_work.cpu || jit_provider_active) {
         peak_general_listener_controller_start();
     }
+    if (peak_requested_work.cpu && !strict_mutation_active)
+        peak_general_listener_funded_initial_attach_fallback();
 #if !defined(__APPLE__)
     if (dynamic_attach_listener_ready) {
         dlopen_interceptor_enable_dynamic_attach();
@@ -1559,6 +1569,7 @@ peak_activate_runtime(void)
             g_free(heartbeat_overhead);
             heartbeat_overhead = NULL;
             heartbeat_time = 0;
+            peak_general_listener_funded_initial_attach_fallback();
             pthread_mutex_lock(&heartbeat_mutex);
             atomic_store(&heartbeat_running, false);
             pthread_mutex_unlock(&heartbeat_mutex);
@@ -1578,6 +1589,12 @@ PEAK_API void
 peak_mpi_init_completed(int result)
 {
     if (result == MPI_SUCCESS) {
+        const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
+        if (atomic_load_explicit(&peak_runtime_activation_state, memory_order_acquire) ==
+                PEAK_RUNTIME_ACTIVATION_READY && peak_mpi_activation_policy_post_init() &&
+            heartbeat_time != 0 && (enable_per_target_heartbeat || enable_global_heartbeat) &&
+            global_mode != NULL && strcmp(global_mode, "1") == 0)
+            peak_general_listener_enable_funded_initial_attach();
         peak_activate_runtime();
     } else if (atomic_load_explicit(&peak_runtime_activation_state,
                                     memory_order_acquire) ==

@@ -387,13 +387,19 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
     struct { char host[256]; unsigned short port; uint64_t nonce; } endpoint;
     memset(&endpoint, 0, sizeof(endpoint));
     if (PMPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
-        PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size < 2) return;
+        PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size < 2) {
+        peak_general_listener_global_budget_startup(0.0, 0);
+        return;
+    }
     if (rank == 0 && peak_global_budget_listen(&endpoint.port) == 0) {
         (void)gethostname(endpoint.host, sizeof(endpoint.host) - 1);
         endpoint.nonce = peak_global_budget_nonce();
     }
     if (PMPI_Bcast(&endpoint, sizeof(endpoint), MPI_BYTE, 0, MPI_COMM_WORLD) != MPI_SUCCESS ||
-        endpoint.port == 0) return;
+        endpoint.port == 0) {
+        peak_general_listener_global_budget_startup(0.0, 0);
+        return;
+    }
     peak_global_budget_set_nonce(endpoint.nonce);
     int started = peak_global_budget_start(endpoint.host, endpoint.port,
         (unsigned)rank, (unsigned)size, global_target_ratio,

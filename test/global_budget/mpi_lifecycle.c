@@ -48,6 +48,8 @@ int main(int argc,char **argv)
         int (*grace)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_grace_faa");
         return guard&&grace ? (guard() || grace()) : 2;
     }
+    unsigned char original_target[16];
+    memcpy(original_target, (const void*)&pressure_000, sizeof(original_target));
     int provided,rank,size;MPI_Init_thread(&argc,&argv,MPI_THREAD_FUNNELED,&provided);
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
     PeakGlobalBudgetView (*view)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_view");
@@ -60,7 +62,24 @@ int main(int argc,char **argv)
     printf("affinity rank=%d threads=2",rank);
     for(int t=0;t<2;t++){printf(" t%d=[",t);int first=1;for(int cpu=0;cpu<CPU_SETSIZE;cpu++)if(CPU_ISSET(cpu,&masks[t])){printf("%s%d",first?"":",",cpu);first=0;}printf("]");}printf("\n");fflush(stdout);
     int bad=0;
-    if(!strcmp(argv[1],"skew")) {
+    if(!strcmp(argv[1],"unfunded")) {
+        bad |= memcmp(original_target, (const void*)&pressure_000, sizeof(original_target)) != 0;
+        bad |= work(.1,2000,1,view,rank,1);
+        bad |= memcmp(original_target, (const void*)&pressure_000, sizeof(original_target)) != 0;
+        printf("lifecycle rank=%d initially_unpatched=%d\n",rank,!bad);fflush(stdout);
+        int sum;MPI_Allreduce(&bad,&sum,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);bad=sum;
+    } else if(!strcmp(argv[1],"fallback")) {
+        void (*disconnect)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_disconnect");
+        if(!disconnect) MPI_Abort(MPI_COMM_WORLD,2);
+        if(rank==0) disconnect();
+        MPI_Barrier(MPI_COMM_WORLD);
+        bad|=work(2.0,8,0,view,rank,0);
+        int patched=memcmp(original_target,(const void*)&pressure_000,sizeof(original_target))!=0;
+        printf("lifecycle rank=%d local_initial_patched=%d\n",rank,patched);fflush(stdout);
+        bad|=!patched;
+        bad|=work(.25,2000,1,view,rank,0);
+        int sum;MPI_Allreduce(&bad,&sum,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);bad=sum;
+    } else if(!strcmp(argv[1],"skew")) {
         MPI_Comm peers;MPI_Comm_split(MPI_COMM_WORLD,rank==0?MPI_UNDEFINED:1,rank,&peers);
         MPI_Barrier(MPI_COMM_WORLD);
         if(rank==0) { printf("lifecycle root_enter_finalize=1\n");fflush(stdout);MPI_Finalize();return 0; }
@@ -71,7 +90,7 @@ int main(int argc,char **argv)
             bad|=work(.15,8,0,view,rank,1);
         }
         MPI_Comm_free(&peers);
-    } else if(!strcmp(argv[1],"recovery")) {
+    } else if(!strcmp(argv[1],"recovery") || !strcmp(argv[1],"initial-once")) {
         bad|=work(2.0,8,0,view,rank,1);
         MPI_Barrier(MPI_COMM_WORLD);
         bad|=work(.25,2000,1,view,rank,1);
