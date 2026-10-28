@@ -4,6 +4,7 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
