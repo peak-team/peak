@@ -7446,6 +7446,66 @@ peak_general_listener_use_selector_resolution(
     return address;
 }
 
+typedef enum {
+    PEAK_SUPPORT_TARGET_WRAPPER,
+    PEAK_SUPPORT_TARGET_SKIP,
+    PEAK_SUPPORT_TARGET_MAIN,
+    PEAK_SUPPORT_TARGET_DLOPEN
+} PeakSupportTargetAction;
+
+typedef struct {
+    const char* name;
+    const char* wrapper;
+    PeakSupportTargetAction action;
+} PeakSupportTarget;
+
+static const PeakSupportTarget peak_support_targets[] = {
+    {"MPI_Finalize", NULL, PEAK_SUPPORT_TARGET_SKIP},
+    {"PMPI_Finalize", NULL, PEAK_SUPPORT_TARGET_SKIP},
+    {"exit", "peak_exit", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"main", NULL, PEAK_SUPPORT_TARGET_MAIN},
+    {"cudaLaunchKernel", "peak_cuda_launch_kernel", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cudaLaunchCooperativeKernel", "peak_cuda_launch_cooperative_kernel", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cudaLaunchCooperativeKernelMultiDevice", "peak_cuda_launch_cooperative_kernel_multiple_device", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cudaLaunchKernelEx", "peak_cuda_launch_kernel_exc", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cudaLaunchKernelExC", "peak_cuda_launch_kernel_exc", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cuLaunchKernel", "peak_cu_launch_kernel", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cuLaunchCooperativeKernel", "peak_cu_launch_cooperative_kernel", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cuLaunchCooperativeKernelMultiDevice", "peak_cu_launch_cooperative_kernel_multiple_device", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cuLaunchKernelEx", "peak_cu_launch_kernel_ex", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cudaGraphLaunch", "peak_cuda_graph_launch", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"cuGraphLaunch", "peak_cu_graph_launch", PEAK_SUPPORT_TARGET_WRAPPER},
+    {"dlopen", NULL, PEAK_SUPPORT_TARGET_DLOPEN},
+};
+
+static const PeakSupportTarget*
+peak_general_listener_support_target(const char* selector,
+                                     const PeakTargetResolveRequest* resolution)
+{
+    const char* qualified_name = strchr(selector, '!');
+    const char* name = qualified_name != NULL ? qualified_name + 1 : selector;
+
+    for (size_t i = 0; i < G_N_ELEMENTS(peak_support_targets); i++) {
+        const PeakSupportTarget* support = &peak_support_targets[i];
+        if (strcmp(name, support->name) != 0)
+            continue;
+        /* Only recognized support names need a global address check. A DSO's
+         * unrelated same-named entry must remain an ordinary profile target. */
+        if (qualified_name != NULL) {
+            if (resolution == NULL || resolution->result != PEAK_TARGET_RESOLVE_UNIQUE ||
+                resolution->resolution.candidates == NULL ||
+                resolution->resolution.candidates->len != 1)
+                return NULL;
+            PeakTargetSymbolCandidate* candidate = g_ptr_array_index(
+                resolution->resolution.candidates, 0);
+            if (candidate->address != peak_general_listener_find_function(name))
+                return NULL;
+        }
+        return support;
+    }
+    return NULL;
+}
+
 void
 peak_general_listener_attach()
 {
@@ -7563,65 +7623,16 @@ peak_general_listener_attach()
                                           peak_hook_address_count);
     }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
-        /* Redirect functions for which PEAK already owns support wrappers. */
-        if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
-            strcmp(peak_hook_strings[i], "PMPI_Finalize") == 0) {
-            hook_address[i] = NULL;
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
-            hook_address[i] = peak_general_listener_find_function("peak_exit");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "main") == 0) {
-            hook_address[i] = NULL;
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernel") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_launch_kernel");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernel") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernelMultiDevice") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel_multiple_device");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelEx") == 0) {
-            /* C++ template variants also use cudaLaunchKernelExC internally. */
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelExC") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernel") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cu_launch_kernel");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernel") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cu_launch_cooperative_kernel");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernelMultiDevice") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cu_launch_cooperative_kernel_multiple_device");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernelEx") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cu_launch_kernel_ex");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaGraphLaunch") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cuda_graph_launch");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuGraphLaunch") == 0) {
-            hook_address[i] =
-                peak_general_listener_find_function("peak_cu_graph_launch");
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
-            peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen listener used for dynamic attach\n");
-            hook_address[i] = NULL;
-            peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+        const PeakSupportTarget* support = peak_general_listener_support_target(
+            peak_hook_strings[i],
+            startup_resolutions != NULL ? &startup_resolutions[i] : NULL);
+        if (support != NULL) {
+            hook_address[i] = support->action == PEAK_SUPPORT_TARGET_WRAPPER
+                ? peak_general_listener_find_function(support->wrapper) : NULL;
+            if (support->action != PEAK_SUPPORT_TARGET_MAIN)
+                peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
+            if (support->action == PEAK_SUPPORT_TARGET_DLOPEN)
+                peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen listener used for dynamic attach\n");
         } else {
             gboolean explicit_selector =
                 peak_symbol_should_use_cpp_map(peak_hook_strings[i]);

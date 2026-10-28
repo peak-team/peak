@@ -582,9 +582,12 @@ def check_dlopen_fftw_scope_and_fork_guard(repo_root):
         "dlopen_interceptor_release_dynamic_attach_request_metadata("
     )
     drain_end = drain.find("dlopen_interceptor_end_dynamic_attach_drain();")
-    drain_close = drain.find(
-        "dlopen_interceptor_internal_dlclose(handles_to_close[i]);"
+    drain_close_match = re.search(
+        r"dlopen_interceptor_internal_dlclose\(\s*"
+        r"g_ptr_array_index\(handles_to_close, i\)\s*\)",
+        drain,
     )
+    drain_close = drain_close_match.start() if drain_close_match else -1
     require(drain_release != -1 and drain_end != -1 and drain_close != -1 and
             drain_release < drain_end < drain_close,
             "queue-owned handles must be closed only after the controller reopens callback admission")
@@ -863,6 +866,7 @@ def check_fast_listener_unwind_abi(repo_root):
     overlay = (repo_root / "cmake/peak-gum/gum_peak_pc_api.c").read_text(
         encoding="utf-8"
     )
+    unwind_frames = read_source(repo_root, "cmake/peak-gum/peak_gum_unwind_frames.inc")
     patcher = (
         repo_root / "cmake/peak-gum/patch_frida_gum_elf_module.py"
     ).read_text(encoding="utf-8")
@@ -878,14 +882,35 @@ def check_fast_listener_unwind_abi(repo_root):
             '"--globalize-symbol"' in patcher and
             'tls_model("initial-exec")' in overlay and
             "peak_gum_cached_invocation_stack" in overlay and
-            "peak_gum_invocation_stack_reap_unwound(stack_address)"
-            in overlay and
             "gum_interceptor_peak_invocation_stack_entry_matches" in overlay and
-            "peak_gum_invocation_stack_depth()" in overlay and
-            "peak_gum_invocation_stack_reap_to_depth(gum_stack_depth)"
+            re.search(
+                r"#if defined\(__x86_64__\)\s*"
+                r"peak_gum_invocation_stack_reap_unwound\(function_ctx->interceptor, caller_ret_addr\);\s*"
+                r"#else\s*\(void\)peak_gum_invocation_stack\(function_ctx->interceptor\);",
+                overlay,
+            ) is not None and
+            re.search(
+                r"#if !defined\(__x86_64__\)\s*"
+                r"peak_gum_invocation_stack_reap_unwound\(function_ctx->interceptor, stack_address\);\s*"
+                r"#endif",
+                overlay,
+            ) is not None and
+            "gum_stack_depth = peak_gum_invocation_stack_depth(function_ctx->interceptor)"
+            in overlay and
+            "peak_gum_invocation_stack_reap_to_depth(function_ctx->interceptor, gum_stack_depth)"
             in overlay,
-            "direct dispatch must cache, snapshot, and restore Gum's generic "
-            "invocation-stack depth without a steady-state Gum TLS lookup")
+            "direct dispatch must synchronize Gum's stack once per x86 entry, "
+            "retain the architecture-specific snapshot, and restore its depth")
+    prepare = extract_function(unwind_frames, "peak_uw_prepare")
+    reap = extract_function(unwind_frames, "peak_uw_reap")
+    require(prepare.find("if (!peak_uw_thread || !peak_uw_thread->free)") != -1 and
+            prepare.find("peak_gum_metadata_guard_enter(interceptor)") >
+            prepare.find("if (!peak_uw_thread || !peak_uw_thread->free)") and
+            reap.find("if (!peak_uw_thread)") <
+            reap.find("while (peak_uw_thread->active)") <
+            reap.find("peak_gum_metadata_guard_enter(interceptor)") and
+            "peak_uw_internal++" in prepare,
+            "unwind metadata guards must stay on cold allocation or stale-frame reap paths")
     require("entry->gum_stack_depth = gum_stack_depth" in listener and
             "*gum_stack_depth_out = entry.gum_stack_depth" in listener,
             "the PEAK direct invocation entry must carry its Gum stack boundary")
@@ -2189,11 +2214,19 @@ def check_stop_window_accounting_sidecar(repo_root):
             "Gum attach support predicate must use cached attach policy")
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
-    require(general_attach_supported.count("peak_log_info(") == 2 and
-            general_attach_supported.count("peak_log_warn(") == 1 and
-            "g_printerr(" not in general_attach_supported and
-            "target entry redirects to another address" in
-            general_attach_supported,
+    require(re.search(
+                r'peak_log_info\(\s*"\[peak\] skipping Gum attach for hook '
+                r'%s: target prologue is too small',
+                general_attach_supported) is not None and
+            re.search(
+                r'peak_log_info\(\s*"\[peak\] skipping Gum attach for hook '
+                r'%s: target prologue is not safe for Gum relocation',
+                general_attach_supported) is not None and
+            re.search(
+                r'peak_log_warn\(\s*"\[peak\] skipping Gum attach for hook '
+                r'%s: target entry redirects to another address',
+                general_attach_supported) is not None and
+            "g_printerr(" not in general_attach_supported,
             "relocation-policy skips must remain INFO while target-attribution "
             "rejection is a default-visible WARN")
     require("peak_general_listener_init_attach_policy();" in general,

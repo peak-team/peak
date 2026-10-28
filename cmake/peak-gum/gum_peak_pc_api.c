@@ -1046,6 +1046,43 @@ _gum_function_context_end_invocation_peak_original(
 G_GNUC_INTERNAL PeakGumInterceptorThreadContext17 *
 peak_gum_get_interceptor_thread_context(void);
 
+#if defined(__linux__)
+G_GNUC_INTERNAL extern GumTlsKey peak_gum_interceptor_guard_key;
+
+/* Bookkeeping may allocate or lock before a new thread's Gum context has
+ * been published. Use Gum's own guard so nested hooks bypass both PEAK and
+ * generic listener dispatch rather than recursively allocating a context. */
+static gpointer
+peak_gum_metadata_guard_enter(gpointer interceptor)
+{
+    gpointer previous_guard = gum_tls_key_get_value(peak_gum_interceptor_guard_key);
+    gum_tls_key_set_value(peak_gum_interceptor_guard_key,
+                          interceptor);
+    return previous_guard;
+}
+
+static void
+peak_gum_metadata_guard_leave(gpointer previous_guard)
+{
+    gum_tls_key_set_value(peak_gum_interceptor_guard_key, previous_guard);
+}
+
+static PeakGumInterceptorThreadContext17 *
+peak_gum_get_interceptor_thread_context_guarded(gpointer interceptor)
+{
+    gpointer previous_guard = peak_gum_metadata_guard_enter(interceptor);
+    PeakGumInterceptorThreadContext17 * context =
+        peak_gum_get_interceptor_thread_context();
+    peak_gum_metadata_guard_leave(previous_guard);
+    return context;
+}
+#else
+static gpointer peak_gum_metadata_guard_enter(gpointer interceptor) { (void)interceptor; return NULL; }
+static void peak_gum_metadata_guard_leave(gpointer previous) { (void)previous; }
+#define peak_gum_get_interceptor_thread_context_guarded(interceptor) \
+    peak_gum_get_interceptor_thread_context()
+#endif
+
 G_GNUC_INTERNAL extern GumSpinlock peak_gum_interceptor_thread_context_lock;
 G_GNUC_INTERNAL extern GHashTable *peak_gum_interceptor_thread_contexts;
 
@@ -1079,13 +1116,14 @@ peak_gum_pointer_in_range(gpointer pointer, gpointer start, gsize size)
 }
 
 static PeakGumInvocationStack17 * PEAK_GUM_FAST_DISPATCH_SECTION
-peak_gum_invocation_stack(void)
+peak_gum_invocation_stack(gpointer interceptor)
 {
     PeakGumInvocationStack17 * stack = peak_gum_cached_invocation_stack;
 
-    if (G_UNLIKELY(stack == NULL)) {
+    /* External stack inspection only reads the cache populated by dispatch. */
+    if (G_UNLIKELY(stack == NULL) && interceptor != NULL) {
         PeakGumInterceptorThreadContext17 * thread_context =
-            peak_gum_get_interceptor_thread_context();
+            peak_gum_get_interceptor_thread_context_guarded(interceptor);
 
         if (thread_context != NULL) {
             stack = thread_context->stack;
@@ -1096,9 +1134,9 @@ peak_gum_invocation_stack(void)
 }
 
 static guint PEAK_GUM_FAST_DISPATCH_SECTION
-peak_gum_invocation_stack_depth(void)
+peak_gum_invocation_stack_depth(gpointer interceptor)
 {
-    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack(interceptor);
 
     if (stack == NULL) {
         return 0;
@@ -1107,17 +1145,18 @@ peak_gum_invocation_stack_depth(void)
 }
 
 static void PEAK_GUM_FAST_DISPATCH_SECTION
-peak_gum_invocation_stack_reap_to_depth(guint target_depth)
+peak_gum_invocation_stack_reap_to_depth(gpointer interceptor, guint target_depth)
 {
-    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack(interceptor);
 
     if (stack == NULL) {
         return;
     }
-    if (target_depth > stack->len) {
+    if (target_depth >= stack->len) {
         return;
     }
 
+    gpointer metadata_guard = peak_gum_metadata_guard_enter(interceptor);
     while (stack->len > target_depth) {
         PeakGumInvocationStackEntry17 * entry =
             &g_array_index(stack,
@@ -1128,16 +1167,19 @@ peak_gum_invocation_stack_reap_to_depth(guint target_depth)
             &entry->function_ctx->trampoline_usage_counter);
         g_array_set_size(stack, stack->len - 1);
     }
+    peak_gum_metadata_guard_leave(metadata_guard);
 }
 
 static void PEAK_GUM_FAST_DISPATCH_SECTION
-peak_gum_invocation_stack_reap_unwound(gpointer live_stack_address)
+peak_gum_invocation_stack_reap_unwound(gpointer interceptor, gpointer live_stack_address)
 {
-    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack(interceptor);
 
     if (stack == NULL) {
         return;
     }
+    gpointer metadata_guard = NULL;
+    gboolean guarded = FALSE;
     while (stack->len > 0) {
         PeakGumInvocationStackEntry17 * entry =
             &g_array_index(stack,
@@ -1150,10 +1192,16 @@ peak_gum_invocation_stack_reap_unwound(gpointer live_stack_address)
                                                        entry->stack_address))) {
             break;
         }
+        if (!guarded) {
+            metadata_guard = peak_gum_metadata_guard_enter(interceptor);
+            guarded = TRUE;
+        }
         g_atomic_int_dec_and_test(
             &entry->function_ctx->trampoline_usage_counter);
         g_array_set_size(stack, stack->len - 1);
     }
+    if (guarded)
+        peak_gum_metadata_guard_leave(metadata_guard);
 }
 
 gboolean PEAK_GUM_FAST_DISPATCH_SECTION
@@ -1162,7 +1210,7 @@ gum_interceptor_peak_invocation_stack_entry_matches(
     gpointer function_address,
     gpointer stack_address)
 {
-    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack();
+    PeakGumInvocationStack17 * stack = peak_gum_invocation_stack(NULL);
     PeakGumInvocationStackEntry17 * entry;
 
     if (stack == NULL || depth >= stack->len) {
@@ -1663,12 +1711,22 @@ _gum_function_context_begin_invocation(
     gpointer * caller_ret_addr,
     gpointer * next_hop)
 {
+#if defined(__linux__)
+    /* Lazy Gum context allocation may itself invoke intercepted libc code.
+     * Honor Gum's guard before PEAK's reaping or depth snapshots touch it. */
+    if (peak_uw_internal != 0 ||
+        gum_tls_key_get_value(peak_gum_interceptor_guard_key) ==
+            function_ctx->interceptor)
+#else
     if (peak_uw_internal != 0)
+#endif
         return _gum_function_context_begin_invocation_peak_original(function_ctx, cpu_context, caller_ret_addr, next_hop);
     gpointer peak_original_return = *caller_ret_addr;
-    peak_uw_reap(caller_ret_addr);
+    peak_uw_reap(function_ctx->interceptor, caller_ret_addr);
 #if defined(__x86_64__)
-    peak_gum_invocation_stack_reap_unwound(caller_ret_addr);
+    peak_gum_invocation_stack_reap_unwound(function_ctx->interceptor, caller_ret_addr);
+#else
+    (void)peak_gum_invocation_stack(function_ctx->interceptor);
 #endif
     GumPeakFastListener * fast_listener =
         peak_gum_context_fast_listener_for_enter(function_ctx);
@@ -1681,7 +1739,7 @@ _gum_function_context_begin_invocation(
         function_ctx->function_address != (gpointer)_Unwind_GetRegionStart &&
         function_ctx->function_address != (gpointer)_Unwind_GetLanguageSpecificData;
     if (peak_needs_frame) {
-        peak_reserved = peak_uw_prepare();
+        peak_reserved = peak_uw_prepare(function_ctx->interceptor);
         if (peak_reserved == NULL) {
             /* Preserve Gum replacement/listener semantics on resource failure.
              * This is explicitly degraded admission, not a repaired EH path. */
@@ -1717,8 +1775,10 @@ _gum_function_context_begin_invocation(
          * generic boundary, otherwise PEAK's TLS stack can lag behind Gum's
          * independently reaped invocation stack.
          */
-        peak_gum_invocation_stack_reap_unwound(stack_address);
-        gum_stack_depth = peak_gum_invocation_stack_depth();
+#if !defined(__x86_64__)
+        peak_gum_invocation_stack_reap_unwound(function_ctx->interceptor, stack_address);
+#endif
+        gum_stack_depth = peak_gum_invocation_stack_depth(function_ctx->interceptor);
         result = fast_listener->on_enter(fast_listener->user_data,
                                          function_ctx,
                                          stack_address,
@@ -1727,12 +1787,12 @@ _gum_function_context_begin_invocation(
         if (G_UNLIKELY(result == GUM_PEAK_FAST_ENTER_FALLBACK)) {
             gboolean invoke = _gum_function_context_begin_invocation_peak_original(
                 function_ctx, cpu_context, caller_ret_addr, next_hop);
-            peak_uw_bind_gum_context();
+            peak_uw_bind_gum_context(function_ctx->interceptor);
             peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                           peak_original_return, invoke, TRUE);
             return invoke || peak_reserved != NULL;
         }
-        peak_uw_bind_gum_context();
+        peak_uw_bind_gum_context(function_ctx->interceptor);
         *next_hop = function_ctx->on_invoke_trampoline;
         if (result == GUM_PEAK_FAST_ENTER_INVOKE) {
             *caller_ret_addr = function_ctx->on_leave_trampoline;
@@ -1746,7 +1806,7 @@ _gum_function_context_begin_invocation(
 
     gboolean invoke = _gum_function_context_begin_invocation_peak_original(
         function_ctx, cpu_context, caller_ret_addr, next_hop);
-    peak_uw_bind_gum_context();
+    peak_uw_bind_gum_context(function_ctx->interceptor);
     peak_uw_enter(peak_reserved, function_ctx, caller_ret_addr,
                   peak_original_return, invoke, TRUE);
     return invoke || peak_reserved != NULL;
@@ -1792,7 +1852,7 @@ _gum_function_context_end_invocation(
                                     stack_address,
                                     &gum_stack_depth,
                                     &return_address);
-        peak_gum_invocation_stack_reap_to_depth(gum_stack_depth);
+        peak_gum_invocation_stack_reap_to_depth(function_ctx->interceptor, gum_stack_depth);
         if (G_UNLIKELY(release_required)) {
             while (g_atomic_int_get(&fast_listener->release_required) == 0) {
 #if defined(__x86_64__) || defined(__amd64__)

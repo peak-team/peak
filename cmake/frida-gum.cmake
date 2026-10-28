@@ -629,6 +629,29 @@ int main(void)
             "Update the caller-provided patched devkit (including checked entry-range revision 3), or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset.")
     endif()
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Older revision-3 devkits have the same public API but do not guard
+        # overlay metadata allocation. Full symbol lists can recurse in libc
+        # on the first intercepted call from a new thread with those devkits.
+        unset(PEAK_GUM_HAS_METADATA_RECURSION_GUARD CACHE)
+        check_c_source_compiles("
+#include <frida-gum.h>
+extern GumTlsKey peak_gum_interceptor_guard_key;
+int main(void)
+{
+    GumTlsKey volatile guard_key = peak_gum_interceptor_guard_key;
+    return guard_key != 0;
+}
+" PEAK_GUM_HAS_METADATA_RECURSION_GUARD)
+        if(NOT PEAK_GUM_HAS_METADATA_RECURSION_GUARD)
+            message(FATAL_ERROR
+                "The selected Frida Gum devkit lacks PEAK's metadata recursion guard. "
+                "Rebuild the caller-provided patched devkit with the current PEAK overlay, "
+                "or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset. "
+                "Checked entry-range revision 3 alone is insufficient for full symbol lists.")
+        endif()
+    endif()
+
     set(_peak_gum_exact_attach_probe_source "
 #include <frida-gum.h>
 

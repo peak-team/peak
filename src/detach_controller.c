@@ -4272,7 +4272,8 @@ peak_detach_controller_capture_gum_snapshot(const PeakDetachRequest* request,
 
     if (gum_interceptor_peak_get_pc_diagnostics(request->interceptor,
                                                 request->function_address,
-                                                request->listener,
+                                                request->operation == PEAK_DETACH_OPERATION_ATTACH
+                                                    ? NULL : request->listener,
                                                 &snapshot->diagnostics)) {
         snapshot->has_context = TRUE;
     } else if (needs_existing_hook_context) {

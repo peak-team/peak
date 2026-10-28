@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Collect ELF function selectors without loading the inspected objects."""
+import argparse
+import _imp
+from collections import deque
+import ast
+import glob
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+class CollectionError(Exception):
+    pass
+
+
+def run(command, timeout=30, env=None, forward=False, parsed=False):
+    """Bound external tools and reap their entire process group."""
+    if parsed:
+        env = dict(os.environ if env is None else env, LC_ALL='C')
+    destination = sys.stderr if forward else subprocess.PIPE
+    process = subprocess.Popen(command, stdout=destination, stderr=destination,
+                               text=not forward, start_new_session=True, env=env)
+    stdout, stderr = '', ''
+    try:
+        if forward:
+            process.wait(timeout=timeout)
+        else:
+            stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if forward:
+            process.wait()
+        else:
+            process.communicate()
+        raise
+    finally:
+        # A script can leave descendants behind after its direct process exits.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.returncode:
+        raise CollectionError('{} failed ({}): {}'.format(command[0], process.returncode,
+                                                        stderr.strip()[-4000:]))
+    return stdout
+
+
+class Collector:
+    def __init__(self, args):
+        self.args = args
+        self.objects = {}
+        self.completed_roots = set()
+        self.root_origin = None
+        self.inherited_rpath = ()
+        self.sources = set()
+        self.unsupported_paths = set()
+        self.symbols = set()
+        self.cache = {}
+        self.library_dirs = [Path(p).absolute() for p in args.library_dir]
+        self.ldcache = {}
+        self.hwcaps = None
+        self.hwcaps_checked = False
+        self.host_abi = None
+        ldconfig = shutil.which('ldconfig') or '/sbin/ldconfig'
+        if Path(ldconfig).exists():
+            for line in run([ldconfig, '-p'], parsed=True).splitlines():
+                match = re.match(r'\s*(\S+) .* => (.+)', line)
+                if match:
+                    self.ldcache.setdefault(match[1], []).append(Path(match[2]))
+
+    def inspect(self, path):
+        path = Path(path).resolve(strict=True)
+        if path in self.cache:
+            return self.cache[path]
+        output = run(['readelf', '-W', '-h', '-d', '-s', str(path)], parsed=True)
+        kind = re.search(r'^\s*Type:\s*(\S+)', output, re.M)
+        if not kind or kind[1] not in ('EXEC', 'DYN'):
+            raise CollectionError('expected ELF executable or shared library: ' + str(path))
+        fields = {}
+        for key in ('Class', 'Data', 'Machine'):
+            match = re.search(r'^\s*' + key + r':\s*(.+)$', output, re.M)
+            if not match:
+                raise CollectionError('not a supported ELF object: ' + str(path))
+            fields[key] = match[1]
+        abi = tuple(fields.values())
+        needed = re.findall(r'\(NEEDED\).*?\[(.*?)\]', output)
+        rpath = re.findall(r'\(RPATH\).*?\[(.*?)\]', output)
+        runpath = re.findall(r'\(RUNPATH\).*?\[(.*?)\]', output)
+        symbols = set()
+        for line in output.splitlines():
+            columns = line.split(None, 7)
+            if len(columns) < 8 or not re.fullmatch(r'\d+:', columns[0]):
+                continue
+            if columns[3] not in ('FUNC', 'IFUNC', 'GNU_IFUNC') or columns[6] in ('UND', 'ABS'):
+                continue
+            if int(columns[1], 16) == 0:
+                continue
+            name = columns[7].split('@', 1)[0]
+            if any(c in name for c in '!\r\n[](){}<>,+') or any(c.isspace() for c in name):
+                raise CollectionError('symbol cannot be represented in PEAK_TARGET_FILE: ' + repr(name))
+            if name:
+                symbols.add(name)
+        sonames = re.findall(r'\(SONAME\).*?\[(.*?)\]', output)
+        indirect = re.findall(r'\((FILTER|AUXILIARY)\).*?\[(.*?)\]', output)
+        result = abi, needed, rpath, runpath, symbols, sonames, indirect
+        self.cache[path] = result
+        return result
+
+    def expand(self, values, origin, split=True):
+        result = []
+        for value in values:
+            if not value:
+                continue
+            for item in (value.split(':') if split else (value,)):
+                # Empty loader search entries mean the current working directory.
+                item = item.replace('${ORIGIN}', str(origin)).replace('$ORIGIN', str(origin))
+                if any(token in item for token in ('$LIB', '${LIB}', '$PLATFORM', '${PLATFORM}')):
+                    if not self.library_dirs:
+                        raise CollectionError('unsupported loader $LIB/$PLATFORM token in ' + item
+                                              + '; supply its expanded directory using --library-dir')
+                    if item not in self.unsupported_paths:
+                        self.unsupported_paths.add(item)
+                        print('warning: skipping loader search path with unsupported $LIB/$PLATFORM token: '
+                              + item + '; supply its expanded directory using --library-dir', file=sys.stderr)
+                    continue
+                result.append(Path(item or '.').absolute())
+        return result
+
+    def active_hwcaps(self, abi):
+        if not self.hwcaps_checked:
+            self.hwcaps_checked = True
+            self.host_abi = self.inspect(sys.executable)[0]
+            headers = run(['readelf', '-W', '-l', sys.executable], parsed=True)
+            match = re.search(r'Requesting program interpreter: ([^\]]+)\]', headers)
+            if match and Path(match[1]).name.startswith('ld-musl-'):
+                self.hwcaps = []  # musl does not implement glibc-hwcaps lookup.
+            elif match:
+                try:
+                    diagnostics = run([match[1], '--list-diagnostics'], parsed=True)
+                    subdirs = re.search(r'^dl_hwcaps_subdirs="([^"]*)"$', diagnostics, re.M)
+                    active = re.search(r'^dl_hwcaps_subdirs_active=(0x[0-9a-fA-F]+|[0-9]+)$', diagnostics, re.M)
+                    if subdirs and active:
+                        names = subdirs[1].split(':') if subdirs[1] else []
+                        mask = int(active[1], 0)
+                        self.hwcaps = [name for index, name in enumerate(names) if mask & (1 << index)]
+                except CollectionError:
+                    pass
+        if self.hwcaps is None or abi != self.host_abi:
+            raise CollectionError('glibc-hwcaps candidates require compatible local loader diagnostics; '
+                                  'cannot safely choose a library for this target ABI')
+        return self.hwcaps
+
+    def directory_candidates(self, directories, name, abi):
+        result = []
+        for directory in directories:
+            caproot = directory / 'glibc-hwcaps'
+            if caproot.is_dir() and any(path.is_file() for path in caproot.glob('*/' + name)):
+                for capability in self.active_hwcaps(abi):
+                    result.append(directory / 'glibc-hwcaps' / capability / name)
+            result.append(directory / name)
+        return result
+
+    def cached_candidates(self, name, abi):
+        candidates = [path for path in self.ldcache.get(name, []) if path.is_file()]
+        if not any('/glibc-hwcaps/' in str(path) for path in candidates):
+            return candidates
+        active = self.active_hwcaps(abi)
+        result = []
+        for path in candidates:
+            if '/glibc-hwcaps/' in str(path):
+                capability = str(path).split('/glibc-hwcaps/', 1)[1].split('/', 1)[0]
+                if capability in active:
+                    result.append((active.index(capability), path))
+            else:
+                result.append((len(active), path))
+        return [path for rank, path in sorted(result, key=lambda entry: entry[0])]
+
+    def add_object(self, path):
+        path = Path(path).resolve(strict=True)
+        if any(c in str(path) for c in '!\r\n[](){}<>,'):
+            raise CollectionError('path cannot be represented in PEAK_TARGET_FILE: ' + repr(str(path)))
+        info = self.inspect(path)
+        if path not in self.objects:
+            self.objects[path] = True
+            self.symbols.update(str(path) + '!' + symbol for symbol in info[4])
+            if not info[4]:
+                print('warning: no defined function symbols in ' + str(path), file=sys.stderr)
+        return info
+
+    def add_runtime(self, observed, baseline, roots):
+        # Only files actually mapped during this run can supply runtime targets.
+        pool, selected, index = {}, set(), {}
+        def validate_identity(visible, expected):
+            try:
+                stat = visible.stat()
+            except OSError as error:
+                raise CollectionError('observed mapped file is unavailable: ' + str(visible)) from error
+            if (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino) != expected:
+                raise CollectionError('observed mapped file changed: ' + str(visible))
+        for active, names in ((True, observed), (False, baseline)):
+            if not active and not selected and not roots:
+                return
+            for name, major, minor, inode in names:
+                visible = Path(name)
+                expected = (major, minor, inode)
+                validate_identity(visible, expected)
+                path = visible.resolve()
+                if active:
+                    self.sources.add(path)
+                if path not in pool:
+                    with path.open('rb') as stream:
+                        if stream.read(4) != b'\x7fELF':
+                            continue
+                    pool[path] = self.inspect(path)
+                    validate_identity(visible, expected)
+                if active:
+                    selected.add(path)
+        for name in roots:
+            path = Path(name)
+            if path.is_file():
+                canonical = path.resolve()
+                self.sources.add(canonical)
+                if canonical in pool:
+                    selected.add(canonical)
+        for path, info in pool.items():
+            for name in [path.name] + info[5]:
+                index.setdefault((info[0], name), set()).add(path)
+        pending = deque(selected)
+        while pending:
+            path = pending.popleft()
+            info = self.add_object(path)
+            for name in info[1]:
+                if '/' in name:
+                    candidate = Path(name).resolve()
+                    matches = {candidate} if candidate in pool and pool[candidate][0] == info[0] else set()
+                else:
+                    matches = index.get((info[0], name), ())
+                for candidate in matches:
+                    if candidate not in selected:
+                        selected.add(candidate)
+                        pending.append(candidate)
+
+    def add(self, path, scope=None):
+        # Each explicitly selected root has a loader closure. Resolve siblings before
+        # descendants so a direct dependency's SONAME wins over a nested request.
+        root = Path(path).absolute()
+        root_key = (root, self.root_origin)
+        if root_key in self.completed_roots:
+            return {} if scope is None else scope
+        pending = deque([(root, self.inherited_rpath)])
+        selected = {} if scope is None else scope
+        visited = set()
+        root_info = self.inspect(root)
+        for soname in root_info[5]:
+            selected.setdefault((root_info[0], soname), root)
+        while pending:
+            visible_path, inherited = pending.popleft()
+            path = visible_path.resolve(strict=True)
+            if path in visited:
+                continue
+            visited.add(path)
+            info = self.add_object(path)
+            if info[6]:
+                raise CollectionError('static discovery does not support DT_' + info[6][0][0] +
+                                      ' loader directives in ' + str(path))
+            abi, needed, rpath, runpath, symbols, sonames = info[:6]
+            own_rpath = self.expand(rpath, visible_path.parent) if not runpath else []
+            # A requester's RUNPATH suppresses inherited RPATH for that request.
+            search = own_rpath + ([] if runpath else list(inherited)) + self.library_dirs
+            library_path = os.environ.get('LD_LIBRARY_PATH', '')
+            if library_path:
+                # Unlike RPATH, glibc also accepts semicolons; an entirely empty
+                # value adds no search path, but empty components mean cwd.
+                search += self.expand([library_path.replace(';', ':')], self.root_origin or root.parent)
+            search += self.expand(runpath, visible_path.parent)
+            descendants = tuple(own_rpath + list(inherited))
+            for name in needed:
+                if (abi, name) in selected:
+                    continue
+                if '/' in name:
+                    candidates = self.expand([name], visible_path.parent, split=False)
+                    candidates += [directory / Path(name).name for directory in self.library_dirs]
+                else:
+                    candidates = self.directory_candidates(search, name, abi)
+                    candidates += self.cached_candidates(name, abi)
+                    system_dirs = [Path(directory) for directory in
+                                   ('/lib', '/lib64', '/usr/lib', '/usr/lib64')]
+                    system_dirs += [Path(p) for p in glob.glob('/lib/*-linux-gnu')]
+                    system_dirs += [Path(p) for p in glob.glob('/usr/lib/*-linux-gnu')]
+                    candidates += self.directory_candidates(system_dirs, name, abi)
+                found = None
+                for candidate in candidates:
+                    if candidate.is_file():
+                        try:
+                            if self.inspect(candidate)[0] == abi:
+                                found = candidate.absolute()
+                                break
+                        except (CollectionError, OSError):
+                            continue
+                if found is None:
+                    raise CollectionError('cannot resolve dependency {!r} required by {}'.format(name, path))
+                selected[(abi, name)] = found
+                for alias in self.inspect(found)[5]:
+                    selected.setdefault((abi, alias), found)
+                pending.append((found, descendants))
+        self.completed_roots.add(root_key)
+        return selected
+
+
+def python_info(interpreter):
+    code = ('import sys,_imp;'
+            'print(repr({"executable":sys.executable,"version":list(sys.version_info[:2]),"path":sys.path,'
+            '"builtins":list(sys.builtin_module_names),"suffixes":_imp.extension_suffixes()}))')
+    return ast.literal_eval(run([interpreter, '-c', code]))
+
+
+def static_python(script, info, collector):
+    """Follow filesystem imports, never import user code in this process."""
+    paths = list(info['path'])
+    # -c injects an empty first entry; a script replaces it with its own directory.
+    # Later empty entries may come from PYTHONPATH and must retain cwd semantics.
+    if paths and paths[0] == '':
+        paths[0] = str(script.parent)
+    roots = [Path(p or '.').resolve() for p in paths]
+    queue = [(script, '')]
+    seen = set()
+    bundled = set()
+
+    def locate(name):
+        parts = name.split('.')
+        if parts[0] in info['builtins'] or _imp.is_frozen(parts[0]):
+            return None
+        locations = roots
+        qualified = []
+        result = None
+        for part in parts:
+            qualified.append(part)
+            namespaces = []
+            result = None
+            regular = False
+            for root in locations:
+                package = root / part
+                init = next((package / ('__init__' + suffix)
+                             for suffix in info['suffixes'] + ['.py']
+                             if (package / ('__init__' + suffix)).is_file()), None)
+                if init is not None:
+                    if init.suffix == '.py':
+                        queue.append((init, '.'.join(qualified)))
+                    else:
+                        collector.add(init)
+                    result, regular = package, True
+                    break
+                for suffix in info['suffixes']:
+                    extension = root / (part + suffix)
+                    if extension.is_file():
+                        collector.add(extension)
+                        return extension
+                source = root / (part + '.py')
+                if source.is_file():
+                    queue.append((source, '.'.join(qualified[:-1])))
+                    return source
+                if package.is_dir():
+                    namespaces.append(package)
+            locations = [result] if regular else namespaces
+            for package in locations:
+                if package not in bundled:
+                    bundled.add(package)
+                    for library in package.rglob('*.so*'):
+                        if library.is_file():
+                            with library.open('rb') as stream:
+                                if stream.read(4) == b'\x7fELF':
+                                    collector.add(library)
+            if not locations:
+                break
+            result = locations[0]
+        return result
+
+    while queue:
+        source, package = queue.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        collector.sources.add(source.resolve())
+        try:
+            tree = ast.parse(source.read_bytes(), filename=str(source))
+        except (SyntaxError, UnicodeError, OSError) as error:
+            raise CollectionError('cannot inspect Python source {}: {}'.format(source, error))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    locate(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                prefix = package.split('.') if package else []
+                if node.level:
+                    prefix = prefix[:len(prefix) - node.level + 1]
+                else:
+                    prefix = []
+                base = '.'.join(prefix + ([node.module] if node.module else []))
+                if base:
+                    locate(base)
+                for alias in node.names:
+                    if alias.name != '*':
+                        locate('.'.join(filter(None, (base, alias.name))))
+
+
+def runtime_python(script, interpreter, arguments, timeout):
+    # Capture newly mapped libraries and native modules without interpreter baseline mappings.
+    helper = r'''
+import sys
+initial_modules = set(sys.modules)
+import _imp, atexit, builtins, importlib, importlib.machinery, os
+paths = set()
+loaded_roots = {}
+ctypes_modules = set()
+extension_suffixes = tuple(_imp.extension_suffixes())
+def mapped_files():
+    result = set()
+    with open('/proc/self/maps') as maps:
+        for line in maps:
+            parts = line.rstrip('\n').split(None, 5)
+            if len(parts) == 6 and 'x' in parts[1] and parts[5].startswith('/'):
+                path = parts[5]
+                if path.startswith('/memfd:'):
+                    continue  # Anonymous descriptors are not filesystem ELF inputs.
+                path = path[:-10] if path.endswith(' (deleted)') else path
+                major, minor = (int(value, 16) for value in parts[3].split(':'))
+                result.add((path, major, minor, int(parts[4])))
+    return result
+baseline = mapped_files()
+baseline_modules = initial_modules
+def snapshot():
+    try:
+        paths.update(mapped_files() - baseline)
+    except OSError:
+        pass  # A successful target call must survive unavailable procfs.
+def namespace(module):
+    if isinstance(module, type(sys)):
+        return object.__getattribute__(module, '__dict__')
+    return {}
+def observed_path(filename):
+    return filename if os.path.isabs(filename) else os.path.join(os.getcwd(), filename)
+def remember(module, capture=True):
+    filename = namespace(module).get('__file__')
+    if isinstance(filename, str):
+        loaded_roots.setdefault(observed_path(filename), None)
+        if capture and filename.endswith(extension_suffixes):
+            snapshot()
+def observe_ctypes(module):
+    ns = namespace(module)
+    if getattr(ns.get('__spec__'), '_initializing', False):
+        return
+    native = namespace(sys.modules.get('_ctypes')).get('dlopen')
+    if native is None or ns.get('_dlopen') is not native or module in ctypes_modules:
+        return
+    ctypes_modules.add(module)
+    try:
+        class LinkMap(module.Structure):
+            _fields_ = [('address', module.c_void_p), ('name', module.c_char_p),
+                        ('dynamic', module.c_void_p)]
+        try:
+            query = module.CDLL(None).dlinfo
+        except (AttributeError, OSError):
+            return  # Other loaders retain the module/mapping inventory fallback.
+        query.argtypes = [module.c_void_p, module.c_int, module.c_void_p]
+        query.restype = module.c_int
+        def dlopen(*args, **kwargs):
+            try:
+                cwd = os.getcwd()
+            except OSError:
+                cwd = None
+            handle = native(*args, **kwargs)
+            snapshot()
+            link = module.POINTER(LinkMap)()
+            try:
+                status = query(handle, 2, module.byref(link))
+            except (OSError, ValueError, module.ArgumentError):
+                return handle
+            if status == 0 and link and link.contents.name:
+                name = os.fsdecode(link.contents.name)
+                if os.path.isabs(name):
+                    loaded_roots.setdefault(name, None)
+                elif cwd is not None:
+                    loaded_roots.setdefault(os.path.join(cwd, name), None)
+            return handle
+        ns['_dlopen'] = dlopen
+    finally:
+        ctypes_modules.discard(module)
+
+original_import = builtins.__import__
+def target_import(name, globals=None, locals=None, fromlist=(), level=0):
+    module = original_import(name, globals, locals, fromlist, level)
+    remember(module)
+    if namespace(module).get('__name__') == 'ctypes':
+        observe_ctypes(module)
+    if (namespace(module).get('__name__') == 'importlib'
+            and namespace(module).get('__file__') == namespace(importlib).get('__file__')):
+        namespace(module)['import_module'] = target_import_module
+        namespace(module)['reload'] = target_reload
+    if not level and name in sys.modules:
+        remember(sys.modules[name])
+    for item in fromlist or ():
+        remember(namespace(module).get(item))
+    return module
+original_import_module = importlib.import_module
+def target_import_module(name, package=None):
+    module = original_import_module(name, package)
+    remember(module)
+    if namespace(module).get('__name__') == 'ctypes':
+        observe_ctypes(module)
+    return module
+original_reload = importlib.reload
+def target_reload(module):
+    if namespace(module).get('__name__') != 'ctypes':
+        return original_reload(module)
+    ctypes_modules.add(module)
+    try:
+        result = original_reload(module)
+    finally:
+        ctypes_modules.discard(module)
+    observe_ctypes(result)
+    return result
+output, script = sys.argv[1:3]
+sys.argv = sys.argv[2:]
+if not os.path.isabs(script):
+    script = os.path.join(os.getcwd(), script)
+if sys.path and sys.path[0] == '':
+    sys.path[0] = os.path.dirname(os.path.realpath(script))
+main = type(sys)('__main__')
+main.__dict__.update(__file__=script, __package__=None, __spec__=None, __cached__=None,
+                     __loader__=importlib.machinery.SourceFileLoader('__main__', script),
+                     __builtins__=builtins)
+with open(script, 'rb') as source:
+    code = compile(source.read(), script, 'exec')
+for name in set(sys.modules) - initial_modules - {'atexit'}:
+    del sys.modules[name]
+sys.modules['__main__'] = main
+builtins.__import__ = target_import
+importlib.import_module = target_import_module
+importlib.reload = target_reload
+def finish():
+    builtins.__import__ = original_import
+    importlib.import_module = original_import_module
+    importlib.reload = original_reload
+    for name, module in list(sys.modules.items()):
+        if name not in baseline_modules:
+            remember(module, capture=False)
+    paths.update(mapped_files() - baseline)
+    with open(output, 'w') as result:
+        result.write(repr({'roots': list(loaded_roots), 'observed': sorted(paths), 'baseline': sorted(baseline)}))
+# Registered first so target callbacks run before the final inventory.
+atexit.register(finish)
+exec(code, main.__dict__)
+'''
+    with tempfile.TemporaryDirectory(prefix='peak-symbols-') as directory:
+        receipt = Path(directory) / 'modules.json'
+        try:
+            run([interpreter, '-c', helper, str(receipt), str(script)] + arguments, timeout, forward=True)
+        except subprocess.TimeoutExpired:
+            raise CollectionError('Python discovery timed out after {} seconds'.format(timeout))
+        return ast.literal_eval(receipt.read_text())
+
+
+def main():
+    def interrupted(signum, frame):
+        raise CollectionError('interrupted by signal ' + str(signum))
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    parser = argparse.ArgumentParser(description='Collect Linux ELF function selectors for PEAK_TARGET_FILE.',
+        epilog='Reads .symtab and .dynsym using readelf; stripped symbols and generated/JIT code cannot be recovered. '
+        'Python static discovery follows filesystem imports and bundled shared libraries, but cannot infer arbitrary '
+        'dynamic imports, ctypes paths, or conditional runtime paths. $LIB/$PLATFORM loader search entries require '
+        'expanded directories supplied with --library-dir; those entries are then skipped with a warning. --run-python executes your script once; '
+        'successful compiled imports/ctypes loads and exit trigger mapped-library snapshots. '
+        'Native loads and unloads entirely between those boundaries may be missed. '
+        'Memory-only/memfd mappings and JIT symbol recovery are unsupported. '
+        'Static discovery rejects effective LD_PRELOAD/LD_AUDIT entries and ELF DT_FILTER/DT_AUXILIARY. '
+        'Its override-free graph does not inventory providers used when overrides are restored. '
+        'Python targets collect native modules and their dependencies; interpreter baseline libraries are excluded. Pure Python functions are not native function symbols.')
+    parser.add_argument('target', help='ELF executable/shared library or Python script')
+    parser.add_argument('-o', '--output', help='output file (default: stdout); replaced only on success')
+    parser.add_argument('--module', action='append', default=[], help='additional known dlopen library (repeatable)')
+    parser.add_argument('--library-dir', action='append', default=[], help='additional dependency search directory (repeatable)')
+    parser.add_argument('--python', default=sys.executable, help='Python interpreter for the target environment')
+    parser.add_argument('--run-python', action='store_true', help='execute Python target to discover runtime-loaded libraries')
+    parser.add_argument('--timeout', type=float, default=30, help='runtime discovery timeout in seconds (default: 30)')
+    argv = sys.argv[1:]
+    arguments = []
+    if '--' in argv:
+        index = argv.index('--')
+        argv, arguments = argv[:index], argv[index + 1:]
+    args = parser.parse_args(argv)
+    try:
+        if sys.platform != 'linux':
+            raise CollectionError('only Linux ELF targets are supported')
+        if not shutil.which('readelf'):
+            raise CollectionError('readelf is required; install binutils')
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise CollectionError('--timeout must be positive')
+        visible_target = Path(args.target).absolute()
+        if not args.run_python:
+            for variable, separators in (('LD_PRELOAD', r'[ :]+'), ('LD_AUDIT', ':')):
+                if any(re.split(separators, os.environ.get(variable, ''))):
+                    raise CollectionError('static discovery does not support effective ' + variable +
+                                          ' entries')
+        target = visible_target.resolve(strict=True)
+        if not target.is_file():
+            raise CollectionError('target must be a regular file')
+        with target.open('rb') as stream:
+            elf = stream.read(4) == b'\x7fELF'
+        collector = Collector(args)
+        startup_scope = None
+        if elf:
+            if args.run_python or arguments:
+                raise CollectionError('--run-python and script arguments require a Python target')
+            collector.root_origin = target.parent
+            headers = run(['readelf', '-W', '-l', str(target)], parsed=True)
+            # The kernel resolves an executable's path; dlopen preserves a DSO alias.
+            startup_scope = collector.add(target if 'Requesting program interpreter:' in headers else visible_target)
+            main_object = collector.inspect(target)
+            if not main_object[3]:
+                collector.inherited_rpath = tuple(collector.expand(main_object[2], target.parent))
+        else:
+            info = python_info(args.python)
+            if not args.run_python and (info['version'] != list(sys.version_info[:2])
+                    or Path(info['executable']).absolute() != Path(sys.executable).absolute()):
+                os.execv(info['executable'], [info['executable'], str(Path(__file__).resolve())] + sys.argv[1:])
+            collector.root_origin = Path(info['executable']).resolve().parent
+            interpreter = collector.inspect(info['executable'])
+            if not interpreter[3]:
+                collector.inherited_rpath = tuple(collector.expand(interpreter[2], collector.root_origin))
+            if args.run_python:
+                discovery = runtime_python(args.target, args.python, arguments, args.timeout)
+                collector.add_runtime(discovery['observed'], discovery['baseline'], discovery['roots'])
+            else:
+                static_python(target, info, collector)
+                print('warning: static Python discovery cannot resolve arbitrary runtime imports or unavailable optional modules.', file=sys.stderr)
+            if arguments and not args.run_python:
+                raise CollectionError('script arguments require --run-python')
+        for module in args.module:
+            collector.add(module, scope=None if startup_scope is None else startup_scope.copy())
+        result = ''.join(symbol + '\n' for symbol in sorted(collector.symbols))
+        if args.output:
+            output = Path(args.output).absolute()
+            inputs = set(collector.objects) | collector.sources | {target}
+            if output.resolve() in inputs or (output.exists() and any(os.path.samefile(output, item) for item in inputs)):
+                raise CollectionError('output must not overwrite an input object or script')
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', dir=output.parent, prefix='.' + output.name + '.',
+                                                 delete=False) as stream:
+                    temporary = stream.name
+                    stream.write(result)
+                os.replace(temporary, output)
+                temporary = None
+            finally:
+                if temporary:
+                    os.unlink(temporary)
+        else:
+            sys.stdout.write(result)
+        print('Collected {} functions from {} ELF objects.'.format(len(collector.symbols), len(collector.objects)),
+              file=sys.stderr)
+        return 0
+    except (CollectionError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print('peak-collect-symbols: error: ' + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

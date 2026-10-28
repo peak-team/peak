@@ -237,6 +237,10 @@ install(TARGETS peak
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS peak_inspect_symbols DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    install(PROGRAMS ${PROJECT_SOURCE_DIR}/tools/peak-collect-symbols
+        DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 if(TARGET peak_detach_helper)
     install(TARGETS peak_detach_helper DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
