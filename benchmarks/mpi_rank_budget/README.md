@@ -189,7 +189,9 @@ After collecting the distributed matrix, run
 and `results/SYNC-LAYOUT/LABEL.rc`. All 20 × six receipts, matching fixed work,
 complete rank measurements, identical paired binding, two hosts with 192 unique
 single-CPU thread bindings, and final 16-target local profiler reports are
-required. Helper zero-target reports are excluded; a genuine application report
+required. Distinct CPU IDs establish distinct logical CPU bindings; proving
+nonsharing of physical cores additionally requires CPU/core/socket topology
+or confirmation that SMT is disabled on the allocation hardware. Helper zero-target reports are excluded; a genuine application report
 with zero profiled targets remains valid. Candidate rank budget metadata must
 match world size 32 and the configured five-percent job risk target.
 The summary preserves each rank's measured costs and native compute imbalance,
