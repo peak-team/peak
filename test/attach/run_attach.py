@@ -4,6 +4,7 @@ import csv
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -114,7 +115,8 @@ else:
             base = [cli, str(target.pid)] + agent_options
             env.update(PEAK_HEARTBEAT_INTERVAL="0.05", PEAK_COST="0.01",
                        PEAK_ENABLE_PER_TARGET_HEARTBEAT="1",
-                       PEAK_ENABLE_GLOBAL_HEARTBEAT="1", PEAK_ENABLE_REATTACH="0",
+                       PEAK_ENABLE_GLOBAL_HEARTBEAT="1", PEAK_ENABLE_REATTACH="1",
+                       PEAK_HIBERNATION_CYCLE="1", PEAK_REATTACH_COOLDOWN_MS="0",
                        PEAK_OVERHEAD_RATIO="0.00000001",
                        PEAK_GLOBAL_OVERHEAD_RATIO="0.00000001",
                        PEAK_DETACH_BACKEND="signal", PEAK_REQUIRE_SAFE_DETACH="1",
@@ -138,22 +140,32 @@ else:
                     raise AssertionError("native injection required but OS denied it:\n" + output)
                 print("SKIP: platform denied native attach:\n" + output)
                 raise SystemExit(77)
-            assert code == 0, (code, output, (root / "fixture.log").read_text())
+            assert code == 0, (code, output, target.poll(), (root / "fixture.log").read_text())
             alive(target, progress)
             code, output = run(base + ["--target", "peak_attach_existing_target"], env)
             assert code != 0 and output.strip(), (code, output)
             alive(target, progress)
+            # A byte-for-byte copied agent has different image identity too.
+            if args.agent:
+                copied_agent = root / ("arbitrary-copy" + args.agent.suffix)
+                shutil.copy2(args.agent, copied_agent)
+                code, output = run([cli, str(target.pid), "--agent", str(copied_agent),
+                                    "--target", "peak_attach_existing_target"], env)
+                assert code != 0 and "already" in output.lower(), (code, output)
+                alive(target, progress)
             time.sleep(1.5)
             target.stdin.write(b"Q")
             target.stdin.flush()
             assert target.wait(timeout=20) == 0, (root / "fixture.log").read_text()
+            assert "statfs_errors=0" in (root / "fixture.log").read_text(), (root / "fixture.log").read_text()
             report(prefix)
             if args.mode == "runtime":
                 with (root / "detach.csv").open() as stream:
                     transitions = list(csv.reader(stream))
-                assert any(len(row) >= 7 and row[3] == "detach"
-                           and row[4:7] == ["success", "1", "safe"]
-                           for row in transitions), transitions
+                for operation in ("detach", "reattach"):
+                    assert any(len(row) >= 7 and row[3] == operation
+                               and row[4:7] == ["success", "1", "safe"]
+                               for row in transitions), (operation, transitions)
             else:
                 memory_logs = list(root.glob("memlog*.csv"))
                 assert memory_logs, list(root.iterdir())

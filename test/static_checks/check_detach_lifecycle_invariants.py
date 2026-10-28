@@ -62,6 +62,36 @@ def check_late_attach_support_windows(repo_root):
             ".replacement_function = replacement" in support and
             ".original_function = original" in support,
             "attach pthread support must hold a strict window and honor staged physical commits")
+    filesystem = read_source(repo_root, "src/filesystem_stat_guard.c")
+    fs_attach = extract_function(filesystem, "peak_filesystem_stat_guard_attach")
+    fs_prepare = fs_attach.find("peak_detach_controller_prepare_hook_mutation_batch")
+    fs_transaction = fs_attach.find("gum_interceptor_begin_transaction")
+    fs_replace = fs_attach.find("gum_interceptor_replace")
+    fs_publish = fs_attach.find("next_statfs =")
+    fs_commit = fs_attach.find("gum_interceptor_end_transaction")
+    fs_finish = fs_attach.find("peak_detach_controller_finish_hook_mutation_batch",
+                               fs_commit)
+    require(0 <= fs_prepare < fs_transaction < fs_replace < fs_publish <
+            fs_commit < fs_finish and
+            "prepared_count != unique_count" in fs_attach[fs_prepare:fs_transaction] and
+            "requests[owner].function_address == targets[i]" in fs_attach and
+            "gum_interceptor_revert" in fs_attach[fs_replace:fs_publish],
+            "late filesystem guards must deduplicate aliases, prepare all "
+            "entries, publish originals and roll back failures within one held transaction")
+    resolver = extract_function(filesystem, "resolve_functions")
+    require("#ifdef PEAK_ATTACH_RUNTIME" in resolver and
+            "void *scope = RTLD_DEFAULT;" in resolver and
+            "void *scope = RTLD_NEXT;" in resolver,
+            "late filesystem guards must resolve libc before their injected DSO")
+    activation = extract_function(read_source(repo_root, "src/peak.c"),
+                                  "peak_activate_runtime")
+    fs_activate = activation.find("peak_filesystem_stat_guard_attach()")
+    require(0 <= activation.find("pthread_listener_attach_ready()") < fs_activate <
+            activation.find("peak_general_listener_attach()") and
+            "PEAK_RUNTIME_ACTIVATION_REJECTED" in activation[fs_activate:
+                activation.find("peak_detach_controller_warmup_backend()")],
+            "attach activation must install filesystem guards before profiling "
+            "and fail closed when the guard batch cannot commit")
     backend = extract_function(controller,
         "peak_detach_controller_init_backend_configuration_once")
     attach_backend = backend.find("#ifdef PEAK_ATTACH_RUNTIME")
@@ -2287,12 +2317,16 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
     require(general_attach_supported.count("peak_log_info(") == 2 and
-            general_attach_supported.count("peak_log_warn(") == 1 and
+            general_attach_supported.count("peak_log_warn(") == 2 and
+            "peak_filesystem_stat_guard_owns_address(address)" in general_attach_supported and
+            "this entry is reserved for the filesystem-stat safety guard" in
+            general_attach_supported and
+            "#ifdef PEAK_ATTACH_RUNTIME" in general_attach_supported and
             "g_printerr(" not in general_attach_supported and
             "target entry redirects to another address" in
             general_attach_supported,
             "relocation-policy skips must remain INFO while target-attribution "
-            "rejection is a default-visible WARN")
+            "and reserved safety-guard entry rejection are default-visible WARNs")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and

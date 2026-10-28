@@ -73,6 +73,11 @@ stays resident until normal process exit, when PEAK writes its usual report.
 The command does not provide a separate stop operation or report the target's
 eventual native exit status.
 
+The debugger's initial attach and runtime bootstrap briefly interrupt target
+execution. A syscall already in flight may return `EINTR` if it is not
+restartable. PEAK's runtime filesystem guards cover later calls; they cannot
+protect a syscall that was already in progress before injection.
+
 Attach does not support `PEAK_EXEC_CHAIN` or `PEAK_EXEC_CHECKPOINT`; those
 features depend on loader interposition installed before the target starts.
 Automatic discovery of new dynamic libraries and the associated runtime
@@ -91,8 +96,7 @@ permissions configured for the workload.
 On macOS Arm64, live attach uses the platform's task debugging permissions.
 Protected or non-debuggable targets may refuse attachment. For native attach
 tests, PEAK signs the fixture with `com.apple.security.get-task-allow` and
-signs the injector and detach helper with
-`com.apple.security.cs.debugger`; the entitlement files are
+signs the injector with `com.apple.security.cs.debugger`; the entitlement files are
 [`fixture.entitlements`](../test/attach/fixture.entitlements) and
 [`debugger.entitlements`](../test/attach/debugger.entitlements). These test
 signing settings describe the permissions required by the test fixture; they

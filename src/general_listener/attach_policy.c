@@ -3,6 +3,9 @@
 #include "internal/general_listener/runtime_config.h"
 #include "internal/unsafe_gum_prologue.h"
 #include "logging.h"
+#ifdef PEAK_ATTACH_RUNTIME
+#include "internal/filesystem_stat_guard.h"
+#endif
 
 #include <dirent.h>
 #include <errno.h>
@@ -64,6 +67,13 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
 {
     const char* reason = NULL;
 
+#ifdef PEAK_ATTACH_RUNTIME
+    if (peak_filesystem_stat_guard_owns_address(address)) {
+        peak_log_warn("[peak] skipping profiling target %s: this entry is reserved for the filesystem-stat safety guard\n",
+                      symbol_name != NULL ? symbol_name : "<unknown>");
+        return FALSE;
+    }
+#endif
     peak_general_listener_init_attach_policy();
 
 #if defined(__APPLE__) && \

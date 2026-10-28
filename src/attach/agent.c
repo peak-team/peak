@@ -6,9 +6,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
-#include <dlfcn.h>
 #else
 #include <link.h>
 #endif
@@ -155,6 +155,8 @@ is_peak_runtime_path(const char *path)
 {
     const char *base = strrchr(path, '/');
     base = base == NULL ? path : base + 1;
+    if (strncmp(base, "libpeak-attach", 14) == 0)
+        return TRUE;
 #if defined(__APPLE__)
     return strncmp(base, "libpeak.", 8) == 0;
 #else
@@ -163,29 +165,57 @@ is_peak_runtime_path(const char *path)
 #endif
 }
 
+static gboolean
+module_has_runtime_marker(const char *path)
+{
+    /* NOLOAD neither loads a DSO nor runs constructors. Scope each lookup to
+     * that image, so our own globally visible entrypoint is never mistaken
+     * for an unrelated library's marker. This also detects renamed copies. */
+    void *module = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+    gboolean found = FALSE;
+    if (module != NULL) {
+        found = dlsym(module, PEAK_ATTACH_ENTRYPOINT) != NULL ||
+                dlsym(module, "peak_runtime_is_active_for_checkpoint") != NULL;
+        dlclose(module);
+    }
+    /* Failed marker probes must not leak loader errors into later bootstrap
+     * symbol resolution on this controller thread. */
+    (void) dlerror();
+    return found;
+}
+
 #if !defined(__APPLE__)
 static int
 find_existing_peak(struct dl_phdr_info *info, size_t size, void *data)
 {
     (void) size;
-    (void) data;
-    return is_peak_runtime_path(info->dlpi_name);
+    if ((void *) info->dlpi_addr == data || info->dlpi_name[0] == '\0')
+        return 0;
+    return is_peak_runtime_path(info->dlpi_name) ||
+           module_has_runtime_marker(info->dlpi_name);
 }
 #endif
 
 #if defined(__APPLE__)
 static _Atomic gboolean existing_peak_image;
+static _Atomic uintptr_t census_self_base;
+static _Atomic gboolean census_complete;
 
 static void
 inspect_loaded_image(const struct mach_header *image, intptr_t slide)
 {
     Dl_info info;
     (void) slide;
+    if (atomic_load_explicit(&census_complete, memory_order_acquire))
+        return;
     /* dyld invokes registration callbacks for its initial image set and future
      * additions under its image lifecycle protection. A raw image-count loop
      * would race concurrent dlclose in an already-running process. */
     if (dladdr(image, &info) != 0 && info.dli_fname != NULL &&
-        is_peak_runtime_path(info.dli_fname))
+        (uintptr_t) info.dli_fbase != atomic_load_explicit(
+            &census_self_base, memory_order_acquire) &&
+        (is_peak_runtime_path(info.dli_fname) ||
+         module_has_runtime_marker(info.dli_fname)))
         atomic_store_explicit(&existing_peak_image, TRUE, memory_order_release);
 }
 #endif
@@ -193,11 +223,19 @@ inspect_loaded_image(const struct mach_header *image, intptr_t slide)
 static gboolean
 has_existing_runtime(void)
 {
+    Dl_info self;
+    /* A static function address cannot be ELF symbol-preempted by an earlier
+     * copied agent. Exclude precisely this image, never a basename alone. */
+    if (dladdr((void *) is_peak_runtime_path, &self) == 0)
+        return TRUE;
 #if defined(__APPLE__)
+    atomic_store_explicit(&census_self_base, (uintptr_t) self.dli_fbase,
+                          memory_order_release);
     _dyld_register_func_for_add_image(inspect_loaded_image);
+    atomic_store_explicit(&census_complete, TRUE, memory_order_release);
     return atomic_load_explicit(&existing_peak_image, memory_order_acquire);
 #else
-    return dl_iterate_phdr(find_existing_peak, NULL) != 0;
+    return dl_iterate_phdr(find_existing_peak, self.dli_fbase) != 0;
 #endif
 }
 
@@ -218,7 +256,7 @@ activate_runtime(void *data)
         return NULL;
     }
     if (has_existing_runtime()) {
-        send_literal_ack(fd, "('error', 'a preloaded PEAK runtime is already present')");
+        send_literal_ack(fd, "('error', 'another PEAK runtime is already present in this process')");
         close(fd);
         return NULL;
     }

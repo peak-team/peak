@@ -297,8 +297,15 @@ if(PEAK_BUILD_ATTACH)
     endif()
     target_link_libraries(peak_attach_agent PRIVATE ${_peak_attach_libraries})
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_link_options(peak_attach_agent PRIVATE "LINKER:--exclude-libs,ALL")
+        set(_peak_attach_exports "${CMAKE_CURRENT_SOURCE_DIR}/attach/exports.map")
+        target_link_options(peak_attach_agent PRIVATE "LINKER:--exclude-libs,ALL"
+            "LINKER:--version-script,${_peak_attach_exports}")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(_peak_attach_exports "${CMAKE_CURRENT_SOURCE_DIR}/attach/exports.macos")
+        target_link_options(peak_attach_agent PRIVATE
+            "LINKER:-exported_symbols_list,${_peak_attach_exports}")
     endif()
+    set_property(TARGET peak_attach_agent APPEND PROPERTY LINK_DEPENDS "${_peak_attach_exports}")
     if(PEAK_CUDA_ENABLED)
         target_compile_definitions(peak_attach_agent PRIVATE
             $<$<BOOL:${PEAK_CUDA_HAS_RUNTIME_LAUNCH_EX}>:PEAK_CUDA_COMPILE_RUNTIME_LAUNCH_EX=1>

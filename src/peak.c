@@ -25,6 +25,9 @@
 #include "detach_controller.h"
 #include "exec_interceptor.h"
 #include "internal/exec_interceptor_internal.h"
+#ifdef PEAK_ATTACH_RUNTIME
+#include "internal/filesystem_stat_guard.h"
+#endif
 #include "internal/general_listener_internal.h"
 #if defined(__APPLE__)
 #include "internal/general_listener/attach_policy.h"
@@ -1332,6 +1335,11 @@ peak_activate_runtime(void)
 #ifdef PEAK_ATTACH_RUNTIME
     if (!pthread_listener_attach_ready()) {
         peak_log_warn("[peak] refusing attach activation because safe pthread interception could not be installed\n");
+        peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
+        return;
+    }
+    if (!peak_filesystem_stat_guard_attach()) {
+        peak_log_warn("[peak] refusing attach activation because filesystem-stat guards could not be installed safely\n");
         peak_runtime_activation_publish(PEAK_RUNTIME_ACTIVATION_REJECTED);
         return;
     }
@@ -2680,7 +2688,7 @@ peak_attach_runtime_start(char **message)
             }
         }
         if (!any_target_attached) {
-            *message = g_strdup("PEAK is active with pending CPU targets; none resolved initially. Inspect target stderr and normal reports for target resolution diagnostics");
+            *message = g_strdup("PEAK is active with pending CPU targets or skipped initial hooks; no CPU target was initially instrumented. Inspect target stderr and normal reports for resolution and attachment diagnostics");
         }
     }
     return 1;

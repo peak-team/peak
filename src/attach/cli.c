@@ -114,7 +114,8 @@ typedef struct {
     pid_t pid;
     int error_fd;
     gboolean done;
-    int status;
+    gboolean failed;
+    gboolean leader_lost;
     char error[4096];
     size_t error_length;
 } InjectionWorker;
@@ -145,7 +146,8 @@ static int run_injector(guint pid, const char *agent, const char *socket_path)
 static void inspect_worker(InjectionWorker *worker)
 {
     char discarded[512];
-    for (;;) {
+    size_t drained = 0;
+    while (drained < 65536) {
         size_t available = sizeof(worker->error) - 1 - worker->error_length;
         char *buffer =
             available ? worker->error + worker->error_length : discarded;
@@ -153,14 +155,25 @@ static void inspect_worker(InjectionWorker *worker)
                          available ? available : sizeof(discarded));
         if (n <= 0)
             break;
+        drained += (size_t)n;
         if (available)
             worker->error_length += n;
     }
     worker->error[worker->error_length] = 0;
     if (!worker->done) {
-        pid_t reaped = waitpid(worker->pid, &worker->status, WNOHANG);
-        if (reaped == worker->pid)
+        siginfo_t info = {0};
+        if (waitid(P_PID, (id_t)worker->pid, &info,
+                   WEXITED | WNOHANG | WNOWAIT) == 0) {
+            if (info.si_pid == worker->pid) {
+                worker->done = TRUE;
+                worker->failed =
+                    info.si_code != CLD_EXITED || info.si_status != 0;
+            }
+        } else if (errno == ECHILD) {
             worker->done = TRUE;
+            worker->failed = TRUE;
+            worker->leader_lost = TRUE;
+        }
     }
 }
 
@@ -184,15 +197,15 @@ static void finish_worker(InjectionWorker *worker, gboolean activated)
             if (!worker->done)
                 poll(&pfd, 1, 20);
         }
-        /* Kill the group even if its leader exited on TERM: Core helpers
-         * belong to that group and must not survive a failed teardown. */
+    }
+    if (!worker->leader_lost) {
+        /* WNOWAIT retains the leader until after the final group signal,
+         * preventing its PID/PGID from being reused during teardown. */
         kill(-worker->pid, SIGKILL);
-        if (!worker->done) {
-            while (waitpid(worker->pid, &worker->status, 0) < 0 &&
-                   errno == EINTR) {
-            }
-            worker->done = TRUE;
+        int status;
+        while (waitpid(worker->pid, &status, 0) < 0 && errno == EINTR) {
         }
+        worker->done = TRUE;
     }
     inspect_worker(worker);
     if (worker->error_length)
@@ -299,9 +312,15 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
     int errors[2];
     if (pipe(errors))
         return FALSE;
-    fcntl(errors[0], F_SETFD, FD_CLOEXEC);
-    fcntl(errors[0], F_SETFL, O_NONBLOCK);
-    fcntl(errors[1], F_SETFD, FD_CLOEXEC);
+    if (fcntl(errors[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(errors[0], F_SETFL, O_NONBLOCK) < 0 ||
+        fcntl(errors[1], F_SETFD, FD_CLOEXEC) < 0) {
+        int error = errno;
+        close(errors[0]);
+        close(errors[1]);
+        errno = error;
+        return FALSE;
+    }
     char *exe = executable_path();
     if (!exe) {
         close(errors[0]);
@@ -314,20 +333,42 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
                          (char *)agent, (char *)socket_path, NULL};
     posix_spawnattr_t attributes;
     posix_spawn_file_actions_t actions;
-    posix_spawnattr_init(&attributes);
-    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
-    posix_spawnattr_setpgroup(&attributes, 0);
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, errors[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, errors[0]);
-    posix_spawn_file_actions_addclose(&actions, errors[1]);
-    int error = posix_spawn(&worker->pid, exe, &actions, &attributes, arguments,
-                            environ);
-    posix_spawn_file_actions_destroy(&actions);
-    posix_spawnattr_destroy(&attributes);
+    gboolean attributes_ready = FALSE, actions_ready = FALSE;
+    int error = posix_spawnattr_init(&attributes);
+    if (error)
+        goto spawn_cleanup;
+    attributes_ready = TRUE;
+    error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawnattr_setpgroup(&attributes, 0);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_init(&actions);
+    if (error)
+        goto spawn_cleanup;
+    actions_ready = TRUE;
+    error =
+        posix_spawn_file_actions_adddup2(&actions, errors[1], STDERR_FILENO);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_addclose(&actions, errors[0]);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_addclose(&actions, errors[1]);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn(&worker->pid, exe, &actions, &attributes, arguments,
+                        environ);
+spawn_cleanup:
+    if (actions_ready)
+        posix_spawn_file_actions_destroy(&actions);
+    if (attributes_ready)
+        posix_spawnattr_destroy(&attributes);
     free(exe);
     close(errors[1]);
     if (error) {
+        worker->pid = 0;
         close(errors[0]);
         errno = error;
         return FALSE;
@@ -515,8 +556,7 @@ int main(int argc, char **argv)
                 close(candidate);
         }
         inspect_worker(&worker);
-        if (worker.done &&
-            (!WIFEXITED(worker.status) || WEXITSTATUS(worker.status)))
+        if (worker.done && worker.failed)
             break;
     }
     if (peer < 0) {
@@ -547,8 +587,8 @@ int main(int argc, char **argv)
     result = 0;
     goto cleanup;
 disconnected:
-    fprintf(stderr, "peak-attach: incomplete profile: target exited or agent "
-                    "connection was lost; activation was not confirmed\n");
+    fprintf(stderr, "peak-attach: target exited or agent connection was lost; "
+                    "activation was not confirmed; PEAK may still be active\n");
     result = 2;
 cleanup:
     if (peer >= 0) {

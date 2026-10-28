@@ -64,6 +64,10 @@ EXPECTED = {
         "flush": 2,
         "revert": 2,
     },
+    ("attach-support-strict", "src/filesystem_stat_guard.c"): {
+        "begin_transaction": 1, "end_transaction": 1,
+        "replace": 1, "revert": 1,
+    },
     ("attach-support-strict", "src/pthread_listener.c"): {
         "attach": 1, "begin_transaction": 1, "end_transaction": 1,
         "replace_fast": 1,
@@ -122,6 +126,9 @@ FUNCTION_ANCHORS = {
         "malloc_interceptor_revert_all_in_transaction": "support-init",
         "malloc_interceptor_flush_rollback": "support-init",
         "malloc_interceptor_detach": "support-shutdown-debt",
+    },
+    "src/filesystem_stat_guard.c": {
+        "peak_filesystem_stat_guard_attach": "attach-support-strict",
     },
     "src/pthread_listener.c": {
         "pthread_listener_attach_support": "attach-support-strict",

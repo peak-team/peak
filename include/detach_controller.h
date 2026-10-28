@@ -51,6 +51,7 @@ typedef struct {
     /* Used by staged Darwin mutations while peers are still running. */
     const GumAttachOptions* attach_options;
     gpointer replacement_function;
+    /* Cleared if a prepared Darwin replacement is rolled back. */
     gpointer* original_function;
 } PeakDetachRequest;
 

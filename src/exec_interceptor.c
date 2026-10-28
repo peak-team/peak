@@ -153,10 +153,10 @@ static __thread int peak_exec_prepublication_execve_resolving;
 #endif
 #if defined(PEAK_ENABLE_TEST_HOOKS)
 static int peak_exec_test_force_execvpe_fallback;
+/* The resolver reentry callback belongs to the Linux-only exec preinit
+ * fixture; do not import an absent test callback into the Mach-O runtime. */
+#if defined(__linux__)
 extern void peak_test_exec_resolver_reentry_hook(void)
-    #if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
 #endif
 #endif
@@ -1849,7 +1849,7 @@ static __thread int peak_posix_spawn_resolving;
 
 static void peak_lookup_execve(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     if (peak_test_exec_resolver_reentry_hook != NULL) {
         peak_test_exec_resolver_reentry_hook();
     }
@@ -1882,7 +1882,7 @@ peak_lookup_posix_spawn(void)
 {
 #if defined(PEAK_ENABLE_TEST_HOOKS)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-        #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));
@@ -1900,7 +1900,7 @@ peak_lookup_posix_spawnp(void)
 {
 #if defined(PEAK_ENABLE_TEST_HOOKS)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-        #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));
@@ -1990,7 +1990,7 @@ peak_real_posix_spawn(void)
 #if defined(PEAK_ENABLE_TEST_HOOKS)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-                        #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));
@@ -2016,7 +2016,7 @@ peak_real_posix_spawn(void)
 #if defined(PEAK_ENABLE_TEST_HOOKS)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-                #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));
@@ -2079,7 +2079,7 @@ peak_real_posix_spawnp(void)
 #if defined(PEAK_ENABLE_TEST_HOOKS)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-                        #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));
@@ -2105,7 +2105,7 @@ peak_real_posix_spawnp(void)
 #if defined(PEAK_ENABLE_TEST_HOOKS)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-                #if defined(__APPLE__)
+#if defined(__APPLE__)
     __attribute__((weak_import));
 #else
     __attribute__((weak));

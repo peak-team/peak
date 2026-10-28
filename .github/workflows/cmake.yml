@@ -99,7 +99,7 @@ jobs:
     - name: Build
       run: >
         cmake --build ${{ github.workspace }}/build --parallel
-        --target peak peak_attach test_attach_fixture test_attach_config
+        --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config
 
     - name: Install
       run: cmake --install ${{ github.workspace }}/build
