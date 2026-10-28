@@ -182,6 +182,56 @@ class Collector:
                 result.append((len(active), path))
         return [path for rank, path in sorted(result, key=lambda entry: entry[0])]
 
+    def add_object(self, path):
+        path = Path(path).resolve(strict=True)
+        if any(c in str(path) for c in '!\r\n'):
+            raise CollectionError('path cannot be represented in PEAK_TARGET_FILE: ' + repr(str(path)))
+        info = self.inspect(path)
+        if path not in self.objects:
+            self.objects[path] = True
+            self.symbols.update(str(path) + '!' + symbol for symbol in info[4])
+            if not info[4]:
+                print('warning: no defined function symbols in ' + str(path), file=sys.stderr)
+        return info
+
+    def add_runtime(self, observed, baseline):
+        # Only files actually mapped during this run can supply runtime targets.
+        pool, selected, index = {}, set(), {}
+        for active, names in ((True, observed), (False, baseline)):
+            if not active and not selected:
+                return
+            for name in names:
+                visible = Path(name)
+                if not visible.is_file():
+                    continue
+                path = visible.resolve()
+                if active:
+                    self.sources.add(path)
+                if path not in pool:
+                    with path.open('rb') as stream:
+                        if stream.read(4) != b'\x7fELF':
+                            continue
+                    pool[path] = self.inspect(path)
+                if active:
+                    selected.add(path)
+        for path, info in pool.items():
+            for name in [path.name] + info[5]:
+                index.setdefault((info[0], name), set()).add(path)
+        pending = deque(selected)
+        while pending:
+            path = pending.popleft()
+            info = self.add_object(path)
+            for name in info[1]:
+                if '/' in name:
+                    candidate = Path(name).resolve()
+                    matches = {candidate} if candidate in pool and pool[candidate][0] == info[0] else set()
+                else:
+                    matches = index.get((info[0], name), ())
+                for candidate in matches:
+                    if candidate not in selected:
+                        selected.add(candidate)
+                        pending.append(candidate)
+
     def add(self, path):
         # Each explicitly selected root has a loader closure. Resolve siblings before
         # descendants so a direct dependency's SONAME wins over a nested request.
@@ -201,14 +251,7 @@ class Collector:
             if path in visited:
                 continue
             visited.add(path)
-            if any(c in str(path) for c in '!\r\n'):
-                raise CollectionError('path cannot be represented in PEAK_TARGET_FILE: ' + repr(str(path)))
-            abi, needed, rpath, runpath, symbols, sonames = self.inspect(path)
-            if path not in self.objects:
-                self.objects[path] = True
-                self.symbols.update(str(path) + '!' + symbol for symbol in symbols)
-                if not symbols:
-                    print('warning: no defined function symbols in ' + str(path), file=sys.stderr)
+            abi, needed, rpath, runpath, symbols, sonames = self.add_object(path)
             own_rpath = self.expand(rpath, visible_path.parent) if not runpath else []
             # A requester's RUNPATH suppresses inherited RPATH for that request.
             search = own_rpath + ([] if runpath else list(inherited)) + self.library_dirs
@@ -352,10 +395,11 @@ def runtime_python(script, interpreter, arguments, timeout):
     helper = r'''
 import sys
 initial_modules = set(sys.modules)
-import atexit, builtins, importlib, importlib.machinery, os
+import _imp, atexit, builtins, importlib, importlib.machinery, os
 paths = set()
 loaded_roots = {}
 ctypes_modules = set()
+extension_suffixes = tuple(_imp.extension_suffixes())
 def mapped_paths():
     result = set()
     with open('/proc/self/maps') as maps:
@@ -367,16 +411,23 @@ def mapped_paths():
     return result
 baseline = mapped_paths()
 baseline_modules = initial_modules
+def snapshot():
+    try:
+        paths.update(mapped_paths() - baseline)
+    except OSError:
+        pass  # A successful target call must survive unavailable procfs.
 def namespace(module):
     if isinstance(module, type(sys)):
         return object.__getattribute__(module, '__dict__')
     return {}
 def observed_path(filename):
     return filename if os.path.isabs(filename) else os.path.join(os.getcwd(), filename)
-def remember(module):
+def remember(module, capture=True):
     filename = namespace(module).get('__file__')
     if isinstance(filename, str):
-        paths.add(observed_path(filename))
+        loaded_roots.setdefault(observed_path(filename), None)
+        if capture and filename.endswith(extension_suffixes):
+            snapshot()
 def observe_ctypes(module):
     ns = namespace(module)
     if getattr(ns.get('__spec__'), '_initializing', False):
@@ -400,6 +451,7 @@ def observe_ctypes(module):
         except OSError:
             cwd = None
         handle = native(*args, **kwargs)
+        snapshot()
         link = module.POINTER(LinkMap)()
         try:
             status = query(handle, 2, module.byref(link))
@@ -435,11 +487,6 @@ def target_import_module(name, package=None):
     if namespace(module).get('__name__') == 'ctypes':
         observe_ctypes(module)
     return module
-def audit(event, args):
-    if event == 'import' and len(args) > 1 and isinstance(args[1], str):
-        paths.add(observed_path(args[1]))
-if hasattr(sys, 'addaudithook'):
-    sys.addaudithook(audit)
 output, script = sys.argv[1:3]
 sys.argv = sys.argv[2:]
 if not os.path.isabs(script):
@@ -462,10 +509,10 @@ def finish():
     importlib.import_module = original_import_module
     for name, module in list(sys.modules.items()):
         if name not in baseline_modules:
-            remember(module)
+            remember(module, capture=False)
     paths.update(mapped_paths() - baseline)
     with open(output, 'w') as result:
-        result.write(repr({'roots': list(loaded_roots), 'paths': sorted(paths)}))
+        result.write(repr({'observed': sorted(set(loaded_roots) | paths), 'baseline': sorted(baseline)}))
 # Registered first so target callbacks run before the final inventory.
 atexit.register(finish)
 exec(code, main.__dict__)
@@ -489,7 +536,8 @@ def main():
         'Python static discovery follows filesystem imports and bundled shared libraries, but cannot infer arbitrary '
         'dynamic imports, ctypes paths, or conditional runtime paths. $LIB/$PLATFORM loader search entries require '
         'expanded directories supplied with --library-dir; those entries are then skipped with a warning. --run-python executes your script once; '
-        'audit-observed imports/ctypes paths and newly mapped libraries at exit are included. '
+        'successful compiled imports/ctypes loads and exit trigger mapped-library snapshots. '
+        'Native loads and unloads entirely between those boundaries may be missed. '
         'Python targets collect native modules and their dependencies; interpreter baseline libraries are excluded. Pure Python functions are not native function symbols.')
     parser.add_argument('target', help='ELF executable/shared library or Python script')
     parser.add_argument('-o', '--output', help='output file (default: stdout); replaced only on success')
@@ -539,17 +587,7 @@ def main():
                 collector.inherited_rpath = tuple(collector.expand(interpreter[2], collector.root_origin))
             if args.run_python:
                 discovery = runtime_python(args.target, args.python, arguments, args.timeout)
-                for authoritative, modules in ((True, discovery['roots']), (False, discovery['paths'])):
-                    for module in modules:
-                        path = Path(module)
-                        if path.is_file():
-                            canonical = path.resolve()
-                            collector.sources.add(canonical)
-                            if not authoritative and canonical in collector.objects:
-                                continue
-                            with path.open('rb') as stream:
-                                if stream.read(4) == b'\x7fELF':
-                                    collector.add(path)
+                collector.add_runtime(discovery['observed'], discovery['baseline'])
             else:
                 static_python(target, info, collector)
                 print('warning: static Python discovery cannot resolve arbitrary runtime imports or unavailable optional modules.', file=sys.stderr)

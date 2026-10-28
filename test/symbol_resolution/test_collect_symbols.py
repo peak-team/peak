@@ -42,10 +42,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix='peak-collect-test-') as tmp:
         root = Path(tmp)
 
-        def build(name, source, output, *flags, cxx=False):
+        def build(name, source, output, *flags, cxx=False, compiler=None):
             path = root / name
             path.write_text(source)
-            run([args.cxx if cxx else args.cc, path, '-o', output, *flags])
+            run([compiler or (args.cxx if cxx else args.cc), path, '-o', output, *flags])
 
         def collect(target, *options, ok=True, env=None, cwd=None):
             out = run([sys.executable, args.collector, target, *options], ok=ok, env=env, cwd=cwd)
@@ -97,12 +97,27 @@ def main():
         run([origin_app], env=loader_env, cwd=origin/'lib', ok=False)
         collect(origin_app, env=loader_env, cwd=origin/'lib', ok=False)
 
+        # This fixture tests ELF loader inheritance, not MPI wrapper link flags.
+        loader_cc = '/usr/bin/cc' if Path('/usr/bin/cc').is_file() else args.cc
         rpath_plugin = root/'rpath-plugin.so'
-        build('rpath-plugin.c', 'extern int origin_leaf(void);int plugin_call(void){return origin_leaf();}',
-              rpath_plugin, '-shared', '-fPIC', '-nostdlib', '-L'+str(origin/'lib'), '-lleaf')
         rpath_main = root/'rpath-main'
-        build('rpath-main.c', '#include <dlfcn.h>\nint main(void){void*h=dlopen("'+str(rpath_plugin)+'",RTLD_NOW);if(!h)return 1;int(*f)(void)=dlsym(h,"plugin_call");return !f||f()!=7;}',
-              rpath_main, '-ldl', '-Wl,--disable-new-dtags,-rpath,'+str(origin/'lib'))
+        def build_rpath_fixture(compiler=None):
+            build('rpath-plugin.c', 'extern int origin_leaf(void);int plugin_call(void){return origin_leaf();}',
+                  rpath_plugin, '-shared', '-fPIC', '-nostdlib', '-L'+str(origin/'lib'), '-lleaf', compiler=compiler)
+            build('rpath-main.c', '#include <dlfcn.h>\n#include <stdio.h>\nint main(void){void*h=dlopen("'+str(rpath_plugin)+'",RTLD_NOW);if(!h){fprintf(stderr,"dlopen: %s\\n",dlerror());return 1;}int(*f)(void)=dlsym(h,"plugin_call");if(!f){fprintf(stderr,"dlsym: %s\\n",dlerror());return 1;}int value=f();if(value!=7){fprintf(stderr,"plugin value: %d\\n",value);return 1;}return 0;}',
+                  rpath_main, '-ldl', '-Wl,--disable-new-dtags,-rpath,'+str(origin/'lib'), compiler=compiler)
+        build_rpath_fixture()
+        main_tags = run(['readelf', '-W', '-d', rpath_main])
+        plugin_tags = run(['readelf', '-W', '-d', rpath_plugin])
+        if ('(RPATH)' not in main_tags or '(RUNPATH)' in main_tags
+                or '(RPATH)' in plugin_tags or '(RUNPATH)' in plugin_tags):
+            print('compiler injected loader tags; rebuilding pure loader fixture with '+loader_cc,
+                  main_tags, plugin_tags, flush=True)
+            build_rpath_fixture(compiler=loader_cc)
+            main_tags = run(['readelf', '-W', '-d', rpath_main])
+            plugin_tags = run(['readelf', '-W', '-d', rpath_plugin])
+        assert '(RPATH)' in main_tags and '(RUNPATH)' not in main_tags, main_tags
+        assert '(RPATH)' not in plugin_tags and '(RUNPATH)' not in plugin_tags, plugin_tags
         run([rpath_main])
         plugin_symbols = collect(rpath_main, '--module', str(rpath_plugin))
         assert f'{origin_leaf}!origin_leaf' in plugin_symbols
@@ -743,6 +758,72 @@ print("collector_saturation_originals_ok")
         run([sys.executable, constructor_script])
         constructor_symbols = collect(constructor_script, '--run-python')
         assert f'{constructor_library}!constructor_work' in constructor_symbols
+
+        python_include = sysconfig.get_path('include')
+        if python_include and (Path(python_include)/'Python.h').is_file():
+            import_real, import_alias = root/'a-import-real', root/'z-import-alias'
+            import_real.mkdir()
+            import_alias.mkdir()
+            import_leaf = import_alias/'libimportleaf.so'
+            build('import-leaf.c', 'int import_leaf(void){return 17;}', import_leaf,
+                  '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libimportleaf.so')
+            import_native = import_real/('importalias'+sysconfig.get_config_var('EXT_SUFFIX'))
+            build('import-alias.c', '#include <Python.h>\nextern int import_leaf(void);static struct PyModuleDef m={PyModuleDef_HEAD_INIT,"importalias",NULL,-1,NULL};PyMODINIT_FUNC PyInit_importalias(void){if(import_leaf()!=17)return NULL;return PyModule_Create(&m);}',
+                  import_native, '-shared', '-fPIC', '-nostdlib', '-I'+python_include,
+                  '-L'+str(import_alias), '-limportleaf', '-Wl,-rpath,$ORIGIN')
+            (import_alias/import_native.name).symlink_to(import_native)
+            import_script = root/'import-alias-runtime.py'
+            import_script.write_text('import sys\n'+
+                                     f'sys.path.insert(0,{str(import_alias)!r})\n'+
+                                     'import importalias\n')
+            run([sys.executable, import_script])
+            import_symbols = collect(import_script, '--run-python')
+            assert f'{import_native}!PyInit_importalias' in import_symbols
+            assert f'{import_leaf}!import_leaf' in import_symbols
+        else:
+            print('SKIP successful import alias identity: Python headers unavailable')
+
+        reuse_a, reuse_b = root/'runtime-reuse-a', root/'runtime-reuse-b'
+        reuse_a.mkdir()
+        reuse_b.mkdir()
+        reused_name = 'libcollector_reused.so'
+        reuse_missing = root/'libcollector_reuse_missing.so'
+        build('reuse-missing.c', 'int reuse_missing(void){return 19;}', reuse_missing,
+              '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libcollector_reuse_missing.so')
+        build('reuse-leaf-a.c', 'int reuse_leaf(void){return 7;}', reuse_a/reused_name,
+              '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,'+reused_name)
+        build('reuse-leaf-b.c', 'extern int reuse_missing(void);int reuse_leaf(void){return reuse_missing();}',
+              reuse_b/reused_name, '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,'+reused_name,
+              '-L'+str(root), '-lcollector_reuse_missing')
+        for suffix, directory in (('a', reuse_a), ('b', reuse_b)):
+            build('reuse-provider-'+suffix+'.c',
+                  'extern int reuse_leaf(void);int reuse_provider(void){return reuse_leaf();}',
+                  directory/'libreuse_provider.so', '-shared', '-fPIC', '-nostdlib',
+                  '-L'+str(directory), '-lcollector_reused', '-Wl,-rpath,$ORIGIN')
+        reuse_missing.unlink()
+        reuse_script = root/'runtime-reuse.py'
+        reuse_script.write_text('import ctypes\n'+
+                                f'a=ctypes.CDLL({str(reuse_a/"libreuse_provider.so")!r})\n'+
+                                f'b=ctypes.CDLL({str(reuse_b/"libreuse_provider.so")!r})\n'+
+                                'assert a.reuse_provider()==7 and b.reuse_provider()==7\n')
+        run([sys.executable, reuse_script])
+        reuse_symbols = collect(reuse_script, '--run-python')
+        assert f'{reuse_a/reused_name}!reuse_leaf' in reuse_symbols
+        assert not any(symbol.startswith(str(reuse_b/reused_name)+'!') for symbol in reuse_symbols)
+
+        build('reuse-leaf-b.c', 'int reuse_leaf(void){return 19;}int reuse_new_provider(void){return 31;}',
+              reuse_b/reused_name, '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,'+reused_name)
+        reload_script = root/'runtime-unload-reload.py'
+        reload_script.write_text('import ctypes, _ctypes\n'+
+                                 f'a=ctypes.CDLL({str(reuse_a/"libreuse_provider.so")!r})\n'+
+                                 'assert a.reuse_provider()==7\n'
+                                 '_ctypes.dlclose(a._handle)\n'+
+                                 f'b=ctypes.CDLL({str(reuse_b/"libreuse_provider.so")!r})\n'+
+                                 'assert b.reuse_provider()==19\n')
+        run([sys.executable, reload_script])
+        reload_symbols = collect(reload_script, '--run-python')
+        assert f'{reuse_a/reused_name}!reuse_leaf' in reload_symbols
+        assert f'{reuse_b/reused_name}!reuse_new_provider' in reload_symbols
 
         at_exit = root/'atexit-runtime.py'
         at_exit.write_text('import atexit\n'

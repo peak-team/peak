@@ -265,8 +265,11 @@ LD_PRELOAD=/path/to/libpeak.so \
 Static discovery cannot see libraries loaded dynamically with `dlopen()` or
 `ctypes`; add their paths with repeated `--module` options. Alternatively,
 `--run-python` selects runtime-only discovery: it runs the script once and
-collects extensions observed through `sys.modules` or Python's audit events,
-plus native shared libraries mapped during that run. It excludes the
+collects successful compiled-module imports and ctypes loads, taking a mapped-library
+snapshot at those boundaries and at exit. The inventory retains libraries observed
+before a later unload. Native loads and unloads entirely between observation
+boundaries cannot be discovered. Each boundary scans `/proc/self/maps`; discovery
+cost grows with the number of boundaries and mapping lines. It excludes the
 interpreter's baseline mappings and cannot discover libraries used only on
 other code paths. Script output is sent to stderr.
 
