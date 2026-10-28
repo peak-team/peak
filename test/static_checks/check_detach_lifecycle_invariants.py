@@ -296,9 +296,16 @@ def check_darwin_strict_lifecycle(repo_root):
     begin_stage = extract_function(gum_bridge, "peak_gum_darwin_begin_stage")
     require("self->current_transaction.level != 0" in begin_stage and
             "self->current_transaction.is_dirty" in begin_stage and
-            "g_hash_table_size(self->current_transaction.pending_update_tasks) != 0"
-            in begin_stage and "g_hash_table_lookup(self->function_by_address" in begin_stage and
-            "GUM_CODE_SIGNING_REQUIRED" in begin_stage,
+            re.search(r"g_hash_table_size\(\s*self->current_transaction\."
+                      r"pending_update_tasks\)\s*!=\s*0", begin_stage) is not None and
+            "g_hash_table_lookup(self->function_by_address" in begin_stage and
+            "GUM_CODE_SIGNING_REQUIRED" in begin_stage and
+            'strcmp(peak_gum_darwin_stage_failure, "none") != 0' in begin_stage and
+            begin_stage.find('strcmp(peak_gum_darwin_stage_failure, "none") != 0') <
+            begin_stage.find("gum_interceptor_begin_transaction") and
+            "return FALSE;" in begin_stage[begin_stage.find(
+                'strcmp(peak_gum_darwin_stage_failure, "none") != 0'):
+                begin_stage.find("gum_interceptor_begin_transaction")],
             "Darwin staging must reject nested, dirty, existing and signing-required contexts")
     finish = extract_function(
         controller, "peak_detach_controller_finish_hook_mutation"

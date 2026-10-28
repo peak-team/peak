@@ -10,6 +10,9 @@
 #include "internal/gum_peak_darwin_patch_api.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 
 #if !defined(__APPLE__) || \
@@ -105,6 +108,26 @@ typedef struct {
 static _Thread_local PeakGumDarwinStage peak_gum_darwin_stage;
 static _Thread_local guint peak_gum_darwin_redirect_size;
 static _Thread_local const gchar* peak_gum_darwin_stage_failure = "none";
+static _Thread_local gboolean peak_gum_darwin_trace_stage;
+
+/* Preparation only: never call this helper while application peers are held.
+ * Use write rather than stdio output so diagnostics don't acquire FILE locks. */
+static void
+peak_gum_darwin_trace(const gchar* phase, gpointer address, gint detail)
+{
+    if (!peak_gum_darwin_trace_stage) {
+        return;
+    }
+    char message[256];
+    int length = snprintf(message, sizeof(message),
+        "[peak] Darwin Gum stage %s address=%p detail=%d\n",
+        phase, address, detail);
+    if (length > 0) {
+        size_t size = (size_t)length < sizeof(message) ?
+            (size_t)length : sizeof(message) - 1;
+        (void)write(STDERR_FILENO, message, size);
+    }
+}
 
 const gchar*
 peak_gum_darwin_last_stage_failure(void)
@@ -292,6 +315,8 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
 {
     GumArm64Writer* writer = details->writer;
     guint* redirect_size = user_data;
+    peak_gum_darwin_trace("redirect-callback", GSIZE_TO_POINTER(writer->pc),
+                          (gint)details->scratch_register);
 
     if (details->capacity >= 4 &&
         gum_arm64_writer_can_branch_directly_between(
@@ -300,6 +325,7 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
             return GUM_REDIRECT_DECLINED;
         }
         *redirect_size = 4;
+        peak_gum_darwin_trace("redirect-direct-ready", details->target, 4);
         return GUM_REDIRECT_WRITTEN;
     }
     if (details->capacity < 16) {
@@ -310,9 +336,14 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
     guint relocatable = 0;
     /* Prove the exact 16-byte prefix this absolute redirect overwrites. A
      * four-byte direct branch above requires no scratch register proof. */
-    if (!gum_arm64_relocator_can_relocate(GSIZE_TO_POINTER(writer->pc),
+    peak_gum_darwin_trace("scratch-proof-begin", GSIZE_TO_POINTER(writer->pc),
+                          (gint)scratch);
+    gboolean proof = gum_arm64_relocator_can_relocate(GSIZE_TO_POINTER(writer->pc),
             16, GUM_SCENARIO_ONLINE, GUM_RELOCATION_CHECKED,
-            &relocatable, &scratch) || relocatable < 16) {
+            &relocatable, &scratch);
+    peak_gum_darwin_trace("scratch-proof-end", GSIZE_TO_POINTER(writer->pc),
+                          (gint)scratch);
+    if (!proof || relocatable < 16) {
         peak_gum_darwin_stage_failure = "absolute-redirect-entry-too-short";
         return GUM_REDIRECT_DECLINED;
     }
@@ -343,6 +374,10 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
 {
     PeakGumInterceptor17* self = (PeakGumInterceptor17*)interceptor;
 
+    const char* diagnostics = getenv("PEAK_ATTACH_DIAGNOSTICS");
+    peak_gum_darwin_trace_stage = diagnostics != NULL &&
+        strcmp(diagnostics, "1") == 0;
+    peak_gum_darwin_trace("begin", address, 0);
     peak_gum_darwin_stage_failure = "none";
     if (self == NULL || address == NULL ||
         peak_gum_darwin_stage.interceptor != NULL) {
@@ -350,6 +385,7 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
         return FALSE;
     }
     g_rec_mutex_lock(&self->mutex);
+    peak_gum_darwin_trace("interceptor-locked", address, self->current_transaction.level);
     /* Never consume another caller's transaction or pending code writes. */
     if (self->current_transaction.level != 0) {
         peak_gum_darwin_stage_failure = "gum-transaction-open";
@@ -402,6 +438,7 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
         }
     }
     gum_interceptor_begin_transaction(interceptor);
+    peak_gum_darwin_trace("transaction-opened", address, 0);
     return TRUE;
 }
 
@@ -442,6 +479,7 @@ peak_gum_darwin_end_stage(GumInterceptor* interceptor, gpointer address,
             peak_gum_darwin_stage_failure = "prepared-context-shape-mismatch";
         }
     }
+    peak_gum_darwin_trace("prepared-context-validated", address, valid);
     /* The lock excludes other Gum writers, and begin_stage required an empty
      * transaction, so every queued update belongs to this operation. */
     g_hash_table_remove_all(self->current_transaction.pending_update_tasks);
@@ -464,7 +502,9 @@ peak_gum_darwin_end_stage(GumInterceptor* interceptor, gpointer address,
             gum_interceptor_detach(interceptor, listener);
         }
     }
+    peak_gum_darwin_trace("allocator-finalize-begin", address, valid);
     gum_interceptor_end_transaction(interceptor);
+    peak_gum_darwin_trace("allocator-finalize-end", address, valid);
     if (!valid) {
         g_rec_mutex_unlock(&self->mutex);
     }
@@ -499,8 +539,10 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
         &peak_gum_darwin_redirect_size;
     staged_options.instrumentation.redirect_space_hint =
         PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE;
+    peak_gum_darwin_trace("gum-attach-begin", function_address, 0);
     result = gum_interceptor_attach(interceptor, function_address, listener,
                                     &staged_options);
+    peak_gum_darwin_trace("gum-attach-end", function_address, result);
     if (result != GUM_ATTACH_OK &&
         strcmp(peak_gum_darwin_stage_failure, "none") == 0) {
         peak_gum_darwin_stage_failure = "gum-attach-rejected";
@@ -544,8 +586,10 @@ peak_gum_darwin_prepare_replace(GumInterceptor* interceptor,
         &peak_gum_darwin_redirect_size;
     staged_options.instrumentation.redirect_space_hint =
         PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE;
+    peak_gum_darwin_trace("gum-replace-begin", function_address, 0);
     result = gum_interceptor_replace(interceptor, function_address,
         replacement_function, original_function, &staged_options);
+    peak_gum_darwin_trace("gum-replace-end", function_address, result);
     if (result != GUM_REPLACE_OK &&
         strcmp(peak_gum_darwin_stage_failure, "none") == 0) {
         peak_gum_darwin_stage_failure = "gum-replace-rejected";

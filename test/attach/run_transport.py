@@ -2,6 +2,7 @@
 import argparse
 from collections import namedtuple
 import os
+import re
 from pathlib import Path
 import signal
 import sys
@@ -20,18 +21,27 @@ if sys.platform == "darwin":
     env["PEAK_ATTACH_DIAGNOSTICS"] = "1"
 
 
-Process = namedtuple("Process", "parent group uid born")
+Process = namedtuple("Process", "parent group uid born command state")
+
+
+class Snapshot(dict):
+    def __init__(self):
+        super().__init__()
+        self.raw = {}
 
 
 def census():
-    snapshot = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,uid=,lstart="],
+    snapshot = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,uid=,stat=,lstart=,comm="],
                               capture_output=True, text=True, timeout=2, check=True)
-    rows = {}
+    rows = Snapshot()
     for line in snapshot.stdout.splitlines():
-        fields = line.split(maxsplit=4)
-        if len(fields) == 5:
+        fields = line.split(maxsplit=10)
+        if fields and fields[0].isdigit():
+            rows.raw[int(fields[0])] = line.strip()
+        if len(fields) == 11:
             pid, parent, group, uid = map(int, fields[:4])
-            rows[pid] = Process(parent, group, uid, fields[4])
+            born = " ".join(fields[5:10])
+            rows[pid] = Process(parent, group, uid, born, fields[10].strip(), fields[4])
     return rows
 
 
@@ -52,20 +62,33 @@ def collect_owned(host_pid, tracked, snapshot):
 
 def matching_owned(tracked, snapshot):
     return {pid: process for pid, process in tracked.items()
-            if pid in snapshot and snapshot[pid][1:] == process[1:]}
+            if pid in snapshot and snapshot[pid][1:4] == process[1:4]
+            and not snapshot[pid].state.startswith("Z")}
 
 
-def surviving_groups(tracked):
-    groups = set()
-    for group in {process.group for process in tracked.values()}:
-        try:
-            os.killpg(group, 0)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            pass
-        groups.add(group)
-    return groups
+def observation_evidence(history, host_pid, tracked, output):
+    candidates = set(tracked) | {host_pid}
+    for child, parent in re.findall(r"tracked injector child (\d+) parent (\d+)", output):
+        candidates.update((int(child), int(parent)))
+    changes = []
+    previous = None
+    for elapsed, snapshot in history:
+        selected = {pid for pid, process in snapshot.items()
+                    if pid in candidates or process.parent in candidates}
+        selected.update(pid for pid in snapshot.raw if pid in candidates)
+        rows = tuple(snapshot.raw[pid] for pid in sorted(selected))
+        if rows != previous:
+            changes.append(f"t={elapsed:.3f}s: {rows!r}")
+            previous = rows
+    return "\n".join(changes[-20:])
+
+
+def surviving_groups(tracked, snapshot):
+    # Darwin killpg(0) can report EPERM for a zombie-only group. Zombies
+    # cannot execute or receive signals; require all live group members gone.
+    groups = {process.group for process in tracked.values()}
+    return {process.group for process in snapshot.values()
+            if process.group in groups and not process.state.startswith("Z")}
 
 
 def cleanup_owned(tracked):
@@ -151,11 +174,13 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                                         stderr=subprocess.PIPE, text=True,
                                         start_new_session=True)
                 tracked = {}
+                history = []
                 try:
                     deadline = time.monotonic() + 3
                     saw_worker = saw_helper = False
                     while time.monotonic() < deadline and host.poll() is None:
                         snapshot = census()
+                        history.append((time.monotonic() - started, snapshot))
                         collect_owned(host.pid, tracked, snapshot)
                         workers = {pid for pid, process in snapshot.items()
                                    if process.parent == host.pid and pid in tracked}
@@ -173,7 +198,9 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                     # children launched after the initial worker observation.
                     deadline = started + 20
                     while host.poll() is None and time.monotonic() < deadline:
-                        collect_owned(host.pid, tracked, census())
+                        snapshot = census()
+                        history.append((time.monotonic() - started, snapshot))
+                        collect_owned(host.pid, tracked, snapshot)
                         time.sleep(0.02)
                     stdout, stderr = host.communicate(timeout=1)
                     assert host.returncode != 0, (stdout, stderr)
@@ -184,11 +211,11 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                     assert "interrupted" in stderr or "timed out" in stderr, stderr
                     deadline = time.monotonic() + 3
                     live = matching_owned(tracked, census())
-                    groups = surviving_groups(tracked)
+                    groups = surviving_groups(tracked, census())
                     while (live or groups) and time.monotonic() < deadline:
                         time.sleep(0.02)
                         live = matching_owned(tracked, census())
-                        groups = surviving_groups(tracked)
+                        groups = surviving_groups(tracked, census())
                     assert not live and not groups, (
                         "owned injector/helper survived CLI exit", live, groups, stderr)
                 except Exception as error:
@@ -201,8 +228,10 @@ with tempfile.TemporaryDirectory(prefix="peak-attach-transport-") as directory:
                         stdout, stderr = "", f"capture failed: {capture_error}"
                     def decoded(value):
                         return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+                    observed = observation_evidence(history, host.pid, tracked,
+                                                    decoded(stdout) + decoded(stderr))
                     raise AssertionError(
-                        f"{error}\ncleanup notes: {cleanup_notes!r}\nCLI stdout:\n{decoded(stdout)}\n"
+                        f"{error}\nprocess observations:\n{observed}\ncleanup notes: {cleanup_notes!r}\nCLI stdout:\n{decoded(stdout)}\n"
                         f"CLI stderr:\n{decoded(stderr)}\n"
                         f"fixture log:\n{(root / 'target.log').read_text()}") from error
                 finally:

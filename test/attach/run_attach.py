@@ -2,6 +2,7 @@
 import argparse
 import csv
 import os
+import re
 from pathlib import Path
 import signal
 import shutil
@@ -77,6 +78,36 @@ def alive(process, progress):
     wait_for(lambda: counter(progress) > before, 3)
 
 
+def fixture_evidence(process, log_path):
+    evidence = log_path.read_text(errors="replace")
+    status = process.poll()
+    if sys.platform != "darwin" or status is None or status >= 0:
+        return evidence
+    directories = [Path.home() / "Library/Logs/DiagnosticReports",
+                   Path("/Library/Logs/DiagnosticReports")]
+    started = getattr(process, "peak_started_at", time.time() - 60)
+    deadline = time.monotonic() + 6
+    expected_pid = re.compile(r'"pid"\s*:\s*' + str(process.pid) + r'\b|\[' + str(process.pid) + r'\]')
+    while time.monotonic() < deadline:
+        for directory in directories:
+            try:
+                candidates = list(directory.glob("*attach*"))
+            except OSError:
+                continue
+            for report in candidates:
+                try:
+                    if report.suffix not in (".ips", ".crash") or report.stat().st_mtime < started - 2:
+                        continue
+                    content = report.read_text(errors="replace")[:262144]
+                except OSError:
+                    continue
+                if expected_pid.search(content):
+                    return evidence + f"\nNative crash report {report}:\n{content}"
+        time.sleep(0.2)
+    return evidence + (f"\nNo native crash report for PID {process.pid} signal {-status} "
+                       f"within 6s; inspected {directories!r}")
+
+
 def filesystem_phase(target, log_path, phase):
     marker = "statfs_phase=" + phase
     previous = log_path.read_text().count(marker)
@@ -140,6 +171,7 @@ else:
         target = subprocess.Popen([str(args.fixture.resolve()), str(progress)],
                                   env=env, stdin=subprocess.PIPE, stdout=log, stderr=log,
                                   start_new_session=True)
+        target.peak_started_at = time.time()
         try:
             wait_for(lambda: counter(progress) > 20 or target.poll() is not None)
             if target.poll() == 77:
@@ -193,7 +225,7 @@ else:
                     raise AssertionError("native injection required but OS denied it:\n" + output)
                 print("SKIP: platform denied native attach:\n" + output)
                 raise SystemExit(77)
-            assert code == 0, (code, output, target.poll(), (root / "fixture.log").read_text())
+            assert code == 0, (code, output, target.poll(), fixture_evidence(target, root / "fixture.log"))
             alive(target, progress)
             filesystem_phase(target, root / "fixture.log", "G")
             alive(target, progress)
@@ -231,7 +263,7 @@ else:
 
             target.stdin.write(b"Q")
             target.stdin.flush()
-            assert target.wait(timeout=20) == 0, (root / "fixture.log").read_text()
+            assert target.wait(timeout=20) == 0, fixture_evidence(target, root / "fixture.log")
             assert "statfs_errors=0" in (root / "fixture.log").read_text(), (root / "fixture.log").read_text()
             guarded = [line for line in (root / "fixture.log").read_text().splitlines()
                        if line.startswith("statfs_guarded_calls=")]
