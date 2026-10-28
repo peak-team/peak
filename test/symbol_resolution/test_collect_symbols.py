@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Integration tests with isolated native and Python fixtures."""
 import argparse
+import _imp
 import os
 import platform
 import re
@@ -149,6 +150,23 @@ def main():
                 assert (f'{library}!collector_hwleaf' in hwcaps_symbols) == (value == selected_hwcaps)
             if selected_hwcaps == 1:
                 print('SKIP optimized hwcaps selection: loader selected the baseline library')
+
+        slash_libraries = [root/'libslash_a.so', root/'libslash_b.so']
+        for index, library in enumerate(slash_libraries):
+            build('slash-'+str(index)+'.c',
+                  f'int slash_{index}(void){{return {index+3};}}', library, '-shared', '-fPIC')
+        slash_app = root/'slash-app'
+        build('slash-main.c', '#include <stdio.h>\nextern int slash_0(void),slash_1(void);int main(void){printf("%d %d\\n",slash_0(),slash_1());}',
+              slash_app, *map(str, slash_libraries))
+        # Preserve slash-qualified NEEDED entries while giving providers the same SONAME.
+        for index, library in enumerate(slash_libraries):
+            build('slash-'+str(index)+'.c',
+                  f'int slash_{index}(void){{return {index+3};}}', library, '-shared', '-fPIC',
+                  '-Wl,-soname,libslash-common.so')
+        assert run([slash_app]).strip() == '3 4'
+        slash_symbols = collect(slash_app)
+        for index, library in enumerate(slash_libraries):
+            assert f'{library}!slash_{index}' in slash_symbols
 
         symlink_case = root/'loader-symlink'
         (symlink_case/'real').mkdir(parents=True)
@@ -600,6 +618,25 @@ print("collector_saturation_originals_ok")
             safe_symbols = collect(safe_script, '--run-python', '--python', sys.executable,
                                    env=safe_env)
             assert_native_origin('math', safe_math_origin, safe_symbols)
+        builtin_script = root/'builtin-shadow.py'
+        (root/'sys.py').write_text('invalid Python syntax !\n')
+        builtin_script.write_text('import sys\nassert sys.version\n')
+        run([sys.executable, builtin_script])
+        collect(builtin_script)
+        (root/'sys.py').unlink()
+        (root/'os.py').write_text('invalid Python syntax !\n')
+        frozen_script = root/'frozen-shadow.py'
+        frozen_script.write_text('import os\n')
+        if _imp.is_frozen('os'):
+            collect(frozen_script)
+        (root/'os.py').unlink()
+        at_exit = root/'atexit-runtime.py'
+        at_exit.write_text('import atexit\n'
+                           'def load():\n    import ctypes\n'+
+                           f'    ctypes.CDLL({str(extension)!r})\n'+
+                           'atexit.register(load)\n')
+        at_exit_symbols = collect(at_exit, '--run-python')
+        assert f'{extension}!extension_function' in at_exit_symbols
         empty_runtime = root/'empty-runtime.py'
         empty_runtime.write_text('pass\n')
         assert collect(empty_runtime, '--run-python') == set(), 'helper baseline polluted empty target'
