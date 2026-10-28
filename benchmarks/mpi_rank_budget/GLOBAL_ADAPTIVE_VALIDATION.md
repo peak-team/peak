@@ -324,7 +324,7 @@ All 32 launches completed on PVC in 5:39, exit 0:0. Strict data validation passe
 | funded-concurrent-allreduce-rotating | 1.403887 | 1.042662 | 1.070654 | 10,616 / 22,612 |
 | iallreduce-critical | 1.093106 | 1.063835 | 1.130603 | 27,999 / 21,015 |
 
-Three of five whole-interval means exceed 5%; bcast-rotating and iallreduce-critical also exceed 5% in cumulative work. Aligned native samples are unusually slow (9.082290/8.038202 s versus global 7.297735/7.395292 s), so its ratio below one is not a demonstrated speedup. Both global aligned runs record zero calls, as do both bcast runs; bcast has zero first attachments across all 32 ranks in both runs. The ledger correction alone has not restored useful sampling in these cases.
+Three of five whole-interval means exceed 5%; bcast-rotating and iallreduce-critical also exceed 5% in cumulative work. Aligned native samples are unusually slow (9.082290/8.038202 s versus global 7.297735/7.395292 s), so its ratio below one is not a demonstrated speedup. Both global aligned runs record zero calls, as do both bcast runs; bcast has zero first attachments across all 32 ranks in both runs. The ledger correction alone has not restored useful profiling coverage in these cases.
 
 All ten main global samples have zero emergency, degradation and invalid-accounting counters. Actual reattach/revisit occurs in barrier-critical (16/2 and 48/7) and iallreduce-critical (0/0 and 32/10), but the two independent trace-enabled diagnostics still prove no recovery: short has zero calls/restoration; funded has 2924 calls and zero restoration. Per-case restoration is not universally required, but these diagnostics do not supply the intended hardware recovery proof.
 
@@ -332,8 +332,35 @@ Four of ten final global samples retain spent above budget: bcast G0 0.208814/0.
 
 Verified result archive SHA256: `e2dbd4d67705c9ebbed75b0e932dd3e13167a3eb0278508bdc121d63a5dbab31`; actual library SHA256: `806f9cbaf78644045d27047436d4283ca67456c127d369c55864256566aff178`. The exact dd1d7e9 source archive is recorded above. All original parameters and independent oracles remain unchanged; valid receipts and lower accounting estimates are not treated as proof of a performance pass.
 
-## Activation-placement control (prepared, hardware results pending)
+## Activation-placement control preparation
 
 The next diagnostic explicitly gives both local and global arms the same activation policy within each group: immediate or post-init. Five unchanged workloads per policy, each N/L/G/G/L/N, plus both recovery diagnostics per policy yield 64 launches. An independent native `exec_meter` starts without LD_PRELOAD or LD_AUDIT, records monotonic time, sets the child's preload/policy environment and execs the workload. The pressure program records exec-start elapsed alongside its existing main/phase times, using a shared final endpoint after the original MPI_Finalize and its timestamp. This captures loader/constructor placement without profiling the meter itself; it excludes launcher/wrapper and the meter's own loader/entry print.
 
-Six bounded local two-rank × two-thread smoke runs (native/local/global under both policies) pass work oracles, empty-preload proof, target-byte checks and exec duration ≥ main duration. Missing meter records are rejected. The receipt is `global_validation/activation-meter-local-smoke.json`. These functional smokes are not performance estimates. The hardware package at `/tmp/peak-global-activation-probe-20261028` is guarded until exact-source commit/freeze; runtime production files are unchanged.
+Six bounded local two-rank × two-thread smoke runs (native/local/global under both policies) pass work oracles, empty-preload proof, target-byte checks and exec duration ≥ main duration. Missing meter records are rejected. The receipt is `global_validation/activation-meter-local-smoke.json`. These functional smokes are not performance estimates. The hardware package at `/tmp/peak-global-activation-probe-20261028` is submitted as job3655370 against exact commit `5c4e90dbf0eb4ae5603a79df04ee2f00e3921a41`; runtime production files remain unchanged. Source archive SHA256 is `fdd9ccaaef09791cbd34ed0df2b0605e8214fd57b662c91a757b535d5ad1124b`, with input-manifest SHA256 `4a70249589d44c2c4ddef64d316c8caa4e5310021c15a9e4dd48ab61bffcbf57`. Completed measurements follow below; submission alone did not establish acceptance.
+
+## Activation-placement result (3655370, unchanged c43 runtime)
+
+All 64 launches completed on PVC in 10:38 with exit 0:0. Strict validation passes, including every rank's meter interval, empty-preload entry proof and explicit policy. The compact record `global_validation/5c4e90d-activation-summary.json` retains all paired samples, stage decompositions, rank costs/calls, and actual recovery proofs. Local and global arms use the same explicit policy within each group; native pairs are measured independently.
+
+| Policy / case | G main / N | G cumulative / N | G main→Finalize / N | G exec-inclusive / N | L exec-inclusive / N | G calls |
+|---|---:|---:|---:|---:|---:|---|
+| immediate-bcast-rotating | 2.736730 | 1.050200 | 1.151395 | 1.161476 | 1.133446 | 52,574 / 51,645 |
+| immediate-barrier-critical | 1.025530 | 1.063847 | 1.075761 | 1.080924 | 1.094937 | 5,479 / 4,601 |
+| immediate-barrier-aligned | 0.956798 | 0.963145 | 0.993580 | 0.999145 | 1.047076 | 64 / 64 |
+| immediate-funded-concurrent-allreduce-rotating | 3.163812 | 0.995080 | 1.009038 | 1.012116 | 1.028794 | 381,124 / 366,488 |
+| immediate-iallreduce-critical | 1.032881 | 1.036056 | 1.048008 | 1.053754 | 1.066974 | 4,908 / 4,387 |
+| post-init-bcast-rotating | 0.729111 | 1.046733 | 1.092343 | 1.092643 | 1.071699 | 768 / 919 |
+| post-init-barrier-critical | 0.997409 | 1.005595 | 1.040107 | 1.040753 | 1.019709 | 36,557 / 15,123 |
+| post-init-barrier-aligned | 1.000743 | 0.971482 | 1.027871 | 1.028028 | 1.080891 | 0 / 738 |
+| post-init-funded-concurrent-allreduce-rotating | 1.203483 | 0.966622 | 0.985532 | 0.985882 | 1.015583 | 10,576 / 22,904 |
+| post-init-iallreduce-critical | 1.029512 | 0.992027 | 1.026118 | 1.026700 | 1.045418 | 38,586 / 17,508 |
+
+Immediate global group-mean pre-main elapsed is 41.9–47.0 ms versus native 2.4–4.9 ms; its MPI-init line reports roughly 3 microseconds of activation because physical preparation has already occurred in constructors. Post-init global group-mean pre-main elapsed is 4.35–7.40 ms, while activation of 74.3–80.0 ms is inside main. The cost has not disappeared: this is placement plus a measured change in initialization duration, not proof of an equal-cost transfer. Main-only comparisons miss pre-main cost. For example immediate iallreduce-critical is +4.80% by main-through-finalize but +5.38% by exec-inclusive time. Four global exec-inclusive group means exceed 5%.
+
+The main phase, cumulative work and whole interval answer different questions. Immediate funded concurrent has main ratio 3.16 but cumulative ratio 0.995 and exec ratio 1.012: its short main slowdown alone does not refute the existing instrumentation approach or violate a cumulative-runtime limit. It records 381,124/366,488 calls versus local 324,171/327,875, with target-rank coverage 33/32 versus local 32/33. This useful profiling coverage comes with 15/9 emergency events across 9/8 ranks, which are retained without treating all emergency counts as universal failures. Post-init funded records 10,576/22,904 calls and coverage 1/2 with no emergency events; its exec ratio below one is affected by native/global warmup means 12.266/11.851 s and is not claimed as a speedup.
+
+Reported startup and teardown remain material fixed costs. Across group means, bootstrap ranges about 10.8–25.3 ms. Global report CSV stage wall is 106–218 ms while its CPU is 0.246–0.305 ms; PEAK finalization is 174–281 ms. Stop/join stays 0.094–0.188 ms, confirming the previous 100 ms race remains fixed. These fixed initialization/publication costs are distinguished from controllable profiling and mutation increments; no filesystem-operation cause is asserted from aggregate wall/CPU alone.
+
+The immediate short diagnostic proves one rank's participant-DONE → physical restoration → new calls. Post-init short has restoration activity but no qualifying later calls. Both independent funded diagnostics prove zero restoration; this remains a hardware-evidence gap. No requirement is invented that every short main phase must restore, and these observations do not by themselves argue for replacing instrumentation. They show that changing activation placement alone does not establish the full overhead/utility/recovery target.
+
+Verified result archive SHA256: `26351f8f6dc11fff148c6e19868d23ffe980be02e2c113133582ed8fb0639c35`; candidate library SHA256: `d799bfab9e419af710b064b6183c3449d53d5453b0c83b31b00fe5be87eecdb7`. Native meter binary SHA256: `230f3c2305735396686a3a117382a31dba8d107707fab155d720c87362f2eaed7`. Runtime source is unchanged from the c43 escrow correction; only benchmark timing and explicit activation controls differ.
