@@ -8,8 +8,11 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <sys/auxv.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 typedef struct {
@@ -35,7 +38,7 @@ hold_peer_thread(void* argument)
 }
 
 int
-main(void)
+main(int argc, char** argv)
 {
     PeakAttachPolicyTestThread state = {
         .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -109,13 +112,22 @@ main(void)
         }
     }
     GumAddress loader_base = getauxval(AT_BASE);
-    if (loader_base != 0) {
-        GumModule* loader = gum_process_find_module_by_address(loader_base);
+    gboolean direct_loader = argc == 3 && strcmp(argv[1], "--direct-loader") == 0;
+    if (direct_loader && loader_base != 0) {
+        fputs("direct loader fixture unexpectedly has AT_BASE\n", stderr);
+        return EXIT_FAILURE;
+    }
+    char* loader_path = NULL;
+    if (loader_base != 0 || direct_loader) {
+        GumModule* loader = direct_loader
+            ? gum_process_find_module_by_name(argv[2])
+            : gum_process_find_module_by_address(loader_base);
         if (loader == NULL) {
             fputs("could not identify the process ELF loader\n", stderr);
             gum_deinit_embedded();
             return EXIT_FAILURE;
         }
+        loader_path = strdup(gum_module_get_path(loader));
         GumMemoryRange range = *gum_module_get_range(loader);
         g_object_unref(loader);
         if (peak_general_listener_attach_target_is_supported(
@@ -148,6 +160,28 @@ main(void)
     }
 #endif
     gum_deinit_embedded();
+#if defined(__linux__)
+    if (!direct_loader && loader_path != NULL) {
+        pid_t child = fork();
+        if (child == 0) {
+            alarm(15);
+            execl(loader_path, loader_path, argv[0], "--direct-loader", loader_path,
+                  (char*)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fputs("direct loader attach-policy regression failed\n", stderr);
+            free(loader_path);
+            return EXIT_FAILURE;
+        }
+    }
+    free(loader_path);
+#else
+    (void)argc;
+    (void)argv;
+#endif
 
     puts("attach_policy_test_ok");
     return EXIT_SUCCESS;

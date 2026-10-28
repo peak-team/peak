@@ -11,7 +11,9 @@
 #include <string.h>
 #if defined(__linux__)
 #include <dlfcn.h>
+#include <link.h>
 #include <sys/auxv.h>
+extern struct r_debug _r_debug __attribute__((weak));
 #endif
 
 #if defined(__APPLE__) && \
@@ -39,6 +41,10 @@ peak_general_listener_init_attach_policy_once(void)
 
 #if defined(__linux__)
     GumAddress loader_base = getauxval(AT_BASE);
+    /* Direct loader invocation has no PT_INTERP, but the ELF rendezvous still
+     * identifies the actual loader without mistaking the main executable. */
+    if (loader_base == 0 && &_r_debug != NULL)
+        loader_base = _r_debug.r_ldbase;
     if (loader_base != 0) {
         GumModule* loader = gum_process_find_module_by_address(loader_base);
         if (loader != NULL) {
