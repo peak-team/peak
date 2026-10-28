@@ -4,6 +4,8 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/arm/thread_status.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -22,6 +24,7 @@
 #define PEAK_DARWIN_MAX_PATCH_RECORDS 8192u
 #define PEAK_DARWIN_GATE_WAIT_US 100u
 #define PEAK_DARWIN_ACCOUNTING_ATTEMPTS 64u
+#define PEAK_DARWIN_SNAPSHOT_ATTEMPTS 64u
 
 #if !defined(__DARWIN_OPAQUE_ARM_THREAD_STATE64)
 #define __darwin_arm_thread_state64_get_pc_fptr(state) \
@@ -40,12 +43,18 @@ typedef struct {
 typedef struct {
     gboolean active;
     gboolean uses_physical_patch;
+    gboolean staged_mutation;
+    GumInterceptor* staged_interceptor;
+    gpointer* staged_original_function;
     size_t hook_id;
     PeakDetachOperation operation;
     thread_act_t threads[PEAK_DARWIN_MAX_THREADS];
     mach_msg_type_number_t thread_count;
     gpointer writable_pages;
     guint writable_page_count;
+    gpointer page_snapshot;
+    gpointer original_pages;
+    gboolean clone_pages;
     gsize writable_patch_offset;
     struct timespec started_at;
 } PeakDarwinHeldMutation;
@@ -359,6 +368,27 @@ peak_darwin_suspend_snapshot(thread_act_t controller_thread,
     return TRUE;
 }
 
+/* A stable full-task snapshot is required even before pthread_create has
+ * a gate. Every newly observed peer is suspended before enumerating again;
+ * success means only this controller can create another thread. */
+static gboolean
+peak_darwin_close_thread_snapshot(thread_act_t controller_thread,
+                                  PeakDetachStatus* status_out)
+{
+    for (unsigned int attempt = 0;
+         attempt < PEAK_DARWIN_SNAPSHOT_ATTEMPTS; attempt++) {
+        mach_msg_type_number_t before = peak_darwin_held.thread_count;
+        if (!peak_darwin_suspend_snapshot(controller_thread, status_out))
+            return FALSE;
+        if (peak_darwin_held.thread_count == before)
+            return TRUE;
+    }
+    peak_darwin_note_failure("thread-snapshot-not-closed", 0, 0,
+                             peak_darwin_held.thread_count);
+    peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+    return FALSE;
+}
+
 static gboolean
 peak_darwin_threads_avoid_patch_interior(const PeakDarwinPatchPlan* plan,
                                          PeakDetachStatus* status_out)
@@ -443,9 +473,14 @@ static void
 peak_darwin_dispose_writable_pages(void)
 {
     if (peak_darwin_held.writable_pages != NULL) {
-        gum_memory_dispose_writable_pages(
-            peak_darwin_held.writable_pages,
-            peak_darwin_held.writable_page_count);
+        if (peak_darwin_held.clone_pages) {
+            gum_free_pages(peak_darwin_held.writable_pages);
+            gum_free_pages(peak_darwin_held.page_snapshot);
+            peak_darwin_held.page_snapshot = NULL;
+        } else {
+            gum_memory_dispose_writable_pages(peak_darwin_held.writable_pages,
+                peak_darwin_held.writable_page_count);
+        }
         peak_darwin_held.writable_pages = NULL;
         peak_darwin_held.writable_page_count = 0;
     }
@@ -463,9 +498,54 @@ peak_darwin_cancel_stop_window(void)
     }
 
     peak_darwin_dispose_writable_pages();
+    if (peak_darwin_held.staged_mutation) {
+        peak_gum_darwin_finish_staged_mutation(
+            peak_darwin_held.staged_interceptor, FALSE);
+        if (peak_darwin_held.staged_original_function != NULL)
+            *peak_darwin_held.staged_original_function = NULL;
+    }
     peak_darwin_end_thread_gate();
     peak_darwin_publish_window(FALSE, &peak_darwin_held.started_at);
     peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
+}
+
+/* Query leaf Mach mappings, including the shared-cache submap. */
+static gboolean
+peak_darwin_page_is_rx(uintptr_t page, gsize page_size)
+{
+    natural_t depth = 0;
+    for (guint attempt = 0; attempt != 32; attempt++) {
+        mach_vm_address_t start = page;
+        mach_vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &start,
+            &size, &depth, (vm_region_recurse_info_t)&info, &count);
+        if (kr != KERN_SUCCESS) {
+            peak_darwin_note_failure("clone-page-query-failed", 0, page, kr);
+            return FALSE;
+        }
+        if (count < VM_REGION_SUBMAP_INFO_COUNT_64) {
+            peak_darwin_note_failure("clone-page-query-short", 0, page, count);
+            return FALSE;
+        }
+        if (start > page || size < page_size || page - start > size - page_size) {
+            peak_darwin_note_failure("clone-page-query-range", 0, page, size);
+            return FALSE;
+        }
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+        if (info.protection != (VM_PROT_READ | VM_PROT_EXECUTE)) {
+            peak_darwin_note_failure("clone-page-protection-unsupported", 0,
+                page, info.protection);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    peak_darwin_note_failure("clone-page-submap-depth", 0, page, depth);
+    return FALSE;
 }
 
 static gboolean
@@ -491,8 +571,47 @@ peak_darwin_prepare_writable_alias(const PeakDarwinPatchPlan* plan,
     first_page = address & ~((uintptr_t)page_size - 1);
     end = address + plan->patch_size;
     page_count = (guint)((end - first_page + page_size - 1) / page_size);
-    peak_darwin_held.writable_pages =
-        gum_memory_try_remap_writable_pages((gpointer)first_page, page_count);
+    if (!gum_memory_can_remap_writable()) {
+        gsize size = page_count * page_size;
+        for (guint i = 0; i < page_count; i++) {
+            if (!peak_darwin_page_is_rx(first_page + i * page_size, page_size)) {
+                peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+                return FALSE;
+            }
+        }
+        gpointer snapshot = gum_try_alloc_n_pages(page_count, GUM_PAGE_RW);
+        gpointer clone = gum_try_alloc_n_pages(page_count, GUM_PAGE_RW);
+        if (snapshot == NULL || clone == NULL) {
+            if (snapshot != NULL) gum_free_pages(snapshot);
+            if (clone != NULL) gum_free_pages(clone);
+            peak_darwin_note_failure("clone-page-allocation-failed", 0, address, size);
+            peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+            return FALSE;
+        }
+        memcpy(snapshot, (gpointer)first_page, size);
+        memcpy(clone, snapshot, size);
+        memcpy((guint8*)clone + address - first_page, plan->bytes_to_write, plan->patch_size);
+        kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)clone,
+            size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            gum_free_pages(snapshot);
+            gum_free_pages(clone);
+            peak_darwin_note_failure("clone-page-seal-failed", 0, address, kr);
+            peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+            return FALSE;
+        }
+        /* The whole mapping changes physical backing, so publish all copied
+         * instructions before any peer can execute the replacement pages. */
+        sys_dcache_flush(clone, size);
+        sys_icache_invalidate(clone, size);
+        peak_darwin_held.writable_pages = clone;
+        peak_darwin_held.page_snapshot = snapshot;
+        peak_darwin_held.original_pages = (gpointer)first_page;
+        peak_darwin_held.clone_pages = TRUE;
+    } else {
+        peak_darwin_held.writable_pages =
+            gum_memory_try_remap_writable_pages((gpointer)first_page, page_count);
+    }
     if (peak_darwin_held.writable_pages == NULL) {
         peak_darwin_note_failure("writable-remap-failed",
                                  0,
@@ -519,19 +638,40 @@ peak_darwin_bytes_equal(const guint8* left,
     return TRUE;
 }
 
-static void
+static gboolean
 peak_darwin_write_patch(const PeakDarwinPatchPlan* plan)
 {
     guint8* writable =
         (guint8*)peak_darwin_held.writable_pages +
         peak_darwin_held.writable_patch_offset;
 
-    for (guint i = 0; i < plan->patch_size; i++) {
-        writable[i] = plan->bytes_to_write[i];
+    if (peak_darwin_held.clone_pages) {
+        gsize size = peak_darwin_held.writable_page_count * gum_query_page_size();
+        if (!peak_darwin_bytes_equal(peak_darwin_held.original_pages,
+                peak_darwin_held.page_snapshot, size)) {
+            peak_darwin_note_failure("clone-page-bytes-changed", 0,
+                (uintptr_t)plan->function_address, size);
+            return FALSE;
+        }
+        mach_vm_address_t target = (mach_vm_address_t)peak_darwin_held.original_pages;
+        vm_prot_t current, maximum;
+        kern_return_t kr = mach_vm_remap(mach_task_self(), &target, size, 0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+            (mach_vm_address_t)peak_darwin_held.writable_pages, TRUE,
+            &current, &maximum, VM_INHERIT_COPY);
+        if (kr != KERN_SUCCESS) {
+            peak_darwin_note_failure("clone-page-map-failed", 0,
+                (uintptr_t)plan->function_address, kr);
+            return FALSE;
+        }
+    } else {
+        for (guint i = 0; i < plan->patch_size; i++)
+            writable[i] = plan->bytes_to_write[i];
     }
     atomic_thread_fence(memory_order_seq_cst);
     sys_dcache_flush(plan->function_address, plan->patch_size);
     sys_icache_invalidate(plan->function_address, plan->patch_size);
+    return TRUE;
 }
 
 static gboolean
@@ -540,6 +680,25 @@ peak_darwin_build_patch_plan(const PeakDetachRequest* request,
                              PeakDetachStatus* status_out)
 {
     *plan = (PeakDarwinPatchPlan){ 0 };
+
+    if (request->operation == PEAK_DETACH_OPERATION_ATTACH ||
+        request->operation == PEAK_DETACH_OPERATION_REPLACE) {
+        if (!peak_gum_darwin_get_staged_patch(request->interceptor,
+                &plan->function_address, plan->active_patch,
+                plan->original_prologue, &plan->patch_size) ||
+            plan->function_address != gum_strip_code_pointer(request->function_address) ||
+            plan->patch_size == 0 ||
+            plan->patch_size > PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE) {
+            peak_darwin_note_failure("staged-patch-identity-mismatch", 0,
+                                     (uintptr_t)request->function_address,
+                                     (uintptr_t)plan->function_address);
+            peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_CLASSIFY_FAILED);
+            return FALSE;
+        }
+        plan->bytes_to_write = plan->active_patch;
+        plan->expected_bytes = plan->original_prologue;
+        return TRUE;
+    }
 
     if (request->operation == PEAK_DETACH_OPERATION_DETACH) {
         if (!peak_gum_darwin_get_function_patch(
@@ -626,9 +785,10 @@ peak_darwin_build_patch_plan(const PeakDetachRequest* request,
     return TRUE;
 }
 
-gboolean
-peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
-                                             PeakDetachStatus* status_out)
+static gboolean
+peak_darwin_prepare_hook_mutation(const PeakDetachRequest* request,
+                                  PeakDetachStatus* status_out,
+                                  gboolean bootstrap)
 {
     PeakDarwinPatchPlan plan;
     thread_act_t controller_thread = MACH_PORT_NULL;
@@ -658,7 +818,9 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         return FALSE;
     }
 
-    if (request->operation != PEAK_DETACH_OPERATION_DETACH &&
+    if (request->operation != PEAK_DETACH_OPERATION_ATTACH &&
+        request->operation != PEAK_DETACH_OPERATION_REPLACE &&
+        request->operation != PEAK_DETACH_OPERATION_DETACH &&
         request->operation != PEAK_DETACH_OPERATION_REATTACH) {
         peak_darwin_note_failure("runtime-gum-mutation-disabled",
                                  0,
@@ -669,7 +831,7 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         return FALSE;
     }
 
-    if (atomic_load_explicit(&peak_darwin_thread_gate_installed,
+    if (!bootstrap && atomic_load_explicit(&peak_darwin_thread_gate_installed,
                              memory_order_acquire) == 0) {
         peak_darwin_note_failure("thread-creation-gate-unavailable",
                                  0,
@@ -680,22 +842,43 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         return FALSE;
     }
 
-    if (!peak_darwin_build_patch_plan(request, &plan, &status)) {
-        peak_darwin_set_status(status_out, status);
-        pthread_mutex_unlock(&peak_darwin_mutation_mutex);
-        return FALSE;
-    }
-
     peak_darwin_held = (PeakDarwinHeldMutation){
         .uses_physical_patch = TRUE,
         .hook_id = request->hook_id,
         .operation = request->operation
     };
-    if (!peak_darwin_prepare_writable_alias(&plan, &status)) {
-        peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
-        peak_darwin_set_status(status_out, status);
-        pthread_mutex_unlock(&peak_darwin_mutation_mutex);
-        return FALSE;
+    if (request->operation == PEAK_DETACH_OPERATION_ATTACH ||
+        request->operation == PEAK_DETACH_OPERATION_REPLACE) {
+        int gum_result;
+        if (request->operation == PEAK_DETACH_OPERATION_ATTACH) {
+            gum_result = peak_gum_darwin_prepare_attach(request->interceptor,
+                request->function_address, request->listener,
+                request->attach_options);
+        } else {
+            if (request->replacement_function == NULL) {
+                peak_darwin_note_failure("replacement-function-missing", 0,
+                                         (uintptr_t)request->function_address, 0);
+                goto cancel;
+            }
+            gum_result = peak_gum_darwin_prepare_replace(request->interceptor,
+                request->function_address, request->replacement_function,
+                request->original_function, NULL);
+        }
+        if (gum_result != 0) {
+            /* The overlay returns a static reason. Record it before cleanup,
+             * while peers are running, and preserve the signed Gum status. */
+            peak_darwin_note_failure(peak_gum_darwin_last_stage_failure(), 0,
+                                     (uintptr_t)request->function_address,
+                                     (uintptr_t)(intptr_t)gum_result);
+            goto cancel;
+        }
+        peak_darwin_held.staged_mutation = TRUE;
+        peak_darwin_held.staged_interceptor = request->interceptor;
+        peak_darwin_held.staged_original_function = request->original_function;
+    }
+    if (!peak_darwin_build_patch_plan(request, &plan, &status) ||
+        !peak_darwin_prepare_writable_alias(&plan, &status)) {
+        goto cancel;
     }
 
     (void)peak_darwin_begin_thread_gate();
@@ -708,12 +891,11 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
     }
 
     /*
-     * The creation gate stops new pthread_create calls.  Enumerating again
-     * after the first suspension pass closes the race with a creator that had
-     * already crossed the gate before it was published.
+     * Once installed, the gate stops new pthread_create calls. During its
+     * first installation there is no gate yet: close the complete Mach task
+     * snapshot until every peer (including newly observed creators) is held.
      */
-    if (!peak_darwin_suspend_snapshot(controller_thread, &status) ||
-        !peak_darwin_suspend_snapshot(controller_thread, &status) ||
+    if (!peak_darwin_close_thread_snapshot(controller_thread, &status) ||
         !peak_darwin_threads_avoid_patch_interior(&plan, &status)) {
         goto cancel;
     }
@@ -729,7 +911,10 @@ peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
         goto cancel;
     }
 
-    peak_darwin_write_patch(&plan);
+    if (!peak_darwin_write_patch(&plan)) {
+        status = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+        goto cancel;
+    }
 
     peak_darwin_held.active = TRUE;
     prepared = TRUE;
@@ -747,6 +932,30 @@ beach:
     pthread_mutex_unlock(&peak_darwin_mutation_mutex);
     return prepared;
 }
+
+gboolean
+peak_detach_controller_prepare_hook_mutation(const PeakDetachRequest* request,
+                                             PeakDetachStatus* status_out)
+{
+    return peak_darwin_prepare_hook_mutation(request, status_out, FALSE);
+}
+
+#ifdef PEAK_ATTACH_RUNTIME
+gboolean
+peak_detach_controller_prepare_pthread_bootstrap(const PeakDetachRequest* request,
+                                                PeakDetachStatus* status_out)
+{
+    if (request == NULL || request->operation != PEAK_DETACH_OPERATION_ATTACH ||
+        request->symbol_name == NULL ||
+        strcmp(request->symbol_name, "pthread_create") != 0 ||
+        atomic_load_explicit(&peak_darwin_thread_gate_installed,
+                             memory_order_acquire) != 0) {
+        peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+        return FALSE;
+    }
+    return peak_darwin_prepare_hook_mutation(request, status_out, TRUE);
+}
+#endif
 
 gboolean
 peak_detach_controller_strict_batch_supported(void)
@@ -944,6 +1153,9 @@ peak_detach_controller_finish_hook_mutation(const PeakDetachRequest* request,
             finished = FALSE;
         }
         peak_darwin_dispose_writable_pages();
+        if (peak_darwin_held.staged_mutation)
+            peak_gum_darwin_finish_staged_mutation(
+                peak_darwin_held.staged_interceptor, TRUE);
         peak_darwin_end_thread_gate();
         peak_darwin_held = (PeakDarwinHeldMutation){ 0 };
         peak_darwin_publish_window(finished, &started_at);

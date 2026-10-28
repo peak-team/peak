@@ -48,6 +48,96 @@ def check_shutdown_order(repo_root):
                 "shutdown Gum detach must happen before controller finish/resume")
 
 
+def check_late_attach_support_windows(repo_root):
+    pthread = read_source(repo_root, "src/pthread_listener.c")
+    memory = read_source(repo_root, "src/malloc_interceptor.c")
+    mpi = read_source(repo_root, "src/mpi_interceptor.c")
+    cuda = read_source(repo_root, "src/cuda_interceptor.cpp")
+    controller = read_source(repo_root, "src/detach_controller.c")
+    support = extract_function(pthread, "pthread_listener_attach_support")
+    require(support.find("peak_detach_controller_prepare_pthread_bootstrap") <
+            support.find("gum_interceptor_begin_transaction") <
+            support.find("peak_detach_controller_finish_hook_mutation") and
+            "peak_detach_controller_current_mutation_uses_physical_patch()" in support and
+            ".replacement_function = replacement" in support and
+            ".original_function = original" in support,
+            "attach pthread support must hold a strict window and honor staged physical commits")
+    filesystem = read_source(repo_root, "src/filesystem_stat_guard.c")
+    fs_attach = extract_function(filesystem, "peak_filesystem_stat_guard_attach")
+    fs_prepare = fs_attach.find("peak_detach_controller_prepare_hook_mutation_batch")
+    fs_transaction = fs_attach.find("gum_interceptor_begin_transaction")
+    fs_replace = fs_attach.find("gum_interceptor_replace")
+    fs_publish = fs_attach.find("next_statfs =")
+    fs_commit = fs_attach.find("gum_interceptor_end_transaction")
+    fs_finish = fs_attach.find("peak_detach_controller_finish_hook_mutation_batch",
+                               fs_commit)
+    require(0 <= fs_prepare < fs_transaction < fs_replace < fs_publish <
+            fs_commit < fs_finish and
+            "if (prepared && prepared_count == unique_count)" in
+            fs_attach[fs_prepare:fs_transaction] and
+            "break;" in fs_attach[fs_prepare:fs_transaction] and
+            "requests[owner].function_address == targets[i]" in fs_attach and
+            "gum_interceptor_revert" in fs_attach[fs_replace:fs_publish],
+            "late filesystem guards must deduplicate aliases, prepare all "
+            "entries, publish originals and roll back failures within one held transaction")
+    fs_retry = fs_attach[fs_prepare:fs_transaction]
+    fs_partial_finish = fs_retry.find("peak_detach_controller_finish_hook_mutation_batch")
+    fs_unlock = fs_retry.find("peak_gum_module_mutation_end()")
+    fs_backoff = fs_retry.find("g_usleep(1000)")
+    require(0 <= fs_partial_finish < fs_unlock < fs_backoff and
+            "if (prepared &&" in fs_retry[:fs_partial_finish] and
+            "peak_detach_controller_abort_after_failed_finish" in
+            fs_retry[fs_partial_finish:fs_unlock] and
+            "attempt == 15" in fs_retry[fs_unlock:fs_backoff] and
+            "if (!retryable" in fs_retry[fs_unlock:fs_backoff] and
+            "return 0;" in fs_retry[fs_unlock:fs_backoff],
+            "filesystem attach retry must release partial held windows and "
+            "module locks before bounded backoff, and stop on nonretryable failure")
+    resolver = extract_function(filesystem, "resolve_functions")
+    require("#ifdef PEAK_ATTACH_RUNTIME" in resolver and
+            "void *scope = RTLD_DEFAULT;" in resolver and
+            "void *scope = RTLD_NEXT;" in resolver,
+            "late filesystem guards must resolve libc before their injected DSO")
+    activation = extract_function(read_source(repo_root, "src/peak.c"),
+                                  "peak_activate_runtime")
+    fs_activate = activation.find("peak_filesystem_stat_guard_attach()")
+    require(0 <= activation.find("pthread_listener_attach_ready()") < fs_activate <
+            activation.find("peak_general_listener_attach()") and
+            "PEAK_RUNTIME_ACTIVATION_REJECTED" in activation[fs_activate:
+                activation.find("peak_detach_controller_warmup_backend()")],
+            "attach activation must install filesystem guards before profiling "
+            "and fail closed when the guard batch cannot commit")
+    backend = extract_function(controller,
+        "peak_detach_controller_init_backend_configuration_once")
+    attach_backend = backend.find("#ifdef PEAK_ATTACH_RUNTIME")
+    helper = backend.find("requested_backend = PEAK_DETACH_REQUESTED_BACKEND_HELPER;",
+                          attach_backend)
+    publish = backend.find("configured_requested_backend = requested_backend;")
+    require(0 <= attach_backend < helper < publish,
+            "late attach must force ptrace rather than claiming preload signal interposition")
+    memory_attach = extract_function(memory, "malloc_interceptor_attach")
+    prepare = memory_attach.find("peak_detach_controller_prepare_hook_mutation_batch")
+    transaction = memory_attach.find("gum_interceptor_begin_transaction")
+    require(0 <= prepare < transaction and
+            "prepared_count != G_N_ELEMENTS(requests)" in
+            memory_attach[prepare:transaction] and
+            memory_attach.count("peak_detach_controller_finish_hook_mutation_batch") == 3 and
+            "#undef PEAK_MALLOC_REPLACE_FAST" in memory,
+            "late memory attach must prepare every allocator atomically, finish "
+            "all exits and use guarded standard replacements for dynamic TLS")
+    mpi_attach = extract_function(mpi, "mpi_interceptor_attach")
+    require(0 <= mpi_attach.find("peak_detach_controller_prepare_hook_mutation") <
+            mpi_attach.find("gum_interceptor_begin_transaction") <
+            mpi_attach.find("peak_detach_controller_finish_hook_mutation"),
+            "late MPI finalization replacement must use a strict mutation window")
+    for name in ("peak_cuda_replace_fast", "peak_cuda_attach_capture_entry"):
+        body = extract_function(cuda, name)
+        require(0 <= body.find("peak_detach_controller_prepare_hook_mutation") <
+                body.find("gum_interceptor_begin_transaction") <
+                body.find("peak_detach_controller_finish_hook_mutation"),
+                f"late CUDA installer {name} must use a strict mutation window")
+
+
 def check_darwin_strict_lifecycle(repo_root):
     controller = read_source(repo_root, "src/detach_controller_darwin.c")
     gum_bridge = read_source(repo_root, "src/gum_peak_darwin_patch_api.c")
@@ -87,6 +177,16 @@ def check_darwin_strict_lifecycle(repo_root):
             activation[bootstrap_proof:gum_init],
             "Darwin activation must prove single-threaded bootstrap before "
             "Gum initialization or pthread hook mutation")
+    staged_guard = activation.find("#if defined(PEAK_ATTACH_RUNTIME) &&")
+    staged_query = activation.find("peak_gum_darwin_staged_attach_supported()")
+    require(0 <= staged_guard < staged_query < bootstrap_proof and
+            "defined(PEAK_HAVE_GUM_DARWIN_PATCH_API)" in
+            activation[staged_guard:staged_query] and
+            "PEAK_GUM_DARWIN_STAGED_ATTACH_API_VERSION >= 1" in
+            activation[staged_guard:staged_query] and
+            "!staged_attach_bootstrap" in activation[bootstrap_proof:gum_init],
+            "only the pinned staged attach build may bypass Darwin preload's "
+            "single-thread bootstrap proof")
 
     cancel = extract_function(controller, "peak_darwin_cancel_stop_window")
     resume = cancel.find("if (!peak_darwin_resume_threads")
@@ -145,23 +245,68 @@ def check_darwin_strict_lifecycle(repo_root):
             "Darwin physical patch lookup must require exclusive listener "
             "ownership and no Gum replacement")
 
-    prepare = extract_function(
-        controller, "peak_detach_controller_prepare_hook_mutation"
-    )
+    prepare = extract_function(controller, "peak_darwin_prepare_hook_mutation")
     shutdown_reject = prepare.find(
-        "request->operation == PEAK_DETACH_OPERATION_SHUTDOWN"
-    )
-    nonphysical_reject = prepare.find(
-        "request->operation != PEAK_DETACH_OPERATION_DETACH"
-    )
-    require(0 <= shutdown_reject < nonphysical_reject and
+        "request->operation == PEAK_DETACH_OPERATION_SHUTDOWN")
+    operation_guard = prepare.find(
+        "request->operation != PEAK_DETACH_OPERATION_ATTACH")
+    gate_guard = prepare.find("if (!bootstrap &&")
+    require(0 <= shutdown_reject < operation_guard < gate_guard and
             "PEAK_DETACH_STATUS_UNSUPPORTED" in
-            prepare[shutdown_reject:nonphysical_reject] and
-            "PEAK_DETACH_STATUS_UNSUPPORTED" in
-            prepare[nonphysical_reject:] and
-            "return FALSE;" in prepare[nonphysical_reject:] and
-            "return TRUE;" not in prepare[nonphysical_reject:],
-            "Darwin non-physical Gum mutations must fail closed without a held window")
+            prepare[shutdown_reject:operation_guard] and
+            "PEAK_DETACH_OPERATION_REPLACE" in prepare[operation_guard:gate_guard] and
+            "PEAK_DETACH_OPERATION_DETACH" in prepare[operation_guard:gate_guard] and
+            "PEAK_DETACH_OPERATION_REATTACH" in prepare[operation_guard:gate_guard] and
+            "PEAK_DETACH_OPERATION_REVERT" not in prepare[operation_guard:gate_guard] and
+            "return FALSE;" in prepare[operation_guard:gate_guard],
+            "Darwin permits only staged attach/replace or physical toggles; "
+            "REVERT and SHUTDOWN must remain fail-closed")
+    stage = prepare.find("peak_gum_darwin_prepare_attach")
+    stage_replace = prepare.find("peak_gum_darwin_prepare_replace")
+    build_plan = prepare.find("peak_darwin_build_patch_plan")
+    stop = prepare.find("peak_darwin_close_thread_snapshot")
+    pc_check = prepare.find("peak_darwin_threads_avoid_patch_interior")
+    byte_check = prepare.find("peak_darwin_bytes_equal")
+    write_patch = prepare.find("peak_darwin_write_patch")
+    require(0 <= stage < stage_replace < build_plan < stop < pc_check <
+            byte_check < write_patch and
+            "gum_interceptor_" not in prepare[stop:write_patch] and
+            "goto cancel;" in prepare[byte_check:write_patch],
+            "Darwin must prepare Gum metadata before STOP, then validate "
+            "peer PCs and original bytes before committing only patch bytes")
+    require("plan->function_address != gum_strip_code_pointer(request->function_address)"
+            in patch_plan and "staged-patch-identity-mismatch" in patch_plan,
+            "staged Darwin commits must validate exact requested entry identity")
+    bootstrap = extract_function(controller,
+        "peak_detach_controller_prepare_pthread_bootstrap")
+    require('strcmp(request->symbol_name, "pthread_create") != 0' in bootstrap and
+            "request->operation != PEAK_DETACH_OPERATION_ATTACH" in bootstrap and
+            "peak_darwin_thread_gate_installed" in bootstrap and
+            "peak_darwin_prepare_hook_mutation(request, status_out, TRUE)" in bootstrap,
+            "the ungated bootstrap exception must only install the first pthread_create listener")
+    end_stage = extract_function(gum_bridge, "peak_gum_darwin_end_stage")
+    require("g_hash_table_remove_all(self->current_transaction.pending_update_tasks)"
+            in end_stage and "!context->activated" in end_stage and
+            "context->trampoline_deflector == NULL" in end_stage and
+            "context->function_address == gum_strip_code_pointer(address)" in end_stage and
+            end_stage.find("g_hash_table_remove_all") <
+            end_stage.find("gum_interceptor_end_transaction"),
+            "Darwin staged Gum preparation must suppress entry activation, "
+            "reject deflectors and preserve exact entry identity")
+    begin_stage = extract_function(gum_bridge, "peak_gum_darwin_begin_stage")
+    require("self->current_transaction.level != 0" in begin_stage and
+            "self->current_transaction.is_dirty" in begin_stage and
+            re.search(r"g_hash_table_size\(\s*self->current_transaction\."
+                      r"pending_update_tasks\)\s*!=\s*0", begin_stage) is not None and
+            "g_hash_table_lookup(self->function_by_address" in begin_stage and
+            "GUM_CODE_SIGNING_REQUIRED" in begin_stage and
+            'strcmp(peak_gum_darwin_stage_failure, "none") != 0' in begin_stage and
+            begin_stage.find('strcmp(peak_gum_darwin_stage_failure, "none") != 0') <
+            begin_stage.find("gum_interceptor_begin_transaction") and
+            "return FALSE;" in begin_stage[begin_stage.find(
+                'strcmp(peak_gum_darwin_stage_failure, "none") != 0'):
+                begin_stage.find("gum_interceptor_begin_transaction")],
+            "Darwin staging must reject nested, dirty, existing and signing-required contexts")
     finish = extract_function(
         controller, "peak_detach_controller_finish_hook_mutation"
     )
@@ -169,14 +314,30 @@ def check_darwin_strict_lifecycle(repo_root):
             "request->operation != PEAK_DETACH_OPERATION_REATTACH" in finish and
             "status = PEAK_DETACH_STATUS_UNSUPPORTED" in finish,
             "Darwin non-physical finish must remain fail-closed without a held window")
+    require(0 <= cancel.find("peak_darwin_resume_threads") <
+            cancel.find("peak_gum_darwin_finish_staged_mutation") and
+            0 <= finish.find("peak_darwin_resume_threads") <
+            finish.find("peak_gum_darwin_finish_staged_mutation"),
+            "Darwin staged finalize/rollback must call Gum only after peers resume")
+    closure = extract_function(controller, "peak_darwin_close_thread_snapshot")
+    require("attempt < PEAK_DARWIN_SNAPSHOT_ATTEMPTS" in closure and
+            "peak_darwin_suspend_snapshot" in closure and
+            "peak_darwin_held.thread_count == before" in closure and
+            "thread-snapshot-not-closed" in closure and
+            "PEAK_DETACH_STATUS_CLASSIFY_FAILED" in closure,
+            "Darwin bootstrap must close the complete peer snapshot within a bound")
 
     final_detach = extract_function(general, "peak_general_listener_dettach")
-    require("Darwin process-exit teardown leaves Gum target listener state alive"
+    require("Resident process-exit teardown leaves Gum target listener state alive"
             in final_detach and
             final_detach.find("return FALSE;") <
             final_detach.find("pthread_t controller_tid"),
             "Darwin process exit must retain Gum target listener state")
+    require("#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)" in final_detach,
+            "Darwin and late attach must retain resident target metadata")
     finalizer = extract_function(peak, "peak_fini_impl")
+    require("#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)" in finalizer,
+            "resident finalization must retain callback-visible configuration")
     loader_state = finalizer.find("gboolean dlopen_shutdown_flushed")
     darwin_loader_guard = finalizer.find("#if defined(__APPLE__)", loader_state)
     darwin_loader_else = finalizer.find("#else", darwin_loader_guard)
@@ -185,7 +346,7 @@ def check_darwin_strict_lifecycle(repo_root):
             finalizer[darwin_loader_guard:darwin_loader_else] and
             "no loader listener" in
             finalizer[darwin_loader_guard:darwin_loader_else] and
-            "Darwin process-exit teardown leaves Gum support hook state alive"
+            "Resident process-exit teardown leaves Gum support hook state alive"
             in finalizer,
             "Darwin must neither install nor shut down dynamic-loader attach machinery")
 
@@ -296,24 +457,16 @@ def check_darwin_strict_lifecycle(repo_root):
             "target")
     require("rejecting PEAK_MEMORY_PROFILE on macOS" in workflow,
             "macOS CI must exercise explicit memory-profile rejection")
-    require("Runtime `ATTACH`, `REPLACE`, and" in readme and
-            "`REVERT` mutations fail closed" in readme and
-            "does not install" in readme and
-            "JIT metadata provider is also kept disabled" in readme and
-            "`PEAK_MEMORY_PROFILE` is also rejected explicitly" in readme and
-            "macOS Arm64 v1 requires PEAK's default downloaded, hash-pinned "
-            "Frida Gum" in readme and
-            "Darwin v1 has no exact-entry attach" in readme and
-            "cannot override this" in readme and
-            "exactly the requested PEAK listener" in readme and
+    require("single-threaded" in readme and "staged" in readme and
+            "macOS Arm64" in readme and "PEAK_BUILD_ATTACH" in readme and
+            "JIT" in readme and "memory" in readme and
+            "REVERT" in readme and "unsupported" in readme and
+            "hash-pinned" in readme and "exactly the requested PEAK listener" in readme and
             "does not claim to cover threads" in readme and
-            "created directly through Mach APIs" in readme and
-            "Memory profiling is rejected" in controller_doc and
-            "exclusive ownership of the" in controller_doc and
-            "canonical Gum context" in controller_doc and
-            "arbitrary Mach thread creation" in controller_doc and
-            "not claimed by this backend" in controller_doc,
-            "Darwin docs must bound v1 safety to startup attach and pthread-based workloads")
+            "staged" in controller_doc and "pthread-based workloads" in controller_doc and
+            "SHUTDOWN" in controller_doc and "REVERT" in controller_doc,
+            "Darwin docs must distinguish pinned staged initial attach from "
+            "preload bootstrap and retain later mutation/platform limits")
 
 
 def check_safe_pc_alignment(repo_root):
@@ -2190,12 +2343,16 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("peak_unsafe_gum_prologue_check" in general_attach_supported,
             "Gum attach support predicate must delegate prologue policy checks")
     require(general_attach_supported.count("peak_log_info(") == 2 and
-            general_attach_supported.count("peak_log_warn(") == 1 and
+            general_attach_supported.count("peak_log_warn(") == 2 and
+            "peak_filesystem_stat_guard_owns_address(address)" in general_attach_supported and
+            "this entry is reserved for the filesystem-stat safety guard" in
+            general_attach_supported and
+            "#ifdef PEAK_ATTACH_RUNTIME" in general_attach_supported and
             "g_printerr(" not in general_attach_supported and
             "target entry redirects to another address" in
             general_attach_supported,
             "relocation-policy skips must remain INFO while target-attribution "
-            "rejection is a default-visible WARN")
+            "and reserved safety-guard entry rejection are default-visible WARNs")
     require("peak_general_listener_init_attach_policy();" in general,
             "general listener attach must initialize cached attach policy")
     require('opendir("/proc/self/task")' in startup_skip and
@@ -2601,9 +2758,23 @@ def check_runtime_configuration_freeze(repo_root):
     controller_configure = extract_function(
         controller, "peak_detach_controller_configure_mpi_process"
     )
+    preflight_verbosity = re.compile(
+        r"#ifdef PEAK_ATTACH_RUNTIME\s*"
+        r"/\* Rejected preflight configurations may be replaced before activation\. \*/\s*"
+        r"if \(!peak_attach_runtime_attempt_is_terminal\(\)\) \{\s*"
+        r"int valid;\s*"
+        r"return peak_log_parse_verbosity\(getenv\(PEAK_VERBOSITY_ENV\), &valid\);\s*"
+        r"\}\s*#endif"
+    )
+    require(len(preflight_verbosity.findall(log_verbosity)) == 1,
+            "only attach preflight before the terminal activation boundary "
+            "may read replaceable logging configuration")
+    cached_log_verbosity = preflight_verbosity.sub("", log_verbosity)
     require("getenv(PEAK_VERBOSITY_ENV)" in log_configure_once and
             "pthread_once(&peak_log_configuration_once" in log_configure and
-            "getenv" not in log_verbosity and
+            "getenv" not in cached_log_verbosity and
+            "peak_log_configure();" in cached_log_verbosity and
+            "return (PeakVerbosity)peak_log_cached_verbosity;" in cached_log_verbosity and
             "peak_log_configure();" in peak_init and
             "peak_log_configure();" in controller_configure,
             "logging verbosity must be frozen before controller threads and "
@@ -2904,11 +3075,21 @@ def check_signal_backend_strict_invariants(repo_root):
         controller, "peak_detach_controller_warmup_backend"
     )
     prepare_mutation = extract_function(
-        controller, "peak_detach_controller_prepare_hook_mutation"
+        controller, "peak_detach_controller_prepare_hook_mutation_internal"
     )
     prepare_batch = extract_function(
-        controller, "peak_detach_controller_prepare_hook_mutation_batch"
+        controller, "peak_detach_controller_prepare_hook_mutation_batch_internal"
     )
+    for public_name in ("peak_detach_controller_prepare_hook_mutation",
+                        "peak_detach_controller_prepare_hook_mutation_batch"):
+        wrapper = extract_function(controller, public_name)
+        require("peak_attach_prepare_stages" in wrapper and
+                public_name + "_internal" in wrapper and
+                wrapper.index("peak_attach_prepare_stages") <
+                wrapper.index(public_name + "_internal"),
+                "attach metadata must be staged before the strict stop implementation")
+        require("peak_attach_finish_stages(FALSE)" in wrapper,
+                "failed strict preparation must roll back staged metadata after resume")
     wait_for_mutation = extract_function(
         controller, "peak_detach_controller_wait_for_mutation_window"
     )
@@ -3559,6 +3740,7 @@ def main():
         return 2
     repo_root = pathlib.Path(sys.argv[1]).resolve()
     check_shutdown_order(repo_root)
+    check_late_attach_support_windows(repo_root)
     check_darwin_strict_lifecycle(repo_root)
     check_safe_pc_alignment(repo_root)
     check_support_hook_lifetimes(repo_root)

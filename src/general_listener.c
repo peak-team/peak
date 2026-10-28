@@ -24,6 +24,19 @@
 #include "utils/env_parser.h"
 #include "utils/target_selector_syntax.h"
 #include "pthread_listener.h"
+
+/* Late attach stages Gum allocation/metadata before holding peer threads.
+ * The preload path retains its existing platform-specific lifecycle. */
+static gboolean
+peak_general_listener_initial_mutation_is_staged(void)
+{
+#if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API) || defined(PEAK_ATTACH_RUNTIME)
+    return peak_detach_controller_current_mutation_uses_physical_patch();
+#else
+    return FALSE;
+#endif
+}
+
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #endif
@@ -1328,8 +1341,15 @@ extern const guint8 __stop_peak_listener_fast_dispatch[];
  * callback TLS can use the initial-exec model. This keeps every steady-state
  * access relative to the thread pointer instead of calling __tls_get_addr.
  */
+#if defined(PEAK_ATTACH_RUNTIME)
+/* Existing threads allocate this TLS block on first access after injection. */
+static __thread GumInvocationListener* peak_calibration_listener;
+static __thread guint peak_calibration_callbacks;
+static __thread PeakGeneralThreadState thread_data;
+#else
 static __thread PeakGeneralThreadState thread_data
     __attribute__((tls_model("initial-exec")));
+#endif
 
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int peak_general_listener_test_fast_close_pause = 0;
@@ -3390,6 +3410,7 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             .interceptor = interceptor,
             .listener = new_listener,
             .operation = PEAK_DETACH_OPERATION_ATTACH,
+            .attach_options = &attach_plan.options,
             .blocked_pc_start = attach_plan.mutation_guard_size > 0
                 ? attach_plan.mutation_address
                 : NULL,
@@ -3416,13 +3437,16 @@ peak_general_listener_dynamic_attach_symbol(const char* symbol_name,
             return result;
         }
 
-        gum_interceptor_begin_transaction(interceptor);
-        GumAttachReturn attach_status =
-            peak_general_listener_gum_attach_target(interceptor,
-                                                    symbol_address,
-                                                    new_listener,
-                                                    &attach_plan);
-        gum_interceptor_end_transaction(interceptor);
+        GumAttachReturn attach_status = GUM_ATTACH_OK;
+        if (!peak_general_listener_initial_mutation_is_staged()) {
+            gum_interceptor_begin_transaction(interceptor);
+            attach_status =
+                peak_general_listener_gum_attach_target(interceptor,
+                                                        symbol_address,
+                                                        new_listener,
+                                                        &attach_plan);
+            gum_interceptor_end_transaction(interceptor);
+        }
 
         if (!peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                          &detach_status)) {
@@ -6309,7 +6333,11 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     if (G_UNLIKELY(thread_data.in_callback)) {
         return;
     }
-    if (G_UNLIKELY(pthread_listener_current_thread_excluded())) {
+    if (G_UNLIKELY(pthread_listener_current_thread_excluded())
+#ifdef PEAK_ATTACH_RUNTIME
+        && listener != peak_calibration_listener
+#endif
+        ) {
         return;
     }
     thread_data.in_callback = TRUE;
@@ -6338,6 +6366,10 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
     entry->gum_stack_depth = gum_invocation_context_get_depth(ic);
     gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
+#ifdef PEAK_ATTACH_RUNTIME
+    if ((GumInvocationListener*)self == peak_calibration_listener)
+        peak_calibration_callbacks++;
+#endif
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -6489,7 +6521,11 @@ peak_general_listener_fast_on_enter(gpointer user_data,
     PeakGeneralListener* self = user_data;
 
     if (G_UNLIKELY(thread_data.in_callback) ||
-        G_UNLIKELY(pthread_listener_current_thread_excluded()) ||
+        (G_UNLIKELY(pthread_listener_current_thread_excluded())
+#ifdef PEAK_ATTACH_RUNTIME
+         && (GumInvocationListener*)self != peak_calibration_listener
+#endif
+        ) ||
         G_UNLIKELY(thread_data.fast_ignore_level != 0) ||
         G_UNLIKELY(atomic_load_explicit(&peak_general_callbacks_suspended,
                                         memory_order_acquire))) {
@@ -6524,6 +6560,10 @@ peak_general_listener_fast_on_enter(gpointer user_data,
 
     gulong current_num_calls = peak_general_listener_num_calls_increment(
         peak_general_listener_num_calls_slot(self, index));
+#ifdef PEAK_ATTACH_RUNTIME
+    if ((GumInvocationListener*)self == peak_calibration_listener)
+        peak_calibration_callbacks++;
+#endif
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
@@ -6782,6 +6822,11 @@ peak_general_listener_gum_attach_target(
         !peak_general_listener_is_ready(PEAKGENERAL_LISTENER(listener))) {
         return GUM_ATTACH_WRONG_SIGNATURE;
     }
+
+    /* Darwin prepares Gum contexts while peers run, then commits only their
+     * entry bytes in the held mutation window. Never install twice. */
+    if (peak_general_listener_initial_mutation_is_staged())
+        return GUM_ATTACH_OK;
 
     GumAttachReturn status =
         peak_gum_interceptor_attach_target(target_interceptor,
@@ -7279,14 +7324,14 @@ peak_general_overhead_bootstrapping()
         return;
     }
 
-    gum_interceptor_begin_transaction(interceptor);
-    GumAttachReturn attach_status =
-        peak_general_listener_gum_attach_target(
-            interceptor,
-            &peak_general_overhead_dummy_func,
-            listener_bootstrapping,
-            NULL);
-    gum_interceptor_end_transaction(interceptor);
+    GumAttachReturn attach_status = GUM_ATTACH_OK;
+    if (!peak_general_listener_initial_mutation_is_staged()) {
+        gum_interceptor_begin_transaction(interceptor);
+        attach_status = peak_general_listener_gum_attach_target(
+                interceptor, &peak_general_overhead_dummy_func,
+                listener_bootstrapping, NULL);
+        gum_interceptor_end_transaction(interceptor);
+    }
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -7307,6 +7352,11 @@ peak_general_overhead_bootstrapping()
     const guint n_tests = 1000;
     const guint calls_per_test = 32;
     double* time = g_new(double, n_tests * 2);
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_calibration_listener = listener_bootstrapping;
+    peak_calibration_callbacks = 0;
+    pthread_listener_calibration_begin();
+#endif
     for (guint i = 0; i < n_tests; i++) {
         time[n_tests + i] = peak_second();
         for (guint call = 0; call < calls_per_test; call++) {
@@ -7316,6 +7366,11 @@ peak_general_overhead_bootstrapping()
             (peak_second() - time[n_tests + i]) / calls_per_test;
     }
 
+#ifdef PEAK_ATTACH_RUNTIME
+    guint calibration_callbacks = peak_calibration_callbacks;
+    peak_calibration_listener = NULL;
+    pthread_listener_calibration_end();
+#endif
     mutation_request.listener = listener_bootstrapping;
     mutation_request.operation = PEAK_DETACH_OPERATION_DETACH;
     startup_attach_can_skip_stop =
@@ -7331,18 +7386,20 @@ peak_general_overhead_bootstrapping()
         peak_detach_controller_abort_after_failed_finish("overhead detach prepare",
                                                         detach_status);
     }
-    if (!peak_general_listener_prepare_fast_detach(
-            interceptor,
-            &peak_general_overhead_dummy_func,
-            listener_bootstrapping)) {
-        peak_detach_controller_abort_after_failed_finish(
-            "overhead fast detach preparation",
-            PEAK_DETACH_STATUS_ERROR);
-        _exit(128);
+    gboolean physical_calibration_detach =
+        peak_general_listener_initial_mutation_is_staged();
+    if (!physical_calibration_detach) {
+        if (!peak_general_listener_prepare_fast_detach(
+                interceptor, &peak_general_overhead_dummy_func,
+                listener_bootstrapping)) {
+            peak_detach_controller_abort_after_failed_finish(
+                "overhead fast detach preparation", PEAK_DETACH_STATUS_ERROR);
+            _exit(128);
+        }
+        gum_interceptor_begin_transaction(interceptor);
+        gum_interceptor_detach(interceptor, listener_bootstrapping);
+        gum_interceptor_end_transaction(interceptor);
     }
-    gum_interceptor_begin_transaction(interceptor);
-    gum_interceptor_detach(interceptor, listener_bootstrapping);
-    gum_interceptor_end_transaction(interceptor);
     if (!startup_attach_can_skip_stop &&
         !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                      &detach_status)) {
@@ -7350,13 +7407,18 @@ peak_general_overhead_bootstrapping()
                                                         detach_status);
     }
     peak_gum_module_mutation_end();
-    if (!peak_general_controller_flush_teardown()) {
+    if (!physical_calibration_detach &&
+        !peak_general_controller_flush_teardown()) {
         g_printerr("[peak] overhead calibration Gum teardown did not flush; leaving bootstrap listener alive\n");
         g_free(time);
         return;
     }
-    peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
-    g_object_unref(listener_bootstrapping);
+    if (!physical_calibration_detach) {
+        peak_general_listener_free(PEAKGENERAL_LISTENER(listener_bootstrapping));
+        g_object_unref(listener_bootstrapping);
+    }
+    /* A physical-only detach retains the Gum context and its listener state;
+     * its restored entry bytes make the following baseline calls unhooked. */
 
     for (guint i = 0; i < n_tests; i++) {
         time[i] = peak_second();
@@ -7370,6 +7432,13 @@ peak_general_overhead_bootstrapping()
     if (peak_general_overhead <= 0.0) {
         peak_general_overhead = peak_general_overhead_floor;
     }
+#ifdef PEAK_ATTACH_RUNTIME
+    peak_log_info("[peak] attach overhead calibration: callbacks=%u excluded=%d cost_seconds=%.9g\n",
+        calibration_callbacks, pthread_listener_current_thread_excluded(), peak_general_overhead);
+    if (calibration_callbacks != n_tests * calls_per_test) {
+        peak_log_warn("[peak] attach overhead calibration did not exercise every profiling callback\n");
+    }
+#endif
     g_free(time);
 }
 
@@ -7711,6 +7780,7 @@ peak_general_listener_attach()
                 .interceptor = interceptor,
                 .listener = new_listener,
                 .operation = PEAK_DETACH_OPERATION_ATTACH,
+                .attach_options = &attach_plan.options,
                 .blocked_pc_start = attach_plan.mutation_guard_size > 0
                     ? attach_plan.mutation_address
                     : NULL,
@@ -7732,13 +7802,16 @@ peak_general_listener_attach()
                 peak_gum_module_mutation_end();
                 continue;
             }
-            gum_interceptor_begin_transaction(interceptor);
-            GumAttachReturn attach_status =
-                peak_general_listener_gum_attach_target(interceptor,
-                                                        resolved_hook_address,
-                                                        new_listener,
-                                                        &attach_plan);
-            gum_interceptor_end_transaction(interceptor);
+            GumAttachReturn attach_status = GUM_ATTACH_OK;
+            if (!peak_general_listener_initial_mutation_is_staged()) {
+                gum_interceptor_begin_transaction(interceptor);
+                attach_status =
+                    peak_general_listener_gum_attach_target(interceptor,
+                                                            resolved_hook_address,
+                                                            new_listener,
+                                                            &attach_plan);
+                gum_interceptor_end_transaction(interceptor);
+            }
             if (!startup_attach_can_skip_stop &&
                 !peak_detach_controller_finish_hook_mutation(&mutation_request,
                                                              &detach_status)) {
@@ -9191,14 +9264,14 @@ gboolean peak_general_listener_dettach()
         peak_general_listener_reap_known_unwound();
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(PEAK_ATTACH_RUNTIME)
     /*
      * A process destructor cannot prove that arbitrary application threads
      * have stopped.  Keep every Gum target context and listener reachable and
      * let process exit reclaim them instead of performing an unguarded final
      * detach/free sequence.
      */
-    peak_log_info("[peak] Darwin process-exit teardown leaves Gum target listener state alive\n");
+    peak_log_info("[peak] Resident process-exit teardown leaves Gum target listener state alive\n");
     return FALSE;
 #endif
 

@@ -48,6 +48,11 @@ typedef struct {
     PeakDetachOperation operation;
     gpointer blocked_pc_start;
     size_t blocked_pc_size;
+    /* Used by staged Darwin mutations while peers are still running. */
+    const GumAttachOptions* attach_options;
+    gpointer replacement_function;
+    /* Cleared if a prepared Darwin replacement is rolled back. */
+    gpointer* original_function;
 } PeakDetachRequest;
 
 typedef struct {
@@ -72,6 +77,13 @@ typedef struct {
 gboolean peak_detach_controller_prepare_hook_mutation(
     const PeakDetachRequest* request,
     PeakDetachStatus* status_out);
+
+#ifdef PEAK_ATTACH_RUNTIME
+/* First pthread_create listener only. The platform backend closes the
+ * complete peer snapshot before a user-space creation gate exists. */
+gboolean peak_detach_controller_prepare_pthread_bootstrap(
+    const PeakDetachRequest* request, PeakDetachStatus* status_out);
+#endif
 
 gboolean peak_detach_controller_strict_batch_supported(void);
 

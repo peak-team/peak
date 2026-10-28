@@ -77,6 +77,9 @@ struct _PthreadState {
  */
 void pthread_listener_attach();
 
+/** Whether all support hooks required by late attach were installed. */
+gboolean pthread_listener_attach_ready(void);
+
 /**
  * @brief Attempts to remove pthread hooks and release Gum listener objects.
  *
@@ -114,6 +117,9 @@ PEAK_PTHREAD_LISTENER_API void pthread_listener_mark_next_created_thread_helper(
 
 /** Returns TRUE for a PEAK helper thread that must silently bypass accounting. */
 gboolean pthread_listener_current_thread_excluded(void);
+/* Private calibration slot admission; helper/memory exclusion stays set. */
+void pthread_listener_calibration_begin(void);
+void pthread_listener_calibration_end(void);
 
 /** Runs one bounded Linux detached-thread reclamation pass on a slow path. */
 gboolean pthread_listener_reclaim_detached_slots(void);

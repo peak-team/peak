@@ -51,6 +51,7 @@ jobs:
         -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         -DBUILD_TESTS=1
         -DPEAK_FETCH_DEPS=ON
+        -DPEAK_BUILD_ATTACH=ON
         -DPEAK_ENABLE_FORTRAN_TESTS=ON
         -DPEAK_BUILD_BENCHMARKS=OFF
         -S ${{ github.workspace }}
@@ -79,6 +80,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Verify Apple Silicon runner
+      run: test "$(uname -m)" = arm64
+
     - name: Configure CMake
       run: >
         cmake -S ${{ github.workspace }}
@@ -88,10 +92,42 @@ jobs:
         -DPEAK_ENABLE_MPI=OFF
         -DBUILD_CUDA_PROFILE=OFF
         -DPEAK_ENABLE_OTF2=OFF
-        -DBUILD_TESTING=OFF
+        -DPEAK_BUILD_ATTACH=ON
+        -DPEAK_FETCH_DEPS=ON
+        -DBUILD_TESTING=ON
+        -DPEAK_ENABLE_RUNTIME_TEST_HOOKS=OFF
 
     - name: Build
-      run: cmake --build ${{ github.workspace }}/build --parallel
+      run: >
+        cmake --build ${{ github.workspace }}/build --parallel
+        --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config test_attach_unresponsive_agent
+
+    - name: Verify Darwin bootstrap dependencies
+      run: |
+        python3 - <<'PY'
+        import subprocess
+        image = "build/src/libpeak-attach-bootstrap.dylib"
+        command = None
+        dependencies = []
+        for line in subprocess.check_output(["otool", "-l", image], text=True).splitlines():
+            fields = line.split()
+            if fields[:1] == ["cmd"]:
+                command = fields[1]
+            elif fields[:1] == ["name"] and command in {
+                    "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB", "LC_LOAD_UPWARD_DYLIB"}:
+                dependencies.append(fields[1])
+        assert dependencies == ["/usr/lib/libSystem.B.dylib"], dependencies
+        PY
+
+    - name: Test macOS attach executable and runtime
+      run: |
+        set -o pipefail
+        ctest --test-dir build --output-on-failure -V \
+          -R '^test_attach_(cli|config|runtime|transport)$' 2>&1 | tee build/attach-ctest.log
+        if grep -Fq 'Skipped' build/attach-ctest.log; then
+          echo 'Attach runtime coverage was skipped; native injection is required.' >&2
+          exit 1
+        fi
 
     - name: Install
       run: cmake --install ${{ github.workspace }}/build
@@ -107,6 +143,16 @@ jobs:
           -DPEAK_EXPECT_CUDA_ENABLED=OFF
         cmake --build package-consumer
         ctest --test-dir package-consumer --output-on-failure
+
+    - name: Upload macOS attach diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-attach-ctest
+        path: |
+          build/attach-ctest.log
+          build/Testing/Temporary/*.log
+        if-no-files-found: ignore
 
     - name: Test DYLD injection
       run: |
@@ -223,7 +269,7 @@ jobs:
           build/macos-detach-concurrent.csv
         grep -E ',reattach,success,1,safe,' \
           build/macos-detach-concurrent.csv
-        grep -F 'Darwin process-exit teardown leaves Gum target listener state alive' \
+        grep -F 'Resident process-exit teardown leaves Gum target listener state alive' \
           build/macos-detach-concurrent.log
         ! grep -F 'Accounting diagnostics:' \
           build/macos-detach-concurrent.log

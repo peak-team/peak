@@ -153,6 +153,7 @@ function(_peak_replace_gum_relocator _source_dir _output_dir)
         "${_source_dir}/peak-gum/gum${_arch}relocator-compat.h"
         "${_source_dir}/peak-gum/${_arch}-relocator-range.inc"
         "${_source_dir}/peak-gum/gum_peak_pc_api.c"
+        "${_source_dir}/peak-gum/gum_peak_staged_redirect.inc"
         "${_source_dir}/peak-gum/frida-gum-peak-api.h"
         "${_source_dir}/peak-gum/patch_frida_gum_elf_module.py")
     set(_prepared "${_output_dir}/gum${_arch}relocator-peak.c")
@@ -666,6 +667,24 @@ int main(void)
         message(FATAL_ERROR
             "The selected PEAK-patched Frida Gum devkit does not expose the exact-entry attach and redirect-resolution APIs for this architecture. "
             "Use the current auto-patched devkit, or rebuild the caller-provided devkit with the current PEAK Gum API overlay.")
+    endif()
+
+    if(PEAK_BUILD_ATTACH AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        unset(PEAK_GUM_HAS_STAGED_MUTATION_API CACHE)
+        check_c_source_compiles("
+#include <frida-gum.h>
+#if !defined(GUM_PEAK_STAGED_MUTATION_API_VERSION) || GUM_PEAK_STAGED_MUTATION_API_VERSION != 1
+#error Missing staged mutation API
+#endif
+int main(void) {
+    void * volatile prepare = (void *) gum_interceptor_peak_prepare_staged_mutation;
+    void * volatile patch = (void *) gum_interceptor_peak_staged_mutation_patch;
+    void * volatile finish = (void *) gum_interceptor_peak_finish_staged_mutation;
+    return prepare == 0 || patch == 0 || finish == 0;
+}" PEAK_GUM_HAS_STAGED_MUTATION_API)
+        if(NOT PEAK_GUM_HAS_STAGED_MUTATION_API)
+            message(FATAL_ERROR "PEAK_BUILD_ATTACH requires the staged mutation API in the Linux Gum devkit. Rebuild the caller-provided patched devkit using the current PEAK overlay, or use PEAK_FRIDA_GUM_PROVIDER=auto with FRIDA_GUM_* unset.")
+        endif()
     endif()
 
     set(CMAKE_REQUIRED_INCLUDES "${_saved_required_includes}")

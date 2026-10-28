@@ -1,6 +1,11 @@
 include(CTest)
 if(BUILD_TESTING)
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+        add_test(NAME test_darwin_attach_controller_mock
+            COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
+                bash ${CMAKE_CURRENT_SOURCE_DIR}/darwin_controller_mock/run.sh)
+        set_tests_properties(test_darwin_attach_controller_mock PROPERTIES TIMEOUT 30)
+
         add_test(NAME test_filesystem_stat_stop_guard
             COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
                 bash ${CMAKE_CURRENT_SOURCE_DIR}/filesystem_stat_guard/run.sh)
@@ -63,6 +68,7 @@ if(BUILD_TESTING)
     find_package(OpenMP)
     find_package(MPI)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_subdirectory(attach)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
         add_test(NAME test_gum_low_gap_classifier

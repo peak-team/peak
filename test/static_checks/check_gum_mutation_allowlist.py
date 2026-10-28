@@ -47,6 +47,10 @@ EXPECTED = {
     ("strict-target-attach", "cmake/peak-gum/gum_peak_pc_api.c"): {
         "attach": 1,
     },
+    ("linux-staged-prepare", "cmake/peak-gum/gum_peak_pc_api.c"): {
+        "begin_transaction": 1, "end_transaction": 1,
+        "replace": 1, "detach": 2, "revert": 2,
+    },
     ("support-init", "cmake/peak-gum/gum_peak_pc_api.c"): {
         "replace": 1,
     },
@@ -64,6 +68,21 @@ EXPECTED = {
         "flush": 2,
         "revert": 2,
     },
+    ("attach-support-strict", "src/filesystem_stat_guard.c"): {
+        "begin_transaction": 1, "end_transaction": 1,
+        "replace": 1, "revert": 1,
+    },
+    ("attach-support-strict", "src/pthread_listener.c"): {
+        "attach": 1, "begin_transaction": 1, "end_transaction": 1,
+        "replace_fast": 1,
+    },
+    ("attach-support-strict", "src/cuda_interceptor.cpp"): {
+        "begin_transaction": 1, "end_transaction": 1,
+    },
+    ("darwin-staged-prepare", "src/gum_peak_darwin_patch_api.c"): {
+        "begin_transaction": 1, "end_transaction": 2,
+        "attach": 1, "replace": 1, "detach": 2, "revert": 2,
+    },
     ("support-init", "src/pthread_listener.c"): {
         "attach": 1,
         "begin_transaction": 1,
@@ -78,8 +97,9 @@ EXPECTED = {
         "revert": 2,
     },
     ("support-init", "src/cuda_interceptor.cpp"): {
-        "begin_transaction": 1,
-        "end_transaction": 1,
+        "begin_transaction": 2,
+        "end_transaction": 2,
+        "replace": 1,
         "replace_fast": 1,
         "revert": 5,
     },
@@ -111,7 +131,11 @@ FUNCTION_ANCHORS = {
         "malloc_interceptor_flush_rollback": "support-init",
         "malloc_interceptor_detach": "support-shutdown-debt",
     },
+    "src/filesystem_stat_guard.c": {
+        "peak_filesystem_stat_guard_attach": "attach-support-strict",
+    },
     "src/pthread_listener.c": {
+        "pthread_listener_attach_support": "attach-support-strict",
         "pthread_listener_attach": "support-init",
         "pthread_listener_flush_teardown": "support-shutdown-debt",
         "pthread_listener_dettach": "support-shutdown-debt",
@@ -122,15 +146,25 @@ FUNCTION_ANCHORS = {
         "mpi_interceptor_dettach": "support-shutdown-debt",
     },
     "src/cuda_interceptor.cpp": {
+        "peak_cuda_attach_capture_entry": "attach-support-strict",
         "peak_cuda_replace_fast": "support-init",
         "cuda_interceptor_attach": "support-init",
         "cuda_interceptor_dettach": "support-shutdown-debt",
+    },
+    "src/gum_peak_darwin_patch_api.c": {
+        "peak_gum_darwin_begin_stage": "darwin-staged-prepare",
+        "peak_gum_darwin_end_stage": "darwin-staged-prepare",
+        "peak_gum_darwin_prepare_attach": "darwin-staged-prepare",
+        "peak_gum_darwin_prepare_replace": "darwin-staged-prepare",
+        "peak_gum_darwin_finish_staged_mutation": "darwin-staged-prepare",
     },
     "src/unsafe_gum_prologue.c": {
         "peak_gum_interceptor_attach_target": "strict-target-attach",
     },
     "cmake/peak-gum/gum_peak_pc_api.c": {
         "gum_interceptor_peak_attach_exact": "strict-target-attach",
+        "gum_interceptor_peak_prepare_staged_mutation": "linux-staged-prepare",
+        "gum_interceptor_peak_finish_staged_mutation": "linux-staged-prepare",
         "peak_gum_fast_unwind_ensure": "support-init",
         "peak_gum_fast_unwind_shutdown": "support-shutdown-debt",
     },
@@ -159,6 +193,19 @@ def classify_function(rel, line_no, function_starts):
     return anchors.get(active)
 
 
+def anchor_definitions(source, anchors):
+    # Call sites do not change the enclosing function. Counting them as
+    # boundaries incorrectly reclassified preload mutations after an attach
+    # helper was called from the same function.
+    starts = []
+    for name in anchors:
+        pattern = (rf"\b{re.escape(name)}\s*\([^)]*\)\s*\{{|"
+                   rf"^\s*#define\s+{re.escape(name)}\s*\(")
+        for match in re.finditer(pattern, source, re.MULTILINE):
+            starts.append((source.count("\n", 0, match.start()) + 1, name))
+    return sorted(starts)
+
+
 def count_mutations(repo_root):
     function_starts = collections.defaultdict(list)
     source_paths = []
@@ -171,29 +218,14 @@ def count_mutations(repo_root):
         source = read_source(repo_root, rel, path)
         source_paths.append((rel, source))
         anchors = FUNCTION_ANCHORS.get(rel, {})
-        if anchors:
-            for line_number, line in enumerate(source.splitlines(), 1):
-                for function_name in anchors:
-                    if re.search(
-                            rf"\b{re.escape(function_name)}\s*\(",
-                            line):
-                        function_starts[rel].append(
-                            (line_number, function_name)
-                        )
+        function_starts[rel] = anchor_definitions(source, anchors)
 
     for rel in ("cmake/peak-gum/gum_peak_pc_api.c",):
         path = repo_root / rel
         source = read_source(repo_root, rel, path)
         source_paths.append((rel, source))
         anchors = FUNCTION_ANCHORS[rel]
-        for line_number, line in enumerate(source.splitlines(), 1):
-            for function_name in anchors:
-                if re.search(
-                        rf"\b{re.escape(function_name)}\s*\(",
-                        line):
-                    function_starts[rel].append(
-                        (line_number, function_name)
-                    )
+        function_starts[rel] = anchor_definitions(source, anchors)
 
     found = collections.defaultdict(collections.Counter)
     unclassified = []

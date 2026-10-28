@@ -2039,3 +2039,137 @@ gum_interceptor_peak_safe_pc(GumPeakFunctionContext * ctx,
 
     return NULL;
 }
+
+/* Pinned Gum 17.15.3 staged initial mutations. All allocator and Gum metadata
+ * work runs before peer suspension. The caller alone publishes entry bytes. */
+typedef struct _GumPeakStagedMutation GumPeakStagedMutation;
+struct _GumPeakStagedMutation {
+  GumInterceptor * interceptor;
+  PeakGumFunctionContext17 * context;
+  GumInvocationListener * listener;
+  guint redirect_size;
+  guint length;
+  guint8 active[32];
+};
+
+#include "gum_peak_staged_redirect.inc"
+
+gboolean
+gum_interceptor_peak_prepare_staged_mutation (GumInterceptor * interceptor,
+    gpointer address, GumInvocationListener * listener,
+    const GumAttachOptions * options, gpointer replacement,
+    gpointer * original, GumPeakStagedMutation ** stage_out)
+{
+  PeakGumInterceptor17 * self = (PeakGumInterceptor17 *) interceptor;
+  GumPeakStagedMutation * stage;
+  gboolean succeeded, valid;
+  PeakGumFunctionContext17 * context;
+  if (stage_out == NULL) return FALSE;
+  *stage_out = NULL;
+  if (interceptor == NULL || address == NULL ||
+      ((listener != NULL) == (replacement != NULL))) return FALSE;
+  if (original != NULL) *original = NULL;
+  g_rec_mutex_lock (&self->mutex);
+  if (self->current_transaction.level != 0 ||
+      self->current_transaction.is_dirty ||
+      g_hash_table_size (self->current_transaction.pending_update_tasks) != 0 ||
+      g_hash_table_contains (self->function_by_address, address) ||
+      gum_process_get_code_signing_policy () == GUM_CODE_SIGNING_REQUIRED) {
+    g_rec_mutex_unlock (&self->mutex);
+    return FALSE;
+  }
+  if (listener != NULL) {
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init (&iter, self->function_by_address);
+    while (g_hash_table_iter_next (&iter, NULL, &value)) {
+      if (peak_gum_context_has_listener (value, listener)) {
+        g_rec_mutex_unlock (&self->mutex);
+        return FALSE;
+      }
+    }
+  }
+  stage = g_new0 (GumPeakStagedMutation, 1);
+  stage->interceptor = interceptor;
+  stage->listener = listener;
+  gum_interceptor_begin_transaction (interceptor);
+  if (listener != NULL) {
+    GumAttachOptions staged = { 0 };
+    if (options != NULL) staged = *options;
+    staged.instrumentation.write_redirect = peak_gum_write_staged_redirect;
+    staged.instrumentation.write_redirect_data = stage;
+    staged.instrumentation.redirect_space_hint = 32;
+    succeeded = gum_interceptor_peak_attach_exact (interceptor, address,
+        listener, &staged) == GUM_ATTACH_OK;
+  } else {
+    GumReplaceOptions staged = { 0 };
+    staged.instrumentation.write_redirect = peak_gum_write_staged_redirect;
+    staged.instrumentation.write_redirect_data = stage;
+    staged.instrumentation.redirect_space_hint = 32;
+    gpointer previous_target = peak_gum_exact_attach_target;
+    peak_gum_exact_attach_target = address;
+    succeeded = gum_interceptor_replace (interceptor, address, replacement,
+        original, &staged) == GUM_REPLACE_OK;
+    peak_gum_exact_attach_target = previous_target;
+  }
+  context = g_hash_table_lookup (self->function_by_address, address);
+  valid = succeeded && context != NULL && !context->activated &&
+      !context->destroyed && context->function_address == address &&
+      context->trampoline_deflector == NULL && context->redirect_code != NULL &&
+      context->overwritten_prologue != NULL && stage->redirect_size != 0 &&
+      stage->redirect_size <= context->overwritten_prologue_len &&
+      context->overwritten_prologue_len <= sizeof (stage->active) &&
+      (listener == NULL || peak_gum_context_has_only_listener (context, listener));
+  g_hash_table_remove_all (self->current_transaction.pending_update_tasks);
+  if (valid) {
+    stage->context = context;
+    stage->length = context->overwritten_prologue_len;
+    memcpy (stage->active, context->overwritten_prologue, stage->length);
+    memcpy (stage->active, context->redirect_code, stage->redirect_size);
+    context->activated = TRUE;
+  } else if (succeeded) {
+    if (listener != NULL) gum_interceptor_detach (interceptor, listener);
+    else gum_interceptor_revert (interceptor, address);
+  }
+  gum_interceptor_end_transaction (interceptor);
+  if (!valid) {
+    if (original != NULL) *original = NULL;
+    g_free (stage);
+    g_rec_mutex_unlock (&self->mutex);
+    return FALSE;
+  }
+  *stage_out = stage;
+  return TRUE;
+}
+
+gboolean
+gum_interceptor_peak_staged_mutation_patch (GumPeakStagedMutation * stage,
+    gpointer * canonical, guint8 * active, guint8 * original, guint * length)
+{
+  if (stage == NULL || canonical == NULL || active == NULL ||
+      original == NULL || length == NULL) return FALSE;
+  *canonical = stage->context->function_address;
+  *length = stage->length;
+  memcpy (active, stage->active, stage->length);
+  memcpy (original, stage->context->overwritten_prologue, stage->length);
+  return TRUE;
+}
+
+void
+gum_interceptor_peak_finish_staged_mutation (GumPeakStagedMutation * stage,
+                                             gboolean committed)
+{
+  GumInterceptor * interceptor;
+  if (stage == NULL) return;
+  interceptor = stage->interceptor;
+  stage->context->write_redirect = NULL;
+  stage->context->write_redirect_data = NULL;
+  if (!committed) {
+    stage->context->activated = FALSE;
+    if (stage->listener != NULL)
+      gum_interceptor_detach (interceptor, stage->listener);
+    else gum_interceptor_revert (interceptor, stage->context->function_address);
+  }
+  g_free (stage);
+  g_rec_mutex_unlock (&((PeakGumInterceptor17 *) interceptor)->mutex);
+}

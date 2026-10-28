@@ -7,6 +7,7 @@ include(GNUInstallDirs)
 option(PEAK_FETCH_DEPS
     "Allow CMake to download pinned dependencies when callers do not provide them"
     ON)
+option(PEAK_BUILD_ATTACH "Build the native launcher for profiling running processes" OFF)
 option(PEAK_ENABLE_OTF2 "Enable OTF2 memory-trace export" OFF)
 option(PEAK_USE_SYSTEM_OTF2 "Find OTF2 in the system before fetching it" ON)
 option(PEAK_ENABLE_FORTRAN_TESTS "Build tests that require a Fortran compiler" OFF)
@@ -80,11 +81,39 @@ message(STATUS "PEAK_GUM_PEAK_PC_API_AVAILABLE = ${PEAK_GUM_PEAK_PC_API_AVAILABL
 message(STATUS "PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE = ${PEAK_GUM_PEAK_EXACT_ATTACH_API_AVAILABLE}")
 message(STATUS "PEAK_GUM_DARWIN_PATCH_API_AVAILABLE = ${PEAK_GUM_DARWIN_PATCH_API_AVAILABLE}")
 
+if(PEAK_BUILD_ATTACH)
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+        message(FATAL_ERROR "PEAK_BUILD_ATTACH supports Linux and macOS.")
+    endif()
+    include(cmake/frida-core.cmake)
+    configure_frida_core("${PROJECT_BINARY_DIR}/frida-core")
+endif()
+
 include(cmake/exec-platform.cmake)
 peak_exec_configure_platform_support()
 peak_exec_enable_raw_syscall_language()
 message(STATUS "PEAK_EXEC_RAW_SYSCALL_SUPPORTED = ${PEAK_EXEC_RAW_SYSCALL_SUPPORTED}")
 message(STATUS "PEAK_DETACH_HELPER_SUPPORTED = ${PEAK_DETACH_HELPER_SUPPORTED}")
+if(PEAK_BUILD_ATTACH)
+    set(_peak_attach_backend_supported OFF)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64)$" AND
+       PEAK_DETACH_HELPER_SUPPORTED AND PEAK_GUM_PEAK_PC_API_AVAILABLE)
+        set(_peak_attach_backend_supported ON)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND
+           CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" AND
+           PEAK_GUM_DARWIN_PATCH_API_AVAILABLE)
+        set(_peak_attach_backend_supported ON)
+    endif()
+    if(NOT _peak_attach_backend_supported)
+        message(FATAL_ERROR
+            "PEAK_BUILD_ATTACH requires a supported mutation backend: Linux "
+            "x86-64/Arm64 with the detach helper and validated PEAK-patched Gum "
+            "PC API, or macOS Arm64 with the staged Darwin Gum patch API. "
+            "For an offline Linux build select PEAK_FRIDA_GUM_PROVIDER=patched-devkit "
+            "and PEAK_PATCHED_GUM_ROOT; otherwise allow the default patched dependency download.")
+    endif()
+endif()
 
 # Find or download OTF2 only when memory-trace export is requested.
 if(PEAK_ENABLE_OTF2)
@@ -242,6 +271,9 @@ if(BUILD_TESTS)
 else()
     option(BUILD_TESTING "Build tests" OFF)
 endif()
+option(PEAK_ENABLE_RUNTIME_TEST_HOOKS
+    "Compile internal hooks into the PEAK runtime for runtime integration tests"
+    ${BUILD_TESTING})
 option(PEAK_BUILD_BENCHMARKS "Build PEAK benchmark/stress targets" OFF)
 option(PEAK_ENABLE_TSAN_TESTS "Enable ThreadSanitizer registry test flags" OFF)
 if(PEAK_ENABLE_FORTRAN_TESTS)
