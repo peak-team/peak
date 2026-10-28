@@ -22,6 +22,11 @@ for an offline build, select a `patched-devkit` provider and point
 On macOS Arm64, use PEAK's pinned stock Frida Gum devkit and Frida Core
 17.15.3. The regular macOS Arm64 Gum requirements in the main README apply to
 the attach runtime as well. Attach support is not available on macOS x86_64.
+The macOS install includes `libpeak-attach-bootstrap.dylib` beside the full
+`libpeak-attach.dylib` runtime. Frida injects this small bootstrap library; it
+uses native dyld to load the full runtime and its system dependencies. Keep
+`peak-attach` and both libraries together in their installed relative layout
+when packaging or moving an installation.
 
 For a default Linux build:
 
@@ -56,7 +61,8 @@ shell. Selectors may use `module!symbol` to disambiguate a symbol. If
 used. The selector syntax and resolution behavior match the regular runtime.
 `--output FILE` sets `PEAK_STATSLOG_PATH`; without it, PEAK uses its normal
 report path and naming rules. `--agent PATH` overrides the installed runtime
-library path.
+library path; on macOS it names the full `libpeak-attach.dylib` runtime, not
+the bootstrap library.
 
 All `PEAK_*` variables from the `peak-attach` process environment are passed
 to the attached runtime. This includes the usual overhead budgets, heartbeat

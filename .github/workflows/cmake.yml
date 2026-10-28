@@ -102,6 +102,23 @@ jobs:
         cmake --build ${{ github.workspace }}/build --parallel
         --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config
 
+    - name: Verify Darwin bootstrap dependencies
+      run: |
+        python3 - <<'PY'
+        import subprocess
+        image = "build/src/libpeak-attach-bootstrap.dylib"
+        command = None
+        dependencies = []
+        for line in subprocess.check_output(["otool", "-l", image], text=True).splitlines():
+            fields = line.split()
+            if fields[:1] == ["cmd"]:
+                command = fields[1]
+            elif fields[:1] == ["name"] and command in {
+                    "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB", "LC_LOAD_UPWARD_DYLIB"}:
+                dependencies.append(fields[1])
+        assert dependencies == ["/usr/lib/libSystem.B.dylib"], dependencies
+        PY
+
     - name: Test macOS attach executable and runtime
       run: |
         set -o pipefail

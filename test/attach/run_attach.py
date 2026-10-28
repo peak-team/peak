@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -136,6 +137,21 @@ else:
                            PEAK_MEMLOG_PATH=str(root / "memlog"),
                            PEAK_ENABLE_PER_TARGET_HEARTBEAT="0",
                            PEAK_ENABLE_GLOBAL_HEARTBEAT="0")
+            if sys.platform == "darwin":
+                # Exercise the libSystem-only loader before any PEAK runtime
+                # state exists. A failed dlopen must leave this target usable
+                # for the immediately following normal activation.
+                invalid_agent = root / "readable-invalid-agent.dylib"
+                invalid_agent.write_text("This is deliberately not a Mach-O image.\n")
+                filesystem_phase(target, root / "fixture.log", "B")
+                code, output = run([cli, str(target.pid), "--agent", str(invalid_agent),
+                                    "--target", "peak_attach_existing_target"], env)
+                assert code != 0 and "Darwin loader" in output, (code, output)
+                assert not any(word in output.lower() for word in
+                               ("timed out", "connection was lost",
+                                "activation was not confirmed")), output
+                alive(target, progress)
+                filesystem_phase(target, root / "fixture.log", "B")
             prefix = root / "stats"
             code, output = run(base + ["--target",
                                       "peak_attach_existing_target,peak_attach_churn_target",

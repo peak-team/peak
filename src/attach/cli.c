@@ -120,13 +120,46 @@ typedef struct {
     size_t error_length;
 } InjectionWorker;
 
+#if defined(__APPLE__)
+static char *default_bootstrap(void);
+#endif
 static int run_injector(guint pid, const char *agent, const char *socket_path)
 {
     FridaInjector *injector = frida_injector_new();
     GError *error = NULL;
-    frida_injector_inject_library_file_sync(injector, pid, agent,
-                                            PEAK_ATTACH_ENTRYPOINT, socket_path,
-                                            NULL, &error);
+    const char *injection_path = agent;
+    const char *entrypoint = PEAK_ATTACH_ENTRYPOINT;
+    const char *data = socket_path;
+#if defined(__APPLE__)
+    char *bootstrap = default_bootstrap();
+    if (!bootstrap || access(bootstrap, R_OK)) {
+        fprintf(stderr,
+                "peak-attach: Darwin bootstrap library is unreadable\n");
+        g_free(bootstrap);
+        g_object_unref(injector);
+        return 1;
+    }
+    if (strlen(agent) + strlen(socket_path) + 20 >=
+        PEAK_ATTACH_DARWIN_DATA_CAPACITY) {
+        fprintf(stderr, "peak-attach: agent and socket paths exceed Darwin "
+                        "injection data capacity\n");
+        g_free(bootstrap);
+        g_object_unref(injector);
+        return 1;
+    }
+    char *payload =
+        g_strdup_printf("PAB1%08x%08x%s%s", (unsigned int)strlen(agent),
+                        (unsigned int)strlen(socket_path), agent, socket_path);
+    injection_path = bootstrap;
+    entrypoint = "peak_attach_bootstrap_main";
+    data = payload;
+#endif
+    frida_injector_inject_library_file_sync(injector, pid, injection_path,
+                                            entrypoint, data, NULL, &error);
+#if defined(__APPLE__)
+    g_free(payload);
+    g_free(bootstrap);
+#endif
     int result = error != NULL;
     if (error) {
         fprintf(stderr, "peak-attach: injection failed: %s\n", error->message);
@@ -252,19 +285,31 @@ static char *executable_directory(void)
     free(path);
     return dir;
 }
-static char *default_agent(void)
+static char *default_library(const char *name, const char *relative_path)
 {
     char *dir = executable_directory();
     if (!dir)
         return NULL;
-    char *path = g_build_filename(dir, PEAK_ATTACH_AGENT_NAME, NULL);
+    char *path = g_build_filename(dir, name, NULL);
     if (access(path, R_OK)) {
         g_free(path);
-        path = g_build_filename(dir, PEAK_ATTACH_AGENT_RELATIVE_PATH, NULL);
+        path = g_build_filename(dir, relative_path, NULL);
     }
     g_free(dir);
     return path;
 }
+static char *default_agent(void)
+{
+    return default_library(PEAK_ATTACH_AGENT_NAME,
+                           PEAK_ATTACH_AGENT_RELATIVE_PATH);
+}
+#if defined(__APPLE__)
+static char *default_bootstrap(void)
+{
+    return default_library(PEAK_ATTACH_BOOTSTRAP_NAME,
+                           PEAK_ATTACH_BOOTSTRAP_RELATIVE_PATH);
+}
+#endif
 static char *default_helper(void)
 {
     char *dir = executable_directory();

@@ -73,11 +73,26 @@ def check_late_attach_support_windows(repo_root):
                                fs_commit)
     require(0 <= fs_prepare < fs_transaction < fs_replace < fs_publish <
             fs_commit < fs_finish and
-            "prepared_count != unique_count" in fs_attach[fs_prepare:fs_transaction] and
+            "if (prepared && prepared_count == unique_count)" in
+            fs_attach[fs_prepare:fs_transaction] and
+            "break;" in fs_attach[fs_prepare:fs_transaction] and
             "requests[owner].function_address == targets[i]" in fs_attach and
             "gum_interceptor_revert" in fs_attach[fs_replace:fs_publish],
             "late filesystem guards must deduplicate aliases, prepare all "
             "entries, publish originals and roll back failures within one held transaction")
+    fs_retry = fs_attach[fs_prepare:fs_transaction]
+    fs_partial_finish = fs_retry.find("peak_detach_controller_finish_hook_mutation_batch")
+    fs_unlock = fs_retry.find("peak_gum_module_mutation_end()")
+    fs_backoff = fs_retry.find("g_usleep(1000)")
+    require(0 <= fs_partial_finish < fs_unlock < fs_backoff and
+            "if (prepared &&" in fs_retry[:fs_partial_finish] and
+            "peak_detach_controller_abort_after_failed_finish" in
+            fs_retry[fs_partial_finish:fs_unlock] and
+            "attempt == 15" in fs_retry[fs_unlock:fs_backoff] and
+            "if (!retryable" in fs_retry[fs_unlock:fs_backoff] and
+            "return 0;" in fs_retry[fs_unlock:fs_backoff],
+            "filesystem attach retry must release partial held windows and "
+            "module locks before bounded backoff, and stop on nonretryable failure")
     resolver = extract_function(filesystem, "resolve_functions")
     require("#ifdef PEAK_ATTACH_RUNTIME" in resolver and
             "void *scope = RTLD_DEFAULT;" in resolver and

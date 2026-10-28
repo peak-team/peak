@@ -328,6 +328,21 @@ if(PEAK_BUILD_ATTACH)
     target_link_libraries(peak_attach PRIVATE ${FRIDA_CORE_LIBRARIES}
         Threads::Threads ${DL_LIBRARY} ${RT_LIBRARY} ${RESOLV_LIBRARY} ${M_LIBRARY})
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        # Core manually maps this libSystem-only bridge; native dyld then loads
+        # the full agent, including dependencies that only exist in the cache.
+        add_library(peak_attach_bootstrap SHARED attach/darwin_bootstrap.c)
+        set_target_properties(peak_attach_bootstrap PROPERTIES OUTPUT_NAME "peak-attach-bootstrap")
+        target_include_directories(peak_attach_bootstrap PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_link_options(peak_attach_bootstrap PRIVATE
+            "LINKER:-exported_symbol,_peak_attach_bootstrap_main")
+        add_dependencies(peak_attach peak_attach_bootstrap)
+        file(RELATIVE_PATH _peak_attach_bootstrap_relative
+            "${CMAKE_INSTALL_FULL_BINDIR}"
+            "${CMAKE_INSTALL_FULL_LIBDIR}/${CMAKE_SHARED_LIBRARY_PREFIX}peak-attach-bootstrap${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        target_compile_definitions(peak_attach PRIVATE
+            "PEAK_ATTACH_BOOTSTRAP_NAME=\"${CMAKE_SHARED_LIBRARY_PREFIX}peak-attach-bootstrap${CMAKE_SHARED_LIBRARY_SUFFIX}\""
+            "PEAK_ATTACH_BOOTSTRAP_RELATIVE_PATH=\"${_peak_attach_bootstrap_relative}\"")
+        install(TARGETS peak_attach_bootstrap LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
         target_link_libraries(peak_attach PRIVATE bsm
             "-framework Foundation" "-framework CoreFoundation" "-framework AppKit")
     endif()

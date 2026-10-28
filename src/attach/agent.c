@@ -163,7 +163,7 @@ is_peak_runtime_path(const char *path)
 {
     const char *base = strrchr(path, '/');
     base = base == NULL ? path : base + 1;
-    if (strncmp(base, "libpeak-attach", 14) == 0)
+    if (strncmp(base, "libpeak-attach.", 15) == 0)
         return TRUE;
 #if defined(__APPLE__)
     return strncmp(base, "libpeak.", 8) == 0;
