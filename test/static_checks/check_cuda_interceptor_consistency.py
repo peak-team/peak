@@ -320,12 +320,12 @@ def main():
                 f"CUDA wrapper must be exported for gum_find_function: {wrapper}")
 
     for target in GENERAL_LISTENER_CUDA_TARGETS:
-        require(f'strcmp(peak_hook_strings[i], "{target}") == 0' in general,
+        require(f'strcmp(support_name, "{target}") == 0' in general,
                 f"missing general-listener CUDA target: {target}")
 
     for target, wrapper in GENERAL_LISTENER_CUDA_WRAPPER_LOOKUPS:
         branch_start = general.find(
-            f'strcmp(peak_hook_strings[i], "{target}") == 0')
+            f'strcmp(support_name, "{target}") == 0')
         require(branch_start != -1,
                 f"missing general-listener CUDA target: {target}")
         next_branch = general.find("} else if", branch_start + 1)
