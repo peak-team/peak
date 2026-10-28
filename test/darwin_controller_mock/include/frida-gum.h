@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 typedef int gboolean;
+typedef char gchar;
 typedef void* gpointer;
 typedef unsigned char guint8;
 typedef unsigned int guint;

@@ -827,8 +827,16 @@ pthread_listener_attach_support(const char* name, gpointer address,
     }
     peak_gum_module_mutation_end();
     if (!installed) {
-        peak_log_warn("[peak] cannot install attach support hook %s (%s); profiling activation will be refused\n",
-                      name, peak_detach_controller_status_string(status));
+        const PeakDetachFailureDetail* failure =
+            peak_detach_controller_last_failure_detail();
+        peak_log_warn("[peak] cannot install attach support hook %s (%s); "
+                      "reason=%s tid=%ld pc=0x%llx aux=%lld; "
+                      "profiling activation will be refused\n",
+                      name, peak_detach_controller_status_string(status),
+                      failure != NULL ? failure->reason : "unknown",
+                      failure != NULL ? failure->tid : 0,
+                      failure != NULL ? (unsigned long long)failure->pc : 0,
+                      failure != NULL ? (long long)(intptr_t)failure->aux : 0);
     }
     return installed;
 }

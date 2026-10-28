@@ -183,18 +183,43 @@ int main(void)
     assert(memcmp(entry, patch_bytes, 32) == 0);
     /* The custom redirect accepts short direct branches, declines short
      * unreachable entries, and emits a full absolute redirect when needed. */
+    for (guint i = 0; i < sizeof(entry); i += 4) {
+        guint32 nop = 0xd503201f;
+        memcpy(entry + i, &nop, 4);
+    }
+    guint32 ret = 0xd65f03c0u;
+    memcpy(entry + sizeof(entry) - 4, &ret, 4);
     GumArm64Writer writer;
     guint8 redirect[32] = { 0 };
     guint redirect_size = 0;
     gum_arm64_writer_init(&writer, redirect);
-    writer.pc = 0x100000000ULL;
+    writer.pc = GUM_ADDRESS(entry);
     GumRedirectWriteDetails details = { &writer,
-        (gpointer)0x2000000000ULL, ARM64_REG_X16, 4 };
+        GSIZE_TO_POINTER(GUM_ADDRESS(entry) + 0x1000000000ULL), ARM64_REG_X16, 4 };
     assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
     details.capacity = 16;
     assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_WRITTEN);
     gum_arm64_writer_flush(&writer);
     assert(redirect_size == 16 && gum_arm64_writer_offset(&writer) == 16);
+    gum_arm64_writer_reset(&writer, redirect);
+    writer.pc = GUM_ADDRESS(entry);
+    guint32 read_x16 = 0xaa1003e0u; /* mov x0, x16 */
+    guint32 read_x17 = 0xaa1103e1u; /* mov x1, x17 */
+    memcpy(entry, &read_x16, 4);
+    memcpy(entry + 4, &read_x17, 4);
+    redirect_size = 0;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(strcmp(peak_gum_darwin_last_stage_failure(),
+        "absolute-redirect-no-free-scratch-register") == 0);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    details.scratch_register = ARM64_REG_X17;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    /* Both live scratch registers are harmless for a direct B redirect. */
+    details.target = entry + 64;
+    details.capacity = 4;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_WRITTEN);
+    assert(redirect_size == 4 && gum_arm64_writer_offset(&writer) == 4);
     gum_arm64_writer_clear(&writer);
     g_hash_table_unref(self.current_transaction.pending_update_tasks);
     g_hash_table_unref(self.function_by_address);

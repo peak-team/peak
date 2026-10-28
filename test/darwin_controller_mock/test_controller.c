@@ -10,6 +10,7 @@ static unsigned char active[4] = { 1, 2, 3, 4 };
 static unsigned char original[4] = { 0 };
 static unsigned int snapshots, suspended, resumed, staged, finished, cancelled;
 static gboolean bad_pc, bad_bytes, bad_identity, endless;
+static int prepare_result;
 static gboolean peer_held[PEAK_DARWIN_MAX_THREADS];
 unsigned int mach_task_self(void) { return 1; }
 thread_act_t mach_thread_self(void) { return 1; }
@@ -68,8 +69,9 @@ GumAttachReturn peak_gum_darwin_prepare_attach(GumInterceptor* i, gpointer p,
     (void)i; (void)p; (void)l; (void)o;
     assert(suspended == resumed); staged++;
     if (bad_bytes) entry[0] = 9;
-    return GUM_ATTACH_OK;
+    return prepare_result;
 }
+const char* peak_gum_darwin_last_stage_failure(void) { return "mock-stage-refused"; }
 GumReplaceReturn peak_gum_darwin_prepare_replace(GumInterceptor* i, gpointer p,
     gpointer r, gpointer* o, const GumReplaceOptions* options) {
     (void)r; (void)options;
@@ -104,6 +106,7 @@ static void reset(void) {
     memset(peer_held, 0, sizeof(peer_held));
     snapshots = suspended = resumed = staged = finished = cancelled = 0;
     bad_pc = bad_bytes = bad_identity = endless = FALSE;
+    prepare_result = GUM_ATTACH_OK;
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 }
 int main(void) {
@@ -116,6 +119,12 @@ int main(void) {
     assert(memcmp(entry, active, 4) == 0 && finished == 0);
     assert(peak_detach_controller_finish_hook_mutation(&request, &status));
     assert(resumed == 2 && finished == 1);
+    reset(); prepare_result = -4;
+    assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(strcmp(peak_detach_controller_last_failure_detail()->reason,
+                  "mock-stage-refused") == 0);
+    assert((intptr_t)peak_detach_controller_last_failure_detail()->aux == -4);
+    assert(suspended == 0 && cancelled == 0);
     reset(); bad_pc = TRUE;
     assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
     assert(suspended == resumed && cancelled == 1 && entry[0] == 0);

@@ -32,6 +32,8 @@ gboolean peak_gum_darwin_get_canonical_address_exact(
  * must finish on that same thread, after resuming all peers, on every path.
  * Only an exact, previously uninstrumented entry is accepted. */
 gboolean peak_gum_darwin_staged_attach_supported(void);
+/* Static diagnostic string for the last preparation on this thread. */
+const gchar* peak_gum_darwin_last_stage_failure(void);
 GumAttachReturn peak_gum_darwin_prepare_attach(
     GumInterceptor* interceptor, gpointer function_address,
     GumInvocationListener* listener, const GumAttachOptions* options);

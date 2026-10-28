@@ -17,6 +17,13 @@
 #error "The PEAK Darwin Gum patch overlay only supports macOS Arm64"
 #endif
 
+/* Internal exported symbol in the pinned static devkit. The custom-redirect
+ * API substitutes x16 when no scratch register is free, so absolute redirects
+ * must independently retain the checked relocator's liveness guarantee. */
+extern gboolean gum_arm64_relocator_can_relocate(
+    gpointer address, guint min_bytes, GumRelocationScenario scenario,
+    GumRelocationPolicy policy, guint* maximum, arm64_reg* available_scratch_reg);
+
 typedef guint8 PeakGumInterceptorType17;
 
 typedef struct {
@@ -97,6 +104,13 @@ typedef struct {
 
 static _Thread_local PeakGumDarwinStage peak_gum_darwin_stage;
 static _Thread_local guint peak_gum_darwin_redirect_size;
+static _Thread_local const gchar* peak_gum_darwin_stage_failure = "none";
+
+const gchar*
+peak_gum_darwin_last_stage_failure(void)
+{
+    return peak_gum_darwin_stage_failure;
+}
 
 G_STATIC_ASSERT(sizeof(gpointer) == 8);
 G_STATIC_ASSERT(sizeof(guint) == 4);
@@ -289,6 +303,22 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
         return GUM_REDIRECT_WRITTEN;
     }
     if (details->capacity < 16) {
+        peak_gum_darwin_stage_failure = "short-entry-unreachable-trampoline";
+        return GUM_REDIRECT_DECLINED;
+    }
+    arm64_reg scratch = details->scratch_register;
+    guint relocatable = 0;
+    /* Prove the exact 16-byte prefix this absolute redirect overwrites. A
+     * four-byte direct branch above requires no scratch register proof. */
+    if (!gum_arm64_relocator_can_relocate(GSIZE_TO_POINTER(writer->pc),
+            16, GUM_SCENARIO_ONLINE, GUM_RELOCATION_CHECKED,
+            &relocatable, &scratch) || relocatable < 16) {
+        peak_gum_darwin_stage_failure = "absolute-redirect-entry-too-short";
+        return GUM_REDIRECT_DECLINED;
+    }
+    if (scratch == ARM64_REG_INVALID ||
+        scratch != (arm64_reg)details->scratch_register) {
+        peak_gum_darwin_stage_failure = "absolute-redirect-no-free-scratch-register";
         return GUM_REDIRECT_DECLINED;
     }
     if (!gum_arm64_writer_put_ldr_reg_address(writer,
@@ -313,18 +343,28 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
 {
     PeakGumInterceptor17* self = (PeakGumInterceptor17*)interceptor;
 
+    peak_gum_darwin_stage_failure = "none";
     if (self == NULL || address == NULL ||
         peak_gum_darwin_stage.interceptor != NULL) {
+        peak_gum_darwin_stage_failure = "invalid-or-pending-stage";
         return FALSE;
     }
     g_rec_mutex_lock(&self->mutex);
     /* Never consume another caller's transaction or pending code writes. */
-    if (self->current_transaction.level != 0 ||
-        self->current_transaction.is_dirty ||
-        g_hash_table_size(self->current_transaction.pending_update_tasks) != 0 ||
-        g_hash_table_lookup(self->function_by_address,
-                            gum_strip_code_pointer(address)) != NULL ||
-        gum_process_get_code_signing_policy() == GUM_CODE_SIGNING_REQUIRED) {
+    if (self->current_transaction.level != 0) {
+        peak_gum_darwin_stage_failure = "gum-transaction-open";
+    } else if (self->current_transaction.is_dirty) {
+        peak_gum_darwin_stage_failure = "gum-transaction-dirty";
+    } else if (g_hash_table_size(
+            self->current_transaction.pending_update_tasks) != 0) {
+        peak_gum_darwin_stage_failure = "gum-pending-entry-updates";
+    } else if (g_hash_table_lookup(self->function_by_address,
+            gum_strip_code_pointer(address)) != NULL) {
+        peak_gum_darwin_stage_failure = "entry-already-instrumented";
+    } else if (gum_process_get_code_signing_policy() == GUM_CODE_SIGNING_REQUIRED) {
+        peak_gum_darwin_stage_failure = "code-signing-policy-required";
+    }
+    if (strcmp(peak_gum_darwin_stage_failure, "none") != 0) {
         g_rec_mutex_unlock(&self->mutex);
         return FALSE;
     }
@@ -337,6 +377,7 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
      * either prefix before Gum can touch a different context. */
     if ((first_instruction & 0xfc000000u) == 0x14000000u ||
         (first_instruction & 0x9f00001fu) == 0x90000011u) {
+        peak_gum_darwin_stage_failure = "entry-redirect-prefix";
         g_rec_mutex_unlock(&self->mutex);
         return FALSE;
     }
@@ -353,6 +394,7 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
                 if (entry != NULL && entry->listener_instance == listener) {
                     /* Rollback uses Gum's listener-wide detach, so it must
                      * own a listener that no published context references. */
+                    peak_gum_darwin_stage_failure = "listener-already-published";
                     g_rec_mutex_unlock(&self->mutex);
                     return FALSE;
                 }
@@ -387,6 +429,19 @@ peak_gum_darwin_end_stage(GumInterceptor* interceptor, gpointer address,
         (replacing ? context->replacement_function != NULL :
             peak_gum_darwin_context_has_only_listener(context, listener));
 
+    if (operation_succeeded && !valid) {
+        if (context == NULL) {
+            peak_gum_darwin_stage_failure = "prepared-context-not-exact";
+        } else if (context->trampoline_deflector != NULL) {
+            peak_gum_darwin_stage_failure = "prepared-deflector-unsupported";
+        } else if (redirect_size == 0 ||
+                   redirect_size > context->overwritten_prologue_len ||
+                   context->overwritten_prologue_len > PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE) {
+            peak_gum_darwin_stage_failure = "prepared-prologue-size-mismatch";
+        } else {
+            peak_gum_darwin_stage_failure = "prepared-context-shape-mismatch";
+        }
+    }
     /* The lock excludes other Gum writers, and begin_stage required an empty
      * transaction, so every queued update belongs to this operation. */
     g_hash_table_remove_all(self->current_transaction.pending_update_tasks);
@@ -428,6 +483,7 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
 
     if (listener == NULL ||
         (options != NULL && options->instrumentation.write_redirect != NULL)) {
+        peak_gum_darwin_stage_failure = "invalid-listener-or-custom-redirect";
         return GUM_ATTACH_WRONG_TYPE;
     }
     if (!peak_gum_darwin_begin_stage(interceptor, function_address, listener)) {
@@ -445,6 +501,10 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
         PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE;
     result = gum_interceptor_attach(interceptor, function_address, listener,
                                     &staged_options);
+    if (result != GUM_ATTACH_OK &&
+        strcmp(peak_gum_darwin_stage_failure, "none") == 0) {
+        peak_gum_darwin_stage_failure = "gum-attach-rejected";
+    }
     redirect_size = peak_gum_darwin_redirect_size;
     if (!peak_gum_darwin_end_stage(interceptor, function_address, listener,
                                    FALSE, redirect_size,
@@ -486,6 +546,10 @@ peak_gum_darwin_prepare_replace(GumInterceptor* interceptor,
         PEAK_GUM_DARWIN_MAX_PROLOGUE_SIZE;
     result = gum_interceptor_replace(interceptor, function_address,
         replacement_function, original_function, &staged_options);
+    if (result != GUM_REPLACE_OK &&
+        strcmp(peak_gum_darwin_stage_failure, "none") == 0) {
+        peak_gum_darwin_stage_failure = "gum-replace-rejected";
+    }
     redirect_size = peak_gum_darwin_redirect_size;
     if (!peak_gum_darwin_end_stage(interceptor, function_address, NULL,
                                    TRUE, redirect_size,

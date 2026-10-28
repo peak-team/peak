@@ -740,20 +740,27 @@ peak_darwin_prepare_hook_mutation(const PeakDetachRequest* request,
     };
     if (request->operation == PEAK_DETACH_OPERATION_ATTACH ||
         request->operation == PEAK_DETACH_OPERATION_REPLACE) {
-        gboolean staged;
+        int gum_result;
         if (request->operation == PEAK_DETACH_OPERATION_ATTACH) {
-            staged = peak_gum_darwin_prepare_attach(request->interceptor,
+            gum_result = peak_gum_darwin_prepare_attach(request->interceptor,
                 request->function_address, request->listener,
-                request->attach_options) == GUM_ATTACH_OK;
+                request->attach_options);
         } else {
-            staged = request->replacement_function != NULL &&
-                peak_gum_darwin_prepare_replace(request->interceptor,
-                    request->function_address, request->replacement_function,
-                    request->original_function, NULL) == GUM_REPLACE_OK;
+            if (request->replacement_function == NULL) {
+                peak_darwin_note_failure("replacement-function-missing", 0,
+                                         (uintptr_t)request->function_address, 0);
+                goto cancel;
+            }
+            gum_result = peak_gum_darwin_prepare_replace(request->interceptor,
+                request->function_address, request->replacement_function,
+                request->original_function, NULL);
         }
-        if (!staged) {
-            peak_darwin_note_failure("staged-mutation-failed", 0,
-                                     (uintptr_t)request->function_address, 0);
+        if (gum_result != 0) {
+            /* The overlay returns a static reason. Record it before cleanup,
+             * while peers are running, and preserve the signed Gum status. */
+            peak_darwin_note_failure(peak_gum_darwin_last_stage_failure(), 0,
+                                     (uintptr_t)request->function_address,
+                                     (uintptr_t)(intptr_t)gum_result);
             goto cancel;
         }
         peak_darwin_held.staged_mutation = TRUE;
