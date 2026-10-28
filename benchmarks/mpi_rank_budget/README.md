@@ -138,3 +138,69 @@ python3 smoke/check_pattern.py
 The direct simulator independently checks all 32 ranks × six threads across 529
 epochs, including all 512 rank/target pairs. Serial checks establish neither
 real MPI correctness nor multi-node performance.
+
+## Synchronization and imbalance matrix
+
+`sync_pressure.c` extends the fixed integer workload with `--sync allreduce`,
+`barrier`, `bcast` (root rotates), `ring` (Sendrecv), or `iallreduce` (independent
+integer work before Wait). `--layout rotating` moves the tiny profiled hot loop
+across ranks; `slack` puts high-frequency profiling on rank 0 while the last rank
+performs 512 arithmetic steps per native call; `critical` moves both the profiled
+hot rank and the heavy 512-step computation together. Other ranks do one step.
+Thus overhead on a fast rank can be hidden behind a slow native rank in `slack`,
+while `critical` places it on the native bottleneck. Twins preserve exact useful
+work in every configuration. No sleep is used to create imbalance.
+
+Compile using the same flags as `pressure.c`, substituting `sync_pressure.c`.
+Use all five sync values with all three layouts, identical arguments and bindings
+for native/baseline/candidate arms. Start with `--epochs 2048 --calls 2000` and
+adjust fixed work before freezing a distributed experiment. Existing warmup flags
+apply. `rank_metric` records retain each rank's compute CPU/wall and sync elapsed;
+`phase_root_wall` measures rank 0's complete phase directly. Sync elapsed includes
+useful overlap for Iallreduce and is not pure waiting. Thread/barrier timing
+categories overlap and must not be summed. Binding strings are gathered and
+printed by rank 0 to avoid split multi-process stdout records.
+
+`python3 sync_analyze.py RESULTS --labels N0 B0 C0 C1 B1 N1` requires actual `.rc`
+receipts, complete per-rank records, successful independent arithmetic/MPI oracles,
+and matching config/checksums before returning valid comparison inputs. It retains
+individual rank measurements rather than combining unrelated maxima. Aggregate
+profiler diagnostics and physical mutation accounting still require separate
+inspection; a valid workload alone does not establish a universal slowdown cap.
+
+`--layout aligned` instead keeps both the heavy native work and profiled hotspot
+on rank 0. The complete matrix is therefore five sync modes × four layouts.
+Per-rank records include exact useful `lcg_steps` and potential profiled calls;
+nonblocking records split posting, independently oracle-checked overlap work,
+and Wait elapsed. Use `--require-unique-affinity` in distributed analysis to
+reject overlapping/multiple-CPU thread bindings; local functional tests may
+retain shared bindings but cannot support a performance conclusion.
+
+Every phase has one final MPI barrier after its selected-sync epoch loop and
+before wall measurement. This uniform measurement boundary prevents rank 0 from
+reporting completion before a late peer in ring/Bcast modes. Its elapsed time is
+recorded separately as `completion_wait` and included in phase wall; it is not
+an additional per-epoch synchronization mode. Oracle/result-validation collectives
+remain outside the measured phase wall.
+
+After collecting the distributed matrix, run
+`python3 sync_summary.py results > matrix-summary.json`. The expected layout is
+`results/SYNC-LAYOUT/LABEL/rank-0.out`, `LABEL/rank-RANK.err` for all 32 ranks,
+and `results/SYNC-LAYOUT/LABEL.rc`. All 20 × six receipts, matching fixed work,
+complete rank measurements, identical paired binding, two hosts with 192 unique
+single-CPU thread bindings, and final 16-target local profiler reports are
+required. Helper zero-target reports are excluded; a genuine application report
+with zero profiled targets remains valid. Candidate rank budget metadata must
+match world size 32 and the configured five-percent job risk target.
+The summary preserves each rank's measured costs and native compute imbalance,
+as well as native/baseline/candidate wall samples and ratios. `valid` certifies
+data completeness, independently of the list of cases exceeding five-percent
+process overhead. Functional local fixtures can use explicit `--ranks 8
+--threads 2 --hosts 1 --allow-shared-affinity --workload-only`; these overrides
+must not be used to qualify distributed performance results.
+
+Timing boundary: the `process` summary key retains the benchmark's
+`process_seconds` field but means **main-entry-through-MPI-Finalize elapsed**.
+It excludes loader/LD_PRELOAD constructors before main and launcher wall time.
+The primary comparison is the measured main-phase wall including its final
+completion barrier; warmup-plus-main and main-through-finalize are supplementary.
