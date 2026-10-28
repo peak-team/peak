@@ -269,7 +269,7 @@ jobs:
           build/macos-detach-concurrent.csv
         grep -E ',reattach,success,1,safe,' \
           build/macos-detach-concurrent.csv
-        grep -F 'Darwin process-exit teardown leaves Gum target listener state alive' \
+        grep -F 'Resident process-exit teardown leaves Gum target listener state alive' \
           build/macos-detach-concurrent.log
         ! grep -F 'Accounting diagnostics:' \
           build/macos-detach-concurrent.log
