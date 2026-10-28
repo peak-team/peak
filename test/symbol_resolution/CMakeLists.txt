@@ -221,3 +221,16 @@ add_test(NAME test_symbol_resolution_ordinary_late
             --duplicate $<TARGET_FILE:test_symbol_resolution_ordinary_late_duplicate>
             --objcopy ${CMAKE_OBJCOPY})
 set_tests_properties(test_symbol_resolution_ordinary_late PROPERTIES TIMEOUT 150)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+add_test(NAME test_peak_collect_symbols
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_collect_symbols.py
+            --collector ${PROJECT_SOURCE_DIR}/tools/peak-collect-symbols
+            --cc ${CMAKE_C_COMPILER}
+            --cxx ${CMAKE_CXX_COMPILER}
+            --strip ${CMAKE_STRIP}
+            --inspect $<TARGET_FILE:peak_inspect_symbols>
+            --lib $<TARGET_FILE:peak>)
+set_tests_properties(test_peak_collect_symbols PROPERTIES TIMEOUT 180)
+endif()

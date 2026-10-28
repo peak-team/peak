@@ -7563,62 +7563,77 @@ peak_general_listener_attach()
                                           peak_hook_address_count);
     }
     for (size_t i = 0; i < peak_hook_address_count; i++) {
+        /* Module-qualified raw symbols need the same support-wrapper policy
+         * as unqualified names. */
+        const char* support_name = strchr(peak_hook_strings[i], '!');
+        if (support_name != NULL && startup_resolutions != NULL &&
+            startup_resolutions[i].result == PEAK_TARGET_RESOLVE_UNIQUE &&
+            startup_resolutions[i].resolution.candidates != NULL &&
+            startup_resolutions[i].resolution.candidates->len == 1) {
+            PeakTargetSymbolCandidate* candidate = g_ptr_array_index(
+                startup_resolutions[i].resolution.candidates, 0);
+            support_name = candidate->address ==
+                    peak_general_listener_find_function(support_name + 1)
+                ? support_name + 1 : peak_hook_strings[i];
+        } else {
+            support_name = peak_hook_strings[i];
+        }
         /* Redirect functions for which PEAK already owns support wrappers. */
-        if (strcmp(peak_hook_strings[i], "MPI_Finalize") == 0 ||
-            strcmp(peak_hook_strings[i], "PMPI_Finalize") == 0) {
+        if (strcmp(support_name, "MPI_Finalize") == 0 ||
+            strcmp(support_name, "PMPI_Finalize") == 0) {
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "exit") == 0) {
+        } else if (strcmp(support_name, "exit") == 0) {
             hook_address[i] = peak_general_listener_find_function("peak_exit");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "main") == 0) {
+        } else if (strcmp(support_name, "main") == 0) {
             hook_address[i] = NULL;
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernel") == 0) {
+        } else if (strcmp(support_name, "cudaLaunchKernel") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_launch_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernel") == 0) {
+        } else if (strcmp(support_name, "cudaLaunchCooperativeKernel") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchCooperativeKernelMultiDevice") == 0) {
+        } else if (strcmp(support_name, "cudaLaunchCooperativeKernelMultiDevice") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_launch_cooperative_kernel_multiple_device");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelEx") == 0) {
+        } else if (strcmp(support_name, "cudaLaunchKernelEx") == 0) {
             /* C++ template variants also use cudaLaunchKernelExC internally. */
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaLaunchKernelExC") == 0) {
+        } else if (strcmp(support_name, "cudaLaunchKernelExC") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_launch_kernel_exc");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernel") == 0) {
+        } else if (strcmp(support_name, "cuLaunchKernel") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cu_launch_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernel") == 0) {
+        } else if (strcmp(support_name, "cuLaunchCooperativeKernel") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cu_launch_cooperative_kernel");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchCooperativeKernelMultiDevice") == 0) {
+        } else if (strcmp(support_name, "cuLaunchCooperativeKernelMultiDevice") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cu_launch_cooperative_kernel_multiple_device");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuLaunchKernelEx") == 0) {
+        } else if (strcmp(support_name, "cuLaunchKernelEx") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cu_launch_kernel_ex");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cudaGraphLaunch") == 0) {
+        } else if (strcmp(support_name, "cudaGraphLaunch") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cuda_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "cuGraphLaunch") == 0) {
+        } else if (strcmp(support_name, "cuGraphLaunch") == 0) {
             hook_address[i] =
                 peak_general_listener_find_function("peak_cu_graph_launch");
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);
-        } else if (strcmp(peak_hook_strings[i], "dlopen") == 0) {
+        } else if (strcmp(support_name, "dlopen") == 0) {
             peak_log_info("[peak] skipping target dlopen: PEAK owns the dlopen listener used for dynamic attach\n");
             hook_address[i] = NULL;
             peak_demangled_strings[i] = g_strdup(peak_hook_strings[i]);

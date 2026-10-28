@@ -54,6 +54,8 @@ GET_INTERCEPTOR_THREAD_CONTEXT = "get_interceptor_thread_context"
 EXPORTED_GET_INTERCEPTOR_THREAD_CONTEXT = (
     "peak_gum_get_interceptor_thread_context"
 )
+INTERCEPTOR_GUARD_KEY = "gum_interceptor_guard_key"
+EXPORTED_INTERCEPTOR_GUARD_KEY = "peak_gum_interceptor_guard_key"
 INTERCEPTOR_THREAD_CONTEXT_LOCK = "gum_interceptor_thread_context_lock"
 EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK = (
     "peak_gum_interceptor_thread_context_lock"
@@ -219,10 +221,12 @@ def route_invocation_dispatch_through_overlay(
     thread_context_state = {
         ("b", INTERCEPTOR_THREAD_CONTEXT_LOCK),
         ("b", INTERCEPTOR_THREAD_CONTEXTS),
+        ("b", INTERCEPTOR_GUARD_KEY),
     }
     exported_thread_context_state = {
         ("B", EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK),
         ("B", EXPORTED_INTERCEPTOR_THREAD_CONTEXTS),
+        ("B", EXPORTED_INTERCEPTOR_GUARD_KEY),
     }
     thread_context_lifecycle = {
         ("d", INTERCEPTOR_CONTEXT_PRIVATE),
@@ -273,6 +277,8 @@ def route_invocation_dispatch_through_overlay(
         f"{INTERCEPTOR_THREAD_CONTEXTS}="
         f"{EXPORTED_INTERCEPTOR_THREAD_CONTEXTS}",
         "--redefine-sym",
+        f"{INTERCEPTOR_GUARD_KEY}={EXPORTED_INTERCEPTOR_GUARD_KEY}",
+        "--redefine-sym",
         f"{INTERCEPTOR_CONTEXT_PRIVATE}="
         f"{EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE}",
         "--redefine-sym",
@@ -294,6 +300,8 @@ def route_invocation_dispatch_through_overlay(
         EXPORTED_INTERCEPTOR_THREAD_CONTEXT_LOCK,
         "--globalize-symbol",
         EXPORTED_INTERCEPTOR_THREAD_CONTEXTS,
+        "--globalize-symbol",
+        EXPORTED_INTERCEPTOR_GUARD_KEY,
         "--globalize-symbol",
         EXPORTED_INTERCEPTOR_CONTEXT_PRIVATE,
         "--globalize-symbol",
