@@ -119,6 +119,8 @@ class Collector:
     def expand(self, values, origin, split=True):
         result = []
         for value in values:
+            if not value:
+                continue
             for item in (value.split(':') if split else (value,)):
                 # Empty loader search entries mean the current working directory.
                 item = item.replace('${ORIGIN}', str(origin)).replace('$ORIGIN', str(origin))
@@ -248,19 +250,19 @@ class Collector:
                         selected.add(candidate)
                         pending.append(candidate)
 
-    def add(self, path):
+    def add(self, path, scope=None):
         # Each explicitly selected root has a loader closure. Resolve siblings before
         # descendants so a direct dependency's SONAME wins over a nested request.
         root = Path(path).absolute()
         root_key = (root, self.root_origin)
         if root_key in self.completed_roots:
-            return
+            return {} if scope is None else scope
         pending = deque([(root, self.inherited_rpath)])
-        selected = {}
+        selected = {} if scope is None else scope
         visited = set()
         root_info = self.inspect(root)
         for soname in root_info[5]:
-            selected[(root_info[0], soname)] = root
+            selected.setdefault((root_info[0], soname), root)
         while pending:
             visible_path, inherited = pending.popleft()
             path = visible_path.resolve(strict=True)
@@ -312,6 +314,7 @@ class Collector:
                     selected.setdefault((abi, alias), found)
                 pending.append((found, descendants))
         self.completed_roots.add(root_key)
+        return selected
 
 
 def python_info(interpreter):
@@ -535,7 +538,7 @@ if sys.path and sys.path[0] == '':
 main = type(sys)('__main__')
 main.__dict__.update(__file__=script, __package__=None, __spec__=None, __cached__=None,
                      __loader__=importlib.machinery.SourceFileLoader('__main__', script),
-                     __builtins__=builtins.__dict__)
+                     __builtins__=builtins)
 with open(script, 'rb') as source:
     code = compile(source.read(), script, 'exec')
 for name in set(sys.modules) - initial_modules - {'atexit'}:
@@ -615,13 +618,14 @@ def main():
         with target.open('rb') as stream:
             elf = stream.read(4) == b'\x7fELF'
         collector = Collector(args)
+        startup_scope = None
         if elf:
             if args.run_python or arguments:
                 raise CollectionError('--run-python and script arguments require a Python target')
             collector.root_origin = target.parent
             headers = run(['readelf', '-W', '-l', str(target)], parsed=True)
             # The kernel resolves an executable's path; dlopen preserves a DSO alias.
-            collector.add(target if 'Requesting program interpreter:' in headers else visible_target)
+            startup_scope = collector.add(target if 'Requesting program interpreter:' in headers else visible_target)
             main_object = collector.inspect(target)
             if not main_object[3]:
                 collector.inherited_rpath = tuple(collector.expand(main_object[2], target.parent))
@@ -643,7 +647,7 @@ def main():
             if arguments and not args.run_python:
                 raise CollectionError('script arguments require --run-python')
         for module in args.module:
-            collector.add(module)
+            collector.add(module, scope=None if startup_scope is None else startup_scope.copy())
         result = ''.join(symbol + '\n' for symbol in sorted(collector.symbols))
         if args.output:
             output = Path(args.output).absolute()
