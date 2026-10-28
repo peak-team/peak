@@ -247,6 +247,14 @@ LD_PRELOAD=/path/to/libpeak.so \
 ./target_application
 ```
 
+Static discovery requires no effective `LD_PRELOAD` or `LD_AUDIT` entries and
+rejects ELF `DT_FILTER`/`DT_AUXILIARY` directives. These loader mechanisms can
+select different providers from an offline dependency search. Static inventory
+describes the override-free application graph; removing overrides only during
+collection does not inventory the providers used with those overrides restored.
+Native collection with preload/audit overrides is unsupported. Python runtime
+discovery below can observe providers in the matching overridden environment.
+
 For Python, use the same interpreter and environment for collection and
 profiling. Discovery statically follows imports to find compiled extension
 modules and their native dependencies without running the script. It does not
