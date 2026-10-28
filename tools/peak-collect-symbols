@@ -244,11 +244,6 @@ class Collector:
                             continue
                 if found is None:
                     raise CollectionError('cannot resolve dependency {!r} required by {}'.format(name, path))
-                aliases = self.inspect(found)[5]
-                # Reuse an object already selected under a matching SONAME.
-                if '/' not in name:
-                    found = next((selected[(abi, alias)] for alias in aliases
-                                  if (abi, alias) in selected), found)
                 selected[(abi, name)] = found
                 for alias in self.inspect(found)[5]:
                     selected.setdefault((abi, alias), found)
@@ -359,6 +354,8 @@ import sys
 initial_modules = set(sys.modules)
 import atexit, builtins, importlib, importlib.machinery, os
 paths = set()
+loaded_roots = {}
+ctypes_modules = set()
 def mapped_paths():
     result = set()
     with open('/proc/self/maps') as maps:
@@ -380,10 +377,49 @@ def remember(module):
     filename = namespace(module).get('__file__')
     if isinstance(filename, str):
         paths.add(observed_path(filename))
+def observe_ctypes(module):
+    ns = namespace(module)
+    if getattr(ns.get('__spec__'), '_initializing', False):
+        return
+    native = namespace(sys.modules.get('_ctypes')).get('dlopen')
+    if native is None or ns.get('_dlopen') is not native or module in ctypes_modules:
+        return
+    ctypes_modules.add(module)
+    class LinkMap(module.Structure):
+        _fields_ = [('address', module.c_void_p), ('name', module.c_char_p),
+                    ('dynamic', module.c_void_p)]
+    try:
+        query = module.CDLL(None).dlinfo
+    except (AttributeError, OSError):
+        return  # Other loaders retain the module/mapping inventory fallback.
+    query.argtypes = [module.c_void_p, module.c_int, module.c_void_p]
+    query.restype = module.c_int
+    def dlopen(*args, **kwargs):
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = None
+        handle = native(*args, **kwargs)
+        link = module.POINTER(LinkMap)()
+        try:
+            status = query(handle, 2, module.byref(link))
+        except (OSError, ValueError, module.ArgumentError):
+            return handle
+        if status == 0 and link and link.contents.name:
+            name = os.fsdecode(link.contents.name)
+            if os.path.isabs(name):
+                loaded_roots.setdefault(name, None)
+            elif cwd is not None:
+                loaded_roots.setdefault(os.path.join(cwd, name), None)
+        return handle
+    ns['_dlopen'] = dlopen
+
 original_import = builtins.__import__
 def target_import(name, globals=None, locals=None, fromlist=(), level=0):
     module = original_import(name, globals, locals, fromlist, level)
     remember(module)
+    if namespace(module).get('__name__') == 'ctypes':
+        observe_ctypes(module)
     if (namespace(module).get('__name__') == 'importlib'
             and namespace(module).get('__file__') == namespace(importlib).get('__file__')):
         namespace(module)['import_module'] = target_import_module
@@ -396,12 +432,12 @@ original_import_module = importlib.import_module
 def target_import_module(name, package=None):
     module = original_import_module(name, package)
     remember(module)
+    if namespace(module).get('__name__') == 'ctypes':
+        observe_ctypes(module)
     return module
 def audit(event, args):
     if event == 'import' and len(args) > 1 and isinstance(args[1], str):
         paths.add(observed_path(args[1]))
-    elif event == 'ctypes.dlopen' and args and isinstance(args[0], str):
-        paths.add(observed_path(args[0]) if '/' in args[0] else args[0])
 if hasattr(sys, 'addaudithook'):
     sys.addaudithook(audit)
 output, script = sys.argv[1:3]
@@ -429,7 +465,7 @@ def finish():
             remember(module)
     paths.update(mapped_paths() - baseline)
     with open(output, 'w') as result:
-        result.write(repr(sorted(paths)))
+        result.write(repr({'roots': list(loaded_roots), 'paths': sorted(paths)}))
 # Registered first so target callbacks run before the final inventory.
 atexit.register(finish)
 exec(code, main.__dict__)
@@ -502,13 +538,18 @@ def main():
             if not interpreter[3]:
                 collector.inherited_rpath = tuple(collector.expand(interpreter[2], collector.root_origin))
             if args.run_python:
-                for module in runtime_python(args.target, args.python, arguments, args.timeout):
-                    path = Path(module)
-                    if path.is_file():
-                        collector.sources.add(path.resolve())
-                        with path.open('rb') as stream:
-                            if stream.read(4) == b'\x7fELF':
-                                collector.add(path)
+                discovery = runtime_python(args.target, args.python, arguments, args.timeout)
+                for authoritative, modules in ((True, discovery['roots']), (False, discovery['paths'])):
+                    for module in modules:
+                        path = Path(module)
+                        if path.is_file():
+                            canonical = path.resolve()
+                            collector.sources.add(canonical)
+                            if not authoritative and canonical in collector.objects:
+                                continue
+                            with path.open('rb') as stream:
+                                if stream.read(4) == b'\x7fELF':
+                                    collector.add(path)
             else:
                 static_python(target, info, collector)
                 print('warning: static Python discovery cannot resolve arbitrary runtime imports or unavailable optional modules.', file=sys.stderr)

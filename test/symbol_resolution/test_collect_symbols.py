@@ -190,6 +190,23 @@ def main():
         for index, library in enumerate(slash_libraries):
             assert f'{library}!slash_{index}' in slash_symbols
 
+        named_libraries = [root/'libnamed_a.so', root/'libnamed_b.so']
+        for index, library in enumerate(named_libraries):
+            build('named-'+str(index)+'.c',
+                  f'int named_{index}(void){{return {index+3};}}', library, '-shared', '-fPIC')
+        named_app = root/'named-app'
+        build('named-main.c', '#include <stdio.h>\nextern int named_0(void),named_1(void);int main(void){printf("%d %d\\n",named_0(),named_1());}',
+              named_app, '-L'+str(root), '-l:libnamed_a.so', '-l:libnamed_b.so',
+              '-Wl,-rpath,'+str(root))
+        for index, library in enumerate(named_libraries):
+            build('named-'+str(index)+'.c',
+                  f'int named_{index}(void){{return {index+3};}}', library, '-shared', '-fPIC',
+                  '-Wl,-soname,libnamed-common.so')
+        assert run([named_app]).strip() == '3 4'
+        named_symbols = collect(named_app)
+        for index, library in enumerate(named_libraries):
+            assert f'{library}!named_{index}' in named_symbols
+
         symlink_case = root/'loader-symlink'
         (symlink_case/'real').mkdir(parents=True)
         (symlink_case/'alias').mkdir()
@@ -680,6 +697,52 @@ print("collector_saturation_originals_ok")
                                     f'os.chdir({str(root)!r})\n')
             audit_symbols = collect(audit_script, '--run-python')
             assert f'{audit_library}!extension_function' in audit_symbols
+
+        runtime_alias = root/'runtime-alias'
+        runtime_real = root/'runtime-real'
+        runtime_alias.mkdir()
+        runtime_real.mkdir()
+        alias_leaf = runtime_alias/'libalias_leaf.so'
+        build('alias-leaf.c', 'int alias_leaf(void){return 7;}', alias_leaf,
+              '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libalias_leaf.so')
+        real_provider = runtime_real/'libalias_provider.so'
+        alias_provider = runtime_alias/'libalias_provider.so'
+        build('alias-provider.c', 'extern int alias_leaf(void);int alias_provider(void){return alias_leaf();}',
+              real_provider, '-shared', '-fPIC', '-nostdlib', '-L'+str(runtime_alias),
+              '-lalias_leaf', '-Wl,-rpath,$ORIGIN')
+        alias_provider.symlink_to(real_provider)
+        alias_script = root/'alias-runtime.py'
+        alias_script.write_text('import ctypes\n'+
+                                f'library=ctypes.CDLL({str(alias_provider)!r})\n'+
+                                'assert library.alias_provider()==7\n')
+        alias_symbols = collect(alias_script, '--run-python')
+        assert f'{real_provider}!alias_provider' in alias_symbols
+        assert f'{alias_leaf}!alias_leaf' in alias_symbols
+        bare_script = root/'bare-runtime.py'
+        bare_script.write_text('import ctypes, _ctypes\n'
+                               'library=ctypes.CDLL("libalias_leaf.so")\n'
+                               'assert library.alias_leaf()==7\n'
+                               '_ctypes.dlclose(library._handle)\n')
+        bare_env = os.environ.copy()
+        bare_env['LD_LIBRARY_PATH'] = str(runtime_alias)
+        bare_symbols = collect(bare_script, '--run-python', env=bare_env)
+        assert f'{alias_leaf}!alias_leaf' in bare_symbols
+
+        constructor_dir = root/'constructor-libraries'
+        constructor_dir.mkdir()
+        constructor_library = constructor_dir/'libconstructor.so'
+        build('constructor.c', '#include <unistd.h>\n__attribute__((constructor)) static void init(void){chdir("'+str(root)+'");}int constructor_work(void){return 23;}',
+              constructor_library, '-shared', '-fPIC', '-nostdlib')
+        constructor_script = root/'constructor-runtime.py'
+        constructor_script.write_text('import ctypes, _ctypes, os\n'+
+                                      f'os.chdir({str(constructor_dir)!r})\n'+
+                                      'library=ctypes.CDLL("./libconstructor.so")\n'
+                                      'assert library.constructor_work()==23\n'+
+                                      f'assert os.getcwd()=={str(root)!r}\n'+
+                                      '_ctypes.dlclose(library._handle)\n')
+        run([sys.executable, constructor_script])
+        constructor_symbols = collect(constructor_script, '--run-python')
+        assert f'{constructor_library}!constructor_work' in constructor_symbols
 
         at_exit = root/'atexit-runtime.py'
         at_exit.write_text('import atexit\n'
