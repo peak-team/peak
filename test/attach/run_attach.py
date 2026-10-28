@@ -365,7 +365,8 @@ else:
                 reap(other)
                 other.stdin.close()
             # PID known to have exited avoids machine-specific PID limits.
-            dead = subprocess.Popen(["/bin/true"], start_new_session=True)
+            dead = subprocess.Popen([sys.executable, "-c", "pass"],
+                                    start_new_session=True)
             dead.wait(timeout=3)
             code, output = run([cli, str(dead.pid)] + agent_options +
                                ["--target", "x"], env)
