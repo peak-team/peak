@@ -8,6 +8,15 @@ typedef int kern_return_t;
 typedef uintptr_t vm_address_t;
 typedef size_t vm_size_t;
 typedef unsigned int* thread_state_t;
+typedef uintptr_t mach_vm_address_t;
+typedef int vm_prot_t;
+#define VM_PROT_READ 1
+#define VM_PROT_EXECUTE 4
+#define VM_FLAGS_FIXED 0
+#define VM_FLAGS_OVERWRITE 16384
+#define VM_INHERIT_COPY 1
+kern_return_t mach_vm_protect(unsigned int, mach_vm_address_t, size_t, int, int);
+kern_return_t mach_vm_remap(unsigned int, mach_vm_address_t*, size_t, uintptr_t, int, unsigned int, mach_vm_address_t, int, vm_prot_t*, vm_prot_t*, int);
 #define MACH_PORT_NULL 0
 #define MACH_PORT_VALID(x) ((x) != 0)
 #define KERN_SUCCESS 0

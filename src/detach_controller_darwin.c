@@ -50,6 +50,9 @@ typedef struct {
     mach_msg_type_number_t thread_count;
     gpointer writable_pages;
     guint writable_page_count;
+    gpointer page_snapshot;
+    gpointer original_pages;
+    gboolean clone_pages;
     gsize writable_patch_offset;
     struct timespec started_at;
 } PeakDarwinHeldMutation;
@@ -468,9 +471,14 @@ static void
 peak_darwin_dispose_writable_pages(void)
 {
     if (peak_darwin_held.writable_pages != NULL) {
-        gum_memory_dispose_writable_pages(
-            peak_darwin_held.writable_pages,
-            peak_darwin_held.writable_page_count);
+        if (peak_darwin_held.clone_pages) {
+            gum_free_pages(peak_darwin_held.writable_pages);
+            gum_free_pages(peak_darwin_held.page_snapshot);
+            peak_darwin_held.page_snapshot = NULL;
+        } else {
+            gum_memory_dispose_writable_pages(peak_darwin_held.writable_pages,
+                peak_darwin_held.writable_page_count);
+        }
         peak_darwin_held.writable_pages = NULL;
         peak_darwin_held.writable_page_count = 0;
     }
@@ -522,8 +530,50 @@ peak_darwin_prepare_writable_alias(const PeakDarwinPatchPlan* plan,
     first_page = address & ~((uintptr_t)page_size - 1);
     end = address + plan->patch_size;
     page_count = (guint)((end - first_page + page_size - 1) / page_size);
-    peak_darwin_held.writable_pages =
-        gum_memory_try_remap_writable_pages((gpointer)first_page, page_count);
+    if (!gum_memory_can_remap_writable()) {
+        gsize size = page_count * page_size;
+        for (guint i = 0; i < page_count; i++) {
+            GumPageProtection protection;
+            if (!gum_memory_query_protection((gpointer)(first_page + i * page_size),
+                    &protection) || protection != GUM_PAGE_RX) {
+                peak_darwin_note_failure("clone-page-protection-unsupported", 0, address, i);
+                peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+                return FALSE;
+            }
+        }
+        gpointer snapshot = gum_try_alloc_n_pages(page_count, GUM_PAGE_RW);
+        gpointer clone = gum_try_alloc_n_pages(page_count, GUM_PAGE_RW);
+        if (snapshot == NULL || clone == NULL) {
+            if (snapshot != NULL) gum_free_pages(snapshot);
+            if (clone != NULL) gum_free_pages(clone);
+            peak_darwin_note_failure("clone-page-allocation-failed", 0, address, size);
+            peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+            return FALSE;
+        }
+        memcpy(snapshot, (gpointer)first_page, size);
+        memcpy(clone, snapshot, size);
+        memcpy((guint8*)clone + address - first_page, plan->bytes_to_write, plan->patch_size);
+        kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)clone,
+            size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            gum_free_pages(snapshot);
+            gum_free_pages(clone);
+            peak_darwin_note_failure("clone-page-seal-failed", 0, address, kr);
+            peak_darwin_set_status(status_out, PEAK_DETACH_STATUS_ERROR);
+            return FALSE;
+        }
+        /* The whole mapping changes physical backing, so publish all copied
+         * instructions before any peer can execute the replacement pages. */
+        sys_dcache_flush(clone, size);
+        sys_icache_invalidate(clone, size);
+        peak_darwin_held.writable_pages = clone;
+        peak_darwin_held.page_snapshot = snapshot;
+        peak_darwin_held.original_pages = (gpointer)first_page;
+        peak_darwin_held.clone_pages = TRUE;
+    } else {
+        peak_darwin_held.writable_pages =
+            gum_memory_try_remap_writable_pages((gpointer)first_page, page_count);
+    }
     if (peak_darwin_held.writable_pages == NULL) {
         peak_darwin_note_failure("writable-remap-failed",
                                  0,
@@ -550,19 +600,40 @@ peak_darwin_bytes_equal(const guint8* left,
     return TRUE;
 }
 
-static void
+static gboolean
 peak_darwin_write_patch(const PeakDarwinPatchPlan* plan)
 {
     guint8* writable =
         (guint8*)peak_darwin_held.writable_pages +
         peak_darwin_held.writable_patch_offset;
 
-    for (guint i = 0; i < plan->patch_size; i++) {
-        writable[i] = plan->bytes_to_write[i];
+    if (peak_darwin_held.clone_pages) {
+        gsize size = peak_darwin_held.writable_page_count * gum_query_page_size();
+        if (!peak_darwin_bytes_equal(peak_darwin_held.original_pages,
+                peak_darwin_held.page_snapshot, size)) {
+            peak_darwin_note_failure("clone-page-bytes-changed", 0,
+                (uintptr_t)plan->function_address, size);
+            return FALSE;
+        }
+        mach_vm_address_t target = (mach_vm_address_t)peak_darwin_held.original_pages;
+        vm_prot_t current, maximum;
+        kern_return_t kr = mach_vm_remap(mach_task_self(), &target, size, 0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+            (mach_vm_address_t)peak_darwin_held.writable_pages, TRUE,
+            &current, &maximum, VM_INHERIT_COPY);
+        if (kr != KERN_SUCCESS) {
+            peak_darwin_note_failure("clone-page-map-failed", 0,
+                (uintptr_t)plan->function_address, kr);
+            return FALSE;
+        }
+    } else {
+        for (guint i = 0; i < plan->patch_size; i++)
+            writable[i] = plan->bytes_to_write[i];
     }
     atomic_thread_fence(memory_order_seq_cst);
     sys_dcache_flush(plan->function_address, plan->patch_size);
     sys_icache_invalidate(plan->function_address, plan->patch_size);
+    return TRUE;
 }
 
 static gboolean
@@ -802,7 +873,10 @@ peak_darwin_prepare_hook_mutation(const PeakDetachRequest* request,
         goto cancel;
     }
 
-    peak_darwin_write_patch(&plan);
+    if (!peak_darwin_write_patch(&plan)) {
+        status = PEAK_DETACH_STATUS_CLASSIFY_FAILED;
+        goto cancel;
+    }
 
     peak_darwin_held.active = TRUE;
     prepared = TRUE;

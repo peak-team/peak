@@ -11,6 +11,8 @@ static unsigned char original[4] = { 0 };
 static unsigned int snapshots, suspended, resumed, staged, finished, cancelled;
 static gboolean bad_pc, bad_bytes, bad_identity, endless;
 static int prepare_result;
+static gboolean clone_mode, other_page_change, map_failure, writable_source;
+static unsigned int allocations;
 static gboolean peer_held[PEAK_DARWIN_MAX_THREADS];
 unsigned int mach_task_self(void) { return 1; }
 thread_act_t mach_thread_self(void) { return 1; }
@@ -31,6 +33,7 @@ kern_return_t task_threads(unsigned int task, thread_act_array_t* out,
     return KERN_SUCCESS;
 }
 kern_return_t thread_suspend(thread_act_t t) {
+    if (other_page_change) entry[100] = 7;
     assert(!peer_held[t]); peer_held[t] = TRUE; suspended++; return 0;
 }
 kern_return_t thread_resume(thread_act_t t) {
@@ -48,6 +51,27 @@ kern_return_t mach_port_deallocate(unsigned int task, unsigned int t) {
 kern_return_t vm_deallocate(unsigned int task, vm_address_t a, vm_size_t n) {
     (void)task; (void)n; free((void*)a); return 0;
 }
+gboolean gum_memory_can_remap_writable(void) { return !clone_mode; }
+gboolean gum_memory_query_protection(const void* p, GumPageProtection* protection) {
+    (void)p; *protection = writable_source ? GUM_PAGE_RW : GUM_PAGE_RX; return TRUE;
+}
+gpointer gum_try_alloc_n_pages(guint n, GumPageProtection p) {
+    assert(suspended == resumed);
+    allocations++; (void)p; return malloc(n * 4096);
+}
+void gum_free_pages(gpointer p) { assert(suspended == resumed); allocations--; free(p); }
+kern_return_t mach_vm_protect(unsigned int t, mach_vm_address_t a, size_t n, int m, int p) {
+    (void)t; (void)a; (void)n; (void)m; (void)p; return 0;
+}
+kern_return_t mach_vm_remap(unsigned int t, mach_vm_address_t* a, size_t n,
+    uintptr_t mask, int flags, unsigned int source, mach_vm_address_t from,
+    int copy, vm_prot_t* current, vm_prot_t* maximum, int inheritance) {
+    (void)t; (void)mask; (void)flags; (void)source; (void)copy;
+    (void)current; (void)maximum; (void)inheritance;
+    assert(peer_held[2] && peer_held[3]);
+    if (map_failure) return KERN_INVALID_ARGUMENT;
+    memcpy((void*)*a, (void*)from, n); return 0;
+}
 gsize gum_query_page_size(void) { return 4096; }
 gpointer gum_memory_try_remap_writable_pages(gpointer p, guint n) {
     assert(suspended == resumed); (void)n; return p;
@@ -58,6 +82,7 @@ void gum_memory_dispose_writable_pages(gpointer p, guint n) {
 gpointer gum_strip_code_pointer(gpointer p) { return p; }
 void sys_dcache_flush(void* p, size_t n) {
     (void)p; (void)n;
+    if (clone_mode && suspended == resumed) return;
     /* Publication cannot occur after only the first or second snapshot.
      * Creator and child must both remain held through the stable third pass. */
     assert(snapshots == 3 && peer_held[2] && peer_held[3]);
@@ -107,6 +132,8 @@ static void reset(void) {
     snapshots = suspended = resumed = staged = finished = cancelled = 0;
     bad_pc = bad_bytes = bad_identity = endless = FALSE;
     prepare_result = GUM_ATTACH_OK;
+    clone_mode = other_page_change = map_failure = writable_source = FALSE;
+    assert(allocations == 0);
     peak_detach_controller_note_thread_creation_gate_installed(FALSE);
 }
 int main(void) {
@@ -119,6 +146,22 @@ int main(void) {
     assert(memcmp(entry, active, 4) == 0 && finished == 0);
     assert(peak_detach_controller_finish_hook_mutation(&request, &status));
     assert(resumed == 2 && finished == 1);
+    reset(); clone_mode = TRUE;
+    assert(peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(memcmp(entry, active, 4) == 0);
+    assert(peak_detach_controller_finish_hook_mutation(&request, &status));
+    assert(allocations == 0);
+    reset(); clone_mode = other_page_change = TRUE;
+    assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(entry[0] == 0 && entry[100] == 7 && allocations == 0);
+    assert(strcmp(peak_detach_controller_last_failure_detail()->reason,
+                  "clone-page-bytes-changed") == 0);
+    reset(); clone_mode = map_failure = TRUE;
+    assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(entry[0] == 0 && allocations == 0 && suspended == resumed);
+    reset(); clone_mode = writable_source = TRUE;
+    assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
+    assert(suspended == 0 && allocations == 0);
     reset(); prepare_result = -4;
     assert(!peak_detach_controller_prepare_pthread_bootstrap(&request, &status));
     assert(strcmp(peak_detach_controller_last_failure_detail()->reason,
