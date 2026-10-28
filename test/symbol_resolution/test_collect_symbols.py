@@ -122,6 +122,18 @@ def main():
         plugin_symbols = collect(rpath_main, '--module', str(rpath_plugin))
         assert f'{origin_leaf}!origin_leaf' in plugin_symbols
 
+        colon_directory = root/'literal:directory'
+        colon_directory.mkdir()
+        colon_library = colon_directory/'libcolon.so'
+        build('colon-leaf.c', 'int colon_leaf(void){return 11;}', colon_library,
+              '-shared', '-fPIC', '-nostdlib')
+        colon_app = root/'colon-app'
+        build('colon-main.c', 'extern int colon_leaf(void);int main(void){return colon_leaf()!=11;}',
+              colon_app, str(colon_library))
+        run([colon_app])
+        colon_symbols = collect(colon_app)
+        assert f'{colon_library}!colon_leaf' in colon_symbols
+
         search = root/'search'
         (search/'a').mkdir(parents=True)
         (search/'b').mkdir()
@@ -277,6 +289,33 @@ int data_only=7;
         assert any(s.startswith(str(provider)+'!_ZL14local_function') for s in symbols)
         assert f'{provider}!data_only' not in symbols
         assert f'{provider}!leaf' not in symbols, 'undefined function emitted'
+        unsafe_module = root/'lib[collector.so'
+        shutil.copy2(provider, unsafe_module)
+        selector_output = root/'selector-contract.txt'
+        selector_output.write_text('preserve selector output\n')
+        collect(unsafe_module, '-o', selector_output, ok=False)
+        assert selector_output.read_text() == 'preserve selector output\n'
+        for raw_name in ('raw[bad', 'raw space', 'raw+0x10'):
+            raw_library = root/'libraw-unsupported.so'
+            assembly = ('__asm__(".text\\n.globl \\"'+raw_name+'\\"\\n.type \\"'+raw_name+
+                        '\\",%function\\n\\"'+raw_name+'\\":\\n.byte 0\\n");')
+            build('raw-unsupported.c', assembly, raw_library, '-shared', '-fPIC', '-nostdlib')
+            collect(raw_library, '-o', selector_output, ok=False)
+            assert selector_output.read_text() == 'preserve selector output\n'
+        for filename in ('lib interior space.so', 'libquote\'double"back\\.so', 'libtrailing.so '):
+            literal_module = root/filename
+            shutil.copy2(provider, literal_module)
+            literal_symbols = collect(literal_module)
+            literal_script = root/'literal-runtime.py'
+            literal_script.write_text('import ctypes\n'+
+                                      f'library=ctypes.CDLL({str(literal_module)!r})\n'+
+                                      'assert library.provider()==7\n')
+            runtime_literal_symbols = collect(literal_script, '--run-python')
+            assert f'{literal_module}!provider' in runtime_literal_symbols
+            if args.inspect:
+                selector = next(symbol for symbol in literal_symbols if symbol.endswith('!provider'))
+                assert 'candidates=1' in run([args.inspect, 'inspect-symbols', selector])
+
         output = root / 'targets.txt'
         collect(app, '-o', output)
         assert set(output.read_text().splitlines()) == symbols
@@ -824,6 +863,70 @@ print("collector_saturation_originals_ok")
         reload_symbols = collect(reload_script, '--run-python')
         assert f'{reuse_a/reused_name}!reuse_leaf' in reload_symbols
         assert f'{reuse_b/reused_name}!reuse_new_provider' in reload_symbols
+
+        reload_library = root/'libreload-observed.so'
+        build('reload-observed.c', 'int reload_work(void){return 13;}', reload_library,
+              '-shared', '-fPIC', '-nostdlib')
+        for following_import in ('', 'import ctypes\n'):
+            reload_script = root/'reload-ctypes-runtime.py'
+            reload_script.write_text('import ctypes, importlib, _ctypes\n'
+                                     'importlib.reload(ctypes)\n'+following_import+
+                                     f'library=ctypes.CDLL({str(reload_library)!r})\n'+
+                                     'assert library.reload_work()==13\n'
+                                     '_ctypes.dlclose(library._handle)\n')
+            reload_symbols = collect(reload_script, '--run-python')
+            assert f'{reload_library}!reload_work' in reload_symbols
+        for operation in ('replace', 'unlink'):
+            data_file = root/'runtime-mmap-data'
+            data_replacement = root/'runtime-mmap-replacement'
+            data_file.write_bytes(b'a'*4096)
+            data_replacement.write_bytes(b'b'*4096)
+            data_script = root/'runtime-mmap-data.py'
+            mutation = (f'os.replace({str(data_replacement)!r},{str(data_file)!r})'
+                        if operation == 'replace' else f'os.unlink({str(data_file)!r})')
+            data_script.write_text('import mmap, os, ctypes\n'+
+                                   f'file=open({str(data_file)!r},"rb")\n'+
+                                   'mapping=mmap.mmap(file.fileno(),0,access=mmap.ACCESS_READ)\n'+
+                                   mutation+'\n'+
+                                   f'library=ctypes.CDLL({str(reload_library)!r})\n'+
+                                   'assert library.reload_work()==13\n'
+                                   'assert mapping[0]==97\n')
+            data_symbols = collect(data_script, '--run-python')
+            assert f'{reload_library}!reload_work' in data_symbols
+
+        memfd_script = root/'runtime-executable-memfd.py'
+        memfd_script.write_text('import os, mmap, ctypes\n'
+                                'if hasattr(os,"memfd_create"):\n'
+                                '    fd=os.memfd_create("collector-non-ELF")\n'
+                                'else:\n'
+                                '    fd=ctypes.CDLL(None).memfd_create(b"collector-non-ELF",0)\n'
+                                'assert fd>=0\n'
+                                'os.ftruncate(fd,4096)\n'
+                                'mapping=mmap.mmap(fd,4096,prot=mmap.PROT_READ|mmap.PROT_EXEC)\n'+
+                                f'library=ctypes.CDLL({str(reload_library)!r})\n'+
+                                'assert library.reload_work()==13\n')
+        memfd_symbols = collect(memfd_script, '--run-python')
+        assert f'{reload_library}!reload_work' in memfd_symbols
+
+        identity_library = root/'libidentity-observed.so'
+        replacement_library = root/'libidentity-replacement.so'
+        for operation in ('replace', 'unlink'):
+            build('identity-observed.c', 'int originally_loaded_symbol(void){return 7;}',
+                  identity_library, '-shared', '-fPIC', '-nostdlib')
+            build('identity-replacement.c', 'int never_loaded_symbol(void){return 9;}',
+                  replacement_library, '-shared', '-fPIC', '-nostdlib')
+            identity_script = root/'identity-runtime.py'
+            mutation = (f'os.replace({str(replacement_library)!r},{str(identity_library)!r})'
+                        if operation == 'replace' else f'os.unlink({str(identity_library)!r})')
+            identity_script.write_text('import ctypes, os\n'+
+                                       f'library=ctypes.CDLL({str(identity_library)!r})\n'+
+                                       'assert library.originally_loaded_symbol()==7\n'+mutation+'\n')
+            identity_output = root/'identity-targets.txt'
+            identity_output.write_text('preserve existing identity output\n')
+            identity_error = run([sys.executable, args.collector, identity_script, '--run-python',
+                                  '-o', identity_output], ok=False, capture_stderr=True)
+            assert 'observed mapped file' in identity_error, identity_error
+            assert identity_output.read_text() == 'preserve existing identity output\n'
 
         at_exit = root/'atexit-runtime.py'
         at_exit.write_text('import atexit\n'
