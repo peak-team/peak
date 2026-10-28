@@ -111,7 +111,8 @@ class Collector:
             if name:
                 symbols.add(name)
         sonames = re.findall(r'\(SONAME\).*?\[(.*?)\]', output)
-        result = abi, needed, rpath, runpath, symbols, sonames
+        indirect = re.findall(r'\((FILTER|AUXILIARY)\).*?\[(.*?)\]', output)
+        result = abi, needed, rpath, runpath, symbols, sonames, indirect
         self.cache[path] = result
         return result
 
@@ -266,7 +267,11 @@ class Collector:
             if path in visited:
                 continue
             visited.add(path)
-            abi, needed, rpath, runpath, symbols, sonames = self.add_object(path)
+            info = self.add_object(path)
+            if info[6]:
+                raise CollectionError('static discovery does not support DT_' + info[6][0][0] +
+                                      ' loader directives in ' + str(path))
+            abi, needed, rpath, runpath, symbols, sonames = info[:6]
             own_rpath = self.expand(rpath, visible_path.parent) if not runpath else []
             # A requester's RUNPATH suppresses inherited RPATH for that request.
             search = own_rpath + ([] if runpath else list(inherited)) + self.library_dirs
@@ -575,6 +580,8 @@ def main():
         'successful compiled imports/ctypes loads and exit trigger mapped-library snapshots. '
         'Native loads and unloads entirely between those boundaries may be missed. '
         'Memory-only/memfd mappings and JIT symbol recovery are unsupported. '
+        'Static discovery rejects effective LD_PRELOAD/LD_AUDIT entries and ELF DT_FILTER/DT_AUXILIARY. '
+        'Its override-free graph does not inventory providers used when overrides are restored. '
         'Python targets collect native modules and their dependencies; interpreter baseline libraries are excluded. Pure Python functions are not native function symbols.')
     parser.add_argument('target', help='ELF executable/shared library or Python script')
     parser.add_argument('-o', '--output', help='output file (default: stdout); replaced only on success')
@@ -597,6 +604,11 @@ def main():
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise CollectionError('--timeout must be positive')
         visible_target = Path(args.target).absolute()
+        if not args.run_python:
+            for variable, separators in (('LD_PRELOAD', r'[ :]+'), ('LD_AUDIT', ':')):
+                if any(re.split(separators, os.environ.get(variable, ''))):
+                    raise CollectionError('static discovery does not support effective ' + variable +
+                                          ' entries')
         target = visible_target.resolve(strict=True)
         if not target.is_file():
             raise CollectionError('target must be a regular file')

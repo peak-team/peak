@@ -928,6 +928,76 @@ print("collector_saturation_originals_ok")
             assert 'observed mapped file' in identity_error, identity_error
             assert identity_output.read_text() == 'preserve existing identity output\n'
 
+        scope_a, scope_b = root/'scope-a', root/'scope-b'
+        scope_a.mkdir()
+        scope_b.mkdir()
+        scope_leaf = scope_a/'libscope_leaf.so'
+        scope_override = scope_b/'libscope_preload.so'
+        for library, value in ((scope_leaf, 7), (scope_override, 23)):
+            build('scope-leaf.c', f'int scope_leaf(void){{return {value};}}', library,
+                  '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libscope_leaf.so', compiler=loader_cc)
+        scope_provider = root/'libscope_provider.so'
+        build('scope-provider.c', 'extern int scope_leaf(void);int scope_provider(void){return scope_leaf();}',
+              scope_provider, '-shared', '-fPIC', '-nostdlib', '-L'+str(scope_a), '-lscope_leaf',
+              '-Wl,-rpath,'+str(scope_a), compiler=loader_cc)
+        scope_app = root/'scope-app'
+        build('scope-main.c', '#include <stdio.h>\nextern int scope_leaf(void);int main(void){printf("%d\\n",scope_leaf());}',
+              scope_app, '-L'+str(scope_a), '-lscope_leaf', '-Wl,-rpath,'+str(scope_a), compiler=loader_cc)
+        assert run([scope_app]).strip() == '7'
+        scope_audit = root/'libscope_audit.so'
+        build('scope-audit.c', '#define _GNU_SOURCE\n#include <link.h>\n#include <string.h>\nunsigned int la_version(unsigned int version){return LAV_CURRENT;}char*la_objsearch(const char*name,uintptr_t*cookie,unsigned int flag){return strcmp(name,"libscope_leaf.so")==0?"'+str(scope_override)+'":(char*)name;}',
+              scope_audit, '-shared', '-fPIC', compiler=loader_cc)
+        scope_plain = root/'scope-plain.py'
+        scope_plain.write_text('pass\n')
+        scope_runtime = root/'scope-runtime.py'
+        scope_runtime.write_text('import ctypes\n'+
+                                 f'library=ctypes.CDLL({str(scope_provider)!r})\n'+
+                                 'assert library.scope_provider()==23\n')
+        scope_output = root/'scope-targets.txt'
+        def reject_static_scope(target, label, env=None):
+            scope_output.write_text('preserve unsupported scope output\n')
+            error = run([sys.executable, args.collector, target, '-o', scope_output],
+                        env=env, ok=False, capture_stderr=True)
+            assert label in error, error
+            assert scope_output.read_text() == 'preserve unsupported scope output\n'
+        scope_base_env = os.environ.copy()
+        scope_base_env.pop('LD_PRELOAD', None)
+        scope_base_env.pop('LD_AUDIT', None)
+        for variable, library in (('LD_PRELOAD', scope_override), ('LD_AUDIT', scope_audit)):
+            scope_env = scope_base_env.copy()
+            scope_env[variable] = str(library)
+            assert run([scope_app], env=scope_env).strip() == '23'
+            reject_static_scope(scope_app, variable, env=scope_env)
+            reject_static_scope(scope_plain, variable, env=scope_env)
+            actual_symbols = collect(scope_runtime, '--run-python', env=scope_env)
+            assert f'{scope_override}!scope_leaf' in actual_symbols
+            assert not any(symbol.startswith(str(scope_leaf)+'!') for symbol in actual_symbols)
+        scope_empty_env = scope_base_env.copy()
+        scope_empty_env.update(LD_PRELOAD=' : : ', LD_AUDIT='::')
+        assert run([scope_app], env=scope_empty_env).strip() == '7'
+        assert f'{scope_leaf}!scope_leaf' in collect(scope_app, env=scope_empty_env)
+
+        scope_impl = root/'libscope_impl.so'
+        build('scope-impl.c', 'int scope_filtered_work(void){return 42;}', scope_impl,
+              '-shared', '-fPIC', '-nostdlib', compiler=loader_cc)
+        for directive in ('filter', 'auxiliary'):
+            scope_filter = root/('libscope_'+directive+'.so')
+            build('scope-filter.c', 'int scope_filtered_work(void){return -1;}', scope_filter,
+                  '-shared', '-fPIC', '-nostdlib', '-Wl,--'+directive+',libscope_impl.so',
+                  '-Wl,-rpath,$ORIGIN', compiler=loader_cc)
+            assert '('+directive.upper()+')' in run(['readelf', '-W', '-d', scope_filter])
+            filter_app = root/('scope-'+directive+'-app')
+            build('scope-filter-main.c', '#include <stdio.h>\nextern int scope_filtered_work(void);int main(void){printf("%d\\n",scope_filtered_work());}',
+                  filter_app, str(scope_filter), '-Wl,-rpath,'+str(root), compiler=loader_cc)
+            assert run([filter_app]).strip() == '42'
+            reject_static_scope(filter_app, 'DT_'+directive.upper())
+            filter_runtime = root/'scope-filter-runtime.py'
+            filter_runtime.write_text('import ctypes\n'+
+                                      f'library=ctypes.CDLL({str(scope_filter)!r})\n'+
+                                      'assert library.scope_filtered_work()==42\n')
+            filter_symbols = collect(filter_runtime, '--run-python')
+            assert f'{scope_impl}!scope_filtered_work' in filter_symbols
+
         at_exit = root/'atexit-runtime.py'
         at_exit.write_text('import atexit\n'
                            'def load():\n    import ctypes\n'+
