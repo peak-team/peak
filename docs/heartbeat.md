@@ -972,3 +972,63 @@ preparation, atomic CSV publication, and text publication using wall and calling
 thread CPU time. `MPI settlement timing:` separately reports final cohort flush
 and helper stop/join. These diagnostics retain the same output and release
 protocol and do not change the benchmark interval or imply an overhead pass.
+
+Global admission uses the coordinator's canonical integer nanosecond wallet.
+A bootstrap observation lease is divided into integer per-hook shares, leaving
+any remainder as unused funded credit. The same integer mutation cost is used
+for eligibility and actual control prepayment. Pending observation shares are
+stored per hook and reconstructed once from each fresh wallet snapshot; already
+prepaid mutation cost is not subtracted a second time on subsequent heartbeats.
+This avoids a spurious 15+1 split when exactly 6,000,000 ns funds a 3 ms batch
+mutation plus sixteen shares of a 3 ms observation lease. Local policy retains
+its existing floating-point estimates.
+
+The closing reserve forecast also includes known multi-window work: a separate
+per-window high-water estimate (at least 3 ms) is multiplied by
+`ceil(resolved live targets / 64)`, including resolved targets awaiting their
+first paid installation. The total forecast is itself monotonic. Heartbeat
+publishes this forecast before requesting an initial/recovery grant. It does
+not repeatedly multiply a previously aggregated total; retirement may show zero
+current targets while retaining the historical total forecast in diagnostics.
+
+`test/global_budget/run_mpi_lifecycle.py` keeps the 16-target recovery probe
+strict: a fully funded initial installation must contain all sixteen hooks in
+one physical batch, followed by a real STOP, restoration, and later calls.
+Its `unfunded`, `initial-once`, and `fallback` modes respectively verify native
+unchanged target bytes without credit, first installation with restoration
+disabled, and safe local installation after coordinator loss. An independent
+`multiwindow --targets /path/to/80-targets.txt --ranks 2` probe checks actual
+80-target installation over multiple batches and the two-window forecast. That
+probe exposes bounded fallback counts and makes no zero-fallback or performance
+claim; it does not weaken the original recovery check.
+
+A deferred, never-patched target set now explicitly publishes
+`initial_unexposed=true` in the version-2 global protocol. Such a rank has no
+executable profiling callbacks, so root need not reserve its 500 microseconds
+of emergency grace before any grant. A first grant atomically reserves its
+whole credit, closing forecast and lifetime grace. Root permanently latches
+that exposure even if a cached `initial_unexposed=true` sample arrives later or
+unused credit is returned. Physical installation or local fallback permanently
+changes the producer flag to false; a later false-to-true transition is invalid.
+Legacy/immediate installation uses the conservative default false. The actual
+500 microsecond lifetime callback allowance is unchanged.
+
+The controller also returns idle credit at a proven physical boundary: every
+hook is inactive and no attach/detach mutation remains pending. It does this
+after releasing its lock and temporarily suppresses new heartbeat admission
+while returning. This clears the old immutable recovery goal even when a short
+ATTACH-to-STOP interval occurred entirely between heartbeat snapshots. A later
+request can then use the newly measured mutation cost instead of remaining
+stuck with an obsolete smaller lease. Controller trace kind 8 records that
+boundary and its `control_fee_ns`; recovery goals are included in trace events
+for rank-local ordering checks. Partial closure does not return active credit.
+
+Physical membership is now published directly at successful backend/Gum patch
+boundaries, before resumed application threads can outrun a heartbeat. A batch
+updates individual physical flags then publishes one count; logical REQUESTED
+states do not count. The bounded atomic transport setter makes this count
+supersede older heartbeat snapshots in client admission and root decisions.
+MPI bootstrap republishes the current physical count after service start, so
+explicit immediate activation is also represented. Retirement still overrides
+membership to zero after callback quiescence. This fixes a missed-input window;
+it does not convert genuine budget denial or finite-grace fallback into success.

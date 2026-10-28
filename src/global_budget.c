@@ -6,6 +6,7 @@ uint64_t peak_global_budget_nonce(void) { return 0; }
 void peak_global_budget_set_nonce(uint64_t n) { (void)n; }
 int peak_global_budget_start(const char *h,unsigned short p,unsigned r,unsigned s,double t,void(*w)(void)) { (void)h;(void)p;(void)r;(void)s;(void)t;(void)w;return -1; }
 void peak_global_budget_publish(const PeakGlobalBudgetSample *s) { (void)s; }
+void peak_global_budget_physical_targets(uint32_t n) { (void)n; }
 PeakGlobalBudgetView peak_global_budget_view(void) { return (PeakGlobalBudgetView){0}; }
 bool peak_global_budget_active(void) { return false; }
 bool peak_global_budget_try_spend(uint64_t n) { (void)n;return false; }
@@ -41,7 +42,7 @@ void peak_global_budget_stop(void) {}
 #include <time.h>
 #include <unistd.h>
 
-/* Version one is a homogeneous-host protocol, confined to an MPI job. */
+/* Version two is a homogeneous-host protocol, confined to an MPI job. */
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "budget credits require lock-free 64-bit atomics");
 _Static_assert(__atomic_always_lock_free(sizeof(double), 0), "budget views require lock-free doubles");
 #define LIMIT 64
@@ -51,6 +52,8 @@ _Static_assert(__atomic_always_lock_free(sizeof(double), 0), "budget views requi
 #define MAX_TOTAL_NS UINT64_C(999999999000000000)
 _Static_assert(MAX_SPEND_NS <= INT64_MAX / INT32_MAX, "temporary debit marker must not overflow");
 #define MAGIC UINT32_C(0x50474231)
+#define PROTOCOL_VERSION 2
+#define GRACE_NS UINT64_C(500000)
 #define FRESH_NS UINT64_C(1000000000)
 #ifndef PEAK_GLOBAL_BUDGET_IO_CHUNK
 #define PEAK_GLOBAL_BUDGET_IO_CHUNK 65536
@@ -72,7 +75,7 @@ typedef struct {
 } Peer;
 typedef struct {
     PeakGlobalBudgetSample latest;
-    bool seen, connected, wants_credit, registered, participant;
+    bool seen, connected, wants_credit, registered, participant, grace_exposed;
     double reservation, previous_cost, granted_total, closing_estimate;
     uint64_t consumed_ns, requested_ns, demand_generation, actioned_generation, message_sequence, returned_ns;
     uint64_t last_update, registration_generation, member_generation, member_sample_sequence, fulfilled_generation, credit_total_ns, profile_ns, control_ns;
@@ -98,6 +101,14 @@ static _Atomic pid_t owner;
 static pthread_t worker;
 static atomic_bool running, pressure_notice, flush_requested, local_retiring, request_recovery;
 static atomic_uint local_attached;
+/* High bit marks controller evidence; HB counts are fallback only. */
+static atomic_uint_fast64_t physical_targets;
+static uint32_t effective_targets(uint32_t fallback)
+{
+    if (atomic_load(&local_retiring)) return 0;
+    uint64_t word = atomic_load_explicit(&physical_targets, memory_order_acquire);
+    return word >> 32 ? (uint32_t)word : fallback;
+}
 static atomic_uint_fast64_t recovery_target_ns, consumed_control_ns;
 static atomic_int_fast64_t available_ns;
 static atomic_uint_fast64_t rejected_spend_count;
@@ -155,7 +166,8 @@ static bool valid_sample(const PeakGlobalBudgetSample *s, const Rank *r)
         s->unfunded_seconds >= r->latest.unfunded_seconds &&
         s->settled_control_credit_ns >= r->latest.settled_control_credit_ns &&
         (!r->latest.retiring || s->retiring) &&
-        (!r->latest.final || (s->final && s->sequence == r->latest.sequence));
+        (!r->latest.final || (s->final && s->sequence == r->latest.sequence)) &&
+        (!s->initial_unexposed || r->latest.initial_unexposed);
 }
 static void publish_view(PeakGlobalBudgetView v)
 {
@@ -313,7 +325,7 @@ static int write_frame(Peer *p)
 }
 static bool header(const Frame *f)
 {
-    return f->magic == MAGIC && f->version == 1 && f->nonce == job_nonce && f->rank < world && f->size == world;
+    return f->magic == MAGIC && f->version == PROTOCOL_VERSION && f->nonce == job_nonce && f->rank < world && f->size == world;
 }
 static bool disconnect(Peer *p, Rank *ranks)
 {
@@ -331,6 +343,7 @@ static int service_poll_timeout(const Peer *local, uint64_t last_target, bool re
         atomic_load(&returned_ns) != local->outgoing.returned_ns ||
         atomic_load(&pressure_notice) != local->outgoing.request_credit ||
         atomic_load(&local_completed_wave) > local->outgoing.sample.completed_wave ||
+        effective_targets(atomic_load(&local_attached)) != local->outgoing.sample.attached_targets ||
         atomic_load(&local_retiring) != local->outgoing.sample.retiring ||
         (atomic_load(&local_retiring) && atomic_load(&public_wave) > local->outgoing.sample.completed_wave);
     return recheck || (!local->pending && urgent) ? 0 : (broken ? 10 : 100);
@@ -352,12 +365,13 @@ static Frame request_snapshot(void)
     PEAK_GLOBAL_BUDGET_TEST_SNAPSHOT_HOOK();
 #endif
     pthread_mutex_lock(&sample_mutex);
-    Frame next = {.magic = MAGIC, .version = 1, .nonce = job_nonce, .rank = rank_id,
+    Frame next = {.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce, .rank = rank_id,
         .size = world, .sample = local_sample, .demand_generation = generation,
         .consumed_profile_ns = atomic_load_explicit(&consumed_ns, memory_order_acquire),
         .consumed_control_ns = atomic_load_explicit(&consumed_control_ns, memory_order_acquire),
         .returned_ns = atomic_load_explicit(&returned_ns, memory_order_acquire)};
     pthread_mutex_unlock(&sample_mutex);
+    next.sample.attached_targets = effective_targets(next.sample.attached_targets);
     return next;
 }
 static void acknowledge_request(uint64_t acknowledged, uint64_t now)
@@ -375,6 +389,47 @@ static void acknowledge_request(uint64_t acknowledged, uint64_t now)
     atomic_store_explicit(&pressure_notice, false, memory_order_release);
     if (atomic_load_explicit(&demand_generation, memory_order_acquire) > acknowledged)
         atomic_store_explicit(&pressure_notice, true, memory_order_release);
+}
+static uint64_t closing_reserve_ns(const Rank *r)
+{
+    double ns = ceil(fmax(.003, r->closing_estimate) * 1e9);
+    return ns >= (double)MAX_TOTAL_NS ? MAX_TOTAL_NS : (uint64_t)ns;
+}
+static uint64_t grace_reserve_ns(const Rank *ranks, unsigned count)
+{
+    uint64_t ns = 0;
+    for (unsigned i = 0; i < count; ++i)
+        if (!ranks[i].seen || ranks[i].grace_exposed) ns += GRACE_NS;
+    return ns;
+}
+typedef struct { uint64_t credit, closing, grace; } CreditGrant;
+static CreditGrant grant_rank_credit(Rank *r, uint64_t free_ns)
+{
+    CreditGrant grant = {0};
+    if (!r->wants_credit) return grant;
+    uint64_t desired = r->requested_ns > 100000 ? r->requested_ns : 100000;
+    bool recovery = !r->latest.attached_targets;
+    if (!recovery) {
+        double predicted = fmin((double)MAX_TOTAL_NS, ceil(r->latest.pressure * .02 * 1e9));
+        if (predicted > (double)desired) desired = (uint64_t)predicted;
+    }
+    uint64_t reserved = r->credit_total_ns - r->consumed_ns - r->returned_ns;
+    uint64_t gap = desired > reserved ? desired - reserved : 0;
+    uint64_t closing = r->registered ? 0 : closing_reserve_ns(r);
+    uint64_t grace = r->grace_exposed ? 0 : GRACE_NS;
+    if (free_ns < closing || free_ns - closing < grace) return grant;
+    uint64_t lend = free_ns - closing - grace;
+    if (lend > MAX_TOTAL_NS - r->credit_total_ns) lend = MAX_TOTAL_NS - r->credit_total_ns;
+    /* Both detached recovery and the first unexposed membership need one
+     * complete paid lease, closing reserve and grace. No fragment is parked. */
+    if ((recovery || !r->grace_exposed) && lend < gap) return grant;
+    grant.credit = gap < lend ? gap : lend; grant.closing = closing; grant.grace = grace;
+    if (!r->registered) { r->registered = true; r->registration_generation = r->demand_generation; }
+    if (grace) r->grace_exposed = true;
+    r->credit_total_ns += grant.credit;
+    r->granted_total = (double)r->credit_total_ns / 1e9;
+    r->reservation = (double)(reserved + grant.credit) / 1e9;
+    return grant;
 }
 static void *service(void *unused)
 {
@@ -441,6 +496,7 @@ static void *service(void *unused)
                 r->demand_generation = f.demand_generation;
                 if (f.sample.settled_control_credit_ns > f.consumed_control_ns || !valid_sample(&f.sample, r)) { (void)disconnect(p, ranks); broken = true; continue; }
                 p->rank = (int)f.rank;
+                if (!f.sample.initial_unexposed) r->grace_exposed = true;
                 if (f.consumed_profile_ns < r->profile_ns || f.consumed_control_ns < r->control_ns || f.returned_ns < r->returned_ns ||
                     f.consumed_profile_ns > r->credit_total_ns || f.consumed_control_ns > r->credit_total_ns - f.consumed_profile_ns ||
                     f.returned_ns > r->credit_total_ns - f.consumed_profile_ns - f.consumed_control_ns) {
@@ -478,10 +534,11 @@ static void *service(void *unused)
                     r->latest.sequence > r->member_sample_sequence &&
                     r->registration_generation <= r->member_generation)))
                     r->registered = false;
-                if (r->registered) closing_reserve += fmax(.003, r->closing_estimate);
+                if (r->registered) closing_reserve += (double)closing_reserve_ns(r) / 1e9;
             }
             double budget = ratio * (seconds_now() - start + atomic_load(&earned_origin));
-            double remaining = fmax(0, budget - spent - reserved - .0005 * world - closing_reserve);
+            double grace_reserve = (double)grace_reserve_ns(ranks, world) / 1e9;
+            double remaining = fmax(0, budget - spent - reserved - grace_reserve - closing_reserve);
             if (wave_pending && done) {
                 span = seconds_now() - wave_start; completed_wave = wave; wave_pending = false;
                 record_event('D', rank_id, 0, wave, span);
@@ -496,33 +553,13 @@ static void *service(void *unused)
                 for (unsigned k = 0; k < world && remaining > 0; ++k) {
                     unsigned i = (allocation_cursor + k) % world;
                     Rank *r = &ranks[i];
-                    if (!r->wants_credit) continue;
-                    uint64_t desired = r->requested_ns > 100000 ? r->requested_ns : 100000;
-                    bool recovery = !r->latest.attached_targets;
-                    if (!recovery) {
-                        double predicted = fmin((double)MAX_TOTAL_NS, ceil(r->latest.pressure * .02 * 1e9));
-                        if (predicted > (double)desired) desired = (uint64_t)predicted;
-                    }
-                    uint64_t reserved_ns = r->credit_total_ns - r->consumed_ns - r->returned_ns;
-                    uint64_t gap = desired > reserved_ns ? desired - reserved_ns : 0;
-                    double closing = r->registered ? 0 : fmax(.003, r->closing_estimate);
-                    if (remaining < closing) continue;
-                    double lendable = fmin((double)(MAX_TOTAL_NS - r->credit_total_ns), floor((remaining - closing) * 1e9));
-                    uint64_t lend_ns = lendable > 0 ? (uint64_t)lendable : 0;
-                    if (lend_ns > MAX_TOTAL_NS - r->credit_total_ns) lend_ns = MAX_TOTAL_NS - r->credit_total_ns;
-                    /* No D or partial R is held unless a detached recovery's
-                     * entire exact-integer gap fits this earned pool. */
-                    if (recovery && lend_ns < gap) continue;
-                    if (!r->registered) {
-                        r->registered = true; r->registration_generation = r->demand_generation;
-                        remaining -= closing; closing_reserve += closing;
-                    }
-                    uint64_t grant_ns = gap < lend_ns ? gap : lend_ns;
-                    double grant = (double)grant_ns / 1e9;
-                    r->credit_total_ns += grant_ns;
-                    r->granted_total = (double)r->credit_total_ns / 1e9;
-                    r->reservation = (double)(reserved_ns + grant_ns) / 1e9;
-                    remaining = fmax(0, remaining - grant);
+                    double free_money = fmin((double)MAX_TOTAL_NS, floor(remaining * 1e9));
+                    uint64_t free_ns = free_money > 0 ? (uint64_t)free_money : 0;
+                    CreditGrant issued = grant_rank_credit(r, free_ns);
+                    closing_reserve += (double)issued.closing / 1e9;
+                    grace_reserve += (double)issued.grace / 1e9;
+                    double grant = (double)issued.credit / 1e9;
+                    remaining = fmax(0, remaining - (double)(issued.credit + issued.closing + issued.grace) / 1e9);
                     if (grant > 0) record_event('G', i, r->demand_generation, wave, grant);
                 }
                 allocation_cursor = (allocation_cursor + 1) % world;
@@ -566,11 +603,11 @@ static void *service(void *unused)
                 if (!urgent && now_ns - p->last_send < UINT64_C(100000000)) continue;
                 p->last_send = now_ns;
                 uint64_t decision = ++reply_sequence;
-                p->outgoing = (Frame){.magic = MAGIC, .version = 1, .nonce = job_nonce, .rank = id,
+                p->outgoing = (Frame){.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce, .rank = id,
                     .size = world, .reply_sequence = decision,
                     .view = {.granted_total_ns = ranks[id].credit_total_ns, .active = all, .cohort_finalized = all_final, .returned_total_ns = ranks[id].returned_ns, .wave_participant = ranks[id].participant, .acknowledged_demand_generation = ranks[id].fulfilled_generation, .wave = wave, .decision_sequence = decision, .view_epoch = decision, .root_completed_wave = completed_wave,
                         .acknowledged_sequence = ranks[id].latest.sequence,
-                        .budget_seconds = budget, .reserved_seconds = reserved, .control_reserve_seconds = .0005 * world + closing_reserve, .global_spent_seconds = spent,
+                        .budget_seconds = budget, .reserved_seconds = reserved, .control_reserve_seconds = grace_reserve + closing_reserve, .global_spent_seconds = spent,
                         .remaining_seconds = remaining,
                         .allowance_seconds = ranks[id].reservation,
                         .wave_span_seconds = span, .granted_total_seconds = ranks[id].granted_total}};
@@ -646,7 +683,8 @@ static void *service(void *unused)
             bool urgent = atomic_exchange(&flush_requested, false) || next.returned_ns != prior->returned_ns || request_target != last_request_target ||
                 next.demand_generation != prior->demand_generation || next.request_credit != prior->request_credit ||
                 next.sample.completed_wave != prior->sample.completed_wave || next.sample.retiring != prior->sample.retiring || next.sample.final != prior->sample.final ||
-                next.sample.finalizer_invalid != prior->sample.finalizer_invalid;
+                next.sample.finalizer_invalid != prior->sample.finalizer_invalid ||
+                next.sample.attached_targets != prior->sample.attached_targets;
             if (next.sample.sequence && (urgent || now_ns - local.last_send >= UINT64_C(100000000))) {
 #ifdef PEAK_GLOBAL_BUDGET_TEST_REQUEST_DELAY_US
                 if (next.demand_generation != prior->demand_generation) {
@@ -701,7 +739,7 @@ static void *service(void *unused)
         int64_t balance = atomic_load_explicit(&available_ns, memory_order_acquire);
         uint64_t keep = atomic_load(&low_water_ns);
         pthread_mutex_lock(&sample_mutex);
-        bool attached = local_sample.attached_targets > 0;
+        bool attached = effective_targets(local_sample.attached_targets) > 0;
         pthread_mutex_unlock(&sample_mutex);
         if (attached && !idle_returned && now_ns - last_consumption >= UINT64_C(100000000) &&
             !atomic_load(&pressure_notice) && !atomic_load(&request_started_ns) &&
@@ -738,7 +776,7 @@ int peak_global_budget_start(const char *host, unsigned short port, unsigned ran
     trace_enabled = (trace && !strcmp(trace, "1")) || (legacy_trace && !strcmp(legacy_trace, "1"));
     client = fd; rank_id = rank; world = size; ratio = target; notify = wake;
     atomic_store(&owner, getpid());
-    atomic_store(&earned_origin, 0); atomic_store(&local_retiring, false);
+    atomic_store(&physical_targets, 0); atomic_store(&earned_origin, 0); atomic_store(&local_retiring, false);
     atomic_store(&rejected_spend_count, 0); atomic_store(&available_ns, 0); atomic_store(&local_attached, 0); atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false);
     atomic_store(&finalizer_state, 0); atomic_store(&public_finalized, false);
     atomic_store(&public_accounting_invalid, false); atomic_store(&root_final_sent, false);
@@ -760,12 +798,19 @@ void peak_global_budget_publish(const PeakGlobalBudgetSample *s)
     if (s->retiring) atomic_store(&local_retiring, true);
     if (!local_sample.final && s->sequence > local_sample.sequence) {
         local_sample = *s; atomic_store(&local_attached, s->attached_targets);
-        if (s->attached_targets) { atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); }
+        if (effective_targets(s->attached_targets)) { atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); }
     }
     local_sample.retiring = atomic_load(&local_retiring);
     pthread_mutex_unlock(&sample_mutex);
     if (s->final) atomic_store(&flush_requested, true);
     if (first || s->retiring) poke();
+}
+void peak_global_budget_physical_targets(uint32_t count)
+{
+    if (getpid() != atomic_load(&owner) || !atomic_load(&running)) return;
+    uint64_t word = (UINT64_C(1) << 32) | count;
+    if (atomic_exchange_explicit(&physical_targets, word, memory_order_acq_rel) != word) poke();
+    if (count) { atomic_store(&recovery_target_ns, 0); atomic_store(&request_recovery, false); }
 }
 void peak_global_budget_startup(double seconds)
 {
@@ -825,7 +870,7 @@ void peak_global_budget_pressure(void)
 {
     if (getpid() == atomic_load(&owner) && !atomic_load(&local_retiring) &&
         !atomic_exchange_explicit(&pressure_notice, true, memory_order_acq_rel))
-        { atomic_store(&request_recovery, !atomic_load(&local_attached));
+        { atomic_store(&request_recovery, !effective_targets(atomic_load(&local_attached)));
           uint64_t now = ns_now(CLOCK_MONOTONIC); atomic_store(&request_started_ns, now);
           atomic_store(&public_deadline, now + UINT64_C(100000000));
           atomic_fetch_add_explicit(&demand_generation, 1, memory_order_release);
@@ -835,7 +880,7 @@ void peak_global_budget_request_credit(uint64_t amount)
 {
     if (getpid() != atomic_load(&owner) || atomic_load(&local_retiring)) return;
     uint64_t debit = atomic_load(&debit_ns);
-    if (!atomic_load(&local_attached)) {
+    if (!effective_targets(atomic_load(&local_attached))) {
         uint64_t target = atomic_load(&recovery_target_ns);
         if (!target) {
             uint64_t zero = 0;
@@ -858,7 +903,7 @@ void peak_global_budget_request_credit(uint64_t amount)
     bool prior = atomic_load_explicit(&pressure_notice, memory_order_acquire);
     peak_global_budget_pressure();
     if (prior && changed) {
-        atomic_store(&request_recovery, !atomic_load(&local_attached));
+        atomic_store(&request_recovery, !effective_targets(atomic_load(&local_attached)));
         /* A larger target is a new demand, so an ACK for the smaller target
          * cannot certify it. Successful callbacks coalesce while pending. */
         uint64_t now = ns_now(CLOCK_MONOTONIC);

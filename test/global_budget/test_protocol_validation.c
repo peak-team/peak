@@ -31,10 +31,10 @@ int main(void)
     s.unfunded_seconds=.0006;assert(!valid_sample(&s,&r));s=r.latest;
     s.unfunded_seconds=.0003;assert(!valid_sample(&s,&r));
     world=4;job_nonce=123;
-    Frame f={.magic=MAGIC,.version=1,.rank=3,.size=4,.nonce=123};
+    Frame f={.magic=MAGIC,.version=PROTOCOL_VERSION,.rank=3,.size=4,.nonce=123};
     assert(header(&f));f.nonce++;assert(!header(&f));f.nonce=123;
-    f.rank=4;assert(!header(&f));f.rank=3;f.version=2;assert(!header(&f));
-    f.version=1;
+    f.rank=4;assert(!header(&f));f.rank=3;f.version=1;assert(!header(&f));
+    f.version=PROTOCOL_VERSION;
     int pair[2];assert(!socketpair(AF_UNIX,SOCK_STREAM|SOCK_NONBLOCK,0,pair));
     Peer p={.fd=pair[0],.rank=-1};size_t offset=0;
     while(offset<sizeof(f)){

@@ -385,6 +385,7 @@ void peak_general_listener_controller_wake(void);
 PEAK_API void peak_general_listener_enable_funded_initial_attach(void);
 PEAK_API void peak_general_listener_funded_initial_attach_fallback(void);
 PEAK_API void peak_general_listener_global_budget_startup(double seconds, int ready);
+PEAK_API void peak_general_listener_global_physical_snapshot(void);
 
 /**
  * @brief Marks a dynamically published hook attached.

@@ -10,7 +10,7 @@ int main(void)
     PeakGlobalBudgetSample s={.sequence=1,.elapsed_seconds=.1};
     peak_global_budget_publish(&s);
     int raw=connect_host("127.0.0.1",port);assert(raw>=0);
-    Frame f={.magic=MAGIC,.version=1,.nonce=job_nonce,.rank=1,.size=2,
+    Frame f={.magic=MAGIC,.version=PROTOCOL_VERSION,.nonce=job_nonce,.rank=1,.size=2,
         .message_sequence=1,.sample={.sequence=1,.elapsed_seconds=.1}};
     size_t sent=0;double deadline=seconds_now()+1;
     while(sent<sizeof(f)&&seconds_now()<deadline){

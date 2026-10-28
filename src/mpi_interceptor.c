@@ -409,6 +409,7 @@ peak_mpi_global_budget_bootstrap(int result, int required, double original_secon
     if (elapsed < 0.0) clock_valid = 0;
     double previous = 0.0;
     unsigned attempt = 0;
+    if (started == 0) peak_general_listener_global_physical_snapshot();
     if (started == 0 && clock_valid) {
         peak_global_budget_origin(original_seconds);
         const struct timespec pause = {0, 1000000};

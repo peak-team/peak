@@ -16,6 +16,7 @@
 #include "../../benchmarks/mpi_rank_budget/targets.inc"
 #undef TARGET
 static int (*coordinator_active)(void);
+static uint32_t (*physical_targets)(void);
 static double now(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9; }
 typedef struct { uint64_t a,b; } Aff;
 static Aff compose(Aff f,Aff g) { return (Aff){f.a*g.a,f.a*g.b+f.b}; }
@@ -38,7 +39,7 @@ static int work(double seconds,unsigned calls,int hot,
         } while(now()<deadline);
     }
     PeakGlobalBudgetView v=view();
-    printf("lifecycle rank=%d hot=%d seconds=%.9g iterations=%llu active=%d coherent=%d wave=%llu root_done=%llu credit=%llu inactive=%d oracle_bad=%d\n",rank,hot,seconds,(unsigned long long)iterations,coordinator_active(),(int)v.active,(unsigned long long)v.wave,(unsigned long long)v.root_completed_wave,(unsigned long long)v.local_credit_ns,inactive,bad);fflush(stdout);
+    printf("lifecycle rank=%d hot=%d seconds=%.9g iterations=%llu active=%d coherent=%d wave=%llu root_done=%llu credit=%llu physical=%u inactive=%d oracle_bad=%d\n",rank,hot,seconds,(unsigned long long)iterations,coordinator_active(),(int)v.active,(unsigned long long)v.wave,(unsigned long long)v.root_completed_wave,(unsigned long long)v.local_credit_ns,physical_targets(),inactive,bad);fflush(stdout);
     return bad || inactive;
 }
 int main(int argc,char **argv)
@@ -46,7 +47,8 @@ int main(int argc,char **argv)
     if(argc==2&&!strcmp(argv[1],"clock-guard")) {
         int (*guard)(void)=dlsym(RTLD_DEFAULT,"mpi_interceptor_test_bootstrap_clock_guard");
         int (*grace)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_grace_faa");
-        return guard&&grace ? (guard() || grace()) : 2;
+        int (*admission)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_admission_ns");
+        return guard&&grace&&admission ? (guard() || grace() || admission()) : 2;
     }
     unsigned char original_target[16];
     memcpy(original_target, (const void*)&pressure_000, sizeof(original_target));
@@ -54,7 +56,8 @@ int main(int argc,char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
     PeakGlobalBudgetView (*view)(void)=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_view");
     coordinator_active=dlsym(RTLD_DEFAULT,"peak_general_listener_test_global_active");
-    if(!view||!coordinator_active||provided<MPI_THREAD_FUNNELED||argc!=2) MPI_Abort(MPI_COMM_WORLD,2);
+    physical_targets=dlsym(RTLD_DEFAULT,"peak_general_listener_test_physical_targets");
+    if(!view||!coordinator_active||!physical_targets||provided<MPI_THREAD_FUNNELED||argc!=2) MPI_Abort(MPI_COMM_WORLD,2);
     cpu_set_t masks[2];
     if(omp_get_max_threads()!=2) MPI_Abort(MPI_COMM_WORLD,2);
 #pragma omp parallel
@@ -64,6 +67,7 @@ int main(int argc,char **argv)
     int bad=0;
     if(!strcmp(argv[1],"unfunded")) {
         bad |= memcmp(original_target, (const void*)&pressure_000, sizeof(original_target)) != 0;
+        bad |= physical_targets() != 0;
         bad |= work(.1,2000,1,view,rank,1);
         bad |= memcmp(original_target, (const void*)&pressure_000, sizeof(original_target)) != 0;
         printf("lifecycle rank=%d initially_unpatched=%d\n",rank,!bad);fflush(stdout);
@@ -90,7 +94,7 @@ int main(int argc,char **argv)
             bad|=work(.15,8,0,view,rank,1);
         }
         MPI_Comm_free(&peers);
-    } else if(!strcmp(argv[1],"recovery") || !strcmp(argv[1],"initial-once")) {
+    } else if(!strcmp(argv[1],"recovery") || !strcmp(argv[1],"initial-once") || !strcmp(argv[1],"multiwindow")) {
         bad|=work(2.0,8,0,view,rank,1);
         MPI_Barrier(MPI_COMM_WORLD);
         bad|=work(.25,2000,1,view,rank,1);

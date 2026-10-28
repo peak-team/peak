@@ -61,8 +61,9 @@ def global_report(text):
 def timing_and_events(text):
     timing=[];events=[]
     for line in text.splitlines():
-        if 'MPI timing:' in line:
+        if any(label in line for label in ('MPI timing:', 'MPI report timing:', 'MPI settlement timing:')):
             values=dict(re.findall(r'(\w+)=([^\s]+)',line))
+            values['timing_kind']='report' if 'MPI report timing:' in line else ('settlement' if 'MPI settlement timing:' in line else 'mpi')
             for key,value in list(values.items()):
                 if key.endswith('_seconds') or key=='seconds':
                     n=float(value)
@@ -105,11 +106,12 @@ def restoration_proof(text, parsed):
     return proofs
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','all'),default='small');a=p.parse_args();cases={};errors={}
+    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','all'),default='small');a=p.parse_args();cases={};errors={}
     matrix=tuple(sy+'-'+la for sy in ('allreduce','barrier','bcast','ring','iallreduce') for la in ('rotating','slack','critical','aligned'))
     funded=tuple('funded-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     funded+=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
-    selected={'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
+    matrix22=matrix+('bcast-rotating-repeat1','bcast-rotating-repeat2')
+    selected={'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
     for name in selected:
       try:
         root=a.results/name;runs={l:workload(root,l) for l in LABELS};ref=runs['N0'];reports={}
@@ -184,5 +186,21 @@ def main():
                 rows.append({'rank':rank,'local':local,'global':glob,'timing_events':parsed,'post_wave_restoration_proofs':restoration_proof(text,parsed)})
             diagnostics[name]={'workload':work,'ranks':rows,'restoration_proof_ranks':sum(bool(r['post_wave_restoration_proofs']) for r in rows)}
         except (OSError,ValueError,KeyError) as e:errors[name]=str(e)
-    print(json.dumps({'diagnostics':diagnostics,'valid':not errors and len(cases)==len(selected),'errors':errors,'cases':cases,'note':'Final fresh=0 is expected after service shutdown. Do not sum snapshots from different epochs or ranks; use coordinator diagnostics as recorded. global_spent conservatively sums rank costs; wave_span is a root GO-to-all-DONE diagnostic and does not replace summed control charges. allowance is rank-local unconsumed reservation, budget is job-wide. This is not a hard slowdown proof.'},indent=2));return bool(errors)
+    pooled={}
+    repeat_names=('bcast-rotating','bcast-rotating-repeat1','bcast-rotating-repeat2')
+    if all(name in cases for name in repeat_names):
+        repeat_ref=cases[repeat_names[0]]['workloads']['N0']
+        for name in repeat_names[1:]:
+            other=cases[name]['workloads']['N0']
+            if any(other[key]!=repeat_ref[key] for key in ('config','scenario','bindings')) or any(other['phases'][phase]['checksum']!=repeat_ref['phases'][phase]['checksum'] for phase in ('warmup','phase')):
+                errors['bcast-repeat-pairing']='repeated work/config/binding mismatch'
+        # Keep all independently matched groups visible; pool all six samples equally.
+        for group in ('native','local','global'):
+            pooled[group]={}
+            for metric in ('main','warmup_main','main_to_finalize'):
+                samples=[sample for name in repeat_names for sample in cases[name]['performance'][group][metric]['samples']]
+                pooled[group][metric]={'samples':samples,'mean':statistics.mean(samples),'minimum':min(samples),'maximum':max(samples),'source_cases':list(repeat_names)}
+        for group in pooled.values():
+            for metric,row in group.items():row['ratio_to_native']=row['mean']/pooled['native'][metric]['mean']
+    print(json.dumps({'bcast_rotating_six_sample_pooled':pooled,'diagnostics':diagnostics,'valid':not errors and len(cases)==len(selected),'errors':errors,'cases':cases,'note':'Final fresh=0 is expected after service shutdown. Do not sum snapshots from different epochs or ranks; use coordinator diagnostics as recorded. global_spent conservatively sums rank costs; wave_span is a root GO-to-all-DONE diagnostic and does not replace summed control charges. allowance is rank-local unconsumed reservation, budget is job-wide. This is not a hard slowdown proof.'},indent=2));return bool(errors)
 if __name__=='__main__':raise SystemExit(main())

@@ -41,6 +41,38 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def first_paid_batches(text):
+    batches, current = [], 0
+    for line in text.splitlines():
+        if 'global controller event:' not in line:
+            continue
+        event = dict(re.findall(r'(\w+)=([^ ]+)', line))
+        if event.get('kind') in ('4', '5') and current:
+            batches.append(current)
+            current = 0
+        elif event.get('kind') == '7':
+            current += 1
+    if current:
+        batches.append(current)
+    return batches
+
+
+def post_stop_initial_funding(text):
+    events = [dict(re.findall(r'(\w+)=([^ ]+)', line))
+              for line in text.splitlines() if 'global controller event:' in line]
+    proofs = []
+    for boundary in events:
+        if boundary.get('kind') != '8' or int(boundary.get('control_fee_ns', 0)) <= 3000000:
+            continue
+        fee = int(boundary['control_fee_ns'])
+        later = [event for event in events if event.get('kind') == '7'
+                 and int(event['monotonic_ns']) > int(boundary['monotonic_ns'])
+                 and int(event.get('recovery_target_ns', 0)) >= 2 * fee]
+        if later:
+            proofs.append({'idle_return': boundary, 'new_initial_installs': later})
+    return proofs
+
+
 def validate_lifecycle(directory, receipt):
     mode = receipt['mode']
     bindings = {int(rank): pair for rank, pair in receipt['bindings'].items()}
@@ -48,6 +80,12 @@ def validate_lifecycle(directory, receipt):
     if mode in ('recovery', 'skew'):
         assert receipt.get('postwave_restore_revisit'), 'no actual post-wave restore/revisit proved'
     root_text = (directory / 'rank-0.err').read_text()
+    if mode == 'recovery' and 'policy=fund-before-attach-post-init' in root_text:
+        batches = receipt.get('first_paid_batches') or [
+            {'rank': rank['rank'], 'batch_sizes': first_paid_batches(
+                (directory / ('rank-' + str(rank['rank']) + '.err')).read_text())}
+            for rank in receipt['ranks']]
+        assert batches and all(16 in rank['batch_sizes'] for rank in batches), 'first install split a fully funded 16-hook batch'
     original = re.search(r'MPI timing: stage=init original_seconds=([^ ]+)', root_text)
     ratio = float(receipt['environment']['PEAK_GLOBAL_OVERHEAD_RATIO'])
     debt_views = []
@@ -67,7 +105,8 @@ def validate_lifecycle(directory, receipt):
             text = (directory / f'rank-{rank}.err').read_text()
             out = (directory / f'rank-{rank}.out').read_text()
             assert 'initially_unpatched=1' in out, record
-            assert 'first_paid_attach_count=0 first_local_attach_count=0' in text, record
+            assert 'first_paid_attach_count=0 first_local_attach_count=0 initial_unexposed=1' in text, record
+            assert float(fields['control_reserve_seconds']) == 0, record
             assert '0 detached, 0 reattached, 0 revisited' in text, record
             assert int(fields['granted_total_ns']) == 0 if 'granted_total_ns' in fields else float(fields['granted_total_seconds']) == 0, record
         assert fields['invalid_accounting_samples'] == '0', record
@@ -78,15 +117,30 @@ def validate_lifecycle(directory, receipt):
             text = (directory / f'rank-{rank}.err').read_text()
             assert 'local_initial_patched=1' in (directory / f'rank-{rank}.out').read_text(), record
             initial = re.findall(r'first_local_attach_count=(\d+)', text)
-            assert initial and int(initial[-1]) > 0, record
+            assert initial and int(initial[-1]) > 0 and 'initial_unexposed=0' in text, record
+        if mode == 'multiwindow':
+            text = (directory / f'rank-{rank}.err').read_text()
+            paid = re.findall(r'first_paid_attach_count=(\d+)', text)
+            assert paid, record
+            record['first_paid_attach_count'] = int(paid[-1])
+            closing = re.findall(r'MPI closing forecast: .*total_seconds=([^\s]+)', text)
+            assert closing and float(closing[-1]) >= .006, record
+            batches = first_paid_batches(text)
+            assert batches and sum(batches) == int(paid[-1]) and max(batches) <= 64, record
+            record['first_paid_batch_sizes'] = batches
+            record['post_stop_initial_funding'] = post_stop_initial_funding(text)
         if mode == 'initial-once':
             text = (directory / f'rank-{rank}.err').read_text()
-            assert 'first_paid_attach_count=16' in text, record
+            assert 'first_paid_attach_count=16' in text and 'initial_unexposed=0' in text, record
             assert 'event: kind=7 ' in text and 'event: kind=6 ' not in text, record
             transitions = re.findall(r'Transition coverage.*: (\d+) detached, (\d+) reattached, (\d+) revisited', text)
             assert transitions and int(transitions[-1][0]) > 0 and transitions[-1][1:] == ('0', '0'), record
+        assert 0 <= float(fields['grace_used_seconds']) <= .000500001, record
         count = int(fields['emergency_fallback_count'])
-        if count:
+        if mode == 'multiwindow' and count:
+            record['bounded_probe_fallback'] = {'count': count,
+                'reason': 'observed bounded fallback in multiwindow functional probe; cause unclassified; no performance assertion'}
+        if count and mode != 'multiwindow':
             assert mode == 'skew' and count == 1 and original and debt_views, record
             assert float(debt_views[0]['startup_seconds']) > ratio * float(original.group(1)), record
             text = (directory / f'rank-{rank}.err').read_text()
@@ -106,6 +160,10 @@ def validate_lifecycle(directory, receipt):
             allowed += count
         assert all(value == '0' for value in record['inactive']), record
         assert record['oracle'] or (mode == 'skew' and rank == 0 and record['root_enter_finalize']), record
+    if mode == 'multiwindow':
+        assert any(rank['first_paid_attach_count'] == 80 and len(rank['first_paid_batch_sizes']) >= 2
+                   for rank in receipt['ranks']), 'no actual multi-window initial installation completed'
+        assert any(rank['post_stop_initial_funding'] for rank in receipt['ranks']), 'no new larger paid goal installed remaining initial targets after physical STOP'
     receipt['classified_startup_hardcaps'] = allowed
     receipt['original_receipt_sha256'] = sha(directory / 'receipt.json')
     destination = directory / ('classification-' + str(time.time_ns()) + '.json')
@@ -119,7 +177,8 @@ parser.add_argument('--replay', type=Path)
 parser.add_argument('--mpicc', default='/usr/lib64/mpich/bin/mpicc')
 parser.add_argument('--mpiexec', default='/usr/lib64/mpich/bin/mpiexec')
 parser.add_argument('--ranks', type=int, default=2)
-parser.add_argument('--mode', choices=('skew', 'recovery', 'unfunded', 'initial-once', 'fallback'))
+parser.add_argument('--mode', choices=('skew', 'recovery', 'unfunded', 'initial-once', 'fallback', 'multiwindow'))
+parser.add_argument('--targets', type=Path)
 parser.add_argument('--activation-policy', choices=('immediate', 'post-init'))
 parser.add_argument('--output', type=Path, default=Path('/tmp'))
 parser.add_argument('--timeout', type=float, default=35)
@@ -131,6 +190,8 @@ if args.library is None or args.mode is None:
     parser.error('--library and --mode are required without --replay')
 
 repo = Path(__file__).resolve().parents[2]
+if args.targets is None:
+    args.targets = repo / 'benchmarks/mpi_rank_budget/targets.txt'
 cpus = sorted(os.sched_getaffinity(0))
 assert 2 <= args.ranks <= 64 and len(cpus) >= 2 * args.ranks
 args.output.mkdir(parents=True, exist_ok=True)
@@ -141,7 +202,7 @@ sources = ('src/general_listener.c', 'src/mpi_interceptor.c', 'src/global_budget
            'src/logging.c', 'include/logging.h', 'src/general_listener/report_formatter.c',
            'include/general_listener.h', 'include/mpi_interceptor.h', 'include/internal/exec_interceptor_internal.h',
            'test/global_budget/mpi_lifecycle.c', 'benchmarks/mpi_rank_budget/targets.inc')
-provenance = {'library_sha256': sha(directory / 'libpeak.so'), 'harness_sha256': sha(__file__),
+provenance = {'library_sha256': sha(directory / 'libpeak.so'), 'harness_sha256': sha(__file__), 'targets_sha256': sha(args.targets),
               'source_sha256': {name: sha(repo / name) for name in sources}}
 assert run([args.mpicc, '-O2', '-g', '-fopenmp', '-fno-ipa-icf', '-rdynamic',
             '-I' + str(repo / 'include'), str(repo / 'test/global_budget/mpi_lifecycle.c'),
@@ -149,7 +210,7 @@ assert run([args.mpicc, '-O2', '-g', '-fopenmp', '-fno-ipa-icf', '-rdynamic',
 provenance['fixture_sha256'] = sha(directory / 'fixture')
 clock_env = {key: value for key, value in os.environ.items() if not key.startswith(('PEAK_', 'PMI', 'PMIX', 'OMPI_', 'MV2_', 'I_MPI_', 'SLURM_')) and key != 'LD_PRELOAD'}
 clock_env.update(LD_PRELOAD=str(directory / 'libpeak.so'), PEAK_MPI_GLOBAL_BUDGET='0',
-                 PEAK_TEXT_OUTPUT='0', PEAK_TARGET_FILE=str(repo / 'benchmarks/mpi_rank_budget/targets.txt'))
+                 PEAK_TEXT_OUTPUT='0', PEAK_TARGET_FILE=str(args.targets))
 assert run([str(directory / 'fixture'), 'clock-guard'], clock_env, 10, directory, 'bootstrap-clock-guard') == 0
 
 (directory / 'PROVENANCE.json').write_text(json.dumps(provenance, indent=2))
@@ -164,7 +225,7 @@ command = prefix + 'export LD_PRELOAD=' + shlex.quote(str(directory / 'libpeak.s
 env = {key: value for key, value in os.environ.items() if not key.startswith(('PEAK_', 'PMI', 'PMIX', 'OMPI_', 'MV2_', 'I_MPI_', 'SLURM_')) and key != 'LD_PRELOAD'}
 env.update(OMP_NUM_THREADS='2', OMP_DYNAMIC='FALSE', OMP_PROC_BIND='close',
            PEAK_MPI_GLOBAL_BUDGET='1', PEAK_GLOBAL_OVERHEAD_RATIO='.05',
-           PEAK_OVERHEAD_RATIO='.005', PEAK_TARGET_FILE=str(repo / 'benchmarks/mpi_rank_budget/targets.txt'),
+           PEAK_OVERHEAD_RATIO='.005', PEAK_TARGET_FILE=str(args.targets),
            PEAK_ENABLE_PER_TARGET_HEARTBEAT='1', PEAK_ENABLE_GLOBAL_HEARTBEAT='1',
            PEAK_ENABLE_REATTACH='1', PEAK_HEARTBEAT_INTERVAL='.01', PEAK_HB_MAX_US='10000',
            PEAK_REATTACH_COOLDOWN_MS='100', PEAK_SAFE_DETACH_MODE='strict',
@@ -193,6 +254,7 @@ for rank in range(args.ranks):
                             'inactive': re.findall(r'inactive=(\d+)', out),
                             'affinity': re.findall(r'^affinity .*', out, re.M)})
 proofs = []
+initial_batch_proofs = []
 for rank in range(args.ranks):
     err = (directory / f'rank-{rank}.err').read_text()
     counts = re.findall(r'\|\s+pressure_000\*+\|\s+(\d+)\|', err)
@@ -203,6 +265,8 @@ for rank in range(args.ranks):
         event = dict(re.findall(r'(\w+)=([^ ]+)', line))
         if event.get('kind') == '6' and event.get('hook_id') == '0' and int(event['completed_wave']) > 0 and final_calls > int(event['calls']):
             proofs.append({'rank': rank, 'event': event, 'final_calls': final_calls})
+    initial_batch_proofs.append({'rank': rank, 'batch_sizes': first_paid_batches(err)})
+receipt['first_paid_batches'] = initial_batch_proofs
 receipt['postwave_restore_revisit'] = proofs
 (directory / 'receipt.json').write_text(json.dumps(receipt, indent=2))
 validate_lifecycle(directory, receipt)

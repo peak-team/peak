@@ -24,7 +24,7 @@ int main(void)
  alarm(8);unsigned short port;assert(!peak_global_budget_listen(&port));assert(!peak_global_budget_start("127.0.0.1",port,0,2,.5,NULL));
  PeakGlobalBudgetSample s={.sequence=1,.elapsed_seconds=.1};peak_global_budget_publish(&s);
  int raw=connect_host("127.0.0.1",port);assert(raw>=0);
- Frame f={.magic=MAGIC,.version=1,.nonce=job_nonce,.rank=1,.size=2,.message_sequence=1,.sample={.sequence=1,.elapsed_seconds=.1}};
+ Frame f={.magic=MAGIC,.version=PROTOCOL_VERSION,.nonce=job_nonce,.rank=1,.size=2,.message_sequence=1,.sample={.sequence=1,.elapsed_seconds=.1}};
  raw_send(raw,&f);usleep(150000);
  f.message_sequence=2;f.request_credit=true;f.demand_generation=1;f.requested_ns=1000;raw_send(raw,&f);
  Frame before=raw_receive(raw,.000099999);

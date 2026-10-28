@@ -3,7 +3,7 @@
 This module uses one job-scoped, random-nonce TCP broker and one helper thread
 per process. It never calls MPI. The MPI init integration bootstraps the address,
 port and nonce on the application's initialization thread; all participating
-ranks must opt in. This first protocol is Linux/64-bit, homogeneous-ABI only,
+ranks must opt in. Protocol version 2 is Linux/64-bit, homogeneous-ABI only,
 with at most 64 ranks. Other platforms build inert API stubs.
 
 Runtime cost snapshots are cumulative, finite and monotonic. The root uses its
@@ -17,7 +17,7 @@ management, live finalizer CPU and service CPU are added separately. The rank
 cost keeps a monotonic high-water mark. This is a conservative estimate, not
 measured application slowdown. Unused grants are never reclaimed merely because they
 expired or a peer disconnected. The root retains max(3 ms, observed closing cost) per registered demand member
-and 500 us per rank for the session-wide unfunded grace; these are explicit initial
+and 500 us per exposed rank for the session-wide unfunded grace; these are explicit initial
 estimates, not certified upper bounds. Startup is charged once by rank zero.
 All helper threads' actual thread CPU time is reported automatically, including
 the root broker, and is charged once (not a second root-only surcharge).
@@ -107,8 +107,8 @@ Existing receipts can be checked without launching MPI:
 python3 test/global_budget/run_mpi_integration.py --replay /path/to/output
 ```
 
-The next implementation uses a dynamic closing reserve: 500 microseconds per
-rank for the unchanged session grace, plus max(3 milliseconds, observed closing
+The implementation uses a dynamic closing reserve: 500 microseconds per
+exposed rank for the unchanged session grace, plus max(3 milliseconds, observed closing
 cost) for each registered demand member. Installed cold hooks alone do not
 register a member. A wave carries an immutable personal `wave_participant` flag;
 cold ranks acknowledge it without physically detaching. Actual costs remain a
@@ -290,7 +290,25 @@ unpatched until a complete paid installation/observation lease is available.
 On supported MPI launches this is the default for global mode when the
 activation policy is unset. First installation uses the controller's ATTACH
 operation and event kind 7; a genuine post-detach restoration retains kind 6.
-The lifetime grace and future closing reserve are unchanged.
+The lifetime grace cap remains unchanged. Protocol v2 accepts an explicit
+`initial_unexposed` proof from deferred, never-patched ranks. Such a rank does
+not reserve grace until its first whole grant atomically funds the requested
+lease, closing reserve and 500us grace. Unknown and legacy ranks reserve grace
+conservatively. Exposure latches permanently on a grant or a producer's false
+declaration; returning unused credit does not release it. A stale true snapshot
+after a grant remains valid, but a producer's false-to-true transition fails
+closed. The broker never infers this proof from zero calls or attached counts.
+
+Controller-confirmed physical target counts override cached heartbeat counts.
+Successful backend changes publish an atomic membership event; a new event is
+sent urgently even if the heartbeat revision is unchanged. Once available,
+this evidence cannot be overwritten by a stale heartbeat. Retirement forces
+the effective count to zero. `test_physical_membership.c` also checks a real
+broker issues STOP for an active member whose cached heartbeat still says zero.
+
+`test_initial_exposure.c` covers 32 deferred versus legacy ranks, the exact
+first-grant boundary and one-nanosecond shortage, stale snapshots after grants,
+permanent exposure after returns, and a genuine TCP declaration rollback.
 
 `run_mpi_lifecycle.py` additionally accepts these real-MPI modes:
 
