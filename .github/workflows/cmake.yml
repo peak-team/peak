@@ -95,11 +95,22 @@ jobs:
         -DPEAK_BUILD_ATTACH=ON
         -DPEAK_FETCH_DEPS=ON
         -DBUILD_TESTING=ON
+        -DPEAK_ENABLE_RUNTIME_TEST_HOOKS=OFF
 
     - name: Build
       run: >
         cmake --build ${{ github.workspace }}/build --parallel
         --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config
+
+    - name: Test macOS attach executable and runtime
+      run: |
+        set -o pipefail
+        ctest --test-dir build --output-on-failure -V \
+          -R '^test_attach_(cli|config|runtime)$' 2>&1 | tee build/attach-ctest.log
+        if grep -Fq 'Skipped' build/attach-ctest.log; then
+          echo 'Attach runtime coverage was skipped; native injection is required.' >&2
+          exit 1
+        fi
 
     - name: Install
       run: cmake --install ${{ github.workspace }}/build
@@ -115,16 +126,6 @@ jobs:
           -DPEAK_EXPECT_CUDA_ENABLED=OFF
         cmake --build package-consumer
         ctest --test-dir package-consumer --output-on-failure
-
-    - name: Test macOS attach executable and runtime
-      run: |
-        set -o pipefail
-        ctest --test-dir build --output-on-failure -V \
-          -R '^test_attach_(cli|config|runtime)$' 2>&1 | tee build/attach-ctest.log
-        if grep -Fq 'Skipped' build/attach-ctest.log; then
-          echo 'Attach runtime coverage was skipped; native injection is required.' >&2
-          exit 1
-        fi
 
     - name: Upload macOS attach diagnostics
       if: failure()

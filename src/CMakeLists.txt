@@ -138,7 +138,7 @@ if(PEAK_GUM_DARWIN_PATCH_API_AVAILABLE AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     target_compile_definitions(peak PRIVATE PEAK_HAVE_GUM_DARWIN_PATCH_API=1)
 endif()
-if(BUILD_TESTS OR BUILD_TESTING)
+if(PEAK_ENABLE_RUNTIME_TEST_HOOKS)
     target_compile_definitions(peak PRIVATE PEAK_ENABLE_TEST_HOOKS=1)
     target_compile_definitions(peak PRIVATE PEAK_TARGET_RESOLVER_TESTING=1)
     if(TARGET cuda_interceptor_obj)
@@ -159,7 +159,7 @@ target_compile_definitions(cuda_interceptor_obj PRIVATE
     $<$<BOOL:${PEAK_CUDA_HAS_DRIVER_LAUNCH_EX}>:PEAK_CUDA_COMPILE_DRIVER_LAUNCH_EX=1>)
 endif()
 
-if(BUILD_TESTS OR BUILD_TESTING)
+if(PEAK_ENABLE_RUNTIME_TEST_HOOKS)
     # Internal integration tests share the test-enabled DSO's Gum runtime.
     # This artifact also exports PEAK test hooks and is never installed as a
     # production package by the package-contract jobs below.
@@ -179,7 +179,7 @@ else()
 endif()
 
 set(_peak_otf2_link_libraries ${OTF2_LIBRARIES})
-if(NOT (BUILD_TESTS OR BUILD_TESTING) AND
+if(NOT PEAK_ENABLE_RUNTIME_TEST_HOOKS AND
    CMAKE_SYSTEM_NAME MATCHES "Darwin")
     foreach(_peak_otf2_library IN LISTS OTF2_LIBRARIES)
         if(_peak_otf2_library MATCHES "\\.a$")
