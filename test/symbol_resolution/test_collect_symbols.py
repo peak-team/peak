@@ -85,6 +85,18 @@ def main():
         assert f'{origin_leaf}!origin_leaf' in origin_symbols
         run([origin_app], env=origin_env)
 
+        for library_path in (str(origin/'unused')+';'+str(origin/'lib'),
+                             str(origin/'unused')+'::'):
+            loader_env = os.environ.copy()
+            loader_env['LD_LIBRARY_PATH'] = library_path
+            run([origin_app], env=loader_env, cwd=origin/'lib')
+            loader_symbols = collect(origin_app, env=loader_env, cwd=origin/'lib')
+            assert f'{origin_leaf}!origin_leaf' in loader_symbols
+            assert f'{origin_mid}!origin_mid' in loader_symbols
+        loader_env['LD_LIBRARY_PATH'] = ''
+        run([origin_app], env=loader_env, cwd=origin/'lib', ok=False)
+        collect(origin_app, env=loader_env, cwd=origin/'lib', ok=False)
+
         search = root/'search'
         (search/'a').mkdir(parents=True)
         (search/'b').mkdir()

@@ -212,8 +212,11 @@ class Collector:
             own_rpath = self.expand(rpath, visible_path.parent) if not runpath else []
             # A requester's RUNPATH suppresses inherited RPATH for that request.
             search = own_rpath + ([] if runpath else list(inherited)) + self.library_dirs
-            if 'LD_LIBRARY_PATH' in os.environ:
-                search += self.expand([os.environ['LD_LIBRARY_PATH']], self.root_origin or root.parent)
+            library_path = os.environ.get('LD_LIBRARY_PATH', '')
+            if library_path:
+                # Unlike RPATH, glibc also accepts semicolons; an entirely empty
+                # value adds no search path, but empty components mean cwd.
+                search += self.expand([library_path.replace(';', ':')], self.root_origin or root.parent)
             search += self.expand(runpath, visible_path.parent)
             descendants = tuple(own_rpath + list(inherited))
             for name in needed:
