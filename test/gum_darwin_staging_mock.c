@@ -1,6 +1,8 @@
 /* Host-independent semantic test for the pinned Darwin transaction overlay.
  * Build with a real 17.15.3 devkit; Gum mutation APIs below are a fake backend.
  * This checks publication ordering, not native Mach thread suspension. */
+#define gum_code_allocator_try_alloc_slice_near mock_alloc_near
+#define gum_code_slice_unref mock_slice_unref
 #define gum_interceptor_attach mock_attach
 #define gum_interceptor_replace mock_replace
 #define gum_interceptor_detach mock_detach
@@ -23,6 +25,36 @@
 static unsigned flushes;
 static guint8 patch_bytes[32];
 static gpointer fake_redirect;
+static gboolean fail_near_allocation;
+static guint reserved_releases;
+static guint near_allocations;
+static gpointer near_marker = (gpointer)0x6789;
+
+GumCodeSlice* mock_alloc_near(GumCodeAllocator* allocator,
+    const GumAddressSpec* spec, gsize alignment)
+{
+    assert(allocator->free_slices == NULL);
+    assert(alignment == 0 && spec->near_address != NULL);
+    assert(spec->max_distance + allocator->pages_per_batch *
+        gum_query_page_size() + 4 == ((gsize)1 << 27));
+    if (fail_near_allocation) return NULL;
+    near_allocations++;
+    GumCodeSlice* reserved = g_new0(GumCodeSlice, 1);
+    reserved->pc = (guint8*)spec->near_address + 64;
+    allocator->free_slices = g_list_append(NULL, near_marker);
+    allocator->free_slices = g_list_append(allocator->free_slices, near_marker);
+    return reserved;
+}
+void mock_slice_unref(GumCodeSlice* reserved)
+{
+    if (reserved != NULL) {
+        /* The reservation must survive until outer transaction finalization. */
+        assert(peak_gum_darwin_stage.interceptor == NULL ||
+            ((PeakGumInterceptor17*)peak_gum_darwin_stage.interceptor)->current_transaction.level == 0);
+        reserved_releases++;
+        g_free(reserved);
+    }
+}
 
 GumCodeSigningPolicy mock_signing_policy(void) { return GUM_CODE_SIGNING_OPTIONAL; }
 void mock_ensure_readable(gconstpointer address, gsize size)
@@ -38,6 +70,10 @@ void mock_end(GumInterceptor* interceptor)
         /* An unremoved activation would publish bytes at this point. */
         assert(g_hash_table_size(txn->pending_update_tasks) == 0);
         txn->is_dirty = FALSE;
+        /* Darwin allocator commit retires unused free slices. */
+        PeakGumCodeAllocator17* allocator = &((PeakGumInterceptor17*)interceptor)->allocator;
+        g_list_free(allocator->free_slices);
+        allocator->free_slices = NULL;
         flushes++;
     }
 }
@@ -47,6 +83,10 @@ static PeakGumFunctionContext17* fake_install(GumInterceptor* interceptor,
     const GumInterceptorOptions* options)
 {
     PeakGumInterceptor17* self = (PeakGumInterceptor17*)interceptor;
+    /* The ordinary unconstrained Gum allocation consumes the primed head. */
+    GList* next_slice = self->allocator.free_slices;
+    assert(next_slice != NULL && next_slice->data == near_marker);
+    self->allocator.free_slices = g_list_delete_link(next_slice, next_slice);
     PeakGumFunctionContext17* context = g_new0(PeakGumFunctionContext17, 1);
     GPtrArray* entries = g_ptr_array_new_with_free_func(g_free);
     GumArm64Writer writer;
@@ -131,9 +171,28 @@ int main(void)
     GumInvocationListener* listener = (GumInvocationListener*)0x1234;
     memcpy(patch_bytes, entry, sizeof(entry));
     g_rec_mutex_init(&self.mutex);
+    self.allocator.pages_per_batch = 7;
+    self.allocator.slice_size = 256;
+    self.allocator.slices_per_batch = 7 * gum_query_page_size() / 256;
     self.function_by_address = g_hash_table_new(NULL, NULL);
     self.current_transaction.pending_update_tasks = g_hash_table_new(NULL, NULL);
     assert(peak_gum_darwin_staged_attach_supported());
+    /* Near allocation restores preexisting free-list nodes on failure; on
+     * success it places the fresh near batch before every old far slice. */
+    GList* old_free = g_list_append(NULL, (gpointer)0x5555);
+    self.allocator.free_slices = old_free;
+    GumCodeSlice* reservation;
+    fail_near_allocation = TRUE;
+    assert(!peak_gum_darwin_reserve_near_batch(interceptor, entry, &reservation));
+    assert(reservation == NULL && self.allocator.free_slices == old_free);
+    fail_near_allocation = FALSE;
+    assert(peak_gum_darwin_reserve_near_batch(interceptor, entry, &reservation));
+    assert(self.allocator.free_slices->data == near_marker);
+    assert(g_list_last(self.allocator.free_slices) == old_free);
+    g_list_free(self.allocator.free_slices);
+    self.allocator.free_slices = NULL;
+    mock_slice_unref(reservation);
+    reserved_releases = near_allocations = 0;
 
     assert(peak_gum_darwin_prepare_attach(interceptor, entry, listener, NULL) == GUM_ATTACH_OK);
     assert(flushes == 1 && memcmp(entry, patch_bytes, 32) == 0);
@@ -181,6 +240,12 @@ int main(void)
     assert(g_hash_table_size(self.function_by_address) == 0);
     fake_redirect = NULL;
     assert(memcmp(entry, patch_bytes, 32) == 0);
+    fail_near_allocation = TRUE;
+    assert(peak_gum_darwin_prepare_attach(interceptor, entry, listener, NULL) != GUM_ATTACH_OK);
+    assert(self.current_transaction.level == 0 && !self.current_transaction.is_dirty);
+    assert(g_hash_table_size(self.function_by_address) == 0);
+    fail_near_allocation = FALSE;
+    assert(near_allocations == reserved_releases);
     /* The custom redirect accepts short direct branches, declines short
      * unreachable entries, and emits a full absolute redirect when needed. */
     for (guint i = 0; i < sizeof(entry); i += 4) {
@@ -215,9 +280,21 @@ int main(void)
     details.scratch_register = ARM64_REG_X17;
     assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
     assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
-    /* Both live scratch registers are harmless for a direct B redirect. */
+    /* The normal on_enter trampoline clobbers the chosen scratch even if
+     * its entry redirect is B. One instruction reads both x16 and x17. */
+    guint32 read_both = 0x8b110200u; /* add x0, x16, x17 */
+    memcpy(entry, &read_both, 4);
     details.target = entry + 64;
     details.capacity = 4;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(strcmp(peak_gum_darwin_last_stage_failure(),
+        "direct-redirect-no-free-scratch-register") == 0);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    details.scratch_register = ARM64_REG_X16;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    guint32 nop = 0xd503201fu;
+    memcpy(entry, &nop, 4);
     assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_WRITTEN);
     assert(redirect_size == 4 && gum_arm64_writer_offset(&writer) == 4);
     gum_arm64_writer_clear(&writer);

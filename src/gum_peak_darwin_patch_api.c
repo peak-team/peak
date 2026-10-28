@@ -21,8 +21,8 @@
 #endif
 
 /* Internal exported symbol in the pinned static devkit. The custom-redirect
- * API substitutes x16 when no scratch register is free, so absolute redirects
- * must independently retain the checked relocator's liveness guarantee. */
+ * API substitutes x16 when no scratch register is free. Every normal Gum
+ * trampoline must independently retain the checked relocator's guarantee. */
 extern gboolean gum_arm64_relocator_can_relocate(
     gpointer address, guint min_bytes, GumRelocationScenario scenario,
     GumRelocationPolicy policy, guint* maximum, arm64_reg* available_scratch_reg);
@@ -137,6 +137,12 @@ peak_gum_darwin_last_stage_failure(void)
 
 G_STATIC_ASSERT(sizeof(gpointer) == 8);
 G_STATIC_ASSERT(sizeof(guint) == 4);
+/* Independently checked against the hash-pinned macOS Arm64 archive's init
+ * and allocation routines; fail compilation if the devkit types drift. */
+G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumInterceptor17, allocator) == 0x38);
+G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumInterceptor17, current_transaction) == 0xa8);
+G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumCodeAllocator17, free_slices) == 0x30);
+G_STATIC_ASSERT(sizeof(PeakGumCodeAllocator17) == sizeof(GumCodeAllocator));
 
 static gboolean
 peak_gum_darwin_context_has_only_listener(PeakGumFunctionContext17* context,
@@ -305,6 +311,38 @@ peak_gum_darwin_get_canonical_address_exact(
     return found;
 }
 
+/* Every normal Gum on_enter trampoline loads its context through the chosen
+ * scratch register, even when the entry redirect itself is a direct B. Retain
+ * stock Gum's liveness guarantee for the exact prefix we will relocate. */
+static gboolean
+peak_gum_darwin_prove_scratch(const GumRedirectWriteDetails* details,
+                              guint prefix_size)
+{
+    GumArm64Writer* writer = details->writer;
+    arm64_reg scratch = details->scratch_register;
+    guint relocatable = 0;
+    peak_gum_darwin_trace("scratch-proof-begin", GSIZE_TO_POINTER(writer->pc),
+                          (gint)scratch);
+    gboolean proof = gum_arm64_relocator_can_relocate(GSIZE_TO_POINTER(writer->pc),
+            prefix_size, GUM_SCENARIO_ONLINE, GUM_RELOCATION_CHECKED,
+            &relocatable, &scratch);
+    peak_gum_darwin_trace("scratch-proof-end", GSIZE_TO_POINTER(writer->pc),
+                          (gint)scratch);
+    if (!proof || relocatable < prefix_size) {
+        peak_gum_darwin_stage_failure = prefix_size == 4 ?
+            "direct-redirect-entry-too-short" : "absolute-redirect-entry-too-short";
+        return FALSE;
+    }
+    if (scratch == ARM64_REG_INVALID ||
+        scratch != (arm64_reg)details->scratch_register) {
+        peak_gum_darwin_stage_failure = prefix_size == 4 ?
+            "direct-redirect-no-free-scratch-register" :
+            "absolute-redirect-no-free-scratch-register";
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* A custom redirect forces Gum's ordinary allocation path: unlike its near
  * trampoline fallback this never installs a deflector in an existing image's
  * code cave while peers are running. Short entries are accepted only when a
@@ -321,6 +359,9 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
     if (details->capacity >= 4 &&
         gum_arm64_writer_can_branch_directly_between(
             writer, writer->pc, GUM_ADDRESS(details->target))) {
+        if (!peak_gum_darwin_prove_scratch(details, 4)) {
+            return GUM_REDIRECT_DECLINED;
+        }
         if (!gum_arm64_writer_put_b_imm(writer, GUM_ADDRESS(details->target))) {
             return GUM_REDIRECT_DECLINED;
         }
@@ -332,24 +373,7 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
         peak_gum_darwin_stage_failure = "short-entry-unreachable-trampoline";
         return GUM_REDIRECT_DECLINED;
     }
-    arm64_reg scratch = details->scratch_register;
-    guint relocatable = 0;
-    /* Prove the exact 16-byte prefix this absolute redirect overwrites. A
-     * four-byte direct branch above requires no scratch register proof. */
-    peak_gum_darwin_trace("scratch-proof-begin", GSIZE_TO_POINTER(writer->pc),
-                          (gint)scratch);
-    gboolean proof = gum_arm64_relocator_can_relocate(GSIZE_TO_POINTER(writer->pc),
-            16, GUM_SCENARIO_ONLINE, GUM_RELOCATION_CHECKED,
-            &relocatable, &scratch);
-    peak_gum_darwin_trace("scratch-proof-end", GSIZE_TO_POINTER(writer->pc),
-                          (gint)scratch);
-    if (!proof || relocatable < 16) {
-        peak_gum_darwin_stage_failure = "absolute-redirect-entry-too-short";
-        return GUM_REDIRECT_DECLINED;
-    }
-    if (scratch == ARM64_REG_INVALID ||
-        scratch != (arm64_reg)details->scratch_register) {
-        peak_gum_darwin_stage_failure = "absolute-redirect-no-free-scratch-register";
+    if (!peak_gum_darwin_prove_scratch(details, 16)) {
         return GUM_REDIRECT_DECLINED;
     }
     if (!gum_arm64_writer_put_ldr_reg_address(writer,
@@ -442,6 +466,69 @@ peak_gum_darwin_begin_stage(GumInterceptor* interceptor, gpointer address,
     return TRUE;
 }
 
+/* The custom redirect backend allocates its trampoline with an unconstrained
+ * alloc_slice(). Supply a fresh near batch at the head of that allocator's
+ * free list so the normal Gum code consumes a near slice, without installing
+ * a deflector in a running image. All ownership/commit rules remain Gum's.
+ * The reserved first slice pins the batch through allocator finalization. */
+static gboolean
+peak_gum_darwin_reserve_near_batch(GumInterceptor* interceptor, gpointer address,
+                                  GumCodeSlice** reserved_out)
+{
+    PeakGumCodeAllocator17* allocator =
+        &((PeakGumInterceptor17*)interceptor)->allocator;
+    gsize page_size = gum_query_page_size();
+    const gsize branch_distance = ((gsize)1 << 27);
+    GList* saved_free_slices;
+    GumAddressSpec spec;
+    GumCodeSlice* reserved;
+
+    *reserved_out = NULL;
+    if (page_size == 0 || allocator->pages_per_batch == 0 ||
+        allocator->pages_per_batch >= branch_distance / page_size ||
+        allocator->slices_per_batch < 2 || allocator->slice_size == 0) {
+        peak_gum_darwin_stage_failure = "near-allocator-layout-invalid";
+        return FALSE;
+    }
+    /* Keep every byte of the batch, including on_enter's offset within its
+     * slice, inside the signed B-immediate range. The callback checks the
+     * final destination too, before accepting a four-byte redirect. */
+    spec.near_address = gum_strip_code_pointer(address);
+    spec.max_distance = branch_distance -
+        allocator->pages_per_batch * page_size - 4;
+    saved_free_slices = allocator->free_slices;
+    allocator->free_slices = NULL;
+    peak_gum_darwin_trace("near-batch-begin", address, 0);
+    reserved = gum_code_allocator_try_alloc_slice_near(
+        (GumCodeAllocator*)allocator, &spec, 0);
+    gboolean has_free_near_slice = allocator->free_slices != NULL;
+    /* g_list_concat only joins lists; Gum's embedded nodes are neither
+     * copied nor freed. Restore the old list on allocation failure too. */
+    allocator->free_slices = g_list_concat(allocator->free_slices,
+                                          saved_free_slices);
+    *reserved_out = reserved;
+    peak_gum_darwin_trace("near-batch-end", reserved != NULL ? reserved->pc : NULL,
+                          has_free_near_slice);
+    if (reserved == NULL || !has_free_near_slice) {
+        peak_gum_darwin_stage_failure = "near-trampoline-allocation-failed";
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void
+peak_gum_darwin_cancel_near_preparation(GumInterceptor* interceptor,
+                                       GumCodeSlice* reserved)
+{
+    PeakGumInterceptor17* self = (PeakGumInterceptor17*)interceptor;
+    /* Finish executable allocation before releasing the reserved last owner,
+     * including unusual partial-allocation failures. Peers are running. */
+    self->current_transaction.is_dirty = TRUE;
+    gum_interceptor_end_transaction(interceptor);
+    gum_code_slice_unref(reserved);
+    g_rec_mutex_unlock(&self->mutex);
+}
+
 /* Called with our sole outer transaction open. Remove activation before
  * ending it, so Gum finalizes executable trampolines and listener metadata
  * without touching the target's entry. */
@@ -449,7 +536,8 @@ static gboolean
 peak_gum_darwin_end_stage(GumInterceptor* interceptor, gpointer address,
                            GumInvocationListener* listener,
                            gboolean replacing, guint redirect_size,
-                           gboolean operation_succeeded)
+                           gboolean operation_succeeded,
+                           GumCodeSlice* reserved)
 {
     PeakGumInterceptor17* self = (PeakGumInterceptor17*)interceptor;
     PeakGumFunctionContext17* context = g_hash_table_lookup(
@@ -505,6 +593,7 @@ peak_gum_darwin_end_stage(GumInterceptor* interceptor, gpointer address,
     peak_gum_darwin_trace("allocator-finalize-begin", address, valid);
     gum_interceptor_end_transaction(interceptor);
     peak_gum_darwin_trace("allocator-finalize-end", address, valid);
+    gum_code_slice_unref(reserved);
     if (!valid) {
         g_rec_mutex_unlock(&self->mutex);
     }
@@ -519,6 +608,7 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
 {
     GumAttachOptions staged_options = { 0 };
     GumAttachReturn result;
+    GumCodeSlice* reserved;
     guint redirect_size;
 
     if (listener == NULL ||
@@ -528,6 +618,11 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
     }
     if (!peak_gum_darwin_begin_stage(interceptor, function_address, listener)) {
         return GUM_ATTACH_WRONG_TYPE;
+    }
+    if (!peak_gum_darwin_reserve_near_batch(interceptor, function_address,
+                                            &reserved)) {
+        peak_gum_darwin_cancel_near_preparation(interceptor, reserved);
+        return GUM_ATTACH_WRONG_SIGNATURE;
     }
     if (options != NULL) {
         staged_options = *options;
@@ -550,7 +645,7 @@ peak_gum_darwin_prepare_attach(GumInterceptor* interceptor,
     redirect_size = peak_gum_darwin_redirect_size;
     if (!peak_gum_darwin_end_stage(interceptor, function_address, listener,
                                    FALSE, redirect_size,
-                                   result == GUM_ATTACH_OK) &&
+                                   result == GUM_ATTACH_OK, reserved) &&
         result == GUM_ATTACH_OK) {
         result = GUM_ATTACH_WRONG_SIGNATURE;
     }
@@ -566,6 +661,7 @@ peak_gum_darwin_prepare_replace(GumInterceptor* interceptor,
 {
     GumReplaceOptions staged_options = { 0 };
     GumReplaceReturn result;
+    GumCodeSlice* reserved;
     guint redirect_size;
 
     if (original_function != NULL) {
@@ -575,6 +671,11 @@ peak_gum_darwin_prepare_replace(GumInterceptor* interceptor,
         (options != NULL && options->instrumentation.write_redirect != NULL) ||
         !peak_gum_darwin_begin_stage(interceptor, function_address, NULL)) {
         return GUM_REPLACE_WRONG_TYPE;
+    }
+    if (!peak_gum_darwin_reserve_near_batch(interceptor, function_address,
+                                            &reserved)) {
+        peak_gum_darwin_cancel_near_preparation(interceptor, reserved);
+        return GUM_REPLACE_WRONG_SIGNATURE;
     }
     if (options != NULL) {
         staged_options = *options;
@@ -597,7 +698,7 @@ peak_gum_darwin_prepare_replace(GumInterceptor* interceptor,
     redirect_size = peak_gum_darwin_redirect_size;
     if (!peak_gum_darwin_end_stage(interceptor, function_address, NULL,
                                    TRUE, redirect_size,
-                                   result == GUM_REPLACE_OK) &&
+                                   result == GUM_REPLACE_OK, reserved) &&
         result == GUM_REPLACE_OK) {
         result = GUM_REPLACE_WRONG_SIGNATURE;
     }
