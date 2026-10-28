@@ -79,27 +79,35 @@ send_ack(int fd, const gchar *status, const gchar *message)
     g_variant_unref(value);
 }
 
-static GVariant *
-read_config(int fd)
+static char *
+read_config_text(int fd)
 {
     uint32_t frame;
-    gchar *text;
-    GVariant *value = NULL;
-    GError *error = NULL;
+    char *text;
     if (!transfer_bytes(fd, &frame, sizeof(frame), FALSE))
         return NULL;
     frame = ntohl(frame);
     if (frame == 0 || frame > PEAK_ATTACH_MAX_FRAME)
         return NULL;
-    text = g_malloc((size_t) frame + 1);
-    if (transfer_bytes(fd, text, frame, FALSE)) {
-        text[frame] = '\0';
-        if (memchr(text, '\0', frame) == NULL)
-            value = g_variant_parse(G_VARIANT_TYPE(PEAK_ATTACH_CONFIG_TYPE),
-                                    text, text + frame, NULL, &error);
+    text = malloc((size_t) frame + 1);
+    if (text == NULL)
+        return NULL;
+    if (!transfer_bytes(fd, text, frame, FALSE) ||
+        memchr(text, '\0', frame) != NULL) {
+        free(text);
+        return NULL;
     }
+    text[frame] = '\0';
+    return text;
+}
+
+static GVariant *
+parse_config(const char *text)
+{
+    GError *error = NULL;
+    GVariant *value = g_variant_parse(G_VARIANT_TYPE(PEAK_ATTACH_CONFIG_TYPE),
+                                      text, NULL, NULL, &error);
     g_clear_error(&error);
-    g_free(text);
     return value;
 }
 
@@ -245,18 +253,30 @@ activate_runtime(void *data)
     gchar *socket_path = data;
     int fd = connect_controller(socket_path);
     GVariant *config = NULL, *dictionary = NULL;
+    char *config_text = NULL;
     gchar *message = NULL;
     guint version;
     free(socket_path);
     if (fd < 0)
         return NULL;
+    /* Drain the host's complete bounded request even when rejecting a
+     * duplicate. Closing a Unix stream with unread request bytes can reset it
+     * and discard our error ACK. libc allocation is safe before Gum/GLib init. */
+    config_text = read_config_text(fd);
+    if (config_text == NULL) {
+        send_literal_ack(fd, "('error', 'invalid attach configuration frame')");
+        close(fd);
+        return NULL;
+    }
     if (atomic_flag_test_and_set_explicit(&activation_claimed, memory_order_acquire)) {
         send_literal_ack(fd, "('error', 'PEAK attach has already been requested for this process')");
+        free(config_text);
         close(fd);
         return NULL;
     }
     if (has_existing_runtime()) {
         send_literal_ack(fd, "('error', 'another PEAK runtime is already present in this process')");
+        free(config_text);
         close(fd);
         return NULL;
     }
@@ -265,10 +285,12 @@ activate_runtime(void *data)
         send_literal_ack(fd, preparation < 0 ?
             "('error', 'this macOS Gum provider has no safe staged attach bootstrap')" :
             "('error', 'Gum lifecycle initialization was already claimed')");
+        free(config_text);
         close(fd);
         return NULL;
     }
-    config = read_config(fd);
+    config = parse_config(config_text);
+    free(config_text);
     if (config == NULL) {
         message = g_strdup("invalid attach configuration frame");
         goto failed;

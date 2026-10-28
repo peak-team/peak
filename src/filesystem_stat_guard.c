@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -551,20 +552,36 @@ peak_filesystem_stat_guard_attach(void)
         errno = saved_errno;
         return 0;
     }
-    peak_gum_module_mutation_begin();
-    gboolean prepared = peak_detach_controller_prepare_hook_mutation_batch(
-        requests, unique_count, results, &prepared_count, &status);
-    if (!prepared || prepared_count != unique_count) {
+    /* A preexisting caller may be stopped inside the short libc syscall
+     * prologue. No hook has been installed yet, so resume a partial window and
+     * retry boundedly rather than making safe attachment depend on one sample. */
+    for (unsigned attempt = 0; ; attempt++) {
+        prepared_count = 0;
+        memset(results, 0, sizeof(results));
+        peak_gum_module_mutation_begin();
+        gboolean prepared = peak_detach_controller_prepare_hook_mutation_batch(
+            requests, unique_count, results, &prepared_count, &status);
+        if (prepared && prepared_count == unique_count)
+            break;
+        PeakDetachStatus prepare_status = status;
         if (prepared &&
             !peak_detach_controller_finish_hook_mutation_batch(&status))
             peak_detach_controller_abort_after_failed_finish(
                 "filesystem-stat attach refusal", status);
         peak_gum_module_mutation_end();
-        peak_log_warn("[peak] filesystem-stat guards could not obtain a safe attach window (%s)\n",
-                      peak_detach_controller_status_string(status));
-        g_object_unref(guard_interceptor);
-        errno = saved_errno;
-        return 0;
+        gboolean retryable = prepare_status == PEAK_DETACH_STATUS_SAFE ||
+            prepare_status == PEAK_DETACH_STATUS_CLASSIFY_FAILED ||
+            prepare_status == PEAK_DETACH_STATUS_TIMEOUT ||
+            prepare_status == PEAK_DETACH_STATUS_FILESYSTEM_STAT_BUSY;
+        if (!retryable || attempt == 15) {
+            peak_log_warn("[peak] filesystem-stat guards could not obtain a safe attach window (%s; prepared %zu/%zu)\n",
+                          peak_detach_controller_status_string(prepare_status),
+                          prepared_count, unique_count);
+            g_object_unref(guard_interceptor);
+            errno = saved_errno;
+            return 0;
+        }
+        g_usleep(1000);
     }
     gum_interceptor_begin_transaction(guard_interceptor);
     for (size_t i = 0; i < unique_count; i++) {

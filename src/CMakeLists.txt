@@ -286,7 +286,12 @@ if(PEAK_BUILD_ATTACH)
     target_compile_options(peak_attach_agent PRIVATE
         "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:-include>"
         "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${PROJECT_SOURCE_DIR}/include/internal/attach_runtime_config.h>")
-    set(_peak_attach_libraries ${_peak_libraries})
+    # Production preload builds put private Darwin archives in LINK_OPTIONS.
+    # Add the agent's own archive dependencies before applying its visibility
+    # policy instead of inheriting only the preload target's link libraries.
+    set(_peak_attach_libraries ${_peak_libraries}
+        ${FRIDA_GUM_LIBRARIES} ${OTF2_LIBRARIES})
+    list(REMOVE_DUPLICATES _peak_attach_libraries)
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         foreach(_library IN LISTS _peak_attach_libraries)
             if(_library MATCHES "\\.a$")

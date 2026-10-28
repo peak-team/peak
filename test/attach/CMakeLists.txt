@@ -53,8 +53,10 @@ target_compile_definitions(test_attach_config PRIVATE PEAK_ATTACH_RUNTIME=1)
 target_compile_options(test_attach_config PRIVATE
     -include ${PROJECT_SOURCE_DIR}/include/internal/attach_runtime_config.h)
 get_target_property(_peak_attach_runtime_libraries peak_attach_agent LINK_LIBRARIES)
-target_link_libraries(test_attach_config PRIVATE ${FRIDA_GUM_LIBRARIES}
+set(_peak_attach_config_libraries ${FRIDA_GUM_LIBRARIES} ${OTF2_LIBRARIES}
     ${_peak_attach_runtime_libraries})
+list(REMOVE_DUPLICATES _peak_attach_config_libraries)
+target_link_libraries(test_attach_config PRIVATE ${_peak_attach_config_libraries})
 add_test(NAME test_attach_config COMMAND test_attach_config)
 set_tests_properties(test_attach_config PROPERTIES TIMEOUT 10)
 

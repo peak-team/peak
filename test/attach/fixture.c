@@ -113,6 +113,16 @@ int main(int argc, char **argv) {
         if (read(STDIN_FILENO, &command, 1) == 1) {
             if (command == 'Q') break;
             if (command == 'B' || command == 'G') {
+#ifdef __linux__
+                /* The stop helper narrows PR_SET_PTRACER to its own PID.
+                 * Restore this fixture's explicit sibling-injector permission
+                 * before acknowledging another external debugger operation. */
+                if (command == 'B' &&
+                    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {
+                    perror("PR_SET_PTRACER bootstrap phase");
+                    return 2;
+                }
+#endif
                 unsigned long next = (atomic_load(&statfs_phase) + 2) & ~1UL;
                 atomic_store(&statfs_phase, next | (command == 'G'));
                 printf("statfs_phase=%c\n", command);
