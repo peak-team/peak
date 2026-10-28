@@ -1880,13 +1880,9 @@ static void peak_lookup_execveat(void)
 static peak_posix_spawn_fn
 peak_lookup_posix_spawn(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
     if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
         peak_test_exec_spawn_resolver_reentry_hook(0);
@@ -1898,13 +1894,9 @@ peak_lookup_posix_spawn(void)
 static peak_posix_spawnp_fn
 peak_lookup_posix_spawnp(void)
 {
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
     extern void peak_test_exec_spawn_resolver_reentry_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
     if (peak_test_exec_spawn_resolver_reentry_hook != NULL) {
         peak_test_exec_spawn_resolver_reentry_hook(1);
@@ -1987,14 +1979,10 @@ peak_real_posix_spawn(void)
                                       memory_order_release);
                 resolved = peak_lookup_posix_spawn();
                 peak_real_posix_spawn_ptr = resolved;
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
                     if (peak_test_exec_spawn_publication_hook != NULL) {
                         peak_test_exec_spawn_publication_hook(0);
@@ -2013,14 +2001,10 @@ peak_real_posix_spawn(void)
         if (owner != self) {
             return NULL;
         }
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
             if (peak_test_exec_spawn_waiter_hook != NULL) {
                 peak_test_exec_spawn_waiter_hook(0);
@@ -2076,14 +2060,10 @@ peak_real_posix_spawnp(void)
                                       memory_order_release);
                 resolved = peak_lookup_posix_spawnp();
                 peak_real_posix_spawnp_ptr = resolved;
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
                 {
                     extern void peak_test_exec_spawn_publication_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
                     if (peak_test_exec_spawn_publication_hook != NULL) {
                         peak_test_exec_spawn_publication_hook(1);
@@ -2102,14 +2082,10 @@ peak_real_posix_spawnp(void)
         if (owner != self) {
             return NULL;
         }
-#if defined(PEAK_ENABLE_TEST_HOOKS)
+#if defined(PEAK_ENABLE_TEST_HOOKS) && defined(__linux__)
         {
             extern void peak_test_exec_spawn_waiter_hook(int)
-#if defined(__APPLE__)
-    __attribute__((weak_import));
-#else
     __attribute__((weak));
-#endif
 
             if (peak_test_exec_spawn_waiter_hook != NULL) {
                 peak_test_exec_spawn_waiter_hook(1);

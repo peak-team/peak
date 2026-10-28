@@ -52,6 +52,14 @@ def alive(process, progress):
     wait_for(lambda: counter(progress) > before, 3)
 
 
+def filesystem_phase(target, log_path, phase):
+    marker = "statfs_phase=" + phase
+    previous = log_path.read_text().count(marker)
+    target.stdin.write(phase.encode())
+    target.stdin.flush()
+    wait_for(lambda: log_path.read_text().count(marker) > previous, 3)
+
+
 def report(prefix):
     paths = list(prefix.parent.glob(prefix.name + "*.csv"))
     assert paths, f"no normal PEAK CSV for {prefix}"
@@ -118,7 +126,8 @@ else:
                        PEAK_ENABLE_GLOBAL_HEARTBEAT="1", PEAK_ENABLE_REATTACH="1",
                        PEAK_HIBERNATION_CYCLE="1", PEAK_REATTACH_COOLDOWN_MS="0",
                        PEAK_OVERHEAD_RATIO="0.00000001",
-                       PEAK_GLOBAL_OVERHEAD_RATIO="0.00000001",
+                       PEAK_GLOBAL_OVERHEAD_RATIO="1.0",
+                       PEAK_GLOBAL_REATTACH_FACTOR="1.0",
                        PEAK_DETACH_BACKEND="signal", PEAK_REQUIRE_SAFE_DETACH="1",
                        PEAK_DETACH_TRACE_PATH=str(root / "detach.csv"),
                        PEAK_OUTPUT_AGGREGATION="local", PEAK_TEXT_OUTPUT="false")
@@ -142,6 +151,9 @@ else:
                 raise SystemExit(77)
             assert code == 0, (code, output, target.poll(), (root / "fixture.log").read_text())
             alive(target, progress)
+            filesystem_phase(target, root / "fixture.log", "G")
+            alive(target, progress)
+            filesystem_phase(target, root / "fixture.log", "B")
             code, output = run(base + ["--target", "peak_attach_existing_target"], env)
             assert code != 0 and output.strip(), (code, output)
             alive(target, progress)
@@ -153,11 +165,32 @@ else:
                                     "--target", "peak_attach_existing_target"], env)
                 assert code != 0 and "already" in output.lower(), (code, output)
                 alive(target, progress)
-            time.sleep(1.5)
+            filesystem_phase(target, root / "fixture.log", "G")
+            if args.mode == "runtime":
+                trace = root / "detach.csv"
+                with trace.open() if trace.exists() else open(os.devnull) as stream:
+                    earlier_rows = len(list(csv.reader(stream)))
+                def completed_cycle():
+                    trace = root / "detach.csv"
+                    if not trace.exists():
+                        return False
+                    with trace.open() as stream:
+                        rows = list(csv.reader(stream))[earlier_rows:]
+                    return all(any(len(row) >= 7 and row[3] == operation
+                                   and row[4:7] == ["success", "1", "safe"]
+                                   for row in rows)
+                               for operation in ("detach", "reattach"))
+                wait_for(completed_cycle, 12)
+            else:
+                time.sleep(1.5)
+
             target.stdin.write(b"Q")
             target.stdin.flush()
             assert target.wait(timeout=20) == 0, (root / "fixture.log").read_text()
             assert "statfs_errors=0" in (root / "fixture.log").read_text(), (root / "fixture.log").read_text()
+            guarded = [line for line in (root / "fixture.log").read_text().splitlines()
+                       if line.startswith("statfs_guarded_calls=")]
+            assert guarded and int(guarded[-1].split("=")[1]) > 0, guarded
             report(prefix)
             if args.mode == "runtime":
                 with (root / "detach.csv").open() as stream:
