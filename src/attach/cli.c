@@ -150,6 +150,18 @@ static void collect_worker_helpers(InjectionWorker *worker)
 {
     if (worker->done || worker->pid <= 0)
         return;
+    struct proc_bsdinfo parent_info;
+    if (proc_pidinfo(worker->pid, PROC_PIDTBSDINFO, 1, &parent_info,
+                     sizeof(parent_info)) != (int)sizeof(parent_info) ||
+        parent_info.pbi_pid != (uint32_t)worker->pid ||
+        parent_info.pbi_ppid != (uint32_t)getpid()) {
+        if (!worker->helper_scan_warned) {
+            fprintf(stderr, "peak-attach: injector worker ownership could not "
+                            "be verified; skipping child census\n");
+            worker->helper_scan_warned = TRUE;
+        }
+        return;
+    }
     pid_t children[64];
     errno = 0;
     int count = proc_listchildpids(worker->pid, children, sizeof(children));
@@ -420,7 +432,7 @@ static void finish_worker(InjectionWorker *worker, gboolean completed_response)
         }
     }
     if (!worker->done) {
-        /* Close the discovery-to-termination race with bounded repeated
+        /* Narrow the discovery-to-termination race with bounded repeated
          * direct-child censuses while the worker identity is still pinned. */
         for (unsigned int pass = 0; pass < 3 && !worker->done; ++pass) {
             collect_worker_helpers(worker);
