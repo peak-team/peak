@@ -25,6 +25,9 @@ GUM_API gpointer gum_arm64_reader_try_get_relative_jump_target(
 #define g_printerr(...) peak_log_warn(__VA_ARGS__)
 
 static gsize peak_attach_policy_initialized = 0;
+#if defined(__linux__)
+static GumMemoryRange peak_elf_loader_range = {0};
+#endif
 static gboolean peak_allow_unsafe_gum_prologue = FALSE;
 static PeakUnsafeGumProloguePolicy peak_unsafe_gum_prologue_policy =
     PEAK_UNSAFE_GUM_PROLOGUE_POLICY_DEFAULT;
@@ -33,6 +36,17 @@ static void
 peak_general_listener_init_attach_policy_once(void)
 {
     gboolean policy_valid = FALSE;
+
+#if defined(__linux__)
+    GumAddress loader_base = getauxval(AT_BASE);
+    if (loader_base != 0) {
+        GumModule* loader = gum_process_find_module_by_address(loader_base);
+        if (loader != NULL) {
+            peak_elf_loader_range = *gum_module_get_range(loader);
+            g_object_unref(loader);
+        }
+    }
+#endif
 
     peak_allow_unsafe_gum_prologue =
         peak_general_listener_env_value_truthy(
@@ -96,10 +110,8 @@ peak_general_listener_attach_target_is_supported(const char* symbol_name,
     }
     /* The ELF loader has private resolver calling conventions that cannot
      * be intercepted with ordinary function entry hooks. */
-    Dl_info target_module = {0};
-    if (address != NULL && dladdr(address, &target_module) != 0 &&
-        getauxval(AT_BASE) != 0 &&
-        target_module.dli_fbase == (gpointer)getauxval(AT_BASE)) {
+    if (GUM_MEMORY_RANGE_INCLUDES(&peak_elf_loader_range,
+                                 (GumAddress)address)) {
         peak_log_info("[peak] skipping Gum attach for hook %s: target belongs to ELF loader infrastructure; target will remain unprofiled\n",
                       symbol_name != NULL ? symbol_name : "<unknown>");
         return FALSE;

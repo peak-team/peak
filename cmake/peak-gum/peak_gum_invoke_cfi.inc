@@ -21,7 +21,7 @@ typedef struct {
 } PeakCfiCursor;
 typedef struct PeakInvokeCfi PeakInvokeCfi;
 struct PeakInvokeCfi {
-  PeakInvokeCfi *next;
+  PeakInvokeCfi *next, *previous, *owner_next;
   gpointer owner;
   guintptr start, end, source, original_start;
   PeakDwarfBases bases;
@@ -32,6 +32,8 @@ struct PeakInvokeCfi {
 };
 static GMutex peak_invoke_lock;
 static PeakInvokeCfi *peak_invoke_frames;
+static GTree *peak_invoke_ranges;
+static GHashTable *peak_invoke_owners;
 static _Thread_local PeakGumFunctionContext17 *peak_invoke_building;
 static _Thread_local PeakInvokeCfi *peak_invoke_pending;
 static _Thread_local gboolean peak_invoke_failed;
@@ -498,11 +500,22 @@ static void peak_cfi_put_sleb(guint8 **p, gint64 n) {
     *(*p)++ = b | (more ? 128 : 0);
   } while (more);
 }
+/* Relocated instruction ranges do not overlap. Keep their address index under
+ * the same lock as the ownership registry, so lookup never retains a retired
+ * record and misses do not scan every instrumented instruction. */
+static gint peak_invoke_compare(gconstpointer a, gconstpointer b) {
+  const PeakInvokeCfi *left = a, *right = b;
+  return (left->start > right->start) - (left->start < right->start);
+}
+static gint peak_invoke_search(gconstpointer key, gconstpointer data) {
+  const PeakInvokeCfi *m = key;
+  guintptr pc = *(const guintptr *)data;
+  return pc <= m->start ? -1 : pc > m->end ? 1 : 0;
+}
 static PeakInvokeCfi *peak_invoke_lookup(guintptr pc) {
-  for (PeakInvokeCfi *m = peak_invoke_frames; m; m = m->next)
-    if (pc > m->start && pc <= m->end)
-      return m;
-  return NULL;
+  return peak_invoke_ranges
+             ? g_tree_search(peak_invoke_ranges, peak_invoke_search, &pc)
+             : NULL;
 }
 static guintptr peak_invoke_normalize_address(guintptr pc) {
   g_mutex_lock(&peak_invoke_lock);
@@ -1022,8 +1035,17 @@ G_GNUC_INTERNAL gboolean _gum_interceptor_backend_create_trampoline(
     PeakInvokeCfi *m = peak_invoke_pending;
     peak_invoke_pending = m->next;
     if (result) {
+      if (!peak_invoke_ranges) {
+        peak_invoke_ranges = g_tree_new(peak_invoke_compare);
+        peak_invoke_owners = g_hash_table_new(g_direct_hash, g_direct_equal);
+      }
       m->next = peak_invoke_frames;
+      if (m->next)
+        m->next->previous = m;
       peak_invoke_frames = m;
+      m->owner_next = g_hash_table_lookup(peak_invoke_owners, m->owner);
+      g_hash_table_insert(peak_invoke_owners, m->owner, m);
+      g_tree_insert(peak_invoke_ranges, m, m);
     } else
       peak_invoke_free(m);
   }
@@ -1037,13 +1059,28 @@ G_GNUC_INTERNAL void
 _gum_interceptor_backend_destroy_trampoline(GumInterceptorBackend *b,
                                             PeakGumFunctionContext17 *ctx) {
   g_mutex_lock(&peak_invoke_lock);
-  for (PeakInvokeCfi **p = &peak_invoke_frames; *p;) {
-    PeakInvokeCfi *m = *p;
-    if (m->owner == ctx) {
-      *p = m->next;
-      peak_invoke_free(m);
-    } else
-      p = &m->next;
+  PeakInvokeCfi *m = peak_invoke_owners
+                         ? g_hash_table_lookup(peak_invoke_owners, ctx)
+                         : NULL;
+  if (m)
+    g_hash_table_remove(peak_invoke_owners, ctx);
+  while (m) {
+    PeakInvokeCfi *next = m->owner_next;
+    g_tree_remove(peak_invoke_ranges, m);
+    if (m->previous)
+      m->previous->next = m->next;
+    else
+      peak_invoke_frames = m->next;
+    if (m->next)
+      m->next->previous = m->previous;
+    peak_invoke_free(m);
+    m = next;
+  }
+  if (peak_invoke_ranges && !peak_invoke_frames) {
+    g_tree_destroy(peak_invoke_ranges);
+    peak_invoke_ranges = NULL;
+    g_hash_table_destroy(peak_invoke_owners);
+    peak_invoke_owners = NULL;
   }
   g_mutex_unlock(&peak_invoke_lock);
   _gum_interceptor_backend_destroy_trampoline_peak_original(b, ctx);

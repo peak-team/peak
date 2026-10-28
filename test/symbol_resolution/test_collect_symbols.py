@@ -2,6 +2,7 @@
 """Integration tests with isolated native and Python fixtures."""
 import argparse
 import os
+import platform
 import re
 from pathlib import Path
 import signal
@@ -12,9 +13,9 @@ import sysconfig
 import tempfile
 
 
-def run(argv, ok=True, timeout=30, env=None, combined=False):
+def run(argv, ok=True, timeout=30, env=None, combined=False, cwd=None, text=True, capture_stderr=False):
     p = subprocess.Popen([str(x) for x in argv], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
+                         stderr=subprocess.PIPE, text=text, start_new_session=True, env=env, cwd=cwd)
     try:
         out, err = p.communicate(timeout=timeout)
     finally:
@@ -24,7 +25,7 @@ def run(argv, ok=True, timeout=30, env=None, combined=False):
             pass
         p.wait()
     assert (p.returncode == 0) == ok, (argv, p.returncode, out, err)
-    return out + err if combined else out
+    return err if capture_stderr else out + err if combined else out
 
 
 def main():
@@ -36,6 +37,7 @@ def main():
     parser.add_argument('--inspect')
     parser.add_argument('--lib')
     args = parser.parse_args()
+    args.collector = str(Path(args.collector).resolve())
     with tempfile.TemporaryDirectory(prefix='peak-collect-test-') as tmp:
         root = Path(tmp)
 
@@ -44,8 +46,8 @@ def main():
             path.write_text(source)
             run([args.cxx if cxx else args.cc, path, '-o', output, *flags])
 
-        def collect(target, *options, ok=True, env=None):
-            out = run([sys.executable, args.collector, target, *options], ok=ok, env=env)
+        def collect(target, *options, ok=True, env=None, cwd=None):
+            out = run([sys.executable, args.collector, target, *options], ok=ok, env=env, cwd=cwd)
             lines = out.splitlines()
             if ok:
                 assert lines == sorted(set(lines)), 'output is not sorted and unique'
@@ -111,6 +113,32 @@ def main():
         assert f'{breadth/"b/libsame.so"}!breadth_same' in breadth_symbols
         assert f'{breadth/"a/libsame.so"}!breadth_same' not in breadth_symbols
         run([breadth_app])
+
+        if platform.machine().lower() in ('x86_64', 'amd64'):
+            # Let the real loader select the host-supported hwcap level; no
+            # assumption about v2/v3/v4 instruction support is needed.
+            hwcaps = root/'hwcaps'
+            hwcaps.mkdir()
+            variants = {1: hwcaps/'libcollector-hwleaf.so'}
+            for level in (2, 3, 4):
+                directory = hwcaps/'glibc-hwcaps'/f'x86-64-v{level}'
+                directory.mkdir(parents=True)
+                variants[level] = directory/'libcollector-hwleaf.so'
+            for value, library in variants.items():
+                build(f'hwcaps-{value}.c', f'int collector_hwleaf(void){{return {value};}}',
+                      library, '-shared', '-fPIC', '-nostdlib',
+                      '-Wl,-soname,libcollector-hwleaf.so')
+            hwcaps_app = hwcaps/'app'
+            build('hwcaps-main.c', '#include <stdio.h>\nextern int collector_hwleaf(void); int main(void){printf("%d\\n",collector_hwleaf());return 0;}',
+                  hwcaps_app, '-L'+str(hwcaps), '-lcollector-hwleaf', '-Wl,-rpath,$ORIGIN')
+            selected_hwcaps = int(run([hwcaps_app]).strip())
+            assert selected_hwcaps in variants
+            hwcaps_symbols = collect(hwcaps_app)
+            assert f'{variants[selected_hwcaps]}!collector_hwleaf' in hwcaps_symbols
+            for value, library in variants.items():
+                assert (f'{library}!collector_hwleaf' in hwcaps_symbols) == (value == selected_hwcaps)
+            if selected_hwcaps == 1:
+                print('SKIP optimized hwcaps selection: loader selected the baseline library')
 
         leaf, provider, app = [root / x for x in ('libleaf.so', 'libprovider.so', 'app')]
         build('leaf.c', 'int duplicate(void){__asm__ volatile(".rept 32; nop; .endr");return 3;} int leaf(void){__asm__ volatile(".rept 32; nop; .endr");return 5;}', leaf,
@@ -274,7 +302,9 @@ int main(void) {
             saturation = root/'saturation'
             saturation.mkdir()
             template = saturation/'template.so'
-            build('saturation-target.c', 'int collector_saturation_target(void){__asm__ volatile(".rept 32; nop; .endr");return 7;}',
+            build('saturation-target.c', r'''int collector_saturation_target(void){__asm__ volatile(".rept 32; nop; .endr");return 7;}
+__asm__(".text\n.globl collector_saturation_unsafe\n.type collector_saturation_unsafe,%function\ncollector_saturation_unsafe:\nret\n.size collector_saturation_unsafe,.-collector_saturation_unsafe\n");
+''',
                   template, '-shared', '-fPIC', '-nostdlib')
             table = run(['readelf', '--syms', '--wide', template])
             offsets = {int(line.split()[1], 16) for line in table.splitlines()
@@ -307,9 +337,15 @@ int collector_saturation_invoke(void) {
                   '-Wl,--no-as-needed', *saturation_modules)
             saturation_symbols = collect(saturation_parent)
             saturation_symbols = {symbol for symbol in saturation_symbols
-                                  if symbol.endswith('!collector_saturation_target')}
+                                  if symbol.endswith(('!collector_saturation_target', '!collector_saturation_unsafe'))}
             assert saturation_symbols == {
-                f'{module}!collector_saturation_target' for module in saturation_modules}
+                f'{module}!{name}' for module in saturation_modules
+                for name in ('collector_saturation_target', 'collector_saturation_unsafe')}
+            ordered_saturation = sorted(saturation_symbols)
+            safe_indices = [index for index, symbol in enumerate(ordered_saturation)
+                            if symbol.endswith('!collector_saturation_target')]
+            unsafe_indices = [index for index, symbol in enumerate(ordered_saturation)
+                              if symbol.endswith('!collector_saturation_unsafe')]
             saturation_targets = root/'saturation-targets.txt'
             saturation_targets.write_text('\n'.join(sorted(saturation_symbols))+'\n')
             saturation_script = root/'saturation-profile.py'
@@ -353,10 +389,11 @@ while True:
     # counters alone can reach zero while the final attach is still active.
     if (stats.drained - baseline_drained >= {saturation_count}
             and stats.queue_length == 0
-            and all(hook_state(index) == 1 for index in range({saturation_count}))):
+            and all(hook_state(index) == 1 for index in {safe_indices!r})):
         break
     assert time.monotonic() < deadline, (stats.drained, stats.queue_length)
     time.sleep(0.01)
+assert all(hook_state(index) == 0 for index in {unsafe_indices!r})
 assert parent.collector_saturation_invoke() == {saturation_count}
 print("collector_saturation_originals_ok")
 ''')
@@ -368,6 +405,7 @@ print("collector_saturation_originals_ok")
             assert 'collector_saturation_originals_ok' in saturation_report, saturation_report
             assert f'Instrumented targets: {saturation_count}' in saturation_report, saturation_report
             assert re.search(r'Recorded calls: '+str(saturation_count)+r'\b', saturation_report), saturation_report
+            assert '!collector_saturation_unsafe|' not in saturation_report, saturation_report
             for module in saturation_modules:
                 row = re.escape(str(module)+'!collector_saturation_target')
                 assert re.search(row+r'[^\n]*\|\s*1\s*\|', saturation_report), module
@@ -433,6 +471,51 @@ print("collector_saturation_originals_ok")
         runtime_locale['LC_ALL'] = 'C.UTF-8'
         run([sys.executable, args.collector, locale_script, '--run-python'],
             env=runtime_locale)
+        shadow_cwd = root/'shadow-cwd'
+        shadow_cwd.mkdir()
+        (shadow_cwd/'math.py').write_text('value = 1\n')
+        math_script = root/'math-static.py'
+        math_script.write_text('import math\nassert hasattr(math, "sin")\n')
+        isolated_python_env = {key: value for key, value in os.environ.items()
+                               if key not in ('PYTHONPATH', 'PYTHONHOME')}
+        run([sys.executable, math_script], cwd=shadow_cwd, env=isolated_python_env)
+        math_symbols = collect(math_script, cwd=shadow_cwd, env=isolated_python_env)
+        assert any(Path(symbol.split('!', 1)[0]).name.startswith('math.')
+                   for symbol in math_symbols), 'unrelated cwd shadowed script import roots'
+        (root/'dynamic_attribute_module.py').write_text(
+            'count = 0\n'
+            'def __getattr__(name):\n'
+            '    global count\n'
+            '    if name == "value":\n'
+            '        count += 1\n'
+            '        return count\n'
+            '    raise AttributeError(name)\n')
+        attribute_script = root/'dynamic-attribute.py'
+        attribute_script.write_text('from dynamic_attribute_module import value\nassert value == 1\n')
+        run([sys.executable, attribute_script], env=isolated_python_env)
+        collect(attribute_script, '--run-python', env=isolated_python_env)
+        # The selected target interpreter owns source grammar even when an
+        # older Python launches the collector. Keep this conditional for CI
+        # hosts that install only one interpreter.
+        if sys.version_info >= (3, 12):
+            older_python = None
+            candidates = ['/usr/bin/python3.9', '/usr/bin/python3.10', '/usr/bin/python3.11',
+                          shutil.which('python3.9'), shutil.which('python3.10'), shutil.which('python3.11')]
+            for candidate in candidates:
+                if candidate and Path(candidate).is_file():
+                    version = run([candidate, '-c', 'import sys; print(sys.version_info.minor)']).strip()
+                    if int(version) < 12:
+                        older_python = candidate
+                        break
+            if older_python:
+                grammar_script = root/'selected-grammar.py'
+                grammar_script.write_text('type Value = int\nimport math\n')
+                grammar_output = run([older_python, args.collector, grammar_script,
+                                      '--python', sys.executable])
+                assert any(Path(symbol.split('!', 1)[0]).name.startswith('math.')
+                           for symbol in grammar_output.splitlines())
+            else:
+                print('SKIP selected Python grammar: older launcher unavailable')
         empty_runtime = root/'empty-runtime.py'
         empty_runtime.write_text('pass\n')
         assert collect(empty_runtime, '--run-python') == set(), 'helper baseline polluted empty target'
@@ -442,6 +525,19 @@ print("collector_saturation_originals_ok")
             json_symbols = collect(json_runtime, '--run-python')
             assert any(Path(symbol.split('!', 1)[0]).name.startswith('_json.')
                        for symbol in json_symbols), import_code
+        binary_script = root/'binary-output.py'
+        binary_script.write_text('import sys\nsys.stdout.buffer.write(bytes([255, 254]))\n')
+        binary_stderr = run([sys.executable, args.collector, binary_script, '--run-python'],
+                            text=False, capture_stderr=True)
+        assert b'\xff\xfe' in binary_stderr, binary_stderr
+        background_marker = root/'background-finished'
+        background_code = f'import time; time.sleep(2); open({str(background_marker)!r}, "w").write("bad")'
+        background_script = root/'background-runtime.py'
+        background_script.write_text('import subprocess, sys\n'+
+                                     f'subprocess.Popen([sys.executable, "-c", {background_code!r}])\n')
+        collect(background_script, '--run-python', '--timeout', '1')
+        run([sys.executable, '-c', 'import time; time.sleep(2.2)'], timeout=5)
+        assert not background_marker.exists(), 'completed target descendant survived collection'
         child_marker = root/'child-finished'
         child_code = f'import time; time.sleep(2); open({str(child_marker)!r}, "w").write("bad")'
         slow = root/'slow.py'

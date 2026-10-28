@@ -93,6 +93,7 @@ typedef struct {
     gpointer module_token;
     gpointer source_handle_token;
     uint64_t ownership_ticket;
+    size_t discovery_cursor;
     PeakDlopenRequestState state;
     gboolean handle_owned;
     gboolean reference_transferred;
@@ -1616,6 +1617,7 @@ dlopen_interceptor_release_dynamic_attach_request_metadata(
     request->module_token = NULL;
     request->source_handle_token = NULL;
     request->ownership_ticket = 0;
+    request->discovery_cursor = 0;
     request->state = PEAK_DLOPEN_REQUEST_EMPTY;
     request->handle_owned = FALSE;
     request->reference_transferred = FALSE;
@@ -1746,6 +1748,7 @@ dlopen_interceptor_requeue_dynamic_attach_request(PeakDlopenDynamicAttachRequest
         request->module_token = NULL;
         request->source_handle_token = NULL;
         request->ownership_ticket = 0;
+        request->discovery_cursor = 0;
         request->state = PEAK_DLOPEN_REQUEST_EMPTY;
         request->handle_owned = FALSE;
         request->reference_transferred = FALSE;
@@ -2650,7 +2653,7 @@ dlopen_interceptor_path_equal(gconstpointer a, gconstpointer b)
  * Derived requests have no borrowed source handle and never rediscover modules. */
 static gboolean
 dlopen_interceptor_enqueue_selected_modules(
-    const PeakDlopenDynamicAttachRequest* source,
+    PeakDlopenDynamicAttachRequest* source,
     const PeakDlopenResolvedTarget* targets,
     size_t count,
     GPtrArray* handles_to_close)
@@ -2666,23 +2669,21 @@ dlopen_interceptor_enqueue_selected_modules(
     gboolean retry = FALSE;
     GHashTable* paths = g_hash_table_new_full(
         g_str_hash, dlopen_interceptor_path_equal, g_free, NULL);
-    for (size_t i = 0; i < count; i++) {
+    /* Target indices remain stable across retries. Resume where capacity ran
+     * out, including when earlier modules still have unsupported symbols;
+     * restarting those modules would starve the remaining selected modules. */
+    for (size_t i = source->discovery_cursor; i < count; i++) {
         gchar* path = NULL;
-        if (targets[i].name != NULL &&
-            peak_target_resolver_dup_selector_module(targets[i].name, &path) &&
-            path != NULL && strchr(path, G_DIR_SEPARATOR) != NULL &&
-            !peak_target_resolver_module_matches(path, source->filename)) {
-            g_hash_table_add(paths, path);
-        } else {
+        source->discovery_cursor = i + 1;
+        if (targets[i].name == NULL ||
+            !peak_target_resolver_dup_selector_module(targets[i].name, &path) ||
+            path == NULL || strchr(path, G_DIR_SEPARATOR) == NULL ||
+            peak_target_resolver_module_matches(path, source->filename) ||
+            g_hash_table_contains(paths, path)) {
             g_free(path);
+            continue;
         }
-    }
-
-    GHashTableIter iter;
-    gpointer key;
-    g_hash_table_iter_init(&iter, paths);
-    while (g_hash_table_iter_next(&iter, &key, NULL)) {
-        const char* path = key;
+        g_hash_table_add(paths, path);
         gboolean queued = FALSE;
         pthread_mutex_lock(&dynamic_attach_gate_mutex);
         size_t index = dynamic_attach_queue_head;
@@ -2707,6 +2708,7 @@ dlopen_interceptor_enqueue_selected_modules(
         if (queued) continue;
         if (!can_accept) {
             retry = controller_open;
+            if (retry) source->discovery_cursor = i;
             break;
         }
 

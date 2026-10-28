@@ -108,6 +108,31 @@ main(void)
             return EXIT_FAILURE;
         }
     }
+    GumAddress loader_base = getauxval(AT_BASE);
+    if (loader_base != 0) {
+        GumModule* loader = gum_process_find_module_by_address(loader_base);
+        if (loader == NULL) {
+            fputs("could not identify the process ELF loader\n", stderr);
+            gum_deinit_embedded();
+            return EXIT_FAILURE;
+        }
+        GumMemoryRange range = *gum_module_get_range(loader);
+        g_object_unref(loader);
+        if (peak_general_listener_attach_target_is_supported(
+                "loader_base", (gpointer)range.base_address) ||
+            peak_general_listener_attach_target_is_supported(
+                "loader_end", (gpointer)(range.base_address + range.size - 1))) {
+            fputs("unsafe override allowed the ELF loader range\n", stderr);
+            gum_deinit_embedded();
+            return EXIT_FAILURE;
+        }
+    }
+    if (!peak_general_listener_attach_target_is_supported(
+            "ordinary_libc", (gpointer)puts)) {
+        fputs("ELF loader policy rejected an ordinary libc entry\n", stderr);
+        gum_deinit_embedded();
+        return EXIT_FAILURE;
+    }
     const char *loader_names[] = {"_dl_find_dso_for_object", "_dl_allocate_tls"};
     for (size_t i = 0; i < G_N_ELEMENTS(loader_names); i++) {
         gpointer entry = dlsym(RTLD_DEFAULT, loader_names[i]);
