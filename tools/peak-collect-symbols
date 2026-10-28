@@ -98,7 +98,7 @@ class Collector:
         runpath = re.findall(r'\(RUNPATH\).*?\[(.*?)\]', output)
         symbols = set()
         for line in output.splitlines():
-            columns = line.split()
+            columns = line.split(None, 7)
             if len(columns) < 8 or not re.fullmatch(r'\d+:', columns[0]):
                 continue
             if columns[3] not in ('FUNC', 'IFUNC', 'GNU_IFUNC') or columns[6] in ('UND', 'ABS'):
@@ -106,7 +106,7 @@ class Collector:
             if int(columns[1], 16) == 0:
                 continue
             name = columns[7].split('@', 1)[0]
-            if any(c in name for c in '!\r\n'):
+            if any(c in name for c in '!\r\n[](){}<>,+') or any(c.isspace() for c in name):
                 raise CollectionError('symbol cannot be represented in PEAK_TARGET_FILE: ' + repr(name))
             if name:
                 symbols.add(name)
@@ -115,10 +115,10 @@ class Collector:
         self.cache[path] = result
         return result
 
-    def expand(self, values, origin):
+    def expand(self, values, origin, split=True):
         result = []
         for value in values:
-            for item in value.split(':'):
+            for item in (value.split(':') if split else (value,)):
                 # Empty loader search entries mean the current working directory.
                 item = item.replace('${ORIGIN}', str(origin)).replace('$ORIGIN', str(origin))
                 if any(token in item for token in ('$LIB', '${LIB}', '$PLATFORM', '${PLATFORM}')):
@@ -184,7 +184,7 @@ class Collector:
 
     def add_object(self, path):
         path = Path(path).resolve(strict=True)
-        if any(c in str(path) for c in '!\r\n'):
+        if any(c in str(path) for c in '!\r\n[](){}<>,'):
             raise CollectionError('path cannot be represented in PEAK_TARGET_FILE: ' + repr(str(path)))
         info = self.inspect(path)
         if path not in self.objects:
@@ -194,16 +194,23 @@ class Collector:
                 print('warning: no defined function symbols in ' + str(path), file=sys.stderr)
         return info
 
-    def add_runtime(self, observed, baseline):
+    def add_runtime(self, observed, baseline, roots):
         # Only files actually mapped during this run can supply runtime targets.
         pool, selected, index = {}, set(), {}
+        def validate_identity(visible, expected):
+            try:
+                stat = visible.stat()
+            except OSError as error:
+                raise CollectionError('observed mapped file is unavailable: ' + str(visible)) from error
+            if (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino) != expected:
+                raise CollectionError('observed mapped file changed: ' + str(visible))
         for active, names in ((True, observed), (False, baseline)):
-            if not active and not selected:
+            if not active and not selected and not roots:
                 return
-            for name in names:
+            for name, major, minor, inode in names:
                 visible = Path(name)
-                if not visible.is_file():
-                    continue
+                expected = (major, minor, inode)
+                validate_identity(visible, expected)
                 path = visible.resolve()
                 if active:
                     self.sources.add(path)
@@ -212,8 +219,16 @@ class Collector:
                         if stream.read(4) != b'\x7fELF':
                             continue
                     pool[path] = self.inspect(path)
+                    validate_identity(visible, expected)
                 if active:
                     selected.add(path)
+        for name in roots:
+            path = Path(name)
+            if path.is_file():
+                canonical = path.resolve()
+                self.sources.add(canonical)
+                if canonical in pool:
+                    selected.add(canonical)
         for path, info in pool.items():
             for name in [path.name] + info[5]:
                 index.setdefault((info[0], name), set()).add(path)
@@ -266,7 +281,7 @@ class Collector:
                 if (abi, name) in selected:
                     continue
                 if '/' in name:
-                    candidates = self.expand([name], visible_path.parent)
+                    candidates = self.expand([name], visible_path.parent, split=False)
                     candidates += [directory / Path(name).name for directory in self.library_dirs]
                 else:
                     candidates = self.directory_candidates(search, name, abi)
@@ -400,20 +415,24 @@ paths = set()
 loaded_roots = {}
 ctypes_modules = set()
 extension_suffixes = tuple(_imp.extension_suffixes())
-def mapped_paths():
+def mapped_files():
     result = set()
     with open('/proc/self/maps') as maps:
         for line in maps:
-            parts = line.rstrip().split(None, 5)
-            if len(parts) == 6 and parts[5].startswith('/'):
+            parts = line.rstrip('\n').split(None, 5)
+            if len(parts) == 6 and 'x' in parts[1] and parts[5].startswith('/'):
                 path = parts[5]
-                result.add(path[:-10] if path.endswith(' (deleted)') else path)
+                if path.startswith('/memfd:'):
+                    continue  # Anonymous descriptors are not filesystem ELF inputs.
+                path = path[:-10] if path.endswith(' (deleted)') else path
+                major, minor = (int(value, 16) for value in parts[3].split(':'))
+                result.add((path, major, minor, int(parts[4])))
     return result
-baseline = mapped_paths()
+baseline = mapped_files()
 baseline_modules = initial_modules
 def snapshot():
     try:
-        paths.update(mapped_paths() - baseline)
+        paths.update(mapped_files() - baseline)
     except OSError:
         pass  # A successful target call must survive unavailable procfs.
 def namespace(module):
@@ -436,35 +455,38 @@ def observe_ctypes(module):
     if native is None or ns.get('_dlopen') is not native or module in ctypes_modules:
         return
     ctypes_modules.add(module)
-    class LinkMap(module.Structure):
-        _fields_ = [('address', module.c_void_p), ('name', module.c_char_p),
-                    ('dynamic', module.c_void_p)]
     try:
-        query = module.CDLL(None).dlinfo
-    except (AttributeError, OSError):
-        return  # Other loaders retain the module/mapping inventory fallback.
-    query.argtypes = [module.c_void_p, module.c_int, module.c_void_p]
-    query.restype = module.c_int
-    def dlopen(*args, **kwargs):
+        class LinkMap(module.Structure):
+            _fields_ = [('address', module.c_void_p), ('name', module.c_char_p),
+                        ('dynamic', module.c_void_p)]
         try:
-            cwd = os.getcwd()
-        except OSError:
-            cwd = None
-        handle = native(*args, **kwargs)
-        snapshot()
-        link = module.POINTER(LinkMap)()
-        try:
-            status = query(handle, 2, module.byref(link))
-        except (OSError, ValueError, module.ArgumentError):
+            query = module.CDLL(None).dlinfo
+        except (AttributeError, OSError):
+            return  # Other loaders retain the module/mapping inventory fallback.
+        query.argtypes = [module.c_void_p, module.c_int, module.c_void_p]
+        query.restype = module.c_int
+        def dlopen(*args, **kwargs):
+            try:
+                cwd = os.getcwd()
+            except OSError:
+                cwd = None
+            handle = native(*args, **kwargs)
+            snapshot()
+            link = module.POINTER(LinkMap)()
+            try:
+                status = query(handle, 2, module.byref(link))
+            except (OSError, ValueError, module.ArgumentError):
+                return handle
+            if status == 0 and link and link.contents.name:
+                name = os.fsdecode(link.contents.name)
+                if os.path.isabs(name):
+                    loaded_roots.setdefault(name, None)
+                elif cwd is not None:
+                    loaded_roots.setdefault(os.path.join(cwd, name), None)
             return handle
-        if status == 0 and link and link.contents.name:
-            name = os.fsdecode(link.contents.name)
-            if os.path.isabs(name):
-                loaded_roots.setdefault(name, None)
-            elif cwd is not None:
-                loaded_roots.setdefault(os.path.join(cwd, name), None)
-        return handle
-    ns['_dlopen'] = dlopen
+        ns['_dlopen'] = dlopen
+    finally:
+        ctypes_modules.discard(module)
 
 original_import = builtins.__import__
 def target_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -475,6 +497,7 @@ def target_import(name, globals=None, locals=None, fromlist=(), level=0):
     if (namespace(module).get('__name__') == 'importlib'
             and namespace(module).get('__file__') == namespace(importlib).get('__file__')):
         namespace(module)['import_module'] = target_import_module
+        namespace(module)['reload'] = target_reload
     if not level and name in sys.modules:
         remember(sys.modules[name])
     for item in fromlist or ():
@@ -487,6 +510,17 @@ def target_import_module(name, package=None):
     if namespace(module).get('__name__') == 'ctypes':
         observe_ctypes(module)
     return module
+original_reload = importlib.reload
+def target_reload(module):
+    if namespace(module).get('__name__') != 'ctypes':
+        return original_reload(module)
+    ctypes_modules.add(module)
+    try:
+        result = original_reload(module)
+    finally:
+        ctypes_modules.discard(module)
+    observe_ctypes(result)
+    return result
 output, script = sys.argv[1:3]
 sys.argv = sys.argv[2:]
 if not os.path.isabs(script):
@@ -504,15 +538,17 @@ for name in set(sys.modules) - initial_modules - {'atexit'}:
 sys.modules['__main__'] = main
 builtins.__import__ = target_import
 importlib.import_module = target_import_module
+importlib.reload = target_reload
 def finish():
     builtins.__import__ = original_import
     importlib.import_module = original_import_module
+    importlib.reload = original_reload
     for name, module in list(sys.modules.items()):
         if name not in baseline_modules:
             remember(module, capture=False)
-    paths.update(mapped_paths() - baseline)
+    paths.update(mapped_files() - baseline)
     with open(output, 'w') as result:
-        result.write(repr({'observed': sorted(set(loaded_roots) | paths), 'baseline': sorted(baseline)}))
+        result.write(repr({'roots': list(loaded_roots), 'observed': sorted(paths), 'baseline': sorted(baseline)}))
 # Registered first so target callbacks run before the final inventory.
 atexit.register(finish)
 exec(code, main.__dict__)
@@ -538,6 +574,7 @@ def main():
         'expanded directories supplied with --library-dir; those entries are then skipped with a warning. --run-python executes your script once; '
         'successful compiled imports/ctypes loads and exit trigger mapped-library snapshots. '
         'Native loads and unloads entirely between those boundaries may be missed. '
+        'Memory-only/memfd mappings and JIT symbol recovery are unsupported. '
         'Python targets collect native modules and their dependencies; interpreter baseline libraries are excluded. Pure Python functions are not native function symbols.')
     parser.add_argument('target', help='ELF executable/shared library or Python script')
     parser.add_argument('-o', '--output', help='output file (default: stdout); replaced only on success')
@@ -587,7 +624,7 @@ def main():
                 collector.inherited_rpath = tuple(collector.expand(interpreter[2], collector.root_origin))
             if args.run_python:
                 discovery = runtime_python(args.target, args.python, arguments, args.timeout)
-                collector.add_runtime(discovery['observed'], discovery['baseline'])
+                collector.add_runtime(discovery['observed'], discovery['baseline'], discovery['roots'])
             else:
                 static_python(target, info, collector)
                 print('warning: static Python discovery cannot resolve arbitrary runtime imports or unavailable optional modules.', file=sys.stderr)
