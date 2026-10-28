@@ -21,6 +21,7 @@ endif()
 set(sources_peak
     dlopen_interceptor.c
     general_listener.c
+    global_budget.c
     general_listener/attach_policy.c
     general_listener/exec_checkpoint_writer.c
     general_listener/output_identity.c

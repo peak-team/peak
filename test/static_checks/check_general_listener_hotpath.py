@@ -295,9 +295,15 @@ def main():
         and "reattach_budget_ok && i < heartbeat_capacity" in admission,
         "reattach must reject stale control headroom after controller-lock acquisition",
     )
-    for token in ("pthread_mutex", "MPI_", "for (", "malloc(", "gum_interceptor_"):
+    for token in ("pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
         require(token not in burst_publish,
                 "burst callbacks must not lock, scan, allocate, call MPI or mutate Gum")
+    require(
+        burst_publish.count("for (") == 1
+        and "retry < 2 && grace >= charge" in burst_publish
+        and "peak_global_budget_try_spend" in burst_publish,
+        "global callback grace must use only a bounded two-attempt credit CAS",
+    )
     for token in (
         "pthread_mutex",
         "pthread_cond",

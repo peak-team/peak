@@ -745,3 +745,60 @@ Useful local checks for this mechanism include:
 Trace rows, when enabled, are diagnostics. They append request provenance,
 retry state, stop-window details, batch ids, and accounting fields. They do not
 control whether stop-window accounting exists.
+
+## Experimental cross-rank runtime budget prototype
+
+`PEAK_MPI_GLOBAL_BUDGET=1` enables a prototype runtime coordinator while retaining
+instrumentation and the existing safe detach controller. The default is off.
+This first implementation requires a homogeneous C-MPI SPMD launch: **every
+MPI_COMM_WORLD rank must preload the same build and enable the same option**.
+The outer MPI initialization wrapper performs one additional endpoint broadcast
+on the application's initialization thread. Partial-rank opt-in is unsupported
+and can block in that collective; it is not a timeout-safe discovery protocol.
+The wrapper preserves the application's requested/provided MPI thread levels.
+After bootstrap, background coordination uses TCP only, including under FUNNELED
+or SINGLE; heartbeat/controller threads do not invoke MPI.
+
+Heartbeat publishes cumulative estimated profile cost, measured control-window
+wall, management CPU and attached pressure after releasing the listener lock.
+The coordinator retains spent cost and tracks issued credits. Fresh positive
+credits fund callback blocks and admission; stale views return to the existing
+local policy. Each rank additionally has at most 500 microseconds of estimated
+unfunded callback grace for the entire session, shared by all hooks and threads.
+It is not renewed by heartbeat, grants or detach/reattach. Exhaustion requests
+the existing local emergency mutation; the report exposes unfunded cost and
+emergency fallback counts. `grace_used_seconds` is the authorized portion and
+cannot exceed 500 microseconds; `unfunded_seconds` also includes callback blocks
+already in flight while emergency closing completes, which are covered by the
+separate closing-cost estimate and can exceed that grace. The callback's ordinary
+cumulative profile estimate includes both portions, so neither is charged twice.
+In-flight mutation and coordination costs remain
+estimates, so this prototype must be evaluated with application timings.
+
+Root STOP commands carry a common wave identifier. Each rank's controller fans
+out the command using its existing safe batch protocol; completed waves are
+acknowledged. The root GO-to-all-DONE duration is a coordination diagnostic.
+The prototype conservatively retains the sum of local control costs and does
+not subtract them based on an unproven overlap assumption. Epoch/critical-path
+communication models and replacement of an application's Barrier are not part
+of this prototype.
+
+Startup waits at most one second for a fresh global view, then degrades to local
+control if unavailable. Shutdown drains local requests, publishes a final cost
+and completion snapshot, and waits at most 100 milliseconds for acknowledgment
+before closing the service. Reports expose startup readiness/time, whether the
+view was ever active, last global costs/credit/wave state and shutdown
+confirmation/time. A missing confirmation is not treated as a successful global
+wave. Startup, coordination and shutdown timings are part of experimental
+validation, not hidden outside its reported timing boundary.
+
+The root's bootstrap/readiness span is charged once as an initial coordinator
+cost; peer bootstrap durations are diagnostics and are not summed as independent
+application delays. This can leave the initial pool in debt until elapsed time
+generates sufficient credit. Invalid runtime accounting closes coordination
+rather than publishing a zero-cost tuple; invalid/degraded counters and missing
+shutdown acknowledgment remain visible in the final report.
+
+For wire compatibility the sample field `unfunded_seconds` currently carries
+the bounded authorized grace usage (`grace_used_seconds`), not the larger
+diagnostic total of all unfunded callback charges.

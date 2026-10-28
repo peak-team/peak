@@ -379,6 +379,7 @@ void peak_general_listener_controller_unlock(void);
  * controller thread process pending Gum lifecycle work outside the callback.
  */
 void peak_general_listener_controller_wake(void);
+PEAK_API void peak_general_listener_global_budget_startup(double seconds, int ready);
 
 /**
  * @brief Marks a dynamically published hook attached.

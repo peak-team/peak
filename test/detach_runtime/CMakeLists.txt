@@ -185,7 +185,7 @@ endif()
 
 add_executable(test_mpi_burst_budget test_mpi_burst_budget.c)
 target_include_directories(test_mpi_burst_budget PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${FRIDA_GUM_INCLUDE_DIRS})
+    ${PROJECT_SOURCE_DIR}/include ${FRIDA_GUM_INCLUDE_DIRS} ${MPI_C_INCLUDE_DIRS})
 target_link_libraries(test_mpi_burst_budget PRIVATE ${DL_LIBRARY} Threads::Threads)
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_options(test_mpi_burst_budget PRIVATE -Wl,--export-dynamic)

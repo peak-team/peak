@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "mpi_interceptor.h"
 #include "general_listener.h"
+#include "internal/global_budget.h"
+#include <unistd.h>
 #include "internal/mpi_teardown_guard.h"
 #include "logging.h"
 #include "utils/env_parser.h"
@@ -49,6 +51,7 @@ static _Atomic unsigned int peak_finalize_test_waiters;
 static _Atomic unsigned int peak_finalize_test_original_calls;
 #endif
 
+extern float global_target_ratio;
 static int (*original_pmpi_finalize)(void);
 extern void peak_fini(void);
 
@@ -324,6 +327,45 @@ mpi_interceptor_resolve_pmpi_init_thread_once(void)
         (PeakMpiInitThreadFunction)dlsym(RTLD_NEXT, "PMPI_Init_thread");
 }
 
+/* Opt-in SPMD bootstrap: every world rank must enable the same mode. */
+static void
+peak_mpi_global_budget_bootstrap(int result, int required)
+{
+    const char* enabled = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    if (result != MPI_SUCCESS || enabled == NULL || strcmp(enabled, "1") != 0)
+        return;
+    struct timespec budget_started;
+    (void)clock_gettime(CLOCK_MONOTONIC, &budget_started);
+    int rank, size, actual_thread_level = MPI_THREAD_SINGLE;
+    (void)PMPI_Query_thread(&actual_thread_level);
+    peak_log_report("[peak] MPI global bootstrap: backend=tcp required_thread_level=%d provided_thread_level=%d all_world_optin_required=1\n", required, actual_thread_level);
+    struct { char host[256]; unsigned short port; uint64_t nonce; } endpoint;
+    memset(&endpoint, 0, sizeof(endpoint));
+    if (PMPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
+        PMPI_Comm_size(MPI_COMM_WORLD, &size) != MPI_SUCCESS || size < 2) return;
+    if (rank == 0 && peak_global_budget_listen(&endpoint.port) == 0) {
+        (void)gethostname(endpoint.host, sizeof(endpoint.host) - 1);
+        endpoint.nonce = peak_global_budget_nonce();
+    }
+    if (PMPI_Bcast(&endpoint, sizeof(endpoint), MPI_BYTE, 0, MPI_COMM_WORLD) != MPI_SUCCESS ||
+        endpoint.port == 0) return;
+    peak_global_budget_set_nonce(endpoint.nonce);
+    int started = peak_global_budget_start(endpoint.host, endpoint.port,
+        (unsigned)rank, (unsigned)size, global_target_ratio,
+        peak_general_listener_controller_wake);
+    int ready = 0;
+    if (started == 0) {
+        const struct timespec pause = {0, 1000000};
+        while (mpi_interceptor_finalize_elapsed_ms(&budget_started) < 1000.0) {
+            if (peak_global_budget_view().active) { ready = 1; break; }
+            nanosleep(&pause, NULL);
+        }
+    }
+    double startup_seconds = mpi_interceptor_finalize_elapsed_ms(&budget_started) / 1000.0;
+    peak_global_budget_startup(startup_seconds);
+    peak_general_listener_global_budget_startup(startup_seconds, ready);
+}
+
 static int
 mpi_interceptor_call_init(PeakMpiInitFunction init,
                           const char* symbol,
@@ -342,6 +384,7 @@ mpi_interceptor_call_init(PeakMpiInitFunction init,
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
         peak_mpi_init_completed(result);
+        peak_mpi_global_budget_bootstrap(result, MPI_THREAD_SINGLE);
     }
     return result;
 }
@@ -366,6 +409,7 @@ mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
         peak_mpi_init_completed(result);
+        peak_mpi_global_budget_bootstrap(result, required);
     }
     return result;
 }

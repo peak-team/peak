@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#include <math.h>
 #include "general_listener.h"
+#include "internal/global_budget.h"
 #include "dlopen_interceptor.h"
 #include "internal/target_resolver.h"
 #include "internal/exec_raw_syscall.h"
@@ -198,6 +200,34 @@ static gulong peak_detach_count = G_MAXULONG;
 static gboolean peak_mpi_burst_guard_enabled;
 static double peak_effective_rank_target;
 static double peak_mpi_burst_limit;
+static uint64_t peak_global_applied_wave;
+static _Atomic uint64_t peak_global_completed_wave;
+static _Atomic gboolean peak_global_ever_active;
+static gboolean peak_global_configured;
+static _Atomic uint64_t peak_global_grace_remaining_ns = 500000;
+static _Atomic uint64_t peak_global_unfunded_ns;
+static _Atomic uint64_t peak_global_emergency_count;
+static _Atomic uint64_t peak_global_startup_ns;
+static _Atomic int peak_global_startup_ready;
+static _Atomic uint64_t peak_global_sample_sequence;
+static _Atomic int peak_global_shutdown_confirmed;
+static _Atomic uint64_t peak_global_shutdown_ns;
+static _Atomic uint64_t peak_global_degraded_samples;
+static _Atomic uint64_t peak_global_invalid_accounting;
+static void peak_general_listener_global_accounting_invalid(void)
+{
+    atomic_fetch_add(&peak_global_invalid_accounting, 1);
+    peak_global_budget_stop();
+}
+static double peak_general_listener_profile_seconds_at_boundary(void);
+PEAK_API void peak_general_listener_global_budget_startup(double seconds, int ready)
+{
+    if (seconds >= 0.0 && seconds < 1e9)
+        atomic_store(&peak_global_startup_ns, (uint64_t)(seconds * 1e9));
+    atomic_store(&peak_global_startup_ready, ready);
+    if (ready) atomic_store(&peak_global_ever_active, TRUE);
+}
+
 static gboolean peak_mpi_burst_wave_active;
 static uint64_t peak_mpi_burst_waves;
 static uint64_t peak_mpi_burst_unsampled_targets;
@@ -4669,11 +4699,23 @@ peak_general_controller_thread_main(void* arg)
 
         (void)pthread_listener_reclaim_detached_slots();
         pthread_mutex_lock(&lock);
+        PeakGlobalBudgetView global_view = {0};
+        if (peak_global_configured) global_view = peak_global_budget_view();
+        if (global_view.active && global_view.wave > peak_global_applied_wave) {
+            peak_general_controller_request_mpi_burst_wave_unlocked();
+            peak_global_applied_wave = global_view.wave;
+        }
         (void)peak_general_controller_process_pending_unlocked(controller_tid,
                                                                tid_keys,
                                                                mapped_ids,
                                                                pause_session_ids,
                                                                pause_status);
+        if (peak_global_applied_wave &&
+            !peak_general_listener_mpi_burst_wave_pending_unlocked())
+        {
+            atomic_store(&peak_global_completed_wave, peak_global_applied_wave);
+            peak_global_budget_complete(peak_global_applied_wave);
+        }
         pthread_mutex_unlock(&lock);
 
         dlopen_interceptor_drain_dynamic_attach_queue();
@@ -4722,6 +4764,14 @@ peak_general_listener_controller_start(void)
 void
 peak_general_listener_controller_stop(void)
 {
+    pthread_mutex_lock(&lock);
+    PeakGlobalBudgetView final_command = {0};
+    if (peak_global_configured) final_command = peak_global_budget_view();
+    if (final_command.active && final_command.wave > peak_global_applied_wave) {
+        peak_general_controller_request_mpi_burst_wave_unlocked();
+        peak_global_applied_wave = final_command.wave;
+    }
+    pthread_mutex_unlock(&lock);
     gboolean should_join;
     pthread_t thread;
     unsigned int shutdown_drain_ms =
@@ -4746,6 +4796,37 @@ peak_general_listener_controller_stop(void)
         general_controller_thread_started = FALSE;
         pthread_mutex_unlock(&general_controller_wake_mutex);
     }
+    const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    if (global_mode != NULL && strcmp(global_mode, "1") == 0) {
+        double started = peak_second();
+        pthread_mutex_lock(&lock);
+        if (peak_global_applied_wave &&
+            !peak_general_listener_mpi_burst_wave_pending_unlocked())
+        {
+            atomic_store(&peak_global_completed_wave, peak_global_applied_wave);
+            peak_global_budget_complete(peak_global_applied_wave);
+        }
+        pthread_mutex_unlock(&lock);
+        PeakDetachAccountingSnapshot accounting;
+        if (peak_general_listener_runtime_accounting_snapshot(&accounting)) {
+            PeakGlobalBudgetSample sample = {
+                .sequence = atomic_fetch_add(&peak_global_sample_sequence, 1) + 1,
+                .completed_wave = atomic_load(&peak_global_completed_wave),
+                .profile_seconds = peak_general_listener_profile_seconds_at_boundary(),
+                .control_seconds = (double)peak_general_listener_control_wall_ns_since_heartbeat(&accounting) / 1e9,
+                .management_seconds = peak_general_listener_management_cpu_seconds(),
+                .unfunded_seconds = (double)(500000 - atomic_load(&peak_global_grace_remaining_ns)) / 1e9,
+                .elapsed_seconds = peak_second() - peak_main_time,
+                .pressure = 0.0, .attached_targets = 0
+            };
+            peak_global_budget_publish(&sample);
+            atomic_store(&peak_global_shutdown_confirmed, peak_global_budget_flush(100));
+        } else {
+            peak_general_listener_global_accounting_invalid();
+        }
+        atomic_store(&peak_global_shutdown_ns, (uint64_t)((peak_second() - started) * 1e9));
+    }
+    peak_global_budget_stop();
 }
 /* Heartbeat policy. */
 
@@ -5270,6 +5351,8 @@ void* peak_heartbeat_monitor(void* arg) {
             total_execution_time >= min_detach_observation_time;
 
         double profile_spent_seconds = 0.0;
+        uint32_t global_attached_targets = 0;
+        uint32_t global_detached_targets = 0;
         double control_spent_seconds = 0.0;
         double spent_ratio = 0.0;
         double attached_recent_sum = 0.0;
@@ -5353,14 +5436,18 @@ void* peak_heartbeat_monitor(void* arg) {
             recent_baseline_ready[i] = TRUE;
             profile_spent_seconds += hook_profile_spent_seconds;
 
+            if (peak_hook_states != NULL && peak_hook_states[i] == PEAK_HOOK_DETACHED)
+                global_detached_targets++;
             if (peak_general_listener_hook_is_attached_for_policy_unlocked(i)) {
+                global_attached_targets++;
                 attached_recent_sum += recent_rate;
                 attached_lifetime_sum += ratio;
             }
         }
         pthread_mutex_unlock(&lock);
 
-        peak_general_listener_runtime_accounting_snapshot(&detach_accounting);
+        gboolean global_accounting_valid =
+            peak_general_listener_runtime_accounting_snapshot(&detach_accounting);
         control_pause_wall_ns =
             peak_general_listener_control_wall_ns_since_heartbeat(
                 &detach_accounting);
@@ -5371,13 +5458,37 @@ void* peak_heartbeat_monitor(void* arg) {
         spent_ratio =
             (profile_spent_seconds + control_spent_seconds) /
             total_execution_time;
+        PeakGlobalBudgetSample global_sample = {
+            .sequence = atomic_fetch_add(&peak_global_sample_sequence, 1) + 1,
+            .unfunded_seconds = (double)(500000 - atomic_load(&peak_global_grace_remaining_ns)) / 1e9,
+            .completed_wave = atomic_load(&peak_global_completed_wave),
+            .profile_seconds = profile_spent_seconds,
+            .control_seconds = control_spent_seconds,
+            .management_seconds = peak_general_listener_management_cpu_seconds(),
+            .elapsed_seconds = total_execution_time,
+            .pressure = MAX(attached_recent_sum, attached_lifetime_sum),
+            .attached_targets = global_attached_targets
+        };
+        if (peak_global_configured) {
+            if (global_accounting_valid) peak_global_budget_publish(&global_sample);
+            else peak_general_listener_global_accounting_invalid();
+        }
         attached_pressure = MAX(attached_recent_sum, attached_lifetime_sum);
         profile_global_overhead = attached_pressure;
         double projected_attached_recent_sum = attached_recent_sum;
         double projected_attached_lifetime_sum = attached_lifetime_sum;
 
+        PeakGlobalBudgetView global_policy = {0};
+        if (peak_global_configured) global_policy = peak_global_budget_view();
+        if (global_policy.active) atomic_store(&peak_global_ever_active, TRUE);
+        else if (peak_global_configured && atomic_load(&peak_global_ever_active))
+            atomic_fetch_add(&peak_global_degraded_samples, 1);
+        if (global_policy.active && attached_pressure > peak_effective_rank_target)
+            peak_global_budget_pressure();
+        /* With a fresh coordinator, local pressure is a request, not an
+         * independently issued mutation. The controller consumes root waves. */
         /* 1) Per-target detach. */
-        if (detach_observation_ready && enable_per_target_heartbeat) {
+        if (detach_observation_ready && enable_per_target_heartbeat && !global_policy.active) {
             pthread_mutex_lock(&lock);
             for (size_t i = 0; i < heartbeat_capacity; i++) {
                 if (!(hook_address[i] && array_listener[i])) continue;
@@ -5414,7 +5525,7 @@ void* peak_heartbeat_monitor(void* arg) {
         }
 
         /* 2) Global detach. */
-        if (detach_observation_ready && enable_global_heartbeat) {
+        if (detach_observation_ready && enable_global_heartbeat && !global_policy.active) {
             double projected_global_overhead =
                 MAX(projected_attached_recent_sum,
                     projected_attached_lifetime_sum);
@@ -5562,7 +5673,23 @@ void* peak_heartbeat_monitor(void* arg) {
                 peak_general_listener_subtract_nonnegative_finite(
                     &headroom_seconds,
                     reattach_control_risk_seconds);
-            if (reattach_budget_ok) {
+            PeakGlobalBudgetView global_admission = {0};
+            if (peak_global_configured) global_admission = peak_global_budget_view();
+            if (global_admission.active) {
+                double recovery_credit = last_stop_seconds +
+                    PEAK_BURST_BUDGET_STRIDE * peak_general_overhead;
+                if (global_detached_targets > 0 &&
+                    recovery_credit > global_admission.allowance_seconds &&
+                    recovery_credit > 0.0 && recovery_credit < (double)UINT64_MAX / 1e9)
+                    peak_global_budget_request_credit((uint64_t)ceil(recovery_credit * 1e9));
+                reattach_budget_ok = reattach_accounting_coherent &&
+                    (enable_per_target_heartbeat || enable_global_heartbeat) &&
+                    global_admission.allowance_seconds > 0.0 &&
+                    peak_general_listener_nonnegative_finite(last_stop_seconds);
+                headroom_seconds = global_admission.allowance_seconds;
+                predicted_batch_stop_seconds = last_stop_seconds;
+            }
+            if (reattach_budget_ok && !global_admission.active) {
                 reattach_risk_spent_ratio =
                     reattach_spent_seconds / total_execution_time;
                 reattach_budget_ok =
@@ -5572,6 +5699,12 @@ void* peak_heartbeat_monitor(void* arg) {
             }
 
             if (reattach_budget_ok) {
+                PeakGlobalBudgetView admission_view = {0};
+                if (peak_global_configured) admission_view = peak_global_budget_view();
+                reattach_budget_ok = reattach_budget_ok &&
+                    (!global_admission.active ||
+                     (admission_view.active && admission_view.wave == global_admission.wave &&
+                      admission_view.allowance_seconds > 0.0));
                 size_t pending_mutation_count = 0;
                 size_t detached_cnt = 0;
                 size_t admitted_count = 0;
@@ -5586,7 +5719,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 gboolean reattach_accounting_locked_valid =
                     peak_general_listener_runtime_accounting_snapshot(
                         &reattach_accounting_locked);
-                reattach_budget_ok =
+                reattach_budget_ok = reattach_budget_ok &&
                     peak_general_listener_reattach_accounting_unchanged(
                         &reattach_accounting_after, reattach_accounting_after_valid,
                         &reattach_accounting_locked, reattach_accounting_locked_valid);
@@ -5774,6 +5907,15 @@ void* peak_heartbeat_monitor(void* arg) {
                     gboolean accepted;
                     double request_ratio =
                         projected_seconds / total_execution_time;
+                    if (global_admission.active && extra_stop_seconds > 0.0) {
+                        double reserve_ns = ceil(extra_stop_seconds * 1e9);
+                        PeakGlobalBudgetView current_grant = peak_global_budget_view();
+                        if (!current_grant.active ||
+                            current_grant.wave != global_admission.wave ||
+                            reserve_ns >= (double)UINT64_MAX ||
+                            !peak_global_budget_try_spend((uint64_t)reserve_ns))
+                            continue;
+                    }
                     accepted =
                         peak_general_listener_request_reattach_with_context_unlocked(
                             i,
@@ -6126,6 +6268,40 @@ peak_general_listener_try_publish_burst_request(PeakGeneralListener* listener,
     PeakBurstBudgetSlot* slot =
         peak_general_listener_burst_slot(listener, thread_id);
     if (!peak_burst_budget_due(slot)) {
+        return FALSE;
+    }
+    PeakGlobalBudgetView budget_view = {0};
+    if (peak_global_configured) budget_view = peak_global_budget_view();
+    if (budget_view.active) {
+        double charge_ns = peak_general_overhead *
+                           PEAK_BURST_BUDGET_STRIDE * 1e9;
+        gboolean funded = charge_ns >= 0.0 && charge_ns < (double)UINT64_MAX &&
+            peak_global_budget_try_spend((uint64_t)ceil(charge_ns));
+        if (funded) return FALSE;
+        peak_global_budget_pressure();
+        uint64_t charge = charge_ns >= 0.0 && charge_ns < (double)UINT64_MAX
+                              ? (uint64_t)ceil(charge_ns) : UINT64_MAX;
+        atomic_fetch_add(&peak_global_unfunded_ns, charge);
+        uint64_t grace = atomic_load(&peak_global_grace_remaining_ns);
+        for (unsigned retry = 0; retry < 2 && grace >= charge; retry++) {
+            if (atomic_compare_exchange_weak(&peak_global_grace_remaining_ns,
+                                             &grace, grace - charge))
+                return FALSE;
+        }
+        /* The rank-wide, session-lifetime grace is bounded. Expiry requests
+         * the existing safe emergency wave; no callback performs mutation. */
+        unsigned long long old = atomic_load_explicit(
+            &listener->callback_hook_control, memory_order_acquire);
+        if (peak_general_listener_callback_hook_state(old) != PEAK_HOOK_ATTACHED ||
+            (old & (PEAK_CALLBACK_BURST_REQUEST_BIT |
+                    PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT))) return FALSE;
+        unsigned long long desired = old | PEAK_CALLBACK_BURST_REQUEST_BIT;
+        if (atomic_compare_exchange_strong_explicit(
+                &listener->callback_hook_control, &old, desired,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            atomic_fetch_add(&peak_global_emergency_count, 1);
+            return TRUE;
+        }
         return FALSE;
     }
     unsigned long long control = atomic_load_explicit(
@@ -7361,6 +7537,16 @@ peak_general_listener_attach()
     peak_effective_rank_target =
         peak_general_listener_rank_budget(global_target_ratio);
     peak_mpi_burst_limit = peak_effective_rank_target * peak_global_detach_factor;
+    const char* global_setting = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    peak_global_configured = global_setting != NULL && strcmp(global_setting, "1") == 0;
+    peak_global_applied_wave = 0;
+    atomic_store(&peak_global_completed_wave, 0);
+    atomic_store(&peak_global_ever_active, FALSE);
+    atomic_store(&peak_global_grace_remaining_ns, 500000);
+    atomic_store(&peak_global_unfunded_ns, 0);
+    atomic_store(&peak_global_emergency_count, 0);
+    atomic_store(&peak_global_degraded_samples, 0);
+    atomic_store(&peak_global_invalid_accounting, 0);
     peak_mpi_burst_wave_active = FALSE;
     peak_mpi_burst_waves = 0;
     peak_mpi_burst_unsampled_targets = 0;
@@ -7627,6 +7813,14 @@ peak_general_listener_attach()
 
 /* Checkpoint and report snapshot capture. */
 #ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API void peak_general_listener_test_global_invalid_accounting(void)
+{
+    peak_general_listener_global_accounting_invalid();
+}
+PEAK_API void peak_general_listener_test_global_disconnect(void)
+{
+    peak_global_budget_stop();
+}
 PEAK_API int
 peak_general_listener_test_reattach_accounting_validation(void)
 {
@@ -8589,6 +8783,31 @@ peak_general_listener_write_budget_policy(const PeakReportFormatOptions* options
 {
     if (!options->print_text) {
         return;
+    }
+    const char* global_mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    if (global_mode != NULL && strcmp(global_mode, "1") == 0) {
+        PeakGlobalBudgetView global = peak_global_budget_view();
+        peak_log_report("[peak] MPI global budget: configured=1 ever_active=%d fresh=%d wave=%llu completed_wave=%llu global_spent_seconds=%.9g remaining_seconds=%.9g allowance_seconds=%.9g wave_span_seconds=%.9g unfunded_seconds=%.9g emergency_fallback_count=%llu granted_total_seconds=%.9g startup_seconds=%.9g startup_ready=%d view_epoch=%llu decision_sequence=%llu root_completed_wave=%llu shutdown_confirmed=%d shutdown_seconds=%.9g budget_seconds=%.9g reserved_seconds=%.9g control_reserve_seconds=%.9g runtime_degraded_samples=%llu invalid_accounting_samples=%llu grace_used_seconds=%.9g\n",
+            (int)atomic_load(&peak_global_ever_active), (int)global.active,
+            (unsigned long long)global.wave,
+            (unsigned long long)atomic_load(&peak_global_completed_wave),
+            global.global_spent_seconds, global.remaining_seconds,
+            global.allowance_seconds, global.wave_span_seconds,
+            (double)atomic_load(&peak_global_unfunded_ns) / 1e9,
+            (unsigned long long)atomic_load(&peak_global_emergency_count),
+            global.granted_total_seconds,
+            (double)atomic_load(&peak_global_startup_ns) / 1e9,
+            atomic_load(&peak_global_startup_ready),
+            (unsigned long long)global.view_epoch,
+            (unsigned long long)global.decision_sequence,
+            (unsigned long long)global.root_completed_wave,
+            atomic_load(&peak_global_shutdown_confirmed),
+            (double)atomic_load(&peak_global_shutdown_ns) / 1e9,
+            global.budget_seconds, global.reserved_seconds,
+            global.control_reserve_seconds,
+            (unsigned long long)atomic_load(&peak_global_degraded_samples),
+            (unsigned long long)atomic_load(&peak_global_invalid_accounting),
+            (double)(500000 - atomic_load(&peak_global_grace_remaining_ns)) / 1e9);
     }
     peak_log_report("[peak] MPI budget risk policy: configured_job_target=%.9g effective_rank_target=%.9g world_size=%u source=%s burst_guard=%s stride=%u burst_action=rank-wide burst_counters_scope=reporting-rank burst_waves=%llu burst_unsampled_targets=%llu batch_capacity=%zu\n",
         (double)global_target_ratio, peak_effective_rank_target,
