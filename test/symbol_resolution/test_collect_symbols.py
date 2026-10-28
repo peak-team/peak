@@ -134,6 +134,68 @@ def main():
         colon_symbols = collect(colon_app)
         assert f'{colon_library}!colon_leaf' in colon_symbols
 
+        empty_tag_cwd = root/'empty-tag-cwd'
+        empty_tag_cwd.mkdir()
+        fake_libc = empty_tag_cwd/'libc.so.6'
+        build('empty-tag-fake-libc.c', 'int fake_libc_marker(void){return 99;}', fake_libc,
+              '-shared', '-fPIC', '-nostdlib', compiler=loader_cc)
+        empty_tag_env = {key: value for key, value in os.environ.items()
+                         if key not in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'LD_AUDIT')}
+        for dtags, tag in (('--disable-new-dtags', 'RPATH'), ('--enable-new-dtags', 'RUNPATH')):
+            empty_tag_app = root/('empty-'+tag.lower())
+            build('empty-tag-main.c', '#include <stdio.h>\nint main(void){puts("REAL_LIBC_OK");}',
+                  empty_tag_app, '-Wl,'+dtags+',-rpath=', compiler=loader_cc)
+            tags = run(['readelf', '-W', '-d', empty_tag_app])
+            assert re.search(r'\('+tag+r'\).*?\[\]', tags), tags
+            assert run([empty_tag_app], cwd=empty_tag_cwd, env=empty_tag_env).strip() == 'REAL_LIBC_OK'
+            empty_tag_symbols = collect(empty_tag_app, cwd=empty_tag_cwd, env=empty_tag_env)
+            assert not any(symbol.endswith('!fake_libc_marker') for symbol in empty_tag_symbols)
+            assert any(symbol.endswith('!puts') for symbol in empty_tag_symbols)
+
+        startup_a, startup_b = root/'startup-a', root/'startup-b'
+        startup_a.mkdir()
+        startup_b.mkdir()
+        startup_name = 'libstartup_scope.so'
+        startup_missing = root/'libstartup_gone.so'
+        build('startup-a.c', 'int startup_scope(void){return 7;}', startup_a/startup_name,
+              '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,'+startup_name, compiler=loader_cc)
+        build('startup-gone.c', 'int startup_gone(void){return 19;}', startup_missing,
+              '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libstartup_gone.so', compiler=loader_cc)
+        build('startup-b.c', 'extern int startup_gone(void);int startup_scope(void){return startup_gone();}',
+              startup_b/startup_name, '-shared', '-fPIC', '-nostdlib', '-L'+str(root),
+              '-lstartup_gone', '-Wl,-soname,'+startup_name, compiler=loader_cc)
+        startup_plugin = root/'libstartup_plugin.so'
+        build('startup-plugin.c', 'extern int startup_scope(void);int plugin_scope(void){return startup_scope();}',
+              startup_plugin, '-shared', '-fPIC', '-nostdlib', '-L'+str(startup_b),
+              '-lstartup_scope', '-Wl,-rpath,'+str(startup_b), compiler=loader_cc)
+        startup_app = root/'startup-app'
+        build('startup-main.c', '#include <stdio.h>\n#include <dlfcn.h>\nextern int startup_scope(void);int main(void){void*h=dlopen("'+str(startup_plugin)+'",RTLD_NOW);if(!h){fprintf(stderr,"%s",dlerror());return 1;}int(*f)(void)=dlsym(h,"plugin_scope");if(!f)return 2;printf("%d %d\\n",startup_scope(),f());}',
+              startup_app, '-L'+str(startup_a), '-lstartup_scope', '-ldl',
+              '-Wl,-rpath,'+str(startup_a), compiler=loader_cc)
+        startup_missing.unlink()
+        assert run([startup_app]).strip() == '7 7'
+        startup_symbols = collect(startup_app, '--module', str(startup_plugin))
+        assert f'{startup_a/startup_name}!startup_scope' in startup_symbols
+        assert not any(symbol.startswith(str(startup_b/startup_name)+'!') for symbol in startup_symbols)
+
+        extra_plugins = []
+        for suffix, value in (('x', 11), ('y', 22)):
+            directory = root/('independent-extra-'+suffix)
+            directory.mkdir()
+            leaf = directory/'libindependent_extra.so'
+            build('extra-'+suffix+'.c',
+                  f'int extra_scope(void){{return {value};}}int extra_{suffix}_only(void){{return {value};}}',
+                  leaf, '-shared', '-fPIC', '-nostdlib', '-Wl,-soname,libindependent_extra.so', compiler=loader_cc)
+            plugin = directory/'libextra_plugin.so'
+            build('extra-plugin.c', 'extern int extra_scope(void);int extra_call(void){return extra_scope();}',
+                  plugin, '-shared', '-fPIC', '-nostdlib', '-L'+str(directory),
+                  '-lindependent_extra', '-Wl,-rpath,$ORIGIN', compiler=loader_cc)
+            run([sys.executable, '-c', f'import ctypes;library=ctypes.CDLL({str(plugin)!r});assert library.extra_call()=={value}'])
+            extra_plugins += ['--module', str(plugin)]
+        extra_symbols = collect(startup_app, *extra_plugins)
+        for suffix in ('x', 'y'):
+            assert f'{root/("independent-extra-"+suffix)/"libindependent_extra.so"}!extra_{suffix}_only' in extra_symbols
+
         search = root/'search'
         (search/'a').mkdir(parents=True)
         (search/'b').mkdir()
@@ -1052,6 +1114,12 @@ print("collector_saturation_originals_ok")
                 assert not any(symbol.startswith(str(copied_python)+'!') for symbol in symbols)
         else:
             print('SKIP inherited interpreter RPATH: compatible origin RPATH/Python headers unavailable')
+
+        builtins_script = root/'builtins-module-runtime.py'
+        builtins_script.write_text('import builtins\nassert __builtins__ is builtins\n'
+                                   'assert __builtins__.len([1,2,3])==3\n')
+        run([sys.executable, builtins_script])
+        collect(builtins_script, '--run-python')
 
         empty_runtime = root/'empty-runtime.py'
         empty_runtime.write_text('pass\n')
