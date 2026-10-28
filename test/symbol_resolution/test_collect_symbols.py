@@ -537,6 +537,20 @@ print("collector_saturation_originals_ok")
         runtime_locale['LC_ALL'] = 'C.UTF-8'
         run([sys.executable, args.collector, locale_script, '--run-python'],
             env=runtime_locale)
+        bootstrap_cwd = root/'bootstrap-cwd'
+        bootstrap_cwd.mkdir()
+        bootstrap_marker = root/'bootstrap-imported'
+        for name in ('json', 'importlib'):
+            (bootstrap_cwd/(name+'.py')).write_text(
+                f'open({str(bootstrap_marker)!r}, "w").write("bad")\n'
+                'raise RuntimeError("unrelated bootstrap import")\n')
+        bootstrap_script = root/'bootstrap-static.py'
+        bootstrap_script.write_text('pass\n')
+        bootstrap_env = {key: value for key, value in os.environ.items()
+                         if key not in ('PYTHONPATH', 'PYTHONHOME')}
+        assert collect(bootstrap_script, cwd=bootstrap_cwd, env=bootstrap_env) == set()
+        assert not bootstrap_marker.exists(), 'metadata probe executed a CWD module'
+
         shadow_cwd = root/'shadow-cwd'
         shadow_cwd.mkdir()
         (shadow_cwd/'math.py').write_text('value = 1\n')

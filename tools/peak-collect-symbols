@@ -5,7 +5,6 @@ import _imp
 from collections import deque
 import ast
 import glob
-import json
 import math
 import os
 from pathlib import Path
@@ -257,10 +256,10 @@ class Collector:
 
 
 def python_info(interpreter):
-    code = ('import sys,json,importlib.machinery;'
-            'print(json.dumps({"executable":sys.executable,"version":list(sys.version_info[:2]),"path":sys.path,'
-            '"builtins":list(sys.builtin_module_names),"suffixes":importlib.machinery.EXTENSION_SUFFIXES}))')
-    return json.loads(run([interpreter, '-c', code]))
+    code = ('import sys,_imp;'
+            'print(repr({"executable":sys.executable,"version":list(sys.version_info[:2]),"path":sys.path,'
+            '"builtins":list(sys.builtin_module_names),"suffixes":_imp.extension_suffixes()}))')
+    return ast.literal_eval(run([interpreter, '-c', code]))
 
 
 def static_python(script, info, collector):
