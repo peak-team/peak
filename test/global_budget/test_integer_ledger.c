@@ -5,10 +5,10 @@ static void wait_credit(uint64_t amount){double deadline=seconds_now()+1;while(p
 int main(void){
  alarm(8);
  PeakGlobalBudgetSample arithmetic={.profile_seconds=0,.control_seconds=.001,.management_seconds=.001,.settled_control_credit_ns=500000};
- assert(fabs(ledger_cost(&arithmetic,2000000,500000)-.004)<1e-12);
- arithmetic=(PeakGlobalBudgetSample){.profile_seconds=.002};assert(fabs(ledger_cost(&arithmetic,1000000,1500000)-.0035)<1e-12);
- arithmetic=(PeakGlobalBudgetSample){.control_seconds=.003};assert(fabs(ledger_cost(&arithmetic,0,3000000)-.006)<1e-12);
- arithmetic.control_seconds=.006;arithmetic.settled_control_credit_ns=3000000;assert(fabs(ledger_cost(&arithmetic,0,3000000)-.006)<1e-12);
+ assert(fabs(ledger_cost(&arithmetic,2000000)-.004)<1e-12);
+ arithmetic=(PeakGlobalBudgetSample){.profile_seconds=.002};assert(fabs(ledger_cost(&arithmetic,1000000)-.002)<1e-12);
+ arithmetic=(PeakGlobalBudgetSample){.control_seconds=.003};assert(fabs(ledger_cost(&arithmetic,0)-.003)<1e-12);
+ arithmetic.control_seconds=.006;arithmetic.settled_control_credit_ns=3000000;assert(fabs(ledger_cost(&arithmetic,0)-.006)<1e-12);
  unsigned short port;assert(!peak_global_budget_listen(&port));assert(!peak_global_budget_start("127.0.0.1",port,0,1,.5,NULL));peak_global_budget_origin(1);
  PeakGlobalBudgetSample s={.sequence=1,.attached_targets=16};peak_global_budget_publish(&s);double deadline=seconds_now()+1;while(!peak_global_budget_active()&&seconds_now()<deadline)usleep(1000);
  peak_global_budget_request_credit(100000);wait_credit(3);assert(peak_global_budget_try_spend(3));

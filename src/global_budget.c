@@ -145,11 +145,17 @@ static double cost(const PeakGlobalBudgetSample *s)
 {
     return s->profile_seconds + s->control_seconds + s->management_seconds + s->transport_seconds;
 }
-static double ledger_cost(const PeakGlobalBudgetSample *s, uint64_t profile, uint64_t control)
+static double ledger_cost(const PeakGlobalBudgetSample *s, uint64_t profile)
 {
     return fmax(s->profile_seconds, (double)profile / 1e9) +
-        s->control_seconds + (double)(control - s->settled_control_credit_ns) / 1e9 +
+        s->control_seconds +
         s->management_seconds + s->transport_seconds;
+}
+/* Control prepayments are releasable escrow, never actual-spent high water.
+ * Keep local credit reservation separate for exact grant/admission arithmetic. */
+static double control_escrow(const Rank *r)
+{
+    return (double)(r->control_ns - r->latest.settled_control_credit_ns) / 1e9;
 }
 static bool valid_sample(const PeakGlobalBudgetSample *s, const Rank *r)
 {
@@ -507,7 +513,7 @@ static void *service(void *unused)
                 r->profile_ns = f.consumed_profile_ns; r->control_ns = f.consumed_control_ns;
                 r->consumed_ns = r->profile_ns + r->control_ns;
                 r->reservation = (double)(r->credit_total_ns - r->consumed_ns - r->returned_ns) / 1e9;
-                double current = ledger_cost(&f.sample, r->profile_ns, r->control_ns);
+                double current = ledger_cost(&f.sample, r->profile_ns);
                 if (current > r->previous_cost) r->previous_cost = current;
                 r->latest = f.sample; r->seen = r->connected = true; r->last_update = now_ns;
             }
@@ -521,7 +527,7 @@ static void *service(void *unused)
                 all_final = all_final && r->seen && r->latest.final;
                 unfunded = unfunded || (r->wants_credit && (r->credit_total_ns - r->consumed_ns - r->returned_ns) < (r->requested_ns > 100000 ? r->requested_ns : 100000));
                 done = done && (r->latest.retiring || r->latest.completed_wave >= wave);
-                spent += r->previous_cost; reserved += r->reservation;
+                spent += r->previous_cost; reserved += r->reservation + control_escrow(r);
             }
             all_final = all_final && all && !broken;
             if (all_final && !final_announced) { final_announced = true; record_event('F', rank_id, 0, wave, spent); }
@@ -589,7 +595,7 @@ static void *service(void *unused)
 
             reserved = 0;
             for (unsigned i = 0; i < world; ++i) {
-                reserved += ranks[i].reservation;
+                reserved += ranks[i].reservation + control_escrow(&ranks[i]);
                 if (ranks[i].wants_credit && (ranks[i].credit_total_ns - ranks[i].consumed_ns - ranks[i].returned_ns) >= (ranks[i].requested_ns > 100000 ? ranks[i].requested_ns : 100000))
                     ranks[i].fulfilled_generation = ranks[i].demand_generation;
             }

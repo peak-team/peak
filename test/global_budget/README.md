@@ -8,13 +8,16 @@ with at most 64 ranks. Other platforms build inert API stubs.
 
 Runtime cost snapshots are cumulative, finite and monotonic. The root uses its
 own monotonic elapsed time. Issued credit is reserved immediately; monotonic
-consumption transfers it from reservations to charged cost, even when the HB
-snapshot has not advanced. Credits and reservations are canonical uint64
+profile consumption transfers it from reservations to charged cost, even when
+the HB snapshot has not advanced. Control consumption transfers local credit
+to unsettled global escrow until proven settlement. Credits and reservations are canonical uint64
 nanoseconds; the floating-point seconds fields are diagnostics. Profile cost is
-max(reported profile, credited profile); control cost is reported control plus
-credited control not yet covered by the controller's settled watermark. HB
+max(reported profile, credited profile); spent control cost is reported actual
+control. Credited control not yet covered by the controller's settled watermark
+remains releasable global reservation, separate from unspent local credit. HB
 management, live finalizer CPU and service CPU are added separately. The rank
-cost keeps a monotonic high-water mark. This is a conservative estimate, not
+actual cost keeps a monotonic high-water mark; temporary control escrow never
+enters that high-water mark. This is a conservative estimate, not
 measured application slowdown. Unused grants are never reclaimed merely because they
 expired or a peer disconnected. The root retains max(3 ms, observed closing cost) per registered demand member
 and 500 us per exposed rank for the session-wide unfunded grace; these are explicit initial
@@ -242,9 +245,10 @@ credit. Metadata seqlock contention does not mean coordinator inactivity.
 Control prepayments use `try_spend_control`. The controller captures
 `control_consumed_ns()` only when its mutations are quiescent and actual control
 accounting is updated. An HB sample saves that settled watermark before reading
-actual C. The root validates component and watermark monotonicity and never
-removes a pending control prepayment merely because an earlier unrelated STOP
-cost is already reported. Retained profile-rate prediction excludes control
+actual C. The root adds actual C to spent and unsettled prepayments to global
+reservation, outside the spent high-water mark. It validates component and
+watermark monotonicity and never removes pending control escrow merely because
+an earlier unrelated STOP cost is already reported. Retained profile-rate prediction excludes control
 prepayments. No callback receives unaccounted free execution on CAS contention.
 
 Before polling, outstanding local FINAL/request/ACK work with no pending socket
@@ -324,3 +328,7 @@ same MPI compiler/launcher options as the existing recovery test. Omit
 `--activation-policy` to test the global-mode default; explicit `immediate` and
 `post-init` remain available. These checks establish behavior and coverage;
 fixed-work hardware timings are still required to assess slowdown.
+
+`test_control_escrow.c` covers completion between the HB watermark and actual
+cost reads, permanent high-water double charging, cancelled paid operations,
+legacy unpaid control alongside new prepayment, and rejection of old marks.

@@ -31,6 +31,14 @@ def global_report(text):
             member[key]=float(member[key])
             if not math.isfinite(member[key]) or member[key]<0:raise ValueError('invalid member cost')
         fields['member']=member
+    admission_rows=re.findall(r'MPI initial admission: ([^\n]+)',text[:actual[-1]])
+    if admission_rows:
+        admission=dict(re.findall(r'(\w+)=([^\s]+)',admission_rows[-1]))
+        for key in ('bootstrap_finished','first_paid_attach_count','first_local_attach_count','initial_unexposed'):
+            if key in admission:
+                admission[key]=int(admission[key])
+                if admission[key]<0:raise ValueError('invalid initial admission counter')
+        fields['initial_admission']=admission
     for key in ('configured','ever_active','fresh','wave','completed_wave','view_epoch','root_completed_wave','shutdown_confirmed','decision_sequence','runtime_degraded_samples','invalid_accounting_samples'):
         if key not in fields: raise ValueError('missing global field '+key)
         fields[key]=int(fields[key])
@@ -106,12 +114,12 @@ def restoration_proof(text, parsed):
     return proofs
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','all'),default='small');a=p.parse_args();cases={};errors={}
+    p=argparse.ArgumentParser();p.add_argument('results',type=Path);p.add_argument('--require-final-members',action='store_true');p.add_argument('--require-diagnostics',action='store_true');p.add_argument('--set',choices=('small','matrix','funded','targeted','matrix22','final32','escrow_targeted','all'),default='small');a=p.parse_args();cases={};errors={}
     matrix=tuple(sy+'-'+la for sy in ('allreduce','barrier','bcast','ring','iallreduce') for la in ('rotating','slack','critical','aligned'))
     funded=tuple('funded-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     funded+=tuple('funded-concurrent-'+sy+'-rotating' for sy in ('allreduce','barrier','bcast','ring','iallreduce'))
     matrix22=matrix+('bcast-rotating-repeat1','bcast-rotating-repeat2')
-    selected={'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
+    selected={'escrow_targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating','iallreduce-critical'),'matrix22':matrix22,'final32':matrix22+funded,'targeted':('bcast-rotating','barrier-critical','barrier-aligned','funded-concurrent-allreduce-rotating'),'small':CASES,'matrix':matrix,'funded':funded,'all':matrix+funded}[a.set]
     for name in selected:
       try:
         root=a.results/name;runs={l:workload(root,l) for l in LABELS};ref=runs['N0'];reports={}

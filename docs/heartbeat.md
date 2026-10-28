@@ -932,8 +932,9 @@ mandatory SPMD bootstrap before degrading, so it does not strand peers inside
 that collective. Invalid startup timing does not create earned credit.
 
 Issued, consumed and returned credit uses canonical integer nanoseconds. Root
-reconciles profile cost with credited profile consumption. Actual control cost
-is added to prepaid control credit still awaiting a proven settlement watermark;
+reconciles profile cost with credited profile consumption. Spent cost includes
+actual control cost only. Prepaid control credit still awaiting a proven
+settlement watermark is a separate, releasable global reservation;
 management and transport CPU are then added separately. A lagging profile snapshot
 therefore cannot hide management cost. Outstanding credit decreases only by
 exact consumption or explicit return, never by unrelated management charges.
@@ -941,8 +942,13 @@ exact consumption or explicit return, never by unrelated management charges.
 The control-credit watermark is captured under the controller lock only when no
 mutation is requested or in progress, before the heartbeat reads actual control
 accounting. A joined controller can settle canceled requests with their actual
-outcome. This keeps prepaid future control work in escrow even when an earlier,
-uncredited STOP already contributed a larger cumulative control cost.
+outcome. Global reservation is the sum of exact unspent local credit and this
+unsettled control escrow; local grant and admission arithmetic uses only the
+exact local credit component. Actual spent cost retains its monotonic high-water
+mark, while escrow can be released on proven settlement. Temporary overlap
+between a newly completed control cost and an older watermark therefore cannot
+become permanent spent cost. This also keeps prepaid future control work in
+escrow when an earlier, uncredited STOP already contributed cumulative cost.
 
 
 Global mode on Linux 64-bit now defaults an already identified MPI process to
