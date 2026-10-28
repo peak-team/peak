@@ -298,12 +298,28 @@ def main():
     for token in ("pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
         require(token not in burst_publish,
                 "burst callbacks must not lock, scan, allocate, call MPI or mutate Gum")
+    settlement_capture = heartbeat.index(
+        "uint64_t settled_control_snapshot = peak_general_listener_settle_control_credit_unlocked()")
+    settlement_unlock = heartbeat.index("pthread_mutex_unlock(&lock)", settlement_capture)
     require(
-        burst_publish.count("for (") == 1
-        and "retry < 2 && grace >= charge" in burst_publish
-        and "peak_global_budget_try_spend" in burst_publish,
-        "global callback grace must use only a bounded two-attempt credit CAS",
+        settlement_capture < settlement_unlock < heartbeat.index(
+            "peak_general_listener_runtime_accounting_snapshot(&detach_accounting)", settlement_unlock)
+        and ".settled_control_credit_ns = settled_control_snapshot" in heartbeat,
+        "control credit watermark must be captured under lock before actual control accounting",
     )
+    grace_claim = function_body(source, "peak_general_listener_claim_global_grace")
+    require(
+        "for (" not in burst_publish and "while (" not in burst_publish
+        and "peak_global_budget_try_spend" in burst_publish
+        and "peak_global_budget_active" in burst_publish
+        and "peak_global_budget_view" not in burst_publish
+        and "atomic_fetch_add_explicit" in grace_claim
+        and "PEAK_GLOBAL_GRACE_NS - old" in grace_claim
+        and "MIN(charge, PEAK_GLOBAL_GRACE_NS + 1)" in grace_claim,
+        "callback credit/grace must remain bounded and avoid publication/CAS false failures",
+    )
+    for token in ("for (", "while (", "pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
+        require(token not in grace_claim, "grace tickets must not loop, lock, allocate, use MPI or mutate Gum")
     for token in (
         "pthread_mutex",
         "pthread_cond",

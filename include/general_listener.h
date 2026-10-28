@@ -349,6 +349,9 @@ gboolean peak_general_listener_dettach();
  * pending target hook state transitions have stopped.
  */
 PEAK_API void peak_general_listener_controller_stop(void);
+void peak_general_listener_global_budget_shutdown(int all_ranks_retired_proven);
+void peak_general_listener_account_teardown_cpu(unsigned long long delta_ns);
+void peak_general_listener_begin_teardown_cpu(clockid_t clock, uint64_t start_ns);
 
 /**
  * @brief Processes pending detach/reattach requests for a bounded interval.

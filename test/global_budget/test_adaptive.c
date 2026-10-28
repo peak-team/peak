@@ -15,10 +15,10 @@ static void rank_run(unsigned rank,unsigned short port)
   double elapsed=now()-start;PeakGlobalBudgetView v=peak_global_budget_view();
   if(elapsed>.2)peak_global_budget_pressure();
   if(v.active&&v.allowance_seconds>0&&peak_global_budget_try_spend(1000))cost+=1e-6;
-  if(rank==0&&elapsed>.7&&cost<1)cost+=1;
+  if(rank==0&&elapsed>.7&&cost<1){cost+=1;peak_global_budget_request_credit(10000000);}
   if(v.wave==1&&!first){first=true;first_grant=v.granted_total_seconds;}
   if(first&&elapsed>2.8&&v.granted_total_seconds>first_grant+1e-7)resumed=true;
-  if(rank==0&&elapsed>3.3&&cost<2)cost+=2;
+  if(rank==0&&elapsed>3.3&&cost<2){cost+=2;peak_global_budget_request_credit(20000000);}
   if(v.wave==2){second=true;if(!wave2_seen)wave2_seen=elapsed;}
   uint64_t ack=v.wave;
   if(rank==1&&v.wave==2&&elapsed-wave2_seen<.2){ack=1;assert(v.root_completed_wave<2);}

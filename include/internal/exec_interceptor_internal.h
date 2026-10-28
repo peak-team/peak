@@ -32,6 +32,12 @@ extern "C" {
  */
 PEAK_EXEC_INTERNAL int peak_exec_checkpoint_enabled_at_startup(void);
 
+/** Consume the one-shot MPI utility marker before runtime activation.
+ * ELF startup also recognizes the exact shell-command prefix injected by the
+ * MPI-scoped system/popen wrappers. The result is latched for this process.
+ */
+PEAK_EXEC_INTERNAL int peak_exec_skip_mpi_runtime_child(int argc, char** argv);
+
 /** @} */
 
 #ifdef __cplusplus

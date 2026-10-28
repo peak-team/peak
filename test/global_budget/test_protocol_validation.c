@@ -20,6 +20,9 @@ int main(void)
     s.elapsed_seconds=4; s.completed_wave=2; s.unfunded_seconds=.0004;
     r.seen=true;r.latest=s;
     assert(valid_sample(&s,&r));
+    s.final=true;assert(!valid_sample(&s,&r));s.final=false;
+    r.latest.retiring=true;s.retiring=true;assert(valid_sample(&s,&r));
+    s.retiring=false;assert(!valid_sample(&s,&r));r.latest.retiring=false;
     s.profile_seconds=.9;assert(!valid_sample(&s,&r));s=r.latest;
     s.control_seconds=1;assert(!valid_sample(&s,&r));s=r.latest;
     s.management_seconds=2;assert(!valid_sample(&s,&r));s=r.latest;
@@ -42,7 +45,7 @@ int main(void)
     assert(!memcmp(&f,&p.incoming,sizeof(f)));
     close(pair[1]);assert(read_frame(&p)==-1);close(pair[0]);
     atomic_store(&owner,getpid());
-    publish_view((PeakGlobalBudgetView){.active=true,.granted_total_seconds=1e-6});
+    publish_view((PeakGlobalBudgetView){.active=true,.granted_total_seconds=1e-6,.granted_total_ns=1000});
     assert(peak_global_budget_view().active);
     pthread_t t[4];for(unsigned i=0;i<4;i++)assert(!pthread_create(&t[i],NULL,consume,NULL));
     for(unsigned i=0;i<4;i++)assert(!pthread_join(t[i],NULL));

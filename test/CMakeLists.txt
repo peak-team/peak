@@ -267,6 +267,17 @@ if(BUILD_TESTING)
         PROPERTIES
             PASS_REGULAR_EXPRESSION "report_snapshot_cxx_link_test_ok")
 
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_logging_batch report/test_logging_batch.c)
+    target_include_directories(test_logging_batch PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_logging_batch PRIVATE -UNDEBUG)
+    target_link_libraries(test_logging_batch PRIVATE Threads::Threads)
+    add_test(NAME test_logging_batch COMMAND test_logging_batch)
+    set_tests_properties(test_logging_batch PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "logging_batch_test_ok")
+    endif()
+
     add_executable(test_report_formatter
         report/test_report_formatter.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/output_identity.c

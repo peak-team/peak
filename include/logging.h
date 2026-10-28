@@ -83,6 +83,21 @@ void peak_log_message_always(const char* format,
 /** Flush the PEAK-owned report stream. */
 int peak_log_flush(void);
 
+/** Start a thread-local text-report staging scope.
+ * Returns 1 when this caller owns a new scope, or 0 for nested scopes and
+ * allocation-failure fallback to the ordinary immediate stream. The owner must
+ * call end, or abort from cancellation cleanup. No application FILE or
+ * descriptor buffering mode is changed. Explicit flush publishes each staged
+ * prefix once and remains valid inside the scope.
+ */
+int peak_log_report_batch_begin(void);
+
+/** Publish and release the current thread's report scope; 0 or -1 on error. */
+int peak_log_report_batch_end(void);
+
+/** Release staging without publishing it, for canceled report writers. */
+void peak_log_report_batch_abort(void);
+
 /** Close the PEAK-owned report stream after final teardown output. */
 void peak_log_shutdown(void);
 

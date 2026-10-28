@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "logging.h"
 
 #include <ctype.h>
@@ -17,6 +18,20 @@ static PeakVerbosity peak_log_cached_verbosity = PEAK_VERBOSITY_WARN;
 static FILE* peak_log_output;
 static int peak_log_output_initialized;
 static int peak_log_force_output_failure;
+
+typedef struct {
+    FILE* memory;
+    char* bytes;
+    size_t size;
+    size_t published;
+    pid_t owner;
+    int error;
+} PeakLogReportBatch;
+
+/* The memstream's output pointers live on the heap rather than in TLS: a
+ * canceled thread or fork child's libc exit cannot dereference retired TLS.
+ * An inherited memstream only flushes memory, never the report descriptor. */
+static _Thread_local PeakLogReportBatch* peak_log_report_batch;
 
 static int
 peak_log_streq_ci(const char* left, const char* right)
@@ -176,13 +191,127 @@ peak_log_output_stream(void)
     return peak_log_output_initialized ? peak_log_output : stderr;
 }
 
+static PeakLogReportBatch*
+peak_log_current_batch(void)
+{
+    PeakLogReportBatch* batch = peak_log_report_batch;
+    return batch != NULL && batch->owner == getpid() ? batch : NULL;
+}
+
+static int
+peak_log_batch_publish(PeakLogReportBatch* batch)
+{
+    FILE* output = peak_log_output_stream();
+
+    if (output == NULL) {
+        batch->error = EBADF;
+    } else if (batch->size > batch->published) {
+        size_t remaining = batch->size - batch->published;
+        size_t written = fwrite(batch->bytes + batch->published, 1,
+                                remaining, output);
+        batch->published += written;
+        if (written != remaining)
+            batch->error = errno != 0 ? errno : EIO;
+    }
+    if (output != NULL && (fflush(output) != 0 || ferror(output)))
+        batch->error = errno != 0 ? errno : EIO;
+    if (batch->error != 0) {
+        errno = batch->error;
+        return -1;
+    }
+    return 0;
+}
+
+int
+peak_log_report_batch_begin(void)
+{
+    if (peak_log_current_batch() != NULL) return 0;
+    PeakLogReportBatch* batch = calloc(1, sizeof(*batch));
+    if (batch == NULL) return 0;
+    batch->memory = open_memstream(&batch->bytes, &batch->size);
+    if (batch->memory == NULL) {
+        free(batch);
+        return 0;
+    }
+    batch->owner = getpid();
+    /* A fork child may replace its inherited, parent-owned TLS pointer. The
+     * inherited FILE remains memory-only and is left to libc process exit. */
+    peak_log_report_batch = batch;
+    return 1;
+}
+
+static void
+peak_log_batch_destroy(void* data)
+{
+    PeakLogReportBatch* batch = data;
+    if (batch->memory != NULL) (void)fclose(batch->memory);
+    free(batch->bytes);
+    free(batch);
+}
+
+void
+peak_log_report_batch_abort(void)
+{
+    PeakLogReportBatch* batch = peak_log_current_batch();
+    if (batch == NULL) return;
+    peak_log_report_batch = NULL;
+    peak_log_batch_destroy(batch);
+}
+
+int
+peak_log_report_batch_end(void)
+{
+    PeakLogReportBatch* batch = peak_log_current_batch();
+    if (batch == NULL) return 0;
+    int result, error;
+    peak_log_report_batch = NULL;
+    pthread_cleanup_push(peak_log_batch_destroy, batch);
+    FILE* memory = batch->memory;
+    batch->memory = NULL;
+    if (memory != NULL && fclose(memory) != 0)
+        batch->error = errno != 0 ? errno : EIO;
+    result = peak_log_batch_publish(batch);
+    error = errno;
+    pthread_cleanup_pop(1);
+    errno = error;
+    return result;
+}
+
 static void
 peak_log_vwrite(const char* format, va_list args)
 {
     FILE* output = peak_log_output_stream();
+    PeakLogReportBatch* batch = peak_log_current_batch();
+
+    if (batch != NULL && batch->memory != NULL) {
+        off_t before = ftello(batch->memory);
+        va_list replay;
+        va_copy(replay, args);
+        int result = vfprintf(batch->memory, format, args);
+        if (result < 0) {
+            /* Preserve complete earlier messages, discard only a partial
+             * current format, then replay that format on the direct stream.
+             * Subsequent messages retain the old immediate-output behavior. */
+            (void)fclose(batch->memory);
+            batch->memory = NULL;
+            if (before < 0 || (size_t)before > batch->size)
+                batch->error = EIO;
+            else
+                batch->size = (size_t)before;
+            (void)peak_log_batch_publish(batch);
+            free(batch->bytes);
+            batch->bytes = NULL;
+            batch->size = batch->published = 0;
+            if (output != NULL && vfprintf(output, format, replay) < 0)
+                batch->error = errno != 0 ? errno : EIO;
+        }
+        va_end(replay);
+        return;
+    }
 
     if (output != NULL) {
-        vfprintf(output, format, args);
+        if (vfprintf(output, format, args) < 0 && batch != NULL)
+            batch->error = errno != 0 ? errno : EIO;
     }
 }
 
@@ -218,6 +347,13 @@ int
 peak_log_flush(void)
 {
     FILE* output = peak_log_output_stream();
+    PeakLogReportBatch* batch = peak_log_current_batch();
+
+    if (batch != NULL) {
+        if (batch->memory != NULL && fflush(batch->memory) != 0)
+            batch->error = errno != 0 ? errno : EIO;
+        return peak_log_batch_publish(batch);
+    }
 
     if (output == NULL) {
         errno = EBADF;
@@ -235,6 +371,7 @@ peak_log_flush(void)
 void
 peak_log_shutdown(void)
 {
+    (void)peak_log_report_batch_end();
     FILE* output = peak_log_output;
 
     peak_log_output = NULL;

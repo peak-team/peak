@@ -47,6 +47,10 @@
 #define PEAK_EXEC_CHECKPOINT_ENV "PEAK_EXEC_CHECKPOINT"
 #define PEAK_EXEC_PROPAGATE_PEAK_ENV_ENV "PEAK_EXEC_PROPAGATE_PEAK_ENV"
 #define PEAK_EXEC_TRACE_PATH_ENV "PEAK_EXEC_TRACE_PATH"
+#define PEAK_MPI_RUNTIME_CHILD_ENV "PEAK_MPI_RUNTIME_CHILD"
+#define PEAK_MPI_RUNTIME_SHELL_PREFIX \
+    "# PEAK MPI runtime child v1\n" \
+    "PEAK_MPI_RUNTIME_CHILD=1; export PEAK_MPI_RUNTIME_CHILD;\n"
 
 /*
  * Post-fork execution is deliberately bounded.  These buffers live in the
@@ -80,6 +84,10 @@ typedef int (*peak_posix_spawnp_fn)(pid_t*,
                                     const posix_spawnattr_t*,
                                     char* const[],
                                     char* const[]);
+typedef int (*peak_system_fn)(const char*);
+typedef FILE* (*peak_popen_fn)(const char*, const char*);
+static _Atomic(peak_system_fn) peak_real_system_ptr;
+static _Atomic(peak_popen_fn) peak_real_popen_ptr;
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #define PEAK_EXEC_DIRECT_RAW_SUPPORTED 1
@@ -127,11 +135,47 @@ static int peak_exec_cached_secure_mode_ready;
 static int peak_exec_startup_chain_enabled;
 static int peak_exec_startup_checkpoint_enabled;
 static int peak_exec_startup_policy_enabled;
+static int peak_exec_startup_mpi_children_enabled;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "exec policy publication must always be lock-free");
 _Static_assert(ATOMIC_LONG_LOCK_FREE == 2,
                "exec resolver ownership must always be lock-free");
 static atomic_int peak_exec_priming_complete = ATOMIC_VAR_INIT(0);
+static int peak_exec_mpi_runtime_child;
+extern int peak_mpi_internal_context_active(void) __attribute__((weak));
+
+static int
+peak_exec_in_mpi_runtime(void)
+{
+    return peak_exec_startup_mpi_children_enabled &&
+           peak_mpi_internal_context_active != NULL &&
+           peak_mpi_internal_context_active();
+}
+
+PEAK_EXEC_INTERNAL int
+peak_exec_skip_mpi_runtime_child(int argc, char** argv)
+{
+    const char* marker = getenv(PEAK_MPI_RUNTIME_CHILD_ENV);
+    const char* global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+
+    if (peak_exec_mpi_runtime_child) return 1;
+    if (marker != NULL && strcmp(marker, "1") == 0) {
+        peak_exec_mpi_runtime_child = global != NULL && strcmp(global, "1") == 0;
+        /* The marker applies to this exec image, not unrelated descendants. */
+        (void)unsetenv(PEAK_MPI_RUNTIME_CHILD_ENV);
+    } else if (global != NULL && strcmp(global, "1") == 0 &&
+               argc >= 3 && argv != NULL && argv[1] != NULL &&
+               strcmp(argv[1], "-c") == 0) {
+        int command_index = argc >= 4 && argv[2] != NULL &&
+                            strcmp(argv[2], "--") == 0 ? 3 : 2;
+        const char* command = argv[command_index];
+        if (command != NULL &&
+            strncmp(command, PEAK_MPI_RUNTIME_SHELL_PREFIX,
+                    sizeof(PEAK_MPI_RUNTIME_SHELL_PREFIX) - 1) == 0)
+            peak_exec_mpi_runtime_child = 1;
+    }
+    return peak_exec_mpi_runtime_child;
+}
 
 PEAK_EXEC_INTERNAL int
 peak_exec_checkpoint_enabled_at_startup(void)
@@ -549,6 +593,41 @@ peak_exec_child_env_get(char* const envp[], const char* name, const char** value
         }
     }
     return -1;
+}
+
+/* Bounded, allocation-free even after fork/vfork. Failure retains native env. */
+static char* const*
+peak_exec_mpi_child_env(char* const envp[], char** entries)
+{
+    size_t out = 0;
+    int has_global = 0;
+
+    if (envp != NULL) {
+        for (size_t i = 0; i < PEAK_EXEC_CHILD_ENV_SLOTS - 3; ++i) {
+            const char* entry;
+            if (peak_exec_child_read_pointer(envp, i, &entry) != 0)
+                return envp;
+            if (entry == NULL) {
+                if (!has_global)
+                    entries[out++] = "PEAK_MPI_GLOBAL_BUDGET=1";
+                entries[out++] = PEAK_MPI_RUNTIME_CHILD_ENV "=1";
+                entries[out] = NULL;
+                return entries;
+            }
+            int is_marker = peak_exec_child_entry_matches(
+                entry, PEAK_MPI_RUNTIME_CHILD_ENV);
+            int is_global = peak_exec_child_entry_matches(
+                entry, "PEAK_MPI_GLOBAL_BUDGET");
+            if (is_marker < 0 || is_global < 0) return envp;
+            has_global |= is_global;
+            if (!is_marker) entries[out++] = (char*)entry;
+        }
+        return envp;
+    }
+    entries[out++] = "PEAK_MPI_GLOBAL_BUDGET=1";
+    entries[out++] = PEAK_MPI_RUNTIME_CHILD_ENV "=1";
+    entries[out] = NULL;
+    return entries;
 }
 
 static int
@@ -2150,6 +2229,11 @@ __attribute__((constructor))
 static void
 peak_exec_prime_real_symbols(void)
 {
+    const char* global_budget = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    peak_exec_startup_mpi_children_enabled =
+        global_budget != NULL && strcmp(global_budget, "1") == 0;
+    peak_real_system_ptr = (peak_system_fn)dlsym(RTLD_NEXT, "system");
+    peak_real_popen_ptr = (peak_popen_fn)dlsym(RTLD_NEXT, "popen");
     (void)peak_real_execve();
     (void)peak_real_execvp();
     (void)peak_real_execvpe();
@@ -2180,6 +2264,62 @@ peak_exec_prime_real_symbols(void)
     atomic_store_explicit(&peak_exec_priming_complete,
                           1,
                           memory_order_release);
+}
+
+/* libc's shell helpers use hidden spawn/exec entry points. Prefixing only a
+ * scoped MPI-runtime command lets the shell and its immediate utility consume
+ * the marker without changing environ or reproducing libc signal/pipe logic. */
+static char*
+peak_exec_mpi_shell_command(const char* command)
+{
+    if (command == NULL || !peak_exec_in_mpi_runtime()) return NULL;
+    size_t length = strlen(command);
+    if (length > SIZE_MAX - sizeof(PEAK_MPI_RUNTIME_SHELL_PREFIX)) return NULL;
+    char* wrapped = malloc(sizeof(PEAK_MPI_RUNTIME_SHELL_PREFIX) + length);
+    if (wrapped != NULL) {
+        memcpy(wrapped, PEAK_MPI_RUNTIME_SHELL_PREFIX,
+               sizeof(PEAK_MPI_RUNTIME_SHELL_PREFIX) - 1);
+        memcpy(wrapped + sizeof(PEAK_MPI_RUNTIME_SHELL_PREFIX) - 1,
+               command, length + 1);
+    }
+    return wrapped;
+}
+
+PEAK_EXEC_API int
+system(const char* command)
+{
+    int entry_errno = errno;
+    if (peak_real_system_ptr == NULL)
+        peak_real_system_ptr = (peak_system_fn)dlsym(RTLD_NEXT, "system");
+    if (peak_real_system_ptr == NULL) { errno = ENOSYS; return -1; }
+    char* wrapped = peak_exec_mpi_shell_command(command);
+    int result, saved_errno;
+    pthread_cleanup_push(free, wrapped);
+    errno = entry_errno;
+    result = peak_real_system_ptr(wrapped != NULL ? wrapped : command);
+    saved_errno = errno;
+    pthread_cleanup_pop(1);
+    errno = saved_errno;
+    return result;
+}
+
+PEAK_EXEC_API FILE*
+popen(const char* command, const char* type)
+{
+    int entry_errno = errno;
+    if (peak_real_popen_ptr == NULL)
+        peak_real_popen_ptr = (peak_popen_fn)dlsym(RTLD_NEXT, "popen");
+    if (peak_real_popen_ptr == NULL) { errno = ENOSYS; return NULL; }
+    char* wrapped = peak_exec_mpi_shell_command(command);
+    FILE* result;
+    int saved_errno;
+    pthread_cleanup_push(free, wrapped);
+    errno = entry_errno;
+    result = peak_real_popen_ptr(wrapped != NULL ? wrapped : command, type);
+    saved_errno = errno;
+    pthread_cleanup_pop(1);
+    errno = saved_errno;
+    return result;
 }
 
 static int
@@ -2377,6 +2517,11 @@ execve(const char* path, char* const argv[], char* const envp[])
     if (!peak_exec_priming_is_complete()) {
         return peak_exec_prepublication_execve(path, argv, envp);
     }
+    if (peak_exec_in_mpi_runtime()) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_call_primed_execve(path, argv, (char* const*)child_envp);
+    }
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_execve(path, argv, envp);
     }
@@ -2425,7 +2570,7 @@ peak_exec_raw_syscall_execve(const char* path,
                              char* const envp[])
 {
     if (!peak_exec_priming_is_complete() ||
-        !peak_exec_startup_policy_enabled) {
+        (!peak_exec_startup_policy_enabled && !peak_exec_in_mpi_runtime())) {
         return peak_exec_prepublication_execve(path, argv, envp);
     }
     return execve(path, argv, envp);
@@ -2437,6 +2582,7 @@ execv(const char* path, char* const argv[])
     if (!peak_exec_priming_is_complete()) {
         return peak_exec_prepublication_execve(path, argv, environ);
     }
+    if (peak_exec_in_mpi_runtime()) return execve(path, argv, environ);
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_execve(path, argv, environ);
     }
@@ -2606,6 +2752,11 @@ execvpe(const char* file, char* const argv[], char* const envp[])
     if (!peak_exec_priming_is_complete()) {
         return peak_exec_prepublication_execvpe(file, argv, envp);
     }
+    if (peak_exec_in_mpi_runtime()) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_call_primed_execvpe(file, argv, (char* const*)child_envp);
+    }
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_execvpe(file, argv, envp);
     }
@@ -2676,6 +2827,7 @@ execvp(const char* file, char* const argv[])
     if (!peak_exec_priming_is_complete()) {
         return peak_exec_prepublication_execvp(file, argv);
     }
+    if (peak_exec_in_mpi_runtime()) return execvpe(file, argv, environ);
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_execvp(file, argv);
     }
@@ -2797,7 +2949,8 @@ execl(const char* path, const char* arg, ...)
     char** argv = NULL;
     int priming_complete = peak_exec_priming_is_complete();
     int direct_bypass = !priming_complete ||
-                        !peak_exec_startup_policy_enabled;
+                        (!peak_exec_startup_policy_enabled &&
+                         !peak_exec_in_mpi_runtime());
     int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
@@ -2853,7 +3006,8 @@ execlp(const char* file, const char* arg, ...)
     char** argv = NULL;
     int priming_complete = peak_exec_priming_is_complete();
     int direct_bypass = !priming_complete ||
-                        !peak_exec_startup_policy_enabled;
+                        (!peak_exec_startup_policy_enabled &&
+                         !peak_exec_in_mpi_runtime());
     int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
@@ -2908,7 +3062,8 @@ execle(const char* path, const char* arg, ...)
     char* const* envp;
     int priming_complete = peak_exec_priming_is_complete();
     int direct_bypass = !priming_complete ||
-                        !peak_exec_startup_policy_enabled;
+                        (!peak_exec_startup_policy_enabled &&
+                         !peak_exec_in_mpi_runtime());
     int noalloc_child = direct_bypass || peak_exec_in_fork_child();
     int result;
     int saved_errno;
@@ -2967,6 +3122,11 @@ fexecve(int fd, char* const argv[], char* const envp[])
 {
     if (!peak_exec_priming_is_complete()) {
         return peak_exec_prepublication_fexecve(fd, argv, envp);
+    }
+    if (peak_exec_in_mpi_runtime()) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_call_primed_fexecve(fd, argv, (char* const*)child_envp);
     }
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_fexecve(fd, argv, envp);
@@ -3030,6 +3190,12 @@ execveat(int dirfd,
         return peak_exec_prepublication_execveat(
             dirfd, pathname, argv, envp, flags);
     }
+    if (peak_exec_in_mpi_runtime()) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_call_primed_execveat(
+            dirfd, pathname, argv, (char* const*)child_envp, flags);
+    }
     if (!peak_exec_startup_policy_enabled) {
         return peak_call_primed_execveat(
             dirfd, pathname, argv, envp, flags);
@@ -3086,7 +3252,7 @@ peak_exec_raw_syscall_execveat(int dirfd,
                                int flags)
 {
     if (!peak_exec_priming_is_complete() ||
-        !peak_exec_startup_policy_enabled) {
+        (!peak_exec_startup_policy_enabled && !peak_exec_in_mpi_runtime())) {
         return peak_exec_prepublication_execveat(
             dirfd, pathname, argv, envp, flags);
     }
@@ -3112,6 +3278,12 @@ posix_spawn(pid_t* pid,
         }
         errno = entry_errno;
         return fn(pid, path, file_actions, attrp, argv, envp);
+    }
+    if (peak_exec_in_mpi_runtime() && peak_real_posix_spawn_ptr != NULL) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_real_posix_spawn_ptr(pid, path, file_actions, attrp, argv,
+                                        (char* const*)child_envp);
     }
     if (!peak_exec_startup_policy_enabled) {
         if (peak_real_posix_spawn_ptr == NULL) {
@@ -3185,6 +3357,12 @@ posix_spawnp(pid_t* pid,
         }
         errno = entry_errno;
         return fn(pid, file, file_actions, attrp, argv, envp);
+    }
+    if (peak_exec_in_mpi_runtime() && peak_real_posix_spawnp_ptr != NULL) {
+        char* entries[PEAK_EXEC_CHILD_ENV_SLOTS];
+        char* const* child_envp = peak_exec_mpi_child_env(envp, entries);
+        return peak_real_posix_spawnp_ptr(pid, file, file_actions, attrp, argv,
+                                         (char* const*)child_envp);
     }
     if (!peak_exec_startup_policy_enabled) {
         if (peak_real_posix_spawnp_ptr == NULL) {

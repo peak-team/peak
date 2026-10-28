@@ -206,3 +206,16 @@ Timing boundary: the `process` summary key retains the benchmark's
 It excludes loader/LD_PRELOAD constructors before main and launcher wall time.
 The primary comparison is the measured main-phase wall including its final
 completion barrier; warmup-plus-main and main-through-finalize are supplementary.
+
+The synchronization workload also accepts `--profile-threads N` (default 1,
+1 ≤ N ≤ OpenMP thread count). On the selected rank, threads 0 through N−1
+call the selected targets; other threads use their arithmetic-identical native
+twins. This preserves every thread's integer work and checksum. Potential
+selected-call totals and per-rank counts include all N selected threads.
+
+Final concurrent coverage uses separate `funded-concurrent-<sync>-rotating`
+cases for all five synchronization modes, with `--profile-threads 6
+--warmup-calls 60000 --epochs 2048 --calls 2000`. Keep their results separate
+from the single-thread funded cases. The new source SHA256 is
+`726dc38ff93d40255304ce7d72a88549d660376e2a1334daa7743d2300c9b0ae`;
+older recorded runs retain their original workload source hash.

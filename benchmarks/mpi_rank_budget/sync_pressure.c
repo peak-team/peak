@@ -42,6 +42,7 @@ int main(int argc,char **argv) {
  MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);stamp("after_mpi_init",rank);
  if(provided<MPI_THREAD_FUNNELED)MPI_Abort(MPI_COMM_WORLD,2);
  const char *sync="allreduce",*layout="rotating";
+ unsigned profile_threads=1;
  unsigned epochs=2048,warmup_work=131072,main_work=1;uint64_t calls=2000,warmup_calls=10000;
  for(int i=1;i<argc;i++) {
   if(i+1>=argc)MPI_Abort(MPI_COMM_WORLD,2);
@@ -52,13 +53,14 @@ int main(int argc,char **argv) {
   else if(!strcmp(key,"--main-work")&&n<=UINT32_MAX)main_work=n;
   else if(!strcmp(key,"--warmup-calls"))warmup_calls=n;
   else if(!strcmp(key,"--warmup-work")&&n<=UINT32_MAX)warmup_work=n;
+  else if(!strcmp(key,"--profile-threads")&&n<=65536)profile_threads=n;
   else if(!strcmp(key,"--threads")&&n<=65536)omp_set_num_threads(n);
   else MPI_Abort(MPI_COMM_WORLD,2);
  }
  if(strcmp(sync,"allreduce")&&strcmp(sync,"barrier")&&strcmp(sync,"bcast")&&strcmp(sync,"ring")&&strcmp(sync,"iallreduce"))MPI_Abort(MPI_COMM_WORLD,2);
  if(strcmp(layout,"rotating")&&strcmp(layout,"slack")&&strcmp(layout,"critical")&&strcmp(layout,"aligned"))MPI_Abort(MPI_COMM_WORLD,2);
  if(warmup_calls>UINT64_MAX/warmup_work||calls>UINT64_MAX/main_work)MPI_Abort(MPI_COMM_WORLD,2);
- omp_set_dynamic(0);int nt=omp_get_max_threads();
+ omp_set_dynamic(0);int nt=omp_get_max_threads();if(profile_threads>(unsigned)nt)MPI_Abort(MPI_COMM_WORLD,2);
  double *compute=calloc(nt,sizeof(double)),*cpu=calloc(nt,sizeof(double)),*pre=calloc(nt,sizeof(double)),*release=calloc(nt,sizeof(double));
  uint64_t *state=calloc(nt,sizeof(uint64_t)),*expected=calloc(nt,sizeof(uint64_t));cpu_set_t *masks=calloc(nt,sizeof(cpu_set_t));
  if(!compute||!cpu||!pre||!release||!state||!expected||!masks)MPI_Abort(MPI_COMM_WORLD,2);
@@ -74,7 +76,7 @@ int main(int argc,char **argv) {
  for(int t=0;t<nt;t++){used+=snprintf(binding+used,sizeof(binding)-used," t%d=[",t);int first=1;for(int c=0;c<CPU_SETSIZE;c++)if(CPU_ISSET(c,&masks[t])){if(used>8000)MPI_Abort(MPI_COMM_WORLD,2);used+=snprintf(binding+used,sizeof(binding)-used,"%s%d",first?"":",",c);first=0;}used+=snprintf(binding+used,sizeof(binding)-used,"]");}
  char *bindings=rank==0?calloc(size,sizeof(binding)):NULL;MPI_Gather(binding,sizeof(binding),MPI_CHAR,bindings,sizeof(binding),MPI_CHAR,0,MPI_COMM_WORLD);
  if(!rank){for(int r=0;r<size;r++)printf("%s\n",bindings+r*sizeof(binding));free(bindings);printf("scenario sync=%s layout=%s\n",sync,layout);}free(masks);
- if(!rank){printf("config ranks=%d threads=%d epochs=%u calls_per_thread_epoch=%llu tiny_work=%u medium_work=%u rotate_epochs=%d sparse_cadence=1 layout=3 targets=16 hotset=1 warmup_calls=%llu warmup_work=%u exported_targets=256 expected_potential_calls=%.0Lf expected_profiled_calls=%.0Lf expected_warmup_calls=%.0Lf\n",size,nt,epochs,(unsigned long long)calls,main_work,main_work,size,(unsigned long long)warmup_calls,warmup_work,(long double)size*nt*epochs*calls,(long double)epochs*calls,(long double)size*nt*warmup_calls);fflush(stdout);}
+ if(!rank){printf("config ranks=%d threads=%d profile_threads=%u epochs=%u calls_per_thread_epoch=%llu tiny_work=%u medium_work=%u rotate_epochs=%d sparse_cadence=1 layout=3 targets=16 hotset=1 warmup_calls=%llu warmup_work=%u exported_targets=256 expected_potential_calls=%.0Lf expected_profiled_calls=%.0Lf expected_warmup_calls=%.0Lf\n",size,nt,profile_threads,epochs,(unsigned long long)calls,main_work,main_work,size,(unsigned long long)warmup_calls,warmup_work,(long double)size*nt*epochs*calls,(long double)profile_threads*epochs*calls,(long double)size*nt*warmup_calls);fflush(stdout);}
  int failures=0;
  for(unsigned phase=0;phase<2;phase++) {
   memset(compute,0,nt*sizeof(double));memset(cpu,0,nt*sizeof(double));memset(pre,0,nt*sizeof(double));memset(release,0,nt*sizeof(double));
@@ -87,7 +89,7 @@ int main(int argc,char **argv) {
     unsigned id=phase?(e/(unsigned)size)%16:0;
     int hot=(!strcmp(layout,"slack")||!strcmp(layout,"aligned"))?0:(int)(e%(unsigned)size);
     int slow=!strcmp(layout,"slack")?size-1:hot;
-    unsigned target=phase&&rank==hot&&tid==0?id:id+128;
+    unsigned target=phase&&rank==hot&&(unsigned)tid<profile_threads?id:id+128;
     uint64_t n=phase?calls:warmup_calls;unsigned work=phase?main_work:warmup_work;
     if(phase&&strcmp(layout,"rotating")&&rank==slow)work=512;
     double tc=thread_cpu(),t=now();
@@ -116,8 +118,8 @@ int main(int argc,char **argv) {
   }
   MPI_Allreduce(&bad,&totalbad,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);MPI_Allreduce(&mpibad,&totalmpibad,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);MPI_Reduce(&checksum,&totalcheck,1,MPI_UINT64_T,MPI_BXOR,0,MPI_COMM_WORLD);failures+=totalbad+totalmpibad;
   uint64_t local_steps=0,total_steps=0;for(unsigned e=0;e<n_epoch;e++){int hot=(!strcmp(layout,"slack")||!strcmp(layout,"aligned"))?0:(int)(e%(unsigned)size);int slow=!strcmp(layout,"slack")?size-1:hot;unsigned w=phase?main_work:warmup_work;if(phase&&strcmp(layout,"rotating")&&rank==slow)w=512;local_steps+=(uint64_t)nt*(phase?calls:warmup_calls)*w;}MPI_Reduce(&local_steps,&total_steps,1,MPI_UINT64_T,MPI_SUM,0,MPI_COMM_WORLD);
-  if(!rank)printf("%s work=%u cadence=1 oracle_bad=%d mpi_bad=%d checksum=%016llx potential_target_calls=%.0Lf profiled_target_calls=%.0Lf lcg_steps=%.0Lf collectives_per_rank=%u\n",phase?"phase":"warmup",phase?main_work:warmup_work,totalbad,totalmpibad,(unsigned long long)totalcheck,(long double)size*nt*(phase?(long double)epochs*calls:warmup_calls),phase?(long double)epochs*calls:0,(long double)total_steps,n_epoch);
-  uint64_t rank_calls=0;for(unsigned e=0;e<n_epoch;e++){int hot=(!strcmp(layout,"slack")||!strcmp(layout,"aligned"))?0:(int)(e%(unsigned)size);if(phase&&rank==hot)rank_calls+=calls;}
+  if(!rank)printf("%s work=%u cadence=1 oracle_bad=%d mpi_bad=%d checksum=%016llx potential_target_calls=%.0Lf profiled_target_calls=%.0Lf lcg_steps=%.0Lf collectives_per_rank=%u\n",phase?"phase":"warmup",phase?main_work:warmup_work,totalbad,totalmpibad,(unsigned long long)totalcheck,(long double)size*nt*(phase?(long double)epochs*calls:warmup_calls),phase?(long double)profile_threads*epochs*calls:0,(long double)total_steps,n_epoch);
+  uint64_t rank_calls=0;for(unsigned e=0;e<n_epoch;e++){int hot=(!strcmp(layout,"slack")||!strcmp(layout,"aligned"))?0:(int)(e%(unsigned)size);if(phase&&rank==hot)rank_calls+=(uint64_t)profile_threads*calls;}
   double row[11]={wall,cs/nt,cpus/nt,mpi,process_delta,(double)local_steps,(double)rank_calls,post,overlap_time,wait_time,completion_wait};double *rows=!rank?calloc(size*11,sizeof(double)):NULL;MPI_Gather(row,11,MPI_DOUBLE,rows,11,MPI_DOUBLE,0,MPI_COMM_WORLD);if(!rank){for(int r=0;r<size;r++)printf("rank_metric phase=%u rank=%d wall=%.9f compute=%.9f cpu=%.9f sync=%.9f process_cpu=%.9f lcg_steps=%.0f potential_profiled_calls=%.0f post=%.9f overlap=%.9f wait=%.9f completion_wait=%.9f\n",phase,r,rows[r*11],rows[r*11+1],rows[r*11+2],rows[r*11+3],rows[r*11+4],rows[r*11+5],rows[r*11+6],rows[r*11+7],rows[r*11+8],rows[r*11+9],rows[r*11+10]);printf("phase_root_wall phase=%u seconds=%.9f\n",phase,wall);free(rows);}
   stats("wall_seconds",wall,rank,size);stats("thread_mean_compute_seconds",cs/nt,rank,size);stats("thread_mean_compute_cpu_seconds",cpus/nt,rank,size);stats("process_user_plus_system_cpu_seconds",process_delta,rank,size);stats("thread_mean_pre_collective_barrier_seconds",ps/nt,rank,size);stats("thread_mean_collective_release_barrier_seconds_OVERLAPS_MPI",rs/nt,rank,size);stats("master_mpi_allreduce_seconds",mpi,rank,size);fflush(stdout);
  }

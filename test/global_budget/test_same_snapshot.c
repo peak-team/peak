@@ -29,7 +29,7 @@ int main(void)
  f.message_sequence=2;f.request_credit=true;f.demand_generation=1;f.requested_ns=1000;raw_send(raw,&f);
  Frame before=raw_receive(raw,.000099999);
  /* Cost snapshot revision remains ONE; credit consumption must still settle. */
- f.message_sequence=3;f.consumed_ns=1000;raw_send(raw,&f);
+ f.message_sequence=3;f.consumed_profile_ns=1000;raw_send(raw,&f);
  Frame after=raw_receive(raw,before.view.granted_total_seconds+.0000009);
  assert(after.view.global_spent_seconds>=1e-6);
  assert(after.view.granted_total_seconds<before.view.granted_total_seconds+.0000011);
@@ -37,24 +37,37 @@ int main(void)
  raw_send(raw,&f);Frame duplicate=raw_receive(raw,after.view.granted_total_seconds);
  assert(duplicate.view.granted_total_seconds==after.view.granted_total_seconds);
  assert(duplicate.view.wave==0);
+ /* Explicit return releases only unused reservation; replay is idempotent. */
+ f.message_sequence=4;f.request_credit=false;f.returned_ns=50000;raw_send(raw,&f);
+ Peer returned_peer={.fd=raw};Frame returned_reply={0};double return_deadline=seconds_now()+.7;
+ while(seconds_now()<return_deadline){int n=read_frame(&returned_peer);assert(n>=0);if(n==1){returned_reply=returned_peer.incoming;returned_peer.received=0;if(returned_reply.view.returned_total_ns==50000)break;}usleep(1000);}
+ assert(returned_reply.view.returned_total_ns==50000);
+ double settled_reservation=returned_reply.view.reserved_seconds;
+ assert(settled_reservation<=.00005001);
+ raw_send(raw,&f);usleep(20000);
+ Frame replay=raw_receive(raw,after.view.granted_total_seconds);
+ assert(replay.view.returned_total_ns==50000);
+ assert(fabs(replay.view.reserved_seconds-settled_reservation)<1e-9);
+ f.request_credit=true;
  /* Force an actual unfunded request, then preserve the SAME request after
   * DONE while attached remains stale-positive. It must not create wave two. */
- f.message_sequence=4;f.demand_generation=2;f.requested_ns=10000000;
+ f.message_sequence=5;f.demand_generation=2;f.requested_ns=10000000;
  f.sample.profile_seconds=2;f.sample.attached_targets=16;raw_send(raw,&f);
  Frame wave=raw_wave(raw,1,0);assert(wave.view.wave==1);
- peak_global_budget_complete(1);f.message_sequence=5;f.sample.completed_wave=1;raw_send(raw,&f);
+ assert(wave.view.acknowledged_demand_generation<f.demand_generation);
+ peak_global_budget_complete(1);f.message_sequence=6;f.sample.completed_wave=1;raw_send(raw,&f);
  wave=raw_wave(raw,1,1);assert(wave.view.wave==1);
- f.message_sequence=6;raw_send(raw,&f);usleep(30000);
+ f.message_sequence=7;raw_send(raw,&f);usleep(30000);
  wave=raw_wave(raw,1,1);assert(wave.view.wave==1);
  /* A genuinely new demand generation can cause a second wave; old ACK one
   * cannot complete it. */
- f.message_sequence=7;f.demand_generation=3;raw_send(raw,&f);
+ f.message_sequence=8;f.demand_generation=3;raw_send(raw,&f);
  wave=raw_wave(raw,2,1);assert(wave.view.wave==2&&wave.view.root_completed_wave==1);
- peak_global_budget_complete(2);f.message_sequence=8;f.sample.completed_wave=2;raw_send(raw,&f);
+ peak_global_budget_complete(2);f.message_sequence=9;f.sample.completed_wave=2;raw_send(raw,&f);
  wave=raw_wave(raw,2,2);assert(wave.view.wave_span_seconds>0);
  assert(peak_global_budget_flush(100));
  /* An ACK for a never-issued future wave is rejected, not counted DONE. */
- f.message_sequence=9;f.sample.completed_wave=3;raw_send(raw,&f);
+ f.message_sequence=10;f.sample.completed_wave=3;raw_send(raw,&f);
  usleep(150000);assert(!peak_global_budget_view().active);
  s.sequence=2;peak_global_budget_publish(&s);
  assert(!peak_global_budget_flush(100));

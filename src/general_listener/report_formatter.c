@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <float.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1060,6 +1061,12 @@ peak_report_formatter_write_rank_local_csv_host_disambiguated(
     return peak_report_formatter_write_csv_scoped(snapshot, true, true);
 }
 
+static void
+peak_report_formatter_cancel_text_batch(void* owned)
+{
+    if (owned != NULL) peak_log_report_batch_abort();
+}
+
 bool
 peak_report_formatter_write_text(
     const PeakReportSnapshot* snapshot,
@@ -1088,6 +1095,11 @@ peak_report_formatter_write_text(
     memset(report_separator, '=', (size_t)row_width);
     report_separator[row_width] = '\0';
     rank_count = peak_report_formatter_rank_count(snapshot);
+
+    int batch_owned = peak_log_report_batch_begin();
+    bool success = true;
+    pthread_cleanup_push(peak_report_formatter_cancel_text_batch,
+                         (void*)(uintptr_t)batch_owned);
 
     {
         const char* report_title = "PEAK Library Performance Report";
@@ -1393,10 +1405,12 @@ peak_report_formatter_write_text(
     }
     peak_log_report("%s\n", row_separator);
     errno = 0;
-    if (peak_log_flush() != 0) {
+    if ((batch_owned && peak_log_report_batch_end() != 0) ||
+        peak_log_flush() != 0) {
         peak_log_warn("[peak] failed to flush the complete text report: %s\n",
                       strerror(errno != 0 ? errno : EIO));
-        return false;
+        success = false;
     }
-    return true;
+    pthread_cleanup_pop(0);
+    return success;
 }

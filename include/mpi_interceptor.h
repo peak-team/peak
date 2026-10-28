@@ -22,6 +22,9 @@
 #define PEAK_MPI_INTERCEPTOR_API
 #endif
 
+PEAK_MPI_INTERCEPTOR_API int peak_mpi_internal_context_active(void);
+
+
 /**
  * @brief Activates a configured PEAK MPI runtime after MPI initialization.
  *

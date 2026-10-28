@@ -20,6 +20,11 @@ int main(void)
     assert(sent==sizeof(f));
     while(!peak_global_budget_view().active&&seconds_now()<deadline)usleep(1000);
     assert(peak_global_budget_view().active);
+#ifdef PEAK_TEST_RETIRING_ROOT
+    peak_global_budget_retire();
+    usleep(100000); assert(peak_global_budget_view().active);
+    assert(!peak_global_budget_try_spend(1));
+#endif
     /* Other participant leaves first. Our final snapshot has not been sent. */
     close(raw);
     deadline=seconds_now()+.5;

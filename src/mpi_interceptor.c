@@ -3,6 +3,7 @@
 #include "general_listener.h"
 #include "internal/global_budget.h"
 #include <unistd.h>
+#include <stdio.h>
 #include "internal/mpi_teardown_guard.h"
 #include "logging.h"
 #include "utils/env_parser.h"
@@ -67,6 +68,14 @@ static pthread_once_t real_pmpi_init_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_mpi_init_thread_once = PTHREAD_ONCE_INIT;
 static pthread_once_t real_pmpi_init_thread_once = PTHREAD_ONCE_INIT;
 static _Thread_local unsigned int peak_mpi_init_wrapper_depth;
+static _Thread_local unsigned int peak_mpi_internal_depth;
+
+int peak_mpi_internal_context_active(void)
+{
+    const char *mode = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    return peak_mpi_internal_depth != 0 && mode && strcmp(mode, "1") == 0;
+}
+
 
 static void
 mpi_interceptor_configure_finalize_owner_timeout(void)
@@ -327,15 +336,51 @@ mpi_interceptor_resolve_pmpi_init_thread_once(void)
         (PeakMpiInitThreadFunction)dlsym(RTLD_NEXT, "PMPI_Init_thread");
 }
 
+static double
+peak_mpi_trace_clock(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+}
+
+static int
+peak_mpi_timing_enabled(void)
+{
+    const char *value = getenv("PEAK_MPI_TIMING_TRACE");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
+/* A clock failure must not turn bounded readiness into an infinite wait. */
+static int peak_mpi_bootstrap_clock_ok(double elapsed, double previous, unsigned attempt)
+{
+    return attempt < 1000 && elapsed >= 0.0 &&
+        (attempt == 0 || elapsed > previous);
+}
+#ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_MPI_INTERCEPTOR_API int mpi_interceptor_test_bootstrap_clock_guard(void)
+{
+    return peak_mpi_bootstrap_clock_ok(-1, 0, 0) ||
+        peak_mpi_bootstrap_clock_ok(4, 5, 1) ||
+        peak_mpi_bootstrap_clock_ok(5, 5, 1) ||
+        peak_mpi_bootstrap_clock_ok(5, 4, 1000) ||
+        !peak_mpi_bootstrap_clock_ok(0, 0, 0) ||
+        !peak_mpi_bootstrap_clock_ok(5, 4, 1);
+}
+#endif
+
 /* Opt-in SPMD bootstrap: every world rank must enable the same mode. */
 static void
-peak_mpi_global_budget_bootstrap(int result, int required)
+peak_mpi_global_budget_bootstrap(int result, int required, double original_seconds,
+                                 double activation_seconds)
 {
     const char* enabled = getenv("PEAK_MPI_GLOBAL_BUDGET");
     if (result != MPI_SUCCESS || enabled == NULL || strcmp(enabled, "1") != 0)
         return;
-    struct timespec budget_started;
-    (void)clock_gettime(CLOCK_MONOTONIC, &budget_started);
+    struct timespec budget_started = {0};
+    int clock_valid = clock_gettime(CLOCK_MONOTONIC, &budget_started) == 0 &&
+        (budget_started.tv_sec != 0 || budget_started.tv_nsec != 0) &&
+        original_seconds >= 0.0 && activation_seconds >= 0.0;
     int rank, size, actual_thread_level = MPI_THREAD_SINGLE;
     (void)PMPI_Query_thread(&actual_thread_level);
     peak_log_report("[peak] MPI global bootstrap: backend=tcp required_thread_level=%d provided_thread_level=%d all_world_optin_required=1\n", required, actual_thread_level);
@@ -354,14 +399,35 @@ peak_mpi_global_budget_bootstrap(int result, int required)
         (unsigned)rank, (unsigned)size, global_target_ratio,
         peak_general_listener_controller_wake);
     int ready = 0;
-    if (started == 0) {
+    double elapsed = clock_valid ? mpi_interceptor_finalize_elapsed_ms(&budget_started) : -1.0;
+    if (elapsed < 0.0) clock_valid = 0;
+    double previous = 0.0;
+    unsigned attempt = 0;
+    if (started == 0 && clock_valid) {
+        peak_global_budget_origin(original_seconds);
         const struct timespec pause = {0, 1000000};
-        while (mpi_interceptor_finalize_elapsed_ms(&budget_started) < 1000.0) {
-            if (peak_global_budget_view().active) { ready = 1; break; }
+        for (; attempt < 1000; attempt++) {
+            if (!peak_mpi_bootstrap_clock_ok(elapsed, previous, attempt)) {
+                clock_valid = 0;
+                break;
+            }
+            if (elapsed >= 1000.0) break;
+            if (peak_global_budget_active()) { ready = 1; break; }
+            previous = elapsed;
             nanosleep(&pause, NULL);
+            elapsed = mpi_interceptor_finalize_elapsed_ms(&budget_started);
         }
     }
-    double startup_seconds = mpi_interceptor_finalize_elapsed_ms(&budget_started) / 1000.0;
+    double final_elapsed = clock_valid ? mpi_interceptor_finalize_elapsed_ms(&budget_started) : -1.0;
+    if (final_elapsed < 0.0 || final_elapsed < elapsed) clock_valid = 0;
+    if (!clock_valid) {
+        /* This branch is deliberately after the mandatory SPMD bootstrap. */
+        peak_global_budget_stop();
+        peak_log_warn("[peak] MPI global bootstrap: startup_clock_valid=0 startup_ready=0\n");
+        peak_general_listener_global_budget_startup(-1.0, 0);
+        return;
+    }
+    double startup_seconds = activation_seconds + final_elapsed / 1000.0;
     peak_global_budget_startup(startup_seconds);
     peak_general_listener_global_budget_startup(startup_seconds, ready);
 }
@@ -373,18 +439,34 @@ mpi_interceptor_call_init(PeakMpiInitFunction init,
                           char*** argv)
 {
     int result;
+    const char *global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    int timed = peak_mpi_timing_enabled() || (global && strcmp(global, "1") == 0);
+    double began = timed ? peak_mpi_trace_clock() : 0.0;
 
     peak_mpi_init_wrapper_depth++;
     if (init == NULL) {
         peak_log_warn("[peak] unable to resolve next %s\n", symbol);
         result = MPI_ERR_OTHER;
     } else {
+        peak_mpi_internal_depth++;
         result = init(argc, argv);
+        peak_mpi_internal_depth--;
     }
+    double original_end = timed ? peak_mpi_trace_clock() : 0.0;
+    double original_seconds = timed && began >= 0.0 && original_end >= began
+        ? original_end - began : -1.0;
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
+        double activation_start = timed ? peak_mpi_trace_clock() : 0.0;
         peak_mpi_init_completed(result);
-        peak_mpi_global_budget_bootstrap(result, MPI_THREAD_SINGLE);
+        double bootstrap_start = timed ? peak_mpi_trace_clock() : 0.0;
+        peak_mpi_global_budget_bootstrap(result, MPI_THREAD_SINGLE, original_seconds,
+            activation_start >= 0.0 && bootstrap_start >= activation_start
+                ? bootstrap_start - activation_start : -1.0);
+        if (peak_mpi_timing_enabled())
+            peak_log_report("[peak] MPI timing: stage=init original_seconds=%.9g activation_seconds=%.9g bootstrap_seconds=%.9g\n",
+                original_seconds, bootstrap_start - activation_start,
+                peak_mpi_trace_clock() - bootstrap_start);
     }
     return result;
 }
@@ -398,18 +480,34 @@ mpi_interceptor_call_init_thread(PeakMpiInitThreadFunction init,
                                  int* provided)
 {
     int result;
+    const char *global = getenv("PEAK_MPI_GLOBAL_BUDGET");
+    int timed = peak_mpi_timing_enabled() || (global && strcmp(global, "1") == 0);
+    double began = timed ? peak_mpi_trace_clock() : 0.0;
 
     peak_mpi_init_wrapper_depth++;
     if (init == NULL) {
         peak_log_warn("[peak] unable to resolve next %s\n", symbol);
         result = MPI_ERR_OTHER;
     } else {
+        peak_mpi_internal_depth++;
         result = init(argc, argv, required, provided);
+        peak_mpi_internal_depth--;
     }
+    double original_end = timed ? peak_mpi_trace_clock() : 0.0;
+    double original_seconds = timed && began >= 0.0 && original_end >= began
+        ? original_end - began : -1.0;
     peak_mpi_init_wrapper_depth--;
     if (peak_mpi_init_wrapper_depth == 0) {
+        double activation_start = timed ? peak_mpi_trace_clock() : 0.0;
         peak_mpi_init_completed(result);
-        peak_mpi_global_budget_bootstrap(result, required);
+        double bootstrap_start = timed ? peak_mpi_trace_clock() : 0.0;
+        peak_mpi_global_budget_bootstrap(result, required, original_seconds,
+            activation_start >= 0.0 && bootstrap_start >= activation_start
+                ? bootstrap_start - activation_start : -1.0);
+        if (peak_mpi_timing_enabled())
+            peak_log_report("[peak] MPI timing: stage=init original_seconds=%.9g activation_seconds=%.9g bootstrap_seconds=%.9g\n",
+                original_seconds, bootstrap_start - activation_start,
+                peak_mpi_trace_clock() - bootstrap_start);
     }
     return result;
 }
@@ -601,9 +699,13 @@ mpi_interceptor_call_original_finalize_once(void)
             hook_address != NULL &&
             mpi_interceptor_restore_finalize_for_direct_call()) {
             int (*direct_pmpi_finalize)(void) = (int (*)(void))hook_address;
+            peak_mpi_internal_depth++;
             result = direct_pmpi_finalize();
+            peak_mpi_internal_depth--;
         } else if (original_pmpi_finalize != NULL) {
+            peak_mpi_internal_depth++;
             result = original_pmpi_finalize();
+            peak_mpi_internal_depth--;
         }
         mpi_interceptor_finalize_publish_done(result);
         return result;
@@ -645,9 +747,17 @@ peak_pmpi_finalize(void)
         return mpi_interceptor_call_original_finalize_once();
     }
     __atomic_store_n(&peak_finalize_path_active, 1, __ATOMIC_RELEASE);
+    int timed = peak_mpi_timing_enabled();
+    double began = timed ? peak_mpi_trace_clock() : 0.0;
     peak_fini();
+    double original_start = timed ? peak_mpi_trace_clock() : 0.0;
     __atomic_store_n(&peak_finalize_path_active, 0, __ATOMIC_RELEASE);
-    return mpi_interceptor_call_original_finalize_once();
+    int result = mpi_interceptor_call_original_finalize_once();
+    peak_general_listener_global_budget_shutdown(0); /* failed/early teardown fallback */
+    /* peak_fini closes the report sink before returning to MPI. */
+    if (timed) fprintf(stderr, "[peak] MPI timing: stage=finalize peak_fini_seconds=%.9g original_seconds=%.9g\n",
+        original_start - began, peak_mpi_trace_clock() - original_start);
+    return result;
 }
 
 int mpi_interceptor_finalize_was_requested()
