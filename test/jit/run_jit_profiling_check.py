@@ -31,6 +31,7 @@ def make_env(libpeak, stats_prefix, map_path, trace_path, extra_env=None):
             "PEAK_TARGET": JIT_SYMBOL,
             "PEAK_STATSLOG_PATH": stats_prefix,
             "PEAK_JIT_ENABLE": "1",
+            "PEAK_VERBOSITY": "info",
             "PEAK_JIT_PROVIDER": "perfmap",
             "PEAK_JIT_MAP_PATH": map_path,
             "PEAK_JIT_TRACE_PATH": trace_path,

@@ -54,6 +54,16 @@ def main():
                 assert all('!' in s and Path(s.split('!', 1)[0]).is_absolute() for s in lines)
             return set(lines)
 
+        def assert_native_origin(module, origin, symbols):
+            print(f'{module} import origin: {origin}')
+            modules = {Path(symbol.split('!', 1)[0]) for symbol in symbols}
+            if origin in ('built-in', 'frozen'):
+                assert not any(path.name.startswith(module+'.') for path in modules), modules
+            else:
+                expected = Path(origin)
+                assert expected.is_absolute() and expected.is_file(), (module, origin)
+                assert expected.resolve() in modules, (module, origin, modules)
+
         # Loader search must follow the executable's origin, RUNPATH
         # boundaries, and breadth-first reuse of an already selected SONAME.
         origin = root/'origin'
@@ -139,6 +149,32 @@ def main():
                 assert (f'{library}!collector_hwleaf' in hwcaps_symbols) == (value == selected_hwcaps)
             if selected_hwcaps == 1:
                 print('SKIP optimized hwcaps selection: loader selected the baseline library')
+
+        symlink_case = root/'loader-symlink'
+        (symlink_case/'real').mkdir(parents=True)
+        (symlink_case/'alias').mkdir()
+        for directory, value in (('real', 1), ('alias', 2)):
+            build('symlink-leaf-'+directory+'.c',
+                  f'int collector_symlink_leaf(void){{return {value};}}',
+                  symlink_case/directory/'libleaf.so', '-shared', '-fPIC', '-nostdlib',
+                  '-Wl,-soname,libleaf.so')
+        real_provider = symlink_case/'real/libprovider.so'
+        alias_provider = symlink_case/'alias/libprovider.so'
+        build('symlink-provider.c', 'extern int collector_symlink_leaf(void); int collector_symlink_provider(void){return collector_symlink_leaf();}',
+              real_provider, '-shared', '-fPIC', '-nostdlib', '-L'+str(symlink_case/'real'),
+              '-lleaf', '-Wl,-rpath,$ORIGIN')
+        alias_provider.symlink_to('../real/libprovider.so')
+        symlink_app = symlink_case/'app'
+        build('symlink-main.c', '#include <stdio.h>\nextern int collector_symlink_provider(void); int main(void){printf("%d\\n",collector_symlink_provider());return 0;}',
+              symlink_app, '-L'+str(symlink_case/'alias'), '-lprovider',
+              '-Wl,-rpath,'+str(symlink_case/'alias'),
+              '-Wl,-rpath-link,'+str(symlink_case/'alias'))
+        assert run([symlink_app]).strip() == '2', 'loader-visible origin fixture did not select alias leaf'
+        for target in (symlink_app, alias_provider):
+            symlink_symbols = collect(target)
+            assert f'{real_provider}!collector_symlink_provider' in symlink_symbols
+            assert f'{symlink_case/"alias/libleaf.so"}!collector_symlink_leaf' in symlink_symbols
+            assert f'{symlink_case/"real/libleaf.so"}!collector_symlink_leaf' not in symlink_symbols
 
         leaf, provider, app = [root / x for x in ('libleaf.so', 'libprovider.so', 'app')]
         build('leaf.c', 'int duplicate(void){__asm__ volatile(".rept 32; nop; .endr");return 3;} int leaf(void){__asm__ volatile(".rept 32; nop; .endr");return 5;}', leaf,
@@ -475,13 +511,34 @@ print("collector_saturation_originals_ok")
         shadow_cwd.mkdir()
         (shadow_cwd/'math.py').write_text('value = 1\n')
         math_script = root/'math-static.py'
-        math_script.write_text('import math\nassert hasattr(math, "sin")\n')
+        math_script.write_text('import math, importlib.util\nassert hasattr(math, "sin")\n'
+                               'print(importlib.util.find_spec("math").origin)\n')
         isolated_python_env = {key: value for key, value in os.environ.items()
                                if key not in ('PYTHONPATH', 'PYTHONHOME')}
-        run([sys.executable, math_script], cwd=shadow_cwd, env=isolated_python_env)
+        math_origin = run([sys.executable, math_script], cwd=shadow_cwd,
+                          env=isolated_python_env).strip()
         math_symbols = collect(math_script, cwd=shadow_cwd, env=isolated_python_env)
-        assert any(Path(symbol.split('!', 1)[0]).name.startswith('math.')
-                   for symbol in math_symbols), 'unrelated cwd shadowed script import roots'
+        assert_native_origin('math', math_origin, math_symbols)
+
+        # Use a separately built extension so the CWD-shadow regression remains
+        # effective when the distribution compiles math into the interpreter.
+        shadow_import_root = root/'shadow-native-imports'
+        shadow_import_root.mkdir()
+        shadow_native = shadow_import_root/('collector_shadow_native'+
+                                            (sysconfig.get_config_var('EXT_SUFFIX') or '.so'))
+        build('shadow-native.c', 'int collector_shadow_symbol(void){return 7;}',
+              shadow_native, '-shared', '-fPIC', '-nostdlib')
+        (shadow_cwd/'collector_shadow_native.py').write_text('SHADOW_MARKER = 1\n')
+        shadow_native_script = root/'shadow-native-static.py'
+        shadow_native_script.write_text('import importlib.util\n'
+                                        'spec = importlib.util.find_spec("collector_shadow_native")\n'+
+                                        f'assert spec.origin == {str(shadow_native)!r}\n'+
+                                        'if False:\n    import collector_shadow_native\n')
+        native_import_env = isolated_python_env.copy()
+        native_import_env['PYTHONPATH'] = str(shadow_import_root)
+        run([sys.executable, shadow_native_script], cwd=shadow_cwd, env=native_import_env)
+        native_import_symbols = collect(shadow_native_script, cwd=shadow_cwd, env=native_import_env)
+        assert f'{shadow_native}!collector_shadow_symbol' in native_import_symbols, native_import_symbols
         (root/'dynamic_attribute_module.py').write_text(
             'count = 0\n'
             'def __getattr__(name):\n'
@@ -509,22 +566,49 @@ print("collector_saturation_originals_ok")
                         break
             if older_python:
                 grammar_script = root/'selected-grammar.py'
-                grammar_script.write_text('type Value = int\nimport math\n')
+                grammar_script.write_text('type Value = int\nimport package.native\n')
                 grammar_output = run([older_python, args.collector, grammar_script,
                                       '--python', sys.executable])
-                assert any(Path(symbol.split('!', 1)[0]).name.startswith('math.')
-                           for symbol in grammar_output.splitlines())
+                assert f'{extension}!extension_function' in grammar_output.splitlines()
             else:
                 print('SKIP selected Python grammar: older launcher unavailable')
+        sibling = root/'sibling-runtime'
+        sibling.mkdir()
+        (sibling/'pkgutil.py').write_text('LOCAL_MARKER = 7\n')
+        sibling_script = sibling/'app.py'
+        sibling_script.write_text('import pkgutil\nassert pkgutil.LOCAL_MARKER == 7\n')
+        run([sys.executable, sibling_script], env=isolated_python_env)
+        collect(sibling_script, '--run-python', '--python', sys.executable,
+                env=isolated_python_env)
+
+        if hasattr(sys.flags, 'safe_path'):
+            safe_scripts = root/'safe-path-scripts'
+            safe_scripts.mkdir()
+            (safe_scripts/'math.py').write_text('SHADOW_MARKER = 9\n')
+            (safe_scripts/'collector_safe_first_root.py').write_text('MARKER = 9\n')
+            first_import_root = root/'safe-path-imports'
+            first_import_root.mkdir()
+            (first_import_root/'collector_safe_first_root.py').write_text('MARKER = 7\n')
+            safe_script = safe_scripts/'app.py'
+            safe_script.write_text('import math, importlib.util, collector_safe_first_root\n'
+                                   'assert hasattr(math, "sin")\n'
+                                   'assert collector_safe_first_root.MARKER == 7\n'
+                                   'print(importlib.util.find_spec("math").origin)\n')
+            safe_env = isolated_python_env.copy()
+            safe_env.update(PYTHONSAFEPATH='1', PYTHONPATH=str(first_import_root))
+            safe_math_origin = run([sys.executable, safe_script], env=safe_env).strip()
+            safe_symbols = collect(safe_script, '--run-python', '--python', sys.executable,
+                                   env=safe_env)
+            assert_native_origin('math', safe_math_origin, safe_symbols)
         empty_runtime = root/'empty-runtime.py'
         empty_runtime.write_text('pass\n')
         assert collect(empty_runtime, '--run-python') == set(), 'helper baseline polluted empty target'
         for import_code in ('import _json', 'import importlib; importlib.import_module("_json")'):
             json_runtime = root/'json-runtime.py'
-            json_runtime.write_text(import_code+'\n')
+            json_runtime.write_text(import_code+'\nimport importlib.util\nprint(importlib.util.find_spec("_json").origin)\n')
+            json_origin = run([sys.executable, json_runtime]).strip()
             json_symbols = collect(json_runtime, '--run-python')
-            assert any(Path(symbol.split('!', 1)[0]).name.startswith('_json.')
-                       for symbol in json_symbols), import_code
+            assert_native_origin('_json', json_origin, json_symbols)
         binary_script = root/'binary-output.py'
         binary_script.write_text('import sys\nsys.stdout.buffer.write(bytes([255, 254]))\n')
         binary_stderr = run([sys.executable, args.collector, binary_script, '--run-python'],
