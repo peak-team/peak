@@ -1,6 +1,6 @@
 # Adaptive global budget validation
 
-Latest candidate `5e100d0` is running full hardware validation in jobs 3654962/3654963. Its results are pending; the previous measured candidate failed combined timing/utility acceptance. No final performance pass is asserted.
+Latest candidate `5e100d0` completed all 194 hardware launches with valid data, but **did not achieve the combined overhead, useful-coverage and recovery target**. Several MPI configurations exceed 5% and the independent hardware recovery diagnostics show no restoration. The complete results below retain all repeats and earlier failures.
 
 Earlier measured revision `aa055912` uses funded admission before the first physical hook attachment in global mode, retains instrumentation and the safe controller, fixes the stop/wake ordering race, and exposes report-stage wall/CPU and final-flush/join timing. It remains experimental and opt-in. Targeted hardware job **3654296** completed all 26 launches with valid data, but failed combined performance/utility acceptance; no 5% performance pass is asserted. Its source is exact `git archive` of `aa05591223146834d6ae3ea5695c76317e855331`, archive SHA256 `42881e3d1a5627bd4c5b62004d41b457714ba86a451adf1cf19415bcca9c9bd1`. Historical evidence below is preserved.
 
@@ -165,7 +165,7 @@ The independent funded diagnostic proves participant-DONE → physical restorati
 
 The zero-call cases have different admission causes. Aligned's hot rank is always rank0. In G0 it received exactly 6,000,000 ns, attached no hooks, consumed no control credit and returned all 6,000,000 ns: this supports the independently reproduced integer-boundary admission defect. In G1 hot rank0 received no grant; meanwhile 19 cold ranks first attached 15 hooks and one attached 16. Bcast G1 gave no grants and no initial attachments to any rank. Its pre-report spent/budget of 129.369/145.901 ms, after the fixed 16 ms world-wide grace reserve (not a registered closing-cost reservation), leaves only 0.532 ms, below a 6 ms initial lease; root startup alone is 101.244 ms. Correcting exact-ns eligibility therefore cannot by itself ensure useful coverage in every budget-starved short case. Main-arm event tracing is disabled, so the archive does not establish first-grant/installation timing relative to warmup versus main; diagnostic arms are not substituted for that missing observation.
 
-## Current 5e100d0 full rerun (results pending)
+## 5e100d0 full rerun submission plan
 
 The corrected-source fixture is frozen at 5e100d0 and submitted in jobs 3654962/3654963. Matrix
 contains the original 20 workload configurations, two additional complete
@@ -180,7 +180,7 @@ replay mappings while including both repeat groups. Its bcast pooled result
 contains all six native, six local and six global samples, mean and range, with
 each original group retained; repeats cannot selectively replace earlier samples.
 `--set final32` accepts a combined results tree with both matrix and funded groups.
-No result or performance claim is recorded for this pending fixture.
+This paragraph records the submission plan; completed measurements follow below.
 
 The corrected-source full rerun is now submitted against exact commit
 `5e100d0453ac99cf1a0d54184ed4cf337d30c3a8`: matrix job **3654962** (134 launches)
@@ -189,5 +189,125 @@ and funded job **3654963** (60 launches). Both source archives have SHA256
 input-manifest SHA256 is
 `084aa4c58fb9cac8816d6e65398f657f332ae34c40180766c39afa90fa047c0a`.
 All 152 inventoried source files match `git show` of that commit; test-only
-working-tree changes were not overlaid. Results and actual partitions remain
-pending verified raw archives. Submission does not imply performance acceptance.
+working-tree changes were not overlaid. At submission, results and actual partitions were pending. Verified completed measurements and actual partitions are recorded below.
+
+The latest completed local gate matches production 5e100d0: **59/59** freshly
+built selected CTests pass (61.96 seconds), with static and diff checks passing.
+The local library SHA256 is
+`808cbd067af6023c3db3c4fb25c5492128100ee7804320d73868a39f6d779e93`.
+Six actual MPI cases pass their mode-specific checks using test-only runner
+revision 8db8908; all latest raw emergency counters are zero, with confirmed
+settlement except deliberately injected transport fallback. Strict participant
+DONE/restore/new-call checks remain in force for recovery. Multiwindow coverage
+proves all 80 first attachments with physical batches `[64,16]` and real calls.
+The physical API clears the recovery target before its kind7 event, so that trace
+is not represented as proof of an exact numeric target. Original failures and
+subsequent classification files remain separately preserved. Detailed source
+hashes and receipts are in `global_validation/5e100d0-local-summary.json`.
+These are functional results, separate from the hardware performance measurements below.
+
+## 5e100d0 funded hardware result (3654963)
+
+All 60 launches completed on SPR in 16:01 with exit 0:0. Strict data validation passes for all ten configurations, including the five six-thread concurrent cases. The detailed compact record is `global_validation/5e100d0-funded-summary.json`; the complete matrix result follows below and the combined assessment is not a performance pass.
+
+| Funded case | G cumulative work / N | G main-through-finalize / N | G calls (two runs) | G target-rank coverage (two runs) |
+|---|---:|---:|---|---|
+| allreduce-rotating | 1.002003 | 1.040522 | 10,557 / 512 | 6 / 1 |
+| barrier-rotating | 1.003020 | 1.021005 | 6,987 / 12,573 | 4 / 7 |
+| bcast-rotating | 1.002205 | 1.023426 | 7,011 / 10,634 | 4 / 6 |
+| ring-rotating | 1.002951 | 1.027372 | 10,546 / 8,640 | 6 / 5 |
+| iallreduce-rotating | 1.002298 | 1.024895 | 10,163 / 10,552 | 6 / 6 |
+| concurrent-allreduce-rotating | 1.002040 | 1.020723 | 22,768 / 10,256 | 2 / 1 |
+| concurrent-barrier-rotating | 1.003989 | 1.023637 | 22,818 / 10,064 | 2 / 1 |
+| concurrent-bcast-rotating | 1.001850 | 1.027982 | 22,828 / 22,767 | 2 / 2 |
+| concurrent-ring-rotating | 1.002867 | 1.034544 | 10,064 / 10,285 | 1 / 1 |
+| concurrent-iallreduce-rotating | 1.001923 | 1.034841 | 10,256 / 34,418 | 1 / 3 |
+
+All ten cumulative-work and whole-interval means are within 5%, with maximum whole ratio 1.040522. This timing result comes with limited utility: single-thread target-rank coverage is 1–7 versus local 32, concurrent coverage 1–3 versus local 32. Concurrent global records about 10–34 thousand calls versus local about 324 thousand. Every global sample has zero reattachment/revisit and one root wave; most pay for all 32 initial sets and then close them, with roughly 64 windows versus local 32. These observations prevent treating the wall ratios alone as satisfactory profiling coverage.
+
+There are six emergency events in five of 640 global rank-samples: concurrent allreduce G0 rank1 has two; concurrent barrier G1 rank0, bcast G0 rank1 and ring G0/G1 rank0 each have one. Runtime degradation is zero throughout. The events remain diagnostics requiring funding/deadline context rather than a universal per-case rejection rule. Concurrent-ring G0 has pre-report spent/budget 0.690856/0.645635 seconds and final 0.724837/0.656580; all other 19 global final samples retain spent below budget. Raw control remains charged by sum, with wave span diagnostic only.
+
+Verified archive SHA256: `03e80e5cab168dd43b7b6bfad24af77dfcbdaa82ce610cee6f86bafd8424c962`; actual library SHA256: `6c745149d2b71a81c1f93e7c6414e93a55108f1a4393f3f6780b7074ccda0da6`. Source is exact 5e100d0 archive recorded above. All comparisons use matched native arms within SPR; they are not pooled with earlier partitions or sources.
+
+## 5e100d0 complete matrix result (3654962)
+
+All 134 launches completed on PVC in 17:49 with exit 0:0. Matrix22 and funded10 strict validation both pass: all 194 real launcher receipts, fixed-work/oracle checks, bindings and final cohort settlements are complete. Valid data is distinct from satisfying the overhead and useful-profiling target. The compact records are `global_validation/5e100d0-matrix-summary.json`, `5e100d0-funded-summary.json` and `5e100d0-final-overview.json`.
+
+| Matrix group | G main / N | G cumulative work / N | G main-through-finalize / N | G calls (two runs) |
+|---|---:|---:|---:|---|
+| allreduce-rotating | 0.07931 | 0.67099 | 0.81883 | 451 / 899 |
+| allreduce-slack | 0.74934 | 0.73109 | 0.80141 | 2,496 / 3,304 |
+| allreduce-critical | 0.98986 | 0.99776 | 1.00945 | 72,338 / 32,303 |
+| allreduce-aligned | 1.00840 | 0.97842 | 1.02695 | 6,666 / 7,599 |
+| barrier-rotating | 0.87598 | 0.92014 | 0.98761 | 327 / 0 |
+| barrier-slack | 1.05769 | 1.08423 | 1.09368 | 10,000 / 0 |
+| barrier-critical | 1.02724 | 1.06267 | 1.05311 | 10,854 / 15,759 |
+| barrier-aligned | 1.03681 | 1.01600 | 1.04556 | 0 / 810 |
+| bcast-rotating | 1.22308 | 1.03175 | 1.05680 | 0 / 0 |
+| bcast-slack | 0.99947 | 0.99342 | 1.03492 | 0 / 3,237 |
+| bcast-critical | 1.01109 | 1.01022 | 1.04620 | 120,706 / 33,205 |
+| bcast-aligned | 1.01564 | 1.02347 | 1.04642 | 18,470 / 7,678 |
+| ring-rotating | 2.99677 | 1.03033 | 1.07149 | 6,000 / 0 |
+| ring-slack | 1.00204 | 1.00067 | 1.04368 | 0 / 0 |
+| ring-critical | 1.00210 | 1.00923 | 1.05492 | 16,596 / 35,824 |
+| ring-aligned | 1.00979 | 0.98830 | 1.03405 | 0 / 18,832 |
+| iallreduce-rotating | 1.42168 | 0.99704 | 1.04254 | 0 / 1,244 |
+| iallreduce-slack | 1.02716 | 0.99883 | 1.02357 | 23,936 / 0 |
+| iallreduce-critical | 1.18245 | 1.11552 | 1.12574 | 42,212 / 89,611 |
+| iallreduce-aligned | 1.01304 | 0.98529 | 1.02334 | 640 / 0 |
+| bcast-rotating-repeat1 | 1.83297 | 1.06210 | 1.07717 | 839 / 2,535 |
+| bcast-rotating-repeat2 | 1.10178 | 0.93093 | 1.00730 | 3,011 / 0 |
+
+Six of the original 20 matrix configurations exceed 5% in main-through-finalize mean; barrier-slack, barrier-critical and iallreduce-critical also exceed 5% in cumulative-work mean. Native outliers in the first allreduce groups make ratios below one unsuitable as speedup evidence. No samples are dropped.
+
+The prespecified bcast-rotating aggregation uses all six native and six global samples, with each matched group retained. Native whole mean/range is 3.909891 s / 3.777640–4.033835 s; global is 4.093578 s / 3.900782–4.311411 s, ratio **1.046980**. Cumulative ratio is **1.007759**. The base group alone is 1.05680 and repeat1 is 1.07717; selecting only repeat2 (1.00730) would be misleading. This pooled timing result does not erase its low sampling coverage.
+
+There are 14 zero-call global samples among 44 matrix samples, including both ring-slack samples. Every matrix global emergency and degradation counter is zero. Both independent recovery diagnostics fail to demonstrate recovery: short has zero calls, zero restoration and wave0; funded has 5064 calls, zero restoration and wave1. Neither has kind6 restoration events or controller overflow, so missing event capture does not explain the absence of proof. Local functional recovery success is preserved separately and does not substitute for these hardware observations.
+
+The worst whole-interval mean is iallreduce-critical, 1.12574. Native samples are 6.877873/7.065434 s and global 8.517381/7.179202 s. Global G0 main is 4.183878 s versus native 3.029311/3.076828 s; global G1 main is 3.036323 s. G0 profile/control sums are 0.007976/0.143065 s, while rank0 finalization includes CSV 183.919 ms, release 140.407 ms and settlement 2.324 ms. These observations expose phase variability and reporting costs but do not identify the exact cause of the roughly one-second phase outlier without event evidence.
+
+Final coordinator spent exceeds reported budget in 20 of 44 matrix global samples and one of 20 funded global samples. Ring-rotating G1 is 0.321826/0.158367 s despite zero selected calls. Coordinator cost continues to include summed actual per-rank control costs; wave span remains diagnostic and is not substituted or discounted. The records therefore establish neither a universal ledger ceiling nor a universal measured slowdown ceiling.
+
+Verified matrix archive SHA256 is `b0cdeb486a131a2fb4445dfa4d1636d1b04ea1fa18bbcff3540ad8ae2a40f938`; actual matrix library SHA256 is `2b70c2f8eddf560f9a7b4ccba1d540a8c3e266f91d0f8dbfee71141ea2df3664`. Source remains exact 5e100d0 archive above. Compare paired arms within each partition; do not pool PVC matrix and SPR funded timing samples.
+
+Reproduce the complete strict analyses with:
+
+```sh
+python3 benchmarks/mpi_rank_budget/global_analyze.py /tmp/peak-global-final-matrix-results/results --set matrix22 --require-final-members --require-diagnostics > /tmp/peak-global-final-matrix-summary.json
+python3 benchmarks/mpi_rank_budget/global_analyze.py /tmp/peak-global-final-funded-results/results --set funded --require-final-members > /tmp/peak-global-final-funded-summary.json
+```
+
+## Subsequent control-escrow correction (hardware validation pending)
+
+After preserving the complete 5e100d0 results, a separate ledger defect was
+identified: old spent included prepaid control escrow and retained that value
+through a high-water maximum. A 3 ms actual control cost with an unsettled 3 ms
+prepayment could therefore report 6 ms; after the 3 ms settlement watermark
+arrived, the retained spent could remain 6 ms. This permanently counted the same
+control work twice and could suppress later grants and recovery.
+
+The correction under separate validation keeps spent based on actual cost and
+holds unsettled control prepayment in the global reserved balance, where it can
+be released when actual-cost settlement is proven. Local reservation and whole
+grant rules remain unchanged; there is no wave-span discount. This is a ledger
+correction, not a retroactive alteration of any 5e100d0 measurements or proof of
+meeting the 5% target. Fresh local gates and a new exact-source hardware fixture
+are required before assessing its effect.
+
+A separate targeted fixture is prepared in
+`/tmp/peak-global-budget-escrow-targeted-20261028`: bcast-rotating,
+barrier-critical, barrier-aligned, funded-concurrent-allreduce-rotating and
+iallreduce-critical, each six matched arms, plus the two original recovery
+diagnostics (32 launches). Work, 16 targets, warmup, epoch/call counts, output
+locations and launcher/entry receipts remain unchanged. At preparation, execution was guarded until the approved commit was frozen; the submitted exact source is recorded below. Analyze it with
+`--set escrow_targeted --require-final-members --require-diagnostics`; no new
+performance pass is asserted here.
+
+The separate escrow fixture is submitted as job **3655082**, frozen at exact commit
+`dd1d7e961f39efbb2051a0d49337ce2e3da5b246`. Its source archive SHA256 is
+`b1312e8210925a694ddc2c7e37a22a42b600f2e326efbfabc5b65751c6425ebe`,
+input-manifest SHA256 is
+`23e5bf68c864e8bd29f9490fb40789048658b81669a9fa3230a290f52ec87c37`.
+All 153 inventoried files match the commit, including `test_control_escrow.c`.
+This submission tests the reserved-balance correction separately; the 194-run
+5e100d0 outcome above remains unchanged.

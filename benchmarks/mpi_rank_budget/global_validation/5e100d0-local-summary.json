@@ -1,0 +1,250 @@
+{
+  "production_commit": "5e100d0",
+  "current_commit": "8db89087f1590bf61592040ff393263e9e752298",
+  "host": "OMEN",
+  "files_sha256": {
+    "src/general_listener.c": "2e5f879d16792e8d10ed612f830fd043b00fb3c04159e2028719b4fc357472cb",
+    "include/general_listener.h": "0a0c5d4d03873c5eec5479c07f9ba954f9b01e9ac3141bcb30cce96155bb8744",
+    "include/internal/general_listener/global_admission.h": "0f46d49d6f5da705bdd3f89403055a4c3971733cc3528928d6a2fe444cc296c3",
+    "src/mpi_interceptor.c": "98eb877ead5a1dd6033941faeb351884ee219f584591466506ee40bb9bc9d720",
+    "src/peak.c": "91f275c45d58d1fc48db0ba147ca039e3be807499e70f5979387693cf5f8ccb0",
+    "src/global_budget.c": "96c7a28f97dd9b81eb85414a6cb022d9ff1b2c8e29ead86ae0a231e085438ca4",
+    "include/internal/global_budget.h": "6626908a2018a5fbacc7c21a7f76acb1efe96de9780a77248ac9a1cbf5495b01",
+    "test/global_budget/mpi_lifecycle.c": "0590aae5a3b9c263fe7264f4017573bfd1e5d66670ad95b88799c2552d49cf3b",
+    "test/global_budget/run_mpi_lifecycle.py": "43605f227a70646c6bbb909fc08950742d36fc2fc774299a7f965c85f4fcee41",
+    "docs/heartbeat.md": "ede472481fcd4cd377b42501336756ff10fae19c2de414e63b71d5ad534879f1",
+    "build-fast-dispatch/src/libpeak.so": "808cbd067af6023c3db3c4fb25c5492128100ee7804320d73868a39f6d779e93"
+  },
+  "actual_mpi": {
+    "recovery": {
+      "receipt_dir": "/tmp/peak-mpi-recovery-808cbd067af6-t912q65z",
+      "original_receipt_sha256": "06c5f6e80f6c042d251f1d651aaf0ad28a0a52a3de85ec4e39109db53b16c1b0",
+      "latest_classification": "/tmp/peak-mpi-recovery-808cbd067af6-t912q65z/classification-1793223357461216789.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "mode-specific functional checks",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.353303092,
+          "budget_seconds": 0.376614701,
+          "wave": 2,
+          "root_completed_wave": 2,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=16 first_local_attach_count=0 initial_unexposed=0"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.353303092,
+          "budget_seconds": 0.376614701,
+          "wave": 2,
+          "root_completed_wave": 2,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=16 first_local_attach_count=0 initial_unexposed=0"
+        }
+      ]
+    },
+    "unfunded": {
+      "receipt_dir": "/tmp/peak-mpi-unfunded-808cbd067af6-xyg8cb6t",
+      "original_receipt_sha256": "77b3e04e9bdf08e7e7f111f61c15fba9a547e73ac142f7ec0d4ea4ce9e167fd5",
+      "latest_classification": "/tmp/peak-mpi-unfunded-808cbd067af6-xyg8cb6t/classification-1793223357488407793.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "mode-specific functional checks",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.0520763609,
+          "budget_seconds": 1.27213921e-10,
+          "wave": 0,
+          "root_completed_wave": 0,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=0 first_local_attach_count=0 initial_unexposed=1"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.0520763609,
+          "budget_seconds": 1.27213921e-10,
+          "wave": 0,
+          "root_completed_wave": 0,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=0 first_local_attach_count=0 initial_unexposed=1"
+        }
+      ]
+    },
+    "initial_once": {
+      "receipt_dir": "/tmp/peak-mpi-initial-once-808cbd067af6-klic1fqv",
+      "original_receipt_sha256": "607a6816dd7ef1e159c01006d07f6200dc1e283a2d16c0fccb5e45a3f4baf24a",
+      "latest_classification": "/tmp/peak-mpi-initial-once-808cbd067af6-klic1fqv/classification-1793223357516523296.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "mode-specific functional checks",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.102817036,
+          "budget_seconds": 0.376392964,
+          "wave": 1,
+          "root_completed_wave": 1,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=16 first_local_attach_count=0 initial_unexposed=0"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.102817036,
+          "budget_seconds": 0.376392964,
+          "wave": 1,
+          "root_completed_wave": 1,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=16 first_local_attach_count=0 initial_unexposed=0"
+        }
+      ]
+    },
+    "fallback": {
+      "receipt_dir": "/tmp/peak-mpi-fallback-808cbd067af6-6gdiqjuw",
+      "original_receipt_sha256": "47739e6c35da7e7bd08d69fdf6d9e4adf9fb881397388f34f898d18f8a6a93ef",
+      "latest_classification": "/tmp/peak-mpi-fallback-808cbd067af6-6gdiqjuw/classification-1793223357544436452.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "mode-specific functional checks",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 0,
+          "runtime_degraded_samples": 321,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 5.295e-05,
+          "budget_seconds": 0.00119066257,
+          "wave": 0,
+          "root_completed_wave": 0,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=0 first_local_attach_count=16 initial_unexposed=0"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 0,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 5.295e-05,
+          "budget_seconds": 0.00119066257,
+          "wave": 0,
+          "root_completed_wave": 0,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=0 first_local_attach_count=16 initial_unexposed=0"
+        }
+      ]
+    },
+    "multiwindow": {
+      "receipt_dir": "/tmp/peak-mpi-multiwindow-808cbd067af6-uw1nc2iu",
+      "original_receipt_sha256": "7a44840d2138d6f66b1469213dae6284007f97755c0755f4a6e3bf602f8b1363",
+      "latest_classification": "/tmp/peak-mpi-multiwindow-808cbd067af6-uw1nc2iu/classification-1793223357574159825.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "mode-specific functional checks",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.332505306,
+          "budget_seconds": 0.376413052,
+          "wave": 3,
+          "root_completed_wave": 3,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=80 first_local_attach_count=0 initial_unexposed=0"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.332505306,
+          "budget_seconds": 0.376413052,
+          "wave": 3,
+          "root_completed_wave": 3,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=80 first_local_attach_count=0 initial_unexposed=0"
+        }
+      ]
+    },
+    "skew": {
+      "receipt_dir": "/tmp/peak-mpi-skew-808cbd067af6-rxdx1l0s",
+      "original_receipt_sha256": "62bfa84495642d45f2cc6e7c0ca3698df2e613301ce16703a2b03ad33d965d74",
+      "latest_classification": "/tmp/peak-mpi-skew-808cbd067af6-rxdx1l0s/classification-1793223357602168368.json",
+      "latest_validator_replay_pass": true,
+      "mode_scope": "liveness/oracle/cohort; fallback diagnostic, strict recovery separate",
+      "ranks": [
+        {
+          "rank": 0,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.191081387,
+          "budget_seconds": 0.211603443,
+          "wave": 2,
+          "root_completed_wave": 2,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=0 first_local_attach_count=0 initial_unexposed=1"
+        },
+        {
+          "rank": 1,
+          "emergency_fallback_count": 0,
+          "grace_used_seconds": 0.0005,
+          "shutdown_confirmed": 1,
+          "runtime_degraded_samples": 0,
+          "invalid_accounting_samples": 0,
+          "global_spent_seconds": 0.191081387,
+          "budget_seconds": 0.211603443,
+          "wave": 2,
+          "root_completed_wave": 2,
+          "initial_admission": "policy=fund-before-attach-post-init bootstrap_finished=1 first_paid_attach_count=16 first_local_attach_count=0 initial_unexposed=0"
+        }
+      ]
+    }
+  },
+  "ctest": {
+    "passed": 59,
+    "failed": 0,
+    "seconds": 61.96,
+    "log": "/tmp/peak-global-physical-59CTest.log",
+    "all_protocol_targets_freshly_rebuilt": true
+  },
+  "static": "/tmp/peak-global-physical-static.log",
+  "diff_check_pass": true,
+  "performance_assertion": false,
+  "preserved_prior_failures": {
+    "v2_skew_original_auxiliary_scope": "/tmp/peak-mpi-skew-1b151e1ced7c-wzwy04ot",
+    "physical_multiwindow_original_trace_numeric_assertion": "/tmp/peak-mpi-multiwindow-808cbd067af6-uw1nc2iu/receipt.json"
+  },
+  "notes": [
+    "No production edits after 5e100d0. Latest runner scope is test-only commit 8db8908.",
+    "Physical API clears recovery_target before kind7. Multiwindow classification explicitly sets goal_exact_value_proved=false when using cleared target evidence, not a fabricated numeric goal.",
+    "All latest actual MPI cases have raw emergency count zero. Failure-injection fallback intentionally reports shutdown_confirmed=0.",
+    "Historical failures remain preserved; later classification files do not rewrite receipt.json."
+  ]
+}
