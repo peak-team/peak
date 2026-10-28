@@ -5,6 +5,7 @@
 #include "internal/exec_raw_syscall.h"
 #include "internal/general_listener_internal.h"
 #include "internal/general_listener/attach_policy.h"
+#include "internal/general_listener/burst_budget.h"
 #include "internal/general_listener/exec_checkpoint_writer.h"
 #include "internal/general_listener/report_formatter.h"
 #include "internal/general_listener/report_maxima.h"
@@ -75,11 +76,13 @@ extern int peak_exec_checkpoint_enabled_at_startup(void) __attribute__((weak));
 #define PEAK_CALLBACK_HOOK_STATE_MASK 0x0fULL
 #define PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT 0x10ULL
 #define PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT 0x20ULL
+#define PEAK_CALLBACK_BURST_REQUEST_BIT 0x40ULL
 #define PEAK_CALLBACK_HOOK_CONTROL_LOW_MASK \
     (PEAK_CALLBACK_HOOK_STATE_MASK | \
      PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT | \
-     PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT)
-#define PEAK_CALLBACK_HOOK_GENERATION_INCREMENT 0x40ULL
+     PEAK_CALLBACK_INITIAL_DETACH_COUNT_CROSSING_BIT | \
+     PEAK_CALLBACK_BURST_REQUEST_BIT)
+#define PEAK_CALLBACK_HOOK_GENERATION_INCREMENT 0x80ULL
 
 _Static_assert(PEAK_HOOK_SHUTDOWN <= PEAK_CALLBACK_HOOK_STATE_MASK,
                "callback hook state must fit in its packed control word");
@@ -104,6 +107,7 @@ typedef enum {
     PEAK_HOOK_REQUEST_SOURCE_NONE = 0,
     PEAK_HOOK_REQUEST_SOURCE_API,
     PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
+    PEAK_HOOK_REQUEST_SOURCE_MPI_BURST,
     PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT,
     PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT
 } PeakHookRequestSource;
@@ -190,6 +194,10 @@ extern unsigned long long sig_cont_wait_interval;
 extern unsigned long long sig_stop_ack_wait_interval;
 extern unsigned int heartbeat_time;
 static gulong peak_detach_count = G_MAXULONG;
+/* Frozen before callback activation. */
+static gboolean peak_mpi_burst_guard_enabled;
+static double peak_effective_rank_target;
+static double peak_mpi_burst_limit;
 static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 _Atomic gboolean heartbeat_running = true;
@@ -1153,6 +1161,16 @@ void pthread_pause_enable(void);
 void pthread_pause_disable(void);
 
 #define PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE 64
+_Static_assert(sizeof(PeakBurstBudgetSlot) <= 24,
+               "burst state must fit unused callback cache-line tail");
+
+static inline PeakBurstBudgetSlot*
+peak_general_listener_burst_slot(PeakGeneralListener* listener, size_t thread_id)
+{
+    return (PeakBurstBudgetSlot*)((guint8*)listener->fast_active +
+        thread_id * PEAK_GENERAL_LISTENER_CACHE_LINE_SIZE + 40);
+}
+
 
 static inline gulong*
 peak_general_listener_num_calls_slot(PeakGeneralListener* listener,
@@ -1851,6 +1869,8 @@ peak_hook_request_source_string(PeakHookRequestSource source)
             return "api";
         case PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT:
             return "detach-count";
+        case PEAK_HOOK_REQUEST_SOURCE_MPI_BURST:
+            return "mpi-burst";
         case PEAK_HOOK_REQUEST_SOURCE_PER_TARGET_HEARTBEAT:
             return "per-target-heartbeat";
         case PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT:
@@ -4310,20 +4330,25 @@ peak_general_controller_process_pending_batch_unlocked(void)
 }
 
 static gboolean
-peak_general_listener_take_detach_count_request(
-    PeakGeneralListener* listener)
+peak_general_listener_take_callback_request(
+    PeakGeneralListener* listener, PeakHookRequestSource* source)
 {
     unsigned long long control =
         atomic_load_explicit(&listener->callback_hook_control,
                              memory_order_acquire);
     if (peak_general_listener_callback_hook_state(control) !=
             PEAK_HOOK_ATTACHED ||
-        (control & PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT) == 0) {
+        (control & (PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT |
+                    PEAK_CALLBACK_BURST_REQUEST_BIT)) == 0) {
         return FALSE;
     }
 
+    *source = (control & PEAK_CALLBACK_BURST_REQUEST_BIT) != 0
+        ? PEAK_HOOK_REQUEST_SOURCE_MPI_BURST
+        : PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT;
     unsigned long long desired =
-        control & ~PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT;
+        control & ~(PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT |
+                    PEAK_CALLBACK_BURST_REQUEST_BIT);
     return atomic_compare_exchange_strong_explicit(
         &listener->callback_hook_control,
         &control,
@@ -4331,6 +4356,15 @@ peak_general_listener_take_detach_count_request(
         memory_order_acq_rel,
         memory_order_relaxed);
 }
+
+#ifdef PEAK_ENABLE_TEST_HOOKS
+static gboolean
+peak_general_listener_take_detach_count_request(PeakGeneralListener* listener)
+{
+    PeakHookRequestSource source;
+    return peak_general_listener_take_callback_request(listener, &source);
+}
+#endif
 
 static void
 peak_general_controller_publish_detach_count_requests_unlocked(void)
@@ -4346,7 +4380,8 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         PeakGeneralListener* listener =
             PEAKGENERAL_LISTENER(array_listener[hook_id]);
-        if (!peak_general_listener_take_detach_count_request(listener)) {
+        PeakHookRequestSource source;
+        if (!peak_general_listener_take_callback_request(listener, &source)) {
             continue;
         }
 
@@ -4363,7 +4398,7 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
 
         (void)peak_general_listener_request_detach_with_context_unlocked(
             hook_id,
-            PEAK_HOOK_REQUEST_SOURCE_DETACH_COUNT,
+            source,
             total_num_calls,
             0.0,
             0.0,
@@ -4745,6 +4780,7 @@ peak_general_listener_retire_listener_slot(PeakGeneralListener* listener,
     *peak_general_listener_exclusive_time_slot(listener, slot) = 0.0;
     *peak_general_listener_max_time_slot(listener, slot) = 0.0f;
     *peak_general_listener_min_time_slot(listener, slot) = 0.0f;
+    *peak_general_listener_burst_slot(listener, slot) = (PeakBurstBudgetSlot){0};
     gboolean checkpoint_reset_safe = TRUE;
     if (listener->checkpoint_shadow != NULL) {
         PeakGeneralListenerCheckpointShadow* shadow =
@@ -5298,7 +5334,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 MAX(projected_attached_recent_sum,
                     projected_attached_lifetime_sum);
             if (projected_global_overhead >
-                global_target_ratio * peak_global_detach_factor) {
+                peak_effective_rank_target * peak_global_detach_factor) {
                 size_t n_attached = 0;
                 pthread_mutex_lock(&lock);
                 for (size_t i = 0; i < heartbeat_capacity; i++) {
@@ -5333,7 +5369,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 for (size_t k = 0; k < n_attached; k++) {
                     size_t idx = entries[k].index;
 
-                    if (reduced_global_overhead <= global_target_ratio) {
+                    if (reduced_global_overhead <= peak_effective_rank_target) {
                         break;
                     }
                     if (entries[k].ratio <= 0.0) {
@@ -5423,7 +5459,7 @@ void* peak_heartbeat_monitor(void* arg) {
                 reattach_accounting_coherent &&
                 (enable_per_target_heartbeat || enable_global_heartbeat) &&
                 peak_general_listener_positive_finite(total_execution_time) &&
-                peak_general_listener_nonnegative_finite(global_target_ratio) &&
+                peak_general_listener_nonnegative_finite(peak_effective_rank_target) &&
                 peak_general_listener_nonnegative_finite(
                     peak_global_reattach_factor) &&
                 peak_general_listener_nonnegative_finite(
@@ -5446,10 +5482,10 @@ void* peak_heartbeat_monitor(void* arg) {
                     &reattach_spent_seconds) &&
                 peak_general_listener_multiply_nonnegative_finite(
                     peak_global_reattach_factor,
-                    global_target_ratio,
+                    peak_effective_rank_target,
                     &reattach_gate_ratio) &&
                 peak_general_listener_multiply_nonnegative_finite(
-                    global_target_ratio,
+                    peak_effective_rank_target,
                     total_execution_time,
                     &headroom_seconds) &&
                 peak_general_listener_subtract_nonnegative_finite(
@@ -5695,8 +5731,8 @@ void* peak_heartbeat_monitor(void* arg) {
         prev_global_time     = now;
 
         /* Normalized amount by which overhead exceeds the global target. */
-        double err = (global_target_ratio > 0.0)
-                         ? (profile_global_overhead / global_target_ratio - 1.0)
+        double err = (peak_effective_rank_target > 0.0)
+                         ? (profile_global_overhead / peak_effective_rank_target - 1.0)
                          : 0.0;
         if (err < 0.0) err = 0.0;
 
@@ -5998,6 +6034,44 @@ peak_general_listener_monotonic_ns(void)
            (guint64)now.tv_nsec;
 }
 
+/* Each hook/thread owns its cache-line tail. Only every 64th call reads
+ * lifecycle state and CPU time. Never acquire locks or mutate Gum here. */
+static inline __attribute__((always_inline)) gboolean
+peak_general_listener_try_publish_burst_request(PeakGeneralListener* listener,
+                                                size_t thread_id)
+{
+    if (G_LIKELY(!peak_mpi_burst_guard_enabled)) {
+        return FALSE;
+    }
+    PeakBurstBudgetSlot* slot =
+        peak_general_listener_burst_slot(listener, thread_id);
+    if (!peak_burst_budget_due(slot)) {
+        return FALSE;
+    }
+    unsigned long long control = atomic_load_explicit(
+        &listener->callback_hook_control, memory_order_acquire);
+    if (peak_general_listener_callback_hook_state(control) != PEAK_HOOK_ATTACHED ||
+        (control & (PEAK_CALLBACK_DETACH_COUNT_REQUEST_BIT |
+                    PEAK_CALLBACK_BURST_REQUEST_BIT)) != 0) {
+        slot->seeded = false;
+        return FALSE;
+    }
+    unsigned long long cpu_ns;
+    if (!peak_general_listener_thread_cpu_ns(&cpu_ns)) {
+        slot->seeded = false;
+        return FALSE;
+    }
+    if (!peak_burst_budget_sample(slot, control, cpu_ns,
+                                 peak_general_overhead, peak_mpi_burst_limit)) {
+        return FALSE;
+    }
+    unsigned long long desired = control | PEAK_CALLBACK_BURST_REQUEST_BIT;
+    /* One snapshot CAS: a delayed sample cannot request a later generation. */
+    return atomic_compare_exchange_strong_explicit(
+        &listener->callback_hook_control, &control, desired,
+        memory_order_acq_rel, memory_order_relaxed);
+}
+
 static inline __attribute__((always_inline)) gboolean
 peak_general_listener_try_publish_detach_count_request(
     PeakGeneralListener* listener,
@@ -6099,7 +6173,8 @@ peak_general_listener_on_enter(GumInvocationListener* listener,
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
-            current_num_calls))) {
+            current_num_calls)) ||
+        G_UNLIKELY(peak_general_listener_try_publish_burst_request(self, index))) {
         peak_general_listener_controller_wake();
     }
 
@@ -6255,7 +6330,8 @@ peak_general_listener_fast_on_enter(gpointer user_data,
 
     if (G_UNLIKELY(peak_general_listener_try_publish_detach_count_request(
             self,
-            current_num_calls))) {
+            current_num_calls)) ||
+        G_UNLIKELY(peak_general_listener_try_publish_burst_request(self, index))) {
         peak_general_listener_controller_wake();
     }
 
@@ -7202,6 +7278,12 @@ peak_general_listener_attach()
      * allow an early caller to step over the final threshold permanently.
      */
     peak_general_listener_configure_detach_threshold();
+    peak_effective_rank_target =
+        peak_general_listener_rank_budget(global_target_ratio);
+    peak_mpi_burst_limit = peak_effective_rank_target * peak_global_detach_factor;
+    peak_mpi_burst_guard_enabled =
+        peak_general_listener_world_mpi_ranks() > 1 &&
+        heartbeat_time > 0 && enable_global_heartbeat;
     gboolean startup_attach_can_skip_stop =
         peak_general_listener_startup_attach_can_skip_stop();
     /* Resolver bookkeeping is optional: pre-mutation allocation failure must
@@ -7651,6 +7733,41 @@ peak_general_listener_test_detach_count_latch_state_gate(void)
         PEAK_HOOK_ATTACHED);
     if (peak_general_listener_take_detach_count_request(&listener)) {
         result = 9;
+    }
+
+    /* The burst bit shares the exact same lifecycle CAS domain. An old CPU
+     * sample must fail after reattach, and state publication clears pending
+     * burst requests just as it clears exact-count requests. */
+    if (result == 0) {
+        PeakHookRequestSource source;
+        unsigned long long expected = stale_attached;
+        unsigned long long desired = expected | PEAK_CALLBACK_BURST_REQUEST_BIT;
+        if (atomic_compare_exchange_strong_explicit(
+                &listener.callback_hook_control, &expected, desired,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            result = 10;
+            goto out;
+        }
+        expected = atomic_load_explicit(&listener.callback_hook_control,
+                                         memory_order_acquire);
+        desired = expected | PEAK_CALLBACK_BURST_REQUEST_BIT;
+        if (!atomic_compare_exchange_strong_explicit(
+                &listener.callback_hook_control, &expected, desired,
+                memory_order_acq_rel, memory_order_relaxed) ||
+            !peak_general_listener_take_callback_request(&listener, &source) ||
+            source != PEAK_HOOK_REQUEST_SOURCE_MPI_BURST) {
+            result = 11;
+            goto out;
+        }
+        atomic_store_explicit(&listener.callback_hook_control, desired,
+                              memory_order_release);
+        peak_general_listener_publish_callback_hook_state(
+            &listener, PEAK_HOOK_DETACHED);
+        peak_general_listener_publish_callback_hook_state(
+            &listener, PEAK_HOOK_ATTACHED);
+        if (peak_general_listener_take_callback_request(&listener, &source)) {
+            result = 12;
+        }
     }
 
 out:
@@ -8297,6 +8414,20 @@ peak_general_listener_report_format_options(
     return options;
 }
 
+static void
+peak_general_listener_write_budget_policy(const PeakReportFormatOptions* options)
+{
+    if (!options->print_text) {
+        return;
+    }
+    peak_log_report("[peak] MPI budget risk policy: configured_job_target=%.9g effective_rank_target=%.9g world_size=%u source=%s burst_guard=%s stride=%u\n",
+        (double)global_target_ratio, peak_effective_rank_target,
+        peak_general_listener_world_mpi_ranks(),
+        peak_general_listener_world_mpi_source(),
+        peak_mpi_burst_guard_enabled ? "enabled" : "disabled",
+        PEAK_BURST_BUDGET_STRIDE);
+}
+
 static gboolean
 peak_general_listener_write_report(PeakReportSnapshot* snapshot,
                                    gboolean sanitize,
@@ -8323,6 +8454,7 @@ peak_general_listener_write_report(PeakReportSnapshot* snapshot,
     } else {
         csv_succeeded = peak_report_formatter_write_csv(snapshot);
     }
+    peak_general_listener_write_budget_policy(&options);
     text_succeeded = peak_report_formatter_write_text(snapshot, &options);
     peak_general_listener_release_report_names();
     return csv_succeeded && text_succeeded;
@@ -8428,6 +8560,7 @@ peak_general_listener_run_socket_report(
         peak_report_snapshot_destroy(aggregate);
         return FALSE;
     }
+    peak_general_listener_write_budget_policy(&options);
     if (!peak_report_formatter_write_text(aggregate, &options)) {
         peak_socket_report_transport_abort(session);
         peak_general_listener_rollback_report_marker_swap(&marker_swap);

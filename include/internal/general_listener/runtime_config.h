@@ -81,6 +81,11 @@ bool peak_general_listener_parse_detach_count_override(
  */
 void peak_general_listener_runtime_configure(void);
 
+/** Frozen, validated launcher world metadata; unknown metadata uses one. */
+unsigned int peak_general_listener_world_mpi_ranks(void);
+const char* peak_general_listener_world_mpi_source(void);
+double peak_general_listener_rank_budget(double configured_job_budget);
+
 /** Returns the first valid launcher-provided local MPI rank count, or one. */
 unsigned int peak_general_listener_local_mpi_ranks(void);
 

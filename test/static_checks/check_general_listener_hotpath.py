@@ -72,7 +72,7 @@ def main():
         "peak_general_listener_first_attached_generation_is_adjacent",
     )
     threshold_take = function_body(
-        source, "peak_general_listener_take_detach_count_request"
+        source, "peak_general_listener_take_callback_request"
     )
     state_publish = function_body(
         source, "peak_general_controller_set_state_unlocked"
@@ -273,6 +273,21 @@ def main():
         "callback state, initial crossing, and request must share an "
         "always-lock-free generation-tagged atomic word",
     )
+    burst_publish = function_body(
+        source, "peak_general_listener_try_publish_burst_request"
+    )
+    require(
+        "peak_general_listener_try_publish_burst_request(self, index)" in generic_enter
+        and "peak_general_listener_try_publish_burst_request(self, index)" in enter
+        and burst_publish.index("peak_burst_budget_due") <
+            burst_publish.index("atomic_load_explicit")
+        and "PEAK_CALLBACK_BURST_REQUEST_BIT" in threshold_take
+        and "atomic_compare_exchange_strong_explicit" in burst_publish,
+        "generic/direct burst guards must amortize lifecycle reads and share the generation CAS",
+    )
+    for token in ("pthread_mutex", "MPI_", "for (", "malloc(", "gum_interceptor_"):
+        require(token not in burst_publish,
+                "burst callbacks must not lock, scan, allocate, call MPI or mutate Gum")
     for token in (
         "pthread_mutex",
         "pthread_cond",
@@ -341,7 +356,7 @@ def main():
         "controller stop must publish running=false before its lock-free wake",
     )
     require(
-        "peak_general_listener_take_detach_count_request" in publish
+        "peak_general_listener_take_callback_request" in publish
         and "peak_general_listener_request_detach_with_context_unlocked" in publish,
         "controller must consume the CAS latch under its existing request path",
     )

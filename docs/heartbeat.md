@@ -172,19 +172,91 @@ profile_global_overhead = max(attached_recent_sum, attached_lifetime_sum)
 ```
 
 If `profile_global_overhead` exceeds
-`global_target_ratio * peak_global_detach_factor`, attached candidates are
+`effective_rank_budget * peak_global_detach_factor`, attached candidates are
 ranked by `max(recent_rate, lifetime_ratio)`, then by recent rate and index.
 After each accepted detach request, the heartbeat debits the local projected
 recent and lifetime sums and stops once the projected global overhead is at or
-below `global_target_ratio`.
+below `effective_rank_budget`.
 
 The request context records the call count, lifetime ratio, global profile
 pressure, elapsed time, and recent rate that caused the request. It does not
 perform the mutation. The controller owns mutation ordering.
 
+## MPI Job Budget and Callback Burst Protection
+
+For a verified launcher world size `W`, the configured
+`PEAK_GLOBAL_OVERHEAD_RATIO` is treated as a job risk budget. The effective
+rank budget is `PEAK_GLOBAL_OVERHEAD_RATIO / W`. Global heartbeat detach,
+reattach admission/headroom, and adaptive heartbeat error all use that same
+rank budget. The per-target ratio remains a separate hook policy.
+
+World metadata is frozen before callbacks start, using the same validated
+rank/size resolver as reporting: complete PMI, PMIX, OMPI, MV2 and Intel MPI
+pairs must agree; Slurm is the fallback only when no complete MPI pair exists.
+Missing, malformed or contradictory metadata selects world size one with
+source `unverified`. This does not independently prove MPI topology. A verified
+single rank preserves the existing policy and has no burst guard.
+
+When `W > 1`, heartbeat is enabled, and global heartbeat policy is enabled,
+both generic and direct callbacks additionally check short CPU blocks. Every
+hook/thread owns 24 bytes in the unused tail of its existing statistics cache
+line, so hooks do not collide in a bounded cache and calls do not add a shared
+atomic counter or lock. Every 64th invocation reads its lifecycle generation
+and `CLOCK_THREAD_CPUTIME_ID`. The first block seeds a baseline; subsequent
+blocks compare:
+
+```text
+64 * calibrated_wall_cost_per_call >
+    effective_rank_budget * PEAK_GLOBAL_DETACH_FACTOR * block_thread_cpu_seconds
+```
+
+Each sample replaces the previous baseline. A long warmup cannot leave credit
+for the next short block; MPI blocking and scheduler waiting do not create CPU
+credit. Useful CPU computation between calls increases the block denominator,
+so a function called infrequently around long computations remains attached.
+The denominator includes all work done by this thread between that hook's
+samples, including other hooks. It is not an aggregate measurement of every
+thread's CPU time. The heartbeat continues to provide the cross-hook/rank-local
+aggregate check.
+
+The numerator is a calibrated **wall** callback cost. This is an estimated
+callback-cost/active-thread-CPU risk signal, not a measurement of actual CPU
+cost or MPI application slowdown. Calibration preemption can conservatively
+increase the estimate. CPU clock failure or a non-increasing reading reseeds
+without requesting detach; the normal heartbeat remains the fallback.
+
+A burst request uses a dedicated bit in the existing packed lifecycle word.
+One compare-and-swap publishes only against the sampled ATTACHED generation,
+then wakes the controller. The callback does not patch code, scan global slots,
+or call MPI. The controller records `mpi-burst` as the request source and uses
+its existing physical detach protocol. Generation changes reseed the window;
+thread retirement clears it before the statistics slot can be reused. An
+independent 64-call block therefore costs at most two blocks before its first
+pressure decision, followed by controller scheduling and safe mutation delay.
+This protection bypasses the heartbeat's initial observation-time gate.
+
+`PEAK_HEARTBEAT_INTERVAL=0` or `PEAK_ENABLE_GLOBAL_HEARTBEAT=0` disables the
+burst guard. A configured zero global ratio retains zero tolerance for positive
+estimated cost; it does not disable policy. Final text output identifies
+`configured_job_target`, `effective_rank_target`, `world_size`, metadata
+`source`, `burst_guard`, and `stride`. This follows existing text-output
+selection, including aggregate-root output and `PEAK_TEXT_OUTPUT` overrides.
+
+The sum of per-rank estimates is a more conservative MPI risk model than the
+maximum rank's cumulative ratio: different ranks may incur overhead on
+successive parts of the application's critical path. Budget division and short
+blocks reduce that failure mode without background MPI communication. They
+cannot guarantee a hard application slowdown bound. Calibration error,
+communication/scheduling effects, the first 128 calls of a generation, safe
+mutation latency, and many individually cold hooks remain outside such a
+proof. An application with a very short critical phase can still finish that
+phase before physical detach completes.
+
 ## Reattach Risk Scaling
 
-Node-local rank scaling is a policy input only for reattach admission. The same
+Node-local rank scaling is an additional conservative policy input only for
+reattach admission. It remains in place after world-budget division to account
+for node contention: control cost itself is not multiplied by world size. The same
 scaled value is also emitted as a reporting diagnostic; it does not affect
 detach decisions or hook state.
 
@@ -213,8 +285,9 @@ reattach_spent_seconds =
   profile_spent_seconds + reattach_control_risk_seconds
 reattach_risk_spent_ratio =
   reattach_spent_seconds / total_execution_time
+effective_rank_budget = global_target_ratio / verified_world_size
 reattach_gate_ratio =
-  peak_global_reattach_factor * global_target_ratio
+  peak_global_reattach_factor * effective_rank_budget
 ```
 
 A reattach wave starts only when `reattach_risk_spent_ratio <=
@@ -284,7 +357,7 @@ Admission is expressed in seconds:
 
 ```text
 headroom_seconds =
-  global_target_ratio * total_execution_time
+  effective_rank_budget * total_execution_time
   - profile_spent_seconds
   - local_mpi_ranks * raw_control_spent_seconds
   - pending_reattach_future_leases
@@ -436,7 +509,7 @@ global_rate =
 ema_global_rate =
   hb_ema_a * global_rate + (1 - hb_ema_a) * previous_ema
 err =
-  max(profile_global_overhead / global_target_ratio - 1, 0)
+  max(profile_global_overhead / effective_rank_budget - 1, 0)
 scale =
   1 / (1 + hb_k_err * err + hb_k_rate * ema_global_rate)
 sleep_us =

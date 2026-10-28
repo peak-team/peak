@@ -380,6 +380,12 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION
                 "mpi_teardown_guard_test_ok success=11 failure_paths=10")
 
+    add_executable(test_burst_budget report/test_burst_budget.c)
+    target_include_directories(test_burst_budget PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_compile_options(test_burst_budget PRIVATE -UNDEBUG)
+    add_test(NAME test_burst_budget COMMAND test_burst_budget)
+    set_tests_properties(test_burst_budget PROPERTIES TIMEOUT 10)
+
     add_executable(test_runtime_config
         report/test_runtime_config.c
         ${PROJECT_SOURCE_DIR}/src/general_listener/runtime_config.c
@@ -671,6 +677,21 @@ if(BUILD_TESTING)
     add_subdirectory(exec_chain)
     add_subdirectory(detach_controller)
     add_subdirectory(detach_runtime)
+    if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        foreach(_burst_mode IN ITEMS generic fast)
+            foreach(_burst_policy IN ITEMS enabled heartbeat-off global-off single conflict)
+                add_test(NAME test_mpi_burst_budget_${_burst_mode}_${_burst_policy}
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_mpi_burst_budget_check.py
+                        --exe $<TARGET_FILE:test_mpi_burst_budget>
+                        --libpeak $<TARGET_FILE:peak>
+                        --mode ${_burst_mode} --policy ${_burst_policy})
+                set_tests_properties(test_mpi_burst_budget_${_burst_mode}_${_burst_policy}
+                    PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+            endforeach()
+        endforeach()
+    endif()
+
     add_subdirectory(dlopen_controller)
     add_subdirectory(symbol_resolution)
     add_subdirectory(jit)

@@ -45,6 +45,35 @@ clear_test_environment(void)
 }
 
 static int
+check_frozen_world_budget(void)
+{
+    clear_test_environment();
+    peak_general_listener_runtime_configure();
+    if (peak_general_listener_world_mpi_ranks() != 1 ||
+        strcmp(peak_general_listener_world_mpi_source(), "unverified") ||
+        peak_general_listener_rank_budget(.1) != .1) return 1;
+    setenv("PMI_RANK", "0", 1);
+    setenv("PMI_SIZE", "32", 1);
+    peak_general_listener_runtime_configure();
+    if (peak_general_listener_world_mpi_ranks() != 32 ||
+        strcmp(peak_general_listener_world_mpi_source(), "PMI_SIZE") ||
+        peak_general_listener_rank_budget(.1) != .1 / 32) return 1;
+    /* Snapshot is immutable until explicit reconfiguration. */
+    setenv("PMI_SIZE", "1", 1);
+    if (peak_general_listener_world_mpi_ranks() != 32) return 1;
+    peak_general_listener_runtime_configure();
+    if (peak_general_listener_world_mpi_ranks() != 1 ||
+        peak_general_listener_rank_budget(.1) != .1) return 1;
+    setenv("OMPI_COMM_WORLD_RANK", "0", 1);
+    setenv("OMPI_COMM_WORLD_SIZE", "32", 1);
+    peak_general_listener_runtime_configure();
+    if (peak_general_listener_world_mpi_ranks() != 1 ||
+        strcmp(peak_general_listener_world_mpi_source(), "unverified")) return 1;
+    clear_test_environment();
+    return 0;
+}
+
+static int
 check_truthy_values(void)
 {
     return peak_general_listener_env_value_truthy(NULL) ||
@@ -615,7 +644,7 @@ main(int argc, char** argv)
                    : 0;
     }
     clear_test_environment();
-    if (check_truthy_values() ||
+    if (check_frozen_world_budget() || check_truthy_values() ||
         check_detach_override()) {
         fputs("runtime_config_test_failed\n", stderr);
         return 1;
