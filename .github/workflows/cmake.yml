@@ -100,7 +100,7 @@ jobs:
     - name: Build
       run: >
         cmake --build ${{ github.workspace }}/build --parallel
-        --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config
+        --target peak peak_inspect_symbols peak_attach test_attach_fixture test_attach_config test_attach_unresponsive_agent
 
     - name: Verify Darwin bootstrap dependencies
       run: |
@@ -123,7 +123,7 @@ jobs:
       run: |
         set -o pipefail
         ctest --test-dir build --output-on-failure -V \
-          -R '^test_attach_(cli|config|runtime)$' 2>&1 | tee build/attach-ctest.log
+          -R '^test_attach_(cli|config|runtime|transport)$' 2>&1 | tee build/attach-ctest.log
         if grep -Fq 'Skipped' build/attach-ctest.log; then
           echo 'Attach runtime coverage was skipped; native injection is required.' >&2
           exit 1

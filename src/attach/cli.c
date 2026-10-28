@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <libproc.h>
 #include <mach-o/dyld.h>
 #endif
 #ifndef MSG_NOSIGNAL
@@ -25,6 +26,14 @@
 #endif
 
 extern char **environ;
+static void diagnostic_phase(const char *phase)
+{
+    const char *enabled = getenv("PEAK_ATTACH_DIAGNOSTICS");
+    if (enabled && !strcmp(enabled, "1")) {
+        fprintf(stderr, "peak-attach[%ld]: %s\n", (long)getpid(), phase);
+        fflush(stderr);
+    }
+}
 static gboolean string_equal(gconstpointer a, gconstpointer b)
 {
     return strcmp(a, b) == 0;
@@ -64,7 +73,7 @@ static gboolean transfer(int fd, void *data, size_t size, gboolean writing,
     }
     return TRUE;
 }
-static gboolean send_variant(int fd, GVariant *v)
+static gboolean send_variant(int fd, GVariant *v, gint64 deadline)
 {
     char *s = g_variant_print(v, TRUE);
     size_t size = strlen(s);
@@ -76,7 +85,7 @@ static gboolean send_variant(int fd, GVariant *v)
         return FALSE;
     }
     uint32_t n = htonl(size);
-    gint64 until = deadline_ms() + 5000;
+    gint64 until = MIN(deadline, deadline_ms() + 5000);
     gboolean ok = transfer(fd, &n, 4, TRUE, until) &&
                   transfer(fd, s, strlen(s), TRUE, until);
     g_free(s);
@@ -110,6 +119,15 @@ static GVariant *receive_variant(int fd, const GVariantType *type,
 }
 /* Core runs in an exec-created process group so an unresponsive backend can
  * be terminated without touching the profiled process or blocking this CLI. */
+#if defined(__APPLE__)
+typedef struct {
+    pid_t pid;
+    pid_t parent_pid;
+    uint64_t start_seconds;
+    uint64_t start_microseconds;
+    gboolean warned;
+} OwnedInjectorHelper;
+#endif
 typedef struct {
     pid_t pid;
     int error_fd;
@@ -118,7 +136,155 @@ typedef struct {
     gboolean leader_lost;
     char error[4096];
     size_t error_length;
+#if defined(__APPLE__)
+    OwnedInjectorHelper helpers[64];
+    size_t helper_count;
+    gboolean helper_scan_warned;
+#endif
 } InjectionWorker;
+
+#if defined(__APPLE__)
+/* Darwin Core helpers call setsid(), so process-group cleanup alone cannot
+ * contain them. Discover only this unreaped worker's direct children. */
+static void collect_worker_helpers(InjectionWorker *worker)
+{
+    if (worker->done || worker->pid <= 0)
+        return;
+    pid_t children[64];
+    errno = 0;
+    int count = proc_listchildpids(worker->pid, children, sizeof(children));
+    if (count < 0 || (!count && errno)) {
+        if (!worker->helper_scan_warned) {
+            fprintf(
+                stderr,
+                "peak-attach: cannot inspect injector helper ownership: %s\n",
+                strerror(errno));
+            worker->helper_scan_warned = TRUE;
+        }
+        return;
+    }
+    for (int i = 0; i < count && i < 64; ++i) {
+        struct proc_bsdinfo info;
+        errno = 0;
+        int received =
+            proc_pidinfo(children[i], PROC_PIDTBSDINFO, 1, &info, sizeof(info));
+        if (received != (int)sizeof(info)) {
+            if (errno && errno != ESRCH && !worker->helper_scan_warned) {
+                fprintf(
+                    stderr,
+                    "peak-attach: cannot inspect injector child identity: %s\n",
+                    strerror(errno));
+                worker->helper_scan_warned = TRUE;
+            }
+            continue;
+        }
+        if (info.pbi_pid != (uint32_t)children[i] ||
+            info.pbi_ppid != (uint32_t)worker->pid)
+            continue;
+        gboolean known = FALSE;
+        for (size_t j = 0; j < worker->helper_count; ++j) {
+            OwnedInjectorHelper *helper = &worker->helpers[j];
+            if (helper->pid == children[i] &&
+                helper->start_seconds == info.pbi_start_tvsec &&
+                helper->start_microseconds == info.pbi_start_tvusec) {
+                known = TRUE;
+                break;
+            }
+        }
+        if (!known && worker->helper_count < 64) {
+            worker->helpers[worker->helper_count++] = (OwnedInjectorHelper){
+                .pid = children[i],
+                .parent_pid = (pid_t)info.pbi_ppid,
+                .start_seconds = info.pbi_start_tvsec,
+                .start_microseconds = info.pbi_start_tvusec};
+            char phase[192];
+            snprintf(phase, sizeof(phase),
+                     "tracked injector child %ld parent %ld birth %llu.%06llu",
+                     (long)children[i], (long)worker->pid,
+                     (unsigned long long)info.pbi_start_tvsec,
+                     (unsigned long long)info.pbi_start_tvusec);
+            diagnostic_phase(phase);
+        }
+    }
+}
+
+static gboolean helper_identity(OwnedInjectorHelper *helper,
+                                struct proc_bsdinfo *info)
+{
+    errno = 0;
+    int size =
+        proc_pidinfo(helper->pid, PROC_PIDTBSDINFO, 1, info, sizeof(*info));
+    if (size != (int)sizeof(*info)) {
+        if (errno && errno != ESRCH && !helper->warned) {
+            fprintf(stderr,
+                    "peak-attach: cannot verify injector helper %ld: %s\n",
+                    (long)helper->pid, strerror(errno));
+            helper->warned = TRUE;
+        }
+        return FALSE;
+    }
+    return info->pbi_pid == (uint32_t)helper->pid &&
+           info->pbi_start_tvsec == helper->start_seconds &&
+           info->pbi_start_tvusec == helper->start_microseconds;
+}
+
+static gboolean worker_helpers_pending(InjectionWorker *worker)
+{
+    for (size_t i = 0; i < worker->helper_count; ++i) {
+        struct proc_bsdinfo info;
+        /* Darwin p_stat SZOMB=5: terminated children are left for Core to reap.
+         */
+        if (helper_identity(&worker->helpers[i], &info) && info.pbi_status != 5)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void signal_worker_helpers(InjectionWorker *worker, int signal_number)
+{
+    collect_worker_helpers(worker);
+    for (size_t i = 0; i < worker->helper_count; ++i) {
+        OwnedInjectorHelper *helper = &worker->helpers[i];
+        struct proc_bsdinfo info;
+        if (!helper_identity(helper, &info) || info.pbi_status == 5)
+            continue;
+        /* Original direct-child discovery plus the kernel birth identity
+         * remains proof of ownership if an exited worker orphaned it to init.
+         */
+        if (helper->parent_pid != worker->pid ||
+            (info.pbi_ppid != (uint32_t)helper->parent_pid &&
+             info.pbi_ppid != 1)) {
+            if (!helper->warned) {
+                fprintf(stderr,
+                        "peak-attach: injector helper %ld changed ownership; "
+                        "leaving it untouched\n",
+                        (long)helper->pid);
+                helper->warned = TRUE;
+            }
+            continue;
+        }
+        if (kill(helper->pid, signal_number) && errno != ESRCH &&
+            !helper->warned) {
+            fprintf(stderr,
+                    "peak-attach: cannot stop owned injector helper %ld: %s\n",
+                    (long)helper->pid, strerror(errno));
+            helper->warned = TRUE;
+        }
+    }
+}
+#else
+static void collect_worker_helpers(InjectionWorker *worker) { (void)worker; }
+static gboolean worker_helpers_pending(InjectionWorker *worker)
+{
+    (void)worker;
+    return FALSE;
+}
+static void signal_worker_helpers(InjectionWorker *worker, int signal_number)
+{
+    (void)worker;
+    (void)signal_number;
+}
+#endif
 
 #if defined(__APPLE__)
 static char *default_bootstrap(void);
@@ -154,18 +320,22 @@ static int run_injector(guint pid, const char *agent, const char *socket_path)
     entrypoint = "peak_attach_bootstrap_main";
     data = payload;
 #endif
+    diagnostic_phase("inject begin");
     frida_injector_inject_library_file_sync(injector, pid, injection_path,
                                             entrypoint, data, NULL, &error);
 #if defined(__APPLE__)
     g_free(payload);
     g_free(bootstrap);
 #endif
+    diagnostic_phase("inject returned");
     int result = error != NULL;
     if (error) {
         fprintf(stderr, "peak-attach: injection failed: %s\n", error->message);
         g_clear_error(&error);
     }
+    diagnostic_phase("injector close begin");
     frida_injector_close_sync(injector, NULL, &error);
+    diagnostic_phase("injector close returned");
     if (error) {
         fprintf(stderr, "peak-attach: injector cleanup failed: %s\n",
                 error->message);
@@ -193,6 +363,7 @@ static void inspect_worker(InjectionWorker *worker)
             worker->error_length += n;
     }
     worker->error[worker->error_length] = 0;
+    collect_worker_helpers(worker);
     if (!worker->done) {
         siginfo_t info = {0};
         if (waitid(P_PID, (id_t)worker->pid, &info,
@@ -210,18 +381,53 @@ static void inspect_worker(InjectionWorker *worker)
     }
 }
 
-static void finish_worker(InjectionWorker *worker, gboolean activated)
+static void finish_worker(InjectionWorker *worker, gboolean completed_response)
 {
     if (worker->pid <= 0)
         return;
-    gint64 deadline = deadline_ms() + (activated ? 3000 : 0);
-    while (!worker->done && deadline_ms() < deadline) {
+    collect_worker_helpers(worker);
+    /* Error ACKs also precede the remote entrypoint return; allow Core to
+     * complete injection and helper close before signaling the worker. */
+    gint64 deadline =
+        deadline_ms() + (completed_response && !interrupted ? 2000 : 0);
+    while ((!worker->done || worker_helpers_pending(worker)) &&
+           deadline_ms() < deadline) {
         inspect_worker(worker);
         struct pollfd pfd = {worker->error_fd, POLLIN, 0};
-        if (!worker->done)
+        if (worker->done)
+            poll(NULL, 0, 20);
+        else
             poll(&pfd, 1, 20);
     }
+    if (worker_helpers_pending(worker)) {
+        diagnostic_phase("stopping owned injector helpers");
+        signal_worker_helpers(worker, SIGTERM);
+        deadline = deadline_ms() + 500;
+        while (worker_helpers_pending(worker) && deadline_ms() < deadline) {
+            inspect_worker(worker);
+            struct pollfd pfd = {worker->error_fd, POLLIN, 0};
+            if (worker->done)
+                poll(NULL, 0, 20);
+            else
+                poll(&pfd, 1, 20);
+        }
+        signal_worker_helpers(worker, SIGKILL);
+        deadline = deadline_ms() + 250;
+        while (worker_helpers_pending(worker) && deadline_ms() < deadline) {
+            inspect_worker(worker);
+            struct pollfd pfd = {worker->error_fd, POLLIN, 0};
+            poll(&pfd, 1, 20);
+        }
+    }
     if (!worker->done) {
+        /* Close the discovery-to-termination race with bounded repeated
+         * direct-child censuses while the worker identity is still pinned. */
+        for (unsigned int pass = 0; pass < 3 && !worker->done; ++pass) {
+            collect_worker_helpers(worker);
+            signal_worker_helpers(worker, SIGKILL);
+            poll(NULL, 0, 10);
+            inspect_worker(worker);
+        }
         kill(-worker->pid, SIGTERM);
         deadline = deadline_ms() + 1000;
         while (!worker->done && deadline_ms() < deadline) {
@@ -234,6 +440,7 @@ static void finish_worker(InjectionWorker *worker, gboolean activated)
     if (!worker->leader_lost) {
         /* WNOWAIT retains the leader until after the final group signal,
          * preventing its PID/PGID from being reused during teardown. */
+        signal_worker_helpers(worker, SIGKILL);
         kill(-worker->pid, SIGKILL);
         int status;
         while (waitpid(worker->pid, &status, 0) < 0 && errno == EINTR) {
@@ -372,6 +579,15 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
         close(errors[1]);
         return FALSE;
     }
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0) {
+        int error = errno;
+        free(exe);
+        close(errors[0]);
+        close(errors[1]);
+        errno = error;
+        return FALSE;
+    }
     char pid_text[32];
     snprintf(pid_text, sizeof(pid_text), "%u", pid);
     char *arguments[] = {exe,           "--internal-inject", pid_text,
@@ -393,6 +609,15 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
     if (error)
         goto spawn_cleanup;
     actions_ready = TRUE;
+    error = posix_spawn_file_actions_adddup2(&actions, null_fd, STDIN_FILENO);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_adddup2(&actions, null_fd, STDOUT_FILENO);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_addclose(&actions, null_fd);
+    if (error)
+        goto spawn_cleanup;
     error =
         posix_spawn_file_actions_adddup2(&actions, errors[1], STDERR_FILENO);
     if (error)
@@ -411,6 +636,7 @@ spawn_cleanup:
     if (attributes_ready)
         posix_spawnattr_destroy(&attributes);
     free(exe);
+    close(null_fd);
     close(errors[1]);
     if (error) {
         worker->pid = 0;
@@ -481,14 +707,18 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
 }
 int main(int argc, char **argv)
 {
+    diagnostic_phase("Frida init begin");
     frida_init();
+    diagnostic_phase("Frida init returned");
     if (argc == 5 && !strcmp(argv[1], "--internal-inject")) {
         char *end;
         unsigned long pid = strtoul(argv[2], &end, 10);
         int result = !*argv[2] || *end || !pid || pid > INT_MAX
                          ? 1
                          : run_injector((guint)pid, argv[3], argv[4]);
+        diagnostic_phase("worker Frida deinit begin");
         frida_deinit();
+        diagnostic_phase("worker Frida deinit returned");
         return result;
     }
     GVariant *configuration = NULL;
@@ -561,6 +791,7 @@ int main(int argc, char **argv)
     char socket_path[108] = {0};
     int listener = -1, peer = -1;
     InjectionWorker worker = {.error_fd = -1};
+    gboolean completed_response = FALSE;
     if (!mkdtemp(directory)) {
         perror("peak-attach: mkdtemp");
         goto cleanup;
@@ -587,6 +818,7 @@ int main(int argc, char **argv)
         perror("peak-attach: start injector");
         goto cleanup;
     }
+    diagnostic_phase("worker spawned; awaiting agent");
     gint64 until = deadline_ms() + 15000;
     while (!interrupted && deadline_ms() < until) {
         struct pollfd f = {listener, POLLIN, 0};
@@ -609,14 +841,18 @@ int main(int argc, char **argv)
                         "was interrupted\n");
         goto cleanup;
     }
-    gboolean configured = send_variant(peer, configuration);
+    diagnostic_phase("authenticated agent connected");
+    gboolean configured = send_variant(peer, configuration, until);
     configuration = NULL;
     if (!configured)
         goto disconnected;
-    GVariant *ready = receive_variant(
-        peer, G_VARIANT_TYPE(PEAK_ATTACH_ACK_TYPE), deadline_ms() + 15000);
+    diagnostic_phase("configuration sent; awaiting response");
+    GVariant *ready =
+        receive_variant(peer, G_VARIANT_TYPE(PEAK_ATTACH_ACK_TYPE), until);
     if (!ready)
         goto disconnected;
+    completed_response = TRUE;
+    diagnostic_phase("agent response received");
     const char *state, *message;
     g_variant_get(ready, "(&s&s)", &state, &message);
     gboolean ok = !strcmp(state, "ready");
@@ -642,7 +878,9 @@ cleanup:
     }
     if (listener >= 0)
         close(listener);
-    finish_worker(&worker, result == 0);
+    diagnostic_phase("worker cleanup begin");
+    finish_worker(&worker, completed_response);
+    diagnostic_phase("worker cleanup returned");
     if (*socket_path)
         unlink(socket_path);
     rmdir(directory);
@@ -655,6 +893,8 @@ args_done:
         g_variant_unref(configuration);
     g_free(agent);
     g_ptr_array_unref(targets);
+    diagnostic_phase("parent Frida deinit begin");
     frida_deinit();
+    diagnostic_phase("parent Frida deinit returned");
     return result;
 }

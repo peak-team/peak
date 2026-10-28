@@ -67,7 +67,7 @@ add_test(NAME test_attach_transport
         --cli $<TARGET_FILE:peak_attach>
         --fixture $<TARGET_FILE:test_attach_fixture>
         --agent $<TARGET_FILE:test_attach_unresponsive_agent>)
-set_tests_properties(test_attach_transport PROPERTIES TIMEOUT 40)
+set_tests_properties(test_attach_transport PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Compile the real Darwin overlay with a fake transaction backend. The

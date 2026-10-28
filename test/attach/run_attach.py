@@ -21,14 +21,38 @@ def reap(process):
             process.wait(timeout=5)
 
 
-def run(command, env, timeout=20):
+def run(command, env, timeout=20, fixture_log=None):
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         out, err = process.communicate(timeout=timeout)
         return process.returncode, out + err
+    except subprocess.TimeoutExpired as expired:
+        # communicate retains its buffers across retries. Replace each partial
+        # buffer with the later complete one instead of duplicating output.
+        out, err = expired.stdout, expired.stderr
+        reap(process)
+        try:
+            out, err = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired as final:
+            out = final.stdout if final.stdout is not None else out
+            err = final.stderr if final.stderr is not None else err
+        def decoded(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        fixture = ""
+        if fixture_log is not None:
+            try:
+                fixture = fixture_log.read_text(errors="replace")
+            except OSError as error:
+                fixture = str(error)
+        raise AssertionError(
+            f"attach command timed out after {timeout}s: {command!r}\n"
+            f"CLI stdout:\n{decoded(out)}\nCLI stderr:\n{decoded(err)}\n"
+            f"fixture log:\n{fixture}") from None
     finally:
         reap(process)
+        process.stdout.close()
+        process.stderr.close()
 
 
 def wait_for(predicate, timeout=10):
@@ -92,6 +116,8 @@ args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(("PEAK_", "FLAME_"))
        and k not in ("LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES")}
+if sys.platform == "darwin":
+    env["PEAK_ATTACH_DIAGNOSTICS"] = "1"
 cli = str(args.cli.resolve())
 if args.mode == "cli":
     code, output = run([cli, "--help"], env)
@@ -145,7 +171,8 @@ else:
                 invalid_agent.write_text("This is deliberately not a Mach-O image.\n")
                 filesystem_phase(target, root / "fixture.log", "B")
                 code, output = run([cli, str(target.pid), "--agent", str(invalid_agent),
-                                    "--target", "peak_attach_existing_target"], env)
+                                    "--target", "peak_attach_existing_target"], env,
+                                   fixture_log=root / "fixture.log")
                 assert code != 0 and "Darwin loader" in output, (code, output)
                 assert not any(word in output.lower() for word in
                                ("timed out", "connection was lost",
@@ -155,7 +182,8 @@ else:
             prefix = root / "stats"
             code, output = run(base + ["--target",
                                       "peak_attach_existing_target,peak_attach_churn_target",
-                                      "--output", str(prefix)], env)
+                                      "--output", str(prefix)], env,
+                                   fixture_log=root / "fixture.log")
             # Only explicit OS security failures may skip real injection coverage.
             denied = ("ptrace operation not permitted", "permission denied",
                       "operation not permitted", "not allowed to attach",
