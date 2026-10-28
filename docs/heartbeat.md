@@ -228,18 +228,61 @@ without requesting detach; the normal heartbeat remains the fallback.
 A burst request uses a dedicated bit in the existing packed lifecycle word.
 One compare-and-swap publishes only against the sampled ATTACHED generation,
 then wakes the controller. The callback does not patch code, scan global slots,
-or call MPI. The controller records `mpi-burst` as the request source and uses
-its existing physical detach protocol. Generation changes reseed the window;
-thread retirement clears it before the statistics slot can be reused. An
-independent 64-call block therefore costs at most two blocks before its first
-pressure decision, followed by controller scheduling and safe mutation delay.
-This protection bypasses the heartbeat's initial observation-time gate.
+or call MPI. The controller treats this recent active-thread pressure alert as a reason for
+conservative **rank-wide** budget protection and immediately requests detach for every currently attached target
+on that rank, including targets with zero recorded calls. It does not wait to
+discover whether the remaining targets become hot. This deliberately prioritizes
+job overhead over function coverage: cold targets can be detached without ever
+being profiled.
+
+Before requesting this rank-wide wave, the controller cancels pending reattach
+requests back to DETACHED and clears their retry/request context and future
+lease. It performs these transitions under the existing controller lock, which
+also excludes concurrent physical reattachment. Reattach admission, including
+the API path, stays closed while a wave member is DETACH_REQUESTED or DETACHING.
+The gate expires after the last member completes or abandons its retry budget;
+existing spent/control headroom and cooldown then govern restoration. The wave
+does not permanently disable profiling. A short-block pressure alert does not
+prove that cumulative spent cost has exhausted the budget; historical headroom
+may still be available.
+
+Reattach also revalidates the control accounting tuple after acquiring the
+controller lock. Completed-window count, failed-window count and wall time must
+still exactly match the valid, unsaturated snapshot charged to headroom. A
+mutation between the earlier budget reads and lock acquisition invalidates the
+whole admission cycle, which resumes on a later heartbeat with a fresh budget.
+This prevents stale pre-wave headroom from restoring hooks even when cooldown is
+zero. It leaves unchanged-accounting admission and physical batch mutation
+unchanged. The recorded second-round HPC rank-wide measurements precede this
+additional admission check; its changed/invalid-tuple behavior is covered by
+local deterministic tests.
+
+All wave members carry `mpi-burst` as their request source and enter the existing
+physical detach batch collector together. With strict batch support, up to 64
+eligible targets share one prepare/finish stop window. Larger sets use multiple
+batches; targets rejected by safety classification may require retry windows.
+Backends without strict batch support retain their existing individual-target
+mutation path, so this policy cannot promise a single stop window there. This
+reduces the previous cost of discovering and stopping one hot function per
+window, which can itself accumulate along an MPI critical path even after
+callback overhead is reduced.
+
+Generation changes reseed the CPU window; thread retirement clears it before
+the statistics slot can be reused. An independent 64-call block therefore costs
+at most two blocks before its first pressure decision, followed by controller
+scheduling and safe mutation delay. This protection bypasses the heartbeat's
+initial observation-time gate.
 
 `PEAK_HEARTBEAT_INTERVAL=0` or `PEAK_ENABLE_GLOBAL_HEARTBEAT=0` disables the
 burst guard. A configured zero global ratio retains zero tolerance for positive
 estimated cost; it does not disable policy. Final text output identifies
 `configured_job_target`, `effective_rank_target`, `world_size`, metadata
-`source`, `burst_guard`, and `stride`. This follows existing text-output
+`source`, `burst_guard`, `stride`, `burst_action=rank-wide`, and batch capacity.
+`burst_waves` and `burst_unsampled_targets` count waves and zero-call targets
+observed by the reporting rank only (`burst_counters_scope=reporting-rank`),
+including when the text report otherwise aggregates MPI ranks. They are not
+job-wide counts or values taken from an independently selected overhead owner.
+This follows existing text-output
 selection, including aggregate-root output and `PEAK_TEXT_OUTPUT` overrides.
 
 The sum of per-rank estimates is a more conservative MPI risk model than the
@@ -248,8 +291,8 @@ successive parts of the application's critical path. Budget division and short
 blocks reduce that failure mode without background MPI communication. They
 cannot guarantee a hard application slowdown bound. Calibration error,
 communication/scheduling effects, the first 128 calls of a generation, safe
-mutation latency, and many individually cold hooks remain outside such a
-proof. An application with a very short critical phase can still finish that
+mutation latency, classification retries, and multiple batches for large target
+sets remain outside such a proof. An application with a very short critical phase can still finish that
 phase before physical detach completes.
 
 ## Reattach Risk Scaling

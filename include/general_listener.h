@@ -279,6 +279,8 @@ PEAK_API int peak_general_listener_test_mpi_uint64_type_size(void);
 uint64_t peak_general_listener_test_add_uint64_saturated(uint64_t lhs,
                                                           uint64_t rhs);
 PEAK_API int peak_general_listener_test_detach_count_latch_state_gate(void);
+PEAK_API int peak_general_listener_test_mpi_burst_wave_state_gate(void);
+PEAK_API int peak_general_listener_test_reattach_accounting_validation(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_hold(void);
 PEAK_API int peak_general_listener_test_checkpoint_snapshot_lock_release(void);
 PEAK_API int peak_general_listener_test_checkpoint_mutation_begin(void);

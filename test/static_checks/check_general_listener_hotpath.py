@@ -285,6 +285,16 @@ def main():
         and "atomic_compare_exchange_strong_explicit" in burst_publish,
         "generic/direct burst guards must amortize lifecycle reads and share the generation CAS",
     )
+    heartbeat = source[source.index("void* peak_heartbeat_monitor("):]
+    admission = heartbeat[heartbeat.index("projected_pending_reattach_seconds = 0.0;\n                pthread_mutex_lock(&lock);"):]
+    require(
+        admission.index("pthread_mutex_lock(&lock)") <
+        admission.index("&reattach_accounting_locked") <
+        admission.index("peak_general_listener_reattach_accounting_unchanged") <
+        admission.index("peak_general_listener_request_reattach_with_context_unlocked")
+        and "reattach_budget_ok && i < heartbeat_capacity" in admission,
+        "reattach must reject stale control headroom after controller-lock acquisition",
+    )
     for token in ("pthread_mutex", "MPI_", "for (", "malloc(", "gum_interceptor_"):
         require(token not in burst_publish,
                 "burst callbacks must not lock, scan, allocate, call MPI or mutate Gum")

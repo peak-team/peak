@@ -679,7 +679,7 @@ if(BUILD_TESTING)
     add_subdirectory(detach_runtime)
     if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         foreach(_burst_mode IN ITEMS generic fast)
-            foreach(_burst_policy IN ITEMS enabled heartbeat-off global-off single conflict)
+            foreach(_burst_policy IN ITEMS enabled heartbeat-off global-off single conflict large)
                 add_test(NAME test_mpi_burst_budget_${_burst_mode}_${_burst_policy}
                     COMMAND ${Python3_EXECUTABLE}
                         ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_mpi_burst_budget_check.py

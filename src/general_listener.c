@@ -198,6 +198,9 @@ static gulong peak_detach_count = G_MAXULONG;
 static gboolean peak_mpi_burst_guard_enabled;
 static double peak_effective_rank_target;
 static double peak_mpi_burst_limit;
+static gboolean peak_mpi_burst_wave_active;
+static uint64_t peak_mpi_burst_waves;
+static uint64_t peak_mpi_burst_unsampled_targets;
 static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 _Atomic gboolean heartbeat_running = true;
@@ -817,6 +820,25 @@ peak_general_listener_runtime_accounting_snapshot(
     }
 
     return TRUE;
+}
+
+/* Admission must use the exact control tuple charged to its headroom. A
+ * coherent pre-lock read alone cannot exclude a mutation before lock entry. */
+static gboolean
+peak_general_listener_reattach_accounting_unchanged(
+    const PeakDetachAccountingSnapshot* budget, gboolean budget_valid,
+    const PeakDetachAccountingSnapshot* current, gboolean current_valid)
+{
+    return budget_valid && current_valid && budget != NULL && current != NULL &&
+        budget->completed_stop_window_count < UINT64_MAX - 1 &&
+        budget->failed_stop_window_count < UINT64_MAX - 1 &&
+        budget->stop_window_wall_ns < UINT64_MAX - 1 &&
+        current->completed_stop_window_count < UINT64_MAX - 1 &&
+        current->failed_stop_window_count < UINT64_MAX - 1 &&
+        current->stop_window_wall_ns < UINT64_MAX - 1 &&
+        budget->completed_stop_window_count == current->completed_stop_window_count &&
+        budget->failed_stop_window_count == current->failed_stop_window_count &&
+        budget->stop_window_wall_ns == current->stop_window_wall_ns;
 }
 
 static void
@@ -2619,6 +2641,25 @@ peak_general_listener_request_detach_unlocked(size_t hook_id)
         0.0);
 }
 
+/* Controller and heartbeat call this only under lock. State completion clears
+ * request context, so the gate expires with the final pending wave member,
+ * including retry-budget abandonment. No permanent no-reattach latch. */
+static gboolean
+peak_general_listener_mpi_burst_wave_pending_unlocked(void)
+{
+    if (!peak_mpi_burst_wave_active) return FALSE;
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (peak_hook_states != NULL && peak_hook_pending_request_source != NULL &&
+            peak_hook_pending_request_source[i] == PEAK_HOOK_REQUEST_SOURCE_MPI_BURST &&
+            (peak_hook_states[i] == PEAK_HOOK_DETACH_REQUESTED ||
+             peak_hook_states[i] == PEAK_HOOK_DETACHING)) {
+            return TRUE;
+        }
+    }
+    peak_mpi_burst_wave_active = FALSE;
+    return FALSE;
+}
+
 static gboolean
 peak_general_listener_request_reattach_with_context_unlocked(
     size_t hook_id,
@@ -2629,7 +2670,8 @@ peak_general_listener_request_reattach_with_context_unlocked(
     double total_time,
     double rate)
 {
-    if (peak_general_controller_mpi_finalize_requested()) {
+    if (peak_general_controller_mpi_finalize_requested() ||
+        peak_general_listener_mpi_burst_wave_pending_unlocked()) {
         return FALSE;
     }
 
@@ -4071,6 +4113,9 @@ peak_general_controller_collect_batch_unlocked(
             operation = PEAK_DETACH_OPERATION_DETACH;
             stable_state = PEAK_HOOK_ATTACHED;
         } else {
+            if (peak_general_listener_mpi_burst_wave_pending_unlocked()) {
+                continue;
+            }
             if (array_listener_gum_detached != NULL &&
                 array_listener_gum_detach_flushed != NULL &&
                 array_listener_gum_detached[i] &&
@@ -4366,6 +4411,40 @@ peak_general_listener_take_detach_count_request(PeakGeneralListener* listener)
 }
 #endif
 
+/* A burst alerts on recent active-thread pressure, not cumulative budget
+ * exhaustion. Conservatively back off across the rank before batch collection
+ * rather than pay a separate stop window for every later hot symbol. This
+ * trades cold coverage for fewer windows along successive ranks' critical paths. */
+static void
+peak_general_controller_request_mpi_burst_wave_unlocked(void)
+{
+    double elapsed = peak_second() - peak_main_time;
+    peak_mpi_burst_wave_active = TRUE;
+    if (peak_mpi_burst_waves != UINT64_MAX) peak_mpi_burst_waves++;
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (peak_hook_states != NULL &&
+            peak_hook_states[i] == PEAK_HOOK_REATTACH_REQUESTED) {
+            peak_general_controller_reset_retry_unlocked(i);
+            peak_general_controller_set_state_unlocked(i, PEAK_HOOK_DETACHED);
+        }
+    }
+    for (size_t i = 0; i < peak_hook_address_count; i++) {
+        if (peak_hook_states == NULL || peak_hook_states[i] != PEAK_HOOK_ATTACHED ||
+            !peak_general_hook_is_published_unlocked(i)) continue;
+        gulong calls = 0;
+        double seconds = 0.0;
+        (void)peak_general_listener_refresh_hook_sample_cache_unlocked(
+            i, &calls, &seconds);
+        if (calls == 0 && peak_mpi_burst_unsampled_targets != UINT64_MAX) {
+            peak_mpi_burst_unsampled_targets++;
+        }
+        (void)peak_general_listener_request_detach_with_context_unlocked(
+            i, PEAK_HOOK_REQUEST_SOURCE_MPI_BURST, calls,
+            elapsed > 0.0 ? seconds / elapsed : 0.0,
+            0.0, elapsed, 0.0);
+    }
+}
+
 static void
 peak_general_controller_publish_detach_count_requests_unlocked(void)
 {
@@ -4385,6 +4464,11 @@ peak_general_controller_publish_detach_count_requests_unlocked(void)
             continue;
         }
 
+        if (source == PEAK_HOOK_REQUEST_SOURCE_MPI_BURST) {
+            peak_general_controller_request_mpi_burst_wave_unlocked();
+            /* Every ATTACHED callback generation was replaced by fan-out. */
+            return;
+        }
         gulong total_num_calls;
         g_mutex_lock(&listener->retired_mutex);
         total_num_calls = listener->retired_num_calls;
@@ -4464,7 +4548,8 @@ peak_general_controller_process_pending_unlocked(pthread_t controller_tid,
                                                                             pause_status,
                                                                             snapshot_count,
                                                                             snapshot_complete);
-        } else if (peak_hook_states[i] == PEAK_HOOK_REATTACH_REQUESTED) {
+        } else if (peak_hook_states[i] == PEAK_HOOK_REATTACH_REQUESTED &&
+                   !peak_general_listener_mpi_burst_wave_pending_unlocked()) {
             did_work |= peak_general_controller_reattach_if_requested_unlocked(i,
                                                                               controller_tid,
                                                                               tid_keys,
@@ -5431,26 +5516,9 @@ void* peak_heartbeat_monitor(void* arg) {
                 peak_general_listener_runtime_accounting_snapshot(
                     &reattach_accounting_after);
             gboolean reattach_accounting_coherent =
-                reattach_accounting_before_valid &&
-                reattach_accounting_after_valid &&
-                reattach_accounting_before.completed_stop_window_count <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_before.failed_stop_window_count <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_before.stop_window_wall_ns <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_after.completed_stop_window_count <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_after.failed_stop_window_count <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_after.stop_window_wall_ns <
-                    (UINT64_MAX - 1) &&
-                reattach_accounting_before.completed_stop_window_count ==
-                    reattach_accounting_after.completed_stop_window_count &&
-                reattach_accounting_before.failed_stop_window_count ==
-                    reattach_accounting_after.failed_stop_window_count &&
-                reattach_accounting_before.stop_window_wall_ns ==
-                    reattach_accounting_after.stop_window_wall_ns;
+                peak_general_listener_reattach_accounting_unchanged(
+                    &reattach_accounting_before, reattach_accounting_before_valid,
+                    &reattach_accounting_after, reattach_accounting_after_valid);
             double reattach_control_spent_seconds =
                 (double)peak_general_listener_control_wall_ns_since_heartbeat(
                     &reattach_accounting_after) / 1e9;
@@ -5510,7 +5578,19 @@ void* peak_heartbeat_monitor(void* arg) {
 
                 projected_pending_reattach_seconds = 0.0;
                 pthread_mutex_lock(&lock);
-                for (size_t i = 0; i < heartbeat_capacity; i++) {
+                /* A burst wave (or any mutation) may have completed after the
+                 * budget read. The controller shares this lock, so this final
+                 * validation remains stable throughout admission, even with
+                 * cooldown=0. Defer stale/invalid headroom to the next cycle. */
+                PeakDetachAccountingSnapshot reattach_accounting_locked;
+                gboolean reattach_accounting_locked_valid =
+                    peak_general_listener_runtime_accounting_snapshot(
+                        &reattach_accounting_locked);
+                reattach_budget_ok =
+                    peak_general_listener_reattach_accounting_unchanged(
+                        &reattach_accounting_after, reattach_accounting_after_valid,
+                        &reattach_accounting_locked, reattach_accounting_locked_valid);
+                for (size_t i = 0; reattach_budget_ok && i < heartbeat_capacity; i++) {
                     double projected_seconds;
                     double projected_ratio;
                     gboolean per_target_eligible;
@@ -7281,6 +7361,9 @@ peak_general_listener_attach()
     peak_effective_rank_target =
         peak_general_listener_rank_budget(global_target_ratio);
     peak_mpi_burst_limit = peak_effective_rank_target * peak_global_detach_factor;
+    peak_mpi_burst_wave_active = FALSE;
+    peak_mpi_burst_waves = 0;
+    peak_mpi_burst_unsampled_targets = 0;
     peak_mpi_burst_guard_enabled =
         peak_general_listener_world_mpi_ranks() > 1 &&
         heartbeat_time > 0 && enable_global_heartbeat;
@@ -7544,6 +7627,93 @@ peak_general_listener_attach()
 
 /* Checkpoint and report snapshot capture. */
 #ifdef PEAK_ENABLE_TEST_HOOKS
+PEAK_API int
+peak_general_listener_test_reattach_accounting_validation(void)
+{
+    PeakDetachAccountingSnapshot budget = {3, 1, 500};
+    PeakDetachAccountingSnapshot current = budget;
+    if (!peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 1;
+    current.completed_stop_window_count++;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 2;
+    current = budget; current.failed_stop_window_count++;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 3;
+    current = budget; current.stop_window_wall_ns++;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 4;
+    current = budget;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, FALSE) ||
+        peak_general_listener_reattach_accounting_unchanged(
+            &budget, FALSE, &current, TRUE)) return 5;
+    /* Equal saturated tuples must not restore admission either. */
+    current.completed_stop_window_count = UINT64_MAX - 1; budget = current;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 6;
+    current = (PeakDetachAccountingSnapshot){0, UINT64_MAX, 0}; budget = current;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 7;
+    current = (PeakDetachAccountingSnapshot){0, 0, UINT64_MAX - 1}; budget = current;
+    if (peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 8;
+    current = (PeakDetachAccountingSnapshot){0}; budget = current;
+    if (!peak_general_listener_reattach_accounting_unchanged(
+            &budget, TRUE, &current, TRUE)) return 9;
+    return 0;
+}
+
+/* Standalone state-machine test; no controller or physical mutation runs. */
+PEAK_API int
+peak_general_listener_test_mpi_burst_wave_state_gate(void)
+{
+    if (peak_hook_address_count != 0) return 1;
+    for (size_t i = 0; i < 3; i++) {
+        size_t id;
+        if (!peak_general_listener_expand_dynamic_hook_tables_unlocked(
+                "burst-state-test", &id)) return 2;
+        hook_address[id] = (gpointer)(uintptr_t)(id + 1);
+        array_listener[id] = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
+        PEAKGENERAL_LISTENER(array_listener[id])->hook_id = id;
+        array_listener_gum_detached[id] = i != 0;
+        array_listener_gum_detach_flushed[id] = TRUE;
+        peak_general_controller_set_state_unlocked(id,
+            i == 0 ? PEAK_HOOK_ATTACHED : PEAK_HOOK_DETACHED);
+    }
+    if (!peak_general_listener_request_reattach_with_context_unlocked(
+            1, PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, 7, .1, .2, 1, .3)) return 3;
+    peak_general_controller_request_mpi_burst_wave_unlocked();
+    if (peak_hook_states[0] != PEAK_HOOK_DETACH_REQUESTED ||
+        peak_hook_pending_request_source[0] != PEAK_HOOK_REQUEST_SOURCE_MPI_BURST ||
+        peak_hook_states[1] != PEAK_HOOK_DETACHED ||
+        peak_hook_pending_request_source[1] != PEAK_HOOK_REQUEST_SOURCE_NONE ||
+        peak_hook_pending_request_calls[1] != 0 ||
+        peak_hook_pending_request_rate[1] != 0.0 ||
+        peak_hook_pending_request_ratio[1] != 0.0 ||
+        !peak_general_listener_mpi_burst_wave_pending_unlocked() ||
+        peak_general_listener_request_reattach_with_context_unlocked(
+            1, PEAK_HOOK_REQUEST_SOURCE_API, 0, 0, 0, 0, 0)) return 4;
+    /* Successful final member reopens admission (normal budget gate remains). */
+    peak_general_controller_reset_retry_unlocked(0);
+    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_DETACHED);
+    if (peak_general_listener_mpi_burst_wave_pending_unlocked() ||
+        !peak_general_listener_request_reattach_with_context_unlocked(
+            1, PEAK_HOOK_REQUEST_SOURCE_API, 0, 0, 0, 0, 0)) return 5;
+    /* Retry abandonment to ATTACHED must also release the transient wave gate. */
+    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_ATTACHED);
+    peak_general_controller_request_mpi_burst_wave_unlocked();
+    peak_general_controller_reset_retry_unlocked(0);
+    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_ATTACHED);
+    if (peak_general_listener_mpi_burst_wave_pending_unlocked()) return 6;
+    for (size_t i = 0; i < 3; i++) {
+        peak_general_listener_free(PEAKGENERAL_LISTENER(array_listener[i]));
+        g_object_unref(array_listener[i]);
+        array_listener[i] = NULL;
+    }
+    return 0;
+}
+
 PEAK_API int
 peak_general_listener_test_detach_count_latch_state_gate(void)
 {
@@ -8420,12 +8590,16 @@ peak_general_listener_write_budget_policy(const PeakReportFormatOptions* options
     if (!options->print_text) {
         return;
     }
-    peak_log_report("[peak] MPI budget risk policy: configured_job_target=%.9g effective_rank_target=%.9g world_size=%u source=%s burst_guard=%s stride=%u\n",
+    peak_log_report("[peak] MPI budget risk policy: configured_job_target=%.9g effective_rank_target=%.9g world_size=%u source=%s burst_guard=%s stride=%u burst_action=rank-wide burst_counters_scope=reporting-rank burst_waves=%llu burst_unsampled_targets=%llu batch_capacity=%zu\n",
         (double)global_target_ratio, peak_effective_rank_target,
         peak_general_listener_world_mpi_ranks(),
         peak_general_listener_world_mpi_source(),
         peak_mpi_burst_guard_enabled ? "enabled" : "disabled",
-        PEAK_BURST_BUDGET_STRIDE);
+        PEAK_BURST_BUDGET_STRIDE,
+        (unsigned long long)peak_mpi_burst_waves,
+        (unsigned long long)peak_mpi_burst_unsampled_targets,
+        peak_detach_controller_strict_batch_supported()
+            ? peak_detach_controller_max_batch_requests() : (size_t)1);
 }
 
 static gboolean

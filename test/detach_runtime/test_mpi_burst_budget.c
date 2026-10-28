@@ -10,11 +10,82 @@
 #include <time.h>
 
 static volatile uint64_t sink;
-__attribute__((noinline)) void peak_mpi_burst_target(void)
+__attribute__((noinline, visibility("default"))) void peak_mpi_burst_target(void)
 {
     __asm__ volatile("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory");
     sink++;
 }
+
+/* Never called: rank-wide protection intentionally sacrifices these samples. */
+#define COLD_TARGET(N) \
+    __attribute__((noinline, used, visibility("default"))) void peak_mpi_burst_cold_##N(void) { \
+        __asm__ volatile("nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; nop" ::: "memory"); \
+        sink += (N) + 1; \
+    }
+COLD_TARGET(0)
+COLD_TARGET(1)
+COLD_TARGET(2)
+COLD_TARGET(3)
+COLD_TARGET(4)
+COLD_TARGET(5)
+COLD_TARGET(6)
+COLD_TARGET(7)
+COLD_TARGET(8)
+COLD_TARGET(9)
+COLD_TARGET(10)
+COLD_TARGET(11)
+COLD_TARGET(12)
+COLD_TARGET(13)
+COLD_TARGET(14)
+COLD_TARGET(15)
+COLD_TARGET(16)
+COLD_TARGET(17)
+COLD_TARGET(18)
+COLD_TARGET(19)
+COLD_TARGET(20)
+COLD_TARGET(21)
+COLD_TARGET(22)
+COLD_TARGET(23)
+COLD_TARGET(24)
+COLD_TARGET(25)
+COLD_TARGET(26)
+COLD_TARGET(27)
+COLD_TARGET(28)
+COLD_TARGET(29)
+COLD_TARGET(30)
+COLD_TARGET(31)
+COLD_TARGET(32)
+COLD_TARGET(33)
+COLD_TARGET(34)
+COLD_TARGET(35)
+COLD_TARGET(36)
+COLD_TARGET(37)
+COLD_TARGET(38)
+COLD_TARGET(39)
+COLD_TARGET(40)
+COLD_TARGET(41)
+COLD_TARGET(42)
+COLD_TARGET(43)
+COLD_TARGET(44)
+COLD_TARGET(45)
+COLD_TARGET(46)
+COLD_TARGET(47)
+COLD_TARGET(48)
+COLD_TARGET(49)
+COLD_TARGET(50)
+COLD_TARGET(51)
+COLD_TARGET(52)
+COLD_TARGET(53)
+COLD_TARGET(54)
+COLD_TARGET(55)
+COLD_TARGET(56)
+COLD_TARGET(57)
+COLD_TARGET(58)
+COLD_TARGET(59)
+COLD_TARGET(60)
+COLD_TARGET(61)
+COLD_TARGET(62)
+COLD_TARGET(63)
 
 static uint64_t now_ns(clockid_t clock)
 {
@@ -71,6 +142,28 @@ int main(int argc, char** argv)
     /* A warmup/wait creates no credit for the following dense call burst. */
     if (pthread_create(&worker, NULL, burst_worker, NULL) ||
         pthread_join(worker, NULL)) return 1;
+    if (argc > 3 && strcmp(argv[3], "1") == 0) {
+        size_t targets = strtoul(argv[2], NULL, 10);
+        PeakHookState (*state)(size_t) =
+            dlsym(RTLD_DEFAULT, "peak_general_listener_hook_state");
+        if (!state) return 1;
+        uint64_t deadline = now_ns(CLOCK_MONOTONIC) + 1000000000;
+        size_t detached = 0;
+        do {
+            detached = 0;
+            for (size_t i = 0; i < targets; i++) {
+                detached += state(i) == PEAK_HOOK_DETACHED;
+            }
+            if (detached == targets) break;
+            struct timespec retry = { .tv_nsec = 1000000 };
+            nanosleep(&retry, NULL);
+        } while (now_ns(CLOCK_MONOTONIC) < deadline);
+        if (detached != targets) {
+            fprintf(stderr, "runtime wave incomplete: %zu/%zu detached\n", detached, targets);
+            return 1;
+        }
+        printf("runtime_detached=%zu\n", detached);
+    }
     puts("mpi_burst_workload_ok");
     return 0;
 }

@@ -575,6 +575,16 @@ if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND PEAK_DETACH_HELPER_SUPPORTED)
     PROPERTIES
       PASS_REGULAR_EXPRESSION "general-listener-uint64-saturation-ok")
 
+  add_test(NAME test_detach_controller_general_listener_reattach_accounting_validation
+    COMMAND test_detach_listener_shutdown general-listener-reattach-accounting-validation)
+  set_tests_properties(test_detach_controller_general_listener_reattach_accounting_validation
+    PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "general-listener-reattach-accounting-validation-ok")
+
+  add_test(NAME test_detach_controller_general_listener_mpi_burst_wave_state_gate
+    COMMAND test_detach_listener_shutdown general-listener-mpi-burst-wave-state-gate)
+  set_tests_properties(test_detach_controller_general_listener_mpi_burst_wave_state_gate
+    PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "general-listener-mpi-burst-wave-state-gate-ok")
+
   add_test(NAME test_detach_controller_general_listener_detach_count_latch_state_gate
     COMMAND test_detach_listener_shutdown
             general-listener-detach-count-latch-state-gate)
