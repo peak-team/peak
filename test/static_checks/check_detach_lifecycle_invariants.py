@@ -2754,9 +2754,23 @@ def check_runtime_configuration_freeze(repo_root):
     controller_configure = extract_function(
         controller, "peak_detach_controller_configure_mpi_process"
     )
+    preflight_verbosity = re.compile(
+        r"#ifdef PEAK_ATTACH_RUNTIME\s*"
+        r"/\* Rejected preflight configurations may be replaced before activation\. \*/\s*"
+        r"if \(!peak_attach_runtime_attempt_is_terminal\(\)\) \{\s*"
+        r"int valid;\s*"
+        r"return peak_log_parse_verbosity\(getenv\(PEAK_VERBOSITY_ENV\), &valid\);\s*"
+        r"\}\s*#endif"
+    )
+    require(len(preflight_verbosity.findall(log_verbosity)) == 1,
+            "only attach preflight before the terminal activation boundary "
+            "may read replaceable logging configuration")
+    cached_log_verbosity = preflight_verbosity.sub("", log_verbosity)
     require("getenv(PEAK_VERBOSITY_ENV)" in log_configure_once and
             "pthread_once(&peak_log_configuration_once" in log_configure and
-            "getenv" not in log_verbosity and
+            "getenv" not in cached_log_verbosity and
+            "peak_log_configure();" in cached_log_verbosity and
+            "return (PeakVerbosity)peak_log_cached_verbosity;" in cached_log_verbosity and
             "peak_log_configure();" in peak_init and
             "peak_log_configure();" in controller_configure,
             "logging verbosity must be frozen before controller threads and "

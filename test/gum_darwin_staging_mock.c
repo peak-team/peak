@@ -26,23 +26,46 @@ static unsigned flushes;
 static guint8 patch_bytes[32];
 static gpointer fake_redirect;
 static gboolean fail_near_allocation;
+static gboolean fail_branch_allocation;
+static gboolean omit_aligned_slice;
 static guint reserved_releases;
 static guint near_allocations;
 static gpointer near_marker = (gpointer)0x6789;
+
+static GList* fake_free_node(gpointer marker, GumAddress pc)
+{
+    PeakGumCodeSliceElement17* element = g_new0(PeakGumCodeSliceElement17, 1);
+    element->parent.data = marker;
+    element->slice.pc = GSIZE_TO_POINTER(pc);
+    return &element->parent;
+}
+static void fake_free_list(GList* list)
+{
+    while (list != NULL) {
+        GList* next = list->next;
+        g_free(list);
+        list = next;
+    }
+}
 
 GumCodeSlice* mock_alloc_near(GumCodeAllocator* allocator,
     const GumAddressSpec* spec, gsize alignment)
 {
     assert(allocator->free_slices == NULL);
     assert(alignment == 0 && spec->near_address != NULL);
+    gboolean branch_batch = spec->max_distance < ((gsize)1 << 27);
     assert(spec->max_distance + allocator->pages_per_batch *
-        gum_query_page_size() + 4 == ((gsize)1 << 27));
-    if (fail_near_allocation) return NULL;
+        gum_query_page_size() + (branch_batch ? 4 : 4096) ==
+        ((gsize)1 << (branch_batch ? 27 : 32)));
+    if (fail_near_allocation || (branch_batch && fail_branch_allocation)) return NULL;
     near_allocations++;
     GumCodeSlice* reserved = g_new0(GumCodeSlice, 1);
-    reserved->pc = (guint8*)spec->near_address + 64;
-    allocator->free_slices = g_list_append(NULL, near_marker);
-    allocator->free_slices = g_list_append(allocator->free_slices, near_marker);
+    GumAddress base = GUM_ADDRESS(spec->near_address);
+    if (!branch_batch) base += 0x10000000;
+    reserved->pc = GSIZE_TO_POINTER(base);
+    allocator->free_slices = fake_free_node(near_marker, base + 256);
+    allocator->free_slices = g_list_concat(allocator->free_slices,
+        fake_free_node(near_marker, base + (omit_aligned_slice ? 512 : 4096)));
     return reserved;
 }
 void mock_slice_unref(GumCodeSlice* reserved)
@@ -72,7 +95,7 @@ void mock_end(GumInterceptor* interceptor)
         txn->is_dirty = FALSE;
         /* Darwin allocator commit retires unused free slices. */
         PeakGumCodeAllocator17* allocator = &((PeakGumInterceptor17*)interceptor)->allocator;
-        g_list_free(allocator->free_slices);
+        fake_free_list(allocator->free_slices);
         allocator->free_slices = NULL;
         flushes++;
     }
@@ -86,7 +109,9 @@ static PeakGumFunctionContext17* fake_install(GumInterceptor* interceptor,
     /* The ordinary unconstrained Gum allocation consumes the primed head. */
     GList* next_slice = self->allocator.free_slices;
     assert(next_slice != NULL && next_slice->data == near_marker);
-    self->allocator.free_slices = g_list_delete_link(next_slice, next_slice);
+    self->allocator.free_slices = next_slice->next;
+    if (self->allocator.free_slices != NULL) self->allocator.free_slices->prev = NULL;
+    g_free(next_slice);
     PeakGumFunctionContext17* context = g_new0(PeakGumFunctionContext17, 1);
     GPtrArray* entries = g_ptr_array_new_with_free_func(g_free);
     GumArm64Writer writer;
@@ -179,7 +204,7 @@ int main(void)
     assert(peak_gum_darwin_staged_attach_supported());
     /* Near allocation restores preexisting free-list nodes on failure; on
      * success it places the fresh near batch before every old far slice. */
-    GList* old_free = g_list_append(NULL, (gpointer)0x5555);
+    GList* old_free = fake_free_node((gpointer)0x5555, 0x5555);
     self.allocator.free_slices = old_free;
     GumCodeSlice* reservation;
     fail_near_allocation = TRUE;
@@ -189,9 +214,28 @@ int main(void)
     assert(peak_gum_darwin_reserve_near_batch(interceptor, entry, &reservation));
     assert(self.allocator.free_slices->data == near_marker);
     assert(g_list_last(self.allocator.free_slices) == old_free);
-    g_list_free(self.allocator.free_slices);
+    fake_free_list(self.allocator.free_slices);
     self.allocator.free_slices = NULL;
     mock_slice_unref(reservation);
+    /* An unavailable B neighborhood falls back to a page-aligned slice
+     * within ADRP reach, reordering embedded nodes without changing owners. */
+    fail_branch_allocation = TRUE;
+    assert(peak_gum_darwin_reserve_near_batch(interceptor, entry, &reservation));
+    PeakGumCodeSliceElement17* aligned = (PeakGumCodeSliceElement17*)self.allocator.free_slices;
+    assert(GPOINTER_TO_SIZE(aligned->slice.pc) % 4096 == 0);
+    assert(self.allocator.free_slices->next != NULL);
+    fake_free_list(self.allocator.free_slices);
+    self.allocator.free_slices = NULL;
+    mock_slice_unref(reservation);
+    old_free = fake_free_node((gpointer)0x5555, 0x5555);
+    self.allocator.free_slices = old_free;
+    omit_aligned_slice = TRUE;
+    assert(!peak_gum_darwin_reserve_near_batch(interceptor, entry, &reservation));
+    assert(reservation != NULL && g_list_last(self.allocator.free_slices) == old_free);
+    fake_free_list(self.allocator.free_slices);
+    self.allocator.free_slices = NULL;
+    mock_slice_unref(reservation);
+    fail_branch_allocation = omit_aligned_slice = FALSE;
     reserved_releases = near_allocations = 0;
 
     assert(peak_gum_darwin_prepare_attach(interceptor, entry, listener, NULL) == GUM_ATTACH_OK);
@@ -268,6 +312,33 @@ int main(void)
     assert(redirect_size == 16 && gum_arm64_writer_offset(&writer) == 16);
     gum_arm64_writer_reset(&writer, redirect);
     writer.pc = GUM_ADDRESS(entry);
+    GumAddress source_page = writer.pc & ~((GumAddress)4095);
+    details.target = GSIZE_TO_POINTER(source_page + 0x10000000);
+    details.capacity = 8;
+    redirect_size = 0;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_WRITTEN);
+    assert(redirect_size == 8 && gum_arm64_writer_offset(&writer) == 8);
+    guint32 adrp, br;
+    memcpy(&adrp, redirect, 4);
+    memcpy(&br, redirect + 4, 4);
+    assert((adrp & 0x9f000000u) == 0x90000000u);
+    assert(br == 0xd61f0200u); /* br x16, without pointer authentication */
+    gum_arm64_writer_reset(&writer, redirect);
+    writer.pc = GUM_ADDRESS(entry);
+    redirect_size = 0;
+    details.target = GSIZE_TO_POINTER(source_page + 0x10000004);
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    details.target = GSIZE_TO_POINTER(source_page + ((GumAddress)1 << 32));
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    details.target = GSIZE_TO_POINTER(source_page + ((GumAddress)1 << 32) - 4096);
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_WRITTEN);
+    assert(redirect_size == 8 && gum_arm64_writer_offset(&writer) == 8);
+    gum_arm64_writer_reset(&writer, redirect);
+    writer.pc = GUM_ADDRESS(entry);
+    details.target = GSIZE_TO_POINTER(source_page + 0x1000000000ULL);
+    details.capacity = 16;
     guint32 read_x16 = 0xaa1003e0u; /* mov x0, x16 */
     guint32 read_x17 = 0xaa1103e1u; /* mov x1, x17 */
     memcpy(entry, &read_x16, 4);
@@ -279,6 +350,12 @@ int main(void)
     assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
     details.scratch_register = ARM64_REG_X17;
     assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
+    details.target = GSIZE_TO_POINTER(source_page + 0x10000000);
+    details.capacity = 8;
+    assert(peak_gum_darwin_write_staged_redirect(&details, &redirect_size) == GUM_REDIRECT_DECLINED);
+    assert(strcmp(peak_gum_darwin_last_stage_failure(),
+        "adrp-redirect-no-free-scratch-register") == 0);
     assert(redirect_size == 0 && gum_arm64_writer_offset(&writer) == 0);
     /* The normal on_enter trampoline clobbers the chosen scratch even if
      * its entry redirect is B. One instruction reads both x16 and x17. */

@@ -23,9 +23,9 @@
 
 gboolean peak_attach_configure(GVariant *dictionary, gchar **message);
 
-/* An attach runtime is process-owned after the first activation attempt.
- * Keeping this library resident preserves callbacks, TLS destructors, and the
- * ordinary PEAK process-exit reporting path. */
+/* Activation attempts are serialized. Correctable preflight errors release
+ * admission; once runtime consumers may exist, the claim stays held for the
+ * process lifetime. Residency preserves callbacks, TLS and exit reporting. */
 static atomic_flag activation_claimed = ATOMIC_FLAG_INIT;
 
 static gboolean
@@ -239,6 +239,8 @@ has_existing_runtime(void)
 #if defined(__APPLE__)
     atomic_store_explicit(&census_self_base, (uintptr_t) self.dli_fbase,
                           memory_order_release);
+    atomic_store_explicit(&existing_peak_image, FALSE, memory_order_release);
+    atomic_store_explicit(&census_complete, FALSE, memory_order_release);
     _dyld_register_func_for_add_image(inspect_loaded_image);
     atomic_store_explicit(&census_complete, TRUE, memory_order_release);
     return atomic_load_explicit(&existing_peak_image, memory_order_acquire);
@@ -255,6 +257,7 @@ activate_runtime(void *data)
     GVariant *config = NULL, *dictionary = NULL;
     char *config_text = NULL;
     gchar *message = NULL;
+    gboolean configured = FALSE;
     guint version;
     free(socket_path);
     if (fd < 0)
@@ -275,6 +278,7 @@ activate_runtime(void *data)
         return NULL;
     }
     if (has_existing_runtime()) {
+        atomic_flag_clear_explicit(&activation_claimed, memory_order_release);
         send_literal_ack(fd, "('error', 'another PEAK runtime is already present in this process')");
         free(config_text);
         close(fd);
@@ -282,6 +286,8 @@ activate_runtime(void *data)
     }
     int preparation = peak_attach_runtime_prepare();
     if (preparation <= 0) {
+        if (preparation < 0)
+            atomic_flag_clear_explicit(&activation_claimed, memory_order_release);
         send_literal_ack(fd, preparation < 0 ?
             "('error', 'this macOS Gum provider has no safe staged attach bootstrap')" :
             "('error', 'Gum lifecycle initialization was already claimed')");
@@ -302,12 +308,18 @@ activate_runtime(void *data)
     }
     if (!peak_attach_configure(dictionary, &message))
         goto failed;
+    configured = TRUE;
     if (!peak_attach_runtime_start(&message))
         goto failed;
     send_ack(fd, "ready", message != NULL ? message :
         "PEAK is profiling until this process exits; normal PEAK reporting runs at exit");
     goto done;
 failed:
+    if (!peak_attach_runtime_attempt_is_terminal()) {
+        if (configured)
+            peak_attach_config_reset_preflight();
+        atomic_flag_clear_explicit(&activation_claimed, memory_order_release);
+    }
     send_ack(fd, "error", message);
 done:
     g_clear_pointer(&dictionary, g_variant_unref);

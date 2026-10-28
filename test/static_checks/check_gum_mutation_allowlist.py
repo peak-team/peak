@@ -76,7 +76,7 @@ EXPECTED = {
         "begin_transaction": 1, "end_transaction": 1,
     },
     ("darwin-staged-prepare", "src/gum_peak_darwin_patch_api.c"): {
-        "begin_transaction": 1, "end_transaction": 1,
+        "begin_transaction": 1, "end_transaction": 2,
         "attach": 1, "replace": 1, "detach": 2, "revert": 2,
     },
     ("support-init", "src/pthread_listener.c"): {

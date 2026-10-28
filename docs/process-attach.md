@@ -71,13 +71,18 @@ is captured when the command runs; it does not change the target's environment.
 PEAK's existing overhead controller may physically detach and reattach
 selected hooks while the attached runtime remains resident.
 
-Activation is one-shot: a second attach attempt to a process where activation
-was already attempted is refused, and a process with an existing preload PEAK
-runtime cannot be attached. Once activation is confirmed, `peak-attach` exits
-successfully while profiling continues in the target. The injected runtime
-stays resident until normal process exit, when PEAK writes its usual report.
-The command does not provide a separate stop operation or report the target's
-eventual native exit status.
+Attach attempts are serialized. Protocol or configuration errors and other
+preflight rejections, such as an invalid selector, unsupported exec option,
+incompatible MPI state, or no requested profiling work, leave the process
+eligible for a corrected retry. The claim becomes one-shot immediately before
+PEAK begins runtime activation and registers process-exit handling. From that
+point onward, retries are refused even if startup fails after partially
+activating the runtime; its configuration and any callback-visible state must
+remain resident. A process with an existing PEAK runtime cannot be attached.
+Once activation is confirmed, `peak-attach` exits successfully while profiling
+continues in the target. The injected runtime stays resident until normal
+process exit, when PEAK writes its usual report. The command does not provide a
+separate stop operation or report the target's eventual native exit status.
 
 The debugger's initial attach and runtime bootstrap briefly interrupt target
 execution. A syscall already in flight may return `EINTR` if it is not

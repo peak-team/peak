@@ -2586,9 +2586,20 @@ peak_attach_library_fini(void)
     peak_fini();
 }
 
+static _Atomic int peak_attach_gum_prepared;
+static _Atomic int peak_attach_attempt_terminal;
+
+int
+peak_attach_runtime_attempt_is_terminal(void)
+{
+    return atomic_load_explicit(&peak_attach_attempt_terminal, memory_order_acquire);
+}
+
 int
 peak_attach_runtime_prepare(void)
 {
+    if (atomic_load_explicit(&peak_attach_gum_prepared, memory_order_acquire))
+        return 1;
 #if defined(__APPLE__)
 #if defined(PEAK_HAVE_GUM_DARWIN_PATCH_API) && \
     PEAK_GUM_DARWIN_STAGED_ATTACH_API_VERSION >= 1
@@ -2603,6 +2614,7 @@ peak_attach_runtime_prepare(void)
     if (!gum_interceptor_peak_unwind_lifecycle_init())
         return 0;
     gum_init_embedded();
+    atomic_store_explicit(&peak_attach_gum_prepared, 1, memory_order_release);
     return 1;
 }
 
@@ -2636,6 +2648,18 @@ peak_attach_runtime_start(char **message)
             *message = g_strdup("late attach to an MPI process requires MPI_Init to have completed; attach after MPI_Init");
             return 0;
         }
+        if (initialized && !finalized) {
+            int provided = MPI_THREAD_SINGLE;
+
+            if (MPI_Query_thread(&provided) != MPI_SUCCESS) {
+                *message = g_strdup("cannot determine the existing MPI thread support level");
+                return 0;
+            }
+            if (provided < MPI_THREAD_MULTIPLE) {
+                *message = g_strdup("late attach to an active MPI runtime requires MPI_THREAD_MULTIPLE; initialize the application with MPI_Init_thread requesting MPI_THREAD_MULTIPLE and verify the provided level before attaching");
+                return 0;
+            }
+        }
     }
 #endif
     /* Validate configured target syntax before any Gum/bootstrap mutation.
@@ -2656,6 +2680,20 @@ peak_attach_runtime_start(char **message)
         }
     }
     free_parsed_result(configured_targets, configured_count);
+    const char *gpu_targets = getenv(PEAK_GPU_TARGET_ENV);
+    const char *gpu_target_file = getenv(PEAK_GPU_TARGET_FILE_ENV);
+    if (configured_count == 0 && !parse_env_to_bool(PEAK_MEMORY_PROFILE) &&
+        !parse_env_to_bool(PEAK_GPU_MONITOR_ALL) &&
+        (gpu_targets == NULL || gpu_targets[0] == '\0') &&
+        (gpu_target_file == NULL || gpu_target_file[0] == '\0') &&
+        !peak_jit_provider_requested()) {
+        *message = g_strdup("no profiling work was requested; configure PEAK_TARGET or another supported profiling mode");
+        return 0;
+    }
+    /* From this boundary onward, runtime state, callbacks or exit handlers
+     * can become consumers of the immutable config. Even a later failure is
+     * terminal: neither configuration nor a partial runtime may be reused. */
+    atomic_store_explicit(&peak_attach_attempt_terminal, 1, memory_order_release);
     /* Helper/control threads never contribute application statistics. */
     pthread_listener_exclude_current_thread();
     peak_set_process_profile_enabled(TRUE);

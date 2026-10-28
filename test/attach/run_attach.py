@@ -1,6 +1,7 @@
 """Exercise the public attach executable against a non-preloaded live process."""
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 from pathlib import Path
@@ -72,15 +73,35 @@ def counter(path):
         return 0
 
 
-def alive(process, progress):
-    assert process.poll() is None, "profiling terminated the target"
-    before = counter(progress)
-    wait_for(lambda: counter(progress) > before, 3)
+def alive(process, progress, fixture_log=None):
+    try:
+        assert process.poll() is None, "profiling terminated the target"
+        before = counter(progress)
+        wait_for(lambda: counter(progress) > before, 3)
+    except AssertionError as error:
+        detail = fixture_evidence(process, fixture_log) if fixture_log else ""
+        raise AssertionError(f"{error}; target status={process.poll()}\n{detail}") from error
 
 
 def fixture_evidence(process, log_path):
     evidence = log_path.read_text(errors="replace")
     status = process.poll()
+    if sys.platform.startswith("linux"):
+        tracers = set()
+        for task in sorted(Path(f"/proc/{process.pid}/task").glob("*/status"))[:24]:
+            try:
+                lines = task.read_text().splitlines()
+            except OSError:
+                continue
+            state = [line for line in lines if line.startswith(("Name:", "State:", "TracerPid:"))]
+            evidence += f"\n{task}: {state!r}"
+            tracers.update(int(line.split(":", 1)[1]) for line in state
+                           if line.startswith("TracerPid:") and int(line.split(":", 1)[1]))
+        for tracer in tracers:
+            try:
+                evidence += f"\ntracer {tracer} comm: " + Path(f"/proc/{tracer}/comm").read_text().strip()
+            except OSError:
+                pass
     if sys.platform != "darwin" or status is None or status >= 0:
         return evidence
     directories = [Path.home() / "Library/Logs/DiagnosticReports",
@@ -118,7 +139,7 @@ def filesystem_phase(target, log_path, phase):
 
 def report(prefix):
     paths = list(prefix.parent.glob(prefix.name + "*.csv"))
-    assert paths, f"no normal PEAK CSV for {prefix}"
+    assert len(paths) == 1, f"expected one PEAK runtime report for {prefix}: {paths}"
     rows = []
     for path in paths:
         with path.open() as stream:
@@ -177,7 +198,7 @@ else:
             if target.poll() == 77:
                 print("SKIP: fixture cannot enable Linux ptrace permission")
                 raise SystemExit(77)
-            alive(target, progress)
+            alive(target, progress, root / "fixture.log")
             agent_options = ["--agent", str(args.agent.resolve())] if args.agent else []
             base = [cli, str(target.pid)] + agent_options
             env.update(PEAK_HEARTBEAT_INTERVAL="0.05", PEAK_COST="0.01",
@@ -209,8 +230,27 @@ else:
                 assert not any(word in output.lower() for word in
                                ("timed out", "connection was lost",
                                 "activation was not confirmed")), output
-                alive(target, progress)
+                alive(target, progress, root / "fixture.log")
                 filesystem_phase(target, root / "fixture.log", "B")
+            # Correctable preflight failures must release their claim/config
+            # without creating hooks, reports, or a second runtime instance.
+            rejected_prefix = root / "rejected"
+            retry_cases = [
+                ("!", env, "invalid PEAK target selector"),
+                ("peak_attach_existing_target", dict(env, PEAK_EXEC_CHAIN="1"),
+                 "late attach cannot propagate PEAK across exec"),
+            ]
+            for selector, rejected_env, diagnostic in retry_cases:
+                filesystem_phase(target, root / "fixture.log", "B")
+                code, output = run(base + ["--target", selector, "--output",
+                                          str(rejected_prefix)], rejected_env,
+                                   fixture_log=root / "fixture.log")
+                assert code != 0 and diagnostic in output, (
+                    code, output, fixture_evidence(target, root / "fixture.log"))
+                assert "already" not in output.lower(), output
+                alive(target, progress, root / "fixture.log")
+                assert not list(root.glob("rejected*.csv")), list(root.iterdir())
+            filesystem_phase(target, root / "fixture.log", "B")
             prefix = root / "stats"
             code, output = run(base + ["--target",
                                       "peak_attach_existing_target,peak_attach_churn_target",
@@ -226,13 +266,19 @@ else:
                 print("SKIP: platform denied native attach:\n" + output)
                 raise SystemExit(77)
             assert code == 0, (code, output, target.poll(), fixture_evidence(target, root / "fixture.log"))
-            alive(target, progress)
+            alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "G")
-            alive(target, progress)
+            alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "B")
-            code, output = run(base + ["--target", "peak_attach_existing_target"], env)
-            assert code != 0 and output.strip(), (code, output)
-            alive(target, progress)
+            with ThreadPoolExecutor(max_workers=2) as clients:
+                duplicates = [clients.submit(
+                    run, base + ["--target", "peak_attach_existing_target"], env,
+                    fixture_log=root / "fixture.log") for _ in range(2)]
+                for duplicate in duplicates:
+                    code, output = duplicate.result()
+                    assert code != 0 and "already" in output.lower(), (
+                        code, output, fixture_evidence(target, root / "fixture.log"))
+            alive(target, progress, root / "fixture.log")
             # A byte-for-byte copied agent has different image identity too.
             if args.agent:
                 copied_agent = root / ("arbitrary-copy" + args.agent.suffix)
@@ -241,7 +287,7 @@ else:
                 code, output = run([cli, str(target.pid), "--agent", str(copied_agent),
                                     "--target", "peak_attach_existing_target"], env)
                 assert code != 0 and "already" in output.lower(), (code, output)
-                alive(target, progress)
+                alive(target, progress, root / "fixture.log")
             filesystem_phase(target, root / "fixture.log", "G")
             if args.mode == "runtime":
                 trace = root / "detach.csv"
@@ -298,7 +344,7 @@ else:
                                     "peak_attach_missing_target"], env)
                 assert code == 0 and output.strip(), (code, output)
                 assert "pending" in output.lower(), output
-                alive(other, other_progress)
+                alive(other, other_progress, root / "fixture.log")
                 other.stdin.write(b"Q")
                 other.stdin.flush()
                 assert other.wait(timeout=20) == 0

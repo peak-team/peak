@@ -5,7 +5,7 @@
 #include <stdatomic.h>
 #include <string.h>
 
-/* Published once before any runtime/helper thread starts; strings live as
+/* Published during serialized preflight; after activation strings live as
  * long as the resident attached runtime. No process environment is changed. */
 static _Atomic(GHashTable *) attached_environment;
 
@@ -64,4 +64,15 @@ const char *
 peak_attach_glib_getenv(const char *name)
 {
     return peak_attach_getenv(name);
+}
+
+void
+peak_attach_config_reset_preflight(void)
+{
+    /* The agent owns exclusive activation and has proved that no runtime
+     * consumer or hook was started. Never call after peak_init admission. */
+    GHashTable *environment = atomic_exchange_explicit(&attached_environment,
+                                                       NULL, memory_order_acq_rel);
+    if (environment != NULL)
+        g_hash_table_unref(environment);
 }

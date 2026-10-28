@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -131,6 +132,7 @@ typedef struct {
 typedef struct {
     pid_t pid;
     int error_fd;
+    int control_fd;
     gboolean done;
     gboolean failed;
     gboolean leader_lost;
@@ -211,10 +213,13 @@ static void collect_worker_helpers(InjectionWorker *worker)
                 .start_microseconds = info.pbi_start_tvusec};
             char phase[192];
             snprintf(phase, sizeof(phase),
-                     "tracked injector child %ld parent %ld birth %llu.%06llu",
+                     "tracked injector child %ld parent %ld birth %llu.%06llu "
+                     "uid %u pgid %u status %u",
                      (long)children[i], (long)worker->pid,
                      (unsigned long long)info.pbi_start_tvsec,
-                     (unsigned long long)info.pbi_start_tvusec);
+                     (unsigned long long)info.pbi_start_tvusec,
+                     (unsigned int)info.pbi_uid, info.pbi_pgid,
+                     info.pbi_status);
             diagnostic_phase(phase);
         }
     }
@@ -301,7 +306,8 @@ static void signal_worker_helpers(InjectionWorker *worker, int signal_number)
 #if defined(__APPLE__)
 static char *default_bootstrap(void);
 #endif
-static int run_injector(guint pid, const char *agent, const char *socket_path)
+static int run_injector(guint pid, const char *agent, const char *socket_path,
+                        int control_fd)
 {
     FridaInjector *injector = frida_injector_new();
     GError *error = NULL;
@@ -345,6 +351,18 @@ static int run_injector(guint pid, const char *agent, const char *socket_path)
         fprintf(stderr, "peak-attach: injection failed: %s\n", error->message);
         g_clear_error(&error);
     }
+    if (!result) {
+        diagnostic_phase("inject accepted; awaiting parent release");
+        gint64 until = deadline_ms() + 20000;
+        while (deadline_ms() < until) {
+            struct pollfd control = {control_fd, POLLIN | POLLHUP, 0};
+            int ready = poll(&control, 1, 100);
+            if (ready > 0 || (ready < 0 && errno != EINTR))
+                break;
+        }
+        diagnostic_phase("parent released injector");
+    }
+    close(control_fd);
     diagnostic_phase("injector close begin");
     frida_injector_close_sync(injector, NULL, &error);
     diagnostic_phase("injector close returned");
@@ -398,10 +416,14 @@ static void finish_worker(InjectionWorker *worker, gboolean completed_response)
     if (worker->pid <= 0)
         return;
     collect_worker_helpers(worker);
+    if (worker->control_fd >= 0) {
+        close(worker->control_fd);
+        worker->control_fd = -1;
+    }
     /* Error ACKs also precede the remote entrypoint return; allow Core to
      * complete injection and helper close before signaling the worker. */
     gint64 deadline =
-        deadline_ms() + (completed_response && !interrupted ? 2000 : 0);
+        deadline_ms() + (completed_response && !interrupted ? 2000 : 500);
     while ((!worker->done || worker_helpers_pending(worker)) &&
            deadline_ms() < deadline) {
         inspect_worker(worker);
@@ -570,12 +592,61 @@ static gboolean verify_peer(int fd, pid_t pid)
            cred.pid == pid;
 #endif
 }
-static gboolean start_worker(InjectionWorker *worker, guint pid,
-                             const char *agent, const char *socket_path)
+static gboolean private_pipe(int descriptors[2])
 {
-    int errors[2];
-    if (pipe(errors))
+    if (pipe(descriptors))
         return FALSE;
+    for (int i = 0; i < 2; ++i) {
+        int replacement = fcntl(descriptors[i], F_DUPFD_CLOEXEC, 3);
+        if (replacement < 0) {
+            int saved = errno;
+            close(descriptors[0]);
+            close(descriptors[1]);
+            errno = saved;
+            return FALSE;
+        }
+        close(descriptors[i]);
+        descriptors[i] = replacement;
+    }
+    return TRUE;
+}
+static gboolean start_worker(InjectionWorker *worker, guint pid,
+                             const char *agent, const char *socket_path,
+                             int target_lock)
+{
+    int lease_copy = -1;
+    int controls[2];
+    if (!private_pipe(controls))
+        return FALSE;
+    int control_copy = fcntl(controls[0], F_DUPFD_CLOEXEC, 10);
+    if (control_copy < 0 || fcntl(controls[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(controls[1], F_SETFD, FD_CLOEXEC) < 0) {
+        if (control_copy >= 0)
+            close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
+        return FALSE;
+    }
+    lease_copy = fcntl(target_lock, F_DUPFD_CLOEXEC, 10);
+    if (lease_copy < 0) {
+        close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
+        return FALSE;
+    }
+    int errors[2];
+    if (!private_pipe(errors)) {
+        close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
+        return FALSE;
+    }
     if (fcntl(errors[0], F_SETFD, FD_CLOEXEC) < 0 ||
         fcntl(errors[0], F_SETFL, O_NONBLOCK) < 0 ||
         fcntl(errors[1], F_SETFD, FD_CLOEXEC) < 0) {
@@ -583,12 +654,22 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
         close(errors[0]);
         close(errors[1]);
         errno = error;
+        close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
         return FALSE;
     }
     char *exe = executable_path();
     if (!exe) {
         close(errors[0]);
         close(errors[1]);
+        close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
         return FALSE;
     }
     int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -598,12 +679,45 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
         close(errors[0]);
         close(errors[1]);
         errno = error;
+        close(control_copy);
+        if (lease_copy >= 0)
+            close(lease_copy);
+        close(controls[0]);
+        close(controls[1]);
         return FALSE;
+    }
+    if (null_fd < 3) {
+        int replacement = fcntl(null_fd, F_DUPFD_CLOEXEC, 3);
+        int saved = errno;
+        close(null_fd);
+        null_fd = replacement;
+        if (null_fd < 0) {
+            free(exe);
+            close(errors[0]);
+            close(errors[1]);
+            close(control_copy);
+            if (lease_copy >= 0)
+                close(lease_copy);
+            close(controls[0]);
+            close(controls[1]);
+            errno = saved;
+            return FALSE;
+        }
     }
     char pid_text[32];
     snprintf(pid_text, sizeof(pid_text), "%u", pid);
-    char *arguments[] = {exe,           "--internal-inject", pid_text,
-                         (char *)agent, (char *)socket_path, NULL};
+    char lease_text[32];
+    snprintf(lease_text, sizeof(lease_text), "%d", lease_copy);
+    char control_text[32];
+    snprintf(control_text, sizeof(control_text), "%d", control_copy);
+    char *arguments[] = {exe,
+                         "--internal-inject",
+                         pid_text,
+                         (char *)agent,
+                         (char *)socket_path,
+                         control_text,
+                         lease_text,
+                         NULL};
     posix_spawnattr_t attributes;
     posix_spawn_file_actions_t actions;
     gboolean attributes_ready = FALSE, actions_ready = FALSE;
@@ -621,6 +735,21 @@ static gboolean start_worker(InjectionWorker *worker, guint pid,
     if (error)
         goto spawn_cleanup;
     actions_ready = TRUE;
+    /* Duplicate the same flock open-file description so parent death cannot
+     * release serialization while Core is still cleaning up in this worker. */
+    error = posix_spawn_file_actions_adddup2(&actions, target_lock, lease_copy);
+    if (error)
+        goto spawn_cleanup;
+    error =
+        posix_spawn_file_actions_adddup2(&actions, controls[0], control_copy);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_addclose(&actions, controls[0]);
+    if (error)
+        goto spawn_cleanup;
+    error = posix_spawn_file_actions_addclose(&actions, controls[1]);
+    if (error)
+        goto spawn_cleanup;
     error = posix_spawn_file_actions_adddup2(&actions, null_fd, STDIN_FILENO);
     if (error)
         goto spawn_cleanup;
@@ -650,12 +779,18 @@ spawn_cleanup:
     free(exe);
     close(null_fd);
     close(errors[1]);
+    close(controls[0]);
+    close(control_copy);
+    if (lease_copy >= 0)
+        close(lease_copy);
     if (error) {
+        close(controls[1]);
         worker->pid = 0;
         close(errors[0]);
         errno = error;
         return FALSE;
     }
+    worker->control_fd = controls[1];
     worker->error_fd = errors[0];
     return TRUE;
 }
@@ -717,20 +852,69 @@ static GVariant *build_configuration(GPtrArray *targets, const char *output)
     }
     return configuration;
 }
+/* Keep lock inodes persistent: unlinking a held file permits a second inode
+ * to admit another injector for the same target. */
+static int lock_target(guint pid)
+{
+    char directory[128], name[64];
+    snprintf(directory, sizeof(directory), "/tmp/peak-attach-locks-%lu",
+             (unsigned long)getuid());
+    if (mkdir(directory, 0700) && errno != EEXIST)
+        return -1;
+    int dir = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat info;
+    if (dir < 0)
+        return -1;
+    if (fstat(dir, &info) || !S_ISDIR(info.st_mode) ||
+        info.st_uid != getuid() || (info.st_mode & 0777) != 0700) {
+        close(dir);
+        errno = EPERM;
+        return -1;
+    }
+    snprintf(name, sizeof(name), "%u.lock", pid);
+    int fd = openat(dir, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    close(dir);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != getuid() ||
+        (info.st_mode & 0777) != 0600 || info.st_nlink != 1) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB)) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
 int main(int argc, char **argv)
 {
     diagnostic_phase("Frida init begin");
     frida_init();
     diagnostic_phase("Frida init returned");
-    if (argc == 5 && !strcmp(argv[1], "--internal-inject")) {
+    if (argc == 7 && !strcmp(argv[1], "--internal-inject")) {
         char *end;
         unsigned long pid = strtoul(argv[2], &end, 10);
-        int result = !*argv[2] || *end || !pid || pid > INT_MAX
-                         ? 1
-                         : run_injector((guint)pid, argv[3], argv[4]);
+        char *lease_end;
+        long lease = strtol(argv[6], &lease_end, 10);
+        char *fd_end;
+        long control = strtol(argv[5], &fd_end, 10);
+        int result =
+            !*argv[6] || *lease_end || lease < 3 || lease > INT_MAX ||
+                    fcntl((int)lease, F_SETFD, FD_CLOEXEC) < 0 || !*argv[5] ||
+                    *fd_end || control < 3 || control > INT_MAX ||
+                    fcntl((int)control, F_SETFD, FD_CLOEXEC) < 0 || !*argv[2] ||
+                    *end || !pid || pid > INT_MAX
+                ? 1
+                : run_injector((guint)pid, argv[3], argv[4], (int)control);
         diagnostic_phase("worker Frida deinit begin");
         frida_deinit();
         diagnostic_phase("worker Frida deinit returned");
+        if (lease >= 3 && lease <= INT_MAX)
+            close((int)lease);
         return result;
     }
     GVariant *configuration = NULL;
@@ -739,6 +923,7 @@ int main(int argc, char **argv)
     const char *output = NULL;
     GPtrArray *targets = g_ptr_array_new_with_free_func(g_free);
     int result = 1;
+    int target_lock = -1;
     for (int k = 1; k < argc; ++k) {
         const char *a = argv[k];
         if (!strcmp(a, "--help")) {
@@ -799,10 +984,19 @@ int main(int argc, char **argv)
     configuration = build_configuration(targets, output);
     if (!configuration)
         goto args_done;
+    target_lock = lock_target(pid);
+    if (target_lock < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN)
+            fprintf(stderr, "peak-attach: another peak-attach command is "
+                            "already activating this process\n");
+        else
+            perror("peak-attach: target activation lock");
+        goto args_done;
+    }
     char directory[] = "/tmp/peak-attach-XXXXXX";
     char socket_path[108] = {0};
     int listener = -1, peer = -1;
-    InjectionWorker worker = {.error_fd = -1};
+    InjectionWorker worker = {.error_fd = -1, .control_fd = -1};
     gboolean completed_response = FALSE;
     if (!mkdtemp(directory)) {
         perror("peak-attach: mkdtemp");
@@ -826,7 +1020,7 @@ int main(int argc, char **argv)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    if (!start_worker(&worker, pid, agent, socket_path)) {
+    if (!start_worker(&worker, pid, agent, socket_path, target_lock)) {
         perror("peak-attach: start injector");
         goto cleanup;
     }
@@ -901,6 +1095,8 @@ invalid:
     usage(stderr);
     fprintf(stderr, "peak-attach: invalid arguments\n");
 args_done:
+    if (target_lock >= 0)
+        close(target_lock);
     if (configuration)
         g_variant_unref(configuration);
     g_free(agent);

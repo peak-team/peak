@@ -31,6 +31,14 @@ main(void)
     if (peak_attach_configure(dictionary, &message) || message == NULL)
         return 6;
     g_free(message);
+    message = NULL;
+    /* A serialized rejected preflight has no runtime consumer yet and can
+     * discard the scoped overlay before the next corrected request. */
+    peak_attach_config_reset_preflight();
+    if (strcmp(getenv("PEAK_TARGET"), "original-target") != 0 ||
+        !peak_attach_configure(dictionary, &message) || message != NULL ||
+        strcmp(peak_attach_getenv("PEAK_TARGET"), "injected-target") != 0)
+        return 7;
     g_variant_unref(dictionary);
     /* The real runtime intentionally stays resident until process exit. */
     return 0;

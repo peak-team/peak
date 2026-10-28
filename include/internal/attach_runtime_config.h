@@ -19,6 +19,9 @@ char *peak_attach_getenv(const char *name);
 const char *peak_attach_glib_getenv(const char *name);
 int peak_attach_runtime_prepare(void);
 int peak_attach_runtime_start(char **message);
+int peak_attach_runtime_attempt_is_terminal(void);
+/* Only the serialized agent preflight may reset, before terminal boundary. */
+void peak_attach_config_reset_preflight(void);
 #ifdef __cplusplus
 }
 #endif

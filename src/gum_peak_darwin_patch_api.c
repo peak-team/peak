@@ -94,9 +94,9 @@ typedef struct {
 } PeakGumListenerEntry17;
 
 typedef struct {
-    PeakGumFunctionContext17* context;
-    gpointer activate;
-} PeakGumUpdateTask17;
+    GList parent;
+    GumCodeSlice slice;
+} PeakGumCodeSliceElement17;
 
 typedef struct {
     GumInterceptor* interceptor;
@@ -143,6 +143,8 @@ G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumInterceptor17, allocator) == 0x38);
 G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumInterceptor17, current_transaction) == 0xa8);
 G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumCodeAllocator17, free_slices) == 0x30);
 G_STATIC_ASSERT(sizeof(PeakGumCodeAllocator17) == sizeof(GumCodeAllocator));
+G_STATIC_ASSERT(G_STRUCT_OFFSET(PeakGumCodeSliceElement17, slice) == 0x18);
+G_STATIC_ASSERT(sizeof(PeakGumCodeSliceElement17) == 0x30);
 
 static gboolean
 peak_gum_darwin_context_has_only_listener(PeakGumFunctionContext17* context,
@@ -330,13 +332,15 @@ peak_gum_darwin_prove_scratch(const GumRedirectWriteDetails* details,
                           (gint)scratch);
     if (!proof || relocatable < prefix_size) {
         peak_gum_darwin_stage_failure = prefix_size == 4 ?
-            "direct-redirect-entry-too-short" : "absolute-redirect-entry-too-short";
+            "direct-redirect-entry-too-short" : prefix_size == 8 ?
+            "adrp-redirect-entry-too-short" : "absolute-redirect-entry-too-short";
         return FALSE;
     }
     if (scratch == ARM64_REG_INVALID ||
         scratch != (arm64_reg)details->scratch_register) {
         peak_gum_darwin_stage_failure = prefix_size == 4 ?
-            "direct-redirect-no-free-scratch-register" :
+            "direct-redirect-no-free-scratch-register" : prefix_size == 8 ?
+            "adrp-redirect-no-free-scratch-register" :
             "absolute-redirect-no-free-scratch-register";
         return FALSE;
     }
@@ -355,6 +359,7 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
     guint* redirect_size = user_data;
     peak_gum_darwin_trace("redirect-callback", GSIZE_TO_POINTER(writer->pc),
                           (gint)details->scratch_register);
+    peak_gum_darwin_trace("redirect-capacity", details->target, (gint)details->capacity);
 
     if (details->capacity >= 4 &&
         gum_arm64_writer_can_branch_directly_between(
@@ -367,6 +372,25 @@ peak_gum_darwin_write_staged_redirect(const GumRedirectWriteDetails* details,
         }
         *redirect_size = 4;
         peak_gum_darwin_trace("redirect-direct-ready", details->target, 4);
+        return GUM_REDIRECT_WRITTEN;
+    }
+    GumAddress target = GUM_ADDRESS(gum_strip_code_pointer(details->target));
+    GumAddress source_page = writer->pc & ~((GumAddress)4095);
+    gint64 page_distance = ((gint64)target - (gint64)source_page) / 4096;
+    if (details->capacity >= 8 && target % 4096 == 0 &&
+        page_distance >= -((gint64)1 << 20) &&
+        page_distance < ((gint64)1 << 20)) {
+        if (!peak_gum_darwin_prove_scratch(details, 8)) {
+            return GUM_REDIRECT_DECLINED;
+        }
+        if (!gum_arm64_writer_put_adrp_reg_address(writer,
+                details->scratch_register, target) ||
+            !gum_arm64_writer_put_br_reg_no_auth(writer,
+                details->scratch_register)) {
+            return GUM_REDIRECT_DECLINED;
+        }
+        *redirect_size = 8;
+        peak_gum_darwin_trace("redirect-adrp-ready", details->target, 8);
         return GUM_REDIRECT_WRITTEN;
     }
     if (details->capacity < 16) {
@@ -482,6 +506,7 @@ peak_gum_darwin_reserve_near_batch(GumInterceptor* interceptor, gpointer address
     GList* saved_free_slices;
     GumAddressSpec spec;
     GumCodeSlice* reserved;
+    gboolean page_aligned_required = FALSE;
 
     *reserved_out = NULL;
     if (page_size == 0 || allocator->pages_per_batch == 0 ||
@@ -501,7 +526,37 @@ peak_gum_darwin_reserve_near_batch(GumInterceptor* interceptor, gpointer address
     peak_gum_darwin_trace("near-batch-begin", address, 0);
     reserved = gum_code_allocator_try_alloc_slice_near(
         (GumCodeAllocator*)allocator, &spec, 0);
+    if (reserved == NULL) {
+        /* The shared cache can occupy the entire B-immediate neighborhood.
+         * An eight-byte ADRP/BR redirect reaches a page-aligned trampoline
+         * within signed 21-bit logical pages (plus its complete batch). */
+        spec.near_address = GSIZE_TO_POINTER(
+            GPOINTER_TO_SIZE(spec.near_address) & ~((gsize)4095));
+        spec.max_distance = ((gsize)1 << 32) -
+            allocator->pages_per_batch * page_size - 4096;
+        page_aligned_required = TRUE;
+        peak_gum_darwin_trace("near-adrp-batch-begin", address, 0);
+        reserved = gum_code_allocator_try_alloc_slice_near(
+            (GumCodeAllocator*)allocator, &spec, 0);
+    }
     gboolean has_free_near_slice = allocator->free_slices != NULL;
+    if (reserved != NULL && page_aligned_required) {
+        GList* aligned = NULL;
+        for (GList* cur = allocator->free_slices; cur != NULL; cur = cur->next) {
+            PeakGumCodeSliceElement17* element = (PeakGumCodeSliceElement17*)cur;
+            if (GPOINTER_TO_SIZE(element->slice.pc) % 4096 == 0) {
+                aligned = cur;
+                break;
+            }
+        }
+        has_free_near_slice = aligned != NULL;
+        if (aligned != NULL) {
+            allocator->free_slices = g_list_remove_link(allocator->free_slices,
+                                                        aligned);
+            allocator->free_slices = g_list_concat(aligned,
+                                                   allocator->free_slices);
+        }
+    }
     /* g_list_concat only joins lists; Gum's embedded nodes are neither
      * copied nor freed. Restore the old list on allocation failure too. */
     allocator->free_slices = g_list_concat(allocator->free_slices,
