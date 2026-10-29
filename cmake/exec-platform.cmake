@@ -52,7 +52,9 @@ function(peak_budget_configure_optional_runtime target)
                 pthread_listener_exclude_current_thread
                 pthread_listener_mark_next_created_thread_helper
                 peak_global_budget_listener_idle_try_guard
-                peak_global_budget_listener_idle_unguard)
+                peak_global_budget_listener_idle_unguard
+                peak_global_budget_listener_admission_waiting
+                peak_global_budget_listener_credit_ready)
             target_link_options(${target} PRIVATE "LINKER:-U,_${_peak_budget_optional_symbol}")
         endforeach()
     endif()
