@@ -202,6 +202,8 @@ static _Atomic int signal_epoch_counter = 1;
 static _Atomic int signal_hold_epoch = 0;
 static _Atomic int signal_release_epoch = 0;
 static _Atomic int signal_wait_sequence = 0;
+/* Controller acknowledgments must not broadcast to parked application peers. */
+static _Atomic int signal_ack_sequence = 0;
 #ifdef PEAK_ENABLE_TEST_HOOKS
 static _Atomic int signal_test_wait_count = 0;
 #endif
@@ -226,6 +228,8 @@ static double strict_gate_wait_timeout_s =
  */
 _Static_assert(sizeof(signal_wait_sequence) == sizeof(int),
                "futex wait word must match int storage");
+_Static_assert(sizeof(signal_ack_sequence) == sizeof(int),
+               "controller ack futex word must match int storage");
 _Static_assert(sizeof(int) * CHAR_BIT == 32,
                "Linux futex wait word must be exactly 32 bits");
 _Static_assert(_Alignof(_Atomic int) == _Alignof(int),
@@ -237,6 +241,12 @@ static int*
 peak_detach_controller_signal_wait_futex_word(void)
 {
     return (int*)(void*)&signal_wait_sequence;
+}
+
+static int*
+peak_detach_controller_signal_ack_futex_word(void)
+{
+    return (int*)(void*)&signal_ack_sequence;
 }
 #endif
 
@@ -1645,6 +1655,7 @@ peak_detach_controller_signal_atomics_supported(void)
            atomic_is_lock_free(&signal_hold_epoch) &&
            atomic_is_lock_free(&signal_release_epoch) &&
            atomic_is_lock_free(&signal_wait_sequence) &&
+           atomic_is_lock_free(&signal_ack_sequence) &&
            atomic_is_lock_free(&signal_slot_count) &&
            atomic_is_lock_free(&signal_slots[0].active_epoch) &&
            atomic_is_lock_free(&signal_slots[0].arrived_epoch) &&
@@ -1992,6 +2003,47 @@ peak_detach_controller_signal_wake_release_waiters(void)
 #endif
 }
 
+/* Called by signal/trap handlers after publishing their epoch predicate.
+ * Only the serialized controller waits here; parked peers use another word. */
+static void
+peak_detach_controller_signal_notify_ack(void)
+{
+#if defined(__linux__)
+    int saved_errno = errno;
+    atomic_fetch_add_explicit(&signal_ack_sequence, 1, memory_order_release);
+    (void)peak_exec_raw_syscall6(SYS_futex,
+        (long)(uintptr_t)peak_detach_controller_signal_ack_futex_word(),
+        FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    errno = saved_errno;
+#endif
+}
+
+static void
+peak_detach_controller_signal_wait_ack(int expected_sequence, double deadline)
+{
+#if defined(__linux__)
+    double remaining = deadline - peak_detach_controller_monotonic_second();
+    if (remaining <= 0) return;
+    /* Exiting TIDs have no handler to notify us. Retain the old 1ms liveness
+     * cadence as a maximum sleep, while real acknowledgments wake promptly. */
+    struct timespec timeout = {.tv_sec = 0,
+        .tv_nsec = (long)(MIN(remaining, .001) * 1e9)};
+    int saved_errno = errno;
+    long result = peak_exec_raw_syscall6(SYS_futex,
+        (long)(uintptr_t)peak_detach_controller_signal_ack_futex_word(),
+        FUTEX_WAIT | FUTEX_PRIVATE_FLAG, expected_sequence,
+        (long)(uintptr_t)&timeout, 0, 0);
+    int wait_errno = errno; /* The raw wrapper translates kernel errors. */
+    if (result < 0 && wait_errno != EAGAIN && wait_errno != EINTR && wait_errno != ETIMEDOUT)
+        (void)nanosleep(&timeout, NULL); /* Unsupported futex: bounded polling. */
+    errno = saved_errno;
+#else
+    (void)expected_sequence;
+    (void)deadline;
+    usleep(1000);
+#endif
+}
+
 #ifdef PEAK_ENABLE_TEST_HOOKS
 int
 peak_detach_controller_test_signal_wait_sequence(void)
@@ -2058,6 +2110,7 @@ peak_detach_controller_signal_wait_for_release(PeakDetachSignalSlot* slot,
                               memory_order_release);
     }
     atomic_store_explicit(&slot->done_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_notify_ack();
     return TRUE;
 }
 
@@ -2091,6 +2144,7 @@ peak_detach_controller_signal_handler(int signo, siginfo_t* info, void* context)
         atomic_store_explicit(&slot->pc, 0, memory_order_relaxed);
     }
     atomic_store_explicit(&slot->arrived_epoch, epoch, memory_order_release);
+    peak_detach_controller_signal_notify_ack();
 
     (void)peak_detach_controller_signal_wait_for_release(slot,
                                                          epoch,
@@ -2433,6 +2487,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
     }
 
     for (;;) {
+        int expected_ack = atomic_load_explicit(&signal_ack_sequence, memory_order_acquire);
         if (atomic_load_explicit(&slot->arrived_epoch, memory_order_acquire) == epoch) {
             if (status_out != NULL) {
                 *status_out = PEAK_DETACH_STATUS_SAFE;
@@ -2452,7 +2507,7 @@ peak_detach_controller_signal_admit_thread(pid_t tid,
             }
             return FALSE;
         }
-        usleep(1000);
+        peak_detach_controller_signal_wait_ack(expected_ack, deadline);
     }
 }
 
@@ -2583,6 +2638,7 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
     double deadline = peak_detach_controller_monotonic_second() +
         ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     for (;;) {
+        int expected_ack = atomic_load_explicit(&signal_ack_sequence, memory_order_acquire);
         gboolean all_done = TRUE;
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
             PeakDetachSignalSlot* slot = &signal_slots[i];
@@ -2634,7 +2690,7 @@ peak_detach_controller_signal_release(PeakDetachStatus* status_out)
             }
             return FALSE;
         }
-        usleep(1000);
+        peak_detach_controller_signal_wait_ack(expected_ack, deadline);
     }
 }
 
@@ -2768,6 +2824,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
     double deadline = peak_detach_controller_monotonic_second() +
         ((double)PEAK_DETACH_CONTROLLER_IO_TIMEOUT_MS / 1000.0);
     for (;;) {
+        int expected_ack = atomic_load_explicit(&signal_ack_sequence, memory_order_acquire);
         gboolean all_arrived = TRUE;
         peak_detach_controller_signal_deactivate_exited_slots(epoch);
         for (uint32_t i = 0, count = atomic_load_explicit(&signal_slot_count, memory_order_acquire); i < count; i++) {
@@ -2788,7 +2845,7 @@ peak_detach_controller_signal_stop_threads_impl(PeakDetachHelperThreadSnapshot* 
             }
             return FALSE;
         }
-        usleep(1000);
+        peak_detach_controller_signal_wait_ack(expected_ack, deadline);
     }
 
     if (!peak_detach_controller_signal_verify_no_unheld_threads(controller_tid,
