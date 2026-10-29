@@ -54,7 +54,8 @@ function(peak_budget_configure_optional_runtime target)
                 peak_global_budget_listener_idle_try_guard
                 peak_global_budget_listener_idle_unguard
                 peak_global_budget_listener_admission_waiting
-                peak_global_budget_listener_credit_ready)
+                peak_global_budget_listener_credit_ready
+                peak_mpi_budget_events_frontier)
             target_link_options(${target} PRIVATE "LINKER:-U,_${_peak_budget_optional_symbol}")
         endforeach()
     endif()

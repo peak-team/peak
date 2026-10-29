@@ -239,6 +239,63 @@ target_link_libraries(cuda_interceptor_obj
 endif()
 
 if(MPI_FOUND)
+    # MPI-4 errata changed declarations implemented by some MPI-4.0 providers.
+    # Redeclarations produce hard errors on mismatches; no warning flags or
+    # provider/version whitelist determine the native ABI used by interposers.
+    include(CheckCSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_LIBRARIES MPI::MPI_C)
+    check_c_source_compiles("#include <mpi.h>
+#if MPI_VERSION < 4
+#error MPI_4_REQUIRED
+#endif
+int main(void) { return 0; }"
+        PEAK_MPI_HAS_VERSION_4)
+    if(PEAK_MPI_HAS_VERSION_4)
+        check_c_source_compiles("#include <mpi.h>
+extern int MPI_Psend_init(const void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+extern int PMPI_Psend_init(const void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+int main(void) { return 0; }"
+            PEAK_MPI_PSEND_INIT_CONST_BUFFER)
+        if(NOT PEAK_MPI_PSEND_INIT_CONST_BUFFER)
+            check_c_source_compiles("#include <mpi.h>
+extern int MPI_Psend_init(void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+extern int PMPI_Psend_init(void *, int, MPI_Count, MPI_Datatype, int, int, MPI_Comm, MPI_Info, MPI_Request *);
+int main(void) { return 0; }"
+                PEAK_MPI_PSEND_INIT_MUTABLE_BUFFER)
+            if(NOT PEAK_MPI_PSEND_INIT_MUTABLE_BUFFER)
+                message(FATAL_ERROR "Installed MPI_Psend_init/PMPI_Psend_init declarations have an unsupported signature")
+            endif()
+        endif()
+        check_c_source_compiles("#include <mpi.h>
+extern int MPI_Pready_list(int, const int *, MPI_Request);
+extern int PMPI_Pready_list(int, const int *, MPI_Request);
+int main(void) { return 0; }"
+            PEAK_MPI_PREADY_LIST_CONST_PARTITIONS)
+        if(NOT PEAK_MPI_PREADY_LIST_CONST_PARTITIONS)
+            check_c_source_compiles("#include <mpi.h>
+extern int MPI_Pready_list(int, int *, MPI_Request);
+extern int PMPI_Pready_list(int, int *, MPI_Request);
+int main(void) { return 0; }"
+                PEAK_MPI_PREADY_LIST_MUTABLE_PARTITIONS)
+            if(NOT PEAK_MPI_PREADY_LIST_MUTABLE_PARTITIONS)
+                message(FATAL_ERROR "Installed MPI_Pready_list/PMPI_Pready_list declarations have an unsupported signature")
+            endif()
+        endif()
+        check_c_source_compiles("#include <mpi.h>
+int main(void) {
+ int (*a)(MPI_Status *, MPI_Datatype, MPI_Count) = &MPI_Status_set_elements_c;
+ int (*b)(MPI_Status *, MPI_Datatype, MPI_Count) = &PMPI_Status_set_elements_c;
+ MPI_Status status; return a(&status, MPI_BYTE, 0) + b(&status, MPI_BYTE, 0);
+}"
+            PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C)
+        target_compile_definitions(peak PRIVATE
+            PEAK_MPI_PSEND_INIT_CONST_BUFFER=$<BOOL:${PEAK_MPI_PSEND_INIT_CONST_BUFFER}>
+            PEAK_MPI_PREADY_LIST_CONST_PARTITIONS=$<BOOL:${PEAK_MPI_PREADY_LIST_CONST_PARTITIONS}>
+            PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C=$<BOOL:${PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C}>)
+    endif()
+    cmake_pop_check_state()
     target_sources(peak PRIVATE mpi_budget_events.c)
     target_link_libraries(peak
         PRIVATE

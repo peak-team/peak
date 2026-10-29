@@ -134,7 +134,6 @@ struct _PeakGeneralListener {
     gfloat retired_min_time;
     PeakGeneralListenerCheckpointShadow* checkpoint_shadow;
     size_t checkpoint_shadow_mapping_size;
-    _Atomic gboolean initial_unfunded_close_eligible;
 };
 
 struct _PeakGumTargetAttachPlan;

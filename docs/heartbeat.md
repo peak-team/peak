@@ -722,10 +722,16 @@ job runtime earn budget; PEAK startup work does not earn credit for itself.
 
 After standard constructor installation, later loader/JIT installation and
 restoration require a complete mutation/observation lease, with future closing
-cost reserved separately. Closing estimates account for
-multiple batches when more than 64 targets are configured. A physical activity
-revision starts the normal idle interval after installation; detached waiting
-time cannot prematurely return the observation lease. Idle returns use a
+cost reserved separately. Closing an already installed hook reduces existing
+instrumentation exposure without waiting for new profiling cash; the full
+measured close cost is charged to `spent`, and any held closing reserve is
+returned only after the close settlement is acknowledged. Closing an initially
+installed hook can leave its measured cost as budget debt. Existing
+profiling-credit and callback-grace budgets still apply. Closing estimates
+account for multiple batches when more than 64 targets are
+configured. A physical activity revision starts the normal idle interval after
+installation; detached waiting time cannot prematurely return the observation
+lease. Idle returns use a
 nonblocking attempt on the controller's existing listener lock and defer returns
 while an eligible admission awaits its next scan or mutations are pending.
 Callback spending remains bounded atomic work.

@@ -11,6 +11,29 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 
+/* Configure against the actual installed prototypes, including pre-errata
+ * MPI-4 headers. Standalone frontend probes default to corrected qualifiers;
+ * optional APIs require an explicit header/link availability result. */
+#ifndef PEAK_MPI_PSEND_INIT_CONST_BUFFER
+#define PEAK_MPI_PSEND_INIT_CONST_BUFFER 1
+#endif
+#ifndef PEAK_MPI_PREADY_LIST_CONST_PARTITIONS
+#define PEAK_MPI_PREADY_LIST_CONST_PARTITIONS 1
+#endif
+#ifndef PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C
+#define PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C 0
+#endif
+#if PEAK_MPI_PSEND_INIT_CONST_BUFFER
+#define PEAK_MPI_PSEND_BUFFER_TYPE const void
+#else
+#define PEAK_MPI_PSEND_BUFFER_TYPE void
+#endif
+#if PEAK_MPI_PREADY_LIST_CONST_PARTITIONS
+#define PEAK_MPI_PREADY_PARTITION_TYPE const int
+#else
+#define PEAK_MPI_PREADY_PARTITION_TYPE int
+#endif
+
 #if defined(__GNUC__)
 #define EXPORT __attribute__((visibility("default")))
 #else
@@ -261,7 +284,7 @@ static void native_elapsed(uint64_t started)
     X(Scatterv_init,(const void *sendbuf, const int sendcounts[], const int displs[], MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm, MPI_Info info, MPI_Request *request),(sendbuf,sendcounts,displs,sendtype,recvbuf,recvcount,recvtype,root,comm,info,request)) \
     X(Session_init,(MPI_Info info, MPI_Errhandler errhandler, MPI_Session *session),(info,errhandler,session)) \
     X(Precv_init,(void *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request),(buf,partitions,count,datatype,dest,tag,comm,info,request)) \
-    X(Psend_init,(const void *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request),(buf,partitions,count,datatype,dest,tag,comm,info,request)) \
+    X(Psend_init,(PEAK_MPI_PSEND_BUFFER_TYPE *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request),(buf,partitions,count,datatype,dest,tag,comm,info,request)) \
     X(Allgather_c,(const void *sendbuf, MPI_Count sendcount, MPI_Datatype sendtype, void *recvbuf, MPI_Count recvcount, MPI_Datatype recvtype, MPI_Comm comm),(sendbuf,sendcount,sendtype,recvbuf,recvcount,recvtype,comm)) \
     X(Allgather_init_c,(const void *sendbuf, MPI_Count sendcount, MPI_Datatype sendtype, void *recvbuf, MPI_Count recvcount, MPI_Datatype recvtype, MPI_Comm comm, MPI_Info info, MPI_Request *request),(sendbuf,sendcount,sendtype,recvbuf,recvcount,recvtype,comm,info,request)) \
     X(Allgatherv_c,(const void *sendbuf, MPI_Count sendcount, MPI_Datatype sendtype, void *recvbuf, const MPI_Count recvcounts[], const MPI_Aint displs[], MPI_Datatype recvtype, MPI_Comm comm),(sendbuf,sendcount,sendtype,recvbuf,recvcounts,displs,recvtype,comm)) \
@@ -332,7 +355,6 @@ static void native_elapsed(uint64_t started)
     X(Pack_external_c,(const char *datarep, const void *inbuf, MPI_Count incount, MPI_Datatype datatype, void *outbuf, MPI_Count outsize, MPI_Count *position),(datarep,inbuf,incount,datatype,outbuf,outsize,position)) \
     X(Pack_external_size_c,(const char *datarep, MPI_Count incount, MPI_Datatype datatype, MPI_Count *size),(datarep,incount,datatype,size)) \
     X(Pack_size_c,(MPI_Count incount, MPI_Datatype datatype, MPI_Comm comm, MPI_Count *size),(incount,datatype,comm,size)) \
-    X(Status_set_elements_c,(MPI_Status *status, MPI_Datatype datatype, MPI_Count count),(status,datatype,count)) \
     X(Type_contiguous_c,(MPI_Count count, MPI_Datatype oldtype, MPI_Datatype *newtype),(count,oldtype,newtype)) \
     X(Type_create_darray_c,(int size, int rank, int ndims, const MPI_Count array_of_gsizes[], const int array_of_distribs[], const int array_of_dargs[], const int array_of_psizes[], int order, MPI_Datatype oldtype, MPI_Datatype *newtype),(size,rank,ndims,array_of_gsizes,array_of_distribs,array_of_dargs,array_of_psizes,order,oldtype,newtype)) \
     X(Type_create_hindexed_c,(MPI_Count count, const MPI_Count array_of_blocklengths[], const MPI_Count array_of_displacements[], MPI_Datatype oldtype, MPI_Datatype *newtype),(count,array_of_blocklengths,array_of_displacements,oldtype,newtype)) \
@@ -393,9 +415,14 @@ static void native_elapsed(uint64_t started)
     X(Session_finalize,(MPI_Session *session),(session)) \
     X(Pready,(int partition, MPI_Request request),(partition,request)) \
     X(Pready_range,(int partition_low, int partition_high, MPI_Request request),(partition_low,partition_high,request)) \
-    X(Pready_list,(int length, const int array_of_partitions[], MPI_Request request),(length,array_of_partitions,request)) \
+    X(Pready_list,(int length, PEAK_MPI_PREADY_PARTITION_TYPE array_of_partitions[], MPI_Request request),(length,array_of_partitions,request)) \
     X(Parrived,(MPI_Request request, int partition, int *flag),(request,partition,flag))
 
+#if MPI_VERSION >= 4 && PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C
+#define PEAK_MPI_OPTIONAL_STATUS_API(X) \
+    X(Status_set_elements_c,(MPI_Status *status,MPI_Datatype datatype,MPI_Count count),(status,datatype,count))
+PEAK_MPI_OPTIONAL_STATUS_API(PEAK_NATIVE)
+#endif
 PEAK_MPI_APIS_3(PEAK_NATIVE)
 #if MPI_VERSION >= 4
 PEAK_MPI_APIS_4(PEAK_NATIVE)
@@ -1656,7 +1683,7 @@ static int peak_mpi_Session_init(MPI_Info info, MPI_Errhandler errhandler, MPI_S
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Session_init(info,errhandler,session);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Precv_init(void *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Precv_init(buf,partitions,count,datatype,dest,tag,comm,info,request);native_stop(active);end(active,result);return result;}
-static int peak_mpi_Psend_init(const void *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request)
+static int peak_mpi_Psend_init(PEAK_MPI_PSEND_BUFFER_TYPE *buf, int partitions, MPI_Count count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Info info, MPI_Request *request)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Psend_init(buf,partitions,count,datatype,dest,tag,comm,info,request);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Allgather_c(const void *sendbuf, MPI_Count sendcount, MPI_Datatype sendtype, void *recvbuf, MPI_Count recvcount, MPI_Datatype recvtype, MPI_Comm comm)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Allgather_c(sendbuf,sendcount,sendtype,recvbuf,recvcount,recvtype,comm);native_stop(active);end(active,result);return result;}
@@ -1798,8 +1825,10 @@ static int peak_mpi_Pack_external_size_c(const char *datarep, MPI_Count incount,
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Pack_external_size_c(datarep,incount,datatype,size);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Pack_size_c(MPI_Count incount, MPI_Datatype datatype, MPI_Comm comm, MPI_Count *size)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Pack_size_c(incount,datatype,comm,size);native_stop(active);end(active,result);return result;}
+#if PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C
 static int peak_mpi_Status_set_elements_c(MPI_Status *status, MPI_Datatype datatype, MPI_Count count)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Status_set_elements_c(status,datatype,count);native_stop(active);end(active,result);return result;}
+#endif
 static int peak_mpi_Type_contiguous_c(MPI_Count count, MPI_Datatype oldtype, MPI_Datatype *newtype)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Type_contiguous_c(count,oldtype,newtype);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Type_create_darray_c(int size, int rank, int ndims, const MPI_Count array_of_gsizes[], const int array_of_distribs[], const int array_of_dargs[], const int array_of_psizes[], int order, MPI_Datatype oldtype, MPI_Datatype *newtype)
@@ -1934,7 +1963,7 @@ static int peak_mpi_Pready(int partition, MPI_Request request)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Pready(partition,request);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Pready_range(int partition_low, int partition_high, MPI_Request request)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Pready_range(partition_low,partition_high,request);native_stop(active);end(active,result);return result;}
-static int peak_mpi_Pready_list(int length, const int array_of_partitions[], MPI_Request request)
+static int peak_mpi_Pready_list(int length, PEAK_MPI_PREADY_PARTITION_TYPE array_of_partitions[], MPI_Request request)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Pready_list(length,array_of_partitions,request);native_stop(active);end(active,result);return result;}
 static int peak_mpi_Parrived(MPI_Request request, int partition, int *flag)
 {int active=begin();if(active){pthread_mutex_lock(&lock);unknown_live();pthread_mutex_unlock(&lock);}native_start(active);int result=call_Parrived(request,partition,flag);native_stop(active);end(active,result);return result;}
@@ -2042,6 +2071,9 @@ PEAK_MPI_IO_APIS_3(PEAK_UNSUPPORTED)
 #define PEAK_ALIAS(N, DECL, ARGS) \
     EXPORT int MPI_##N DECL { return peak_mpi_##N ARGS; } \
     EXPORT int PMPI_##N DECL { return peak_mpi_##N ARGS; }
+#if MPI_VERSION >= 4 && PEAK_MPI_HAVE_STATUS_SET_ELEMENTS_C
+PEAK_MPI_OPTIONAL_STATUS_API(PEAK_ALIAS)
+#endif
 PEAK_MPI_APIS_3(PEAK_ALIAS)
 #if MPI_VERSION >= 4
 PEAK_MPI_APIS_4(PEAK_ALIAS)
@@ -2063,5 +2095,6 @@ PEAK_MPI_IO_APIS_3(PEAK_ALIAS)
 #undef PEAK_MPI_IO_APIS_3
 #endif
 #undef PEAK_ALIAS
+#undef PEAK_MPI_OPTIONAL_STATUS_API
 #undef PEAK_MPI_APIS_3
 #undef PEAK_MPI_APIS_4
