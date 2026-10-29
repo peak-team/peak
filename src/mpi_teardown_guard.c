@@ -217,7 +217,7 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
     int done = 0;
     int mpi_result;
     double deadline;
-    const struct timespec poll_pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+    long poll_pause_ns = 1000000L;
 
     if (peak_mpi_teardown_collectives_failed_closed()) {
         return false;
@@ -272,7 +272,8 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
             free(pending);
             return true;
         }
-        if (peak_second() >= deadline) {
+        double now = peak_second();
+        if (now >= deadline) {
             peak_log_warn("[peak] MPI %s timed out after %u ms; disabling later MPI teardown calls\n",
                           operation,
                           timeout_ms);
@@ -284,8 +285,20 @@ peak_mpi_teardown_all_ranks_min(const int* local_values,
             peak_mpi_teardown_request_abandon(pending);
             return false;
         }
-        /* Avoid a process-wide busy spin while still driving MPI progress. */
+        /* Keep short requests prompt, but avoid accumulating a millisecond
+         * polling CPU bill while another rank is still doing application work.
+         * Every wake still drives progress and checks the original deadline. */
+        double remaining_ns = (deadline - now) * 1e9;
+        struct timespec poll_pause = {
+            .tv_sec = 0,
+            .tv_nsec = remaining_ns < (double)poll_pause_ns
+                ? (long)remaining_ns : poll_pause_ns
+        };
         (void)nanosleep(&poll_pause, NULL);
+        if (poll_pause_ns < 10000000L) {
+            poll_pause_ns *= 2;
+            if (poll_pause_ns > 10000000L) poll_pause_ns = 10000000L;
+        }
     }
 }
 
