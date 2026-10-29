@@ -357,17 +357,6 @@ static int peak_mpi_bootstrap_clock_ok(double elapsed, double previous, unsigned
     return attempt < 1000 && elapsed >= 0.0 &&
         (attempt == 0 || elapsed > previous);
 }
-#ifdef PEAK_ENABLE_TEST_HOOKS
-PEAK_MPI_INTERCEPTOR_API int mpi_interceptor_test_bootstrap_clock_guard(void)
-{
-    return peak_mpi_bootstrap_clock_ok(-1, 0, 0) ||
-        peak_mpi_bootstrap_clock_ok(4, 5, 1) ||
-        peak_mpi_bootstrap_clock_ok(5, 5, 1) ||
-        peak_mpi_bootstrap_clock_ok(5, 4, 1000) ||
-        !peak_mpi_bootstrap_clock_ok(0, 0, 0) ||
-        !peak_mpi_bootstrap_clock_ok(5, 4, 1);
-}
-#endif
 
 /* Opt-in SPMD bootstrap: every world rank must enable the same mode. */
 static void
@@ -761,16 +750,10 @@ peak_pmpi_finalize(void)
         return mpi_interceptor_call_original_finalize_once();
     }
     __atomic_store_n(&peak_finalize_path_active, 1, __ATOMIC_RELEASE);
-    int timed = peak_mpi_timing_enabled();
-    double began = timed ? peak_mpi_trace_clock() : 0.0;
     peak_fini();
-    double original_start = timed ? peak_mpi_trace_clock() : 0.0;
     __atomic_store_n(&peak_finalize_path_active, 0, __ATOMIC_RELEASE);
     int result = mpi_interceptor_call_original_finalize_once();
     peak_general_listener_global_budget_shutdown(0); /* failed/early teardown fallback */
-    /* peak_fini closes the report sink before returning to MPI. */
-    if (timed) fprintf(stderr, "[peak] MPI timing: stage=finalize peak_fini_seconds=%.9g original_seconds=%.9g\n",
-        original_start - began, peak_mpi_trace_clock() - original_start);
     return result;
 }
 

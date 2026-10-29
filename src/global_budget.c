@@ -41,7 +41,8 @@ int peak_global_budget_broker_main(int argc,char **argv) { (void)argc;(void)argv
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/random.h>
+#include <sys/syscall.h>
+#include "internal/exec_raw_syscall.h"
 #include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
@@ -384,7 +385,19 @@ int peak_global_budget_listen(unsigned short *port)
     socklen_t length = sizeof(addr);
     if (bind(s, (void *)&addr, sizeof(addr)) || listen(s, LIMIT) ||
         getsockname(s, (void *)&addr, &length)) { close(s); return -1; }
-    if (getrandom(&job_nonce, sizeof(job_nonce), 0) != sizeof(job_nonce) || !job_nonce) { close(s); return -1; }
+    ssize_t entropy_bytes = -1;
+#if defined(SYS_getrandom)
+    entropy_bytes = peak_exec_raw_syscall6(SYS_getrandom, (long)(uintptr_t)&job_nonce,
+        sizeof(job_nonce), 0x0001u /* GRND_NONBLOCK */, 0, 0, 0);
+#endif
+    if (entropy_bytes != sizeof(job_nonce)) {
+        int entropy_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (entropy_fd >= 0) {
+            entropy_bytes = read(entropy_fd, &job_nonce, sizeof(job_nonce));
+            close(entropy_fd);
+        }
+    }
+    if (entropy_bytes != sizeof(job_nonce) || !job_nonce) { close(s); return -1; }
     listener = s;
     atomic_store(&owner, getpid());
     *port = ntohs(addr.sin_port);
@@ -479,9 +492,6 @@ static bool reply_urgent(const Peer *p, const Rank *r, bool all, bool final, uin
 static Frame request_snapshot(void)
 {
     uint64_t generation = atomic_load_explicit(&demand_generation, memory_order_acquire);
-#ifdef PEAK_GLOBAL_BUDGET_TEST_SNAPSHOT_HOOK
-    PEAK_GLOBAL_BUDGET_TEST_SNAPSHOT_HOOK();
-#endif
     pthread_mutex_lock(&sample_mutex);
     Frame next = {.magic = MAGIC, .version = PROTOCOL_VERSION, .nonce = job_nonce, .rank = rank_id,
         .size = world, .sample = local_sample, .demand_generation = generation,
@@ -494,9 +504,6 @@ static Frame request_snapshot(void)
         /* Acquire the commitment BEFORE reading its cost. False + new cost is
          * conservative; true + an older cost must never be constructed. */
         next.root_startup_sealed = atomic_load_explicit(&startup_sealed, memory_order_acquire);
-#ifdef PEAK_GLOBAL_BUDGET_TEST_SEAL_SNAPSHOT_HOOK
-        PEAK_GLOBAL_BUDGET_TEST_SEAL_SNAPSHOT_HOOK();
-#endif
         next.root_origin_seconds = atomic_load(&earned_origin);
         next.root_startup_seconds = atomic_load(&startup_charge);
     }
@@ -857,12 +864,6 @@ static void *service(void *unused)
                 next.sample.finalizer_invalid != prior->sample.finalizer_invalid ||
                 next.sample.attached_targets != prior->sample.attached_targets;
             if (next.sample.sequence && (urgent || now_ns - local.last_send >= UINT64_C(100000000))) {
-#ifdef PEAK_GLOBAL_BUDGET_TEST_REQUEST_DELAY_US
-                if (next.demand_generation != prior->demand_generation) {
-                    struct timespec delay = {0, PEAK_GLOBAL_BUDGET_TEST_REQUEST_DELAY_US * 1000L};
-                    nanosleep(&delay, NULL);
-                }
-#endif
                 if (next.demand_generation != prior->demand_generation)
                     record_event('r', rank_id, next.demand_generation, next.sample.completed_wave, (double)atomic_load(&request_started_ns) / 1e9);
                 if (next.demand_generation != prior->demand_generation) { last_consumption = now_ns; idle_returned = false; }

@@ -4,6 +4,9 @@
 #include "internal/exec_memory.h"
 #include "internal/exec_raw_syscall.h"
 #include "utils/utils.h"
+#ifdef HAVE_MPI
+#include "mpi_interceptor.h"
+#endif
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -142,14 +145,16 @@ _Static_assert(ATOMIC_LONG_LOCK_FREE == 2,
                "exec resolver ownership must always be lock-free");
 static atomic_int peak_exec_priming_complete = ATOMIC_VAR_INIT(0);
 static int peak_exec_mpi_runtime_child;
-extern int peak_mpi_internal_context_active(void) __attribute__((weak));
 
 static int
 peak_exec_in_mpi_runtime(void)
 {
+#ifdef HAVE_MPI
     return peak_exec_startup_mpi_children_enabled &&
-           peak_mpi_internal_context_active != NULL &&
            peak_mpi_internal_context_active();
+#else
+    return 0;
+#endif
 }
 
 PEAK_EXEC_INTERNAL int

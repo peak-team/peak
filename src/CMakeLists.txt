@@ -111,6 +111,10 @@ target_link_libraries(peak_inspect_symbols PRIVATE
 
 if(PEAK_DETACH_HELPER_SUPPORTED)
     add_executable(peak_detach_helper detach_helper.c global_budget.c)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        target_sources(peak_detach_helper PRIVATE
+            ${PROJECT_SOURCE_DIR}/cmake/peak-gum/peak_aarch64_raw_syscall.S)
+    endif()
     target_compile_definitions(peak_detach_helper PRIVATE PEAK_GLOBAL_BUDGET_HELPER=1)
     target_link_libraries(peak_detach_helper PRIVATE Threads::Threads ${M_LIBRARY})
     target_include_directories(peak_detach_helper

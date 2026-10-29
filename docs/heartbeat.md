@@ -184,116 +184,25 @@ perform the mutation. The controller owns mutation ordering.
 
 ## MPI Job Budget and Callback Burst Protection
 
-For a verified launcher world size `W`, the configured
-`PEAK_GLOBAL_OVERHEAD_RATIO` is treated as a job risk budget. The effective
-rank budget is `PEAK_GLOBAL_OVERHEAD_RATIO / W`. Global heartbeat detach,
-reattach admission/headroom, and adaptive heartbeat error all use that same
-rank budget. The per-target ratio remains a separate hook policy.
+With verified launcher world size `W`, the local fallback policy uses
+`PEAK_GLOBAL_OVERHEAD_RATIO / W` for heartbeat detach and reattach admission.
+This conservative scaling covers successive profiling delays on different ranks.
+World metadata must agree across the available PMI, PMIX, OMPI, MV2 or Intel MPI
+pairs; Slurm is used when no complete MPI pair exists. Unverified metadata uses
+size one. Per-target ratio policy remains independent.
 
-World metadata is frozen before callbacks start, using the same validated
-rank/size resolver as reporting: complete PMI, PMIX, OMPI, MV2 and Intel MPI
-pairs must agree; Slurm is the fallback only when no complete MPI pair exists.
-Missing, malformed or contradictory metadata selects world size one with
-source `unverified`. This does not independently prove MPI topology. A verified
-single rank preserves the existing policy and has no burst guard.
+For MPI jobs with global heartbeat enabled, each hook/thread checks every 64th
+callback against its active-thread CPU time. An excessive block publishes a
+request for the existing controller to close the rank's hooks; the callback does
+not mutate code or call MPI. Pending restores are canceled before closing, and
+restoration waits for a quiescent controller, sufficient budget and the normal
+cooldown. The request is tied to the current hook generation so an old callback
+cannot close a later installation.
 
-When `W > 1`, heartbeat is enabled, and global heartbeat policy is enabled,
-both generic and direct callbacks additionally check short CPU blocks. Every
-hook/thread owns 24 bytes in the unused tail of its existing statistics cache
-line, so hooks do not collide in a bounded cache and calls do not add a shared
-atomic counter or lock. Every 64th invocation reads its lifecycle generation
-and `CLOCK_THREAD_CPUTIME_ID`. The first block seeds a baseline; subsequent
-blocks compare:
-
-```text
-64 * calibrated_wall_cost_per_call >
-    effective_rank_budget * PEAK_GLOBAL_DETACH_FACTOR * block_thread_cpu_seconds
-```
-
-Each sample replaces the previous baseline. A long warmup cannot leave credit
-for the next short block; MPI blocking and scheduler waiting do not create CPU
-credit. Useful CPU computation between calls increases the block denominator,
-so a function called infrequently around long computations remains attached.
-The denominator includes all work done by this thread between that hook's
-samples, including other hooks. It is not an aggregate measurement of every
-thread's CPU time. The heartbeat continues to provide the cross-hook/rank-local
-aggregate check.
-
-The numerator is a calibrated **wall** callback cost. This is an estimated
-callback-cost/active-thread-CPU risk signal, not a measurement of actual CPU
-cost or MPI application slowdown. Calibration preemption can conservatively
-increase the estimate. CPU clock failure or a non-increasing reading reseeds
-without requesting detach; the normal heartbeat remains the fallback.
-
-A burst request uses a dedicated bit in the existing packed lifecycle word.
-One compare-and-swap publishes only against the sampled ATTACHED generation,
-then wakes the controller. The callback does not patch code, scan global slots,
-or call MPI. The controller treats this recent active-thread pressure alert as a reason for
-conservative **rank-wide** budget protection and immediately requests detach for every currently attached target
-on that rank, including targets with zero recorded calls. It does not wait to
-discover whether the remaining targets become hot. This deliberately prioritizes
-job overhead over function coverage: cold targets can be detached without ever
-being profiled.
-
-Before requesting this rank-wide wave, the controller cancels pending reattach
-requests back to DETACHED and clears their retry/request context and future
-lease. It performs these transitions under the existing controller lock, which
-also excludes concurrent physical reattachment. Reattach admission, including
-the API path, stays closed while a wave member is DETACH_REQUESTED or DETACHING.
-The gate expires after the last member completes or abandons its retry budget;
-existing spent/control headroom and cooldown then govern restoration. The wave
-does not permanently disable profiling. A short-block pressure alert does not
-prove that cumulative spent cost has exhausted the budget; historical headroom
-may still be available.
-
-Reattach also revalidates the control accounting tuple after acquiring the
-controller lock. Completed-window count, failed-window count and wall time must
-still exactly match the valid, unsaturated snapshot charged to headroom. A
-mutation between the earlier budget reads and lock acquisition invalidates the
-whole admission cycle, which resumes on a later heartbeat with a fresh budget.
-This prevents stale pre-wave headroom from restoring hooks even when cooldown is
-zero. It leaves unchanged-accounting admission and physical batch mutation
-unchanged. The recorded second-round HPC rank-wide measurements precede this
-additional admission check; its changed/invalid-tuple behavior is covered by
-local deterministic tests.
-
-All wave members carry `mpi-burst` as their request source and enter the existing
-physical detach batch collector together. With strict batch support, up to 64
-eligible targets share one prepare/finish stop window. Larger sets use multiple
-batches; targets rejected by safety classification may require retry windows.
-Backends without strict batch support retain their existing individual-target
-mutation path, so this policy cannot promise a single stop window there. This
-reduces the previous cost of discovering and stopping one hot function per
-window, which can itself accumulate along an MPI critical path even after
-callback overhead is reduced.
-
-Generation changes reseed the CPU window; thread retirement clears it before
-the statistics slot can be reused. An independent 64-call block therefore costs
-at most two blocks before its first pressure decision, followed by controller
-scheduling and safe mutation delay. This protection bypasses the heartbeat's
-initial observation-time gate.
-
-`PEAK_HEARTBEAT_INTERVAL=0` or `PEAK_ENABLE_GLOBAL_HEARTBEAT=0` disables the
-burst guard. A configured zero global ratio retains zero tolerance for positive
-estimated cost; it does not disable policy. Final text output identifies
-`configured_job_target`, `effective_rank_target`, `world_size`, metadata
-`source`, `burst_guard`, `stride`, `burst_action=rank-wide`, and batch capacity.
-`burst_waves` and `burst_unsampled_targets` count waves and zero-call targets
-observed by the reporting rank only (`burst_counters_scope=reporting-rank`),
-including when the text report otherwise aggregates MPI ranks. They are not
-job-wide counts or values taken from an independently selected overhead owner.
-This follows existing text-output
-selection, including aggregate-root output and `PEAK_TEXT_OUTPUT` overrides.
-
-The sum of per-rank estimates is a more conservative MPI risk model than the
-maximum rank's cumulative ratio: different ranks may incur overhead on
-successive parts of the application's critical path. Budget division and short
-blocks reduce that failure mode without background MPI communication. They
-cannot guarantee a hard application slowdown bound. Calibration error,
-communication/scheduling effects, the first 128 calls of a generation, safe
-mutation latency, classification retries, and multiple batches for large target
-sets remain outside such a proof. An application with a very short critical phase can still finish that
-phase before physical detach completes.
+`MPI budget risk policy:` identifies the configured target, effective rank
+budget and world-size source. Burst counters describe the reporting rank.
+These estimates are conservative admission signals, not direct measurements of
+application slowdown.
 
 ## Reattach Risk Scaling
 
@@ -748,318 +657,77 @@ control whether stop-window accounting exists.
 
 ## Experimental cross-rank runtime budget
 
-`PEAK_MPI_GLOBAL_BUDGET=1` enables the experimental runtime coordinator while retaining
-instrumentation and the existing safe detach controller. The default is off.
-The implementation supports at most 64 ranks on 64-bit Linux and requires a homogeneous C-MPI SPMD launch: **every
-MPI_COMM_WORLD rank must preload the same build and enable the same option**.
-The outer MPI initialization wrapper performs one additional endpoint broadcast
-on the application's initialization thread. Partial-rank opt-in is unsupported
-and can block in that collective; it is not a timeout-safe discovery protocol.
-The wrapper preserves the application's requested/provided MPI thread levels.
-After bootstrap, background coordination uses TCP only, including under FUNNELED
-or SINGLE; heartbeat/controller threads do not invoke MPI. A separate native
-`peak_detach_helper --global-budget-broker` process owns the coordinator; every
-rank, including rank 0, is a client. It is distinct from the ptrace detach helper.
-Rank 0's safe thread stop therefore cannot pause the coordinator. The broker
-starts without PEAK preload/audit libraries, charges its own CPU once to the
-shared ledger, and is terminated and reaped when its owner stops. It needs no
-thread exemption from the safe mutation backend.
+Set `PEAK_MPI_GLOBAL_BUDGET=1` on every rank to use one adaptive budget for the
+MPI job. The option defaults off. It supports homogeneous Linux 64-bit C-MPI
+SPMD jobs with 2–64 ranks using the same PEAK build and configuration, including
+the matching `peak_detach_helper` executable. All `MPI_COMM_WORLD` ranks must
+participate: startup performs one endpoint broadcast on the application's MPI
+initialization thread. Partial opt-in is unsupported. Requested/provided MPI
+thread levels are preserved; background coordination uses TCP, never MPI.
 
-On supported MPI launches with heartbeat admission, global mode defaults to
-`prepare` when `PEAK_MPI_ACTIVATION_POLICY` is unset. PEAK prepares its runtime
-before MPI initialization and resolves user targets without patching their entry
-points. The hold also covers dynamically discovered targets and remains in place
-while bootstrap is pending. Explicit `post-init` retains fully deferred runtime
-initialization; explicit `immediate`, non-MPI processes and default-off operation
-retain their existing activation behavior. The existing safe controller first installs
-a target only after a complete mutation-plus-observation lease is funded; root
-also reserves its future closing cost. This avoids making a never-funded rank pay
-a physical closing cost merely because its hotspot appears later. First paid
-installation is reported separately from restoration (`first_paid_attach_count`
-and controller event kind 7); kind 6 continues to mean restoration after a real
-detach. Disabling reattachment still permits a funded first installation.
-Bootstrap failure permits safe local admission and is reported as unconfirmed
-global protection. Explicit immediate activation and configurations without an
-admission heartbeat retain the earlier physical-attachment path.
+With heartbeat admission available, global mode defaults to
+`PEAK_MPI_ACTIVATION_POLICY=prepare`: PEAK initializes before MPI, while user
+targets remain native until their first installation is funded. This applies to
+static and dynamically discovered targets. Explicit `post-init` defers all
+runtime preparation until MPI initialization returns. Explicit `immediate`
+retains pre-MPI profiling before global coordination starts. Non-MPI and
+heartbeat-disabled configurations keep their existing local behavior.
 
-Heartbeat publishes cumulative estimated profile cost, measured control-window
-wall, management CPU and attached pressure after releasing the listener lock.
-The coordinator retains spent cost and tracks issued credits. Fresh positive
-credits fund callback blocks and admission; stale views return to the existing
-local policy. Each rank additionally has at most 500 microseconds of estimated
-unfunded callback grace for the entire session, shared by all hooks and threads.
-It is not renewed by heartbeat, grants or detach/reattach. Exhaustion requests
-the existing local emergency mutation; the report exposes unfunded cost and
-emergency fallback counts. `grace_used_seconds` is the authorized portion and
-cannot exceed 500 microseconds; `unfunded_seconds` also includes callback blocks
-already in flight while emergency closing completes, which are covered by the
-separate closing-cost estimate and can exceed that grace. The callback's ordinary
-cumulative profile estimate includes both portions, so neither is charged twice.
-In-flight mutation and coordination costs remain
-estimates, so the implementation must be evaluated with application timings.
+### Shared accounting and admission
 
-Root STOP commands carry a common wave identifier. Each rank's controller fans
-out the command using its existing safe batch protocol; completed waves are
-acknowledged. The root GO-to-all-DONE duration is a coordination diagnostic.
-The coordinator conservatively retains the sum of local control costs and does
-not subtract them based on an unproven overlap assumption. Epoch/critical-path
-communication models and replacement of an application's Barrier are not part
-of this implementation.
+The coordinator lends only available lifetime headroom:
 
-Startup waits at most one second for a fresh global view, then degrades to local
-control if unavailable. Shutdown drains local requests and retires the local application participant.
-The helper remains active until the existing all-rank teardown proof completes;
-final cohort settlement then waits at most two seconds before closing the
-service. Ordinary nonfinal flushes remain bounded to 100 milliseconds. Reports expose startup readiness/time, whether the
-view was ever active, last global costs/credit/wave state and shutdown
-confirmation/time. A missing confirmation is not treated as a successful global
-wave. Startup, coordination and shutdown timings are part of experimental
-validation, not hidden outside its reported timing boundary.
+```text
+available = max(0, target * job_elapsed - spent - outstanding - closing_reserve)
+```
 
-The root's bootstrap/readiness span is charged once as an initial coordinator
-cost; peer bootstrap durations are diagnostics and are not summed as independent
-application delays. This can leave the initial pool in debt until elapsed time
-generates sufficient credit. Invalid runtime accounting closes coordination
-rather than publishing a zero-cost tuple; invalid/degraded counters and missing
-shutdown acknowledgment remain visible in the final report.
+`spent` combines estimated callback cost, measured control-window wall time,
+management CPU and broker/client CPU. Control costs are conservatively summed
+across ranks. `outstanding` includes unspent issued credit and control
+prepayments awaiting settlement; actual control cost is charged once when its
+settlement watermark arrives. Credits use integer nanoseconds and are released
+only by actual consumption or an explicit return.
 
-For wire compatibility the sample field `unfunded_seconds` currently carries
-the bounded authorized grace usage (`grace_used_seconds`), not the larger
-diagnostic total of all unfunded callback charges.
+Root publishes preparation and bootstrap costs before sealing startup. An online
+cohort alone cannot authorize credit. Only original MPI initialization and later
+job runtime earn budget; PEAK startup work does not earn credit for itself.
 
-The coordinator requests refill before the local credit reaches
-zero. It uses observed consumption and refill latency, and root can issue STOP
-before the funded tail expires. The callback still has only its bounded,
-session-wide 500 microsecond unfunded grace; no network delay authorizes free
-instrumentation. The original application's MPI_Init wall duration, measured on
-root before PEAK activation, is included in earned runtime. Constructor time and
-bootstrap cost do not create additional credit.
+First installation and restoration require a complete mutation/observation lease,
+with future closing cost reserved separately. Closing estimates account for
+multiple batches when more than 64 targets are configured. A physical activity
+revision starts the normal idle interval after installation; detached waiting
+time cannot prematurely return the observation lease. Idle returns use a
+nonblocking attempt on the controller's existing listener lock and defer returns
+while an eligible admission awaits its next scan or mutations are pending.
+Callback spending remains bounded atomic work.
 
-A rank joins coordination by consuming credit or requesting observation, not by
-merely having cold hooks installed. A STOP view explicitly identifies each wave
-participant. Cold ranks acknowledge without physically removing their hooks;
-participants use the existing safe rank-wide batch. Actual closing costs remain
-summed. The reserve grows with observed member closing costs, and an idle rank
-returns unused credit once after safe detachment. Recovery admission uses the
-local atomic credit balance, not the delayed root reservation diagnostic.
+Callbacks that exhaust credit notify the controller and share at most 500 µs of
+estimated unfunded grace per rank for the session. The allowance does not renew
+on restore. Accepted per-hook safety requests can merge into one rank-wide
+closing operation; their count is neither a physical-window count nor a network
+error count. Cold bursts may close early if replenishment arrives too late.
 
-`PEAK_MPI_GLOBAL_TRACE=1` enables bounded controller/service event diagnostics.
-Controller kinds 1/2 identify GO observation/DONE, 3 a local emergency consumed
-by the controller, and 4/5 mutation batch preparation/completion. The fixed ring
-reports overflow; no callback prints or allocates. Cross-node events must be
-ordered by wave/request/decision causality, not subtraction of unsynchronized
-monotonic clocks. `PEAK_MPI_TIMING_TRACE=1` separately reports original MPI init,
-PEAK activation/bootstrap, PEAK finalization and original MPI finalize. Internal
-finalization stages expose heartbeat join, controller stop, support cleanup,
-report publication and release. These optional diagnostics are for causal
-validation and are not overhead guarantees.
+### Coordinator lifecycle and reporting
 
-Timing diagnostics split final settlement into FINAL/cohort flush and service
-thread join. The stop flag is published before the eventfd wake, so a helper
-cannot consume its final wake while still observing a running session and enter
-another 100-millisecond idle poll. Report capture, preparation, CSV publication
-and text output expose separate wall and thread-CPU durations under the same
-timing switch; these measurements distinguish report I/O waits from CPU cost.
+A separate native `peak_detach_helper --global-budget-broker` process owns the
+ledger. Every rank, including root, is a client, so root's safe thread pauses
+cannot freeze coordination. The broker starts without PEAK preload/audit
+libraries. Its process CPU is charged to the job budget.
 
-Controller event kind 6 records a successful hook restoration, including its
-hook identifier, the already completed wave, and a fresh cumulative call
-baseline read after physical restoration. The final exact call count for that hook must exceed the baseline to
-prove that the restored hook was visited. Reattachment is admitted only after
-root has acknowledged all members' completion of the current wave, and its
-mutation reserve is charged before admission. The service also accepts the
-legacy trace switch `PEAK_GLOBAL_BUDGET_TRACE`.
+A rank entering MPI finalization suspends callbacks and drains its controller,
+then retires while its client continues serving peers that still do application
+work. After the existing all-rank finalization proof, FINAL revisions settle
+remaining costs. Root waits for confirmation that every final reply was fully
+written before reaping the broker. Early root finalization therefore does not
+cut off the remaining ranks.
 
-In global mode, execution launched from the calling thread of the original MPI
-initializer/finalizer is tagged as a one-shot runtime utility child. Such a child
-skips PEAK activation, avoiding inherited-preload profiler setup and reports in
-MPI's internal utility programs. The parent environment is not modified. Normal
-application exec/spawn and default-off operation retain their existing profiling
-behavior. This scope follows the original MPI call context, not executable names;
-MPI helper-thread ancestry is not inferred without evidence.
+`MPI initial admission:`, `MPI global budget:` and `MPI global settlement:`
+report admission, current accounting and final confirmation. A failed bootstrap
+stops the global service and releases initial admission to the existing local
+policy; failed or stale coordination is reported as unconfirmed global
+protection. The optional timing trace separates startup, report and settlement
+costs.
 
-Recovery requests fund both mutation and a useful observation interval. The
-operating lease is the maximum of the most recent control-window cost, one
-callback charge block, and the retained consumption rate multiplied by the
-larger of the observation horizon and twice the observed refill latency. A full
-mutation-plus-operating balance is required before restoration; partial grants
-wait. Mutation is debited first and subsequent callbacks debit actual profile
-cost, so the operating lease is reserved credit rather than a second profile
-charge. This amortizes a paid restoration instead of repeatedly restoring with
-only one callback block left. The root's separate closing reserve and the
-session-wide unfunded grace are unchanged by this admission rule.
-
-During MPI finalization a quiescent rank retires after callback suspension and
-controller shutdown. Its TCP helper remains alive while the existing all-rank
-MPI participation/report-release proof waits for ranks still doing application
-work. Retired helpers charge their own CPU, release unused credit and acknowledge
-future waves without new physical mutation. After that existing proof, support
-wrappers are restored, a new final cost revision is published, and bounded
-settlement stops the helper. The final `MPI global settlement:` row is distinct
-from the earlier report's `MPI global budget:` snapshot and is authoritative for
-shutdown confirmation. Failed or unproven participation remains unconfirmed.
-Final settlement also charges measured finalizer-thread CPU for PEAK report,
-release and support cleanup; waiting wall time for peer application work and the
-original MPI_Finalize call are excluded. A failed CPU clock is diagnosed rather
-than represented as a successful measurement.
-
-Root's measured early preparation, post-init activation and bootstrap durations
-are charged once as startup cost. Only the original MPI_Init call earns the
-initial runtime offset; PEAK preparation, activation and bootstrap do not.
-`MPI preparation:` keeps these components separate. The exec-inclusive benchmark
-also includes loader/constructor time, so moving work before main cannot appear
-as free initialization.
-
-Bootstrap readiness does not authorize spending. The native broker may report a
-live all-rank connection while holding all grants and new STOP waves. Root first
-publishes its final startup charge, then seals startup in the same authenticated
-snapshot. Only after the broker receives that seal can it lend earned headroom.
-The snapshot reads the seal before the fee so a concurrent publication cannot
-pair an old zero fee with a new authorization. A failed startup clock leaves
-funding closed; sealing cannot move backward.
-
-Retired finalizer-thread CPU is sampled live through its POSIX thread CPU clock,
-starting at PEAK finalization entry. The helper uses the maximum of the published
-management total and the frozen heartbeat baseline plus that CPU delta. The
-last counter update and live watch therefore settle the same cost once. FINAL
-is distinct from retirement: only after the existing all-rank proof does each
-rank publish a new FINAL revision. Closing waits for every FINAL revision and
-its cohort acknowledgment, preventing root from dropping late peers' final cost
-frames. In native-broker mode, root additionally waits for an authenticated
-confirmation that all cohort FINAL replies were fully written before stopping
-and reaping the broker. Root's own FINAL acknowledgment alone is insufficient.
-The original MPI finalizer runs after this helper has stopped and is
-outside this PEAK-management CPU watch.
-
-Concurrent callback charges use the primary atomic available-credit counter;
-contention is not interpreted as budget exhaustion. The finite unfunded grace
-also uses monotonically issued atomic tickets rather than a retry-limited CAS.
-A crossing ticket burns the remaining grace tail and requests emergency closing;
-it does not return tickets or enlarge the session limit. Coherent diagnostic
-snapshot contention is distinct from coordinator inactivity: callbacks use the
-atomic active/freshness predicate, and a heartbeat skips admission on an
-incoherent snapshot without switching to the old detach policy.
-
-Detached recovery receives a complete observation lease and closing registration
-in one funded decision, preventing unusable partial reservations from occupying
-the pool across every detached rank. Active refills can still use partial
-credit. A recovery request's complete target stays fixed until acknowledgment
-and admission; waiting to earn that recovery budget is excluded from active
-network-refill latency prediction.
-
-Actual physical membership carries an activity revision as well as its count.
-A fresh positive revision starts the existing 100 ms idle interval, so time spent
-waiting detached cannot immediately reclaim a restored observation lease. Surplus
-returns use a nonblocking attempt on the controller's existing listener lock and
-refuse pending or running mutations. The physical revision check and wallet
-return commit share that lock; prepaid partial installations therefore retain
-their operating credit. Callback spending still uses bounded atomics only.
-
-Bootstrap readiness has an independent iteration cap and rejects failing or
-backward monotonic readings. A local clock failure still participates in the
-mandatory SPMD bootstrap before degrading, so it does not strand peers inside
-that collective. Invalid startup timing does not create earned credit.
-
-Issued, consumed and returned credit uses canonical integer nanoseconds. Root
-reconciles profile cost with credited profile consumption. Spent cost includes
-actual control cost only. Prepaid control credit still awaiting a proven
-settlement watermark is a separate, releasable global reservation;
-management and transport CPU are then added separately. A lagging profile snapshot
-therefore cannot hide management cost. Outstanding credit decreases only by
-exact consumption or explicit return, never by unrelated management charges.
-
-The control-credit watermark is captured under the controller lock only when no
-mutation is requested or in progress, before the heartbeat reads actual control
-accounting. A joined controller can settle canceled requests with their actual
-outcome. Global reservation is the sum of exact unspent local credit and this
-unsettled control escrow; local grant and admission arithmetic uses only the
-exact local credit component. Actual spent cost retains its monotonic high-water
-mark, while escrow can be released on proven settlement. Temporary overlap
-between a newly completed control cost and an older watermark therefore cannot
-become permanent spent cost. This also keeps prepaid future control work in
-escrow when an earlier, uncredited STOP already contributed cumulative cost.
-
-
-With early preparation or explicit post-init activation and a working heartbeat
-admission loop, targets are first registered without patching their code.
-An earned full mutation plus observation lease admits their first safe
-batch installation; future closing reserve remains separate. The initial
-observation lease is at least the estimated 3 ms mutation cost, shared across
-hooks in the batch. A cold, never-funded target therefore incurs no physical
-first-close window. This is instrumentation admission, not sampling.
-
-`MPI initial admission:` reports this path and separate first-paid/local-attach
-counts. Trace kind 7 records a first physical installation with a fresh call
-baseline; kind 6 remains a restoration after a real detach. First installation
-does not fabricate detach/reattach/revisit history. `PEAK_ENABLE_REATTACH=0`
-still permits a paid first installation, while preventing later restorations.
-When both heartbeat policies are disabled, the prior physical installation path
-is retained; heartbeat creation failure queues safe local initial installation.
-Bootstrap failure releases the bounded startup admission hold to existing local
-policy. Explicit immediate activation already installed hooks before MPI and
-cannot receive the no-first-close guarantee retroactively.
-
-With `PEAK_MPI_TIMING_TRACE=1`, `MPI report timing:` separates capture,
-preparation, atomic CSV publication, and text publication using wall and calling
-thread CPU time. `MPI settlement timing:` separately reports final cohort flush
-and helper stop/join. These diagnostics retain the same output and release
-protocol and do not change the benchmark interval or imply an overhead pass.
-
-Global admission uses the coordinator's canonical integer nanosecond wallet.
-A bootstrap observation lease is divided into integer per-hook shares, leaving
-any remainder as unused funded credit. The same integer mutation cost is used
-for eligibility and actual control prepayment. Pending observation shares are
-stored per hook and reconstructed once from each fresh wallet snapshot; already
-prepaid mutation cost is not subtracted a second time on subsequent heartbeats.
-This avoids a spurious 15+1 split when exactly 6,000,000 ns funds a 3 ms batch
-mutation plus sixteen shares of a 3 ms observation lease. Local policy retains
-its existing floating-point estimates.
-
-The closing reserve forecast also includes known multi-window work: a separate
-per-window high-water estimate (at least 3 ms) is multiplied by
-`ceil(resolved live targets / 64)`, including resolved targets awaiting their
-first paid installation. The total forecast is itself monotonic. Heartbeat
-publishes this forecast before requesting an initial/recovery grant. It does
-not repeatedly multiply a previously aggregated total; retirement may show zero
-current targets while retaining the historical total forecast in diagnostics.
-
-`test/global_budget/run_mpi_lifecycle.py` keeps the 16-target recovery probe
-strict: a fully funded initial installation must contain all sixteen hooks in
-one physical batch, followed by a real STOP, restoration, and later calls.
-Its `unfunded`, `initial-once`, and `fallback` modes respectively verify native
-unchanged target bytes without credit, first installation with restoration
-disabled, and safe local installation after coordinator loss. An independent
-`multiwindow --targets /path/to/80-targets.txt --ranks 2` probe checks actual
-80-target installation over multiple batches and the two-window forecast. That
-probe exposes bounded fallback counts and makes no zero-fallback or performance
-claim; it does not weaken the original recovery check.
-
-A deferred, never-patched target set now explicitly publishes
-`initial_unexposed=true` in the version-2 global protocol. Such a rank has no
-executable profiling callbacks, so root need not reserve its 500 microseconds
-of emergency grace before any grant. A first grant atomically reserves its
-whole credit, closing forecast and lifetime grace. Root permanently latches
-that exposure even if a cached `initial_unexposed=true` sample arrives later or
-unused credit is returned. Physical installation or local fallback permanently
-changes the producer flag to false; a later false-to-true transition is invalid.
-Legacy/immediate installation uses the conservative default false. The actual
-500 microsecond lifetime callback allowance is unchanged.
-
-The controller also returns idle credit at a proven physical boundary: every
-hook is inactive and no attach/detach mutation remains pending. It does this
-after releasing its lock and temporarily suppresses new heartbeat admission
-while returning. This clears the old immutable recovery goal even when a short
-ATTACH-to-STOP interval occurred entirely between heartbeat snapshots. A later
-request can then use the newly measured mutation cost instead of remaining
-stuck with an obsolete smaller lease. Controller trace kind 8 records that
-boundary and its `control_fee_ns`; recovery goals are included in trace events
-for rank-local ordering checks. Partial closure does not return active credit.
-
-Physical membership is now published directly at successful backend/Gum patch
-boundaries, before resumed application threads can outrun a heartbeat. A batch
-updates individual physical flags then publishes one count; logical REQUESTED
-states do not count. The bounded atomic transport setter makes this count
-supersede older heartbeat snapshots in client admission and root decisions.
-MPI bootstrap republishes the current physical count after service start, so
-explicit immediate activation is also represented. Retirement still overrides
-membership to zero after callback quiescence. This fixes a missed-input window;
-it does not convert genuine budget denial or finite-grace fallback into success.
+The target controls an estimated lifetime budget. Calibration and mutation-cost
+prediction can be imperfect, and short jobs can finish before startup/closing
+costs are amortized. Reports retain final debt when measured costs exceed the estimate.

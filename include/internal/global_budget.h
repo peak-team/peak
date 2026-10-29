@@ -38,4 +38,4 @@ bool peak_global_budget_flush(unsigned timeout_ms);
 void peak_global_budget_stop(void);
 /* Native helper dispatch; not called by application callbacks. */
 int peak_global_budget_broker_main(int argc, char **argv);
-#endif
+#endif /* PEAK_GLOBAL_BUDGET_H */

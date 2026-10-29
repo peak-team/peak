@@ -1813,30 +1813,30 @@ def check_stop_window_accounting_sidecar(repo_root):
     reattach_after = heartbeat.find("reattach_accounting_after_valid =")
     reattach_coherent = heartbeat.find("reattach_accounting_coherent =")
     reattach_budget = heartbeat.find("reattach_accounting_coherent &&")
-    reattach_coherence_contract = heartbeat[
-        reattach_coherent:reattach_budget
-    ]
-    unsaturated_accounting_fields = [
-        f"reattach_accounting_{side}.{field} <\n"
-        "                    (UINT64_MAX - 1)"
-        for side in ("before", "after")
-        for field in (
-            "completed_stop_window_count",
-            "failed_stop_window_count",
-            "stop_window_wall_ns",
-        )
-    ]
+    coherence_helper = extract_function(general, "peak_general_listener_reattach_accounting_unchanged")
+    compact_helper = re.sub(r"\s+", "", coherence_helper)
+    accounting_fields = ("completed_stop_window_count", "failed_stop_window_count", "stop_window_wall_ns")
+    require("budget_valid&&current_valid" in compact_helper and
+            "budget!=NULL&&current!=NULL" in compact_helper and
+            all(f"{side}->{field}<UINT64_MAX-1" in compact_helper
+                for side in ("budget", "current") for field in accounting_fields) and
+            all(f"budget->{field}==current->{field}" in compact_helper
+                for field in accounting_fields),
+            "reattach coherence helper must reject invalid/saturated or changed accounting tuples")
+    coherence_call = re.sub(r"\s+", "", heartbeat[reattach_coherent:reattach_budget])
     require(reattach_before != -1 and reattach_predictor != -1 and
-            reattach_after != -1 and reattach_coherent != -1 and
-            reattach_budget != -1 and
-            reattach_before < reattach_predictor < reattach_after <
-            reattach_coherent < reattach_budget and
-            all(field in reattach_coherence_contract
-                for field in unsaturated_accounting_fields) and
-            "reattach_accounting_before.completed_stop_window_count ==\n                    reattach_accounting_after.completed_stop_window_count" in heartbeat and
-            "reattach_accounting_before.failed_stop_window_count ==\n                    reattach_accounting_after.failed_stop_window_count" in heartbeat and
-            "reattach_accounting_before.stop_window_wall_ns ==\n                    reattach_accounting_after.stop_window_wall_ns" in heartbeat,
+            reattach_after != -1 and reattach_coherent != -1 and reattach_budget != -1 and
+            reattach_before < reattach_predictor < reattach_after < reattach_coherent < reattach_budget and
+            "peak_general_listener_reattach_accounting_unchanged(&reattach_accounting_before,reattach_accounting_before_valid,&reattach_accounting_after,reattach_accounting_after_valid)" in coherence_call,
             "reattach admission must use unsaturated accounting snapshots that bracket and match the predictor read")
+    locked_snapshot = heartbeat.find("PeakDetachAccountingSnapshot reattach_accounting_locked;")
+    admission_lock = heartbeat.rfind("pthread_mutex_lock(&lock)", 0, locked_snapshot)
+    locked_check = heartbeat.find("peak_general_listener_reattach_accounting_unchanged(", locked_snapshot)
+    admission_request = heartbeat.find("peak_general_listener_request_reattach_with_context_unlocked", locked_check)
+    locked_contract = re.sub(r"\s+", "", heartbeat[locked_check:admission_request])
+    require(admission_lock != -1 and admission_lock < locked_snapshot < locked_check < admission_request and
+            "peak_general_listener_reattach_accounting_unchanged(&reattach_accounting_after,reattach_accounting_after_valid,&reattach_accounting_locked,reattach_accounting_locked_valid)" in locked_contract,
+            "reattach admission must revalidate the accounting tuple under the controller lock")
     require("peak_general_listener_accounting_snapshot(&accounting_baseline)" in note_runtime_start and
             "&peak_general_listener_heartbeat_control_baseline_ns" in note_runtime_start and
             "accounting_baseline.stop_window_wall_ns" in note_runtime_start and
@@ -1920,7 +1920,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "spent_ratio" not in per_target_detach,
             "per-target detach must remain cumulative-only and independent of reattach risk")
     require("double projected_global_overhead =\n                MAX(projected_attached_recent_sum,\n                    projected_attached_lifetime_sum)" in global_detach_for_budget and
-            "if (projected_global_overhead >\n                global_target_ratio * peak_global_detach_factor)" in global_detach_for_budget and
+            "if (projected_global_overhead >\n                peak_effective_rank_target * peak_global_detach_factor)" in global_detach_for_budget and
             "double contribution =\n                        MAX(rate_snapshot[i], ratio_snapshot[i])" in global_detach_for_budget and
             "if (contribution <= 0.0) continue;" in global_detach_for_budget and
             "entries[n_attached].ratio = contribution" in global_detach_for_budget and
@@ -1929,7 +1929,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "double reduced_recent_sum = projected_attached_recent_sum" in global_detach_for_budget and
             "double reduced_lifetime_sum = projected_attached_lifetime_sum" in global_detach_for_budget and
             "double reduced_global_overhead = projected_global_overhead" in global_detach_for_budget and
-            "if (reduced_global_overhead <= global_target_ratio)" in global_detach_for_budget and
+            "if (reduced_global_overhead <= peak_effective_rank_target)" in global_detach_for_budget and
             "reduced_recent_sum -= entries[k].rate" in global_detach_for_budget and
             "reduced_lifetime_sum -= entries[k].lifetime" in global_detach_for_budget and
             "reduced_global_overhead =\n                            MAX(reduced_recent_sum, reduced_lifetime_sum)" in global_detach_for_budget and
@@ -1942,7 +1942,7 @@ def check_stop_window_accounting_sidecar(repo_root):
             "local_mpi_ranks" not in global_detach_for_budget,
             "global detach must carry both profile signals and exclude raw and risk control spend")
     require("profile_global_overhead - prev_global_overhead" in adaptive_sleep and
-            "profile_global_overhead / global_target_ratio" in adaptive_sleep and
+            "profile_global_overhead / peak_effective_rank_target" in adaptive_sleep and
             "recent_rate" not in adaptive_sleep and
             "rate_snapshot" not in adaptive_sleep and
             "risk" not in adaptive_sleep and
@@ -1992,15 +1992,15 @@ def check_stop_window_accounting_sidecar(repo_root):
     require("double reattach_gate_ratio = 0.0" in reattach_section and
             "peak_general_listener_nonnegative_finite(\n"
             "                    peak_global_reattach_factor)" in reattach_section and
-            "peak_general_listener_nonnegative_finite(global_target_ratio)" in reattach_section and
+            "peak_general_listener_nonnegative_finite(peak_effective_rank_target)" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
             "                    peak_global_reattach_factor,\n"
-            "                    global_target_ratio,\n"
+            "                    peak_effective_rank_target,\n"
             "                    &reattach_gate_ratio)" in reattach_section,
             "reattach gate must be built with checked factor-times-target arithmetic")
     require("double headroom_seconds = 0.0" in reattach_section and
             "peak_general_listener_multiply_nonnegative_finite(\n"
-            "                    global_target_ratio,\n"
+            "                    peak_effective_rank_target,\n"
             "                    total_execution_time,\n"
             "                    &headroom_seconds)" in reattach_section and
             "peak_general_listener_subtract_nonnegative_finite(\n"

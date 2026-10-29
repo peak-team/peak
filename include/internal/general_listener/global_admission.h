@@ -1,5 +1,5 @@
-#ifndef PEAK_GENERAL_LISTENER_GLOBAL_ADMISSION_H
-#define PEAK_GENERAL_LISTENER_GLOBAL_ADMISSION_H
+#ifndef PEAK_GLOBAL_ADMISSION_H
+#define PEAK_GLOBAL_ADMISSION_H
 #include <stdbool.h>
 #include <stdint.h>
 #include <math.h>
@@ -30,4 +30,4 @@ static inline double peak_global_admission_closing_forecast(double previous,
     return fmax(previous, fmax(.003, per_window) *
         (double)peak_global_admission_closing_windows(targets));
 }
-#endif
+#endif /* PEAK_GLOBAL_ADMISSION_H */

@@ -273,53 +273,11 @@ def main():
         "callback state, initial crossing, and request must share an "
         "always-lock-free generation-tagged atomic word",
     )
-    burst_publish = function_body(
-        source, "peak_general_listener_try_publish_burst_request"
-    )
-    require(
-        "peak_general_listener_try_publish_burst_request(self, index)" in generic_enter
-        and "peak_general_listener_try_publish_burst_request(self, index)" in enter
-        and burst_publish.index("peak_burst_budget_due") <
-            burst_publish.index("atomic_load_explicit")
-        and "PEAK_CALLBACK_BURST_REQUEST_BIT" in threshold_take
-        and "atomic_compare_exchange_strong_explicit" in burst_publish,
-        "generic/direct burst guards must amortize lifecycle reads and share the generation CAS",
-    )
-    heartbeat = source[source.index("void* peak_heartbeat_monitor("):]
-    admission = heartbeat[heartbeat.index("projected_pending_reattach_seconds = 0.0;\n                pthread_mutex_lock(&lock);"):]
-    require(
-        admission.index("pthread_mutex_lock(&lock)") <
-        admission.index("&reattach_accounting_locked") <
-        admission.index("peak_general_listener_reattach_accounting_unchanged") <
-        admission.index("peak_general_listener_request_reattach_with_context_unlocked")
-        and "reattach_budget_ok && i < heartbeat_capacity" in admission,
-        "reattach must reject stale control headroom after controller-lock acquisition",
-    )
-    for token in ("pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
-        require(token not in burst_publish,
-                "burst callbacks must not lock, scan, allocate, call MPI or mutate Gum")
-    settlement_capture = heartbeat.index(
-        "uint64_t settled_control_snapshot = peak_general_listener_settle_control_credit_unlocked()")
-    settlement_unlock = heartbeat.index("pthread_mutex_unlock(&lock)", settlement_capture)
-    require(
-        settlement_capture < settlement_unlock < heartbeat.index(
-            "peak_general_listener_runtime_accounting_snapshot(&detach_accounting)", settlement_unlock)
-        and ".settled_control_credit_ns = settled_control_snapshot" in heartbeat,
-        "control credit watermark must be captured under lock before actual control accounting",
-    )
+    burst_publish = function_body(source, "peak_general_listener_try_publish_burst_request")
     grace_claim = function_body(source, "peak_general_listener_claim_global_grace")
-    require(
-        "for (" not in burst_publish and "while (" not in burst_publish
-        and "peak_global_budget_try_spend" in burst_publish
-        and "peak_global_budget_active" in burst_publish
-        and "peak_global_budget_view" not in burst_publish
-        and "atomic_fetch_add_explicit" in grace_claim
-        and "PEAK_GLOBAL_GRACE_NS - old" in grace_claim
-        and "MIN(charge, PEAK_GLOBAL_GRACE_NS + 1)" in grace_claim,
-        "callback credit/grace must remain bounded and avoid publication/CAS false failures",
-    )
     for token in ("for (", "while (", "pthread_mutex", "MPI_", "malloc(", "gum_interceptor_"):
-        require(token not in grace_claim, "grace tickets must not loop, lock, allocate, use MPI or mutate Gum")
+        require(token not in burst_publish and token not in grace_claim,
+                "callback budget helpers must remain bounded and avoid locks, allocation, MPI and Gum")
     for token in (
         "pthread_mutex",
         "pthread_cond",

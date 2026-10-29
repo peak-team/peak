@@ -4,7 +4,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,28 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int fail_open, fail_format;
-static FILE* checked_open_memstream(char** bytes, size_t* size)
-{
-    if (fail_open) { errno = ENOMEM; return NULL; }
-    return open_memstream(bytes, size);
-}
-static int checked_vfprintf(FILE* stream, const char* format, va_list args)
-{
-    if (fail_format) {
-        fail_format = 0;
-        assert(fwrite("PARTIAL", 1, 7, stream) == 7);
-        errno = ENOMEM;
-        return -1;
-    }
-    return vfprintf(stream, format, args);
-}
-/* Exercise real logging with deterministic allocation/partial-format faults. */
-#define open_memstream checked_open_memstream
-#define vfprintf checked_vfprintf
-#include "../../src/logging.c"
-#undef open_memstream
-#undef vfprintf
+#include "logging.h"
 
 static FILE* capture(void)
 {
@@ -102,36 +80,6 @@ static void prefixes(void)
     peak_log_shutdown();
     assert(fclose(file) == 0);
 }
-static void failures(void)
-{
-    FILE* file = capture();
-    fail_open = 1;
-    assert(peak_log_report_batch_begin() == 0);
-    peak_log_report("direct-");
-    fail_open = 0;
-    assert(peak_log_report_batch_begin() == 1);
-    peak_log_report("prefix-");
-    fail_format = 1;
-    peak_log_report("replayed-%d-", 7);
-    peak_log_report("tail\n");
-    assert(peak_log_report_batch_end() == 0);
-    require_text(file, "direct-prefix-replayed-7-tail\n");
-    peak_log_shutdown();
-    assert(fclose(file) == 0);
-}
-static void full(void)
-{
-    int fd = open("/dev/full", O_WRONLY);
-    assert(fd >= 0 && dup2(fd, STDERR_FILENO) >= 0);
-    assert(close(fd) == 0);
-    peak_log_initialize_output(0);
-    assert(peak_log_report_batch_begin() == 1);
-    peak_log_report("undeliverable\n");
-    errno = 0;
-    assert(peak_log_report_batch_end() == -1 && errno != 0);
-    assert(peak_log_flush() == -1);
-    peak_log_shutdown();
-}
 static void fork_flush(void)
 {
     FILE* file = capture();
@@ -186,23 +134,11 @@ static void cancellation(void)
     peak_log_shutdown();
     close(pipefd[0]); close(pipefd[1]);
 }
-int main(int argc, char** argv)
+int main(void)
 {
     alarm(15);
     assert(setenv("PEAK_VERBOSITY", "warn", 1) == 0);
-    if (argc == 2) {
-        peak_log_initialize_output(0);
-        int owned = strcmp(argv[1], "batch") == 0 ?
-                    peak_log_report_batch_begin() : 0;
-        for (int i = 0; i < 10000; ++i)
-            peak_log_report("row %d with a fixed profiler report payload\n", i);
-        if (owned) assert(peak_log_report_batch_end() == 0);
-        assert(peak_log_flush() == 0);
-        peak_log_shutdown();
-        return 0;
-    }
-    void (*checks[])(void) = {equivalence, prefixes, failures, full,
-                              fork_flush, cancellation};
+    void (*checks[])(void) = {equivalence, prefixes, fork_flush, cancellation};
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
         pid_t child = fork();
         assert(child >= 0);

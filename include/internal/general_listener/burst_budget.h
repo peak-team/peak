@@ -46,4 +46,4 @@ peak_burst_budget_sample(PeakBurstBudgetSlot* slot,
     return exceeded;
 }
 
-#endif
+#endif /* PEAK_BURST_BUDGET_H */

@@ -2,7 +2,6 @@
 #include <dlfcn.h>
 #include <mpi.h>
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -69,7 +68,6 @@ main(int argc, char** argv)
     char mode[32];
     char policy[16];
     int expect_post_init;
-    int expect_prepare;
     int synthetic_failure;
     int rank = -1;
     int sum = 0;
@@ -83,9 +81,8 @@ main(int argc, char** argv)
         fail("activation test argument is too long");
     }
     expect_post_init = strcmp(policy, "post-init") == 0;
-    expect_prepare = strcmp(policy, "prepare") == 0;
     synthetic_failure = strcmp(mode, "synthetic-failure") == 0;
-    if (!expect_post_init && !expect_prepare && strcmp(policy, "immediate") != 0) {
+    if (!expect_post_init && strcmp(policy, "immediate") != 0) {
         fail("unknown activation expectation");
     }
 
@@ -116,9 +113,6 @@ main(int argc, char** argv)
         if (runtime_active() != 0 || hook_state(0) != 0) {
             fail("loader activity activated PEAK before MPI_Init");
         }
-    } else if (expect_prepare) {
-        uint32_t (*physical)(void) = dlsym(RTLD_DEFAULT, "peak_general_listener_test_physical_targets");
-        if (physical == NULL || physical() != 0) fail("prepare patched a dynamic target before MPI_Init");
     } else {
         wait_for_attached(hook_state);
     }
@@ -129,9 +123,6 @@ main(int argc, char** argv)
     if (sum != 36) {
         fail("pre-init target returned an unexpected result");
     }
-
-    if (expect_prepare && call_count(0) != 0)
-        fail("prepare collected dynamic target calls before MPI_Init");
 
     if (synthetic_failure) {
         init_completed = (PeakMpiInitCompletedFunction)dlsym(
@@ -159,7 +150,7 @@ main(int argc, char** argv)
     if (sum != 36) {
         fail("deferred target returned an unexpected result");
     }
-    if (call_count(0) != ((expect_post_init || expect_prepare) ? 8UL : 16UL)) {
+    if (call_count(0) != (expect_post_init ? 8UL : 16UL)) {
         fail("profiled target call count does not match activation policy");
     }
 

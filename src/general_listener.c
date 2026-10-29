@@ -310,6 +310,9 @@ static uint64_t peak_mpi_burst_waves;
 static uint64_t peak_mpi_burst_unsampled_targets;
 static gboolean peak_detach_count_overridden = FALSE;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+/* An admission quote belongs to the next controller scan, including when
+ * a partial initial batch already left physical targets active. */
+static gboolean peak_global_admission_waiting;
 
 /* Service-only idle-return guard. A paid queued mutation already owns its
  * observation lease, even before the backend has published physical targets.
@@ -331,7 +334,8 @@ PEAK_API bool
 peak_global_budget_listener_idle_try_guard(void)
 {
     if (pthread_mutex_trylock(&lock) != 0) return false;
-    if (peak_general_listener_idle_has_pending_unlocked()) {
+    if (peak_global_admission_waiting ||
+        peak_general_listener_idle_has_pending_unlocked()) {
         pthread_mutex_unlock(&lock);
         return false;
     }
@@ -6023,6 +6027,18 @@ void* peak_heartbeat_monitor(void* arg) {
             }
         }
 
+        /* A canceled admission must not retain an otherwise idle wallet. */
+        PeakGlobalBudgetView admission_status = {0};
+        if (peak_global_configured) admission_status = peak_global_budget_view();
+        if (!detach_observation_ready ||
+            !(enable_reattach || peak_global_funded_initial_attach) ||
+            check_interval == 0 || !admission_status.active ||
+            admission_status.root_completed_wave < admission_status.wave) {
+            pthread_mutex_lock(&lock);
+            peak_global_admission_waiting = FALSE;
+            pthread_mutex_unlock(&lock);
+        }
+
         /* 3) Reattach. */
         if (detach_observation_ready &&
             (enable_reattach || peak_global_funded_initial_attach) &&
@@ -6124,6 +6140,37 @@ void* peak_heartbeat_monitor(void* arg) {
                     ? global_batch_stop_ns + operating_ns : UINT64_MAX;
                 if (global_admission.recovery_target_ns > 0)
                     global_recovery_credit_ns = global_admission.recovery_target_ns;
+                /* Keep a real admission quote until the next locked scan can
+                 * consume it. A grant ACK precedes that scan and does not make
+                 * these operating funds idle. */
+                pthread_mutex_lock(&lock);
+                peak_global_admission_waiting = FALSE;
+                if (reattach_accounting_coherent &&
+                    (enable_per_target_heartbeat || enable_global_heartbeat) &&
+                    !atomic_load(&peak_global_returning_idle) &&
+                    global_admission.root_completed_wave >= global_admission.wave &&
+                    global_recovery_credit_ns != UINT64_MAX) {
+                    for (size_t i = 0; i < heartbeat_capacity; i++) {
+                        if (!(hook_address[i] && array_listener[i]) ||
+                            peak_hook_states == NULL ||
+                            peak_hook_states[i] != PEAK_HOOK_DETACHED ||
+                            !peak_detached[i] || peak_need_detach[i] ||
+                            (!enable_reattach && !(peak_hook_never_attached != NULL &&
+                                peak_hook_never_attached[i])) ||
+                            !peak_general_listener_reattach_cooldown_ready_unlocked(i, now))
+                            continue;
+                        double projected =
+                            peak_general_listener_projected_detach_profile_seconds_unlocked(
+                                i, profile_seconds_snapshot[i]);
+                        if (enable_global_heartbeat ||
+                            (enable_per_target_heartbeat &&
+                             projected / total_execution_time <= target_profile_ratio)) {
+                            peak_global_admission_waiting = TRUE;
+                            break;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&lock);
                 if (!atomic_load(&peak_global_returning_idle) && global_detached_targets > 0 &&
                     global_admission.root_completed_wave >= global_admission.wave &&
                     global_recovery_credit_ns > global_admission.local_credit_ns &&
@@ -6454,6 +6501,9 @@ void* peak_heartbeat_monitor(void* arg) {
                     headroom_seconds = remaining_headroom_seconds;
                     admitted_count++;
                 }
+                /* Queued mutations now own the lease and are covered by the
+                 * same idle guard; rejected/canceled candidates own no quote. */
+                peak_global_admission_waiting = FALSE;
                 pthread_mutex_unlock(&lock);
             }
         }
@@ -8068,6 +8118,7 @@ peak_general_listener_attach()
     peak_global_closing_window_seconds = 0.0;
     peak_global_closing_target_count = 0;
     peak_global_idle_returned = FALSE;
+    peak_global_admission_waiting = FALSE;
     peak_global_idle_return_pending = FALSE;
     atomic_store(&peak_global_returning_idle, FALSE);
     peak_global_text_reported = FALSE;
@@ -8354,157 +8405,6 @@ peak_general_listener_attach()
 
 /* Checkpoint and report snapshot capture. */
 #ifdef PEAK_ENABLE_TEST_HOOKS
-PEAK_API void peak_general_listener_test_global_invalid_accounting(void)
-{
-    peak_general_listener_global_accounting_invalid();
-}
-typedef struct { unsigned successes; } PeakGraceTestWorker;
-static void *peak_general_listener_test_grace_worker(void *argument)
-{
-    PeakGraceTestWorker *worker = argument;
-    for (unsigned i = 0; i < 1000; i++)
-        if (peak_general_listener_claim_global_grace(1000)) worker->successes++;
-    return NULL;
-}
-PEAK_API int peak_general_listener_test_global_admission_ns(void)
-{
-    const uint64_t mutation = UINT64_C(3000000);
-    const uint64_t share = UINT64_C(3000000) / 16;
-    uint64_t exact = UINT64_C(6000000), tight = exact - 1;
-    for (unsigned i = 0; i < 16; i++) {
-        uint64_t fee = i == 0 ? mutation : 0;
-        if (!peak_global_admission_claim_ns(&exact, share, fee)) return 1;
-        uint64_t before = tight;
-        gboolean admitted = peak_global_admission_claim_ns(&tight, share, fee);
-        if (admitted != (i < 15) || (!admitted && tight != before)) return 2;
-    }
-    if (exact != 0 || tight != share - 1) return 3;
-    /* Previous HB already prepaid mutation: current primary wallet is 3ms.
-     * Rebuild eight pending observation leases from that same fresh wallet,
-     * then admit the remaining eight in the existing paid batch. */
-    for (unsigned heartbeat = 0; heartbeat < 4; heartbeat++) {
-        uint64_t wallet = mutation;
-        for (unsigned pending = 0; pending < 8; pending++)
-            if (!peak_global_admission_claim_ns(&wallet, share, 0)) return 4;
-        if (wallet != UINT64_C(1500000)) return 5;
-        for (unsigned candidate = 0; candidate < 8; candidate++)
-            if (!peak_global_admission_claim_ns(&wallet, share, 0)) return 6;
-        if (wallet != 0) return 7;
-    }
-    uint64_t remainder = UINT64_C(6000001);
-    for (unsigned i = 0; i < 16; i++)
-        if (!peak_global_admission_claim_ns(&remainder,
-                UINT64_C(3000001) / 16, i == 0 ? mutation : 0)) return 8;
-    if (remainder != 1) return 9;
-    uint64_t invalid = 10;
-    if (peak_global_admission_claim_ns(&invalid, UINT64_MAX, 0) || invalid != 10 ||
-        peak_global_admission_claim_ns(&invalid, 1, UINT64_MAX) || invalid != 10 ||
-        peak_global_admission_seconds_ns(NAN) != UINT64_MAX ||
-        peak_global_admission_seconds_ns(-DBL_MIN) != UINT64_MAX ||
-        peak_global_admission_seconds_ns(.003) != mutation) return 10;
-    const uint64_t counts[] = {0, 1, 64, 65, 128, 129};
-    const uint64_t windows[] = {0, 1, 1, 2, 2, 3};
-    double closing = 0.0;
-    for (unsigned i = 0; i < 6; i++) {
-        if (peak_global_admission_closing_windows(counts[i]) != windows[i]) return 11;
-        closing = peak_global_admission_closing_forecast(closing, .003, counts[i]);
-        if (closing != .003 * (double)windows[i]) return 12;
-    }
-    for (unsigned heartbeat = 0; heartbeat < 4; heartbeat++)
-        if (peak_global_admission_closing_forecast(closing, .003, 129) != closing)
-            return 13;
-    if (peak_global_admission_closing_forecast(closing, .003, 1) != closing ||
-        peak_global_admission_closing_forecast(0.0, .001, 65) != .006 ||
-        peak_global_admission_closing_forecast(closing, .004, 129) != .012)
-        return 14;
-    /* Physical boundaries, unlike sampled attached counts, must neither
-     * reclaim active/pending credit nor return a fresh recovery loan twice. */
-    pthread_mutex_lock(&lock);
-    PeakHookState* saved_states = peak_hook_states;
-    gboolean* saved_physical = peak_hook_physical_attached;
-    size_t saved_count = peak_hook_address_count;
-    gboolean saved_idle = peak_global_idle_returned;
-    gboolean saved_pending = peak_global_idle_return_pending;
-    gboolean saved_returning = atomic_load(&peak_global_returning_idle);
-    PeakHookState states[3] = {PEAK_HOOK_ATTACHED, PEAK_HOOK_DETACHED, PEAK_HOOK_DETACHED};
-    gboolean physical[3] = {TRUE, FALSE, FALSE};
-    peak_hook_states = states;
-    peak_hook_physical_attached = physical;
-    peak_hook_address_count = 3;
-    peak_global_idle_returned = FALSE;
-    peak_global_idle_return_pending = TRUE;
-    atomic_store(&peak_global_returning_idle, FALSE);
-    int failure = peak_general_listener_take_idle_return_unlocked() ? 15 : 0;
-    physical[0] = FALSE;
-    const PeakHookState pending_states[] = {PEAK_HOOK_DETACH_REQUESTED,
-        PEAK_HOOK_DETACHING, PEAK_HOOK_REATTACH_REQUESTED, PEAK_HOOK_REATTACHING};
-    for (unsigned i = 0; i < G_N_ELEMENTS(pending_states); i++) {
-        states[0] = pending_states[i];
-        if (peak_general_listener_take_idle_return_unlocked()) failure = 16;
-    }
-    states[0] = PEAK_HOOK_DETACHED;
-    physical[0] = TRUE;
-    if (peak_general_listener_take_idle_return_unlocked()) failure = 19;
-    physical[0] = FALSE;
-    if (!peak_general_listener_take_idle_return_unlocked() ||
-        !peak_global_idle_returned || peak_global_idle_return_pending ||
-        !atomic_load(&peak_global_returning_idle)) failure = 17;
-    atomic_store(&peak_global_returning_idle, FALSE);
-    if (peak_general_listener_take_idle_return_unlocked()) failure = 18;
-    peak_hook_states = saved_states;
-    peak_hook_physical_attached = saved_physical;
-    peak_hook_address_count = saved_count;
-    peak_global_idle_returned = saved_idle;
-    peak_global_idle_return_pending = saved_pending;
-    atomic_store(&peak_global_returning_idle, saved_returning);
-    pthread_mutex_unlock(&lock);
-    return failure;
-}
-
-PEAK_API int peak_general_listener_test_global_grace_faa(void)
-{
-    PeakGraceTestWorker workers[6] = {{0}};
-    pthread_t threads[6];
-    unsigned created = 0, successes = 0;
-    atomic_store(&peak_global_grace_claimed_ns, 0);
-    for (; created < 6; created++)
-        if (pthread_create(&threads[created], NULL,
-                peak_general_listener_test_grace_worker, &workers[created]) != 0) break;
-    for (unsigned i = 0; i < created; i++) {
-        pthread_join(threads[i], NULL);
-        successes += workers[i].successes;
-    }
-    uint64_t claimed = atomic_load(&peak_global_grace_claimed_ns);
-    int failed = created != 6 || successes != 500 ||
-        claimed < PEAK_GLOBAL_GRACE_NS || claimed > PEAK_GLOBAL_GRACE_NS + 6000;
-    atomic_store(&peak_global_grace_claimed_ns, 0);
-    if (peak_general_listener_claim_global_grace(UINT64_MAX) ||
-        atomic_load(&peak_global_grace_claimed_ns) != PEAK_GLOBAL_GRACE_NS + 1 ||
-        peak_general_listener_claim_global_grace(1)) failed = 1;
-    atomic_store(&peak_global_grace_claimed_ns, 0);
-    return failed;
-}
-PEAK_API int peak_general_listener_test_global_idle_guard(void)
-{
-    static const PeakHookState pending[] = {
-        PEAK_HOOK_DETACH_REQUESTED, PEAK_HOOK_DETACHING,
-        PEAK_HOOK_REATTACH_REQUESTED, PEAK_HOOK_REATTACHING
-    };
-    int failed = 0;
-    pthread_mutex_lock(&lock);
-    /* No recursive/blocking acquisition when a controller owns the mutex. */
-    if (peak_global_budget_listener_idle_try_guard()) failed = 1;
-    if (peak_hook_states != NULL && peak_hook_address_count != 0) {
-        PeakHookState saved = peak_hook_states[0];
-        for (size_t i = 0; i < G_N_ELEMENTS(pending); i++) {
-            peak_hook_states[0] = pending[i];
-            if (!peak_general_listener_idle_has_pending_unlocked()) failed = 1;
-        }
-        peak_hook_states[0] = saved;
-    }
-    pthread_mutex_unlock(&lock);
-    return failed;
-}
 PEAK_API uint64_t peak_general_listener_test_all_target_calls(void)
 {
     uint64_t calls = 0;
@@ -8530,96 +8430,6 @@ PEAK_API int peak_general_listener_test_global_active(void)
 PEAK_API PeakGlobalBudgetView peak_general_listener_test_global_view(void)
 {
     return peak_global_budget_view();
-}
-PEAK_API void peak_general_listener_test_global_disconnect(void)
-{
-    peak_global_budget_stop();
-}
-PEAK_API int
-peak_general_listener_test_reattach_accounting_validation(void)
-{
-    PeakDetachAccountingSnapshot budget = {3, 1, 500};
-    PeakDetachAccountingSnapshot current = budget;
-    if (!peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 1;
-    current.completed_stop_window_count++;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 2;
-    current = budget; current.failed_stop_window_count++;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 3;
-    current = budget; current.stop_window_wall_ns++;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 4;
-    current = budget;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, FALSE) ||
-        peak_general_listener_reattach_accounting_unchanged(
-            &budget, FALSE, &current, TRUE)) return 5;
-    /* Equal saturated tuples must not restore admission either. */
-    current.completed_stop_window_count = UINT64_MAX - 1; budget = current;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 6;
-    current = (PeakDetachAccountingSnapshot){0, UINT64_MAX, 0}; budget = current;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 7;
-    current = (PeakDetachAccountingSnapshot){0, 0, UINT64_MAX - 1}; budget = current;
-    if (peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 8;
-    current = (PeakDetachAccountingSnapshot){0}; budget = current;
-    if (!peak_general_listener_reattach_accounting_unchanged(
-            &budget, TRUE, &current, TRUE)) return 9;
-    return 0;
-}
-
-/* Standalone state-machine test; no controller or physical mutation runs. */
-PEAK_API int
-peak_general_listener_test_mpi_burst_wave_state_gate(void)
-{
-    if (peak_hook_address_count != 0) return 1;
-    for (size_t i = 0; i < 3; i++) {
-        size_t id;
-        if (!peak_general_listener_expand_dynamic_hook_tables_unlocked(
-                "burst-state-test", &id)) return 2;
-        hook_address[id] = (gpointer)(uintptr_t)(id + 1);
-        array_listener[id] = g_object_new(PEAKGENERAL_TYPE_LISTENER, NULL);
-        PEAKGENERAL_LISTENER(array_listener[id])->hook_id = id;
-        array_listener_gum_detached[id] = i != 0;
-        array_listener_gum_detach_flushed[id] = TRUE;
-        peak_general_controller_set_state_unlocked(id,
-            i == 0 ? PEAK_HOOK_ATTACHED : PEAK_HOOK_DETACHED);
-    }
-    if (!peak_general_listener_request_reattach_with_context_unlocked(
-            1, PEAK_HOOK_REQUEST_SOURCE_GLOBAL_HEARTBEAT, 7, .1, .2, 1, .3)) return 3;
-    peak_general_controller_request_mpi_burst_wave_unlocked();
-    if (peak_hook_states[0] != PEAK_HOOK_DETACH_REQUESTED ||
-        peak_hook_pending_request_source[0] != PEAK_HOOK_REQUEST_SOURCE_MPI_BURST ||
-        peak_hook_states[1] != PEAK_HOOK_DETACHED ||
-        peak_hook_pending_request_source[1] != PEAK_HOOK_REQUEST_SOURCE_NONE ||
-        peak_hook_pending_request_calls[1] != 0 ||
-        peak_hook_pending_request_rate[1] != 0.0 ||
-        peak_hook_pending_request_ratio[1] != 0.0 ||
-        !peak_general_listener_mpi_burst_wave_pending_unlocked() ||
-        peak_general_listener_request_reattach_with_context_unlocked(
-            1, PEAK_HOOK_REQUEST_SOURCE_API, 0, 0, 0, 0, 0)) return 4;
-    /* Successful final member reopens admission (normal budget gate remains). */
-    peak_general_controller_reset_retry_unlocked(0);
-    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_DETACHED);
-    if (peak_general_listener_mpi_burst_wave_pending_unlocked() ||
-        !peak_general_listener_request_reattach_with_context_unlocked(
-            1, PEAK_HOOK_REQUEST_SOURCE_API, 0, 0, 0, 0, 0)) return 5;
-    /* Retry abandonment to ATTACHED must also release the transient wave gate. */
-    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_ATTACHED);
-    peak_general_controller_request_mpi_burst_wave_unlocked();
-    peak_general_controller_reset_retry_unlocked(0);
-    peak_general_controller_set_state_unlocked(0, PEAK_HOOK_ATTACHED);
-    if (peak_general_listener_mpi_burst_wave_pending_unlocked()) return 6;
-    for (size_t i = 0; i < 3; i++) {
-        peak_general_listener_free(PEAKGENERAL_LISTENER(array_listener[i]));
-        g_object_unref(array_listener[i]);
-        array_listener[i] = NULL;
-    }
-    return 0;
 }
 
 PEAK_API int

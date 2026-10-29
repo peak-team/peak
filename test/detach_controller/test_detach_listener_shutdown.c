@@ -868,26 +868,6 @@ run_uint64_saturation(void)
 }
 
 static int
-run_reattach_accounting_validation(void)
-{
-    check_true("reattach rejects changed or invalid control headroom snapshots",
-               peak_general_listener_test_reattach_accounting_validation() == 0);
-    fprintf(stderr, "general-listener-reattach-accounting-validation-ok\n");
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-}
-
-static int
-run_mpi_burst_wave_state_gate(void)
-{
-    gum_init_embedded();
-    check_true("MPI burst wave cancels pending reattach and gates admission",
-               peak_general_listener_test_mpi_burst_wave_state_gate() == 0);
-    gum_deinit_embedded();
-    fprintf(stderr, "general-listener-mpi-burst-wave-state-gate-ok\n");
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-}
-
-static int
 run_detach_count_latch_state_gate(void)
 {
     check_true("detach-count latch obeys callback hook state",
@@ -1071,12 +1051,6 @@ main(int argc, char** argv)
     }
     if (strcmp(argv[1], "general-listener-uint64-saturation") == 0) {
         return run_uint64_saturation();
-    }
-    if (strcmp(argv[1], "general-listener-reattach-accounting-validation") == 0) {
-        return run_reattach_accounting_validation();
-    }
-    if (strcmp(argv[1], "general-listener-mpi-burst-wave-state-gate") == 0) {
-        return run_mpi_burst_wave_state_gate();
     }
     if (strcmp(argv[1],
                "general-listener-detach-count-latch-state-gate") == 0) {

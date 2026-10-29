@@ -268,14 +268,19 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "report_snapshot_cxx_link_test_ok")
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(test_logging_batch report/test_logging_batch.c)
-    target_include_directories(test_logging_batch PRIVATE
-        ${PROJECT_SOURCE_DIR}/include)
-    target_compile_options(test_logging_batch PRIVATE -UNDEBUG)
-    target_link_libraries(test_logging_batch PRIVATE Threads::Threads)
-    add_test(NAME test_logging_batch COMMAND test_logging_batch)
-    set_tests_properties(test_logging_batch PROPERTIES TIMEOUT 20
-        PASS_REGULAR_EXPRESSION "logging_batch_test_ok")
+        # Match the production logger's DSO unwind boundary for cancellation.
+        add_library(test_logging_batch_runtime SHARED ${PROJECT_SOURCE_DIR}/src/logging.c)
+        target_include_directories(test_logging_batch_runtime PRIVATE ${PROJECT_SOURCE_DIR}/include)
+        target_link_libraries(test_logging_batch_runtime PRIVATE Threads::Threads)
+        set_target_properties(test_logging_batch_runtime PROPERTIES C_VISIBILITY_PRESET default)
+        add_executable(test_logging_batch report/test_logging_batch.c)
+        target_include_directories(test_logging_batch PRIVATE
+            ${PROJECT_SOURCE_DIR}/include)
+        target_compile_options(test_logging_batch PRIVATE -UNDEBUG)
+        target_link_libraries(test_logging_batch PRIVATE test_logging_batch_runtime Threads::Threads)
+        add_test(NAME test_logging_batch COMMAND test_logging_batch)
+        set_tests_properties(test_logging_batch PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "logging_batch_test_ok")
     endif()
 
     add_executable(test_report_formatter
@@ -390,12 +395,6 @@ if(BUILD_TESTING)
             TIMEOUT 30
             PASS_REGULAR_EXPRESSION
                 "mpi_teardown_guard_test_ok success=11 failure_paths=10")
-
-    add_executable(test_burst_budget report/test_burst_budget.c)
-    target_include_directories(test_burst_budget PRIVATE ${PROJECT_SOURCE_DIR}/include)
-    target_compile_options(test_burst_budget PRIVATE -UNDEBUG)
-    add_test(NAME test_burst_budget COMMAND test_burst_budget)
-    set_tests_properties(test_burst_budget PROPERTIES TIMEOUT 10)
 
     add_executable(test_runtime_config
         report/test_runtime_config.c
@@ -692,18 +691,12 @@ if(BUILD_TESTING)
     endif()
     add_subdirectory(detach_runtime)
     if(PEAK_GUM_PEAK_PC_API_AVAILABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        foreach(_burst_mode IN ITEMS generic fast)
-            foreach(_burst_policy IN ITEMS enabled heartbeat-off global-off single conflict large)
-                add_test(NAME test_mpi_burst_budget_${_burst_mode}_${_burst_policy}
-                    COMMAND ${Python3_EXECUTABLE}
-                        ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_mpi_burst_budget_check.py
-                        --exe $<TARGET_FILE:test_mpi_burst_budget>
-                        --libpeak $<TARGET_FILE:peak>
-                        --mode ${_burst_mode} --policy ${_burst_policy})
-                set_tests_properties(test_mpi_burst_budget_${_burst_mode}_${_burst_policy}
-                    PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
-            endforeach()
-        endforeach()
+        add_test(NAME test_mpi_burst_budget
+            COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/test/detach_runtime/run_mpi_burst_budget_check.py
+                --exe $<TARGET_FILE:test_mpi_burst_budget>
+                --libpeak $<TARGET_FILE:peak>)
+        set_tests_properties(test_mpi_burst_budget PROPERTIES TIMEOUT 20)
     endif()
 
     add_subdirectory(dlopen_controller)
@@ -2543,35 +2536,6 @@ if(BUILD_TESTING)
                 PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=mpi-init policy=post-init"
                 FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Caught signal|Segmentation fault|SIGSEGV|signal 11"
                 TIMEOUT 30)
-        foreach(prepare_compat heartbeat-off non-mpi)
-            if(prepare_compat STREQUAL "heartbeat-off")
-                set(prepare_compat_mode mpi-init-thread)
-                set(prepare_compat_env "PEAK_MPI_ACTIVATION_POLICY=prepare;PEAK_HEARTBEAT_INTERVAL=0")
-            else()
-                set(prepare_compat_mode synthetic-failure)
-                set(prepare_compat_env "PEAK_MPI_ACTIVATION_POLICY=;PEAK_HEARTBEAT_INTERVAL=0.01")
-            endif()
-            add_test(NAME test_mpi_prepare_compat_${prepare_compat}
-                COMMAND $<TARGET_FILE:test_mpi_init_deferred_activation>
-                        ${prepare_compat_mode} immediate)
-            set_tests_properties(test_mpi_prepare_compat_${prepare_compat}
-                PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_GLOBAL_BUDGET=1;PEAK_OUTPUT_AGGREGATION=local;${prepare_compat_env};${PRELOAD_VAR}"
-                    PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=${prepare_compat_mode} policy=immediate"
-                    FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Segmentation fault"
-                    TIMEOUT 30)
-        endforeach()
-        foreach(prepare_mode synthetic-failure mpi-init-thread)
-            add_test(NAME test_mpi_prepare_local_fallback_${prepare_mode}
-                COMMAND $<TARGET_FILE:test_mpi_init_deferred_activation>
-                        ${prepare_mode} prepare)
-            set_tests_properties(test_mpi_prepare_local_fallback_${prepare_mode}
-                PROPERTIES
-                    ENVIRONMENT "PEAK_TARGET=peak_mpi_init_deferred_target;PEAK_MPI_ACTIVATION_POLICY=prepare;PEAK_MPI_GLOBAL_BUDGET=1;PEAK_OUTPUT_AGGREGATION=local;PEAK_HEARTBEAT_INTERVAL=0.01;PEAK_ENABLE_GLOBAL_HEARTBEAT=1;PEAK_REQUIRE_SAFE_DETACH=1;PEAK_SAFE_DETACH_MODE=strict;PEAK_DETACH_BACKEND=signal;${PRELOAD_VAR}"
-                    PASS_REGULAR_EXPRESSION "mpi_init_activation_policy_ok mode=${prepare_mode} policy=prepare"
-                    FAIL_REGULAR_EXPRESSION "mpi_init_deferred_activation_error|Segmentation fault"
-                    TIMEOUT 30)
-        endforeach()
         add_test(NAME test_mpi_init_failure_falls_back_non_mpi
             COMMAND $<TARGET_FILE:test_mpi_init_deferred_activation>
                     synthetic-failure

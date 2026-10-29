@@ -31,17 +31,20 @@ set_tests_properties(test_exec_chain_platform_selection_contract
         TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
-    add_executable(test_mpi_runtime_child test_mpi_runtime_child.c)
-    target_compile_options(test_mpi_runtime_child PRIVATE -UNDEBUG)
-    target_link_options(test_mpi_runtime_child PRIVATE -Wl,--export-dynamic)
-    target_link_libraries(test_mpi_runtime_child PRIVATE ${CMAKE_DL_LIBS})
-    add_test(NAME test_mpi_runtime_child
-        COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/run_mpi_runtime_child_check.py
-                --exe $<TARGET_FILE:test_mpi_runtime_child>
-                --libpeak $<TARGET_FILE:peak>)
-    set_tests_properties(test_mpi_runtime_child PROPERTIES TIMEOUT 120
-        PASS_REGULAR_EXPRESSION "mpi_runtime_child_check_ok")
+    if(PEAK_ENABLE_MPI AND MPI_C_FOUND)
+        add_executable(test_mpi_runtime_child test_mpi_runtime_child.c)
+        target_compile_options(test_mpi_runtime_child PRIVATE -UNDEBUG)
+        target_link_options(test_mpi_runtime_child PRIVATE -Wl,--export-dynamic)
+        target_link_libraries(test_mpi_runtime_child PRIVATE ${CMAKE_DL_LIBS})
+        add_test(NAME test_mpi_runtime_child
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/run_mpi_runtime_child_check.py
+                    --exe $<TARGET_FILE:test_mpi_runtime_child>
+                    --libpeak $<TARGET_FILE:peak>)
+        set_tests_properties(test_mpi_runtime_child PROPERTIES TIMEOUT 120
+            PASS_REGULAR_EXPRESSION "mpi_runtime_child_check_ok")
+
+    endif()
 
     add_executable(test_exec_chain test_exec_chain.c)
     target_link_options(test_exec_chain PRIVATE -Wl,--export-dynamic -Wl,--as-needed)

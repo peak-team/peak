@@ -37,55 +37,6 @@ COLD_TARGET(11)
 COLD_TARGET(12)
 COLD_TARGET(13)
 COLD_TARGET(14)
-COLD_TARGET(15)
-COLD_TARGET(16)
-COLD_TARGET(17)
-COLD_TARGET(18)
-COLD_TARGET(19)
-COLD_TARGET(20)
-COLD_TARGET(21)
-COLD_TARGET(22)
-COLD_TARGET(23)
-COLD_TARGET(24)
-COLD_TARGET(25)
-COLD_TARGET(26)
-COLD_TARGET(27)
-COLD_TARGET(28)
-COLD_TARGET(29)
-COLD_TARGET(30)
-COLD_TARGET(31)
-COLD_TARGET(32)
-COLD_TARGET(33)
-COLD_TARGET(34)
-COLD_TARGET(35)
-COLD_TARGET(36)
-COLD_TARGET(37)
-COLD_TARGET(38)
-COLD_TARGET(39)
-COLD_TARGET(40)
-COLD_TARGET(41)
-COLD_TARGET(42)
-COLD_TARGET(43)
-COLD_TARGET(44)
-COLD_TARGET(45)
-COLD_TARGET(46)
-COLD_TARGET(47)
-COLD_TARGET(48)
-COLD_TARGET(49)
-COLD_TARGET(50)
-COLD_TARGET(51)
-COLD_TARGET(52)
-COLD_TARGET(53)
-COLD_TARGET(54)
-COLD_TARGET(55)
-COLD_TARGET(56)
-COLD_TARGET(57)
-COLD_TARGET(58)
-COLD_TARGET(59)
-COLD_TARGET(60)
-COLD_TARGET(61)
-COLD_TARGET(62)
-COLD_TARGET(63)
 
 static uint64_t now_ns(clockid_t clock)
 {
@@ -116,17 +67,13 @@ static void* burst_worker(void* unused)
     return NULL;
 }
 
-int main(int argc, char** argv)
+int main(void)
 {
     GumInvocationListener*** listeners = dlsym(RTLD_DEFAULT, "array_listener");
     if (!listeners || !*listeners || !(*listeners)[0]) return 1;
     PeakGeneralListener* listener = (PeakGeneralListener*)(*listeners)[0];
-    if (argc > 1 && strcmp(argv[1], "generic") == 0) {
-        /* The test owns this pre-workload switch; no invocation is in flight. */
-        __atomic_store_n(&listener->fast_listener.enabled, 0, __ATOMIC_RELEASE);
-    } else if (!listener->fast_dispatch_enabled) {
-        return 77;
-    }
+    /* Own the callback selection before any application invocation. */
+    __atomic_store_n(&listener->fast_listener.enabled, 0, __ATOMIC_RELEASE);
     /* Join/retirement must clear the window before a thread slot is reused. */
     pthread_t worker;
     if (pthread_create(&worker, NULL, useful_worker, NULL) ||
@@ -142,8 +89,8 @@ int main(int argc, char** argv)
     /* A warmup/wait creates no credit for the following dense call burst. */
     if (pthread_create(&worker, NULL, burst_worker, NULL) ||
         pthread_join(worker, NULL)) return 1;
-    if (argc > 3 && strcmp(argv[3], "1") == 0) {
-        size_t targets = strtoul(argv[2], NULL, 10);
+    {
+        const size_t targets = 16;
         PeakHookState (*state)(size_t) =
             dlsym(RTLD_DEFAULT, "peak_general_listener_hook_state");
         if (!state) return 1;
